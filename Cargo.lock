@@ -967,6 +967,7 @@ dependencies = [
  "proptest",
  "roaring",
  "seahash",
+ "serde",
  "slab",
  "sqlparser",
  "tempfile",

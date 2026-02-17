@@ -41,6 +41,7 @@
 // Re-export public API
 pub use types::*;
 pub use errors::*;
+pub use runtime::SubscriptionEngine;
 
 // Internal modules
 mod types;

@@ -1,1 +1,5 @@
-//\! Persistent shard storage and background merge operations
+//! Persistence layer with compression and background merge
+
+pub mod codec;
+pub mod shard;
+pub mod merge;
