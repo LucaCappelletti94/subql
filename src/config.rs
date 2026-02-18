@@ -17,7 +17,7 @@ pub enum ConfigError {
 
     /// TOML serialize error
     #[error("TOML serialize error: {0}")]
-    Serialize(String),
+    Serialize(#[from] toml::ser::Error),
 }
 
 /// Main configuration structure
@@ -96,8 +96,7 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
 
 /// Save configuration to TOML file
 pub fn save_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
-    let toml_string = toml::to_string_pretty(config)
-        .map_err(|e| ConfigError::Serialize(e.to_string()))?;
+    let toml_string = toml::to_string_pretty(config)?;
     std::fs::write(path, toml_string)?;
     Ok(())
 }
