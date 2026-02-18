@@ -8,6 +8,12 @@ use sqlparser::parser::Parser;
 use crate::{RegisterError, TableId, SchemaCatalog, Cell};
 use super::{BytecodeProgram, Instruction};
 
+/// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
+const MAX_EXPR_DEPTH: usize = 512;
+
+/// Maximum SQL input length (defense-in-depth against pathological inputs).
+const MAX_SQL_LEN: usize = 8192;
+
 /// Parse and compile SQL SELECT statement to bytecode
 ///
 /// # Arguments
@@ -18,11 +24,18 @@ use super::{BytecodeProgram, Instruction};
 /// # Returns
 /// * `Ok((table_id, program))` - Compiled bytecode for the WHERE clause
 /// * `Err(RegisterError)` - Parse error, unsupported SQL, or schema error
+#[allow(clippy::option_if_let_else)]
 pub fn parse_and_compile<D: Dialect>(
     sql: &str,
     dialect: &D,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(TableId, BytecodeProgram), RegisterError> {
+    if sql.len() > MAX_SQL_LEN {
+        return Err(RegisterError::UnsupportedSql(
+            "SQL input too long".to_string()
+        ));
+    }
+
     // Parse SQL
     let statements = Parser::parse_sql(dialect, sql)
         .map_err(|e| RegisterError::ParseError {
@@ -90,6 +103,7 @@ fn extract_table_and_where(stmt: &Statement)
                             // TableFactor::Table (it fails at parse time), but guard against
                             // future parser changes.
                             name.0.first()
+                                .and_then(|part| part.as_ident())
                                 .ok_or_else(|| RegisterError::UnsupportedSql(
                                     "Missing table name".to_string()
                                 ))?
@@ -132,20 +146,28 @@ fn compile_expression(
     catalog: &dyn SchemaCatalog,
 ) -> Result<BytecodeProgram, RegisterError> {
     let mut instructions = Vec::new();
-    compile_expr_recursive(expr, table_id, catalog, &mut instructions)?;
+    compile_expr_recursive(expr, table_id, catalog, &mut instructions, 0)?;
     Ok(BytecodeProgram::new(instructions))
 }
 
 /// Recursive helper for expression compilation
 ///
 /// Compiles expression to leave result on top of stack.
+#[allow(clippy::too_many_lines)]
 fn compile_expr_recursive(
     expr: &Expr,
     table_id: TableId,
     catalog: &dyn SchemaCatalog,
     out: &mut Vec<Instruction>,
+    depth: usize,
 ) -> Result<(), RegisterError> {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
+
+    if depth > MAX_EXPR_DEPTH {
+        return Err(RegisterError::UnsupportedSql(
+            "Expression nesting too deep".to_string()
+        ));
+    }
 
     match expr {
         // ====================================================================
@@ -153,8 +175,8 @@ fn compile_expr_recursive(
         // ====================================================================
         Expr::BinaryOp { left, op, right } => {
             // Compile operands (left then right, stack order)
-            compile_expr_recursive(left, table_id, catalog, out)?;
-            compile_expr_recursive(right, table_id, catalog, out)?;
+            compile_expr_recursive(left, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(right, table_id, catalog, out, depth + 1)?;
 
             // Emit comparison/logical/arithmetic operator
             match op {
@@ -179,7 +201,7 @@ fn compile_expr_recursive(
 
                 _ => {
                     return Err(RegisterError::UnsupportedSql(
-                        format!("Binary operator {:?} not supported", op)
+                        format!("Binary operator {op:?} not supported")
                     ));
                 }
             }
@@ -208,7 +230,7 @@ fn compile_expr_recursive(
                 out.push(Instruction::LoadColumn(col_id));
             } else {
                 return Err(RegisterError::UnsupportedSql(
-                    format!("Complex identifier {:?} not supported", parts)
+                    format!("Complex identifier {parts:?} not supported")
                 ));
             }
         }
@@ -217,7 +239,7 @@ fn compile_expr_recursive(
         // Literals
         // ====================================================================
         Expr::Value(val) => {
-            let cell = value_to_cell(val)?;
+            let cell = value_to_cell(&val.value)?;
             out.push(Instruction::PushLiteral(cell));
         }
 
@@ -226,13 +248,13 @@ fn compile_expr_recursive(
         // ====================================================================
         Expr::InList { expr, list, negated } => {
             // Compile the expression being tested
-            compile_expr_recursive(expr, table_id, catalog, out)?;
+            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
 
             // Convert list values to cells
             let mut literals = Vec::with_capacity(list.len());
             for item in list {
                 if let Expr::Value(val) = item {
-                    literals.push(value_to_cell(val)?);
+                    literals.push(value_to_cell(&val.value)?);
                 } else {
                     return Err(RegisterError::UnsupportedSql(
                         "IN with subqueries not supported - SubQL only supports IN with literal lists like IN ('a', 'b', 'c'). \
@@ -254,9 +276,9 @@ fn compile_expr_recursive(
         // ====================================================================
         Expr::Between { expr, low, high, negated } => {
             // Stack order: value, lower, upper
-            compile_expr_recursive(expr, table_id, catalog, out)?;
-            compile_expr_recursive(low, table_id, catalog, out)?;
-            compile_expr_recursive(high, table_id, catalog, out)?;
+            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(low, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(high, table_id, catalog, out, depth + 1)?;
 
             out.push(Instruction::Between);
 
@@ -269,12 +291,12 @@ fn compile_expr_recursive(
         // NULL Checks
         // ====================================================================
         Expr::IsNull(expr) => {
-            compile_expr_recursive(expr, table_id, catalog, out)?;
+            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
             out.push(Instruction::IsNull);
         }
 
         Expr::IsNotNull(expr) => {
-            compile_expr_recursive(expr, table_id, catalog, out)?;
+            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
             out.push(Instruction::IsNotNull);
         }
 
@@ -282,7 +304,7 @@ fn compile_expr_recursive(
         // Unary Operations
         // ====================================================================
         Expr::UnaryOp { op, expr } => {
-            compile_expr_recursive(expr, table_id, catalog, out)?;
+            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
 
             match op {
                 UnaryOperator::Not => out.push(Instruction::Not),
@@ -294,7 +316,7 @@ fn compile_expr_recursive(
                 }
                 _ => {
                     return Err(RegisterError::UnsupportedSql(
-                        format!("Unary operator {:?} not supported", op)
+                        format!("Unary operator {op:?} not supported")
                     ));
                 }
             }
@@ -303,7 +325,7 @@ fn compile_expr_recursive(
         // ====================================================================
         // LIKE Pattern Matching
         // ====================================================================
-        Expr::Like { expr, pattern, negated, escape_char } => {
+        Expr::Like { expr, pattern, negated, escape_char, .. } => {
             if escape_char.is_some() {
                 return Err(RegisterError::UnsupportedSql(
                     "LIKE ESCAPE not yet supported".to_string()
@@ -311,8 +333,8 @@ fn compile_expr_recursive(
             }
 
             // Compile string and pattern
-            compile_expr_recursive(expr, table_id, catalog, out)?;
-            compile_expr_recursive(pattern, table_id, catalog, out)?;
+            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(pattern, table_id, catalog, out, depth + 1)?;
 
             // Case-sensitive LIKE by default
             out.push(Instruction::Like { case_sensitive: true });
@@ -322,7 +344,7 @@ fn compile_expr_recursive(
             }
         }
 
-        Expr::ILike { expr, pattern, negated, escape_char } => {
+        Expr::ILike { expr, pattern, negated, escape_char, .. } => {
             if escape_char.is_some() {
                 return Err(RegisterError::UnsupportedSql(
                     "ILIKE ESCAPE not yet supported".to_string()
@@ -330,8 +352,8 @@ fn compile_expr_recursive(
             }
 
             // Compile string and pattern
-            compile_expr_recursive(expr, table_id, catalog, out)?;
-            compile_expr_recursive(pattern, table_id, catalog, out)?;
+            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(pattern, table_id, catalog, out, depth + 1)?;
 
             // Case-insensitive LIKE
             out.push(Instruction::Like { case_sensitive: false });
@@ -345,7 +367,7 @@ fn compile_expr_recursive(
         // Nested Expressions (parentheses)
         // ====================================================================
         Expr::Nested(inner) => {
-            compile_expr_recursive(inner, table_id, catalog, out)?;
+            compile_expr_recursive(inner, table_id, catalog, out, depth + 1)?;
         }
 
         // ====================================================================
@@ -353,8 +375,8 @@ fn compile_expr_recursive(
         // ====================================================================
         _ => {
             return Err(RegisterError::UnsupportedSql(
-                format!("Expression {:?} not supported - SubQL supports basic WHERE clause predicates (comparisons, AND/OR/NOT, IN lists, BETWEEN, NULL checks, LIKE). \
-                         For complex expressions, aggregates, or functions, run this as a regular SQL query in your database.", expr)
+                format!("Expression {expr:?} not supported - SubQL supports basic WHERE clause predicates (comparisons, AND/OR/NOT, IN lists, BETWEEN, NULL checks, LIKE). \
+                         For complex expressions, aggregates, or functions, run this as a regular SQL query in your database.")
             ));
         }
     }
@@ -371,24 +393,25 @@ fn value_to_cell(val: &sqlparser::ast::Value) -> Result<Cell, RegisterError> {
         Value::Boolean(b) => Ok(Cell::Bool(*b)),
         Value::Number(n, _long) => {
             // Try parsing as i64 first, then f64
+            #[allow(clippy::option_if_let_else)]
             if let Ok(i) = n.parse::<i64>() {
                 Ok(Cell::Int(i))
             } else if let Ok(f) = n.parse::<f64>() {
                 Ok(Cell::Float(f))
             } else {
                 Err(RegisterError::TypeError(
-                    format!("Cannot parse number: {}", n)
+                    format!("Cannot parse number: {n}")
                 ))
             }
         }
-        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
-            Ok(Cell::String(s.as_str().into()))
-        }
-        Value::NationalStringLiteral(s) | Value::HexStringLiteral(s) => {
+        Value::SingleQuotedString(s)
+        | Value::DoubleQuotedString(s)
+        | Value::NationalStringLiteral(s)
+        | Value::HexStringLiteral(s) => {
             Ok(Cell::String(s.as_str().into()))
         }
         _ => Err(RegisterError::UnsupportedSql(
-            format!("Value type {:?} not supported", val)
+            format!("Value type {val:?} not supported")
         )),
     }
 }
@@ -1166,7 +1189,7 @@ mod tests {
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
 
-        let invalid_sql = "SELECT FROM WHERE"; // Malformed SQL
+        let invalid_sql = "NOT VALID SQL ;;;"; // Malformed SQL
         let result = parse_and_compile(invalid_sql, &dialect, &catalog);
         assert!(matches!(result, Err(RegisterError::ParseError { .. })));
     }

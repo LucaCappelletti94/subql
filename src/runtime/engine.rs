@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use ahash::AHashMap;
 use sqlparser::dialect::Dialect;
 use crate::{
-    TableId, SubscriptionId, SessionId, UserId,
+    IdTypes, TableId,
     SubscriptionSpec, RegisterResult, PruneReport, WalEvent,
     RegisterError, DispatchError, StorageError,
     SchemaCatalog,
@@ -19,7 +19,7 @@ use super::{
     ids::PredicateId,
     predicate::{Predicate, Binding},
     partition::TablePartition,
-    dispatch::{UserDictionary, dispatch_users},
+    dispatch::{UserDictionary, MatchedUsers, dispatch_users},
     indexes::extract_indexable_atoms,
 };
 
@@ -27,15 +27,15 @@ use super::{
 ///
 /// Manages subscriptions across all tables with hybrid indexing and
 /// predicate deduplication.
-pub struct SubscriptionEngine<D: Dialect> {
+pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
     /// SQL dialect for parsing
     dialect: D,
     /// Schema catalog for table/column resolution
     catalog: Arc<dyn SchemaCatalog>,
     /// Table partitions (TableId → TablePartition)
-    partitions: AHashMap<TableId, TablePartition>,
+    partitions: AHashMap<TableId, TablePartition<I>>,
     /// User dictionaries (TableId → UserDictionary)
-    user_dictionaries: AHashMap<TableId, UserDictionary>,
+    user_dictionaries: AHashMap<TableId, UserDictionary<I>>,
     /// VM for bytecode evaluation
     vm: Vm,
     /// Optional storage path for durability
@@ -43,10 +43,11 @@ pub struct SubscriptionEngine<D: Dialect> {
     /// Shard rotation threshold (bytes)
     rotation_threshold: usize,
     /// Background merge manager
+    #[allow(dead_code)]
     merge_manager: MergeManager,
 }
 
-impl<D: Dialect> SubscriptionEngine<D> {
+impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// Create new subscription engine
     #[must_use]
     pub fn new(catalog: Arc<dyn SchemaCatalog>, dialect: D) -> Self {
@@ -65,6 +66,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
     /// Create engine with durable storage
     ///
     /// Loads existing shards from storage directory on startup.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn with_storage(
         catalog: Arc<dyn SchemaCatalog>,
         dialect: D,
@@ -72,7 +74,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
     ) -> Result<Self, StorageError> {
         let mut engine = Self {
             dialect,
-            catalog: catalog.clone(),
+            catalog: Arc::clone(&catalog),
             partitions: AHashMap::new(),
             user_dictionaries: AHashMap::new(),
             vm: Vm::new(),
@@ -83,7 +85,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
 
         // Create storage directory if it doesn't exist
         std::fs::create_dir_all(&storage_path)
-            .map_err(|e| StorageError::Io(format!("Failed to create storage directory: {}", e)))?;
+            .map_err(|e| StorageError::Io(format!("Failed to create storage directory: {e}")))?;
 
         // Load existing shards
         engine.load_all_shards()?;
@@ -95,7 +97,8 @@ impl<D: Dialect> SubscriptionEngine<D> {
     ///
     /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds user.
     /// If storage is enabled and rotation threshold is exceeded, triggers snapshot.
-    pub fn register(&mut self, spec: SubscriptionSpec) -> Result<RegisterResult, RegisterError> {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn register(&mut self, spec: SubscriptionSpec<I>) -> Result<RegisterResult, RegisterError> {
         // 1. Parse and compile SQL
         let (table_id, bytecode) = parse_and_compile(&spec.sql, &self.dialect, &*self.catalog)?;
 
@@ -108,7 +111,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
             .or_insert_with(|| TablePartition::new(table_id));
 
         let user_dict = self.user_dictionaries.entry(table_id)
-            .or_insert_with(UserDictionary::new);
+            .or_default();
 
         // 4. Get user ordinal
         let user_ord = user_dict.get_or_create(spec.user_id);
@@ -158,11 +161,9 @@ impl<D: Dialect> SubscriptionEngine<D> {
         partition.add_binding(binding, pred_id);
 
         // 7. Check if rotation needed (if storage enabled)
-        if self.storage_path.is_some() {
-            if let Ok(true) = self.should_rotate(table_id) {
-                // Snapshot to disk (ignore errors for now, just best-effort)
-                let _ = self.snapshot_table(table_id);
-            }
+        if self.storage_path.is_some() && matches!(self.should_rotate(table_id), Ok(true)) {
+            // Snapshot to disk (ignore errors for now, just best-effort)
+            let _ = self.snapshot_table(table_id);
         }
 
         Ok(RegisterResult {
@@ -176,7 +177,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
     /// Unregister a subscription
     ///
     /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
-    pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
+    pub fn unregister_subscription(&mut self, subscription_id: I::SubscriptionId) -> bool {
         // Find the binding across all partitions
         for (_table_id, partition) in &mut self.partitions {
             let snapshot = partition.load_snapshot();
@@ -192,7 +193,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
     }
 
     /// Dispatch event to interested users
-    pub fn users(&mut self, event: &WalEvent) -> Result<Vec<UserId>, DispatchError> {
+    pub fn users(&mut self, event: &WalEvent) -> Result<MatchedUsers<'_, I>, DispatchError> {
         // Get table partition
         let partition = self.partitions.get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
@@ -206,7 +207,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
     }
 
     /// Unregister all subscriptions for a session
-    pub fn unregister_session(&mut self, session_id: SessionId) -> PruneReport {
+    pub fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport {
         let mut removed_bindings = 0;
         let removed_predicates = 0;
         let removed_users = 0;
@@ -268,22 +269,22 @@ impl<D: Dialect> SubscriptionEngine<D> {
             .ok_or_else(|| StorageError::Io("No storage path configured".to_string()))?;
 
         let partition = self.partitions.get(&table_id)
-            .ok_or_else(|| StorageError::Corrupt(format!("Unknown table ID: {}", table_id)))?;
+            .ok_or_else(|| StorageError::Corrupt(format!("Unknown table ID: {table_id}")))?;
 
         let user_dict = self.user_dictionaries.get(&table_id)
-            .ok_or_else(|| StorageError::Corrupt(format!("No user dictionary for table {}", table_id)))?;
+            .ok_or_else(|| StorageError::Corrupt(format!("No user dictionary for table {table_id}")))?;
 
         // Load snapshot
         let snapshot = partition.load_snapshot();
 
         // Convert predicates to serializable format
         let mut predicate_data_vec = Vec::new();
-        for (_idx, pred) in snapshot.predicates.predicates.iter() {
+        for (_idx, pred) in &snapshot.predicates.predicates {
             let pred_data = PredicateData {
                 hash: pred.hash,
                 normalized_sql: pred.normalized_sql.to_string(),
                 bytecode_instructions: bincode::serialize(&*pred.bytecode)
-                    .map_err(|e| StorageError::Codec(format!("Bytecode serialize error: {}", e)))?,
+                    .map_err(|e| StorageError::Codec(format!("Bytecode serialize error: {e}")))?,
                 dependency_columns: pred.dependency_columns.to_vec(),
                 refcount: pred.refcount,
                 updated_at_unix_ms: pred.updated_at_unix_ms,
@@ -294,11 +295,10 @@ impl<D: Dialect> SubscriptionEngine<D> {
         // Convert bindings to serializable format
         let mut binding_data_vec = Vec::new();
         for binding in snapshot.predicates.bindings.values() {
-            let binding_data = BindingData {
+            let binding_data = BindingData::<I> {
                 subscription_id: binding.subscription_id,
                 predicate_hash: snapshot.predicates.get_predicate(binding.predicate_id)
-                    .map(|p| p.hash)
-                    .unwrap_or(0),
+                    .map_or(0, |p| p.hash),
                 user_id: binding.user_id,
                 session_id: binding.session_id,
                 updated_at_unix_ms: binding.updated_at_unix_ms,
@@ -307,28 +307,29 @@ impl<D: Dialect> SubscriptionEngine<D> {
         }
 
         // Convert user dictionary to serializable format
-        let user_dict_data = UserDictData {
+        let user_dict_data = UserDictData::<I> {
             ordinal_to_user: user_dict.ordinal_to_user_vec(),
         };
 
         // Build payload
-        let payload = ShardPayload {
+        let payload: ShardPayload<I> = ShardPayload {
             predicates: predicate_data_vec,
             bindings: binding_data_vec,
             user_dict: user_dict_data,
+            #[allow(clippy::cast_possible_truncation)]
             created_at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis() as u64,
         };
 
         // Serialize shard
-        let bytes = serialize_shard(table_id, &payload, &*self.catalog)?;
+        let bytes = serialize_shard::<I>(table_id, &payload, &*self.catalog)?;
 
         // Write to disk
-        let shard_path = storage_path.join(format!("table_{}.shard", table_id));
+        let shard_path = storage_path.join(format!("table_{table_id}.shard"));
         std::fs::write(&shard_path, bytes)
-            .map_err(|e| StorageError::Io(format!("Failed to write shard: {}", e)))?;
+            .map_err(|e| StorageError::Io(format!("Failed to write shard: {e}")))?;
 
         Ok(())
     }
@@ -336,16 +337,16 @@ impl<D: Dialect> SubscriptionEngine<D> {
     /// Load shard from disk into partition
     fn load_shard(&mut self, table_id: TableId, path: &Path) -> Result<(), StorageError> {
         let bytes = std::fs::read(path)
-            .map_err(|e| StorageError::Io(format!("Failed to read shard: {}", e)))?;
+            .map_err(|e| StorageError::Io(format!("Failed to read shard: {e}")))?;
 
-        let (_header, payload) = deserialize_shard(&bytes, &*self.catalog)?;
+        let (_header, payload) = deserialize_shard::<I>(&bytes, &*self.catalog)?;
 
         // Create or get partition
         let partition = self.partitions.entry(table_id)
             .or_insert_with(|| TablePartition::new(table_id));
 
         let user_dict = self.user_dictionaries.entry(table_id)
-            .or_insert_with(UserDictionary::new);
+            .or_default();
 
         // Restore user dictionary
         for user_id in &payload.user_dict.ordinal_to_user {
@@ -373,7 +374,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
             } else {
                 // Deserialize bytecode
                 let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
-                    .map_err(|e| StorageError::Codec(format!("Bytecode deserialize error: {}", e)))?;
+                    .map_err(|e| StorageError::Codec(format!("Bytecode deserialize error: {e}")))?;
 
                 // Create predicate
                 let snapshot = partition.load_snapshot();
@@ -425,11 +426,11 @@ impl<D: Dialect> SubscriptionEngine<D> {
 
         // Read all .shard files (directory must exist — with_storage creates it)
         let entries = std::fs::read_dir(storage_path)
-            .map_err(|e| StorageError::Io(format!("Failed to read storage directory: {}", e)))?;
+            .map_err(|e| StorageError::Io(format!("Failed to read storage directory: {e}")))?;
 
         for entry in entries {
             let entry = entry
-                .map_err(|e| StorageError::Io(format!("Failed to read directory entry: {}", e)))?;
+                .map_err(|e| StorageError::Io(format!("Failed to read directory entry: {e}")))?;
             let path = entry.path();
 
             if path.extension().and_then(|s| s.to_str()) == Some("shard") {
@@ -450,7 +451,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
     /// Check if rotation is needed for a table
     fn should_rotate(&self, table_id: TableId) -> Result<bool, StorageError> {
         let partition = self.partitions.get(&table_id)
-            .ok_or_else(|| StorageError::Corrupt(format!("Unknown table ID: {}", table_id)))?;
+            .ok_or_else(|| StorageError::Corrupt(format!("Unknown table ID: {table_id}")))?;
 
         let snapshot = partition.load_snapshot();
 
@@ -469,7 +470,7 @@ impl<D: Dialect> SubscriptionEngine<D> {
 
     /// Get current rotation threshold
     #[must_use]
-    pub fn rotation_threshold(&self) -> usize {
+    pub const fn rotation_threshold(&self) -> usize {
         self.rotation_threshold
     }
 }
@@ -479,7 +480,7 @@ mod tests {
     use super::*;
     use sqlparser::dialect::PostgreSqlDialect;
     use std::collections::HashMap;
-    use crate::{Cell, EventKind, RowImage, PrimaryKey};
+    use crate::{Cell, EventKind, RowImage, PrimaryKey, DefaultIds};
 
     struct MockCatalog {
         tables: HashMap<String, (TableId, usize)>,
@@ -521,7 +522,7 @@ mod tests {
     #[test]
     fn test_engine_creation() {
         let catalog = make_catalog();
-        let engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         assert_eq!(engine.subscription_count(), 0);
     }
@@ -529,7 +530,7 @@ mod tests {
     #[test]
     fn test_register_subscription() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let spec = SubscriptionSpec {
             subscription_id: 1,
@@ -550,7 +551,7 @@ mod tests {
     #[test]
     fn test_predicate_deduplication() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register same predicate for two users
         let spec1 = SubscriptionSpec {
@@ -581,7 +582,7 @@ mod tests {
     #[test]
     fn test_dispatch_simple() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription: amount > 100
         let spec = SubscriptionSpec {
@@ -623,7 +624,7 @@ mod tests {
     #[test]
     fn test_bindings_persist() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription
         let spec = SubscriptionSpec {
@@ -650,7 +651,7 @@ mod tests {
     #[test]
     fn test_unregister_removes_binding() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription
         let spec = SubscriptionSpec {
@@ -679,7 +680,7 @@ mod tests {
     #[test]
     fn test_multiple_predicates_indexed() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register first predicate
         let spec1 = SubscriptionSpec {
@@ -725,7 +726,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with storage
-        let mut engine = SubscriptionEngine::with_storage(
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
             catalog.clone(),
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),
@@ -750,7 +751,7 @@ mod tests {
         assert!(shard_path.exists());
 
         // Create new engine, load from disk
-        let engine2 = SubscriptionEngine::with_storage(
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
             catalog,
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),
@@ -776,7 +777,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with storage
-        let mut engine = SubscriptionEngine::with_storage(
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
             catalog.clone(),
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),
@@ -806,7 +807,7 @@ mod tests {
         engine.snapshot_table(1).unwrap();
 
         // Load in new engine
-        let engine2 = SubscriptionEngine::with_storage(
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
             catalog,
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),
@@ -827,7 +828,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine and register users
-        let mut engine = SubscriptionEngine::with_storage(
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
             catalog.clone(),
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),
@@ -848,7 +849,7 @@ mod tests {
         engine.snapshot_table(1).unwrap();
 
         // Load in new engine
-        let engine2 = SubscriptionEngine::with_storage(
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
             catalog,
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),
@@ -869,7 +870,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with empty storage directory
-        let engine = SubscriptionEngine::with_storage(
+        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
             catalog,
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),
@@ -886,7 +887,7 @@ mod tests {
     #[test]
     fn test_predicate_count() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // No predicates initially
         assert_eq!(engine.predicate_count(1), 0);
@@ -909,7 +910,7 @@ mod tests {
     #[test]
     fn test_unregister_session() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscriptions with session
         let spec1 = SubscriptionSpec {
@@ -941,7 +942,7 @@ mod tests {
     #[test]
     fn test_rotation_threshold() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Default threshold
         let default = engine.rotation_threshold();
@@ -955,7 +956,7 @@ mod tests {
     #[test]
     fn test_dispatch_users_via_engine() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register a subscription
         let spec = SubscriptionSpec {
@@ -993,7 +994,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with non-existent storage path
-        let engine = SubscriptionEngine::with_storage(
+        let engine: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> = SubscriptionEngine::with_storage(
             catalog,
             PostgreSqlDialect {},
             std::path::PathBuf::from("/tmp/subql_nonexistent_test_dir_12345"),
@@ -1006,7 +1007,7 @@ mod tests {
     #[test]
     fn test_unregister_nonexistent_subscription() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Unregister subscription that doesn't exist
         let found = engine.unregister_subscription(999);
@@ -1016,7 +1017,7 @@ mod tests {
     #[test]
     fn test_dispatch_unknown_table() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Dispatch to unknown table
         let event = WalEvent {
@@ -1044,7 +1045,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
 
-        let mut engine = SubscriptionEngine::with_storage(
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
             catalog.clone(),
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),
@@ -1083,7 +1084,7 @@ mod tests {
     #[test]
     fn test_unregister_session_empty() {
         let catalog = make_catalog();
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Unregister session with no subscriptions
         let report = engine.unregister_session(999);
@@ -1096,13 +1097,14 @@ mod tests {
         use crate::persistence::shard::{
             serialize_shard, ShardPayload, PredicateData, BindingData, UserDictData,
         };
+        use crate::DefaultIds;
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
 
         // Create a shard with a binding that references a predicate hash
         // that does NOT exist in the predicate list
-        let payload = ShardPayload {
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![PredicateData {
                 hash: 0xAAAA,
                 normalized_sql: "amount > 100".to_string(),
@@ -1142,14 +1144,14 @@ mod tests {
         };
 
         // Serialize shard with catalog fingerprint
-        let shard_bytes = serialize_shard(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
 
         // Write corrupt shard to disk
         let shard_path = temp_dir.path().join("table_1.shard");
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         // Try to load — should fail with Corrupt error about unknown predicate hash
-        let result = SubscriptionEngine::with_storage(
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> = SubscriptionEngine::with_storage(
             catalog,
             PostgreSqlDialect {},
             temp_dir.path().to_path_buf(),

@@ -1,0 +1,29 @@
+[package]
+name = "subql-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+honggfuzz = "0.5"
+subql = { path = "..", features = ["testing"] }
+
+[[bin]]
+name = "fuzz_parse_sql"
+path = "fuzz_parse_sql.rs"
+
+[[bin]]
+name = "fuzz_vm_eval"
+path = "fuzz_vm_eval.rs"
+
+[[bin]]
+name = "fuzz_deserialize_shard"
+path = "fuzz_deserialize_shard.rs"
+
+[[bin]]
+name = "fuzz_canonicalize"
+path = "fuzz_canonicalize.rs"
+
+[[bin]]
+name = "fuzz_codec_decode"
+path = "fuzz_codec_decode.rs"

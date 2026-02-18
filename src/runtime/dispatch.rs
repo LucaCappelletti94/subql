@@ -1,9 +1,8 @@
 //! Event dispatch pipeline
 
-use std::sync::Arc;
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
-use crate::{UserId, WalEvent, EventKind, DispatchError, compiler::{Vm, Tri}};
+use crate::{IdTypes, WalEvent, EventKind, DispatchError, compiler::{Vm, Tri}};
 use super::{
     ids::UserOrdinal,
     partition::TablePartition,
@@ -14,14 +13,14 @@ use super::{
 /// Maps dense ordinals (0-based, used in bitmaps) to sparse UserIds.
 /// Enables efficient RoaringBitmap operations while supporting arbitrary UserIds.
 #[derive(Clone, Debug)]
-pub struct UserDictionary {
+pub struct UserDictionary<I: IdTypes> {
     /// UserOrdinal → UserId (dense, 0-indexed)
-    ordinal_to_user: Vec<UserId>,
+    ordinal_to_user: Vec<I::UserId>,
     /// UserId → UserOrdinal (for reverse lookup)
-    user_to_ordinal: AHashMap<UserId, UserOrdinal>,
+    user_to_ordinal: AHashMap<I::UserId, UserOrdinal>,
 }
 
-impl UserDictionary {
+impl<I: IdTypes> UserDictionary<I> {
     /// Create new empty dictionary
     #[must_use]
     pub fn new() -> Self {
@@ -32,12 +31,13 @@ impl UserDictionary {
     }
 
     /// Get or create ordinal for user
-    pub fn get_or_create(&mut self, user_id: UserId) -> UserOrdinal {
+    pub fn get_or_create(&mut self, user_id: I::UserId) -> UserOrdinal {
         if let Some(&ordinal) = self.user_to_ordinal.get(&user_id) {
             return ordinal;
         }
 
         // Allocate new ordinal
+        #[allow(clippy::cast_possible_truncation)]
         let ordinal = UserOrdinal::new(self.ordinal_to_user.len() as u32);
         self.ordinal_to_user.push(user_id);
         self.user_to_ordinal.insert(user_id, ordinal);
@@ -47,44 +47,54 @@ impl UserDictionary {
 
     /// Get ordinal for user (if exists)
     #[must_use]
-    pub fn get(&self, user_id: UserId) -> Option<UserOrdinal> {
+    pub fn get(&self, user_id: I::UserId) -> Option<UserOrdinal> {
         self.user_to_ordinal.get(&user_id).copied()
-    }
-
-    /// Resolve ordinals to UserIds
-    #[must_use]
-    pub fn resolve_users(&self, ordinals: &RoaringBitmap) -> Vec<UserId> {
-        let mut users: Vec<UserId> = ordinals
-            .iter()
-            .filter_map(|ord| self.ordinal_to_user.get(ord as usize).copied())
-            .collect();
-
-        users.sort_unstable();
-        users.dedup();
-        users
     }
 
     /// Get user by ordinal
     #[must_use]
-    pub fn get_user(&self, ordinal: UserOrdinal) -> Option<UserId> {
+    pub fn get_user(&self, ordinal: UserOrdinal) -> Option<I::UserId> {
         self.ordinal_to_user.get(ordinal.get() as usize).copied()
     }
 
     /// Remove user (for cleanup)
-    pub fn remove(&mut self, user_id: UserId) -> Option<UserOrdinal> {
+    pub fn remove(&mut self, user_id: I::UserId) -> Option<UserOrdinal> {
         self.user_to_ordinal.remove(&user_id)
     }
 
     /// Get ordinal_to_user vector for serialization
     #[must_use]
-    pub fn ordinal_to_user_vec(&self) -> Vec<UserId> {
+    pub fn ordinal_to_user_vec(&self) -> Vec<I::UserId> {
         self.ordinal_to_user.clone()
     }
 }
 
-impl Default for UserDictionary {
+impl<I: IdTypes> Default for UserDictionary<I> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Zero-allocation iterator over matched user IDs.
+///
+/// Owns the `RoaringBitmap` (already heap-allocated during dispatch — moving
+/// it is just a pointer move) and borrows the `UserDictionary` to translate
+/// ordinals into user IDs.
+pub struct MatchedUsers<'a, I: IdTypes> {
+    bitmap_iter: roaring::bitmap::IntoIter,
+    dict: &'a UserDictionary<I>,
+}
+
+impl<'a, I: IdTypes> Iterator for MatchedUsers<'a, I> {
+    type Item = I::UserId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for ord in self.bitmap_iter.by_ref() {
+            if let Some(user_id) = self.dict.ordinal_to_user.get(ord as usize).copied() {
+                return Some(user_id);
+            }
+        }
+        None
     }
 }
 
@@ -96,13 +106,13 @@ impl Default for UserDictionary {
 /// 3. Get table partition
 /// 4. Select candidate predicates (index lookups)
 /// 5. VM evaluation (filter to Tri::True)
-/// 6. Resolve users from matching predicates
-pub fn dispatch_users(
+/// 6. Return zero-alloc iterator over matched users
+pub fn dispatch_users<'a, I: IdTypes>(
     event: &WalEvent,
-    partition: &TablePartition,
-    user_dict: &UserDictionary,
+    partition: &TablePartition<I>,
+    user_dict: &'a UserDictionary<I>,
     vm: &mut Vm,
-) -> Result<Vec<UserId>, DispatchError> {
+) -> Result<MatchedUsers<'a, I>, DispatchError> {
     // 1. Validate event
     validate_event(event)?;
 
@@ -123,13 +133,13 @@ pub fn dispatch_users(
     let snapshot = partition.load_snapshot();
     let mut matching_ordinals = RoaringBitmap::new();
 
-    for pred_id_u32 in candidates.iter() {
+    for pred_id_u32 in &candidates {
         let pred_id = super::ids::PredicateId::from_u32(pred_id_u32);
 
         if let Some(pred) = snapshot.predicates.get_predicate(pred_id) {
             // Evaluate predicate against row
             let result = vm.eval(&pred.bytecode, row)
-                .map_err(|e| DispatchError::VmError(format!("{:?}", e)))?;
+                .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
 
             // Only Tri::True is a match
             if result == Tri::True {
@@ -141,12 +151,15 @@ pub fn dispatch_users(
         }
     }
 
-    // 5. Resolve users
-    Ok(user_dict.resolve_users(&matching_ordinals))
+    // 5. Return zero-alloc iterator
+    Ok(MatchedUsers {
+        bitmap_iter: matching_ordinals.into_iter(),
+        dict: user_dict,
+    })
 }
 
 /// Validate event has required fields
-fn validate_event(event: &WalEvent) -> Result<(), DispatchError> {
+const fn validate_event(event: &WalEvent) -> Result<(), DispatchError> {
     match event.kind {
         EventKind::Insert => {
             if event.new_row.is_none() {
@@ -173,13 +186,16 @@ fn validate_event(event: &WalEvent) -> Result<(), DispatchError> {
     Ok(())
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use crate::DefaultIds;
 
     #[test]
     fn test_user_dictionary_get_or_create() {
-        let mut dict = UserDictionary::new();
+        let mut dict = UserDictionary::<DefaultIds>::new();
 
         let ord1 = dict.get_or_create(100);
         assert_eq!(ord1.get(), 0);
@@ -193,24 +209,8 @@ mod tests {
     }
 
     #[test]
-    fn test_user_dictionary_resolve() {
-        let mut dict = UserDictionary::new();
-
-        dict.get_or_create(10);
-        dict.get_or_create(20);
-        dict.get_or_create(30);
-
-        let mut bitmap = RoaringBitmap::new();
-        bitmap.insert(0); // User 10
-        bitmap.insert(2); // User 30
-
-        let users = dict.resolve_users(&bitmap);
-        assert_eq!(users, vec![10, 30]);
-    }
-
-    #[test]
     fn test_user_dictionary_get() {
-        let mut dict = UserDictionary::new();
+        let mut dict = UserDictionary::<DefaultIds>::new();
 
         dict.get_or_create(42);
 
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_user_dictionary_remove() {
-        let mut dict = UserDictionary::new();
+        let mut dict = UserDictionary::<DefaultIds>::new();
 
         let ord = dict.get_or_create(42);
         assert_eq!(dict.get(42), Some(ord));
@@ -268,13 +268,9 @@ mod tests {
         assert_eq!(dict.get(42), None);
     }
 
-    // ========================================================================
-    // Phase 2: Additional Integration Tests
-    // ========================================================================
-
     #[test]
     fn test_user_dictionary_get_user() {
-        let mut dict = UserDictionary::new();
+        let mut dict = UserDictionary::<DefaultIds>::new();
 
         let ord = dict.get_or_create(100);
         assert_eq!(dict.get_user(ord), Some(100));
@@ -285,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_user_dictionary_default() {
-        let dict = UserDictionary::default();
+        let dict = UserDictionary::<DefaultIds>::default();
         assert_eq!(dict.get(42), None);
     }
 
@@ -335,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_user_dictionary_ordinal_to_user_vec() {
-        let mut dict = UserDictionary::new();
+        let mut dict = UserDictionary::<DefaultIds>::new();
         dict.get_or_create(10);
         dict.get_or_create(20);
         dict.get_or_create(30);
@@ -345,23 +341,22 @@ mod tests {
     }
 
     #[test]
-    fn test_user_dictionary_resolve_users_dedup() {
-        let mut dict = UserDictionary::new();
+    fn test_matched_users_iterator() {
+        let mut dict = UserDictionary::<DefaultIds>::new();
         dict.get_or_create(10);
         dict.get_or_create(20);
+        dict.get_or_create(30);
 
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert(0); // User 10
-        bitmap.insert(0); // Duplicate (bitmap auto-dedupes)
-        bitmap.insert(1); // User 20
+        bitmap.insert(2); // User 30
 
-        let users = dict.resolve_users(&bitmap);
-        assert_eq!(users, vec![10, 20]); // Should be sorted and deduped
+        let users: Vec<_> = (MatchedUsers {
+            bitmap_iter: bitmap.into_iter(),
+            dict: &dict,
+        }).collect();
+        assert_eq!(users, vec![10, 30]);
     }
-
-    // ========================================================================
-    // Phase 3C: Push to 95% - Dispatch Integration Tests
-    // ========================================================================
 
     #[test]
     fn test_dispatch_users_update_event_matching() {
@@ -370,17 +365,16 @@ mod tests {
         use super::super::indexes::IndexableAtom;
         use crate::compiler::{Vm, BytecodeProgram, Instruction};
 
-        let mut partition = TablePartition::new(1);
-        let mut user_dict = UserDictionary::new();
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        // Add a predicate: age > 18
         let pred = Predicate {
             id: super::super::ids::PredicateId::from_slab_index(0),
             hash: 0x1234,
             normalized_sql: "age > 18".into(),
             bytecode: Arc::new(BytecodeProgram::new(vec![
-                Instruction::LoadColumn(1),  // age column
+                Instruction::LoadColumn(1),
                 Instruction::PushLiteral(crate::Cell::Int(18)),
                 Instruction::GreaterThan,
             ])),
@@ -392,7 +386,6 @@ mod tests {
         let pred_id = pred.id;
         partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
 
-        // Add binding
         let ord = user_dict.get_or_create(42);
         let binding = super::super::predicate::Binding {
             subscription_id: 100,
@@ -404,7 +397,6 @@ mod tests {
         };
         partition.add_binding(binding, pred_id);
 
-        // Create UPDATE event with matching row (age=25 > 18)
         let event = WalEvent {
             kind: EventKind::Update,
             table_id: 1,
@@ -423,7 +415,7 @@ mod tests {
 
         let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
         assert!(result.is_ok());
-        let users = result.unwrap();
+        let users: Vec<_> = result.unwrap().collect();
         assert!(users.contains(&42), "User 42 should match age > 18 with age=25");
     }
 
@@ -434,11 +426,10 @@ mod tests {
         use super::super::indexes::IndexableAtom;
         use crate::compiler::{Vm, BytecodeProgram, Instruction};
 
-        let mut partition = TablePartition::new(1);
-        let mut user_dict = UserDictionary::new();
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        // Add a predicate: age < 30
         let pred = Predicate {
             id: super::super::ids::PredicateId::from_slab_index(0),
             hash: 0x5678,
@@ -467,7 +458,6 @@ mod tests {
         };
         partition.add_binding(binding, pred_id);
 
-        // Create DELETE event with matching row (age=25 < 30)
         let event = WalEvent {
             kind: EventKind::Delete,
             table_id: 1,
@@ -484,7 +474,7 @@ mod tests {
 
         let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
         assert!(result.is_ok());
-        let users = result.unwrap();
+        let users: Vec<_> = result.unwrap().collect();
         assert!(users.contains(&99), "User 99 should match age < 30 with age=25");
     }
 
@@ -495,11 +485,10 @@ mod tests {
         use super::super::indexes::IndexableAtom;
         use crate::compiler::{Vm, BytecodeProgram, Instruction};
 
-        let mut partition = TablePartition::new(1);
-        let mut user_dict = UserDictionary::new();
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        // Add a predicate: age > 50
         let pred = Predicate {
             id: super::super::ids::PredicateId::from_slab_index(0),
             hash: 0xABCD,
@@ -528,7 +517,6 @@ mod tests {
         };
         partition.add_binding(binding, pred_id);
 
-        // Create event with non-matching row (age=25 is NOT > 50)
         let event = WalEvent {
             kind: EventKind::Insert,
             table_id: 1,
@@ -545,7 +533,7 @@ mod tests {
 
         let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
         assert!(result.is_ok());
-        let users = result.unwrap();
+        let users: Vec<_> = result.unwrap().collect();
         assert!(users.is_empty(), "No users should match age > 50 with age=25");
     }
 }

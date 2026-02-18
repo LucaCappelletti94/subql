@@ -3,7 +3,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use subql::{
     SubscriptionEngine, SubscriptionSpec, WalEvent, SchemaCatalog,
-    EventKind, Cell, RowImage, PrimaryKey, TableId,
+    EventKind, Cell, RowImage, PrimaryKey, TableId, DefaultIds,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use std::sync::Arc;
@@ -96,7 +96,7 @@ fn dispatch_scaling_benchmark(c: &mut Criterion) {
             &predicate_count,
             |b, &count| {
                 let catalog = Arc::new(BenchCatalog::new());
-                let mut engine = SubscriptionEngine::new(
+                let mut engine = SubscriptionEngine::<_, DefaultIds>::new(
                     catalog,
                     PostgreSqlDialect {},
                 );
@@ -134,7 +134,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     // Equality predicates (best case)
     group.bench_function("equality_predicates", |b| {
         let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
         // Register 1000 equality predicates
         for i in 0..1000 {
@@ -159,7 +159,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     // Range predicates (moderate case)
     group.bench_function("range_predicates", |b| {
         let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
         // Register 1000 range predicates
         for i in 0..1000 {
@@ -184,7 +184,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     // Complex predicates (fallback case)
     group.bench_function("complex_predicates", |b| {
         let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
         // Register 1000 complex predicates
         for i in 0..1000 {
@@ -218,7 +218,7 @@ fn registration_benchmark(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let catalog = Arc::new(BenchCatalog::new());
-                SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {})
             },
             |mut engine| {
                 let spec = SubscriptionSpec {
@@ -237,7 +237,7 @@ fn registration_benchmark(c: &mut Criterion) {
     // Reused registration (existing predicate)
     group.bench_function("reused_predicate", |b| {
         let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
         // Pre-register predicate
         let spec = SubscriptionSpec {
@@ -274,7 +274,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
     // Many users, same predicate (best dedup)
     group.bench_function("high_dedup_ratio", |b| {
         let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
         // Register same predicate for 1000 users
         for i in 0..1000 {
@@ -299,7 +299,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
     // Every user has unique predicate (no dedup)
     group.bench_function("low_dedup_ratio", |b| {
         let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
         // Register unique predicate per user
         for i in 0..1000 {

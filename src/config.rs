@@ -62,15 +62,15 @@ pub struct CatalogConfig {
 }
 
 // Default values
-fn default_rotation_threshold() -> usize {
+const fn default_rotation_threshold() -> usize {
     10 * 1024 * 1024 // 10 MB
 }
 
-fn default_merge_threshold() -> usize {
+const fn default_merge_threshold() -> usize {
     5
 }
 
-fn default_merge_interval() -> u64 {
+const fn default_merge_interval() -> u64 {
     3600 // 1 hour
 }
 

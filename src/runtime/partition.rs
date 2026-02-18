@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
-use crate::{TableId, ColumnId, RowImage, EventKind};
+use crate::{IdTypes, TableId, ColumnId, RowImage, EventKind};
 use super::{
     ids::PredicateId,
     predicate::{Predicate, PredicateStore, Binding},
@@ -14,32 +14,32 @@ use super::{
 ///
 /// Used for lock-free reads during dispatch.
 #[derive(Clone)]
-pub struct TablePartitionSnapshot {
+pub struct TablePartitionSnapshot<I: IdTypes> {
     pub table_id: TableId,
     pub indexes: HybridIndexes,
-    pub predicates: Arc<PredicateStore>,
+    pub predicates: Arc<PredicateStore<I>>,
 }
 
 /// Table partition with atomic swap
 ///
 /// Partitions predicates by table for efficient dispatch.
 /// Uses ArcSwap for lock-free snapshot reads during event dispatch.
-pub struct TablePartition {
+pub struct TablePartition<I: IdTypes> {
     table_id: TableId,
-    snapshot: ArcSwap<TablePartitionSnapshot>,
+    snapshot: ArcSwap<TablePartitionSnapshot<I>>,
     // Mutable store (not shared with snapshot)
-    mutable_predicates: PredicateStore,
+    mutable_predicates: PredicateStore<I>,
 }
 
-impl TablePartition {
+impl<I: IdTypes> TablePartition<I> {
     /// Create new table partition
     #[must_use]
     pub fn new(table_id: TableId) -> Self {
-        let predicates = PredicateStore::new();
-        let snapshot = TablePartitionSnapshot {
+        let predicates = PredicateStore::<I>::new();
+        let snapshot = TablePartitionSnapshot::<I> {
             table_id,
             indexes: HybridIndexes::new(),
-            predicates: Arc::new(PredicateStore::new()),
+            predicates: Arc::new(PredicateStore::<I>::new()),
         };
 
         Self {
@@ -51,13 +51,14 @@ impl TablePartition {
 
     /// Load current snapshot (lock-free)
     #[must_use]
-    pub fn load_snapshot(&self) -> Arc<TablePartitionSnapshot> {
+    pub fn load_snapshot(&self) -> Arc<TablePartitionSnapshot<I>> {
         self.snapshot.load_full()
     }
 
     /// Add predicate to partition
     ///
     /// Rebuilds indexes and performs atomic swap.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn add_predicate(&mut self, predicate: Predicate, atoms: Vec<IndexableAtom>) {
         let pred_id = predicate.id;
         let deps = predicate.dependency_columns.to_vec();
@@ -72,7 +73,7 @@ impl TablePartition {
     /// Add binding to an existing predicate
     ///
     /// Increments refcount and updates snapshot.
-    pub fn add_binding(&mut self, binding: Binding, pred_id: PredicateId) {
+    pub fn add_binding(&mut self, binding: Binding<I>, pred_id: PredicateId) {
         // Add to mutable store
         self.mutable_predicates.add_binding(binding);
         self.mutable_predicates.increment_refcount(pred_id);
@@ -85,7 +86,7 @@ impl TablePartition {
     ///
     /// If refcount reaches 0, predicate is removed and indexes are rebuilt.
     /// Returns true if predicate was removed.
-    pub fn remove_binding(&mut self, sub_id: crate::SubscriptionId) -> bool {
+    pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> bool {
         if let Some(binding) = self.mutable_predicates.remove_binding(sub_id) {
             let removed = self.mutable_predicates.decrement_refcount(binding.predicate_id);
 
@@ -211,16 +212,16 @@ impl TablePartition {
             }
 
             // Intersect with candidates so far
-            if !update_candidates.is_empty() {
-                candidates &= &update_candidates;
-            } else {
+            if update_candidates.is_empty() {
                 // No predicates depend on changed columns
                 return candidates;
             }
+            candidates &= &update_candidates;
         }
 
         // Query indexes based on row values
         for (col_idx, cell) in row.cells.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
             let col_id = col_idx as ColumnId;
 
             if let Some(indexable) = IndexableCell::from_cell(cell) {
@@ -259,7 +260,7 @@ impl TablePartition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{compiler::{BytecodeProgram, Instruction}, Cell};
+    use crate::{compiler::{BytecodeProgram, Instruction}, Cell, DefaultIds};
     use super::super::indexes::{IndexableAtom, NullKind};
     use super::super::ids::UserOrdinal;
 
@@ -283,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_partition_creation() {
-        let partition = TablePartition::new(42);
+        let partition = TablePartition::<DefaultIds>::new(42);
         assert_eq!(partition.table_id(), 42);
 
         let snapshot = partition.load_snapshot();
@@ -292,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_add_predicate() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         let pred = make_predicate(0, 0x1234);
         let atoms = vec![IndexableAtom::Equality {
@@ -309,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_select_candidates_fallback() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         let pred = make_predicate(0, 0x1234);
         partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
@@ -323,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_select_candidates_update_optimization() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         // Predicate depends on column 1
         let pred = make_predicate(0, 0x1234);
@@ -342,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_lock_free_snapshot() {
-        let partition = TablePartition::new(1);
+        let partition = TablePartition::<DefaultIds>::new(1);
 
         // Load snapshot multiple times
         let snap1 = partition.load_snapshot();
@@ -358,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_remove_binding_refcount_no_predicate_remove() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         // Add predicate
         let pred = make_predicate(0, 0x1234);
@@ -397,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_remove_binding_nonexistent() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         // Try to remove non-existent binding
         let removed = partition.remove_binding(999);
@@ -406,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_select_candidates_with_equality_index() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         // Add predicate with equality index
         let pred = make_predicate(0, 0x1234);
@@ -425,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_select_candidates_with_null_checks() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         // Add predicate with IS NULL check
         let pred1 = make_predicate(0, 0x1234);
@@ -451,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_indexes_with_predicates() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         // Add a predicate
         let pred = make_predicate(0, 0x1234);
@@ -471,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_select_candidates_update_no_overlap() {
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         // Add predicate that depends on column 1
         // (make_predicate already sets dependency_columns to [1u16])
@@ -496,7 +497,7 @@ mod tests {
     fn test_select_candidates_null_cell_matches_is_null_index() {
         use super::super::indexes::{IndexableAtom, NullKind};
 
-        let mut partition = TablePartition::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
 
         // Add predicate with IS NULL index on column 1
         let pred = make_predicate(0, 0x9999);

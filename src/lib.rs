@@ -14,9 +14,11 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use subql::{SubscriptionEngine, SubscriptionSpec, WalEvent};
+//! use subql::{SubscriptionEngine, SubscriptionSpec, WalEvent, DefaultIds};
+//! use sqlparser::dialect::PostgreSqlDialect;
 //!
-//! let mut engine = SubscriptionEngine::new(catalog);
+//! let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+//!     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 //!
 //! // Register subscription
 //! engine.register(SubscriptionSpec {
@@ -29,19 +31,15 @@
 //!
 //! // Dispatch event
 //! let event = WalEvent { /* ... */ };
-//! let interested_users = engine.users(&event)?;
+//! let interested_users: Vec<u64> = engine.users(&event)?.collect();
 //! ```
 
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::missing_errors_doc)]  // Will be added in later phases
-#![allow(clippy::missing_panics_doc)]  // Will be added in later phases
-#![allow(clippy::doc_markdown)]        // Phase 1: Allow missing backticks in docs
-#![forbid(unsafe_code)]
+// Lint configuration is in [lints] section of Cargo.toml
 
 // Re-export public API
 pub use types::*;
 pub use errors::*;
-pub use runtime::SubscriptionEngine;
+pub use runtime::{SubscriptionEngine, MatchedUsers};
 
 // Internal modules
 mod types;
@@ -52,8 +50,8 @@ pub mod runtime;
 pub mod persistence;
 pub mod config;
 
-#[cfg(feature = "fuzzing")]
-pub mod fuzz_helpers;
+#[cfg(any(feature = "testing", test))]
+pub mod test_harnesses;
 
 // Version and metadata
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

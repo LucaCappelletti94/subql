@@ -4,7 +4,7 @@
 
 use subql::{
     SubscriptionEngine, SubscriptionSpec, WalEvent, SchemaCatalog,
-    EventKind, Cell, RowImage, PrimaryKey, TableId,
+    EventKind, Cell, RowImage, PrimaryKey, TableId, DefaultIds,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use std::sync::Arc;
@@ -89,7 +89,7 @@ fn main() {
     println!();
 
     let catalog = Arc::new(BenchCatalog::new());
-    let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
     println!("Registering 100,000 predicates...");
 
@@ -116,10 +116,10 @@ fn main() {
 
     // Dispatch 1000 events
     for i in 0..1000 {
-        let users = engine.users(&event).unwrap();
+        let user_count = engine.users(&event).unwrap().count();
 
         if (i + 1) % 100 == 0 {
-            println!("  {} events dispatched (matched {} users)", i + 1, users.len());
+            println!("  {} events dispatched (matched {} users)", i + 1, user_count);
         }
     }
 

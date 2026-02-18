@@ -15,22 +15,26 @@ impl PredicateId {
     /// # Panics
     /// Panics if index is `usize::MAX` (reserved for None representation)
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn from_slab_index(index: usize) -> Self {
         assert!(index < u32::MAX as usize, "Slab index too large");
         // slab indices start at 0, but NonZeroU32 requires non-zero
         // So we use index + 1 for storage
-        Self(NonZeroU32::new((index as u32) + 1).unwrap())
+        // Safety: the assert above guarantees index < u32::MAX, so index+1 is non-zero
+        #[allow(clippy::unwrap_used)]
+        let inner = NonZeroU32::new((index as u32) + 1).unwrap();
+        Self(inner)
     }
 
     /// Convert back to slab index
     #[must_use]
-    pub fn to_slab_index(self) -> usize {
+    pub const fn to_slab_index(self) -> usize {
         (self.0.get() - 1) as usize
     }
 
     /// Get raw u32 representation
     #[must_use]
-    pub fn as_u32(self) -> u32 {
+    pub const fn as_u32(self) -> u32 {
         self.0.get()
     }
 
@@ -66,7 +70,7 @@ impl UserOrdinal {
 
     /// Increment ordinal (for dictionary allocation)
     #[must_use]
-    pub fn next(self) -> Self {
+    pub const fn next(self) -> Self {
         Self(self.0 + 1)
     }
 }

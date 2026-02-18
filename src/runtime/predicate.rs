@@ -4,7 +4,7 @@ use std::sync::Arc;
 use slab::Slab;
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
-use crate::{SubscriptionId, UserId, SessionId, compiler::BytecodeProgram, ColumnId};
+use crate::{IdTypes, compiler::BytecodeProgram, ColumnId};
 use super::ids::{PredicateId, UserOrdinal, PredicateHash};
 
 /// Compiled predicate with metadata
@@ -27,41 +27,60 @@ pub struct Predicate {
 }
 
 /// Subscription binding (user → predicate → subscription)
-#[derive(Clone, Debug)]
-pub struct Binding {
+#[derive(Debug)]
+pub struct Binding<I: IdTypes> {
     /// Subscription identifier
-    pub subscription_id: SubscriptionId,
+    pub subscription_id: I::SubscriptionId,
     /// Predicate this subscription uses
     pub predicate_id: PredicateId,
     /// User who owns this subscription
-    pub user_id: UserId,
+    pub user_id: I::UserId,
     /// Dense user ordinal for bitmap indexing
     pub user_ordinal: UserOrdinal,
     /// Session ID if session-bound, None if durable
-    pub session_id: Option<SessionId>,
+    pub session_id: Option<I::SessionId>,
     /// Timestamp for conflict resolution
     pub updated_at_unix_ms: u64,
 }
+
+impl<I: IdTypes> Clone for Binding<I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<I: IdTypes> Copy for Binding<I> {}
 
 /// Predicate storage with deduplication
 ///
 /// Manages predicates with slab allocation and hash-based deduplication.
 /// Tracks refcounts and automatically removes predicates when refcount reaches 0.
-#[derive(Clone)]
-pub struct PredicateStore {
+pub struct PredicateStore<I: IdTypes> {
     /// Slab-allocated predicates (stable IDs)
     pub predicates: Slab<Predicate>,
     /// Hash → PredicateId (for deduplication)
     pub hash_index: AHashMap<PredicateHash, PredicateId>,
     /// SubscriptionId → Binding
-    pub bindings: AHashMap<SubscriptionId, Binding>,
+    pub bindings: AHashMap<I::SubscriptionId, Binding<I>>,
     /// SessionId → Vec<SubscriptionId> (for session cleanup)
-    pub session_index: AHashMap<SessionId, Vec<SubscriptionId>>,
+    pub session_index: AHashMap<I::SessionId, Vec<I::SubscriptionId>>,
     /// PredicateId → RoaringBitmap<UserOrdinal> (users interested in this predicate)
     pub predicate_users: AHashMap<PredicateId, RoaringBitmap>,
 }
 
-impl PredicateStore {
+impl<I: IdTypes> Clone for PredicateStore<I> {
+    fn clone(&self) -> Self {
+        Self {
+            predicates: self.predicates.clone(),
+            hash_index: self.hash_index.clone(),
+            bindings: self.bindings.clone(),
+            session_index: self.session_index.clone(),
+            predicate_users: self.predicate_users.clone(),
+        }
+    }
+}
+
+impl<I: IdTypes> PredicateStore<I> {
     /// Create new empty predicate store
     #[must_use]
     pub fn new() -> Self {
@@ -145,7 +164,7 @@ impl PredicateStore {
     }
 
     /// Add subscription binding
-    pub fn add_binding(&mut self, binding: Binding) {
+    pub fn add_binding(&mut self, binding: Binding<I>) {
         let sub_id = binding.subscription_id;
         let pred_id = binding.predicate_id;
         let user_ord = binding.user_ordinal;
@@ -172,7 +191,7 @@ impl PredicateStore {
     /// Remove subscription binding
     ///
     /// Returns the removed binding if it existed.
-    pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> Option<Binding> {
+    pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> Option<Binding<I>> {
         let binding = self.bindings.remove(&sub_id)?;
 
         // Remove from predicate_users
@@ -198,12 +217,12 @@ impl PredicateStore {
 
     /// Get all subscription IDs for a session
     #[must_use]
-    pub fn get_session_subscriptions(&self, session_id: SessionId) -> Option<&[SubscriptionId]> {
-        self.session_index.get(&session_id).map(|v| v.as_slice())
+    pub fn get_session_subscriptions(&self, session_id: I::SessionId) -> Option<&[I::SubscriptionId]> {
+        self.session_index.get(&session_id).map(std::vec::Vec::as_slice)
     }
 }
 
-impl Default for PredicateStore {
+impl<I: IdTypes> Default for PredicateStore<I> {
     fn default() -> Self {
         Self::new()
     }
@@ -213,6 +232,7 @@ impl Default for PredicateStore {
 mod tests {
     use super::*;
     use crate::compiler::Instruction;
+    use crate::DefaultIds;
 
     fn make_predicate(id: usize, hash: u128, refcount: u32) -> Predicate {
         Predicate {
@@ -228,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_add_and_find_predicate() {
-        let mut store = PredicateStore::new();
+        let mut store = PredicateStore::<DefaultIds>::new();
 
         let pred = make_predicate(0, 0x1234, 1);
         let id = store.add_predicate(pred);
@@ -239,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_refcount_increment() {
-        let mut store = PredicateStore::new();
+        let mut store = PredicateStore::<DefaultIds>::new();
 
         let pred = make_predicate(0, 0x1234, 1);
         let id = store.add_predicate(pred);
@@ -252,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_refcount_decrement() {
-        let mut store = PredicateStore::new();
+        let mut store = PredicateStore::<DefaultIds>::new();
 
         let pred = make_predicate(0, 0x1234, 2);
         let id = store.add_predicate(pred);
@@ -268,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_binding_lifecycle() {
-        let mut store = PredicateStore::new();
+        let mut store = PredicateStore::<DefaultIds>::new();
 
         let binding = Binding {
             subscription_id: 100,
@@ -291,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_predicate_users_bitmap() {
-        let mut store = PredicateStore::new();
+        let mut store = PredicateStore::<DefaultIds>::new();
 
         let pred_id = PredicateId::from_slab_index(0);
 
@@ -328,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_increment_refcount_nonexistent() {
-        let mut store = PredicateStore::new();
+        let mut store = PredicateStore::<DefaultIds>::new();
 
         // Try to increment refcount of non-existent predicate
         let fake_id = PredicateId::from_slab_index(999);
@@ -338,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_decrement_refcount_nonexistent() {
-        let mut store = PredicateStore::new();
+        let mut store = PredicateStore::<DefaultIds>::new();
 
         // Try to decrement refcount of non-existent predicate
         let fake_id = PredicateId::from_slab_index(999);
@@ -348,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_predicate_store_default() {
-        let store = PredicateStore::default();
+        let store = PredicateStore::<DefaultIds>::default();
         assert!(store.predicates.is_empty());
     }
 }

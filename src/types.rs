@@ -1,19 +1,48 @@
 //! Core type definitions for subql
 
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::sync::Arc;
+use serde::{Serialize, de::DeserializeOwned};
 
 // ============================================================================
-// Domain ID Types
+// Generic ID Types
 // ============================================================================
 
-/// User identifier (globally unique)
-pub type UserId = u64;
+/// Marker trait for ID types used in the subscription engine.
+///
+/// Any type satisfying these bounds can be used as a user, session, or
+/// subscription identifier.
+pub trait Id: Copy + Eq + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static {}
 
-/// Session identifier (per-connection)
-pub type SessionId = u64;
+/// Blanket implementation: every type meeting the bounds is automatically an `Id`.
+impl<T: Copy + Eq + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static> Id for T {}
 
-/// Subscription identifier (globally unique, assigned by caller)
-pub type SubscriptionId = u64;
+/// Associated types that pin the three consumer-facing ID representations.
+///
+/// No default type parameters — `SubscriptionEngine<D, I>` always requires
+/// both, forcing an explicit choice and preventing hidden bugs.
+pub trait IdTypes: 'static {
+    /// User identifier (globally unique)
+    type UserId: Id;
+    /// Session identifier (per-connection)
+    type SessionId: Id;
+    /// Subscription identifier (globally unique, assigned by caller)
+    type SubscriptionId: Id;
+}
+
+/// Default ID configuration using `u64` for all three identifiers.
+pub struct DefaultIds;
+
+impl IdTypes for DefaultIds {
+    type UserId = u64;
+    type SessionId = u64;
+    type SubscriptionId = u64;
+}
+
+// ============================================================================
+// Domain ID Types (non-generic, internal)
+// ============================================================================
 
 /// Table identifier (from schema catalog)
 pub type TableId = u32;
@@ -213,13 +242,13 @@ pub struct WalEvent {
 
 /// Subscription specification provided by user
 #[derive(Clone, Debug)]
-pub struct SubscriptionSpec {
+pub struct SubscriptionSpec<I: IdTypes> {
     /// Unique subscription ID (assigned by caller)
-    pub subscription_id: SubscriptionId,
+    pub subscription_id: I::SubscriptionId,
     /// User who owns this subscription
-    pub user_id: UserId,
+    pub user_id: I::UserId,
     /// Session ID if session-bound, None if durable
-    pub session_id: Option<SessionId>,
+    pub session_id: Option<I::SessionId>,
     /// SQL SELECT statement with WHERE clause
     pub sql: String,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
@@ -292,36 +321,39 @@ pub trait SchemaCatalog: Send + Sync {
 }
 
 /// Subscription registration operations
-pub trait SubscriptionRegistration: Send + Sync {
+pub trait SubscriptionRegistration<I: IdTypes>: Send + Sync {
     /// Register a new subscription
     ///
     /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds user.
     /// Returns error if SQL is unparseable or unsupported.
-    fn register(&mut self, spec: SubscriptionSpec)
+    fn register(&mut self, spec: SubscriptionSpec<I>)
         -> Result<RegisterResult, crate::RegisterError>;
 
     /// Unregister a subscription by ID
     ///
     /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
     /// Returns true if subscription existed and was removed.
-    fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool;
+    fn unregister_subscription(&mut self, subscription_id: I::SubscriptionId) -> bool;
 }
 
 /// Event dispatch operations
-pub trait SubscriptionDispatch: Send + Sync {
+pub trait SubscriptionDispatch<I: IdTypes>: Send + Sync {
+    /// Iterator over matched user IDs
+    type UserIter<'a>: Iterator<Item = I::UserId> where Self: 'a;
+
     /// Get interested users for a WAL event
     ///
-    /// Returns deduplicated, sorted list of UserIds.
-    fn users(&self, event: &WalEvent) -> Result<Vec<UserId>, crate::DispatchError>;
+    /// Returns a zero-alloc iterator of matched user IDs.
+    fn users(&mut self, event: &WalEvent) -> Result<Self::UserIter<'_>, crate::DispatchError>;
 }
 
 /// Session lifecycle operations
-pub trait SubscriptionPruning: Send + Sync {
+pub trait SubscriptionPruning<I: IdTypes>: Send + Sync {
     /// Unregister all subscriptions for a session
     ///
     /// Removes all session-bound subscriptions, decrements refcounts, prunes predicates.
     /// Durable subscriptions (session_id = None) are NOT affected.
-    fn unregister_session(&mut self, session_id: SessionId) -> PruneReport;
+    fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport;
 }
 
 /// Durable shard storage operations

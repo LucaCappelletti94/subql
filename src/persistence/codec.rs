@@ -10,19 +10,19 @@ use crate::StorageError;
 pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
     // Serialize with bincode
     let serialized = bincode::serialize(value)
-        .map_err(|e| StorageError::Codec(format!("Bincode serialize error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("Bincode serialize error: {e}")))?;
 
     // Compress with LZ4
     let mut encoder = lz4::EncoderBuilder::new()
         .level(4)  // Fast compression
         .build(Vec::new())
-        .map_err(|e| StorageError::Codec(format!("LZ4 encoder error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("LZ4 encoder error: {e}")))?;
 
     std::io::copy(&mut serialized.as_slice(), &mut encoder)
-        .map_err(|e| StorageError::Codec(format!("LZ4 compression error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("LZ4 compression error: {e}")))?;
 
     let (compressed, result) = encoder.finish();
-    result.map_err(|e| StorageError::Codec(format!("LZ4 finish error: {}", e)))?;
+    result.map_err(|e| StorageError::Codec(format!("LZ4 finish error: {e}")))?;
 
     Ok(compressed)
 }
@@ -33,15 +33,15 @@ pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
     // Decompress with LZ4
     let mut decoder = lz4::Decoder::new(bytes)
-        .map_err(|e| StorageError::Codec(format!("LZ4 decoder error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("LZ4 decoder error: {e}")))?;
 
     let mut decompressed = Vec::new();
     std::io::copy(&mut decoder, &mut decompressed)
-        .map_err(|e| StorageError::Codec(format!("LZ4 decompression error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("LZ4 decompression error: {e}")))?;
 
     // Deserialize with bincode
     bincode::deserialize(&decompressed)
-        .map_err(|e| StorageError::Codec(format!("Bincode deserialize error: {}", e)))
+        .map_err(|e| StorageError::Codec(format!("Bincode deserialize error: {e}")))
 }
 
 #[cfg(test)]

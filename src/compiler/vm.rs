@@ -357,7 +357,7 @@ fn cells_equal(a: &Cell, b: &Cell) -> bool {
     }
 }
 
-#[allow(clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names, clippy::cast_precision_loss)]
 fn compare_ordered_cells<F>(lhs: &Cell, rhs: &Cell, predicate: F) -> Tri
 where
     F: FnOnce(std::cmp::Ordering) -> bool,
@@ -434,6 +434,7 @@ fn simple_like(string: &str, pattern: &str) -> bool {
 ///
 /// Type coercion: Int + Int → Int, otherwise Float
 /// NULL propagation: NULL + anything → NULL
+#[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
 fn arithmetic_add(a: Cell, b: Cell) -> Cell {
     // NULL propagation
     if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
@@ -453,6 +454,7 @@ fn arithmetic_add(a: Cell, b: Cell) -> Cell {
 ///
 /// Type coercion: Int - Int → Int, otherwise Float
 /// NULL propagation: NULL - anything → NULL
+#[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
 fn arithmetic_subtract(a: Cell, b: Cell) -> Cell {
     // NULL propagation
     if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
@@ -472,6 +474,7 @@ fn arithmetic_subtract(a: Cell, b: Cell) -> Cell {
 ///
 /// Type coercion: Int * Int → Int, otherwise Float
 /// NULL propagation: NULL * anything → NULL
+#[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
 fn arithmetic_multiply(a: Cell, b: Cell) -> Cell {
     // NULL propagation
     if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
@@ -492,6 +495,7 @@ fn arithmetic_multiply(a: Cell, b: Cell) -> Cell {
 /// Always returns Float (SQL semantics)
 /// Division by zero → NULL
 /// NULL propagation: NULL / anything → NULL
+#[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
 fn arithmetic_divide(a: Cell, b: Cell) -> Cell {
     // NULL propagation
     if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
@@ -523,6 +527,7 @@ fn arithmetic_divide(a: Cell, b: Cell) -> Cell {
 /// Integer operation only (coerces to Int first)
 /// Modulo by zero → NULL
 /// NULL propagation: NULL % anything → NULL
+#[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
 fn arithmetic_modulo(a: Cell, b: Cell) -> Cell {
     // NULL propagation
     if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
@@ -541,18 +546,14 @@ fn arithmetic_modulo(a: Cell, b: Cell) -> Cell {
         _ => return Cell::Null, // Type mismatch
     };
 
-    // Modulo by zero → NULL
-    if b_int == 0 {
-        return Cell::Null;
-    }
-
-    Cell::Int(a_int % b_int)
+    a_int.checked_rem(b_int).map_or(Cell::Null, Cell::Int)
 }
 
 /// Negate a cell: -a (unary minus)
 ///
 /// Type preserved: Int → Int, Float → Float
 /// NULL propagation: -NULL → NULL
+#[allow(clippy::needless_pass_by_value)]
 fn arithmetic_negate(a: Cell) -> Cell {
     // NULL propagation
     if a.is_null() || a.is_missing() {
@@ -560,7 +561,7 @@ fn arithmetic_negate(a: Cell) -> Cell {
     }
 
     match a {
-        Cell::Int(x) => Cell::Int(-x),
+        Cell::Int(x) => Cell::Int(x.saturating_neg()),
         Cell::Float(x) => Cell::Float(-x),
         _ => Cell::Null, // Type mismatch
     }

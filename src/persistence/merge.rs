@@ -3,17 +3,17 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use ahash::AHashMap;
-use crate::{TableId, MergeJobId, MergeError, MergeReport, SchemaCatalog};
-use super::shard::{ShardPayload, deserialize_shard, PredicateData};
+use crate::{IdTypes, DefaultIds, TableId, MergeJobId, MergeError, MergeReport, SchemaCatalog};
+use super::shard::{ShardPayload, BindingData, deserialize_shard, PredicateData, UserDictData};
 
 /// Merge job result
-type MergeResult = Result<MergedShard, String>;
+type MergeResult = Result<MergedShard<DefaultIds>, String>;
 
 /// Merged shard ready for swap
 #[derive(Debug)]
-pub struct MergedShard {
+pub struct MergedShard<I: IdTypes> {
     pub table_id: TableId,
-    pub payload: ShardPayload,
+    pub payload: ShardPayload<I>,
     pub stats: MergeStats,
 }
 
@@ -68,7 +68,7 @@ impl MergeManager {
             let start = std::time::Instant::now();
 
             // Perform merge
-            let result = merge_shards_impl(table_id, shard_bytes, &*catalog, start);
+            let result = merge_shards_impl(table_id, &shard_bytes, &*catalog, start);
 
             // Send result
             let _ = tx.send(result);
@@ -84,7 +84,7 @@ impl MergeManager {
     /// Check if merge is complete and return result
     ///
     /// Returns Some(result) if merge complete, None if still running.
-    pub fn try_get_result(&mut self, job_id: MergeJobId) -> Result<Option<MergedShard>, MergeError> {
+    pub fn try_get_result(&mut self, job_id: MergeJobId) -> Result<Option<MergedShard<DefaultIds>>, MergeError> {
         let job = self.jobs.get_mut(&job_id)
             .ok_or(MergeError::UnknownJob(job_id))?;
 
@@ -125,20 +125,20 @@ impl Default for MergeManager {
 }
 
 /// Perform merge operation
-fn merge_shards_impl(
+fn merge_shards_impl<I: IdTypes>(
     table_id: TableId,
-    shard_bytes: Vec<Vec<u8>>,
+    shard_bytes: &[Vec<u8>],
     catalog: &dyn SchemaCatalog,
     start: std::time::Instant,
-) -> MergeResult {
+) -> Result<MergedShard<I>, String> {
     let mut all_predicates = Vec::new();
     let mut all_bindings = Vec::new();
-    let mut user_ordinals = Vec::new();
+    let mut user_ordinals: Vec<I::UserId> = Vec::new();
 
     // 1. Load all shards
-    for bytes in &shard_bytes {
+    for bytes in shard_bytes {
         let (_header, payload) = deserialize_shard(bytes, catalog)
-            .map_err(|e| format!("Shard deserialize error: {:?}", e))?;
+            .map_err(|e| format!("Shard deserialize error: {e:?}"))?;
 
         all_predicates.extend(payload.predicates);
         all_bindings.extend(payload.bindings);
@@ -173,7 +173,7 @@ fn merge_shards_impl(
     let output_predicates: Vec<PredicateData> = unique_predicates.into_values().collect();
 
     // 4. Filter bindings (remove duplicates)
-    let mut unique_bindings: AHashMap<u64, super::shard::BindingData> = AHashMap::new();
+    let mut unique_bindings: AHashMap<I::SubscriptionId, BindingData<I>> = AHashMap::new();
 
     for binding in all_bindings {
         unique_bindings
@@ -188,27 +188,37 @@ fn merge_shards_impl(
 
     let output_bindings: Vec<_> = unique_bindings.into_values().collect();
 
+    // SystemTime::now() is always after UNIX_EPOCH on supported platforms;
+    // truncation from u128 to u64 is acceptable (won't overflow until year ~584M).
+    #[allow(clippy::cast_possible_truncation)]
+    let created_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before UNIX epoch")
+        .as_millis() as u64;
+
+    // Capture lengths before moving into payload
+    let num_output_predicates = output_predicates.len();
+    let num_output_bindings = output_bindings.len();
+
     // 5. Build merged payload
-    let payload = ShardPayload {
-        predicates: output_predicates.clone(),
-        bindings: output_bindings.clone(),
-        user_dict: super::shard::UserDictData {
+    let payload: ShardPayload<I> = ShardPayload {
+        predicates: output_predicates,
+        bindings: output_bindings,
+        user_dict: UserDictData {
             ordinal_to_user: user_ordinals,
         },
-        created_at_unix_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
+        created_at_unix_ms,
     };
 
+    #[allow(clippy::cast_possible_truncation)] // build time won't exceed u64::MAX ms
     let build_ms = start.elapsed().as_millis() as u64;
 
     let stats = MergeStats {
         input_shards: shard_bytes.len(),
         input_predicates,
-        output_predicates: output_predicates.len(),
+        output_predicates: num_output_predicates,
         input_bindings,
-        output_bindings: output_bindings.len(),
+        output_bindings: num_output_bindings,
         build_ms,
     };
 
@@ -222,6 +232,7 @@ fn merge_shards_impl(
 /// Convert merge stats to report
 impl From<MergeStats> for MergeReport {
     fn from(stats: MergeStats) -> Self {
+        #[allow(clippy::cast_precision_loss)] // approximate ratio is fine for reporting
         let dedup_ratio = if stats.output_predicates > 0 {
             stats.input_predicates as f32 / stats.output_predicates as f32
         } else {
@@ -242,7 +253,7 @@ impl From<MergeStats> for MergeReport {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use super::super::shard::{serialize_shard, PredicateData, BindingData, UserDictData};
+    use super::super::shard::{serialize_shard, PredicateData, UserDictData};
 
     struct MockCatalog {
         fingerprints: HashMap<TableId, u64>,
@@ -286,14 +297,14 @@ mod tests {
             updated_at_unix_ms: 1000,
         };
 
-        let payload1 = ShardPayload {
+        let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred.clone()],
             bindings: vec![],
             user_dict: UserDictData { ordinal_to_user: vec![] },
             created_at_unix_ms: 1000,
         };
 
-        let payload2 = ShardPayload {
+        let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred],
             bindings: vec![],
             user_dict: UserDictData { ordinal_to_user: vec![] },
@@ -305,7 +316,7 @@ mod tests {
 
         // Merge
         let start = std::time::Instant::now();
-        let result = merge_shards_impl(1, vec![shard1, shard2], &catalog, start);
+        let result = merge_shards_impl::<DefaultIds>(1, &[shard1, shard2], &catalog, start);
 
         assert!(result.is_ok());
         let merged = result.unwrap();
@@ -321,7 +332,7 @@ mod tests {
         let mut manager = MergeManager::new();
 
         let catalog = Box::new(make_catalog());
-        let payload = ShardPayload {
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
             user_dict: UserDictData { ordinal_to_user: vec![10, 20] },
@@ -373,7 +384,7 @@ mod tests {
         assert_eq!(manager.active_jobs(), 0);
 
         let catalog = Box::new(make_catalog());
-        let payload = ShardPayload {
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
             user_dict: UserDictData { ordinal_to_user: vec![] },
@@ -403,7 +414,7 @@ mod tests {
         let mut manager = MergeManager::new();
 
         let catalog = Box::new(make_catalog());
-        let payload = ShardPayload {
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
             user_dict: UserDictData { ordinal_to_user: vec![] },
@@ -444,14 +455,14 @@ mod tests {
             updated_at_unix_ms: 2000, // Newer
         };
 
-        let payload1 = ShardPayload {
+        let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_old],
             bindings: vec![],
             user_dict: UserDictData { ordinal_to_user: vec![] },
             created_at_unix_ms: 1000,
         };
 
-        let payload2 = ShardPayload {
+        let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_new],
             bindings: vec![],
             user_dict: UserDictData { ordinal_to_user: vec![] },
@@ -462,7 +473,7 @@ mod tests {
         let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
 
         let start = std::time::Instant::now();
-        let result = merge_shards_impl(1, vec![shard1, shard2], &catalog, start);
+        let result = merge_shards_impl::<DefaultIds>(1, &[shard1, shard2], &catalog, start);
 
         assert!(result.is_ok());
         let merged = result.unwrap();
@@ -478,7 +489,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create two shards with same binding but different timestamps
-        let binding_old = BindingData {
+        let binding_old: BindingData<DefaultIds> = BindingData {
             subscription_id: 100,
             predicate_hash: 0x1234,
             user_id: 42,
@@ -486,7 +497,7 @@ mod tests {
             updated_at_unix_ms: 1000, // Older
         };
 
-        let binding_new = BindingData {
+        let binding_new: BindingData<DefaultIds> = BindingData {
             subscription_id: 100, // Same sub_id
             predicate_hash: 0x1234,
             user_id: 42,
@@ -494,14 +505,14 @@ mod tests {
             updated_at_unix_ms: 2000, // Newer
         };
 
-        let payload1 = ShardPayload {
+        let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![binding_old],
             user_dict: UserDictData { ordinal_to_user: vec![] },
             created_at_unix_ms: 1000,
         };
 
-        let payload2 = ShardPayload {
+        let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![binding_new],
             user_dict: UserDictData { ordinal_to_user: vec![] },
@@ -512,7 +523,7 @@ mod tests {
         let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
 
         let start = std::time::Instant::now();
-        let result = merge_shards_impl(1, vec![shard1, shard2], &catalog, start);
+        let result = merge_shards_impl::<DefaultIds>(1, &[shard1, shard2], &catalog, start);
 
         assert!(result.is_ok());
         let merged = result.unwrap();
@@ -589,7 +600,7 @@ mod tests {
         assert!(matches!(result, Ok(None)));
 
         // Now send result and check again
-        let _ = tx.send(Ok(MergedShard {
+        let _ = tx.send(Ok(MergedShard::<DefaultIds> {
             table_id: 1,
             payload: ShardPayload {
                 predicates: vec![],

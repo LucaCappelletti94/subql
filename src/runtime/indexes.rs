@@ -33,7 +33,7 @@ impl IndexableCell {
             Cell::Bool(b) => Some(Self::Bool(*b)),
             Cell::Int(i) => Some(Self::Int(*i)),
             Cell::Float(f) => Some(Self::Float(f.to_bits())),
-            Cell::String(s) => Some(Self::String(s.clone())),
+            Cell::String(s) => Some(Self::String(Arc::clone(s))),
             Cell::Null | Cell::Missing => None,
         }
     }
@@ -187,6 +187,7 @@ impl HybridIndexes {
 
     /// Query range index (return predicates whose ranges contain value)
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn query_range(&self, col_id: ColumnId, value: &IndexableCell) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
 
@@ -237,6 +238,8 @@ impl Default for HybridIndexes {
 ///
 /// Analyzes bytecode to identify simple conditions that can be indexed.
 /// Returns empty vec if predicate is too complex to index efficiently.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn extract_indexable_atoms(
     bytecode: &crate::compiler::BytecodeProgram,
     _deps: &[ColumnId],

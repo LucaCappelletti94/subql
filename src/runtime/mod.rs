@@ -8,3 +8,4 @@ pub mod dispatch;
 pub mod engine;
 
 pub use engine::SubscriptionEngine;
+pub use dispatch::MatchedUsers;

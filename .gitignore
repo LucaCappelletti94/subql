@@ -21,8 +21,11 @@ target
 #.idea/
 
 
-# Honggfuzz workspace (corpus, crashes, coverage)
+# Honggfuzz (corpus, crashes, coverage, build artifacts)
 hfuzz_workspace/
+hfuzz_target/
+fuzz/hfuzz_workspace/
+fuzz/hfuzz_target/
 
 # Added by cargo
 

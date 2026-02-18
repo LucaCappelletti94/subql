@@ -1,7 +1,7 @@
 //! Shard format with header and validation
 
 use serde::{Serialize, Deserialize};
-use crate::{TableId, StorageError, SchemaCatalog};
+use crate::{IdTypes, TableId, StorageError, SchemaCatalog};
 use super::codec;
 
 /// Shard format version
@@ -18,7 +18,7 @@ pub struct ShardHeader {
     /// Format version
     pub version: u16,
     /// Padding for alignment
-    pub _padding: u8,
+    pub padding: u8,
     /// Table ID this shard belongs to
     pub table_id: TableId,
     /// Schema fingerprint (for compatibility checking)
@@ -32,7 +32,7 @@ pub struct ShardHeader {
 impl ShardHeader {
     /// Create new shard header
     #[must_use]
-    pub fn new(
+    pub const fn new(
         table_id: TableId,
         schema_fingerprint: u64,
         uncompressed_size: u64,
@@ -41,7 +41,7 @@ impl ShardHeader {
         Self {
             magic: *MAGIC,
             version: SHARD_VERSION,
-            _padding: 0,
+            padding: 0,
             table_id,
             schema_fingerprint,
             uncompressed_size,
@@ -82,16 +82,28 @@ impl ShardHeader {
 }
 
 /// Shard payload (compressed)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShardPayload {
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct ShardPayload<I: IdTypes> {
     /// Predicates in this shard
     pub predicates: Vec<PredicateData>,
     /// Bindings in this shard
-    pub bindings: Vec<BindingData>,
+    pub bindings: Vec<BindingData<I>>,
     /// User dictionary
-    pub user_dict: UserDictData,
+    pub user_dict: UserDictData<I>,
     /// Shard creation timestamp (milliseconds since Unix epoch)
     pub created_at_unix_ms: u64,
+}
+
+impl<I: IdTypes> Clone for ShardPayload<I> {
+    fn clone(&self) -> Self {
+        Self {
+            predicates: self.predicates.clone(),
+            bindings: self.bindings.clone(),
+            user_dict: self.user_dict.clone(),
+            created_at_unix_ms: self.created_at_unix_ms,
+        }
+    }
 }
 
 /// Serializable predicate data
@@ -106,32 +118,50 @@ pub struct PredicateData {
 }
 
 /// Serializable binding data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BindingData {
-    pub subscription_id: u64,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct BindingData<I: IdTypes> {
+    pub subscription_id: I::SubscriptionId,
     pub predicate_hash: u128,  // Link to predicate
-    pub user_id: u64,
-    pub session_id: Option<u64>,
+    pub user_id: I::UserId,
+    pub session_id: Option<I::SessionId>,
     pub updated_at_unix_ms: u64,
 }
 
+impl<I: IdTypes> Clone for BindingData<I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<I: IdTypes> Copy for BindingData<I> {}
+
 /// Serializable user dictionary
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserDictData {
-    pub ordinal_to_user: Vec<u64>,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct UserDictData<I: IdTypes> {
+    pub ordinal_to_user: Vec<I::UserId>,
+}
+
+impl<I: IdTypes> Clone for UserDictData<I> {
+    fn clone(&self) -> Self {
+        Self {
+            ordinal_to_user: self.ordinal_to_user.clone(),
+        }
+    }
 }
 
 /// Serialize shard to bytes
 ///
 /// Returns full shard (header + compressed payload).
-pub fn serialize_shard(
+pub fn serialize_shard<I: IdTypes>(
     table_id: TableId,
-    payload: &ShardPayload,
+    payload: &ShardPayload<I>,
     catalog: &dyn SchemaCatalog,
 ) -> Result<Vec<u8>, StorageError> {
     // Serialize payload
     let uncompressed = bincode::serialize(payload)
-        .map_err(|e| StorageError::Codec(format!("Payload serialize error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("Payload serialize error: {e}")))?;
 
     // Compress payload
     let compressed = codec::encode(payload)?;
@@ -139,7 +169,7 @@ pub fn serialize_shard(
     // Get schema fingerprint
     let schema_fingerprint = catalog.schema_fingerprint(table_id)
         .ok_or_else(|| StorageError::Corrupt(
-            format!("No schema fingerprint for table {}", table_id)
+            format!("No schema fingerprint for table {table_id}")
         ))?;
 
     // Create header
@@ -152,7 +182,7 @@ pub fn serialize_shard(
 
     // Serialize header
     let header_bytes = bincode::serialize(&header)
-        .map_err(|e| StorageError::Codec(format!("Header serialize error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("Header serialize error: {e}")))?;
 
     // Concatenate header + compressed payload
     let mut result = header_bytes;
@@ -164,26 +194,27 @@ pub fn serialize_shard(
 /// Deserialize shard from bytes
 ///
 /// Returns (header, payload).
-pub fn deserialize_shard(
+pub fn deserialize_shard<I: IdTypes>(
     bytes: &[u8],
     catalog: &dyn SchemaCatalog,
-) -> Result<(ShardHeader, ShardPayload), StorageError> {
+) -> Result<(ShardHeader, ShardPayload<I>), StorageError> {
     // Deserialize header
     let header: ShardHeader = bincode::deserialize(bytes)
-        .map_err(|e| StorageError::Codec(format!("Header deserialize error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("Header deserialize error: {e}")))?;
 
     // Validate header
     header.validate(catalog)?;
 
     // Extract payload bytes (skip header)
     let header_size = bincode::serialized_size(&header)
-        .map_err(|e| StorageError::Codec(format!("Header size error: {}", e)))?;
+        .map_err(|e| StorageError::Codec(format!("Header size error: {e}")))?;
 
+    #[allow(clippy::cast_possible_truncation)] // header_size is always small enough for usize
     let payload_bytes = bytes.get(header_size as usize..)
         .ok_or_else(|| StorageError::Corrupt("Truncated shard".to_string()))?;
 
     // Decompress and deserialize payload
-    let payload: ShardPayload = codec::decode(payload_bytes)?;
+    let payload: ShardPayload<I> = codec::decode(payload_bytes)?;
 
     Ok((header, payload))
 }
@@ -192,6 +223,7 @@ pub fn deserialize_shard(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use crate::DefaultIds;
 
     struct MockCatalog {
         fingerprints: HashMap<TableId, u64>,
@@ -225,7 +257,7 @@ mod tests {
     fn test_shard_roundtrip() {
         let catalog = make_catalog();
 
-        let payload = ShardPayload {
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
             user_dict: UserDictData {
@@ -235,7 +267,7 @@ mod tests {
         };
 
         let bytes = serialize_shard(1, &payload, &catalog).unwrap();
-        let (header, decoded_payload) = deserialize_shard(&bytes, &catalog).unwrap();
+        let (header, decoded_payload) = deserialize_shard::<DefaultIds>(&bytes, &catalog).unwrap();
 
         assert_eq!(header.table_id, 1);
         assert_eq!(header.schema_fingerprint, 0x1234567890ABCDEF);
@@ -281,7 +313,7 @@ mod tests {
             fingerprints: HashMap::new(), // Empty - no fingerprints
         };
 
-        let payload = ShardPayload {
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
             user_dict: UserDictData { ordinal_to_user: vec![] },
