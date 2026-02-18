@@ -42,9 +42,8 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
     storage_path: Option<PathBuf>,
     /// Shard rotation threshold (bytes)
     rotation_threshold: usize,
-    /// Background merge manager
-    #[allow(dead_code)]
-    merge_manager: MergeManager,
+    /// Reserved for background merge compaction (not yet wired up)
+    _merge_manager: MergeManager,
 }
 
 impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
@@ -59,7 +58,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             vm: Vm::new(),
             storage_path: None,
             rotation_threshold: 10 * 1024 * 1024, // 10 MB default
-            merge_manager: MergeManager::new(),
+            _merge_manager: MergeManager::new(),
         }
     }
 
@@ -80,7 +79,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             vm: Vm::new(),
             storage_path: Some(storage_path.clone()),
             rotation_threshold: 10 * 1024 * 1024, // 10 MB default
-            merge_manager: MergeManager::new(),
+            _merge_manager: MergeManager::new(),
         };
 
         // Create storage directory if it doesn't exist
@@ -481,31 +480,7 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
     use std::collections::HashMap;
     use crate::{Cell, EventKind, RowImage, PrimaryKey, DefaultIds};
-
-    struct MockCatalog {
-        tables: HashMap<String, (TableId, usize)>,
-        columns: HashMap<(TableId, String), u16>,
-    }
-
-    impl SchemaCatalog for MockCatalog {
-        fn table_id(&self, table_name: &str) -> Option<TableId> {
-            self.tables.get(table_name).map(|(id, _)| *id)
-        }
-
-        fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-            self.columns.get(&(table_id, column_name.to_string())).copied()
-        }
-
-        fn table_arity(&self, table_id: TableId) -> Option<usize> {
-            self.tables.values()
-                .find(|(id, _)| *id == table_id)
-                .map(|(_, arity)| *arity)
-        }
-
-        fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-            Some(0x1234)
-        }
-    }
+    use crate::testing::MockCatalog;
 
     fn make_catalog() -> Arc<MockCatalog> {
         let mut tables = HashMap::new();

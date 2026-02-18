@@ -243,40 +243,11 @@ impl Vm {
             // Arithmetic Operations
             // ================================================================
 
-            Instruction::Add => {
-                let b = self.pop_cell()?;
-                let a = self.pop_cell()?;
-                let result = arithmetic_add(a, b);
-                self.stack.push(StackValue::Cell(result));
-            }
-
-            Instruction::Subtract => {
-                let b = self.pop_cell()?;
-                let a = self.pop_cell()?;
-                let result = arithmetic_subtract(a, b);
-                self.stack.push(StackValue::Cell(result));
-            }
-
-            Instruction::Multiply => {
-                let b = self.pop_cell()?;
-                let a = self.pop_cell()?;
-                let result = arithmetic_multiply(a, b);
-                self.stack.push(StackValue::Cell(result));
-            }
-
-            Instruction::Divide => {
-                let b = self.pop_cell()?;
-                let a = self.pop_cell()?;
-                let result = arithmetic_divide(a, b);
-                self.stack.push(StackValue::Cell(result));
-            }
-
-            Instruction::Modulo => {
-                let b = self.pop_cell()?;
-                let a = self.pop_cell()?;
-                let result = arithmetic_modulo(a, b);
-                self.stack.push(StackValue::Cell(result));
-            }
+            Instruction::Add => self.execute_binary_cell_op(arithmetic_add)?,
+            Instruction::Subtract => self.execute_binary_cell_op(arithmetic_subtract)?,
+            Instruction::Multiply => self.execute_binary_cell_op(arithmetic_multiply)?,
+            Instruction::Divide => self.execute_binary_cell_op(arithmetic_divide)?,
+            Instruction::Modulo => self.execute_binary_cell_op(arithmetic_modulo)?,
 
             Instruction::Negate => {
                 let a = self.pop_cell()?;
@@ -285,6 +256,13 @@ impl Vm {
             }
         }
 
+        Ok(())
+    }
+
+    fn execute_binary_cell_op(&mut self, op: fn(Cell, Cell) -> Cell) -> Result<(), VmError> {
+        let b = self.pop_cell()?;
+        let a = self.pop_cell()?;
+        self.stack.push(StackValue::Cell(op(a, b)));
         Ok(())
     }
 
@@ -370,34 +348,25 @@ where
     let ord = match (lhs, rhs) {
         (Cell::Int(x), Cell::Int(y)) => x.cmp(y),
         (Cell::Float(x), Cell::Float(y)) => {
-            if x < y {
-                std::cmp::Ordering::Less
-            } else if x > y {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
+            if x.is_nan() || y.is_nan() {
+                return Tri::Unknown;
             }
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
         }
         // Mixed Int/Float comparisons - coerce to Float
         (Cell::Int(x), Cell::Float(y)) => {
             let x_float = *x as f64;
-            if x_float < *y {
-                std::cmp::Ordering::Less
-            } else if x_float > *y {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
+            if y.is_nan() {
+                return Tri::Unknown;
             }
+            x_float.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
         }
         (Cell::Float(x), Cell::Int(y)) => {
             let y_float = *y as f64;
-            if *x < y_float {
-                std::cmp::Ordering::Less
-            } else if *x > y_float {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
+            if x.is_nan() {
+                return Tri::Unknown;
             }
+            x.partial_cmp(&y_float).unwrap_or(std::cmp::Ordering::Equal)
         }
         (Cell::String(x), Cell::String(y)) => x.cmp(y),
         _ => return Tri::Unknown, // Type mismatch
@@ -406,115 +375,130 @@ where
     if predicate(ord) { Tri::True } else { Tri::False }
 }
 
-/// Simple LIKE pattern matching
+/// SQL LIKE pattern matching
 ///
-/// Supports % (wildcard) and _ (single char). Does NOT support escaping.
+/// Supports `%` (zero or more characters) and `_` (exactly one character).
+/// Does NOT support ESCAPE clauses.
 fn simple_like(string: &str, pattern: &str) -> bool {
-    // TODO: Implement full LIKE semantics
-    // For Phase 1, use simple contains/prefix/suffix
-    if pattern == "%" {
-        true // Match anything
-    } else if pattern.starts_with('%') && pattern.ends_with('%') {
-        let middle = &pattern[1..pattern.len() - 1];
-        string.contains(middle)
-    } else if let Some(stripped) = pattern.strip_prefix('%') {
-        string.ends_with(stripped)
-    } else if let Some(stripped) = pattern.strip_suffix('%') {
-        string.starts_with(stripped)
-    } else {
-        string == pattern
+    let s: Vec<char> = string.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let pn = p.len();
+
+    // dp[j] = true means s[0..i] matches p[0..j]
+    let mut dp = vec![false; pn + 1];
+    dp[0] = true;
+
+    // Initialize: leading '%' can match empty string
+    for (j, &ch) in p.iter().enumerate() {
+        if ch == '%' {
+            dp[j + 1] = dp[j];
+        } else {
+            break;
+        }
     }
+
+    for &sc in &s {
+        let mut new_dp = vec![false; pn + 1];
+        for j in 0..pn {
+            if !(dp[j] || (p[j] == '%' && new_dp[j])) {
+                continue;
+            }
+            match p[j] {
+                '%' => {
+                    new_dp[j] = true;
+                    new_dp[j + 1] = true;
+                }
+                '_' => {
+                    if dp[j] {
+                        new_dp[j + 1] = true;
+                    }
+                }
+                ch => {
+                    if dp[j] && sc == ch {
+                        new_dp[j + 1] = true;
+                    }
+                }
+            }
+        }
+        dp = new_dp;
+    }
+
+    dp[pn]
 }
 
 // ============================================================================
 // Arithmetic Operations
 // ============================================================================
 
-/// Add two cells: a + b
+/// Binary null propagation: returns `Some(Cell::Null)` if either operand is null/missing.
+const fn null_propagate_binary(a: &Cell, b: &Cell) -> Option<Cell> {
+    if !a.is_present() || !b.is_present() {
+        Some(Cell::Null)
+    } else {
+        None
+    }
+}
+
+/// Generic numeric binary operation.
 ///
-/// Type coercion: Int + Int → Int, otherwise Float
-/// NULL propagation: NULL + anything → NULL
-#[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
-fn arithmetic_add(a: Cell, b: Cell) -> Cell {
-    // NULL propagation
-    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
-        return Cell::Null;
+/// Handles null propagation and Int/Float type coercion.
+/// `int_op` is applied for `(Int, Int)`, `float_op` for any Float-involved pair.
+#[allow(clippy::cast_precision_loss)]
+fn numeric_binop(
+    a: Cell,
+    b: Cell,
+    int_op: fn(i64, i64) -> i64,
+    float_op: fn(f64, f64) -> f64,
+) -> Cell {
+    if let Some(null) = null_propagate_binary(&a, &b) {
+        return null;
     }
 
     match (a, b) {
-        (Cell::Int(x), Cell::Int(y)) => Cell::Int(x.saturating_add(y)),
-        (Cell::Int(x), Cell::Float(y)) => Cell::Float(x as f64 + y),
-        (Cell::Float(x), Cell::Int(y)) => Cell::Float(x + y as f64),
-        (Cell::Float(x), Cell::Float(y)) => Cell::Float(x + y),
+        (Cell::Int(x), Cell::Int(y)) => Cell::Int(int_op(x, y)),
+        (Cell::Int(x), Cell::Float(y)) => Cell::Float(float_op(x as f64, y)),
+        (Cell::Float(x), Cell::Int(y)) => Cell::Float(float_op(x, y as f64)),
+        (Cell::Float(x), Cell::Float(y)) => Cell::Float(float_op(x, y)),
         _ => Cell::Null, // Type mismatch
     }
+}
+
+/// Add two cells: a + b
+fn arithmetic_add(a: Cell, b: Cell) -> Cell {
+    numeric_binop(a, b, i64::saturating_add, std::ops::Add::add)
 }
 
 /// Subtract two cells: a - b
-///
-/// Type coercion: Int - Int → Int, otherwise Float
-/// NULL propagation: NULL - anything → NULL
-#[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
 fn arithmetic_subtract(a: Cell, b: Cell) -> Cell {
-    // NULL propagation
-    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
-        return Cell::Null;
-    }
-
-    match (a, b) {
-        (Cell::Int(x), Cell::Int(y)) => Cell::Int(x.saturating_sub(y)),
-        (Cell::Int(x), Cell::Float(y)) => Cell::Float(x as f64 - y),
-        (Cell::Float(x), Cell::Int(y)) => Cell::Float(x - y as f64),
-        (Cell::Float(x), Cell::Float(y)) => Cell::Float(x - y),
-        _ => Cell::Null, // Type mismatch
-    }
+    numeric_binop(a, b, i64::saturating_sub, std::ops::Sub::sub)
 }
 
 /// Multiply two cells: a * b
-///
-/// Type coercion: Int * Int → Int, otherwise Float
-/// NULL propagation: NULL * anything → NULL
-#[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
 fn arithmetic_multiply(a: Cell, b: Cell) -> Cell {
-    // NULL propagation
-    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
-        return Cell::Null;
-    }
-
-    match (a, b) {
-        (Cell::Int(x), Cell::Int(y)) => Cell::Int(x.saturating_mul(y)),
-        (Cell::Int(x), Cell::Float(y)) => Cell::Float(x as f64 * y),
-        (Cell::Float(x), Cell::Int(y)) => Cell::Float(x * y as f64),
-        (Cell::Float(x), Cell::Float(y)) => Cell::Float(x * y),
-        _ => Cell::Null, // Type mismatch
-    }
+    numeric_binop(a, b, i64::saturating_mul, std::ops::Mul::mul)
 }
 
 /// Divide two cells: a / b
 ///
-/// Always returns Float (SQL semantics)
-/// Division by zero → NULL
-/// NULL propagation: NULL / anything → NULL
+/// Always returns Float (SQL semantics). Division by zero → NULL.
 #[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
 fn arithmetic_divide(a: Cell, b: Cell) -> Cell {
-    // NULL propagation
-    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
-        return Cell::Null;
+    if let Some(null) = null_propagate_binary(&a, &b) {
+        return null;
     }
 
     let a_float = match a {
         Cell::Int(x) => x as f64,
         Cell::Float(x) => x,
-        _ => return Cell::Null, // Type mismatch
+        _ => return Cell::Null,
     };
 
     let b_float = match b {
         Cell::Int(y) => y as f64,
         Cell::Float(y) => y,
-        _ => return Cell::Null, // Type mismatch
+        _ => return Cell::Null,
     };
 
-    // Division by zero → NULL
     if b_float == 0.0 {
         return Cell::Null;
     }
@@ -524,46 +508,39 @@ fn arithmetic_divide(a: Cell, b: Cell) -> Cell {
 
 /// Modulo two cells: a % b
 ///
-/// Integer operation only (coerces to Int first)
-/// Modulo by zero → NULL
-/// NULL propagation: NULL % anything → NULL
+/// Integer operation only (coerces to Int first). Modulo by zero → NULL.
 #[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
 fn arithmetic_modulo(a: Cell, b: Cell) -> Cell {
-    // NULL propagation
-    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
-        return Cell::Null;
+    if let Some(null) = null_propagate_binary(&a, &b) {
+        return null;
     }
 
     let a_int = match a {
         Cell::Int(x) => x,
         Cell::Float(x) => x as i64,
-        _ => return Cell::Null, // Type mismatch
+        _ => return Cell::Null,
     };
 
     let b_int = match b {
         Cell::Int(y) => y,
         Cell::Float(y) => y as i64,
-        _ => return Cell::Null, // Type mismatch
+        _ => return Cell::Null,
     };
 
     a_int.checked_rem(b_int).map_or(Cell::Null, Cell::Int)
 }
 
 /// Negate a cell: -a (unary minus)
-///
-/// Type preserved: Int → Int, Float → Float
-/// NULL propagation: -NULL → NULL
 #[allow(clippy::needless_pass_by_value)]
 fn arithmetic_negate(a: Cell) -> Cell {
-    // NULL propagation
-    if a.is_null() || a.is_missing() {
+    if !a.is_present() {
         return Cell::Null;
     }
 
     match a {
         Cell::Int(x) => Cell::Int(x.saturating_neg()),
         Cell::Float(x) => Cell::Float(-x),
-        _ => Cell::Null, // Type mismatch
+        _ => Cell::Null,
     }
 }
 
@@ -1962,5 +1939,195 @@ mod tests {
 
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    // ========================================================================
+    // Full LIKE pattern matching tests
+    // ========================================================================
+
+    #[test]
+    fn test_like_underscore_wildcard() {
+        let mut vm = Vm::new();
+
+        let test_cases = vec![
+            ("abc", "a_c", true),
+            ("abc", "_bc", true),
+            ("abc", "ab_", true),
+            ("abc", "___", true),
+            ("ab", "___", false),
+            ("abcd", "___", false),
+            ("abc", "a__", true),
+        ];
+
+        for (string, pattern, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(Cell::String(string.into())),
+                Instruction::PushLiteral(Cell::String(pattern.into())),
+                Instruction::Like { case_sensitive: true },
+            ]);
+
+            let row = make_row(vec![]);
+            let result = vm.eval(&program, &row).unwrap();
+
+            if expected {
+                assert_eq!(result, Tri::True, "'{string}' LIKE '{pattern}' should be True");
+            } else {
+                assert_eq!(result, Tri::False, "'{string}' LIKE '{pattern}' should be False");
+            }
+        }
+    }
+
+    #[test]
+    fn test_like_multiple_percent_wildcards() {
+        let mut vm = Vm::new();
+
+        let test_cases = vec![
+            ("abcdef", "a%d%f", true),
+            ("abcdef", "%b%e%", true),
+            ("abcdef", "a%c%f", true),
+            ("abcdef", "a%z%f", false),
+            ("", "%", true),
+            ("", "%%", true),
+            ("a", "a%b%c", false),
+            ("abc", "a%b%c", true),
+        ];
+
+        for (string, pattern, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(Cell::String(string.into())),
+                Instruction::PushLiteral(Cell::String(pattern.into())),
+                Instruction::Like { case_sensitive: true },
+            ]);
+
+            let row = make_row(vec![]);
+            let result = vm.eval(&program, &row).unwrap();
+
+            if expected {
+                assert_eq!(result, Tri::True, "'{string}' LIKE '{pattern}' should be True");
+            } else {
+                assert_eq!(result, Tri::False, "'{string}' LIKE '{pattern}' should be False");
+            }
+        }
+    }
+
+    #[test]
+    fn test_like_mixed_wildcards() {
+        let mut vm = Vm::new();
+
+        let test_cases = vec![
+            ("abc", "_%_", true),
+            ("ab", "_%_", true),
+            ("a", "_%_", false),
+            ("abc", "%_c", true),
+            ("ac", "%_c", true),
+            ("c", "%_c", false),
+        ];
+
+        for (string, pattern, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(Cell::String(string.into())),
+                Instruction::PushLiteral(Cell::String(pattern.into())),
+                Instruction::Like { case_sensitive: true },
+            ]);
+
+            let row = make_row(vec![]);
+            let result = vm.eval(&program, &row).unwrap();
+
+            if expected {
+                assert_eq!(result, Tri::True, "'{string}' LIKE '{pattern}' should be True");
+            } else {
+                assert_eq!(result, Tri::False, "'{string}' LIKE '{pattern}' should be False");
+            }
+        }
+    }
+
+    #[test]
+    fn test_like_edge_cases() {
+        let mut vm = Vm::new();
+
+        let test_cases = vec![
+            ("", "", true),
+            ("", "_", false),
+            ("a", "", false),
+            ("", "a", false),
+        ];
+
+        for (string, pattern, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(Cell::String(string.into())),
+                Instruction::PushLiteral(Cell::String(pattern.into())),
+                Instruction::Like { case_sensitive: true },
+            ]);
+
+            let row = make_row(vec![]);
+            let result = vm.eval(&program, &row).unwrap();
+
+            if expected {
+                assert_eq!(result, Tri::True, "'{string}' LIKE '{pattern}' should be True");
+            } else {
+                assert_eq!(result, Tri::False, "'{string}' LIKE '{pattern}' should be False");
+            }
+        }
+    }
+
+    // ========================================================================
+    // NaN float handling tests
+    // ========================================================================
+
+    #[test]
+    fn test_nan_comparison_returns_unknown() {
+        let mut vm = Vm::new();
+
+        // NaN < 5.0 → Unknown
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(f64::NAN)),
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::LessThan,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+
+        // 5.0 > NaN → Unknown
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::PushLiteral(Cell::Float(f64::NAN)),
+            Instruction::GreaterThan,
+        ]);
+
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+
+        // NaN == NaN → Unknown (via ordered comparison)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(f64::NAN)),
+            Instruction::PushLiteral(Cell::Float(f64::NAN)),
+            Instruction::GreaterThanOrEqual,
+        ]);
+
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_nan_int_comparison_returns_unknown() {
+        let mut vm = Vm::new();
+
+        // NaN < Int → Unknown
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(f64::NAN)),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::LessThan,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+
+        // Int < NaN → Unknown
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::PushLiteral(Cell::Float(f64::NAN)),
+            Instruction::LessThan,
+        ]);
+
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
 }

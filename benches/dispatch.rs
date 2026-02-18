@@ -1,6 +1,7 @@
 //! Dispatch performance benchmarks
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
 use subql::{
     SubscriptionEngine, SubscriptionSpec, WalEvent, SchemaCatalog,
     EventKind, Cell, RowImage, PrimaryKey, TableId, DefaultIds,
@@ -307,7 +308,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
                 subscription_id: i,
                 user_id: i,
                 session_id: None,
-                sql: format!("SELECT * FROM orders WHERE amount > {}", i),
+                sql: format!("SELECT * FROM orders WHERE amount > {i}"),
                 updated_at_unix_ms: 0,
             };
             engine.register(spec).unwrap();

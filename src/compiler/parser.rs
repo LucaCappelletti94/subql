@@ -421,31 +421,7 @@ mod tests {
     use super::*;
     use sqlparser::dialect::{PostgreSqlDialect, MySqlDialect, SQLiteDialect};
     use std::collections::HashMap;
-
-    struct MockCatalog {
-        tables: HashMap<String, (TableId, usize)>, // TableId, arity
-        columns: HashMap<(TableId, String), u16>,
-    }
-
-    impl SchemaCatalog for MockCatalog {
-        fn table_id(&self, table_name: &str) -> Option<TableId> {
-            self.tables.get(table_name).map(|(id, _)| *id)
-        }
-
-        fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-            self.columns.get(&(table_id, column_name.to_string())).copied()
-        }
-
-        fn table_arity(&self, table_id: TableId) -> Option<usize> {
-            self.tables.values()
-                .find(|(id, _)| *id == table_id)
-                .map(|(_, arity)| *arity)
-        }
-
-        fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-            Some(0xABCD_1234_5678_9ABC)
-        }
-    }
+    use crate::testing::MockCatalog;
 
     fn make_catalog() -> MockCatalog {
         let mut tables = HashMap::new();

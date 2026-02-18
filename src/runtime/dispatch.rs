@@ -113,10 +113,7 @@ pub fn dispatch_users<'a, I: IdTypes>(
     user_dict: &'a UserDictionary<I>,
     vm: &mut Vm,
 ) -> Result<MatchedUsers<'a, I>, DispatchError> {
-    // 1. Validate event
-    validate_event(event)?;
-
-    // 2. Get row image based on event kind
+    // 1. Get row image based on event kind (validates presence)
     let row = match event.kind {
         EventKind::Insert => event.new_row.as_ref()
             .ok_or(DispatchError::MissingRequiredRowImage("INSERT requires new_row"))?,
@@ -126,10 +123,10 @@ pub fn dispatch_users<'a, I: IdTypes>(
             .ok_or(DispatchError::MissingRequiredRowImage("DELETE requires old_row"))?,
     };
 
-    // 3. Select candidates (index lookups + fallback)
+    // 2. Select candidates (index lookups + fallback)
     let candidates = partition.select_candidates(row, event.kind, &event.changed_columns);
 
-    // 4. VM evaluation (filter to Tri::True)
+    // 3. VM evaluation (filter to Tri::True)
     let snapshot = partition.load_snapshot();
     let mut matching_ordinals = RoaringBitmap::new();
 
@@ -151,39 +148,11 @@ pub fn dispatch_users<'a, I: IdTypes>(
         }
     }
 
-    // 5. Return zero-alloc iterator
+    // 4. Return zero-alloc iterator
     Ok(MatchedUsers {
         bitmap_iter: matching_ordinals.into_iter(),
         dict: user_dict,
     })
-}
-
-/// Validate event has required fields
-const fn validate_event(event: &WalEvent) -> Result<(), DispatchError> {
-    match event.kind {
-        EventKind::Insert => {
-            if event.new_row.is_none() {
-                return Err(DispatchError::MissingRequiredRowImage(
-                    "INSERT requires new_row"
-                ));
-            }
-        }
-        EventKind::Update => {
-            if event.new_row.is_none() {
-                return Err(DispatchError::MissingRequiredRowImage(
-                    "UPDATE requires new_row"
-                ));
-            }
-        }
-        EventKind::Delete => {
-            if event.old_row.is_none() {
-                return Err(DispatchError::MissingRequiredRowImage(
-                    "DELETE requires old_row"
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 
@@ -219,7 +188,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_event_insert() {
+    fn test_dispatch_insert_valid_event() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let partition = TablePartition::<DefaultIds>::new(1);
+        let user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
         let event = WalEvent {
             kind: EventKind::Insert,
             table_id: 1,
@@ -234,11 +210,18 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        assert!(validate_event(&event).is_ok());
+        assert!(dispatch_users(&event, &partition, &user_dict, &mut vm).is_ok());
     }
 
     #[test]
-    fn test_validate_event_missing_new_row() {
+    fn test_dispatch_insert_missing_new_row() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let partition = TablePartition::<DefaultIds>::new(1);
+        let user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
         let event = WalEvent {
             kind: EventKind::Insert,
             table_id: 1,
@@ -252,7 +235,7 @@ mod tests {
         };
 
         assert!(matches!(
-            validate_event(&event),
+            dispatch_users(&event, &partition, &user_dict, &mut vm),
             Err(DispatchError::MissingRequiredRowImage(_))
         ));
     }
@@ -286,7 +269,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_event_update_missing_new_row() {
+    fn test_dispatch_update_missing_new_row() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let partition = TablePartition::<DefaultIds>::new(1);
+        let user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
         let event = WalEvent {
             kind: EventKind::Update,
             table_id: 1,
@@ -302,13 +292,20 @@ mod tests {
         };
 
         assert!(matches!(
-            validate_event(&event),
+            dispatch_users(&event, &partition, &user_dict, &mut vm),
             Err(DispatchError::MissingRequiredRowImage(_))
         ));
     }
 
     #[test]
-    fn test_validate_event_delete_missing_old_row() {
+    fn test_dispatch_delete_missing_old_row() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let partition = TablePartition::<DefaultIds>::new(1);
+        let user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
         let event = WalEvent {
             kind: EventKind::Delete,
             table_id: 1,
@@ -324,7 +321,7 @@ mod tests {
         };
 
         assert!(matches!(
-            validate_event(&event),
+            dispatch_users(&event, &partition, &user_dict, &mut vm),
             Err(DispatchError::MissingRequiredRowImage(_))
         ));
     }

@@ -24,22 +24,24 @@ pub struct TablePartitionSnapshot<I: IdTypes> {
 ///
 /// Partitions predicates by table for efficient dispatch.
 /// Uses ArcSwap for lock-free snapshot reads during event dispatch.
+/// The `mutable_predicates` field uses copy-on-write via `Arc::make_mut`,
+/// so snapshots share the store until a mutation occurs.
 pub struct TablePartition<I: IdTypes> {
     table_id: TableId,
     snapshot: ArcSwap<TablePartitionSnapshot<I>>,
-    // Mutable store (not shared with snapshot)
-    mutable_predicates: PredicateStore<I>,
+    /// COW predicate store — `Arc::clone` for cheap snapshots, `Arc::make_mut` for mutations
+    mutable_predicates: Arc<PredicateStore<I>>,
 }
 
 impl<I: IdTypes> TablePartition<I> {
     /// Create new table partition
     #[must_use]
     pub fn new(table_id: TableId) -> Self {
-        let predicates = PredicateStore::<I>::new();
+        let predicates = Arc::new(PredicateStore::<I>::new());
         let snapshot = TablePartitionSnapshot::<I> {
             table_id,
             indexes: HybridIndexes::new(),
-            predicates: Arc::new(PredicateStore::<I>::new()),
+            predicates: Arc::clone(&predicates),
         };
 
         Self {
@@ -63,8 +65,8 @@ impl<I: IdTypes> TablePartition<I> {
         let pred_id = predicate.id;
         let deps = predicate.dependency_columns.to_vec();
 
-        // Add to mutable store
-        self.mutable_predicates.add_predicate(predicate);
+        // COW: clone-on-write if snapshot still shares this Arc
+        Arc::make_mut(&mut self.mutable_predicates).add_predicate(predicate);
 
         // Rebuild indexes
         self.rebuild_indexes(&atoms, pred_id, &deps);
@@ -74,9 +76,9 @@ impl<I: IdTypes> TablePartition<I> {
     ///
     /// Increments refcount and updates snapshot.
     pub fn add_binding(&mut self, binding: Binding<I>, pred_id: PredicateId) {
-        // Add to mutable store
-        self.mutable_predicates.add_binding(binding);
-        self.mutable_predicates.increment_refcount(pred_id);
+        let store = Arc::make_mut(&mut self.mutable_predicates);
+        store.add_binding(binding);
+        store.increment_refcount(pred_id);
 
         // Update snapshot with new predicates
         self.update_snapshot();
@@ -86,9 +88,11 @@ impl<I: IdTypes> TablePartition<I> {
     ///
     /// If refcount reaches 0, predicate is removed and indexes are rebuilt.
     /// Returns true if predicate was removed.
+    #[allow(clippy::option_if_let_else)]
     pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> bool {
-        if let Some(binding) = self.mutable_predicates.remove_binding(sub_id) {
-            let removed = self.mutable_predicates.decrement_refcount(binding.predicate_id);
+        let store = Arc::make_mut(&mut self.mutable_predicates);
+        if let Some(binding) = store.remove_binding(sub_id) {
+            let removed = store.decrement_refcount(binding.predicate_id);
 
             // Update snapshot
             if removed {
@@ -112,7 +116,7 @@ impl<I: IdTypes> TablePartition<I> {
         let new_snapshot = TablePartitionSnapshot {
             table_id: self.table_id,
             indexes: current.indexes.clone(),
-            predicates: Arc::new(self.mutable_predicates.clone()),
+            predicates: Arc::clone(&self.mutable_predicates),
         };
 
         self.snapshot.store(Arc::new(new_snapshot));
@@ -145,14 +149,12 @@ impl<I: IdTypes> TablePartition<I> {
 
         new_indexes.finalize_ranges();
 
-        // Create new snapshot with cloned predicates
         let new_snapshot = TablePartitionSnapshot {
             table_id: self.table_id,
             indexes: new_indexes,
-            predicates: Arc::new(self.mutable_predicates.clone()),
+            predicates: Arc::clone(&self.mutable_predicates),
         };
 
-        // Atomic swap
         self.snapshot.store(Arc::new(new_snapshot));
     }
 
@@ -160,7 +162,6 @@ impl<I: IdTypes> TablePartition<I> {
     fn rebuild_all_indexes(&self) {
         let mut new_indexes = HybridIndexes::new();
 
-        // Re-index all predicates
         for (idx, pred) in &self.mutable_predicates.predicates {
             let pred_deps = pred.dependency_columns.to_vec();
             let pred_atoms = super::indexes::extract_indexable_atoms(&pred.bytecode, &pred_deps);
@@ -174,11 +175,10 @@ impl<I: IdTypes> TablePartition<I> {
 
         new_indexes.finalize_ranges();
 
-        // Create new snapshot
         let new_snapshot = TablePartitionSnapshot {
             table_id: self.table_id,
             indexes: new_indexes,
-            predicates: Arc::new(self.mutable_predicates.clone()),
+            predicates: Arc::clone(&self.mutable_predicates),
         };
 
         self.snapshot.store(Arc::new(new_snapshot));
