@@ -70,8 +70,11 @@ impl MergeManager {
             // Perform merge
             let result = merge_shards_impl(table_id, &shard_bytes, &*catalog, start);
 
-            // Send result
-            let _ = tx.send(result);
+            // Send result — receiver may have been dropped if caller discarded the job
+            if tx.send(result).is_err() {
+                #[cfg(feature = "observability")]
+                tracing::warn!("Merge result receiver dropped before result was sent");
+            }
         });
 
         self.jobs.insert(job_id, MergeJob {
