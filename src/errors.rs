@@ -69,6 +69,10 @@ pub enum StorageError {
     #[error("I/O error: {0}")]
     Io(String),
 
+    /// Configuration error (e.g., missing storage path)
+    #[error("Config error: {0}")]
+    Config(String),
+
     /// Codec error (bincode/LZ4)
     #[error("Codec error: {0}")]
     Codec(String),

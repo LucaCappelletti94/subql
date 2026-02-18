@@ -265,7 +265,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// Serializes all predicates, bindings, and user dictionary to a shard file.
     pub fn snapshot_table(&self, table_id: TableId) -> Result<(), StorageError> {
         let storage_path = self.storage_path.as_ref()
-            .ok_or_else(|| StorageError::Io("No storage path configured".to_string()))?;
+            .ok_or_else(|| StorageError::Config("No storage path configured".to_string()))?;
 
         let partition = self.partitions.get(&table_id)
             .ok_or_else(|| StorageError::Corrupt(format!("Unknown table ID: {table_id}")))?;
@@ -421,7 +421,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// Load all shards from storage directory
     fn load_all_shards(&mut self) -> Result<(), StorageError> {
         let storage_path = self.storage_path.as_ref()
-            .ok_or_else(|| StorageError::Io("No storage path configured".to_string()))?;
+            .ok_or_else(|| StorageError::Config("No storage path configured".to_string()))?;
 
         // Read all .shard files (directory must exist — with_storage creates it)
         let entries = std::fs::read_dir(storage_path)
