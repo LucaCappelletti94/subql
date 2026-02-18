@@ -61,15 +61,16 @@ impl<I: IdTypes> TablePartition<I> {
     ///
     /// Rebuilds indexes and performs atomic swap.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn add_predicate(&mut self, predicate: Predicate, atoms: Vec<IndexableAtom>) {
-        let pred_id = predicate.id;
+    pub fn add_predicate(&mut self, predicate: Predicate, atoms: Vec<IndexableAtom>) -> PredicateId {
         let deps = predicate.dependency_columns.to_vec();
 
         // COW: clone-on-write if snapshot still shares this Arc
-        Arc::make_mut(&mut self.mutable_predicates).add_predicate(predicate);
+        let pred_id = Arc::make_mut(&mut self.mutable_predicates).add_predicate(predicate);
 
         // Rebuild indexes
         self.rebuild_indexes(&atoms, pred_id, &deps);
+
+        pred_id
     }
 
     /// Add binding to an existing predicate
@@ -132,7 +133,7 @@ impl<I: IdTypes> TablePartition<I> {
             let pred_deps = pred.dependency_columns.to_vec();
 
             // For existing predicates, extract atoms from their bytecode
-            let pred_atoms = if pred.id == pred_id {
+            let pred_atoms = if PredicateId::from_slab_index(idx) == pred_id {
                 // This is the new predicate, use provided atoms
                 atoms.to_vec()
             } else {
@@ -196,13 +197,7 @@ impl<I: IdTypes> TablePartition<I> {
         changed_cols: &[ColumnId],
     ) -> RoaringBitmap {
         let snapshot = self.load_snapshot();
-        let mut candidates = RoaringBitmap::new();
-
-        // Always include fallback (unindexable predicates)
-        candidates |= &snapshot.indexes.fallback;
-
-        // UPDATE optimization: only predicates depending on changed columns
-        if kind == EventKind::Update && !changed_cols.is_empty() {
+        let update_filter = if kind == EventKind::Update && !changed_cols.is_empty() {
             let mut update_candidates = RoaringBitmap::new();
 
             for &col in changed_cols {
@@ -211,13 +206,19 @@ impl<I: IdTypes> TablePartition<I> {
                 }
             }
 
-            // Intersect with candidates so far
             if update_candidates.is_empty() {
                 // No predicates depend on changed columns
-                return candidates;
+                return RoaringBitmap::new();
             }
-            candidates &= &update_candidates;
-        }
+            Some(update_candidates)
+        } else {
+            None
+        };
+
+        let mut candidates = RoaringBitmap::new();
+
+        // Always include fallback (unindexable predicates)
+        candidates |= &snapshot.indexes.fallback;
 
         // Query indexes based on row values
         for (col_idx, cell) in row.cells.iter().enumerate() {
@@ -245,6 +246,11 @@ impl<I: IdTypes> TablePartition<I> {
                     candidates |= bitmap;
                 }
             }
+        }
+
+        // UPDATE optimization: only predicates depending on changed columns.
+        if let Some(update_candidates) = update_filter {
+            candidates &= &update_candidates;
         }
 
         candidates
@@ -514,5 +520,53 @@ mod tests {
 
         // Should include the predicate because column 1 is NULL
         assert!(candidates.contains(pred_id.as_u32()));
+    }
+
+    #[test]
+    fn test_update_no_dependency_overlap_returns_empty_without_fallback() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // Predicate depends on column 1 and is indexable (no fallback).
+        let pred = make_predicate(0, 0xAAAA);
+        partition.add_predicate(pred, vec![IndexableAtom::Equality {
+            column_id: 1,
+            value: IndexableCell::Int(100),
+        }]);
+
+        let row = make_row(vec![Cell::Int(1), Cell::Int(100)]);
+
+        // UPDATE changed column 0 only; no dependency overlap.
+        let candidates = partition.select_candidates(&row, EventKind::Update, &[0]);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_update_dependency_overlap_keeps_candidates() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // Predicate that depends on changed column 0.
+        let mut pred_changed = make_predicate(0, 0xBBBB);
+        pred_changed.dependency_columns = Arc::from([0u16]);
+        let pred_changed_id = partition.add_predicate(pred_changed, vec![IndexableAtom::Equality {
+            column_id: 0,
+            value: IndexableCell::Int(1),
+        }]);
+
+        // Predicate that depends on unchanged column 1.
+        let pred_unchanged = make_predicate(1, 0xCCCC);
+        let pred_unchanged_id = partition.add_predicate(pred_unchanged, vec![IndexableAtom::Equality {
+            column_id: 1,
+            value: IndexableCell::Int(100),
+        }]);
+
+        let row = make_row(vec![Cell::Int(1), Cell::Int(100)]);
+
+        // UPDATE changed column 0 only; only pred_changed should be a candidate.
+        let candidates = partition.select_candidates(&row, EventKind::Update, &[0]);
+        assert!(candidates.contains(pred_changed_id.as_u32()));
+        assert!(
+            !candidates.contains(pred_unchanged_id.as_u32()),
+            "predicates with no changed-column overlap must be excluded on UPDATE"
+        );
     }
 }

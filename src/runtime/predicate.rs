@@ -113,12 +113,14 @@ impl<I: IdTypes> PredicateStore<I> {
 
     /// Add new predicate
     ///
-    /// Returns PredicateId. Caller must also update hash_index.
-    pub fn add_predicate(&mut self, predicate: Predicate) -> PredicateId {
-        let id = predicate.id;
+    /// Returns allocated `PredicateId` from slab insertion.
+    pub fn add_predicate(&mut self, mut predicate: Predicate) -> PredicateId {
+        let entry = self.predicates.vacant_entry();
+        let id = PredicateId::from_slab_index(entry.key());
         let hash = predicate.hash;
+        predicate.id = id;
 
-        self.predicates.insert(predicate);
+        entry.insert(predicate);
         self.hash_index.insert(hash, id);
 
         id
@@ -370,5 +372,25 @@ mod tests {
     fn test_predicate_store_default() {
         let store = PredicateStore::<DefaultIds>::default();
         assert!(store.predicates.is_empty());
+    }
+
+    #[test]
+    fn test_predicate_store_rejects_or_normalizes_mismatched_predicate_id() {
+        let mut store = PredicateStore::<DefaultIds>::new();
+
+        // Intentionally provide an ID that does not match the first free slab slot.
+        let pred = make_predicate(99, 0xBEEF, 1);
+        let returned_id = store.add_predicate(pred);
+
+        // Returned ID must point to a real predicate.
+        let stored = store.get_predicate(returned_id)
+            .expect("returned ID should resolve to stored predicate");
+        assert_eq!(stored.hash, 0xBEEF);
+
+        // Hash index must resolve to the same valid predicate ID.
+        let by_hash = store.find_by_hash(0xBEEF)
+            .expect("hash index should contain inserted predicate");
+        assert_eq!(by_hash, returned_id);
+        assert!(store.get_predicate(by_hash).is_some());
     }
 }

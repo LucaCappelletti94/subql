@@ -141,12 +141,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             (existing, false)
         } else {
             // Create new predicate
-            let pred_id = PredicateId::from_slab_index(
-                snapshot.predicates.predicates.len()
-            );
-
             let pred = Predicate {
-                id: pred_id,
+                // Placeholder; store allocates the authoritative ID.
+                id: PredicateId::from_slab_index(0),
                 hash,
                 normalized_sql: normalized.clone().into(),
                 bytecode: Arc::new(bytecode.clone()),
@@ -159,7 +156,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
 
             // Add predicate to partition
-            partition.add_predicate(pred, atoms);
+            let pred_id = partition.add_predicate(pred, atoms);
 
             (pred_id, true)
         };
@@ -195,18 +192,28 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///
     /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
     pub fn unregister_subscription(&mut self, subscription_id: I::SubscriptionId) -> bool {
+        self.unregister_subscription_internal(subscription_id).is_some()
+    }
+
+    /// Internal unregister helper.
+    ///
+    /// Returns `Some(predicate_removed)` if subscription existed, else `None`.
+    fn unregister_subscription_internal(
+        &mut self,
+        subscription_id: I::SubscriptionId,
+    ) -> Option<bool> {
         // Find the binding across all partitions
         for (_table_id, partition) in &mut self.partitions {
             let snapshot = partition.load_snapshot();
 
             if snapshot.predicates.bindings.contains_key(&subscription_id) {
                 // Remove binding and decrement refcount
-                partition.remove_binding(subscription_id);
-                return true;
+                let predicate_removed = partition.remove_binding(subscription_id);
+                return Some(predicate_removed);
             }
         }
 
-        false
+        None
     }
 
     /// Dispatch event to interested users
@@ -219,6 +226,25 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let user_dict = self.user_dictionaries.get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
+        // Validate selected row image arity against schema catalog.
+        let row = match event.kind {
+            crate::EventKind::Insert | crate::EventKind::Update => event.new_row.as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage("INSERT/UPDATE requires new_row"))?,
+            crate::EventKind::Delete => event.old_row.as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage("DELETE requires old_row"))?,
+        };
+
+        if let Some(expected) = self.catalog.table_arity(event.table_id) {
+            let got = row.len();
+            if got != expected {
+                return Err(DispatchError::InvalidRowArity {
+                    table_id: event.table_id,
+                    expected,
+                    got,
+                });
+            }
+        }
+
         // Dispatch
         dispatch_users(event, partition, user_dict, &mut self.vm)
     }
@@ -226,7 +252,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// Unregister all subscriptions for a session
     pub fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport {
         let mut removed_bindings = 0;
-        let removed_predicates = 0;
+        let mut removed_predicates = 0;
         let removed_users = 0;
 
         // Collect subscription IDs to remove
@@ -243,7 +269,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         // Remove subscriptions
         for sub_id in to_remove {
-            self.unregister_subscription(sub_id);
+            if self.unregister_subscription_internal(sub_id) == Some(true) {
+                removed_predicates += 1;
+            }
         }
 
         PruneReport {
@@ -393,12 +421,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
                     .map_err(|e| StorageError::Codec(format!("Bytecode deserialize error: {e}")))?;
 
-                // Create predicate
-                let snapshot = partition.load_snapshot();
-                let pred_id = PredicateId::from_slab_index(snapshot.predicates.predicates.len());
-
                 let pred = Predicate {
-                    id: pred_id,
+                    // Placeholder; store allocates the authoritative ID.
+                    id: PredicateId::from_slab_index(0),
                     hash: pred_data.hash,
                     normalized_sql: pred_data.normalized_sql.clone().into(),
                     bytecode: Arc::new(bytecode.clone()),
@@ -411,7 +436,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
 
                 // Add predicate to partition
-                partition.add_predicate(pred, atoms);
+                let pred_id = partition.add_predicate(pred, atoms);
 
                 hash_to_pred_id.insert(pred_data.hash, pred_id);
                 pred_id
@@ -570,11 +595,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
                     .map_err(|e| MergeError::BuildFailed(format!("Bytecode deserialize error: {e}")))?;
 
-                let snapshot = partition.load_snapshot();
-                let pred_id = PredicateId::from_slab_index(snapshot.predicates.predicates.len());
-
                 let pred = Predicate {
-                    id: pred_id,
+                    // Placeholder; store allocates the authoritative ID.
+                    id: PredicateId::from_slab_index(0),
                     hash: pred_data.hash,
                     normalized_sql: pred_data.normalized_sql.clone().into(),
                     bytecode: Arc::new(bytecode.clone()),
@@ -584,7 +607,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 };
 
                 let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
-                partition.add_predicate(pred, atoms);
+                let pred_id = partition.add_predicate(pred, atoms);
 
                 hash_to_pred_id.insert(pred_data.hash, pred_id);
                 pred_id
@@ -788,6 +811,63 @@ mod tests {
         let partition = engine.partitions.get(&1).unwrap();
         let snapshot = partition.load_snapshot();
         assert!(!snapshot.predicates.bindings.contains_key(&100));
+    }
+
+    #[test]
+    fn test_register_after_unsubscribe_does_not_break_hash_lookup_or_dispatch() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Sub 1 -> predicate A
+        engine.register(SubscriptionSpec {
+            subscription_id: 1,
+            user_id: 101,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+            updated_at_unix_ms: 1,
+        }).unwrap();
+
+        // Sub 2 -> predicate B (kept alive while A is removed)
+        engine.register(SubscriptionSpec {
+            subscription_id: 2,
+            user_id: 202,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount < 0".to_string(),
+            updated_at_unix_ms: 2,
+        }).unwrap();
+
+        // Remove A to create a slab hole.
+        assert!(engine.unregister_subscription(1));
+
+        // Sub 3 -> predicate C should be independently dispatchable.
+        engine.register(SubscriptionSpec {
+            subscription_id: 3,
+            user_id: 303,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount = 7".to_string(),
+            updated_at_unix_ms: 3,
+        }).unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(7)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([
+                    Cell::Int(7),          // id
+                    Cell::Int(7),          // amount
+                    Cell::String("ok".into()),
+                ]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        assert!(users.contains(&303), "newly registered predicate should dispatch after hole reuse");
     }
 
     #[test]
@@ -1152,6 +1232,113 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_insert_invalid_row_arity() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine.register(SubscriptionSpec {
+            subscription_id: 31,
+            user_id: 31,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+            updated_at_unix_ms: 31,
+        }).unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                // orders table arity in test catalog is 3
+                cells: Arc::from([Cell::Int(1), Cell::Int(5)]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let result = engine.users(&event);
+        assert!(matches!(
+            result,
+            Err(DispatchError::InvalidRowArity { table_id: 1, expected: 3, got: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_dispatch_update_invalid_row_arity() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine.register(SubscriptionSpec {
+            subscription_id: 32,
+            user_id: 32,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+            updated_at_unix_ms: 32,
+        }).unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(2), Cell::String("old".into())]),
+            }),
+            new_row: Some(RowImage {
+                // Invalid arity for UPDATE selected row image (new_row)
+                cells: Arc::from([Cell::Int(1), Cell::Int(5)]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let result = engine.users(&event);
+        assert!(matches!(
+            result,
+            Err(DispatchError::InvalidRowArity { table_id: 1, expected: 3, got: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_dispatch_delete_invalid_row_arity() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine.register(SubscriptionSpec {
+            subscription_id: 33,
+            user_id: 33,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+            updated_at_unix_ms: 33,
+        }).unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Delete,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                // Invalid arity for DELETE selected row image (old_row)
+                cells: Arc::from([Cell::Int(1), Cell::Int(5)]),
+            }),
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let result = engine.users(&event);
+        assert!(matches!(
+            result,
+            Err(DispatchError::InvalidRowArity { table_id: 1, expected: 3, got: 2 })
+        ));
+    }
+
+    #[test]
     fn test_storage_rotation_triggers_snapshot() {
         use tempfile::TempDir;
 
@@ -1202,6 +1389,63 @@ mod tests {
         // Unregister session with no subscriptions
         let report = engine.unregister_session(999);
         assert_eq!(report.removed_bindings, 0);
+    }
+
+    #[test]
+    fn test_unregister_session_reports_removed_predicates_when_last_binding_removed() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine.register(SubscriptionSpec {
+            subscription_id: 10,
+            user_id: 1,
+            session_id: Some(42),
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+            updated_at_unix_ms: 10,
+        }).unwrap();
+
+        engine.register(SubscriptionSpec {
+            subscription_id: 11,
+            user_id: 1,
+            session_id: Some(42),
+            sql: "SELECT * FROM orders WHERE amount < 10".to_string(),
+            updated_at_unix_ms: 11,
+        }).unwrap();
+
+        let report = engine.unregister_session(42);
+        assert_eq!(report.removed_bindings, 2);
+        assert_eq!(
+            report.removed_predicates, 2,
+            "both predicates should be removed when their last bindings are session-bound"
+        );
+    }
+
+    #[test]
+    fn test_unregister_session_does_not_count_predicate_removed_when_other_bindings_remain() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Session-bound binding
+        engine.register(SubscriptionSpec {
+            subscription_id: 20,
+            user_id: 1,
+            session_id: Some(43),
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+            updated_at_unix_ms: 20,
+        }).unwrap();
+
+        // Durable binding keeps predicate alive
+        engine.register(SubscriptionSpec {
+            subscription_id: 21,
+            user_id: 2,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+            updated_at_unix_ms: 21,
+        }).unwrap();
+
+        let report = engine.unregister_session(43);
+        assert_eq!(report.removed_bindings, 1);
+        assert_eq!(report.removed_predicates, 0);
     }
 
     #[test]
