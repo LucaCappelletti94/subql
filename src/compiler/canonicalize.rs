@@ -8,7 +8,8 @@ use seahash::SeaHasher;
 use crate::RegisterError;
 
 /// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
-const MAX_EXPR_DEPTH: usize = 512;
+/// 128 is sufficient for any real-world SQL; lower values reduce stack usage.
+const MAX_EXPR_DEPTH: usize = 128;
 
 /// Maximum SQL input length (defense-in-depth against pathological inputs).
 const MAX_SQL_LEN: usize = 8192;
