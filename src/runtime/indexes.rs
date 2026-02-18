@@ -137,8 +137,6 @@ impl HybridIndexes {
         }
 
         // Add to appropriate indexes
-        let mut indexed = false;
-
         for atom in atoms {
             match atom {
                 IndexableAtom::Equality { column_id, value } => {
@@ -150,7 +148,6 @@ impl HybridIndexes {
                         .entry(key)
                         .or_default()
                         .insert(pred_id_u32);
-                    indexed = true;
                 }
 
                 IndexableAtom::Range { column_id, lower, upper } => {
@@ -162,7 +159,6 @@ impl HybridIndexes {
                             lower: *lower,
                             upper: *upper,
                         });
-                    indexed = true;
                 }
 
                 IndexableAtom::Null { column_id, kind } => {
@@ -170,19 +166,12 @@ impl HybridIndexes {
                         .entry((*column_id, *kind))
                         .or_default()
                         .insert(pred_id_u32);
-                    indexed = true;
                 }
 
                 IndexableAtom::Fallback => {
                     self.fallback.insert(pred_id_u32);
-                    indexed = true;
                 }
             }
-        }
-
-        // If nothing indexed, add to fallback
-        if !indexed {
-            self.fallback.insert(pred_id_u32);
         }
     }
 
@@ -249,12 +238,149 @@ impl Default for HybridIndexes {
 /// Analyzes bytecode to identify simple conditions that can be indexed.
 /// Returns empty vec if predicate is too complex to index efficiently.
 pub fn extract_indexable_atoms(
-    _bytecode: &crate::compiler::BytecodeProgram,
+    bytecode: &crate::compiler::BytecodeProgram,
     _deps: &[ColumnId],
 ) -> Vec<IndexableAtom> {
-    // TODO: Full atom extraction in Phase 2
-    // For now, return Fallback for all predicates
-    vec![IndexableAtom::Fallback]
+    use crate::compiler::Instruction;
+
+    let mut atoms = Vec::new();
+    let instructions = &bytecode.instructions;
+
+    // Pattern matching on instruction sequences
+    let mut i = 0;
+    while i < instructions.len() {
+        // Check for 4-instruction patterns first (BETWEEN)
+        if let Some([Instruction::LoadColumn(col), Instruction::PushLiteral(lower), Instruction::PushLiteral(upper), Instruction::Between])
+            = instructions.get(i..i.saturating_add(4))
+        {
+            if let (Cell::Int(lower_val), Cell::Int(upper_val)) = (lower, upper) {
+                atoms.push(IndexableAtom::Range {
+                    column_id: *col,
+                    lower: Some(*lower_val),
+                    upper: Some(*upper_val),
+                });
+            }
+            i += 4;
+            continue;
+        }
+
+        // Check for 3-instruction patterns
+        match instructions.get(i..i.saturating_add(3)) {
+            // Pattern 1: LoadColumn, PushLiteral, Equal → Equality index
+            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::Equal]) => {
+                if let Some(indexable) = IndexableCell::from_cell(val) {
+                    atoms.push(IndexableAtom::Equality {
+                        column_id: *col,
+                        value: indexable,
+                    });
+                }
+                i += 3;
+            }
+
+            // Pattern 2: LoadColumn, PushLiteral, NotEqual → Skip (not easily indexable)
+            Some([Instruction::LoadColumn(_), Instruction::PushLiteral(_), Instruction::NotEqual]) => {
+                i += 3;
+            }
+
+            // Pattern 3: LoadColumn, PushLiteral, GreaterThan → Range [val+1, ∞)
+            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThan]) => {
+                if let Cell::Int(int_val) = val {
+                    atoms.push(IndexableAtom::Range {
+                        column_id: *col,
+                        lower: Some(int_val.saturating_add(1)),
+                        upper: None,
+                    });
+                }
+                i += 3;
+            }
+
+            // Pattern 4: LoadColumn, PushLiteral, GreaterThanOrEqual → Range [val, ∞)
+            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThanOrEqual]) => {
+                if let Cell::Int(int_val) = val {
+                    atoms.push(IndexableAtom::Range {
+                        column_id: *col,
+                        lower: Some(*int_val),
+                        upper: None,
+                    });
+                }
+                i += 3;
+            }
+
+            // Pattern 5: LoadColumn, PushLiteral, LessThan → Range (-∞, val-1]
+            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThan]) => {
+                if let Cell::Int(int_val) = val {
+                    atoms.push(IndexableAtom::Range {
+                        column_id: *col,
+                        lower: None,
+                        upper: Some(int_val.saturating_sub(1)),
+                    });
+                }
+                i += 3;
+            }
+
+            // Pattern 6: LoadColumn, PushLiteral, LessThanOrEqual → Range (-∞, val]
+            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThanOrEqual]) => {
+                if let Cell::Int(int_val) = val {
+                    atoms.push(IndexableAtom::Range {
+                        column_id: *col,
+                        lower: None,
+                        upper: Some(*int_val),
+                    });
+                }
+                i += 3;
+            }
+
+            _ => {
+                // Check for other patterns
+                match instructions.get(i) {
+                    // Pattern 7: LoadColumn, IsNull → NULL check
+                    Some(Instruction::LoadColumn(col)) => {
+                        if matches!(instructions.get(i + 1), Some(Instruction::IsNull)) {
+                            atoms.push(IndexableAtom::Null {
+                                column_id: *col,
+                                kind: NullKind::IsNull,
+                            });
+                            i += 2;
+                        } else if matches!(instructions.get(i + 1), Some(Instruction::IsNotNull)) {
+                            // Pattern 8: LoadColumn, IsNotNull → NULL check
+                            atoms.push(IndexableAtom::Null {
+                                column_id: *col,
+                                kind: NullKind::IsNotNull,
+                            });
+                            i += 2;
+                        } else if matches!(instructions.get(i + 1), Some(Instruction::In(_))) {
+                            // Pattern 9: LoadColumn, In([...]) → Multiple equality atoms
+                            if let Some(Instruction::In(values)) = instructions.get(i + 1) {
+                                for val in values {
+                                    if let Some(indexable) = IndexableCell::from_cell(val) {
+                                        atoms.push(IndexableAtom::Equality {
+                                            column_id: *col,
+                                            value: indexable,
+                                        });
+                                    }
+                                }
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+
+                    // Pattern 10: LoadColumn, PushLiteral, PushLiteral, Between → Range [lower, upper]
+                    Some(_) => i += 1,
+
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // If no indexable atoms found, return Fallback
+    if atoms.is_empty() {
+        vec![IndexableAtom::Fallback]
+    } else {
+        atoms
+    }
 }
 
 #[cfg(test)]
@@ -371,5 +497,525 @@ mod tests {
         indexes.add_predicate(pred_id, &[], &[]);
 
         assert!(indexes.fallback.contains(pred_id.as_u32()));
+    }
+
+    #[test]
+    fn test_extract_equality_pattern() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: age = 42
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::Equal,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(
+            atoms[0],
+            IndexableAtom::Equality {
+                column_id: 1,
+                value: IndexableCell::Int(42)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_range_patterns() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: age > 18
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Int(18)),
+            Instruction::GreaterThan,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(
+            atoms[0],
+            IndexableAtom::Range {
+                column_id: 1,
+                lower: Some(19),
+                upper: None
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_between_pattern() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: age BETWEEN 18 AND 65
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Int(18)),
+            Instruction::PushLiteral(Cell::Int(65)),
+            Instruction::Between,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(
+            atoms[0],
+            IndexableAtom::Range {
+                column_id: 1,
+                lower: Some(18),
+                upper: Some(65)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_null_patterns() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: status IS NULL
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(2),
+            Instruction::IsNull,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[2]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(
+            atoms[0],
+            IndexableAtom::Null {
+                column_id: 2,
+                kind: NullKind::IsNull
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_in_pattern() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: status IN ('active', 'pending')
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(2),
+            Instruction::In(vec![
+                Cell::String("active".into()),
+                Cell::String("pending".into()),
+            ]),
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[2]);
+
+        assert_eq!(atoms.len(), 2);
+        assert!(atoms.iter().any(|a| matches!(
+            a,
+            IndexableAtom::Equality {
+                column_id: 2,
+                value: IndexableCell::String(s)
+            } if s.as_ref() == "active"
+        )));
+        assert!(atoms.iter().any(|a| matches!(
+            a,
+            IndexableAtom::Equality {
+                column_id: 2,
+                value: IndexableCell::String(s)
+            } if s.as_ref() == "pending"
+        )));
+    }
+
+    #[test]
+    fn test_extract_complex_returns_fallback() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: name LIKE '%test%' (complex, not easily indexable)
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::PushLiteral(Cell::String("%test%".into())),
+            Instruction::Like { case_sensitive: true },
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[0]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(atoms[0], IndexableAtom::Fallback));
+    }
+
+    // ========================================================================
+    // Phase 3: Push to 95% Coverage - Indexes Completion
+    // ========================================================================
+
+    #[test]
+    fn test_indexable_cell_from_float() {
+        let float_cell = Cell::Float(3.14);
+        let indexable = IndexableCell::from_cell(&float_cell);
+        assert!(indexable.is_some());
+        assert!(matches!(indexable, Some(IndexableCell::Float(_))));
+    }
+
+    #[test]
+    fn test_indexable_cell_from_string() {
+        let string_cell = Cell::String("test".into());
+        let indexable = IndexableCell::from_cell(&string_cell);
+        assert_eq!(indexable, Some(IndexableCell::String("test".into())));
+    }
+
+    #[test]
+    fn test_hybrid_indexes_default() {
+        let indexes = HybridIndexes::default();
+        assert!(indexes.equality.is_empty());
+        assert!(indexes.fallback.is_empty());
+    }
+
+    #[test]
+    fn test_range_query_with_float() {
+        let mut indexes = HybridIndexes::new();
+
+        let pred_id = PredicateId::from_slab_index(0);
+        let atoms = vec![IndexableAtom::Range {
+            column_id: 3,
+            lower: Some(10),
+            upper: Some(20),
+        }];
+
+        indexes.add_predicate(pred_id, &atoms, &[3]);
+
+        // Query with float value (gets converted to int for range)
+        let result = indexes.query_range(3, &IndexableCell::Float(15.5f64.to_bits()));
+        assert!(result.contains(pred_id.as_u32()));
+    }
+
+    #[test]
+    fn test_range_query_with_string() {
+        let mut indexes = HybridIndexes::new();
+
+        let pred_id = PredicateId::from_slab_index(0);
+        let atoms = vec![IndexableAtom::Range {
+            column_id: 3,
+            lower: Some(10),
+            upper: Some(20),
+        }];
+
+        indexes.add_predicate(pred_id, &atoms, &[3]);
+
+        // Query with string value (doesn't match range, returns empty)
+        let result = indexes.query_range(3, &IndexableCell::String("test".into()));
+        assert!(!result.contains(pred_id.as_u32()));
+    }
+
+    #[test]
+    fn test_range_unbounded_lower() {
+        let mut indexes = HybridIndexes::new();
+
+        let pred_id = PredicateId::from_slab_index(0);
+        let atoms = vec![IndexableAtom::Range {
+            column_id: 3,
+            lower: None,  // Unbounded lower
+            upper: Some(20),
+        }];
+
+        indexes.add_predicate(pred_id, &atoms, &[3]);
+
+        // Value below upper bound
+        let result = indexes.query_range(3, &IndexableCell::Int(10));
+        assert!(result.contains(pred_id.as_u32()));
+
+        // Value above upper bound
+        let result = indexes.query_range(3, &IndexableCell::Int(25));
+        assert!(!result.contains(pred_id.as_u32()));
+    }
+
+    #[test]
+    fn test_range_unbounded_upper() {
+        let mut indexes = HybridIndexes::new();
+
+        let pred_id = PredicateId::from_slab_index(0);
+        let atoms = vec![IndexableAtom::Range {
+            column_id: 3,
+            lower: Some(10),
+            upper: None,  // Unbounded upper
+        }];
+
+        indexes.add_predicate(pred_id, &atoms, &[3]);
+
+        // Value above lower bound
+        let result = indexes.query_range(3, &IndexableCell::Int(15));
+        assert!(result.contains(pred_id.as_u32()));
+
+        // Value below lower bound
+        let result = indexes.query_range(3, &IndexableCell::Int(5));
+        assert!(!result.contains(pred_id.as_u32()));
+    }
+
+    #[test]
+    fn test_range_fully_unbounded() {
+        let mut indexes = HybridIndexes::new();
+
+        let pred_id = PredicateId::from_slab_index(0);
+        let atoms = vec![IndexableAtom::Range {
+            column_id: 3,
+            lower: None,
+            upper: None,  // Fully unbounded
+        }];
+
+        indexes.add_predicate(pred_id, &atoms, &[3]);
+
+        // Any value should match
+        let result = indexes.query_range(3, &IndexableCell::Int(100));
+        assert!(result.contains(pred_id.as_u32()));
+
+        let result = indexes.query_range(3, &IndexableCell::Int(-100));
+        assert!(result.contains(pred_id.as_u32()));
+    }
+
+    #[test]
+    fn test_equality_query_different_types() {
+        let mut indexes = HybridIndexes::new();
+
+        let pred_id = PredicateId::from_slab_index(0);
+
+        // Add equality for Bool
+        indexes.add_predicate(pred_id, &[IndexableAtom::Equality {
+            column_id: 1,
+            value: IndexableCell::Bool(true),
+        }], &[1]);
+
+        // Add equality for String
+        let pred_id2 = PredicateId::from_slab_index(1);
+        indexes.add_predicate(pred_id2, &[IndexableAtom::Equality {
+            column_id: 2,
+            value: IndexableCell::String("test".into()),
+        }], &[2]);
+
+        // Query bool
+        let result = indexes.query_equality(1, &IndexableCell::Bool(true));
+        assert!(result.is_some());
+
+        // Query string
+        let result = indexes.query_equality(2, &IndexableCell::String("test".into()));
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_null_check_is_not_null() {
+        let mut indexes = HybridIndexes::new();
+
+        let pred_id = PredicateId::from_slab_index(0);
+        let atoms = vec![IndexableAtom::Null {
+            column_id: 5,
+            kind: NullKind::IsNotNull,
+        }];
+
+        indexes.add_predicate(pred_id, &atoms, &[5]);
+
+        let bitmap = indexes.null_checks.get(&(5, NullKind::IsNotNull));
+        assert!(bitmap.is_some());
+        assert!(bitmap.unwrap().contains(pred_id.as_u32()));
+    }
+
+    // ========================================================================
+    // Push Coverage: Extract Indexable Atoms - All Patterns
+    // ========================================================================
+
+    #[test]
+    fn test_extract_not_equal_pattern() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: age != 42 (not indexable, skipped)
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::NotEqual,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        // NotEqual is not indexable, should fall back
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(atoms[0], IndexableAtom::Fallback));
+    }
+
+    #[test]
+    fn test_extract_greater_than_or_equal_pattern() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: age >= 18
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Int(18)),
+            Instruction::GreaterThanOrEqual,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(
+            atoms[0],
+            IndexableAtom::Range {
+                column_id: 1,
+                lower: Some(18),
+                upper: None
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_less_than_pattern() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: age < 30
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Int(30)),
+            Instruction::LessThan,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(
+            atoms[0],
+            IndexableAtom::Range {
+                column_id: 1,
+                lower: None,
+                upper: Some(29)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_less_than_or_equal_pattern() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: age <= 65
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Int(65)),
+            Instruction::LessThanOrEqual,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(
+            atoms[0],
+            IndexableAtom::Range {
+                column_id: 1,
+                lower: None,
+                upper: Some(65)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_is_not_null_pattern() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: status IS NOT NULL
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(2),
+            Instruction::IsNotNull,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[2]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(
+            atoms[0],
+            IndexableAtom::Null {
+                column_id: 2,
+                kind: NullKind::IsNotNull
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_gte_with_float_not_indexed() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: price >= 9.99 (Float - range only works with Int)
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Float(9.99)),
+            Instruction::GreaterThanOrEqual,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        // Float can't be range-indexed, falls back
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(atoms[0], IndexableAtom::Fallback));
+    }
+
+    #[test]
+    fn test_extract_lt_with_float_not_indexed() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: price < 100.0 (Float - range only works with Int)
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Float(100.0)),
+            Instruction::LessThan,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(atoms[0], IndexableAtom::Fallback));
+    }
+
+    #[test]
+    fn test_extract_lte_with_float_not_indexed() {
+        use crate::compiler::{BytecodeProgram, Instruction};
+
+        // Bytecode for: price <= 50.0 (Float - range only works with Int)
+        let bytecode = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(1),
+            Instruction::PushLiteral(Cell::Float(50.0)),
+            Instruction::LessThanOrEqual,
+        ]);
+
+        let atoms = extract_indexable_atoms(&bytecode, &[1]);
+
+        assert_eq!(atoms.len(), 1);
+        assert!(matches!(atoms[0], IndexableAtom::Fallback));
+    }
+
+    #[test]
+    fn test_finalize_ranges_sort_order() {
+        let mut indexes = HybridIndexes::new();
+
+        // Add multiple range entries with different lower bounds
+        let pred1 = PredicateId::from_slab_index(0);
+        let pred2 = PredicateId::from_slab_index(1);
+        let pred3 = PredicateId::from_slab_index(2);
+
+        // Unbounded lower (should come first after sort)
+        indexes.add_predicate(pred1, &[IndexableAtom::Range {
+            column_id: 1, lower: None, upper: Some(100),
+        }], &[1]);
+
+        // Bounded lower (should come last)
+        indexes.add_predicate(pred2, &[IndexableAtom::Range {
+            column_id: 1, lower: Some(50), upper: Some(200),
+        }], &[1]);
+
+        // Another unbounded lower (None,None case)
+        indexes.add_predicate(pred3, &[IndexableAtom::Range {
+            column_id: 1, lower: None, upper: None,
+        }], &[1]);
+
+        indexes.finalize_ranges();
+
+        // After sorting: unbounded (None) comes before bounded (Some)
+        let entries = indexes.range.get(&1).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        // First two entries should have None lower bounds
+        assert!(entries[0].lower.is_none());
+        assert!(entries[1].lower.is_none());
+        // Last should have Some lower bound
+        assert_eq!(entries[2].lower, Some(50));
     }
 }

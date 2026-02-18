@@ -50,6 +50,10 @@ mod errors;
 pub mod compiler;
 pub mod runtime;
 pub mod persistence;
+pub mod config;
+
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_helpers;
 
 // Version and metadata
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

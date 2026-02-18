@@ -238,6 +238,51 @@ impl Vm {
                     if matched { Tri::True } else { Tri::False }
                 ));
             }
+
+            // ================================================================
+            // Arithmetic Operations
+            // ================================================================
+
+            Instruction::Add => {
+                let b = self.pop_cell()?;
+                let a = self.pop_cell()?;
+                let result = arithmetic_add(a, b);
+                self.stack.push(StackValue::Cell(result));
+            }
+
+            Instruction::Subtract => {
+                let b = self.pop_cell()?;
+                let a = self.pop_cell()?;
+                let result = arithmetic_subtract(a, b);
+                self.stack.push(StackValue::Cell(result));
+            }
+
+            Instruction::Multiply => {
+                let b = self.pop_cell()?;
+                let a = self.pop_cell()?;
+                let result = arithmetic_multiply(a, b);
+                self.stack.push(StackValue::Cell(result));
+            }
+
+            Instruction::Divide => {
+                let b = self.pop_cell()?;
+                let a = self.pop_cell()?;
+                let result = arithmetic_divide(a, b);
+                self.stack.push(StackValue::Cell(result));
+            }
+
+            Instruction::Modulo => {
+                let b = self.pop_cell()?;
+                let a = self.pop_cell()?;
+                let result = arithmetic_modulo(a, b);
+                self.stack.push(StackValue::Cell(result));
+            }
+
+            Instruction::Negate => {
+                let a = self.pop_cell()?;
+                let result = arithmetic_negate(a);
+                self.stack.push(StackValue::Cell(result));
+            }
         }
 
         Ok(())
@@ -333,6 +378,27 @@ where
                 std::cmp::Ordering::Equal
             }
         }
+        // Mixed Int/Float comparisons - coerce to Float
+        (Cell::Int(x), Cell::Float(y)) => {
+            let x_float = *x as f64;
+            if x_float < *y {
+                std::cmp::Ordering::Less
+            } else if x_float > *y {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }
+        (Cell::Float(x), Cell::Int(y)) => {
+            let y_float = *y as f64;
+            if *x < y_float {
+                std::cmp::Ordering::Less
+            } else if *x > y_float {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }
         (Cell::String(x), Cell::String(y)) => x.cmp(y),
         _ => return Tri::Unknown, // Type mismatch
     };
@@ -357,6 +423,146 @@ fn simple_like(string: &str, pattern: &str) -> bool {
         string.starts_with(stripped)
     } else {
         string == pattern
+    }
+}
+
+// ============================================================================
+// Arithmetic Operations
+// ============================================================================
+
+/// Add two cells: a + b
+///
+/// Type coercion: Int + Int → Int, otherwise Float
+/// NULL propagation: NULL + anything → NULL
+fn arithmetic_add(a: Cell, b: Cell) -> Cell {
+    // NULL propagation
+    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
+        return Cell::Null;
+    }
+
+    match (a, b) {
+        (Cell::Int(x), Cell::Int(y)) => Cell::Int(x.saturating_add(y)),
+        (Cell::Int(x), Cell::Float(y)) => Cell::Float(x as f64 + y),
+        (Cell::Float(x), Cell::Int(y)) => Cell::Float(x + y as f64),
+        (Cell::Float(x), Cell::Float(y)) => Cell::Float(x + y),
+        _ => Cell::Null, // Type mismatch
+    }
+}
+
+/// Subtract two cells: a - b
+///
+/// Type coercion: Int - Int → Int, otherwise Float
+/// NULL propagation: NULL - anything → NULL
+fn arithmetic_subtract(a: Cell, b: Cell) -> Cell {
+    // NULL propagation
+    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
+        return Cell::Null;
+    }
+
+    match (a, b) {
+        (Cell::Int(x), Cell::Int(y)) => Cell::Int(x.saturating_sub(y)),
+        (Cell::Int(x), Cell::Float(y)) => Cell::Float(x as f64 - y),
+        (Cell::Float(x), Cell::Int(y)) => Cell::Float(x - y as f64),
+        (Cell::Float(x), Cell::Float(y)) => Cell::Float(x - y),
+        _ => Cell::Null, // Type mismatch
+    }
+}
+
+/// Multiply two cells: a * b
+///
+/// Type coercion: Int * Int → Int, otherwise Float
+/// NULL propagation: NULL * anything → NULL
+fn arithmetic_multiply(a: Cell, b: Cell) -> Cell {
+    // NULL propagation
+    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
+        return Cell::Null;
+    }
+
+    match (a, b) {
+        (Cell::Int(x), Cell::Int(y)) => Cell::Int(x.saturating_mul(y)),
+        (Cell::Int(x), Cell::Float(y)) => Cell::Float(x as f64 * y),
+        (Cell::Float(x), Cell::Int(y)) => Cell::Float(x * y as f64),
+        (Cell::Float(x), Cell::Float(y)) => Cell::Float(x * y),
+        _ => Cell::Null, // Type mismatch
+    }
+}
+
+/// Divide two cells: a / b
+///
+/// Always returns Float (SQL semantics)
+/// Division by zero → NULL
+/// NULL propagation: NULL / anything → NULL
+fn arithmetic_divide(a: Cell, b: Cell) -> Cell {
+    // NULL propagation
+    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
+        return Cell::Null;
+    }
+
+    let a_float = match a {
+        Cell::Int(x) => x as f64,
+        Cell::Float(x) => x,
+        _ => return Cell::Null, // Type mismatch
+    };
+
+    let b_float = match b {
+        Cell::Int(y) => y as f64,
+        Cell::Float(y) => y,
+        _ => return Cell::Null, // Type mismatch
+    };
+
+    // Division by zero → NULL
+    if b_float == 0.0 {
+        return Cell::Null;
+    }
+
+    Cell::Float(a_float / b_float)
+}
+
+/// Modulo two cells: a % b
+///
+/// Integer operation only (coerces to Int first)
+/// Modulo by zero → NULL
+/// NULL propagation: NULL % anything → NULL
+fn arithmetic_modulo(a: Cell, b: Cell) -> Cell {
+    // NULL propagation
+    if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
+        return Cell::Null;
+    }
+
+    let a_int = match a {
+        Cell::Int(x) => x,
+        Cell::Float(x) => x as i64,
+        _ => return Cell::Null, // Type mismatch
+    };
+
+    let b_int = match b {
+        Cell::Int(y) => y,
+        Cell::Float(y) => y as i64,
+        _ => return Cell::Null, // Type mismatch
+    };
+
+    // Modulo by zero → NULL
+    if b_int == 0 {
+        return Cell::Null;
+    }
+
+    Cell::Int(a_int % b_int)
+}
+
+/// Negate a cell: -a (unary minus)
+///
+/// Type preserved: Int → Int, Float → Float
+/// NULL propagation: -NULL → NULL
+fn arithmetic_negate(a: Cell) -> Cell {
+    // NULL propagation
+    if a.is_null() || a.is_missing() {
+        return Cell::Null;
+    }
+
+    match a {
+        Cell::Int(x) => Cell::Int(-x),
+        Cell::Float(x) => Cell::Float(-x),
+        _ => Cell::Null, // Type mismatch
     }
 }
 
@@ -496,5 +702,1264 @@ mod tests {
 
         let row = make_row(vec![Cell::Int(66)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_arithmetic_add() {
+        let mut vm = Vm::new();
+
+        // a + b > 100
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0), // a
+            Instruction::LoadColumn(1), // b
+            Instruction::Add,
+            Instruction::PushLiteral(Cell::Int(100)),
+            Instruction::GreaterThan,
+        ]);
+
+        // 60 + 50 = 110 > 100 ✓
+        let row = make_row(vec![Cell::Int(60), Cell::Int(50)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // 30 + 40 = 70 > 100 ✗
+        let row = make_row(vec![Cell::Int(30), Cell::Int(40)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+
+        // Int + Float = Float
+        let row = make_row(vec![Cell::Int(50), Cell::Float(60.5)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // NULL + anything = NULL → Unknown
+        let row = make_row(vec![Cell::Null, Cell::Int(50)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_arithmetic_subtract() {
+        let mut vm = Vm::new();
+
+        // end_date - start_date > 300
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0), // end_date
+            Instruction::LoadColumn(1), // start_date
+            Instruction::Subtract,
+            Instruction::PushLiteral(Cell::Int(300)),
+            Instruction::GreaterThan,
+        ]);
+
+        // 500 - 100 = 400 > 300 ✓
+        let row = make_row(vec![Cell::Int(500), Cell::Int(100)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // 400 - 200 = 200 > 300 ✗
+        let row = make_row(vec![Cell::Int(400), Cell::Int(200)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_arithmetic_multiply() {
+        let mut vm = Vm::new();
+
+        // price * quantity > 1000
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0), // price
+            Instruction::LoadColumn(1), // quantity
+            Instruction::Multiply,
+            Instruction::PushLiteral(Cell::Int(1000)),
+            Instruction::GreaterThan,
+        ]);
+
+        // 50 * 30 = 1500 > 1000 ✓
+        let row = make_row(vec![Cell::Int(50), Cell::Int(30)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // 10 * 50 = 500 > 1000 ✗
+        let row = make_row(vec![Cell::Int(10), Cell::Int(50)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_arithmetic_divide() {
+        let mut vm = Vm::new();
+
+        // total / count > 100.0
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0), // total
+            Instruction::LoadColumn(1), // count
+            Instruction::Divide,
+            Instruction::PushLiteral(Cell::Float(100.0)),
+            Instruction::GreaterThan,
+        ]);
+
+        // 500 / 4 = 125.0 > 100.0 ✓
+        let row = make_row(vec![Cell::Int(500), Cell::Int(4)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // 300 / 5 = 60.0 > 100.0 ✗
+        let row = make_row(vec![Cell::Int(300), Cell::Int(5)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+
+        // Division by zero = NULL → Unknown
+        let row = make_row(vec![Cell::Int(500), Cell::Int(0)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_arithmetic_modulo() {
+        let mut vm = Vm::new();
+
+        // id % 10 = 0 (check if divisible by 10)
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0), // id
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::Modulo,
+            Instruction::PushLiteral(Cell::Int(0)),
+            Instruction::Equal,
+        ]);
+
+        // 100 % 10 = 0 ✓
+        let row = make_row(vec![Cell::Int(100)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // 105 % 10 = 5 ≠ 0 ✗
+        let row = make_row(vec![Cell::Int(105)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+
+        // Modulo by zero = NULL → Unknown
+        let row = make_row(vec![Cell::Int(100)]);
+        let program_div_zero = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::PushLiteral(Cell::Int(0)),
+            Instruction::Modulo,
+            Instruction::PushLiteral(Cell::Int(0)),
+            Instruction::Equal,
+        ]);
+        assert_eq!(vm.eval(&program_div_zero, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_arithmetic_negate() {
+        let mut vm = Vm::new();
+
+        // elevation BETWEEN -50 AND 50 (using negate for -50)
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0), // elevation
+            Instruction::PushLiteral(Cell::Int(50)),
+            Instruction::Negate,  // -50
+            Instruction::PushLiteral(Cell::Int(50)),
+            Instruction::Between,
+        ]);
+
+        // elevation = 25 is in [-50, 50] ✓
+        let row = make_row(vec![Cell::Int(25)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // elevation = -30 is in [-50, 50] ✓
+        let row = make_row(vec![Cell::Int(-30)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // elevation = 75 is NOT in [-50, 50] ✗
+        let row = make_row(vec![Cell::Int(75)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+
+        // -NULL = NULL → Unknown
+        let program_null = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::Negate,
+            Instruction::PushLiteral(Cell::Int(0)),
+            Instruction::Equal,
+        ]);
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program_null, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_arithmetic_complex_expression() {
+        let mut vm = Vm::new();
+
+        // (products_this_year - products_last_year) > 0.5 * products_last_year
+        // Simplified: (a - b) > 0.5 * b
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0), // products_this_year
+            Instruction::LoadColumn(1), // products_last_year
+            Instruction::Subtract,      // a - b
+            Instruction::PushLiteral(Cell::Float(0.5)),
+            Instruction::LoadColumn(1), // products_last_year
+            Instruction::Multiply,      // 0.5 * b
+            Instruction::GreaterThan,   // (a - b) > (0.5 * b)
+        ]);
+
+        // 150 - 100 = 50 > 0.5 * 100 = 50 ✗ (equal, not greater)
+        let row = make_row(vec![Cell::Int(150), Cell::Int(100)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+
+        // 160 - 100 = 60 > 0.5 * 100 = 50 ✓
+        let row = make_row(vec![Cell::Int(160), Cell::Int(100)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    // Error path and edge case tests for comprehensive coverage
+    #[test]
+    fn test_stack_underflow() {
+        let mut vm = Vm::new();
+
+        // Empty program
+        let program = BytecodeProgram::new(vec![]);
+        let row = make_row(vec![]);
+        assert!(matches!(vm.eval(&program, &row), Err(VmError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_malformed_stack_leaves_cell_not_tri() {
+        let mut vm = Vm::new();
+
+        // Program leaves Cell on stack instead of Tri
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(42)),
+        ]);
+        let row = make_row(vec![]);
+
+        // Should return Unknown (not crash)
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_malformed_stack_not_empty() {
+        let mut vm = Vm::new();
+
+        // Program leaves extra values on stack
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::Equal,
+            Instruction::PushLiteral(Cell::Int(3)), // Extra value
+        ]);
+        let row = make_row(vec![]);
+
+        // Should return Unknown (not crash)
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_load_column_out_of_bounds() {
+        let mut vm = Vm::new();
+
+        // Load column beyond row bounds
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(999), // Out of bounds
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![Cell::Int(1)]);
+
+        // Missing column → IsNull returns False (not NULL, but Missing)
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_arithmetic_type_mismatch() {
+        let mut vm = Vm::new();
+
+        // Try to add string + int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("test".into())),
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::Add,
+            Instruction::PushLiteral(Cell::Int(0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+
+        // Type mismatch → NULL → Unknown
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_arithmetic_with_missing() {
+        let mut vm = Vm::new();
+
+        // Missing + Int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Missing),
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::Add,
+            Instruction::PushLiteral(Cell::Int(0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+
+        // Missing → NULL → Unknown
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_comparison_type_mismatch() {
+        let mut vm = Vm::new();
+
+        // Compare string with int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("test".into())),
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::GreaterThan,
+        ]);
+
+        let row = make_row(vec![]);
+
+        // Type mismatch → Unknown
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_like_with_non_string() {
+        let mut vm = Vm::new();
+
+        // LIKE with int (type mismatch)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::PushLiteral(Cell::String("%test%".into())),
+            Instruction::Like { case_sensitive: true },
+        ]);
+
+        let row = make_row(vec![]);
+
+        // Type mismatch → Unknown
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_like_pattern_matching() {
+        let mut vm = Vm::new();
+
+        // Test LIKE patterns (simple implementation - only prefix/suffix/contains)
+        let test_cases = vec![
+            ("hello", "%", true),           // Match all
+            ("hello", "hello", true),       // Exact match
+            ("hello", "hell%", true),       // Prefix
+            ("hello", "%ello", true),       // Suffix
+            ("hello", "%ell%", true),       // Contains
+            ("hello", "goodbye", false),    // No match
+            ("hello", "hell", false),       // Partial prefix (no %)
+        ];
+
+        for (string, pattern, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(Cell::String(string.into())),
+                Instruction::PushLiteral(Cell::String(pattern.into())),
+                Instruction::Like { case_sensitive: true },
+            ]);
+
+            let row = make_row(vec![]);
+            let result = vm.eval(&program, &row).unwrap();
+
+            if expected {
+                assert_eq!(result, Tri::True, "Pattern '{}' should match '{}'", pattern, string);
+            } else {
+                assert_eq!(result, Tri::False, "Pattern '{}' should not match '{}'", pattern, string);
+            }
+        }
+    }
+
+    #[test]
+    fn test_like_case_insensitive() {
+        let mut vm = Vm::new();
+
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("HELLO".into())),
+            Instruction::PushLiteral(Cell::String("%hello%".into())),
+            Instruction::Like { case_sensitive: false },
+        ]);
+
+        let row = make_row(vec![]);
+
+        // Case-insensitive LIKE should match
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_between_with_null() {
+        let mut vm = Vm::new();
+
+        let test_cases = vec![
+            (Cell::Null, Cell::Int(1), Cell::Int(10)),
+            (Cell::Int(5), Cell::Null, Cell::Int(10)),
+            (Cell::Int(5), Cell::Int(1), Cell::Null),
+        ];
+
+        for (value, lower, upper) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(value),
+                Instruction::PushLiteral(lower),
+                Instruction::PushLiteral(upper),
+                Instruction::Between,
+            ]);
+
+            let row = make_row(vec![]);
+
+            // Any NULL → Unknown
+            assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+        }
+    }
+
+    #[test]
+    fn test_in_with_null() {
+        let mut vm = Vm::new();
+
+        // NULL IN (1, 2, 3)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::In(vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]),
+        ]);
+
+        let row = make_row(vec![]);
+
+        // NULL IN (...) → Unknown
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_in_empty_list() {
+        let mut vm = Vm::new();
+
+        // value IN () - empty list
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::In(vec![]),
+        ]);
+
+        let row = make_row(vec![]);
+
+        // Nothing matches empty list
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_mixed_type_comparisons_edge_cases() {
+        let mut vm = Vm::new();
+
+        // Test Int vs Float edge cases
+        let test_cases = vec![
+            (Cell::Int(100), Cell::Float(100.0), false),    // Equal (not less than)
+            (Cell::Int(100), Cell::Float(99.9), false),     // Greater (not less than)
+            (Cell::Float(99.9), Cell::Int(100), true),      // Less than
+        ];
+
+        for (lhs, rhs, less_than_expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(lhs.clone()),
+                Instruction::PushLiteral(rhs.clone()),
+                Instruction::LessThan,
+            ]);
+
+            let row = make_row(vec![]);
+            let result = vm.eval(&program, &row).unwrap();
+
+            if less_than_expected {
+                assert_eq!(result, Tri::True, "{:?} < {:?} should be True", lhs, rhs);
+            } else {
+                assert_eq!(result, Tri::False, "{:?} < {:?} should be False", lhs, rhs);
+            }
+        }
+    }
+
+    #[test]
+    fn test_modulo_with_float() {
+        let mut vm = Vm::new();
+
+        // Float % Float (gets converted to Int)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(10.7)),
+            Instruction::PushLiteral(Cell::Float(3.2)),
+            Instruction::Modulo,
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+
+        // 10 % 3 = 1
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_negate_with_bool() {
+        let mut vm = Vm::new();
+
+        // Negate bool (type mismatch)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::Negate,
+            Instruction::PushLiteral(Cell::Int(0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+
+        // Type mismatch → NULL → Unknown
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    // ========================================================================
+    // Phase 1: Additional Error Path Coverage Tests
+    // ========================================================================
+
+    #[test]
+    fn test_stack_not_empty_after_eval() {
+        let mut vm = Vm::new();
+
+        // Malformed program: pushes 2 Tri values but they don't get consumed
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::Equal,  // Pops 2 Cells, pushes 1 Tri
+            Instruction::PushLiteral(Cell::Int(3)),
+            Instruction::PushLiteral(Cell::Int(4)),
+            Instruction::Equal,  // Pops 2 Cells, pushes 1 Tri
+            // Now stack has 2 Tri values - malformed!
+        ]);
+
+        let row = make_row(vec![]);
+
+        // Stack has 2 values, should return Unknown (line 67)
+        let result = vm.eval(&program, &row);
+        assert_eq!(result.unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_not_equal_operator() {
+        let mut vm = Vm::new();
+
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::NotEqual,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_less_than_or_equal() {
+        let mut vm = Vm::new();
+
+        let test_cases = vec![
+            (Cell::Int(5), Cell::Int(10), Tri::True),   // Less than
+            (Cell::Int(10), Cell::Int(10), Tri::True),  // Equal
+            (Cell::Int(15), Cell::Int(10), Tri::False), // Greater than
+        ];
+
+        for (lhs, rhs, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(lhs),
+                Instruction::PushLiteral(rhs),
+                Instruction::LessThanOrEqual,
+            ]);
+
+            let row = make_row(vec![]);
+            assert_eq!(vm.eval(&program, &row).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_greater_than_or_equal() {
+        let mut vm = Vm::new();
+
+        let test_cases = vec![
+            (Cell::Int(15), Cell::Int(10), Tri::True),  // Greater than
+            (Cell::Int(10), Cell::Int(10), Tri::True),  // Equal
+            (Cell::Int(5), Cell::Int(10), Tri::False),  // Less than
+        ];
+
+        for (lhs, rhs, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(lhs),
+                Instruction::PushLiteral(rhs),
+                Instruction::GreaterThanOrEqual,
+            ]);
+
+            let row = make_row(vec![]);
+            assert_eq!(vm.eval(&program, &row).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_is_not_null_with_missing() {
+        let mut vm = Vm::new();
+
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(99),  // Missing column
+            Instruction::IsNotNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_is_not_null_with_value() {
+        let mut vm = Vm::new();
+
+        // Test with actual value (not null, not missing)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::IsNotNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_or_operator() {
+        let mut vm = Vm::new();
+
+        // True OR False = True
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::Equal,  // Push Tri::True
+            Instruction::PushLiteral(Cell::Bool(false)),
+            Instruction::PushLiteral(Cell::Bool(false)),
+            Instruction::Equal,  // Push Tri::True (false == false)
+            Instruction::Or,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_not_operator() {
+        let mut vm = Vm::new();
+
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::Equal,  // Push Tri::True
+            Instruction::Not,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_like_with_null_pattern() {
+        let mut vm = Vm::new();
+
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("test".into())),
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::Like { case_sensitive: true },
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_type_mismatch_pop_cell() {
+        let mut vm = Vm::new();
+
+        // Push a Tri, then try to use it in arithmetic (expects Cell)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::Equal,  // Pushes Tri
+            Instruction::PushLiteral(Cell::Int(3)),
+            Instruction::Add,  // Tries to pop Cell but gets Tri
+        ]);
+
+        let row = make_row(vec![]);
+        let result = vm.eval(&program, &row);
+        assert!(matches!(result, Err(VmError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_type_mismatch_pop_tri() {
+        let mut vm = Vm::new();
+
+        // Push a Cell, then try to use it in logical operation (expects Tri)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::And,  // Tries to pop Tri but gets Cell
+        ]);
+
+        let row = make_row(vec![]);
+        let result = vm.eval(&program, &row);
+        assert!(matches!(result, Err(VmError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_default_vm() {
+        let vm = Vm::default();
+        assert!(vm.stack.is_empty());
+    }
+
+    #[test]
+    fn test_cells_equal_float_epsilon() {
+        let mut vm = Vm::new();
+
+        // Test float equality with very close values
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(1.0)),
+            Instruction::PushLiteral(Cell::Float(1.0 + f64::EPSILON / 2.0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_cells_equal_type_mismatch() {
+        let mut vm = Vm::new();
+
+        // Bool == Int should be False (not Unknown)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_compare_ordered_int_float() {
+        let mut vm = Vm::new();
+
+        // Int < Float
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::PushLiteral(Cell::Float(10.5)),
+            Instruction::LessThan,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_compare_ordered_float_int() {
+        let mut vm = Vm::new();
+
+        // Float > Int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(10.5)),
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::GreaterThan,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_compare_ordered_string() {
+        let mut vm = Vm::new();
+
+        // String comparison
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("apple".into())),
+            Instruction::PushLiteral(Cell::String("banana".into())),
+            Instruction::LessThan,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_add_mixed_types() {
+        let mut vm = Vm::new();
+
+        // Int + Float
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::PushLiteral(Cell::Float(2.5)),
+            Instruction::Add,
+            Instruction::PushLiteral(Cell::Float(7.5)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_add_float_int() {
+        let mut vm = Vm::new();
+
+        // Float + Int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(2.5)),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Add,
+            Instruction::PushLiteral(Cell::Float(7.5)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_add_float_float() {
+        let mut vm = Vm::new();
+
+        // Float + Float
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(2.5)),
+            Instruction::PushLiteral(Cell::Float(3.5)),
+            Instruction::Add,
+            Instruction::PushLiteral(Cell::Float(6.0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_subtract_with_null() {
+        let mut vm = Vm::new();
+
+        // NULL - Int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Subtract,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_subtract_mixed_types() {
+        let mut vm = Vm::new();
+
+        // Int - Float, Float - Int, Float - Float
+        let test_cases = vec![
+            (Cell::Int(10), Cell::Float(2.5), Cell::Float(7.5)),
+            (Cell::Float(10.5), Cell::Int(5), Cell::Float(5.5)),
+            (Cell::Float(10.5), Cell::Float(2.5), Cell::Float(8.0)),
+        ];
+
+        for (a, b, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(a),
+                Instruction::PushLiteral(b),
+                Instruction::Subtract,
+                Instruction::PushLiteral(expected),
+                Instruction::Equal,
+            ]);
+
+            let row = make_row(vec![]);
+            assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_multiply_with_null() {
+        let mut vm = Vm::new();
+
+        // NULL * Int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Multiply,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_multiply_mixed_types() {
+        let mut vm = Vm::new();
+
+        let test_cases = vec![
+            (Cell::Int(3), Cell::Float(2.5), Cell::Float(7.5)),
+            (Cell::Float(2.5), Cell::Int(3), Cell::Float(7.5)),
+            (Cell::Float(2.5), Cell::Float(2.0), Cell::Float(5.0)),
+        ];
+
+        for (a, b, expected) in test_cases {
+            let program = BytecodeProgram::new(vec![
+                Instruction::PushLiteral(a),
+                Instruction::PushLiteral(b),
+                Instruction::Multiply,
+                Instruction::PushLiteral(expected),
+                Instruction::Equal,
+            ]);
+
+            let row = make_row(vec![]);
+            assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_divide_with_null() {
+        let mut vm = Vm::new();
+
+        // NULL / Int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Divide,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_divide_type_mismatch() {
+        let mut vm = Vm::new();
+
+        // String / Int (type mismatch)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("test".into())),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Divide,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_modulo_with_null() {
+        let mut vm = Vm::new();
+
+        // NULL % Int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Modulo,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_modulo_type_mismatch() {
+        let mut vm = Vm::new();
+
+        // String % Int (type mismatch)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("test".into())),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Modulo,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_negate_with_null() {
+        let mut vm = Vm::new();
+
+        // -NULL
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::Negate,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_negate_float() {
+        let mut vm = Vm::new();
+
+        // -Float
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(5.5)),
+            Instruction::Negate,
+            Instruction::PushLiteral(Cell::Float(-5.5)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    // ========================================================================
+    // Phase 3: Push to 95% Coverage - VM Completion
+    // ========================================================================
+
+    #[test]
+    fn test_stack_underflow_pop_cell() {
+        let mut vm = Vm::new();
+
+        // Empty stack, try to pop cell
+        let program = BytecodeProgram::new(vec![
+            Instruction::Add,  // Tries to pop 2 cells from empty stack
+        ]);
+
+        let row = make_row(vec![]);
+        let result = vm.eval(&program, &row);
+        assert!(matches!(result, Err(VmError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_stack_underflow_pop_tri() {
+        let mut vm = Vm::new();
+
+        // Empty stack, try to pop tri
+        let program = BytecodeProgram::new(vec![
+            Instruction::And,  // Tries to pop 2 Tri from empty stack
+        ]);
+
+        let row = make_row(vec![]);
+        let result = vm.eval(&program, &row);
+        assert!(matches!(result, Err(VmError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_float_comparison_equal() {
+        let mut vm = Vm::new();
+
+        // Float == Float (exactly equal)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::LessThan,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_compare_int_float_equal() {
+        let mut vm = Vm::new();
+
+        // Int == Float (mixed comparison, equal values)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::GreaterThan,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_compare_float_int_equal() {
+        let mut vm = Vm::new();
+
+        // Float == Int (mixed comparison, equal values)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(10.0)),
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::LessThan,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_arithmetic_divide_int_int() {
+        let mut vm = Vm::new();
+
+        // Int / Int (converts to float)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::Divide,
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_divide_float_float() {
+        let mut vm = Vm::new();
+
+        // Float / Float
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(10.0)),
+            Instruction::PushLiteral(Cell::Float(2.0)),
+            Instruction::Divide,
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_modulo_int_int() {
+        let mut vm = Vm::new();
+
+        // Int % Int
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::PushLiteral(Cell::Int(3)),
+            Instruction::Modulo,
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_modulo_float_float_coerced() {
+        let mut vm = Vm::new();
+
+        // Float % Float (coerced to Int)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(10.0)),
+            Instruction::PushLiteral(Cell::Float(3.0)),
+            Instruction::Modulo,
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_negate_type_mismatch() {
+        let mut vm = Vm::new();
+
+        // Negate string (type mismatch)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("test".into())),
+            Instruction::Negate,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    // ========================================================================
+    // Phase 3C: Final Push to 95% - VM Completion
+    // ========================================================================
+
+    #[test]
+    fn test_arithmetic_subtract_float_float() {
+        let mut vm = Vm::new();
+
+        // Float - Float
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(10.5)),
+            Instruction::PushLiteral(Cell::Float(3.5)),
+            Instruction::Subtract,
+            Instruction::PushLiteral(Cell::Float(7.0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_multiply_float_float() {
+        let mut vm = Vm::new();
+
+        // Float * Float
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(2.5)),
+            Instruction::PushLiteral(Cell::Float(4.0)),
+            Instruction::Multiply,
+            Instruction::PushLiteral(Cell::Float(10.0)),
+            Instruction::Equal,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_divide_non_numeric_denominator() {
+        let mut vm = Vm::new();
+
+        // Int / String (type mismatch in denominator)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::PushLiteral(Cell::String("not a number".into())),
+            Instruction::Divide,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_modulo_non_numeric_denominator() {
+        let mut vm = Vm::new();
+
+        // Int % String (type mismatch in denominator)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(10)),
+            Instruction::PushLiteral(Cell::String("not a number".into())),
+            Instruction::Modulo,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_subtract_type_mismatch() {
+        let mut vm = Vm::new();
+
+        // String - Int (type mismatch)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("test".into())),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Subtract,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_arithmetic_multiply_type_mismatch() {
+        let mut vm = Vm::new();
+
+        // String * Int (type mismatch)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::String("test".into())),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Multiply,
+            Instruction::IsNull,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
     }
 }

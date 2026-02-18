@@ -321,4 +321,34 @@ mod tests {
         assert!(bitmap.contains(1));
         assert_eq!(bitmap.len(), 2);
     }
+
+    // ========================================================================
+    // Phase 3: Push to 95% Coverage - Predicate Completion
+    // ========================================================================
+
+    #[test]
+    fn test_increment_refcount_nonexistent() {
+        let mut store = PredicateStore::new();
+
+        // Try to increment refcount of non-existent predicate
+        let fake_id = PredicateId::from_slab_index(999);
+        let result = store.increment_refcount(fake_id);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_decrement_refcount_nonexistent() {
+        let mut store = PredicateStore::new();
+
+        // Try to decrement refcount of non-existent predicate
+        let fake_id = PredicateId::from_slab_index(999);
+        let result = store.decrement_refcount(fake_id);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_predicate_store_default() {
+        let store = PredicateStore::default();
+        assert!(store.predicates.is_empty());
+    }
 }

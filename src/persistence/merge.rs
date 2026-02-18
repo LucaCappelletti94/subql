@@ -356,4 +356,259 @@ mod tests {
         assert_eq!(report.output_predicates, 50);
         assert!((report.dedup_ratio - 2.0).abs() < 0.01);
     }
+
+    // ========================================================================
+    // Phase 3: Push to 95% Coverage - Merge Completion
+    // ========================================================================
+
+    #[test]
+    fn test_merge_manager_default() {
+        let manager = MergeManager::default();
+        assert_eq!(manager.active_jobs(), 0);
+    }
+
+    #[test]
+    fn test_merge_manager_active_jobs() {
+        let mut manager = MergeManager::new();
+        assert_eq!(manager.active_jobs(), 0);
+
+        let catalog = Box::new(make_catalog());
+        let payload = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData { ordinal_to_user: vec![] },
+            created_at_unix_ms: 1000,
+        };
+
+        let mock_catalog = make_catalog();
+        let shard = serialize_shard(1, &payload, &mock_catalog).unwrap();
+
+        let _job_id = manager.merge_shards_background(1, vec![shard], catalog).unwrap();
+
+        // Should have 1 active job
+        assert_eq!(manager.active_jobs(), 1);
+    }
+
+    #[test]
+    fn test_merge_manager_unknown_job() {
+        let mut manager = MergeManager::new();
+
+        // Try to get result for non-existent job
+        let result = manager.try_get_result(999);
+        assert!(matches!(result, Err(MergeError::UnknownJob(999))));
+    }
+
+    #[test]
+    fn test_merge_manager_still_running() {
+        let mut manager = MergeManager::new();
+
+        let catalog = Box::new(make_catalog());
+        let payload = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData { ordinal_to_user: vec![] },
+            created_at_unix_ms: 1000,
+        };
+
+        let mock_catalog = make_catalog();
+        let shard = serialize_shard(1, &payload, &mock_catalog).unwrap();
+
+        let job_id = manager.merge_shards_background(1, vec![shard], catalog).unwrap();
+
+        // Immediately check - might still be running
+        let result = manager.try_get_result(job_id);
+        // Could be None (still running) or Some (very fast)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_merge_predicate_keeps_most_recent() {
+        let catalog = make_catalog();
+
+        // Create two shards with same predicate but different timestamps
+        let pred_old = PredicateData {
+            hash: 0x1234,
+            normalized_sql: "age > 18".to_string(),
+            bytecode_instructions: vec![],
+            dependency_columns: vec![1],
+            refcount: 1,
+            updated_at_unix_ms: 1000, // Older
+        };
+
+        let pred_new = PredicateData {
+            hash: 0x1234, // Same hash
+            normalized_sql: "age > 18 (updated)".to_string(),
+            bytecode_instructions: vec![1, 2, 3],
+            dependency_columns: vec![1],
+            refcount: 2,
+            updated_at_unix_ms: 2000, // Newer
+        };
+
+        let payload1 = ShardPayload {
+            predicates: vec![pred_old],
+            bindings: vec![],
+            user_dict: UserDictData { ordinal_to_user: vec![] },
+            created_at_unix_ms: 1000,
+        };
+
+        let payload2 = ShardPayload {
+            predicates: vec![pred_new],
+            bindings: vec![],
+            user_dict: UserDictData { ordinal_to_user: vec![] },
+            created_at_unix_ms: 2000,
+        };
+
+        let shard1 = serialize_shard(1, &payload1, &catalog).unwrap();
+        let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = merge_shards_impl(1, vec![shard1, shard2], &catalog, start);
+
+        assert!(result.is_ok());
+        let merged = result.unwrap();
+
+        // Should keep the newer one
+        assert_eq!(merged.payload.predicates.len(), 1);
+        assert_eq!(merged.payload.predicates[0].updated_at_unix_ms, 2000);
+        assert_eq!(merged.payload.predicates[0].normalized_sql, "age > 18 (updated)");
+    }
+
+    #[test]
+    fn test_merge_bindings_keeps_most_recent() {
+        let catalog = make_catalog();
+
+        // Create two shards with same binding but different timestamps
+        let binding_old = BindingData {
+            subscription_id: 100,
+            predicate_hash: 0x1234,
+            user_id: 42,
+            session_id: Some(1000),
+            updated_at_unix_ms: 1000, // Older
+        };
+
+        let binding_new = BindingData {
+            subscription_id: 100, // Same sub_id
+            predicate_hash: 0x1234,
+            user_id: 42,
+            session_id: Some(2000), // Different session
+            updated_at_unix_ms: 2000, // Newer
+        };
+
+        let payload1 = ShardPayload {
+            predicates: vec![],
+            bindings: vec![binding_old],
+            user_dict: UserDictData { ordinal_to_user: vec![] },
+            created_at_unix_ms: 1000,
+        };
+
+        let payload2 = ShardPayload {
+            predicates: vec![],
+            bindings: vec![binding_new],
+            user_dict: UserDictData { ordinal_to_user: vec![] },
+            created_at_unix_ms: 2000,
+        };
+
+        let shard1 = serialize_shard(1, &payload1, &catalog).unwrap();
+        let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = merge_shards_impl(1, vec![shard1, shard2], &catalog, start);
+
+        assert!(result.is_ok());
+        let merged = result.unwrap();
+
+        // Should keep the newer one
+        assert_eq!(merged.payload.bindings.len(), 1);
+        assert_eq!(merged.payload.bindings[0].updated_at_unix_ms, 2000);
+        assert_eq!(merged.payload.bindings[0].session_id, Some(2000));
+    }
+
+    #[test]
+    fn test_merge_stats_zero_output_predicates() {
+        let stats = MergeStats {
+            input_shards: 2,
+            input_predicates: 0,
+            output_predicates: 0, // Zero output
+            input_bindings: 0,
+            output_bindings: 0,
+            build_ms: 100,
+        };
+
+        let report: MergeReport = stats.into();
+        assert_eq!(report.dedup_ratio, 1.0); // Should default to 1.0
+    }
+
+    #[test]
+    fn test_merge_with_invalid_shard_bytes() {
+        let mut manager = MergeManager::new();
+
+        let catalog = Box::new(make_catalog());
+        // Invalid shard bytes - will fail to deserialize
+        let invalid_shard = vec![0u8, 1, 2, 3, 4, 5];
+
+        let job_id = manager.merge_shards_background(1, vec![invalid_shard], catalog).unwrap();
+
+        // Wait for merge to fail
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let result = manager.try_get_result(job_id);
+        assert!(matches!(result, Err(MergeError::BuildFailed(_))));
+    }
+
+    #[test]
+    fn test_merge_thread_disconnected() {
+        // Simulate thread panic by manually creating a job with a disconnected channel
+        let mut manager = MergeManager::new();
+
+        let (tx, rx) = mpsc::channel::<MergeResult>();
+        // Drop the sender immediately — simulates thread panic
+        drop(tx);
+
+        let job_id = manager.next_job_id;
+        manager.next_job_id += 1;
+        manager.jobs.insert(job_id, MergeJob { receiver: rx });
+
+        // Now try_get_result should see Disconnected
+        let result = manager.try_get_result(job_id);
+        assert!(matches!(result, Err(MergeError::BuildFailed(ref msg)) if msg == "Thread panicked"));
+    }
+
+    #[test]
+    fn test_merge_still_running() {
+        // Create a channel where sender is alive but hasn't sent yet
+        let mut manager = MergeManager::new();
+
+        let (tx, rx) = mpsc::channel::<MergeResult>();
+
+        let job_id = manager.next_job_id;
+        manager.next_job_id += 1;
+        manager.jobs.insert(job_id, MergeJob { receiver: rx });
+
+        // Before sending anything, check — should be "still running"
+        let result = manager.try_get_result(job_id);
+        assert!(matches!(result, Ok(None)));
+
+        // Now send result and check again
+        let _ = tx.send(Ok(MergedShard {
+            table_id: 1,
+            payload: ShardPayload {
+                predicates: vec![],
+                bindings: vec![],
+                user_dict: UserDictData { ordinal_to_user: vec![] },
+                created_at_unix_ms: 1000,
+            },
+            stats: MergeStats {
+                input_shards: 1,
+                input_predicates: 0,
+                output_predicates: 0,
+                input_bindings: 0,
+                output_bindings: 0,
+                build_ms: 0,
+            },
+        }));
+
+        let result = manager.try_get_result(job_id);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
 }

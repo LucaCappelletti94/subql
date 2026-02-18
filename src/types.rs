@@ -48,7 +48,7 @@ pub enum EventKind {
 /// - `Missing`: Column not present in this image (UPDATE `old_row` may be incomplete)
 /// - `Null`: SQL NULL value
 /// - Typed value: Bool, Int, Float, String
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Cell {
     /// Column not present in row image
     Missing,
@@ -81,6 +81,74 @@ impl Cell {
     #[must_use]
     pub const fn is_present(&self) -> bool {
         !matches!(self, Self::Null | Self::Missing)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cell_is_null() {
+        assert!(Cell::Null.is_null());
+        assert!(!Cell::Missing.is_null());
+        assert!(!Cell::Bool(true).is_null());
+        assert!(!Cell::Int(42).is_null());
+        assert!(!Cell::Float(3.14).is_null());
+        assert!(!Cell::String("test".into()).is_null());
+    }
+
+    #[test]
+    fn test_cell_is_missing() {
+        assert!(Cell::Missing.is_missing());
+        assert!(!Cell::Null.is_missing());
+        assert!(!Cell::Bool(false).is_missing());
+        assert!(!Cell::Int(0).is_missing());
+        assert!(!Cell::Float(0.0).is_missing());
+        assert!(!Cell::String("".into()).is_missing());
+    }
+
+    #[test]
+    fn test_cell_is_present() {
+        assert!(Cell::Bool(true).is_present());
+        assert!(Cell::Int(42).is_present());
+        assert!(Cell::Float(3.14).is_present());
+        assert!(Cell::String("test".into()).is_present());
+        assert!(!Cell::Null.is_present());
+        assert!(!Cell::Missing.is_present());
+    }
+
+    #[test]
+    fn test_row_image_get() {
+        let row = RowImage {
+            cells: Arc::from(vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]),
+        };
+
+        assert_eq!(row.get(0), Some(&Cell::Int(1)));
+        assert_eq!(row.get(1), Some(&Cell::Int(2)));
+        assert_eq!(row.get(2), Some(&Cell::Int(3)));
+        assert_eq!(row.get(3), None);
+        assert_eq!(row.get(100), None);
+    }
+
+    #[test]
+    fn test_row_image_len() {
+        let empty = RowImage { cells: Arc::from(vec![]) };
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+
+        let row = RowImage {
+            cells: Arc::from(vec![Cell::Int(1), Cell::Int(2)]),
+        };
+        assert_eq!(row.len(), 2);
+        assert!(!row.is_empty());
+    }
+
+    #[test]
+    fn test_event_kind() {
+        assert_ne!(EventKind::Insert, EventKind::Update);
+        assert_ne!(EventKind::Update, EventKind::Delete);
+        assert_eq!(EventKind::Insert, EventKind::Insert);
     }
 }
 

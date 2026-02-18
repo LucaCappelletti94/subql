@@ -273,4 +273,22 @@ mod tests {
         let result = header.validate(&catalog);
         assert!(matches!(result, Err(StorageError::SchemaMismatch { .. })));
     }
+
+    #[test]
+    fn test_serialize_missing_fingerprint() {
+        // Catalog that returns None for schema fingerprint
+        let catalog = MockCatalog {
+            fingerprints: HashMap::new(), // Empty - no fingerprints
+        };
+
+        let payload = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData { ordinal_to_user: vec![] },
+            created_at_unix_ms: 1000,
+        };
+
+        let result = serialize_shard(1, &payload, &catalog);
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
+    }
 }

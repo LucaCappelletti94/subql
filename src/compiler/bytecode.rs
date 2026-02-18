@@ -1,9 +1,10 @@
 //! VM bytecode instruction set for predicate evaluation
 
 use crate::{Cell, ColumnId};
+use serde::{Serialize, Deserialize};
 
 /// VM instruction for tri-state predicate evaluation
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
     // ========================================================================
     // Stack Operations
@@ -93,6 +94,54 @@ pub enum Instruction {
     Not,
 
     // ========================================================================
+    // Arithmetic Operators (pop 2 cells, push cell)
+    // ========================================================================
+
+    /// Add: a + b
+    ///
+    /// Type coercion: Int + Int → Int, otherwise Float
+    /// NULL propagation: NULL + anything → NULL
+    /// Stack: [..., a, b] → [..., Cell]
+    Add,
+
+    /// Subtract: a - b
+    ///
+    /// Type coercion: Int - Int → Int, otherwise Float
+    /// NULL propagation: NULL - anything → NULL
+    /// Stack: [..., a, b] → [..., Cell]
+    Subtract,
+
+    /// Multiply: a * b
+    ///
+    /// Type coercion: Int * Int → Int, otherwise Float
+    /// NULL propagation: NULL * anything → NULL
+    /// Stack: [..., a, b] → [..., Cell]
+    Multiply,
+
+    /// Divide: a / b
+    ///
+    /// Always returns Float (SQL semantics)
+    /// Division by zero → NULL
+    /// NULL propagation: NULL / anything → NULL
+    /// Stack: [..., a, b] → [..., Cell]
+    Divide,
+
+    /// Modulo: a % b
+    ///
+    /// Integer operation only (coerces to Int first)
+    /// Modulo by zero → NULL
+    /// NULL propagation: NULL % anything → NULL
+    /// Stack: [..., a, b] → [..., Cell]
+    Modulo,
+
+    /// Negate: -a (unary minus)
+    ///
+    /// Type preserved: Int → Int, Float → Float
+    /// NULL propagation: -NULL → NULL
+    /// Stack: [..., a] → [..., Cell]
+    Negate,
+
+    // ========================================================================
     // Special Operations
     // ========================================================================
 
@@ -115,7 +164,7 @@ pub enum Instruction {
 }
 
 /// Compiled bytecode program
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BytecodeProgram {
     /// Instruction sequence
     pub instructions: Vec<Instruction>,

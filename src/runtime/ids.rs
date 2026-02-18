@@ -33,6 +33,15 @@ impl PredicateId {
     pub fn as_u32(self) -> u32 {
         self.0.get()
     }
+
+    /// Reconstruct PredicateId from raw u32 (inverse of as_u32)
+    ///
+    /// # Panics
+    /// Panics if `raw` is 0.
+    #[must_use]
+    pub fn from_u32(raw: u32) -> Self {
+        Self(NonZeroU32::new(raw).expect("PredicateId cannot be zero"))
+    }
 }
 
 /// User ordinal within table partition (for bitmap indexing)
