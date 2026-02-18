@@ -142,14 +142,12 @@ fn merge_shards_impl<I: IdTypes>(
 
         all_predicates.extend(payload.predicates);
         all_bindings.extend(payload.bindings);
-
-        // Merge user dictionaries
-        for user_id in payload.user_dict.ordinal_to_user {
-            if !user_ordinals.contains(&user_id) {
-                user_ordinals.push(user_id);
-            }
-        }
+        user_ordinals.extend(payload.user_dict.ordinal_to_user);
     }
+
+    // Deduplicate users via sort + dedup (O(n log n) instead of O(n^2))
+    user_ordinals.sort_unstable();
+    user_ordinals.dedup();
 
     let input_predicates = all_predicates.len();
     let input_bindings = all_bindings.len();

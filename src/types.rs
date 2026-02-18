@@ -13,10 +13,10 @@ use serde::{Serialize, de::DeserializeOwned};
 ///
 /// Any type satisfying these bounds can be used as a user, session, or
 /// subscription identifier.
-pub trait Id: Copy + Eq + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static {}
+pub trait Id: Copy + Ord + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static {}
 
 /// Blanket implementation: every type meeting the bounds is automatically an `Id`.
-impl<T: Copy + Eq + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static> Id for T {}
+impl<T: Copy + Ord + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static> Id for T {}
 
 /// Associated types that pin the three consumer-facing ID representations.
 ///
