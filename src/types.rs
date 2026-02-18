@@ -241,7 +241,7 @@ pub struct WalEvent {
 // ============================================================================
 
 /// Subscription specification provided by user
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionSpec<I: IdTypes> {
     /// Unique subscription ID (assigned by caller)
     pub subscription_id: I::SubscriptionId,
@@ -256,7 +256,7 @@ pub struct SubscriptionSpec<I: IdTypes> {
 }
 
 /// Result of successful subscription registration
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisterResult {
     /// Table this subscription applies to
     pub table_id: TableId,
@@ -269,7 +269,7 @@ pub struct RegisterResult {
 }
 
 /// Report from pruning session subscriptions
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PruneReport {
     /// Number of subscription bindings removed
     pub removed_bindings: usize,
@@ -280,7 +280,7 @@ pub struct PruneReport {
 }
 
 /// Report from background merge operation
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MergeReport {
     /// Number of input shards merged
     pub input_shards: usize,
