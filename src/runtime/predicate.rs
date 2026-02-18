@@ -1,11 +1,11 @@
 //! Predicate storage with deduplication and refcounting
 
-use std::sync::Arc;
-use slab::Slab;
+use super::ids::{PredicateHash, PredicateId, UserOrdinal};
+use crate::{compiler::BytecodeProgram, ColumnId, IdTypes};
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
-use crate::{IdTypes, compiler::BytecodeProgram, ColumnId};
-use super::ids::{PredicateId, UserOrdinal, PredicateHash};
+use slab::Slab;
+use std::sync::Arc;
 
 /// Compiled predicate with metadata
 #[derive(Clone, Debug)]
@@ -177,10 +177,7 @@ impl<I: IdTypes> PredicateStore<I> {
 
         // Track session
         if let Some(sid) = session_id {
-            self.session_index
-                .entry(sid)
-                .or_default()
-                .push(sub_id);
+            self.session_index.entry(sid).or_default().push(sub_id);
         }
 
         // Track user interest in predicate
@@ -219,8 +216,13 @@ impl<I: IdTypes> PredicateStore<I> {
 
     /// Get all subscription IDs for a session
     #[must_use]
-    pub fn get_session_subscriptions(&self, session_id: I::SessionId) -> Option<&[I::SubscriptionId]> {
-        self.session_index.get(&session_id).map(std::vec::Vec::as_slice)
+    pub fn get_session_subscriptions(
+        &self,
+        session_id: I::SessionId,
+    ) -> Option<&[I::SubscriptionId]> {
+        self.session_index
+            .get(&session_id)
+            .map(std::vec::Vec::as_slice)
     }
 }
 
@@ -383,12 +385,14 @@ mod tests {
         let returned_id = store.add_predicate(pred);
 
         // Returned ID must point to a real predicate.
-        let stored = store.get_predicate(returned_id)
+        let stored = store
+            .get_predicate(returned_id)
             .expect("returned ID should resolve to stored predicate");
         assert_eq!(stored.hash, 0xBEEF);
 
         // Hash index must resolve to the same valid predicate ID.
-        let by_hash = store.find_by_hash(0xBEEF)
+        let by_hash = store
+            .find_by_hash(0xBEEF)
             .expect("hash index should contain inserted predicate");
         assert_eq!(by_hash, returned_id);
         assert!(store.get_predicate(by_hash).is_some());

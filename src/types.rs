@@ -1,9 +1,9 @@
 //! Core type definitions for subql
 
+use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
-use serde::{Serialize, de::DeserializeOwned};
 
 // ============================================================================
 // Generic ID Types
@@ -13,7 +13,10 @@ use serde::{Serialize, de::DeserializeOwned};
 ///
 /// Any type satisfying these bounds can be used as a user, session, or
 /// subscription identifier.
-pub trait Id: Copy + Ord + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static {}
+pub trait Id:
+    Copy + Ord + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static
+{
+}
 
 /// Blanket implementation: every type meeting the bounds is automatically an `Id`.
 impl<T: Copy + Ord + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static> Id for T {}
@@ -162,7 +165,9 @@ mod tests {
 
     #[test]
     fn test_row_image_len() {
-        let empty = RowImage { cells: Arc::from(vec![]) };
+        let empty = RowImage {
+            cells: Arc::from(vec![]),
+        };
         assert_eq!(empty.len(), 0);
         assert!(empty.is_empty());
 
@@ -318,6 +323,14 @@ pub trait SchemaCatalog: Send + Sync {
     /// Fingerprint changes when table schema changes (add/remove/rename columns).
     /// Used to detect shard incompatibility on load.
     fn schema_fingerprint(&self, table_id: TableId) -> Option<u64>;
+
+    /// Get primary key column IDs for a table
+    ///
+    /// Used by WAL parsers (e.g. wal2json INSERT events) to extract PK values
+    /// from the new row when `oldkeys` is absent.
+    fn primary_key_columns(&self, _table_id: TableId) -> Option<&[ColumnId]> {
+        None
+    }
 }
 
 /// Subscription registration operations
@@ -326,8 +339,10 @@ pub trait SubscriptionRegistration<I: IdTypes>: Send + Sync {
     ///
     /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds user.
     /// Returns error if SQL is unparseable or unsupported.
-    fn register(&mut self, spec: SubscriptionSpec<I>)
-        -> Result<RegisterResult, crate::RegisterError>;
+    fn register(
+        &mut self,
+        spec: SubscriptionSpec<I>,
+    ) -> Result<RegisterResult, crate::RegisterError>;
 
     /// Unregister a subscription by ID
     ///
@@ -339,7 +354,9 @@ pub trait SubscriptionRegistration<I: IdTypes>: Send + Sync {
 /// Event dispatch operations
 pub trait SubscriptionDispatch<I: IdTypes>: Send + Sync {
     /// Iterator over matched user IDs
-    type UserIter<'a>: Iterator<Item = I::UserId> where Self: 'a;
+    type UserIter<'a>: Iterator<Item = I::UserId>
+    where
+        Self: 'a;
 
     /// Get interested users for a WAL event
     ///

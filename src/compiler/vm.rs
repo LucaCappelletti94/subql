@@ -1,7 +1,7 @@
 //! VM interpreter for bytecode evaluation
 
+use super::{BytecodeProgram, Instruction, Tri};
 use crate::{Cell, RowImage};
-use super::{Tri, Instruction, BytecodeProgram};
 
 /// VM evaluation error
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,9 +47,7 @@ impl Vm {
     /// Evaluate bytecode program against a row
     ///
     /// Returns Tri::True if row matches, False/Unknown if not.
-    pub fn eval(&mut self, program: &BytecodeProgram, row: &RowImage)
-        -> Result<Tri, VmError>
-    {
+    pub fn eval(&mut self, program: &BytecodeProgram, row: &RowImage) -> Result<Tri, VmError> {
         self.stack.clear();
 
         // Execute each instruction
@@ -76,18 +74,14 @@ impl Vm {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute(&mut self, instruction: &Instruction, row: &RowImage)
-        -> Result<(), VmError>
-    {
+    fn execute(&mut self, instruction: &Instruction, row: &RowImage) -> Result<(), VmError> {
         match instruction {
             Instruction::PushLiteral(cell) => {
                 self.stack.push(StackValue::Cell(cell.clone()));
             }
 
             Instruction::LoadColumn(col_id) => {
-                let cell = row.get(*col_id)
-                    .cloned()
-                    .unwrap_or(Cell::Missing);
+                let cell = row.get(*col_id).cloned().unwrap_or(Cell::Missing);
                 self.stack.push(StackValue::Cell(cell));
             }
 
@@ -102,30 +96,25 @@ impl Vm {
             }
 
             Instruction::LessThan => {
-                let result = self.compare_ordered(|ord| {
-                    matches!(ord, std::cmp::Ordering::Less)
-                })?;
+                let result = self.compare_ordered(|ord| matches!(ord, std::cmp::Ordering::Less))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::LessThanOrEqual => {
-                let result = self.compare_ordered(|ord| {
-                    !matches!(ord, std::cmp::Ordering::Greater)
-                })?;
+                let result =
+                    self.compare_ordered(|ord| !matches!(ord, std::cmp::Ordering::Greater))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::GreaterThan => {
-                let result = self.compare_ordered(|ord| {
-                    matches!(ord, std::cmp::Ordering::Greater)
-                })?;
+                let result =
+                    self.compare_ordered(|ord| matches!(ord, std::cmp::Ordering::Greater))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::GreaterThanOrEqual => {
-                let result = self.compare_ordered(|ord| {
-                    !matches!(ord, std::cmp::Ordering::Less)
-                })?;
+                let result =
+                    self.compare_ordered(|ord| !matches!(ord, std::cmp::Ordering::Less))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
@@ -177,9 +166,8 @@ impl Vm {
 
                 // Check if cell matches any literal
                 let found = literals.iter().any(|lit| cells_equal(&cell, lit));
-                self.stack.push(StackValue::Tri(
-                    if found { Tri::True } else { Tri::False }
-                ));
+                self.stack
+                    .push(StackValue::Tri(if found { Tri::True } else { Tri::False }));
             }
 
             Instruction::Between => {
@@ -188,9 +176,13 @@ impl Vm {
                 let value = self.pop_cell()?;
 
                 // Any NULL/Missing → Unknown
-                if value.is_null() || value.is_missing() ||
-                   lower.is_null() || lower.is_missing() ||
-                   upper.is_null() || upper.is_missing() {
+                if value.is_null()
+                    || value.is_missing()
+                    || lower.is_null()
+                    || lower.is_missing()
+                    || upper.is_null()
+                    || upper.is_missing()
+                {
                     self.stack.push(StackValue::Tri(Tri::Unknown));
                     return Ok(());
                 }
@@ -212,20 +204,24 @@ impl Vm {
                 let string = self.pop_cell()?;
 
                 // NULL in either position → Unknown
-                if string.is_null() || string.is_missing() ||
-                   pattern.is_null() || pattern.is_missing() {
+                if string.is_null()
+                    || string.is_missing()
+                    || pattern.is_null()
+                    || pattern.is_missing()
+                {
                     self.stack.push(StackValue::Tri(Tri::Unknown));
                     return Ok(());
                 }
 
                 // Extract strings
-                let (str_val, pat_val) = if let (Cell::String(s), Cell::String(p)) = (&string, &pattern) {
-                    (s.as_ref(), p.as_ref())
-                } else {
-                    // Type mismatch → Unknown
-                    self.stack.push(StackValue::Tri(Tri::Unknown));
-                    return Ok(());
-                };
+                let (str_val, pat_val) =
+                    if let (Cell::String(s), Cell::String(p)) = (&string, &pattern) {
+                        (s.as_ref(), p.as_ref())
+                    } else {
+                        // Type mismatch → Unknown
+                        self.stack.push(StackValue::Tri(Tri::Unknown));
+                        return Ok(());
+                    };
 
                 // Simple LIKE implementation (% = wildcard, _ = single char)
                 let matched = if *case_sensitive {
@@ -234,15 +230,16 @@ impl Vm {
                     simple_like(&str_val.to_lowercase(), &pat_val.to_lowercase())
                 };
 
-                self.stack.push(StackValue::Tri(
-                    if matched { Tri::True } else { Tri::False }
-                ));
+                self.stack.push(StackValue::Tri(if matched {
+                    Tri::True
+                } else {
+                    Tri::False
+                }));
             }
 
             // ================================================================
             // Arithmetic Operations
             // ================================================================
-
             Instruction::Add => self.execute_binary_cell_op(arithmetic_add)?,
             Instruction::Subtract => self.execute_binary_cell_op(arithmetic_subtract)?,
             Instruction::Multiply => self.execute_binary_cell_op(arithmetic_multiply)?,
@@ -372,7 +369,11 @@ where
         _ => return Tri::Unknown, // Type mismatch
     };
 
-    if predicate(ord) { Tri::True } else { Tri::False }
+    if predicate(ord) {
+        Tri::True
+    } else {
+        Tri::False
+    }
 }
 
 /// SQL LIKE pattern matching
@@ -550,7 +551,9 @@ mod tests {
     use std::sync::Arc;
 
     fn make_row(cells: Vec<Cell>) -> RowImage {
-        RowImage { cells: Arc::from(cells) }
+        RowImage {
+            cells: Arc::from(cells),
+        }
     }
 
     #[test]
@@ -619,10 +622,7 @@ mod tests {
         let mut vm = Vm::new();
 
         // email IS NULL
-        let program = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0),
-            Instruction::IsNull,
-        ]);
+        let program = BytecodeProgram::new(vec![Instruction::LoadColumn(0), Instruction::IsNull]);
 
         let row = make_row(vec![Cell::Null]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
@@ -823,7 +823,7 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0), // elevation
             Instruction::PushLiteral(Cell::Int(50)),
-            Instruction::Negate,  // -50
+            Instruction::Negate, // -50
             Instruction::PushLiteral(Cell::Int(50)),
             Instruction::Between,
         ]);
@@ -884,7 +884,10 @@ mod tests {
         // Empty program
         let program = BytecodeProgram::new(vec![]);
         let row = make_row(vec![]);
-        assert!(matches!(vm.eval(&program, &row), Err(VmError::StackUnderflow)));
+        assert!(matches!(
+            vm.eval(&program, &row),
+            Err(VmError::StackUnderflow)
+        ));
     }
 
     #[test]
@@ -892,9 +895,7 @@ mod tests {
         let mut vm = Vm::new();
 
         // Program leaves Cell on stack instead of Tri
-        let program = BytecodeProgram::new(vec![
-            Instruction::PushLiteral(Cell::Int(42)),
-        ]);
+        let program = BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Int(42))]);
         let row = make_row(vec![]);
 
         // Should return Unknown (not crash)
@@ -997,7 +998,9 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Int(42)),
             Instruction::PushLiteral(Cell::String("%test%".into())),
-            Instruction::Like { case_sensitive: true },
+            Instruction::Like {
+                case_sensitive: true,
+            },
         ]);
 
         let row = make_row(vec![]);
@@ -1012,29 +1015,43 @@ mod tests {
 
         // Test LIKE patterns (simple implementation - only prefix/suffix/contains)
         let test_cases = vec![
-            ("hello", "%", true),           // Match all
-            ("hello", "hello", true),       // Exact match
-            ("hello", "hell%", true),       // Prefix
-            ("hello", "%ello", true),       // Suffix
-            ("hello", "%ell%", true),       // Contains
-            ("hello", "goodbye", false),    // No match
-            ("hello", "hell", false),       // Partial prefix (no %)
+            ("hello", "%", true),        // Match all
+            ("hello", "hello", true),    // Exact match
+            ("hello", "hell%", true),    // Prefix
+            ("hello", "%ello", true),    // Suffix
+            ("hello", "%ell%", true),    // Contains
+            ("hello", "goodbye", false), // No match
+            ("hello", "hell", false),    // Partial prefix (no %)
         ];
 
         for (string, pattern, expected) in test_cases {
             let program = BytecodeProgram::new(vec![
                 Instruction::PushLiteral(Cell::String(string.into())),
                 Instruction::PushLiteral(Cell::String(pattern.into())),
-                Instruction::Like { case_sensitive: true },
+                Instruction::Like {
+                    case_sensitive: true,
+                },
             ]);
 
             let row = make_row(vec![]);
             let result = vm.eval(&program, &row).unwrap();
 
             if expected {
-                assert_eq!(result, Tri::True, "Pattern '{}' should match '{}'", pattern, string);
+                assert_eq!(
+                    result,
+                    Tri::True,
+                    "Pattern '{}' should match '{}'",
+                    pattern,
+                    string
+                );
             } else {
-                assert_eq!(result, Tri::False, "Pattern '{}' should not match '{}'", pattern, string);
+                assert_eq!(
+                    result,
+                    Tri::False,
+                    "Pattern '{}' should not match '{}'",
+                    pattern,
+                    string
+                );
             }
         }
     }
@@ -1046,7 +1063,9 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::String("HELLO".into())),
             Instruction::PushLiteral(Cell::String("%hello%".into())),
-            Instruction::Like { case_sensitive: false },
+            Instruction::Like {
+                case_sensitive: false,
+            },
         ]);
 
         let row = make_row(vec![]);
@@ -1118,9 +1137,9 @@ mod tests {
 
         // Test Int vs Float edge cases
         let test_cases = vec![
-            (Cell::Int(100), Cell::Float(100.0), false),    // Equal (not less than)
-            (Cell::Int(100), Cell::Float(99.9), false),     // Greater (not less than)
-            (Cell::Float(99.9), Cell::Int(100), true),      // Less than
+            (Cell::Int(100), Cell::Float(100.0), false), // Equal (not less than)
+            (Cell::Int(100), Cell::Float(99.9), false),  // Greater (not less than)
+            (Cell::Float(99.9), Cell::Int(100), true),   // Less than
         ];
 
         for (lhs, rhs, less_than_expected) in test_cases {
@@ -1190,11 +1209,11 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Int(1)),
             Instruction::PushLiteral(Cell::Int(2)),
-            Instruction::Equal,  // Pops 2 Cells, pushes 1 Tri
+            Instruction::Equal, // Pops 2 Cells, pushes 1 Tri
             Instruction::PushLiteral(Cell::Int(3)),
             Instruction::PushLiteral(Cell::Int(4)),
-            Instruction::Equal,  // Pops 2 Cells, pushes 1 Tri
-            // Now stack has 2 Tri values - malformed!
+            Instruction::Equal, // Pops 2 Cells, pushes 1 Tri
+                                // Now stack has 2 Tri values - malformed!
         ]);
 
         let row = make_row(vec![]);
@@ -1245,9 +1264,9 @@ mod tests {
         let mut vm = Vm::new();
 
         let test_cases = vec![
-            (Cell::Int(15), Cell::Int(10), Tri::True),  // Greater than
-            (Cell::Int(10), Cell::Int(10), Tri::True),  // Equal
-            (Cell::Int(5), Cell::Int(10), Tri::False),  // Less than
+            (Cell::Int(15), Cell::Int(10), Tri::True), // Greater than
+            (Cell::Int(10), Cell::Int(10), Tri::True), // Equal
+            (Cell::Int(5), Cell::Int(10), Tri::False), // Less than
         ];
 
         for (lhs, rhs, expected) in test_cases {
@@ -1267,7 +1286,7 @@ mod tests {
         let mut vm = Vm::new();
 
         let program = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(99),  // Missing column
+            Instruction::LoadColumn(99), // Missing column
             Instruction::IsNotNull,
         ]);
 
@@ -1297,10 +1316,10 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Bool(true)),
             Instruction::PushLiteral(Cell::Bool(true)),
-            Instruction::Equal,  // Push Tri::True
+            Instruction::Equal, // Push Tri::True
             Instruction::PushLiteral(Cell::Bool(false)),
             Instruction::PushLiteral(Cell::Bool(false)),
-            Instruction::Equal,  // Push Tri::True (false == false)
+            Instruction::Equal, // Push Tri::True (false == false)
             Instruction::Or,
         ]);
 
@@ -1315,7 +1334,7 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Bool(true)),
             Instruction::PushLiteral(Cell::Bool(true)),
-            Instruction::Equal,  // Push Tri::True
+            Instruction::Equal, // Push Tri::True
             Instruction::Not,
         ]);
 
@@ -1330,7 +1349,9 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::String("test".into())),
             Instruction::PushLiteral(Cell::Null),
-            Instruction::Like { case_sensitive: true },
+            Instruction::Like {
+                case_sensitive: true,
+            },
         ]);
 
         let row = make_row(vec![]);
@@ -1345,9 +1366,9 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Int(1)),
             Instruction::PushLiteral(Cell::Int(2)),
-            Instruction::Equal,  // Pushes Tri
+            Instruction::Equal, // Pushes Tri
             Instruction::PushLiteral(Cell::Int(3)),
-            Instruction::Add,  // Tries to pop Cell but gets Tri
+            Instruction::Add, // Tries to pop Cell but gets Tri
         ]);
 
         let row = make_row(vec![]);
@@ -1363,7 +1384,7 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Int(1)),
             Instruction::PushLiteral(Cell::Int(2)),
-            Instruction::And,  // Tries to pop Tri but gets Cell
+            Instruction::And, // Tries to pop Tri but gets Cell
         ]);
 
         let row = make_row(vec![]);
@@ -1689,7 +1710,7 @@ mod tests {
 
         // Empty stack, try to pop cell
         let program = BytecodeProgram::new(vec![
-            Instruction::Add,  // Tries to pop 2 cells from empty stack
+            Instruction::Add, // Tries to pop 2 cells from empty stack
         ]);
 
         let row = make_row(vec![]);
@@ -1703,7 +1724,7 @@ mod tests {
 
         // Empty stack, try to pop tri
         let program = BytecodeProgram::new(vec![
-            Instruction::And,  // Tries to pop 2 Tri from empty stack
+            Instruction::And, // Tries to pop 2 Tri from empty stack
         ]);
 
         let row = make_row(vec![]);
@@ -1963,16 +1984,26 @@ mod tests {
             let program = BytecodeProgram::new(vec![
                 Instruction::PushLiteral(Cell::String(string.into())),
                 Instruction::PushLiteral(Cell::String(pattern.into())),
-                Instruction::Like { case_sensitive: true },
+                Instruction::Like {
+                    case_sensitive: true,
+                },
             ]);
 
             let row = make_row(vec![]);
             let result = vm.eval(&program, &row).unwrap();
 
             if expected {
-                assert_eq!(result, Tri::True, "'{string}' LIKE '{pattern}' should be True");
+                assert_eq!(
+                    result,
+                    Tri::True,
+                    "'{string}' LIKE '{pattern}' should be True"
+                );
             } else {
-                assert_eq!(result, Tri::False, "'{string}' LIKE '{pattern}' should be False");
+                assert_eq!(
+                    result,
+                    Tri::False,
+                    "'{string}' LIKE '{pattern}' should be False"
+                );
             }
         }
     }
@@ -1996,16 +2027,26 @@ mod tests {
             let program = BytecodeProgram::new(vec![
                 Instruction::PushLiteral(Cell::String(string.into())),
                 Instruction::PushLiteral(Cell::String(pattern.into())),
-                Instruction::Like { case_sensitive: true },
+                Instruction::Like {
+                    case_sensitive: true,
+                },
             ]);
 
             let row = make_row(vec![]);
             let result = vm.eval(&program, &row).unwrap();
 
             if expected {
-                assert_eq!(result, Tri::True, "'{string}' LIKE '{pattern}' should be True");
+                assert_eq!(
+                    result,
+                    Tri::True,
+                    "'{string}' LIKE '{pattern}' should be True"
+                );
             } else {
-                assert_eq!(result, Tri::False, "'{string}' LIKE '{pattern}' should be False");
+                assert_eq!(
+                    result,
+                    Tri::False,
+                    "'{string}' LIKE '{pattern}' should be False"
+                );
             }
         }
     }
@@ -2027,16 +2068,26 @@ mod tests {
             let program = BytecodeProgram::new(vec![
                 Instruction::PushLiteral(Cell::String(string.into())),
                 Instruction::PushLiteral(Cell::String(pattern.into())),
-                Instruction::Like { case_sensitive: true },
+                Instruction::Like {
+                    case_sensitive: true,
+                },
             ]);
 
             let row = make_row(vec![]);
             let result = vm.eval(&program, &row).unwrap();
 
             if expected {
-                assert_eq!(result, Tri::True, "'{string}' LIKE '{pattern}' should be True");
+                assert_eq!(
+                    result,
+                    Tri::True,
+                    "'{string}' LIKE '{pattern}' should be True"
+                );
             } else {
-                assert_eq!(result, Tri::False, "'{string}' LIKE '{pattern}' should be False");
+                assert_eq!(
+                    result,
+                    Tri::False,
+                    "'{string}' LIKE '{pattern}' should be False"
+                );
             }
         }
     }
@@ -2056,16 +2107,26 @@ mod tests {
             let program = BytecodeProgram::new(vec![
                 Instruction::PushLiteral(Cell::String(string.into())),
                 Instruction::PushLiteral(Cell::String(pattern.into())),
-                Instruction::Like { case_sensitive: true },
+                Instruction::Like {
+                    case_sensitive: true,
+                },
             ]);
 
             let row = make_row(vec![]);
             let result = vm.eval(&program, &row).unwrap();
 
             if expected {
-                assert_eq!(result, Tri::True, "'{string}' LIKE '{pattern}' should be True");
+                assert_eq!(
+                    result,
+                    Tri::True,
+                    "'{string}' LIKE '{pattern}' should be True"
+                );
             } else {
-                assert_eq!(result, Tri::False, "'{string}' LIKE '{pattern}' should be False");
+                assert_eq!(
+                    result,
+                    Tri::False,
+                    "'{string}' LIKE '{pattern}' should be False"
+                );
             }
         }
     }

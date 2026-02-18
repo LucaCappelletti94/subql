@@ -2,13 +2,13 @@
 //!
 //! Run with: cargo run --release --features dhat-heap --bin memory_profile
 
-use subql::{
-    SubscriptionEngine, SubscriptionSpec, WalEvent, SchemaCatalog,
-    EventKind, Cell, RowImage, PrimaryKey, TableId, DefaultIds,
-};
 use sqlparser::dialect::PostgreSqlDialect;
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
+use subql::{
+    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
+    SubscriptionSpec, TableId, WalEvent,
+};
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -44,11 +44,14 @@ impl SchemaCatalog for BenchCatalog {
     }
 
     fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-        self.columns.get(&(table_id, column_name.to_string())).copied()
+        self.columns
+            .get(&(table_id, column_name.to_string()))
+            .copied()
     }
 
     fn table_arity(&self, table_id: TableId) -> Option<usize> {
-        self.tables.values()
+        self.tables
+            .values()
             .find(|(id, _)| *id == table_id)
             .map(|(_, arity)| *arity)
     }
@@ -119,7 +122,11 @@ fn main() {
         let user_count = engine.users(&event).unwrap().count();
 
         if (i + 1) % 100 == 0 {
-            println!("  {} events dispatched (matched {} users)", i + 1, user_count);
+            println!(
+                "  {} events dispatched (matched {} users)",
+                i + 1,
+                user_count
+            );
         }
     }
 

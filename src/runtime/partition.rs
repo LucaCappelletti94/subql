@@ -1,14 +1,14 @@
 //! Table partition with lock-free snapshot reads
 
-use std::sync::Arc;
-use arc_swap::ArcSwap;
-use roaring::RoaringBitmap;
-use crate::{IdTypes, TableId, ColumnId, RowImage, EventKind};
 use super::{
     ids::PredicateId,
-    predicate::{Predicate, PredicateStore, Binding},
     indexes::{HybridIndexes, IndexableAtom, IndexableCell},
+    predicate::{Binding, Predicate, PredicateStore},
 };
+use crate::{ColumnId, EventKind, IdTypes, RowImage, TableId};
+use arc_swap::ArcSwap;
+use roaring::RoaringBitmap;
+use std::sync::Arc;
 
 /// Immutable snapshot of table partition
 ///
@@ -61,7 +61,11 @@ impl<I: IdTypes> TablePartition<I> {
     ///
     /// Rebuilds indexes and performs atomic swap.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn add_predicate(&mut self, predicate: Predicate, atoms: Vec<IndexableAtom>) -> PredicateId {
+    pub fn add_predicate(
+        &mut self,
+        predicate: Predicate,
+        atoms: Vec<IndexableAtom>,
+    ) -> PredicateId {
         let deps = predicate.dependency_columns.to_vec();
 
         // COW: clone-on-write if snapshot still shares this Arc
@@ -141,11 +145,7 @@ impl<I: IdTypes> TablePartition<I> {
                 super::indexes::extract_indexable_atoms(&pred.bytecode, &pred_deps)
             };
 
-            new_indexes.add_predicate(
-                PredicateId::from_slab_index(idx),
-                &pred_atoms,
-                &pred_deps,
-            );
+            new_indexes.add_predicate(PredicateId::from_slab_index(idx), &pred_atoms, &pred_deps);
         }
 
         new_indexes.finalize_ranges();
@@ -167,11 +167,7 @@ impl<I: IdTypes> TablePartition<I> {
             let pred_deps = pred.dependency_columns.to_vec();
             let pred_atoms = super::indexes::extract_indexable_atoms(&pred.bytecode, &pred_deps);
 
-            new_indexes.add_predicate(
-                PredicateId::from_slab_index(idx),
-                &pred_atoms,
-                &pred_deps,
-            );
+            new_indexes.add_predicate(PredicateId::from_slab_index(idx), &pred_atoms, &pred_deps);
         }
 
         new_indexes.finalize_ranges();
@@ -238,11 +234,19 @@ impl<I: IdTypes> TablePartition<I> {
 
             // NULL index
             if cell.is_null() {
-                if let Some(bitmap) = snapshot.indexes.null_checks.get(&(col_id, super::indexes::NullKind::IsNull)) {
+                if let Some(bitmap) = snapshot
+                    .indexes
+                    .null_checks
+                    .get(&(col_id, super::indexes::NullKind::IsNull))
+                {
                     candidates |= bitmap;
                 }
             } else if !cell.is_missing() {
-                if let Some(bitmap) = snapshot.indexes.null_checks.get(&(col_id, super::indexes::NullKind::IsNotNull)) {
+                if let Some(bitmap) = snapshot
+                    .indexes
+                    .null_checks
+                    .get(&(col_id, super::indexes::NullKind::IsNotNull))
+                {
                     candidates |= bitmap;
                 }
             }
@@ -265,10 +269,13 @@ impl<I: IdTypes> TablePartition<I> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{compiler::{BytecodeProgram, Instruction}, Cell, DefaultIds};
-    use super::super::indexes::{IndexableAtom, NullKind};
     use super::super::ids::UserOrdinal;
+    use super::super::indexes::{IndexableAtom, NullKind};
+    use super::*;
+    use crate::{
+        compiler::{BytecodeProgram, Instruction},
+        Cell, DefaultIds,
+    };
 
     fn make_predicate(id: usize, hash: u128) -> Predicate {
         Predicate {
@@ -340,7 +347,7 @@ mod tests {
 
         // UPDATE with no changed columns → should return empty (except fallback)
         let candidates = partition.select_candidates(&row, EventKind::Update, &[]);
-        assert!(!candidates.is_empty());  // Fallback is always included
+        assert!(!candidates.is_empty()); // Fallback is always included
 
         // UPDATE with changed column 1 → should include predicate
         let candidates = partition.select_candidates(&row, EventKind::Update, &[1]);
@@ -417,10 +424,13 @@ mod tests {
 
         // Add predicate with equality index
         let pred = make_predicate(0, 0x1234);
-        partition.add_predicate(pred, vec![IndexableAtom::Equality {
-            column_id: 0,
-            value: IndexableCell::Int(42),
-        }]);
+        partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Equality {
+                column_id: 0,
+                value: IndexableCell::Int(42),
+            }],
+        );
 
         // Row with matching value
         let row = make_row(vec![Cell::Int(42)]);
@@ -436,17 +446,23 @@ mod tests {
 
         // Add predicate with IS NULL check
         let pred1 = make_predicate(0, 0x1234);
-        partition.add_predicate(pred1, vec![IndexableAtom::Null {
-            column_id: 0,
-            kind: NullKind::IsNull,
-        }]);
+        partition.add_predicate(
+            pred1,
+            vec![IndexableAtom::Null {
+                column_id: 0,
+                kind: NullKind::IsNull,
+            }],
+        );
 
         // Add predicate with IS NOT NULL check
         let pred2 = make_predicate(1, 0x5678);
-        partition.add_predicate(pred2, vec![IndexableAtom::Null {
-            column_id: 1,
-            kind: NullKind::IsNotNull,
-        }]);
+        partition.add_predicate(
+            pred2,
+            vec![IndexableAtom::Null {
+                column_id: 1,
+                kind: NullKind::IsNotNull,
+            }],
+        );
 
         // Row with NULL and non-NULL values
         let row = make_row(vec![Cell::Null, Cell::Int(100)]);
@@ -462,10 +478,13 @@ mod tests {
 
         // Add a predicate
         let pred = make_predicate(0, 0x1234);
-        partition.add_predicate(pred, vec![IndexableAtom::Equality {
-            column_id: 0,
-            value: IndexableCell::Int(42),
-        }]);
+        partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Equality {
+                column_id: 0,
+                value: IndexableCell::Int(42),
+            }],
+        );
 
         // Manually trigger rebuild (normally happens on unsubscribe with removal)
         partition.rebuild_all_indexes();
@@ -483,10 +502,13 @@ mod tests {
         // Add predicate that depends on column 1
         // (make_predicate already sets dependency_columns to [1u16])
         let pred = make_predicate(0, 0x1234);
-        partition.add_predicate(pred, vec![IndexableAtom::Equality {
-            column_id: 1,
-            value: IndexableCell::Int(100),
-        }]);
+        partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Equality {
+                column_id: 1,
+                value: IndexableCell::Int(100),
+            }],
+        );
 
         let row = make_row(vec![Cell::Int(1), Cell::Int(100), Cell::Int(2)]);
 
@@ -508,10 +530,13 @@ mod tests {
         // Add predicate with IS NULL index on column 1
         let pred = make_predicate(0, 0x9999);
         let pred_id = pred.id;
-        partition.add_predicate(pred, vec![IndexableAtom::Null {
-            column_id: 1,
-            kind: NullKind::IsNull,
-        }]);
+        partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Null {
+                column_id: 1,
+                kind: NullKind::IsNull,
+            }],
+        );
 
         // Row with NULL in column 1
         let row = make_row(vec![Cell::Int(1), Cell::Null, Cell::Int(2)]);
@@ -528,10 +553,13 @@ mod tests {
 
         // Predicate depends on column 1 and is indexable (no fallback).
         let pred = make_predicate(0, 0xAAAA);
-        partition.add_predicate(pred, vec![IndexableAtom::Equality {
-            column_id: 1,
-            value: IndexableCell::Int(100),
-        }]);
+        partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Equality {
+                column_id: 1,
+                value: IndexableCell::Int(100),
+            }],
+        );
 
         let row = make_row(vec![Cell::Int(1), Cell::Int(100)]);
 
@@ -547,17 +575,23 @@ mod tests {
         // Predicate that depends on changed column 0.
         let mut pred_changed = make_predicate(0, 0xBBBB);
         pred_changed.dependency_columns = Arc::from([0u16]);
-        let pred_changed_id = partition.add_predicate(pred_changed, vec![IndexableAtom::Equality {
-            column_id: 0,
-            value: IndexableCell::Int(1),
-        }]);
+        let pred_changed_id = partition.add_predicate(
+            pred_changed,
+            vec![IndexableAtom::Equality {
+                column_id: 0,
+                value: IndexableCell::Int(1),
+            }],
+        );
 
         // Predicate that depends on unchanged column 1.
         let pred_unchanged = make_predicate(1, 0xCCCC);
-        let pred_unchanged_id = partition.add_predicate(pred_unchanged, vec![IndexableAtom::Equality {
-            column_id: 1,
-            value: IndexableCell::Int(100),
-        }]);
+        let pred_unchanged_id = partition.add_predicate(
+            pred_unchanged,
+            vec![IndexableAtom::Equality {
+                column_id: 1,
+                value: IndexableCell::Int(100),
+            }],
+        );
 
         let row = make_row(vec![Cell::Int(1), Cell::Int(100)]);
 

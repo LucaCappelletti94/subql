@@ -2,11 +2,11 @@
 //!
 //! Supports generic SQL dialects via sqlparser crate.
 
-use sqlparser::ast::{Expr, Statement, SetExpr, TableFactor};
+use super::{BytecodeProgram, Instruction};
+use crate::{Cell, RegisterError, SchemaCatalog, TableId};
+use sqlparser::ast::{Expr, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
-use crate::{RegisterError, TableId, SchemaCatalog, Cell};
-use super::{BytecodeProgram, Instruction};
 
 /// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
 const MAX_EXPR_DEPTH: usize = 512;
@@ -32,21 +32,20 @@ pub fn parse_and_compile<D: Dialect>(
 ) -> Result<(TableId, BytecodeProgram), RegisterError> {
     if sql.len() > MAX_SQL_LEN {
         return Err(RegisterError::UnsupportedSql(
-            "SQL input too long".to_string()
+            "SQL input too long".to_string(),
         ));
     }
 
     // Parse SQL
-    let statements = Parser::parse_sql(dialect, sql)
-        .map_err(|e| RegisterError::ParseError {
-            line: 1, // sqlparser doesn't provide line numbers easily
-            column: 0,
-            message: e.to_string(),
-        })?;
+    let statements = Parser::parse_sql(dialect, sql).map_err(|e| RegisterError::ParseError {
+        line: 1, // sqlparser doesn't provide line numbers easily
+        column: 0,
+        message: e.to_string(),
+    })?;
 
     if statements.len() != 1 {
         return Err(RegisterError::UnsupportedSql(
-            "Expected exactly one SELECT statement".to_string()
+            "Expected exactly one SELECT statement".to_string(),
         ));
     }
 
@@ -56,7 +55,8 @@ pub fn parse_and_compile<D: Dialect>(
     let (table_name, where_clause) = extract_table_and_where(stmt)?;
 
     // Resolve table ID
-    let table_id = catalog.table_id(&table_name)
+    let table_id = catalog
+        .table_id(&table_name)
         .ok_or_else(|| RegisterError::UnknownTable(table_name.clone()))?;
 
     // Compile WHERE clause to bytecode
@@ -65,17 +65,13 @@ pub fn parse_and_compile<D: Dialect>(
     } else {
         // No WHERE clause = always match
         // Push True onto stack
-        BytecodeProgram::new(vec![
-            Instruction::PushLiteral(Cell::Bool(true)),
-        ])
+        BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(true))])
     };
 
     Ok((table_id, program))
 }
 
-fn extract_table_and_where(stmt: &Statement)
-    -> Result<(String, Option<Expr>), RegisterError>
-{
+fn extract_table_and_where(stmt: &Statement) -> Result<(String, Option<Expr>), RegisterError> {
     match stmt {
         Statement::Query(query) => {
             match query.body.as_ref() {
@@ -165,7 +161,7 @@ fn compile_expr_recursive(
 
     if depth > MAX_EXPR_DEPTH {
         return Err(RegisterError::UnsupportedSql(
-            "Expression nesting too deep".to_string()
+            "Expression nesting too deep".to_string(),
         ));
     }
 
@@ -200,9 +196,9 @@ fn compile_expr_recursive(
                 BinaryOperator::Modulo => out.push(Instruction::Modulo),
 
                 _ => {
-                    return Err(RegisterError::UnsupportedSql(
-                        format!("Binary operator {op:?} not supported")
-                    ));
+                    return Err(RegisterError::UnsupportedSql(format!(
+                        "Binary operator {op:?} not supported"
+                    )));
                 }
             }
         }
@@ -211,27 +207,29 @@ fn compile_expr_recursive(
         // Identifiers (column references)
         // ====================================================================
         Expr::Identifier(ident) => {
-            let col_id = catalog.column_id(table_id, &ident.value)
-                .ok_or_else(|| RegisterError::UnknownColumn {
+            let col_id = catalog.column_id(table_id, &ident.value).ok_or_else(|| {
+                RegisterError::UnknownColumn {
                     table_id,
                     column: ident.value.clone(),
-                })?;
+                }
+            })?;
             out.push(Instruction::LoadColumn(col_id));
         }
 
         Expr::CompoundIdentifier(parts) => {
             // Handle table.column format
             if parts.len() == 2 {
-                let col_id = catalog.column_id(table_id, &parts[1].value)
+                let col_id = catalog
+                    .column_id(table_id, &parts[1].value)
                     .ok_or_else(|| RegisterError::UnknownColumn {
                         table_id,
                         column: parts[1].value.clone(),
                     })?;
                 out.push(Instruction::LoadColumn(col_id));
             } else {
-                return Err(RegisterError::UnsupportedSql(
-                    format!("Complex identifier {parts:?} not supported")
-                ));
+                return Err(RegisterError::UnsupportedSql(format!(
+                    "Complex identifier {parts:?} not supported"
+                )));
             }
         }
 
@@ -246,7 +244,11 @@ fn compile_expr_recursive(
         // ====================================================================
         // IN Lists
         // ====================================================================
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             // Compile the expression being tested
             compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
 
@@ -274,7 +276,12 @@ fn compile_expr_recursive(
         // ====================================================================
         // BETWEEN
         // ====================================================================
-        Expr::Between { expr, low, high, negated } => {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             // Stack order: value, lower, upper
             compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
             compile_expr_recursive(low, table_id, catalog, out, depth + 1)?;
@@ -315,9 +322,9 @@ fn compile_expr_recursive(
                     out.push(Instruction::Negate);
                 }
                 _ => {
-                    return Err(RegisterError::UnsupportedSql(
-                        format!("Unary operator {op:?} not supported")
-                    ));
+                    return Err(RegisterError::UnsupportedSql(format!(
+                        "Unary operator {op:?} not supported"
+                    )));
                 }
             }
         }
@@ -325,10 +332,16 @@ fn compile_expr_recursive(
         // ====================================================================
         // LIKE Pattern Matching
         // ====================================================================
-        Expr::Like { expr, pattern, negated, escape_char, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            escape_char,
+            ..
+        } => {
             if escape_char.is_some() {
                 return Err(RegisterError::UnsupportedSql(
-                    "LIKE ESCAPE not yet supported".to_string()
+                    "LIKE ESCAPE not yet supported".to_string(),
                 ));
             }
 
@@ -337,17 +350,25 @@ fn compile_expr_recursive(
             compile_expr_recursive(pattern, table_id, catalog, out, depth + 1)?;
 
             // Case-sensitive LIKE by default
-            out.push(Instruction::Like { case_sensitive: true });
+            out.push(Instruction::Like {
+                case_sensitive: true,
+            });
 
             if *negated {
                 out.push(Instruction::Not);
             }
         }
 
-        Expr::ILike { expr, pattern, negated, escape_char, .. } => {
+        Expr::ILike {
+            expr,
+            pattern,
+            negated,
+            escape_char,
+            ..
+        } => {
             if escape_char.is_some() {
                 return Err(RegisterError::UnsupportedSql(
-                    "ILIKE ESCAPE not yet supported".to_string()
+                    "ILIKE ESCAPE not yet supported".to_string(),
                 ));
             }
 
@@ -356,7 +377,9 @@ fn compile_expr_recursive(
             compile_expr_recursive(pattern, table_id, catalog, out, depth + 1)?;
 
             // Case-insensitive LIKE
-            out.push(Instruction::Like { case_sensitive: false });
+            out.push(Instruction::Like {
+                case_sensitive: false,
+            });
 
             if *negated {
                 out.push(Instruction::Not);
@@ -399,29 +422,27 @@ fn value_to_cell(val: &sqlparser::ast::Value) -> Result<Cell, RegisterError> {
             } else if let Ok(f) = n.parse::<f64>() {
                 Ok(Cell::Float(f))
             } else {
-                Err(RegisterError::TypeError(
-                    format!("Cannot parse number: {n}")
-                ))
+                Err(RegisterError::TypeError(format!(
+                    "Cannot parse number: {n}"
+                )))
             }
         }
         Value::SingleQuotedString(s)
         | Value::DoubleQuotedString(s)
         | Value::NationalStringLiteral(s)
-        | Value::HexStringLiteral(s) => {
-            Ok(Cell::String(s.as_str().into()))
-        }
-        _ => Err(RegisterError::UnsupportedSql(
-            format!("Value type {val:?} not supported")
-        )),
+        | Value::HexStringLiteral(s) => Ok(Cell::String(s.as_str().into())),
+        _ => Err(RegisterError::UnsupportedSql(format!(
+            "Value type {val:?} not supported"
+        ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::dialect::{PostgreSqlDialect, MySqlDialect, SQLiteDialect};
-    use std::collections::HashMap;
     use crate::testing::MockCatalog;
+    use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+    use std::collections::HashMap;
 
     fn make_catalog() -> MockCatalog {
         let mut tables = HashMap::new();
@@ -550,11 +571,14 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),  // age column
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::GreaterThan,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1), // age column
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::GreaterThan,
+            ]
+        );
     }
 
     #[test]
@@ -567,11 +591,14 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(0),  // id column
-            Instruction::PushLiteral(Cell::Int(42)),
-            Instruction::Equal,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(0), // id column
+                Instruction::PushLiteral(Cell::Int(42)),
+                Instruction::Equal,
+            ]
+        );
     }
 
     #[test]
@@ -584,15 +611,18 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),  // age
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::GreaterThan,
-            Instruction::LoadColumn(0),  // id
-            Instruction::PushLiteral(Cell::Int(42)),
-            Instruction::Equal,
-            Instruction::And,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1), // age
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::GreaterThan,
+                Instruction::LoadColumn(0), // id
+                Instruction::PushLiteral(Cell::Int(42)),
+                Instruction::Equal,
+                Instruction::And,
+            ]
+        );
     }
 
     #[test]
@@ -605,15 +635,18 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),  // age
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::LessThan,
-            Instruction::LoadColumn(1),  // age again
-            Instruction::PushLiteral(Cell::Int(65)),
-            Instruction::GreaterThan,
-            Instruction::Or,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1), // age
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::LessThan,
+                Instruction::LoadColumn(1), // age again
+                Instruction::PushLiteral(Cell::Int(65)),
+                Instruction::GreaterThan,
+                Instruction::Or,
+            ]
+        );
     }
 
     #[test]
@@ -626,14 +659,13 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(0),  // id
-            Instruction::In(vec![
-                Cell::Int(1),
-                Cell::Int(2),
-                Cell::Int(3),
-            ]),
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(0), // id
+                Instruction::In(vec![Cell::Int(1), Cell::Int(2), Cell::Int(3),]),
+            ]
+        );
     }
 
     #[test]
@@ -646,11 +678,14 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(0),
-            Instruction::In(vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]),
-            Instruction::Not,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(0),
+                Instruction::In(vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]),
+                Instruction::Not,
+            ]
+        );
     }
 
     #[test]
@@ -663,12 +698,15 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),  // age
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::PushLiteral(Cell::Int(65)),
-            Instruction::Between,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1), // age
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::PushLiteral(Cell::Int(65)),
+                Instruction::Between,
+            ]
+        );
     }
 
     #[test]
@@ -681,13 +719,16 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::PushLiteral(Cell::Int(65)),
-            Instruction::Between,
-            Instruction::Not,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1),
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::PushLiteral(Cell::Int(65)),
+                Instruction::Between,
+                Instruction::Not,
+            ]
+        );
     }
 
     #[test]
@@ -700,10 +741,13 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(2),  // email
-            Instruction::IsNull,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(2), // email
+                Instruction::IsNull,
+            ]
+        );
     }
 
     #[test]
@@ -716,10 +760,10 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(2),
-            Instruction::IsNotNull,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![Instruction::LoadColumn(2), Instruction::IsNotNull,]
+        );
     }
 
     #[test]
@@ -732,11 +776,16 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(2),  // email
-            Instruction::PushLiteral(Cell::String("%@example.com".into())),
-            Instruction::Like { case_sensitive: true },
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(2), // email
+                Instruction::PushLiteral(Cell::String("%@example.com".into())),
+                Instruction::Like {
+                    case_sensitive: true
+                },
+            ]
+        );
     }
 
     #[test]
@@ -749,12 +798,17 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(2),
-            Instruction::PushLiteral(Cell::String("%@example.com".into())),
-            Instruction::Like { case_sensitive: true },
-            Instruction::Not,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(2),
+                Instruction::PushLiteral(Cell::String("%@example.com".into())),
+                Instruction::Like {
+                    case_sensitive: true
+                },
+                Instruction::Not,
+            ]
+        );
     }
 
     #[test]
@@ -767,12 +821,15 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::LessThan,
-            Instruction::Not,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1),
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::LessThan,
+                Instruction::Not,
+            ]
+        );
     }
 
     #[test]
@@ -786,17 +843,20 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),  // age
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::GreaterThan,
-            Instruction::LoadColumn(1),  // age
-            Instruction::IsNull,
-            Instruction::Or,
-            Instruction::LoadColumn(2),  // email
-            Instruction::IsNotNull,
-            Instruction::And,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1), // age
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::GreaterThan,
+                Instruction::LoadColumn(1), // age
+                Instruction::IsNull,
+                Instruction::Or,
+                Instruction::LoadColumn(2), // email
+                Instruction::IsNotNull,
+                Instruction::And,
+            ]
+        );
     }
 
     #[test]
@@ -819,8 +879,11 @@ mod tests {
             assert!(result.is_ok(), "Failed to parse: {}", where_clause);
 
             let (_, program) = result.unwrap();
-            assert_eq!(program.instructions[2], expected_op,
-                      "Wrong operator for: {}", where_clause);
+            assert_eq!(
+                program.instructions[2], expected_op,
+                "Wrong operator for: {}",
+                where_clause
+            );
         }
     }
 
@@ -834,11 +897,14 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(2),
-            Instruction::PushLiteral(Cell::String("test@example.com".into())),
-            Instruction::Equal,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(2),
+                Instruction::PushLiteral(Cell::String("test@example.com".into())),
+                Instruction::Equal,
+            ]
+        );
     }
 
     #[test]
@@ -853,11 +919,14 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Null),
-            Instruction::Equal,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1),
+                Instruction::PushLiteral(Cell::Null),
+                Instruction::Equal,
+            ]
+        );
     }
 
     #[test]
@@ -895,11 +964,14 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::GreaterThan,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1),
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::GreaterThan,
+            ]
+        );
     }
 
     #[test]
@@ -912,11 +984,14 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Float(18.5)),
-            Instruction::GreaterThan,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1),
+                Instruction::PushLiteral(Cell::Float(18.5)),
+                Instruction::GreaterThan,
+            ]
+        );
     }
 
     #[test]
@@ -929,13 +1004,16 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1), // price
-            Instruction::LoadColumn(2), // quantity
-            Instruction::Add,
-            Instruction::PushLiteral(Cell::Int(100)),
-            Instruction::GreaterThan,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1), // price
+                Instruction::LoadColumn(2), // quantity
+                Instruction::Add,
+                Instruction::PushLiteral(Cell::Int(100)),
+                Instruction::GreaterThan,
+            ]
+        );
     }
 
     #[test]
@@ -1220,11 +1298,14 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),  // age column
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::GreaterThan,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1), // age column
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::GreaterThan,
+            ]
+        );
     }
 
     #[test]
@@ -1263,11 +1344,16 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(2),  // email
-            Instruction::PushLiteral(Cell::String("%TEST%".into())),
-            Instruction::Like { case_sensitive: false },
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(2), // email
+                Instruction::PushLiteral(Cell::String("%TEST%".into())),
+                Instruction::Like {
+                    case_sensitive: false
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1280,12 +1366,17 @@ mod tests {
         assert!(result.is_ok());
 
         let (_, program) = result.unwrap();
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(2),
-            Instruction::PushLiteral(Cell::String("%spam%".into())),
-            Instruction::Like { case_sensitive: false },
-            Instruction::Not,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(2),
+                Instruction::PushLiteral(Cell::String("%spam%".into())),
+                Instruction::Like {
+                    case_sensitive: false
+                },
+                Instruction::Not,
+            ]
+        );
     }
 
     #[test]
@@ -1299,11 +1390,14 @@ mod tests {
 
         let (_, program) = result.unwrap();
         // Unary + is a no-op, should just load column
-        assert_eq!(program.instructions, vec![
-            Instruction::LoadColumn(1),  // age
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::Equal,
-        ]);
+        assert_eq!(
+            program.instructions,
+            vec![
+                Instruction::LoadColumn(1), // age
+                Instruction::PushLiteral(Cell::Int(18)),
+                Instruction::Equal,
+            ]
+        );
     }
 
     #[test]
@@ -1329,7 +1423,9 @@ mod tests {
 
         let (_, program) = result.unwrap();
         // Should compile the boolean literal
-        assert!(program.instructions.contains(&Instruction::PushLiteral(Cell::Bool(true))));
+        assert!(program
+            .instructions
+            .contains(&Instruction::PushLiteral(Cell::Bool(true))));
     }
 
     // ========================================================================

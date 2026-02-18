@@ -1,12 +1,12 @@
 //! Event dispatch pipeline
 
+use super::{ids::UserOrdinal, partition::TablePartition};
+use crate::{
+    compiler::{Tri, Vm},
+    DispatchError, EventKind, IdTypes, WalEvent,
+};
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
-use crate::{IdTypes, WalEvent, EventKind, DispatchError, compiler::{Vm, Tri}};
-use super::{
-    ids::UserOrdinal,
-    partition::TablePartition,
-};
 
 /// User dictionary for ordinal ↔ UserId translation
 ///
@@ -115,12 +115,30 @@ pub fn dispatch_users<'a, I: IdTypes>(
 ) -> Result<MatchedUsers<'a, I>, DispatchError> {
     // 1. Get row image based on event kind (validates presence)
     let row = match event.kind {
-        EventKind::Insert => event.new_row.as_ref()
-            .ok_or(DispatchError::MissingRequiredRowImage("INSERT requires new_row"))?,
-        EventKind::Update => event.new_row.as_ref()
-            .ok_or(DispatchError::MissingRequiredRowImage("UPDATE requires new_row"))?,
-        EventKind::Delete => event.old_row.as_ref()
-            .ok_or(DispatchError::MissingRequiredRowImage("DELETE requires old_row"))?,
+        EventKind::Insert => {
+            event
+                .new_row
+                .as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage(
+                    "INSERT requires new_row",
+                ))?
+        }
+        EventKind::Update => {
+            event
+                .new_row
+                .as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage(
+                    "UPDATE requires new_row",
+                ))?
+        }
+        EventKind::Delete => {
+            event
+                .old_row
+                .as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage(
+                    "DELETE requires old_row",
+                ))?
+        }
     };
 
     // 2. Select candidates (index lookups + fallback)
@@ -135,7 +153,8 @@ pub fn dispatch_users<'a, I: IdTypes>(
 
         if let Some(pred) = snapshot.predicates.get_predicate(pred_id) {
             // Evaluate predicate against row
-            let result = vm.eval(&pred.bytecode, row)
+            let result = vm
+                .eval(&pred.bytecode, row)
                 .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
 
             // Only Tri::True is a match
@@ -155,12 +174,11 @@ pub fn dispatch_users<'a, I: IdTypes>(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::DefaultIds;
+    use std::sync::Arc;
 
     #[test]
     fn test_user_dictionary_get_or_create() {
@@ -351,16 +369,17 @@ mod tests {
         let users: Vec<_> = (MatchedUsers {
             bitmap_iter: bitmap.into_iter(),
             dict: &dict,
-        }).collect();
+        })
+        .collect();
         assert_eq!(users, vec![10, 30]);
     }
 
     #[test]
     fn test_dispatch_users_update_event_matching() {
+        use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
-        use super::super::indexes::IndexableAtom;
-        use crate::compiler::{Vm, BytecodeProgram, Instruction};
+        use crate::compiler::{BytecodeProgram, Instruction, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
         let mut user_dict = UserDictionary::<DefaultIds>::new();
@@ -413,15 +432,18 @@ mod tests {
         let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
         assert!(result.is_ok());
         let users: Vec<_> = result.unwrap().collect();
-        assert!(users.contains(&42), "User 42 should match age > 18 with age=25");
+        assert!(
+            users.contains(&42),
+            "User 42 should match age > 18 with age=25"
+        );
     }
 
     #[test]
     fn test_dispatch_users_delete_event_matching() {
+        use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
-        use super::super::indexes::IndexableAtom;
-        use crate::compiler::{Vm, BytecodeProgram, Instruction};
+        use crate::compiler::{BytecodeProgram, Instruction, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
         let mut user_dict = UserDictionary::<DefaultIds>::new();
@@ -472,15 +494,18 @@ mod tests {
         let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
         assert!(result.is_ok());
         let users: Vec<_> = result.unwrap().collect();
-        assert!(users.contains(&99), "User 99 should match age < 30 with age=25");
+        assert!(
+            users.contains(&99),
+            "User 99 should match age < 30 with age=25"
+        );
     }
 
     #[test]
     fn test_dispatch_users_no_match() {
+        use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
-        use super::super::indexes::IndexableAtom;
-        use crate::compiler::{Vm, BytecodeProgram, Instruction};
+        use crate::compiler::{BytecodeProgram, Instruction, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
         let mut user_dict = UserDictionary::<DefaultIds>::new();
@@ -531,6 +556,9 @@ mod tests {
         let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
         assert!(result.is_ok());
         let users: Vec<_> = result.unwrap().collect();
-        assert!(users.is_empty(), "No users should match age > 50 with age=25");
+        assert!(
+            users.is_empty(),
+            "No users should match age > 50 with age=25"
+        );
     }
 }

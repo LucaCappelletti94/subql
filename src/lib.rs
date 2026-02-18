@@ -37,18 +37,20 @@
 // Lint configuration is in [lints] section of Cargo.toml
 
 // Re-export public API
-pub use types::*;
 pub use errors::*;
-pub use runtime::{SubscriptionEngine, MatchedUsers};
+pub use runtime::{MatchedUsers, SubscriptionEngine};
+pub use types::*;
+pub use wal::{Wal2JsonV1Parser, Wal2JsonV2Parser, WalParseError, WalParser};
 
 // Internal modules
-mod types;
 mod errors;
+mod types;
 
 pub mod compiler;
-pub mod runtime;
-pub mod persistence;
 pub mod config;
+pub mod persistence;
+pub mod runtime;
+pub mod wal;
 
 #[cfg(any(feature = "testing", test))]
 pub mod test_harnesses;
@@ -58,8 +60,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::collections::HashMap;
     use crate::{SchemaCatalog, TableId};
+    use std::collections::HashMap;
 
     pub struct MockCatalog {
         pub tables: HashMap<String, (TableId, usize)>,
@@ -72,11 +74,14 @@ pub(crate) mod testing {
         }
 
         fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-            self.columns.get(&(table_id, column_name.to_string())).copied()
+            self.columns
+                .get(&(table_id, column_name.to_string()))
+                .copied()
         }
 
         fn table_arity(&self, table_id: TableId) -> Option<usize> {
-            self.tables.values()
+            self.tables
+                .values()
                 .find(|(id, _)| *id == table_id)
                 .map(|(_, arity)| *arity)
         }

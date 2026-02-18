@@ -1,7 +1,7 @@
 //! VM bytecode instruction set for predicate evaluation
 
 use crate::{Cell, ColumnId};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// VM instruction for tri-state predicate evaluation
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -9,7 +9,6 @@ pub enum Instruction {
     // ========================================================================
     // Stack Operations
     // ========================================================================
-
     /// Push a literal cell value onto stack
     ///
     /// Stack: [...] → [..., cell]
@@ -24,7 +23,6 @@ pub enum Instruction {
     // ========================================================================
     // Comparison Operators (pop 2 cells, push Tri)
     // ========================================================================
-
     /// Equal: a = b
     ///
     /// NULL-safe: NULL = NULL → Unknown (not True!)
@@ -59,7 +57,6 @@ pub enum Instruction {
     // ========================================================================
     // NULL Checks (pop 1 cell, push Tri)
     // ========================================================================
-
     /// IS NULL check
     ///
     /// Stack: [..., cell] → [..., Tri]
@@ -73,7 +70,6 @@ pub enum Instruction {
     // ========================================================================
     // Logical Operators (pop 2 Tri, push Tri)
     // ========================================================================
-
     /// AND with tri-state semantics
     ///
     /// Stack: [..., a, b] → [..., Tri]
@@ -87,7 +83,6 @@ pub enum Instruction {
     // ========================================================================
     // Unary Operators (pop 1 Tri, push Tri)
     // ========================================================================
-
     /// NOT with tri-state semantics
     ///
     /// Stack: [..., tri] → [..., Tri]
@@ -96,7 +91,6 @@ pub enum Instruction {
     // ========================================================================
     // Arithmetic Operators (pop 2 cells, push cell)
     // ========================================================================
-
     /// Add: a + b
     ///
     /// Type coercion: Int + Int → Int, otherwise Float
@@ -144,7 +138,6 @@ pub enum Instruction {
     // ========================================================================
     // Special Operations
     // ========================================================================
-
     /// IN (...) - checks if top of stack is in literal set
     ///
     /// NULL IN (...) → Unknown
@@ -219,10 +212,10 @@ mod tests {
     fn test_extract_dependencies() {
         // age > 18 AND status = 'active'
         let instructions = vec![
-            Instruction::LoadColumn(5),  // age
+            Instruction::LoadColumn(5), // age
             Instruction::PushLiteral(Cell::Int(18)),
             Instruction::GreaterThan,
-            Instruction::LoadColumn(7),  // status
+            Instruction::LoadColumn(7), // status
             Instruction::PushLiteral(Cell::String("active".into())),
             Instruction::Equal,
             Instruction::And,
@@ -236,9 +229,7 @@ mod tests {
     #[test]
     fn test_constant_program() {
         // Just a literal true (e.g., WHERE true)
-        let instructions = vec![
-            Instruction::PushLiteral(Cell::Bool(true)),
-        ];
+        let instructions = vec![Instruction::PushLiteral(Cell::Bool(true))];
 
         let program = BytecodeProgram::new(instructions);
         assert_eq!(program.dependency_columns, Vec::<ColumnId>::new());
@@ -252,7 +243,7 @@ mod tests {
             Instruction::LoadColumn(5),
             Instruction::PushLiteral(Cell::Int(18)),
             Instruction::GreaterThan,
-            Instruction::LoadColumn(5),  // Same column again
+            Instruction::LoadColumn(5), // Same column again
             Instruction::PushLiteral(Cell::Int(65)),
             Instruction::LessThan,
             Instruction::And,

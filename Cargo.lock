@@ -943,6 +943,7 @@ dependencies = [
  "roaring",
  "seahash",
  "serde",
+ "serde_json",
  "slab",
  "sqlparser",
  "tempfile",

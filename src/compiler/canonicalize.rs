@@ -1,11 +1,11 @@
 //! SQL normalization and hashing for predicate deduplication
 
-use sqlparser::ast::{Expr, Statement, BinaryOperator};
+use crate::RegisterError;
+use seahash::SeaHasher;
+use sqlparser::ast::{BinaryOperator, Expr, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 use std::hash::{Hash, Hasher};
-use seahash::SeaHasher;
-use crate::RegisterError;
 
 /// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
 /// 128 is sufficient for any real-world SQL; lower values reduce stack usage.
@@ -42,7 +42,7 @@ pub type PredicateHash = u128;
 pub fn normalize_sql(sql: &str, dialect: &dyn Dialect) -> Result<String, RegisterError> {
     if sql.len() > MAX_SQL_LEN {
         return Err(RegisterError::UnsupportedSql(
-            "SQL input too long".to_string()
+            "SQL input too long".to_string(),
         ));
     }
 
@@ -50,16 +50,15 @@ pub fn normalize_sql(sql: &str, dialect: &dyn Dialect) -> Result<String, Registe
     check_sql_depth(sql)?;
 
     // Parse SQL
-    let statements = Parser::parse_sql(dialect, sql)
-        .map_err(|e| RegisterError::ParseError {
-            line: 1,
-            column: 0,
-            message: e.to_string(),
-        })?;
+    let statements = Parser::parse_sql(dialect, sql).map_err(|e| RegisterError::ParseError {
+        line: 1,
+        column: 0,
+        message: e.to_string(),
+    })?;
 
     if statements.len() != 1 {
         return Err(RegisterError::UnsupportedSql(
-            "Expected exactly one SELECT statement".to_string()
+            "Expected exactly one SELECT statement".to_string(),
         ));
     }
 
@@ -79,7 +78,7 @@ pub fn normalize_sql(sql: &str, dialect: &dyn Dialect) -> Result<String, Registe
 ///
 /// Uses `seahash` for deterministic, high-quality hashing.
 /// Returns 128-bit hash (two 64-bit hashes concatenated).
-#[must_use] 
+#[must_use]
 pub fn hash_sql(normalized: &str) -> PredicateHash {
     // First 64 bits
     let mut hasher1 = SeaHasher::new();
@@ -132,7 +131,7 @@ fn check_sql_depth(sql: &str) -> Result<(), RegisterError> {
 
         if paren_depth > MAX_EXPR_DEPTH || consecutive_ops > MAX_EXPR_DEPTH {
             return Err(RegisterError::UnsupportedSql(
-                "Expression nesting too deep".to_string()
+                "Expression nesting too deep".to_string(),
             ));
         }
     }
@@ -150,25 +149,25 @@ fn extract_where(stmt: &Statement) -> Result<Option<Expr>, RegisterError> {
                     // Validate single table (no joins)
                     if select.from.len() != 1 {
                         return Err(RegisterError::UnsupportedSql(
-                            "Exactly one table required".to_string()
+                            "Exactly one table required".to_string(),
                         ));
                     }
 
                     if !select.from[0].joins.is_empty() {
                         return Err(RegisterError::UnsupportedSql(
-                            "Joins not supported".to_string()
+                            "Joins not supported".to_string(),
                         ));
                     }
 
                     Ok(select.selection.clone())
                 }
                 _ => Err(RegisterError::UnsupportedSql(
-                    "Only SELECT supported".to_string()
+                    "Only SELECT supported".to_string(),
                 )),
             }
         }
         _ => Err(RegisterError::UnsupportedSql(
-            "Only SELECT supported".to_string()
+            "Only SELECT supported".to_string(),
         )),
     }
 }
@@ -186,7 +185,7 @@ fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
 fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterError> {
     if depth > MAX_EXPR_DEPTH {
         return Err(RegisterError::UnsupportedSql(
-            "Expression nesting too deep".to_string()
+            "Expression nesting too deep".to_string(),
         ));
     }
 
@@ -210,7 +209,11 @@ fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterErr
         }
 
         Expr::UnaryOp { op, expr } => {
-            format!("{} {}", unary_op_to_string(op), normalize_expr_inner(expr, depth + 1)?)
+            format!(
+                "{} {}",
+                unary_op_to_string(op),
+                normalize_expr_inner(expr, depth + 1)?
+            )
         }
 
         Expr::IsNull(expr) => {
@@ -221,48 +224,80 @@ fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterErr
             format!("{} IS NOT NULL", normalize_expr_inner(expr, depth + 1)?)
         }
 
-        Expr::InList { expr, list, negated } => {
-            let mut list_strs: Vec<String> = list.iter()
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let mut list_strs: Vec<String> = list
+                .iter()
                 .map(|e| normalize_expr_inner(e, depth + 1))
                 .collect::<Result<_, _>>()?;
             list_strs.sort(); // Stable ordering
 
             let not_str = if *negated { "NOT " } else { "" };
-            format!("{} {}IN ({})",
-                    normalize_expr_inner(expr, depth + 1)?,
-                    not_str,
-                    list_strs.join(", "))
+            format!(
+                "{} {}IN ({})",
+                normalize_expr_inner(expr, depth + 1)?,
+                not_str,
+                list_strs.join(", ")
+            )
         }
 
-        Expr::Between { expr, low, high, negated } => {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let not_str = if *negated { "NOT " } else { "" };
-            format!("{} {}BETWEEN {} AND {}",
-                    normalize_expr_inner(expr, depth + 1)?,
-                    not_str,
-                    normalize_expr_inner(low, depth + 1)?,
-                    normalize_expr_inner(high, depth + 1)?)
+            format!(
+                "{} {}BETWEEN {} AND {}",
+                normalize_expr_inner(expr, depth + 1)?,
+                not_str,
+                normalize_expr_inner(low, depth + 1)?,
+                normalize_expr_inner(high, depth + 1)?
+            )
         }
 
-        Expr::Like { expr, pattern, negated, escape_char, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            escape_char,
+            ..
+        } => {
             let not_str = if *negated { "NOT " } else { "" };
-            let escape_str = escape_char.as_ref()
+            let escape_str = escape_char
+                .as_ref()
                 .map_or_else(String::new, |ch| format!(" ESCAPE '{ch}'"));
-            format!("{} {}LIKE {}{}",
-                    normalize_expr_inner(expr, depth + 1)?,
-                    not_str,
-                    normalize_expr_inner(pattern, depth + 1)?,
-                    escape_str)
+            format!(
+                "{} {}LIKE {}{}",
+                normalize_expr_inner(expr, depth + 1)?,
+                not_str,
+                normalize_expr_inner(pattern, depth + 1)?,
+                escape_str
+            )
         }
 
-        Expr::ILike { expr, pattern, negated, escape_char, .. } => {
+        Expr::ILike {
+            expr,
+            pattern,
+            negated,
+            escape_char,
+            ..
+        } => {
             let not_str = if *negated { "NOT " } else { "" };
-            let escape_str = escape_char.as_ref()
+            let escape_str = escape_char
+                .as_ref()
                 .map_or_else(String::new, |ch| format!(" ESCAPE '{ch}'"));
-            format!("{} {}ILIKE {}{}",
-                    normalize_expr_inner(expr, depth + 1)?,
-                    not_str,
-                    normalize_expr_inner(pattern, depth + 1)?,
-                    escape_str)
+            format!(
+                "{} {}ILIKE {}{}",
+                normalize_expr_inner(expr, depth + 1)?,
+                not_str,
+                normalize_expr_inner(pattern, depth + 1)?,
+                escape_str
+            )
         }
 
         Expr::Nested(inner) => {
@@ -270,13 +305,14 @@ fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterErr
             normalize_expr_inner(inner, depth + 1)?
         }
 
-        Expr::Identifier(ident) => {
-            ident.value.clone()
-        }
+        Expr::Identifier(ident) => ident.value.clone(),
 
-        Expr::CompoundIdentifier(parts) => {
-            parts.iter().map(|p| &p.value).cloned().collect::<Vec<_>>().join(".")
-        }
+        Expr::CompoundIdentifier(parts) => parts
+            .iter()
+            .map(|p| &p.value)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("."),
 
         Expr::Value(val) => {
             format!("{}", val.value)
@@ -292,7 +328,10 @@ fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterErr
 /// Check if binary operator is commutative
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_commutative(op: &BinaryOperator) -> bool {
-    matches!(op, BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Eq)
+    matches!(
+        op,
+        BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Eq
+    )
 }
 
 /// Convert binary operator to canonical string

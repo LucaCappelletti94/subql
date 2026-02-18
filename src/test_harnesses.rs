@@ -16,8 +16,8 @@ use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
-use crate::DefaultIds;
 use crate::types::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
+use crate::DefaultIds;
 
 /// Maximally permissive schema catalog for fuzzing.
 ///
@@ -31,9 +31,9 @@ impl SchemaCatalog for FuzzCatalog {
     }
 
     fn column_id(&self, _table_id: TableId, column_name: &str) -> Option<ColumnId> {
-        let hash = column_name
-            .bytes()
-            .fold(0u16, |acc, b| acc.wrapping_mul(31).wrapping_add(u16::from(b)));
+        let hash = column_name.bytes().fold(0u16, |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(u16::from(b))
+        });
         Some(hash % 64)
     }
 

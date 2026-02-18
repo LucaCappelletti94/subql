@@ -7,12 +7,12 @@
 //! 4. Fallback: unindexable predicates (LIKE, complex expressions)
 //! 5. Dependency: col → predicates referencing col (for UPDATE optimization)
 
-use std::sync::Arc;
-use std::cmp::Ordering;
+use super::ids::PredicateId;
+use crate::{Cell, ColumnId};
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
-use crate::{Cell, ColumnId};
-use super::ids::PredicateId;
+use std::cmp::Ordering;
+use std::sync::Arc;
 
 /// Indexable cell value (excludes NULL/Missing)
 ///
@@ -21,7 +21,7 @@ use super::ids::PredicateId;
 pub enum IndexableCell {
     Bool(bool),
     Int(i64),
-    Float(u64),  // f64::to_bits()
+    Float(u64), // f64::to_bits()
     String(Arc<str>),
 }
 
@@ -50,8 +50,8 @@ pub struct EqualityKey {
 #[derive(Clone, Debug)]
 pub struct RangeEntry {
     pub predicate_id: PredicateId,
-    pub lower: Option<i64>,  // None = unbounded
-    pub upper: Option<i64>,  // None = unbounded
+    pub lower: Option<i64>, // None = unbounded
+    pub upper: Option<i64>, // None = unbounded
 }
 
 /// NULL check kind
@@ -78,10 +78,7 @@ pub enum IndexableAtom {
         upper: Option<i64>,
     },
     /// col IS NULL / IS NOT NULL
-    Null {
-        column_id: ColumnId,
-        kind: NullKind,
-    },
+    Null { column_id: ColumnId, kind: NullKind },
     /// Unindexable (LIKE, complex expressions)
     Fallback,
 }
@@ -119,7 +116,12 @@ impl HybridIndexes {
     }
 
     /// Add predicate to indexes based on indexable atoms
-    pub fn add_predicate(&mut self, pred_id: PredicateId, atoms: &[IndexableAtom], deps: &[ColumnId]) {
+    pub fn add_predicate(
+        &mut self,
+        pred_id: PredicateId,
+        atoms: &[IndexableAtom],
+        deps: &[ColumnId],
+    ) {
         let pred_id_u32 = pred_id.as_u32();
 
         // Track dependencies
@@ -144,21 +146,19 @@ impl HybridIndexes {
                         column_id: *column_id,
                         value: value.clone(),
                     };
-                    self.equality
-                        .entry(key)
-                        .or_default()
-                        .insert(pred_id_u32);
+                    self.equality.entry(key).or_default().insert(pred_id_u32);
                 }
 
-                IndexableAtom::Range { column_id, lower, upper } => {
-                    self.range
-                        .entry(*column_id)
-                        .or_default()
-                        .push(RangeEntry {
-                            predicate_id: pred_id,
-                            lower: *lower,
-                            upper: *upper,
-                        });
+                IndexableAtom::Range {
+                    column_id,
+                    lower,
+                    upper,
+                } => {
+                    self.range.entry(*column_id).or_default().push(RangeEntry {
+                        predicate_id: pred_id,
+                        lower: *lower,
+                        upper: *upper,
+                    });
                 }
 
                 IndexableAtom::Null { column_id, kind } => {
@@ -177,7 +177,11 @@ impl HybridIndexes {
 
     /// Query equality index
     #[must_use]
-    pub fn query_equality(&self, col_id: ColumnId, value: &IndexableCell) -> Option<&RoaringBitmap> {
+    pub fn query_equality(
+        &self,
+        col_id: ColumnId,
+        value: &IndexableCell,
+    ) -> Option<&RoaringBitmap> {
         let key = EqualityKey {
             column_id: col_id,
             value: value.clone(),
@@ -219,7 +223,7 @@ impl HybridIndexes {
             entries.sort_by(|a, b| {
                 match (a.lower, b.lower) {
                     (None, None) => Ordering::Equal,
-                    (None, Some(_)) => Ordering::Less,  // Unbounded comes first
+                    (None, Some(_)) => Ordering::Less, // Unbounded comes first
                     (Some(_), None) => Ordering::Greater,
                     (Some(x), Some(y)) => x.cmp(&y),
                 }
@@ -253,8 +257,9 @@ pub fn extract_indexable_atoms(
     let mut i = 0;
     while i < instructions.len() {
         // Check for 4-instruction patterns first (BETWEEN)
-        if let Some([Instruction::LoadColumn(col), Instruction::PushLiteral(lower), Instruction::PushLiteral(upper), Instruction::Between])
-            = instructions.get(i..i.saturating_add(4))
+        if let Some(
+            [Instruction::LoadColumn(col), Instruction::PushLiteral(lower), Instruction::PushLiteral(upper), Instruction::Between],
+        ) = instructions.get(i..i.saturating_add(4))
         {
             if let (Cell::Int(lower_val), Cell::Int(upper_val)) = (lower, upper) {
                 atoms.push(IndexableAtom::Range {
@@ -270,7 +275,9 @@ pub fn extract_indexable_atoms(
         // Check for 3-instruction patterns
         match instructions.get(i..i.saturating_add(3)) {
             // Pattern 1: LoadColumn, PushLiteral, Equal → Equality index
-            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::Equal]) => {
+            Some(
+                [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::Equal],
+            ) => {
                 if let Some(indexable) = IndexableCell::from_cell(val) {
                     atoms.push(IndexableAtom::Equality {
                         column_id: *col,
@@ -281,12 +288,16 @@ pub fn extract_indexable_atoms(
             }
 
             // Pattern 2: LoadColumn, PushLiteral, NotEqual → Skip (not easily indexable)
-            Some([Instruction::LoadColumn(_), Instruction::PushLiteral(_), Instruction::NotEqual]) => {
+            Some(
+                [Instruction::LoadColumn(_), Instruction::PushLiteral(_), Instruction::NotEqual],
+            ) => {
                 i += 3;
             }
 
             // Pattern 3: LoadColumn, PushLiteral, GreaterThan → Range [val+1, ∞)
-            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThan]) => {
+            Some(
+                [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThan],
+            ) => {
                 if let Cell::Int(int_val) = val {
                     atoms.push(IndexableAtom::Range {
                         column_id: *col,
@@ -298,7 +309,9 @@ pub fn extract_indexable_atoms(
             }
 
             // Pattern 4: LoadColumn, PushLiteral, GreaterThanOrEqual → Range [val, ∞)
-            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThanOrEqual]) => {
+            Some(
+                [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThanOrEqual],
+            ) => {
                 if let Cell::Int(int_val) = val {
                     atoms.push(IndexableAtom::Range {
                         column_id: *col,
@@ -310,7 +323,9 @@ pub fn extract_indexable_atoms(
             }
 
             // Pattern 5: LoadColumn, PushLiteral, LessThan → Range (-∞, val-1]
-            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThan]) => {
+            Some(
+                [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThan],
+            ) => {
                 if let Cell::Int(int_val) = val {
                     atoms.push(IndexableAtom::Range {
                         column_id: *col,
@@ -322,7 +337,9 @@ pub fn extract_indexable_atoms(
             }
 
             // Pattern 6: LoadColumn, PushLiteral, LessThanOrEqual → Range (-∞, val]
-            Some([Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThanOrEqual]) => {
+            Some(
+                [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThanOrEqual],
+            ) => {
                 if let Cell::Int(int_val) = val {
                     atoms.push(IndexableAtom::Range {
                         column_id: *col,
@@ -486,9 +503,21 @@ mod tests {
 
         indexes.add_predicate(pred_id, &atoms, &[1, 2, 5]);
 
-        assert!(indexes.dependency.get(&1).unwrap().contains(pred_id.as_u32()));
-        assert!(indexes.dependency.get(&2).unwrap().contains(pred_id.as_u32()));
-        assert!(indexes.dependency.get(&5).unwrap().contains(pred_id.as_u32()));
+        assert!(indexes
+            .dependency
+            .get(&1)
+            .unwrap()
+            .contains(pred_id.as_u32()));
+        assert!(indexes
+            .dependency
+            .get(&2)
+            .unwrap()
+            .contains(pred_id.as_u32()));
+        assert!(indexes
+            .dependency
+            .get(&5)
+            .unwrap()
+            .contains(pred_id.as_u32()));
     }
 
     #[test]
@@ -579,10 +608,7 @@ mod tests {
         use crate::compiler::{BytecodeProgram, Instruction};
 
         // Bytecode for: status IS NULL
-        let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(2),
-            Instruction::IsNull,
-        ]);
+        let bytecode = BytecodeProgram::new(vec![Instruction::LoadColumn(2), Instruction::IsNull]);
 
         let atoms = extract_indexable_atoms(&bytecode, &[2]);
 
@@ -636,7 +662,9 @@ mod tests {
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Cell::String("%test%".into())),
-            Instruction::Like { case_sensitive: true },
+            Instruction::Like {
+                case_sensitive: true,
+            },
         ]);
 
         let atoms = extract_indexable_atoms(&bytecode, &[0]);
@@ -714,7 +742,7 @@ mod tests {
         let pred_id = PredicateId::from_slab_index(0);
         let atoms = vec![IndexableAtom::Range {
             column_id: 3,
-            lower: None,  // Unbounded lower
+            lower: None, // Unbounded lower
             upper: Some(20),
         }];
 
@@ -737,7 +765,7 @@ mod tests {
         let atoms = vec![IndexableAtom::Range {
             column_id: 3,
             lower: Some(10),
-            upper: None,  // Unbounded upper
+            upper: None, // Unbounded upper
         }];
 
         indexes.add_predicate(pred_id, &atoms, &[3]);
@@ -759,7 +787,7 @@ mod tests {
         let atoms = vec![IndexableAtom::Range {
             column_id: 3,
             lower: None,
-            upper: None,  // Fully unbounded
+            upper: None, // Fully unbounded
         }];
 
         indexes.add_predicate(pred_id, &atoms, &[3]);
@@ -779,17 +807,25 @@ mod tests {
         let pred_id = PredicateId::from_slab_index(0);
 
         // Add equality for Bool
-        indexes.add_predicate(pred_id, &[IndexableAtom::Equality {
-            column_id: 1,
-            value: IndexableCell::Bool(true),
-        }], &[1]);
+        indexes.add_predicate(
+            pred_id,
+            &[IndexableAtom::Equality {
+                column_id: 1,
+                value: IndexableCell::Bool(true),
+            }],
+            &[1],
+        );
 
         // Add equality for String
         let pred_id2 = PredicateId::from_slab_index(1);
-        indexes.add_predicate(pred_id2, &[IndexableAtom::Equality {
-            column_id: 2,
-            value: IndexableCell::String("test".into()),
-        }], &[2]);
+        indexes.add_predicate(
+            pred_id2,
+            &[IndexableAtom::Equality {
+                column_id: 2,
+                value: IndexableCell::String("test".into()),
+            }],
+            &[2],
+        );
 
         // Query bool
         let result = indexes.query_equality(1, &IndexableCell::Bool(true));
@@ -916,10 +952,8 @@ mod tests {
         use crate::compiler::{BytecodeProgram, Instruction};
 
         // Bytecode for: status IS NOT NULL
-        let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(2),
-            Instruction::IsNotNull,
-        ]);
+        let bytecode =
+            BytecodeProgram::new(vec![Instruction::LoadColumn(2), Instruction::IsNotNull]);
 
         let atoms = extract_indexable_atoms(&bytecode, &[2]);
 
@@ -995,19 +1029,37 @@ mod tests {
         let pred3 = PredicateId::from_slab_index(2);
 
         // Unbounded lower (should come first after sort)
-        indexes.add_predicate(pred1, &[IndexableAtom::Range {
-            column_id: 1, lower: None, upper: Some(100),
-        }], &[1]);
+        indexes.add_predicate(
+            pred1,
+            &[IndexableAtom::Range {
+                column_id: 1,
+                lower: None,
+                upper: Some(100),
+            }],
+            &[1],
+        );
 
         // Bounded lower (should come last)
-        indexes.add_predicate(pred2, &[IndexableAtom::Range {
-            column_id: 1, lower: Some(50), upper: Some(200),
-        }], &[1]);
+        indexes.add_predicate(
+            pred2,
+            &[IndexableAtom::Range {
+                column_id: 1,
+                lower: Some(50),
+                upper: Some(200),
+            }],
+            &[1],
+        );
 
         // Another unbounded lower (None,None case)
-        indexes.add_predicate(pred3, &[IndexableAtom::Range {
-            column_id: 1, lower: None, upper: None,
-        }], &[1]);
+        indexes.add_predicate(
+            pred3,
+            &[IndexableAtom::Range {
+                column_id: 1,
+                lower: None,
+                upper: None,
+            }],
+            &[1],
+        );
 
         indexes.finalize_ranges();
 

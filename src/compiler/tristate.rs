@@ -167,8 +167,14 @@ mod tests {
         for a in [Tri::True, Tri::False, Tri::Unknown] {
             for b in [Tri::True, Tri::False, Tri::Unknown] {
                 for c in [Tri::True, Tri::False, Tri::Unknown] {
-                    assert_eq!(a.and(b).and(c), a.and(b.and(c)),
-                        "AND associativity failed for {:?}, {:?}, {:?}", a, b, c);
+                    assert_eq!(
+                        a.and(b).and(c),
+                        a.and(b.and(c)),
+                        "AND associativity failed for {:?}, {:?}, {:?}",
+                        a,
+                        b,
+                        c
+                    );
                 }
             }
         }
@@ -179,8 +185,14 @@ mod tests {
         for a in [Tri::True, Tri::False, Tri::Unknown] {
             for b in [Tri::True, Tri::False, Tri::Unknown] {
                 for c in [Tri::True, Tri::False, Tri::Unknown] {
-                    assert_eq!(a.or(b).or(c), a.or(b.or(c)),
-                        "OR associativity failed for {:?}, {:?}, {:?}", a, b, c);
+                    assert_eq!(
+                        a.or(b).or(c),
+                        a.or(b.or(c)),
+                        "OR associativity failed for {:?}, {:?}, {:?}",
+                        a,
+                        b,
+                        c
+                    );
                 }
             }
         }
@@ -191,12 +203,22 @@ mod tests {
         for a in [Tri::True, Tri::False, Tri::Unknown] {
             for b in [Tri::True, Tri::False, Tri::Unknown] {
                 // NOT (a AND b) = (NOT a) OR (NOT b)
-                assert_eq!(a.and(b).not(), a.not().or(b.not()),
-                    "De Morgan's first law failed for {:?}, {:?}", a, b);
+                assert_eq!(
+                    a.and(b).not(),
+                    a.not().or(b.not()),
+                    "De Morgan's first law failed for {:?}, {:?}",
+                    a,
+                    b
+                );
 
                 // NOT (a OR b) = (NOT a) AND (NOT b)
-                assert_eq!(a.or(b).not(), a.not().and(b.not()),
-                    "De Morgan's second law failed for {:?}, {:?}", a, b);
+                assert_eq!(
+                    a.or(b).not(),
+                    a.not().and(b.not()),
+                    "De Morgan's second law failed for {:?}, {:?}",
+                    a,
+                    b
+                );
             }
         }
     }

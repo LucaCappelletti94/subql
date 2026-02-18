@@ -1,8 +1,8 @@
 //! Serialization codec with compression
 
+use crate::StorageError;
 use bincode;
 use lz4;
-use crate::StorageError;
 
 /// Serialize and compress data
 ///
@@ -14,7 +14,7 @@ pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
 
     // Compress with LZ4
     let mut encoder = lz4::EncoderBuilder::new()
-        .level(4)  // Fast compression
+        .level(4) // Fast compression
         .build(Vec::new())
         .map_err(|e| StorageError::Codec(format!("LZ4 encoder error: {e}")))?;
 
@@ -47,7 +47,7 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Storage
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Serialize, Deserialize};
+    use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     struct TestData {

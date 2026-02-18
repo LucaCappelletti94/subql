@@ -1,14 +1,14 @@
 //! Dispatch performance benchmarks
 
-use std::hint::black_box;
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use subql::{
-    SubscriptionEngine, SubscriptionSpec, WalEvent, SchemaCatalog,
-    EventKind, Cell, RowImage, PrimaryKey, TableId, DefaultIds,
-};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use sqlparser::dialect::PostgreSqlDialect;
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::hint::black_box;
+use std::sync::Arc;
+use subql::{
+    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
+    SubscriptionSpec, TableId, WalEvent,
+};
 
 // Mock catalog for benchmarking
 struct BenchCatalog {
@@ -46,11 +46,14 @@ impl SchemaCatalog for BenchCatalog {
     }
 
     fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-        self.columns.get(&(table_id, column_name.to_string())).copied()
+        self.columns
+            .get(&(table_id, column_name.to_string()))
+            .copied()
     }
 
     fn table_arity(&self, table_id: TableId) -> Option<usize> {
-        self.tables.values()
+        self.tables
+            .values()
             .find(|(id, _)| *id == table_id)
             .map(|(_, arity)| *arity)
     }
@@ -71,16 +74,16 @@ fn make_test_event() -> WalEvent {
         old_row: None,
         new_row: Some(RowImage {
             cells: Arc::from([
-                Cell::Int(1),           // id
-                Cell::Int(42),          // user_id
-                Cell::Int(250),         // amount
-                Cell::String("active".into()),  // status
-                Cell::Int(5),           // priority
-                Cell::Int(10),          // quantity
-                Cell::Int(0),           // discount
-                Cell::Int(25),          // tax
-                Cell::Int(10),          // shipping
-                Cell::Int(1234567890),  // created_at
+                Cell::Int(1),                  // id
+                Cell::Int(42),                 // user_id
+                Cell::Int(250),                // amount
+                Cell::String("active".into()), // status
+                Cell::Int(5),                  // priority
+                Cell::Int(10),                 // quantity
+                Cell::Int(0),                  // discount
+                Cell::Int(25),                 // tax
+                Cell::Int(10),                 // shipping
+                Cell::Int(1234567890),         // created_at
             ]),
         }),
         changed_columns: Arc::from([]),
@@ -97,10 +100,8 @@ fn dispatch_scaling_benchmark(c: &mut Criterion) {
             &predicate_count,
             |b, &count| {
                 let catalog = Arc::new(BenchCatalog::new());
-                let mut engine = SubscriptionEngine::<_, DefaultIds>::new(
-                    catalog,
-                    PostgreSqlDialect {},
-                );
+                let mut engine =
+                    SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
                 // Register N predicates with different conditions
                 for i in 0..count {
@@ -193,7 +194,11 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
                 subscription_id: i,
                 user_id: i,
                 session_id: None,
-                sql: format!("SELECT * FROM orders WHERE amount > {} OR priority = {}", i * 10, i % 10),
+                sql: format!(
+                    "SELECT * FROM orders WHERE amount > {} OR priority = {}",
+                    i * 10,
+                    i % 10
+                ),
                 updated_at_unix_ms: 0,
             };
             engine.register(spec).unwrap();

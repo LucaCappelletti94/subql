@@ -1,27 +1,28 @@
 //! Subscription engine - main public API
 
-use std::sync::Arc;
-use std::path::{Path, PathBuf};
+use super::{
+    dispatch::{dispatch_users, MatchedUsers, UserDictionary},
+    ids::PredicateId,
+    indexes::extract_indexable_atoms,
+    partition::TablePartition,
+    predicate::{Binding, Predicate},
+};
+use crate::{
+    compiler::{canonicalize, parse_and_compile, BytecodeProgram, Vm},
+    persistence::{
+        merge::MergeManager,
+        shard::{
+            deserialize_shard, serialize_shard, BindingData, PredicateData, ShardPayload,
+            UserDictData,
+        },
+    },
+    DispatchError, IdTypes, MergeError, MergeJobId, MergeReport, PruneReport, RegisterError,
+    RegisterResult, SchemaCatalog, StorageError, SubscriptionSpec, TableId, WalEvent,
+};
 use ahash::AHashMap;
 use sqlparser::dialect::Dialect;
-use crate::{
-    IdTypes, TableId,
-    SubscriptionSpec, RegisterResult, PruneReport, MergeReport, WalEvent, MergeJobId,
-    RegisterError, DispatchError, StorageError, MergeError,
-    SchemaCatalog,
-    compiler::{Vm, parse_and_compile, canonicalize, BytecodeProgram},
-    persistence::{
-        shard::{ShardPayload, PredicateData, BindingData, UserDictData, serialize_shard, deserialize_shard},
-        merge::MergeManager,
-    },
-};
-use super::{
-    ids::PredicateId,
-    predicate::{Predicate, Binding},
-    partition::TablePartition,
-    dispatch::{UserDictionary, MatchedUsers, dispatch_users},
-    indexes::extract_indexable_atoms,
-};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Wrapper to pass `Arc<dyn SchemaCatalog>` as `Box<dyn SchemaCatalog + Send>`.
 struct CatalogRef(Arc<dyn SchemaCatalog>);
@@ -124,18 +125,20 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let hash = canonicalize::hash_sql(&normalized);
 
         // 3. Get/create table partition and user dictionary
-        let partition = self.partitions.entry(table_id)
+        let partition = self
+            .partitions
+            .entry(table_id)
             .or_insert_with(|| TablePartition::new(table_id));
 
-        let user_dict = self.user_dictionaries.entry(table_id)
-            .or_default();
+        let user_dict = self.user_dictionaries.entry(table_id).or_default();
 
         // 4. Get user ordinal
         let user_ord = user_dict.get_or_create(spec.user_id);
 
         // 5. Check if predicate exists (deduplication)
         let snapshot = partition.load_snapshot();
-        let (pred_id, created_new) = if let Some(existing) = snapshot.predicates.find_by_hash(hash) {
+        let (pred_id, created_new) = if let Some(existing) = snapshot.predicates.find_by_hash(hash)
+        {
             // Predicate exists, increment refcount
             // (We need mutable access, so we'll do this via the partition's mutable store)
             (existing, false)
@@ -192,7 +195,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///
     /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
     pub fn unregister_subscription(&mut self, subscription_id: I::SubscriptionId) -> bool {
-        self.unregister_subscription_internal(subscription_id).is_some()
+        self.unregister_subscription_internal(subscription_id)
+            .is_some()
     }
 
     /// Internal unregister helper.
@@ -219,20 +223,35 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// Dispatch event to interested users
     pub fn users(&mut self, event: &WalEvent) -> Result<MatchedUsers<'_, I>, DispatchError> {
         // Get table partition
-        let partition = self.partitions.get(&event.table_id)
+        let partition = self
+            .partitions
+            .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
         // Get user dictionary
-        let user_dict = self.user_dictionaries.get(&event.table_id)
+        let user_dict = self
+            .user_dictionaries
+            .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
         // Validate selected row image arity against schema catalog.
-        let row = match event.kind {
-            crate::EventKind::Insert | crate::EventKind::Update => event.new_row.as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage("INSERT/UPDATE requires new_row"))?,
-            crate::EventKind::Delete => event.old_row.as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage("DELETE requires old_row"))?,
-        };
+        let row =
+            match event.kind {
+                crate::EventKind::Insert | crate::EventKind::Update => event
+                    .new_row
+                    .as_ref()
+                    .ok_or(DispatchError::MissingRequiredRowImage(
+                        "INSERT/UPDATE requires new_row",
+                    ))?,
+                crate::EventKind::Delete => {
+                    event
+                        .old_row
+                        .as_ref()
+                        .ok_or(DispatchError::MissingRequiredRowImage(
+                            "DELETE requires old_row",
+                        ))?
+                }
+            };
 
         if let Some(expected) = self.catalog.table_arity(event.table_id) {
             let got = row.len();
@@ -284,17 +303,17 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// Get number of registered predicates for a table
     #[must_use]
     pub fn predicate_count(&self, table_id: TableId) -> usize {
-        self.partitions.get(&table_id)
-            .map_or(0, |p| {
-                let snapshot = p.load_snapshot();
-                snapshot.predicates.predicates.len()
-            })
+        self.partitions.get(&table_id).map_or(0, |p| {
+            let snapshot = p.load_snapshot();
+            snapshot.predicates.predicates.len()
+        })
     }
 
     /// Get number of registered subscriptions
     #[must_use]
     pub fn subscription_count(&self) -> usize {
-        self.partitions.values()
+        self.partitions
+            .values()
             .map(|p| {
                 let snapshot = p.load_snapshot();
                 snapshot.predicates.bindings.len()
@@ -310,14 +329,19 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///
     /// Serializes all predicates, bindings, and user dictionary to a shard file.
     pub fn snapshot_table(&self, table_id: TableId) -> Result<(), StorageError> {
-        let storage_path = self.storage_path.as_ref()
+        let storage_path = self
+            .storage_path
+            .as_ref()
             .ok_or_else(|| StorageError::Config("No storage path configured".to_string()))?;
 
-        let partition = self.partitions.get(&table_id)
+        let partition = self
+            .partitions
+            .get(&table_id)
             .ok_or_else(|| StorageError::Corrupt(format!("Unknown table ID: {table_id}")))?;
 
-        let user_dict = self.user_dictionaries.get(&table_id)
-            .ok_or_else(|| StorageError::Corrupt(format!("No user dictionary for table {table_id}")))?;
+        let user_dict = self.user_dictionaries.get(&table_id).ok_or_else(|| {
+            StorageError::Corrupt(format!("No user dictionary for table {table_id}"))
+        })?;
 
         // Load snapshot
         let snapshot = partition.load_snapshot();
@@ -342,7 +366,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         for binding in snapshot.predicates.bindings.values() {
             let binding_data = BindingData::<I> {
                 subscription_id: binding.subscription_id,
-                predicate_hash: snapshot.predicates.get_predicate(binding.predicate_id)
+                predicate_hash: snapshot
+                    .predicates
+                    .get_predicate(binding.predicate_id)
                     .map_or(0, |p| p.hash),
                 user_id: binding.user_id,
                 session_id: binding.session_id,
@@ -387,11 +413,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let (_header, payload) = deserialize_shard::<I>(&bytes, &*self.catalog)?;
 
         // Create or get partition
-        let partition = self.partitions.entry(table_id)
+        let partition = self
+            .partitions
+            .entry(table_id)
             .or_insert_with(|| TablePartition::new(table_id));
 
-        let user_dict = self.user_dictionaries.entry(table_id)
-            .or_default();
+        let user_dict = self.user_dictionaries.entry(table_id).or_default();
 
         // Restore user dictionary
         for user_id in &payload.user_dict.ordinal_to_user {
@@ -408,18 +435,24 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let mut hash_to_pred_id: AHashMap<u128, PredicateId> = AHashMap::new();
 
         for binding_data in &payload.bindings {
-            let pred_data = pred_hash_to_data.get(&binding_data.predicate_hash)
-                .ok_or_else(|| StorageError::Corrupt(
-                    format!("Binding references unknown predicate hash: {:016x}", binding_data.predicate_hash)
-                ))?;
+            let pred_data = pred_hash_to_data
+                .get(&binding_data.predicate_hash)
+                .ok_or_else(|| {
+                    StorageError::Corrupt(format!(
+                        "Binding references unknown predicate hash: {:016x}",
+                        binding_data.predicate_hash
+                    ))
+                })?;
 
             // Check if predicate already loaded
             let pred_id = if let Some(&existing_id) = hash_to_pred_id.get(&pred_data.hash) {
                 existing_id
             } else {
                 // Deserialize bytecode
-                let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
-                    .map_err(|e| StorageError::Codec(format!("Bytecode deserialize error: {e}")))?;
+                let bytecode: BytecodeProgram =
+                    bincode::deserialize(&pred_data.bytecode_instructions).map_err(|e| {
+                        StorageError::Codec(format!("Bytecode deserialize error: {e}"))
+                    })?;
 
                 let pred = Predicate {
                     // Placeholder; store allocates the authoritative ID.
@@ -463,7 +496,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
     /// Load all shards from storage directory
     fn load_all_shards(&mut self) -> Result<(), StorageError> {
-        let storage_path = self.storage_path.as_ref()
+        let storage_path = self
+            .storage_path
+            .as_ref()
             .ok_or_else(|| StorageError::Config("No storage path configured".to_string()))?;
 
         // Read all .shard files (directory must exist — with_storage creates it)
@@ -492,15 +527,16 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
     /// Check if rotation is needed for a table
     fn should_rotate(&self, table_id: TableId) -> Result<bool, StorageError> {
-        let partition = self.partitions.get(&table_id)
+        let partition = self
+            .partitions
+            .get(&table_id)
             .ok_or_else(|| StorageError::Corrupt(format!("Unknown table ID: {table_id}")))?;
 
         let snapshot = partition.load_snapshot();
 
         // Estimate size (rough approximation)
-        let estimated_size =
-            snapshot.predicates.predicates.len() * 1024 + // ~1KB per predicate (bytecode + metadata)
-            snapshot.predicates.bindings.len() * 128;      // ~128B per binding
+        let estimated_size = snapshot.predicates.predicates.len() * 1024 + // ~1KB per predicate (bytecode + metadata)
+            snapshot.predicates.bindings.len() * 128; // ~128B per binding
 
         Ok(estimated_size > self.rotation_threshold)
     }
@@ -533,10 +569,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         // Read shard bytes from disk
         let mut shard_bytes = Vec::with_capacity(shard_paths.len());
         for path in shard_paths {
-            let bytes = std::fs::read(path)
-                .map_err(|e| MergeError::Storage(StorageError::Io(
-                    format!("Failed to read shard for merge: {e}")
-                )))?;
+            let bytes = std::fs::read(path).map_err(|e| {
+                MergeError::Storage(StorageError::Io(format!(
+                    "Failed to read shard for merge: {e}"
+                )))
+            })?;
             shard_bytes.push(bytes);
         }
 
@@ -564,10 +601,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let table_id = merged.table_id;
 
         // Load merged payload into partition
-        let partition = self.partitions.entry(table_id)
+        let partition = self
+            .partitions
+            .entry(table_id)
             .or_insert_with(|| TablePartition::new(table_id));
-        let user_dict = self.user_dictionaries.entry(table_id)
-            .or_default();
+        let user_dict = self.user_dictionaries.entry(table_id).or_default();
 
         // Restore user dictionary from merged shard
         for &user_id in &merged.payload.user_dict.ordinal_to_user {
@@ -584,16 +622,22 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let mut hash_to_pred_id: AHashMap<u128, PredicateId> = AHashMap::new();
 
         for binding_data in &merged.payload.bindings {
-            let pred_data = pred_hash_to_data.get(&binding_data.predicate_hash)
-                .ok_or_else(|| MergeError::BuildFailed(
-                    format!("Merged binding references unknown predicate hash: {:016x}", binding_data.predicate_hash)
-                ))?;
+            let pred_data = pred_hash_to_data
+                .get(&binding_data.predicate_hash)
+                .ok_or_else(|| {
+                    MergeError::BuildFailed(format!(
+                        "Merged binding references unknown predicate hash: {:016x}",
+                        binding_data.predicate_hash
+                    ))
+                })?;
 
             let pred_id = if let Some(&existing_id) = hash_to_pred_id.get(&pred_data.hash) {
                 existing_id
             } else {
-                let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
-                    .map_err(|e| MergeError::BuildFailed(format!("Bytecode deserialize error: {e}")))?;
+                let bytecode: BytecodeProgram =
+                    bincode::deserialize(&pred_data.bytecode_instructions).map_err(|e| {
+                        MergeError::BuildFailed(format!("Bytecode deserialize error: {e}"))
+                    })?;
 
                 let pred = Predicate {
                     // Placeholder; store allocates the authoritative ID.
@@ -638,10 +682,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::MockCatalog;
+    use crate::{Cell, DefaultIds, EventKind, PrimaryKey, RowImage};
     use sqlparser::dialect::PostgreSqlDialect;
     use std::collections::HashMap;
-    use crate::{Cell, EventKind, RowImage, PrimaryKey, DefaultIds};
-    use crate::testing::MockCatalog;
 
     fn make_catalog() -> Arc<MockCatalog> {
         let mut tables = HashMap::new();
@@ -658,7 +702,8 @@ mod tests {
     #[test]
     fn test_engine_creation() {
         let catalog = make_catalog();
-        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         assert_eq!(engine.subscription_count(), 0);
     }
@@ -666,7 +711,8 @@ mod tests {
     #[test]
     fn test_register_subscription() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let spec = SubscriptionSpec {
             subscription_id: 1,
@@ -687,7 +733,8 @@ mod tests {
     #[test]
     fn test_predicate_deduplication() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register same predicate for two users
         let spec1 = SubscriptionSpec {
@@ -718,7 +765,8 @@ mod tests {
     #[test]
     fn test_dispatch_simple() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription: amount > 100
         let spec = SubscriptionSpec {
@@ -742,9 +790,9 @@ mod tests {
             old_row: None,
             new_row: Some(RowImage {
                 cells: Arc::from([
-                    Cell::Int(1),      // id
-                    Cell::Int(200),    // amount
-                    Cell::String("pending".into()),  // status
+                    Cell::Int(1),                   // id
+                    Cell::Int(200),                 // amount
+                    Cell::String("pending".into()), // status
                 ]),
             }),
             changed_columns: Arc::from([]),
@@ -760,7 +808,8 @@ mod tests {
     #[test]
     fn test_bindings_persist() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription
         let spec = SubscriptionSpec {
@@ -787,7 +836,8 @@ mod tests {
     #[test]
     fn test_unregister_removes_binding() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription
         let spec = SubscriptionSpec {
@@ -816,37 +866,44 @@ mod tests {
     #[test]
     fn test_register_after_unsubscribe_does_not_break_hash_lookup_or_dispatch() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Sub 1 -> predicate A
-        engine.register(SubscriptionSpec {
-            subscription_id: 1,
-            user_id: 101,
-            session_id: None,
-            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
-            updated_at_unix_ms: 1,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 101,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 1,
+            })
+            .unwrap();
 
         // Sub 2 -> predicate B (kept alive while A is removed)
-        engine.register(SubscriptionSpec {
-            subscription_id: 2,
-            user_id: 202,
-            session_id: None,
-            sql: "SELECT * FROM orders WHERE amount < 0".to_string(),
-            updated_at_unix_ms: 2,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 202,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 0".to_string(),
+                updated_at_unix_ms: 2,
+            })
+            .unwrap();
 
         // Remove A to create a slab hole.
         assert!(engine.unregister_subscription(1));
 
         // Sub 3 -> predicate C should be independently dispatchable.
-        engine.register(SubscriptionSpec {
-            subscription_id: 3,
-            user_id: 303,
-            session_id: None,
-            sql: "SELECT * FROM orders WHERE amount = 7".to_string(),
-            updated_at_unix_ms: 3,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 3,
+                user_id: 303,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount = 7".to_string(),
+                updated_at_unix_ms: 3,
+            })
+            .unwrap();
 
         let event = WalEvent {
             kind: EventKind::Insert,
@@ -858,8 +915,8 @@ mod tests {
             old_row: None,
             new_row: Some(RowImage {
                 cells: Arc::from([
-                    Cell::Int(7),          // id
-                    Cell::Int(7),          // amount
+                    Cell::Int(7), // id
+                    Cell::Int(7), // amount
                     Cell::String("ok".into()),
                 ]),
             }),
@@ -867,13 +924,17 @@ mod tests {
         };
 
         let users: Vec<_> = engine.users(&event).unwrap().collect();
-        assert!(users.contains(&303), "newly registered predicate should dispatch after hole reuse");
+        assert!(
+            users.contains(&303),
+            "newly registered predicate should dispatch after hole reuse"
+        );
     }
 
     #[test]
     fn test_multiple_predicates_indexed() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register first predicate
         let spec1 = SubscriptionSpec {
@@ -919,11 +980,13 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with storage
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
-            catalog.clone(),
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        ).unwrap();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog.clone(),
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
 
         // Register subscription
         let spec = SubscriptionSpec {
@@ -944,11 +1007,13 @@ mod tests {
         assert!(shard_path.exists());
 
         // Create new engine, load from disk
-        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
-            catalog,
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        ).unwrap();
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
 
         // Verify subscription loaded
         assert_eq!(engine2.subscription_count(), 1);
@@ -970,11 +1035,13 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with storage
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
-            catalog.clone(),
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        ).unwrap();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog.clone(),
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
 
         // Register same predicate for two users
         let spec1 = SubscriptionSpec {
@@ -1000,11 +1067,13 @@ mod tests {
         engine.snapshot_table(1).unwrap();
 
         // Load in new engine
-        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
-            catalog,
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        ).unwrap();
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
 
         // Verify both subscriptions loaded, but only one predicate
         assert_eq!(engine2.subscription_count(), 2);
@@ -1021,11 +1090,13 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine and register users
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
-            catalog.clone(),
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        ).unwrap();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog.clone(),
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
 
         for i in 0..5 {
             let spec = SubscriptionSpec {
@@ -1042,11 +1113,13 @@ mod tests {
         engine.snapshot_table(1).unwrap();
 
         // Load in new engine
-        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
-            catalog,
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        ).unwrap();
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
 
         // Verify user dictionary
         let user_dict = engine2.user_dictionaries.get(&1).unwrap();
@@ -1063,11 +1136,13 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with empty storage directory
-        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
-            catalog,
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        ).unwrap();
+        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
 
         // Should start with no subscriptions
         assert_eq!(engine.subscription_count(), 0);
@@ -1080,7 +1155,8 @@ mod tests {
     #[test]
     fn test_predicate_count() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // No predicates initially
         assert_eq!(engine.predicate_count(1), 0);
@@ -1103,7 +1179,8 @@ mod tests {
     #[test]
     fn test_unregister_session() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscriptions with session
         let spec1 = SubscriptionSpec {
@@ -1135,7 +1212,8 @@ mod tests {
     #[test]
     fn test_rotation_threshold() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Default threshold
         let default = engine.rotation_threshold();
@@ -1149,7 +1227,8 @@ mod tests {
     #[test]
     fn test_dispatch_users_via_engine() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register a subscription
         let spec = SubscriptionSpec {
@@ -1187,11 +1266,12 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with non-existent storage path
-        let engine: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> = SubscriptionEngine::with_storage(
-            catalog,
-            PostgreSqlDialect {},
-            std::path::PathBuf::from("/tmp/subql_nonexistent_test_dir_12345"),
-        );
+        let engine: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                std::path::PathBuf::from("/tmp/subql_nonexistent_test_dir_12345"),
+            );
 
         // Should succeed (just no shards to load)
         assert!(engine.is_ok());
@@ -1200,7 +1280,8 @@ mod tests {
     #[test]
     fn test_unregister_nonexistent_subscription() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Unregister subscription that doesn't exist
         let found = engine.unregister_subscription(999);
@@ -1210,7 +1291,8 @@ mod tests {
     #[test]
     fn test_dispatch_unknown_table() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Dispatch to unknown table
         let event = WalEvent {
@@ -1234,15 +1316,18 @@ mod tests {
     #[test]
     fn test_dispatch_insert_invalid_row_arity() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        engine.register(SubscriptionSpec {
-            subscription_id: 31,
-            user_id: 31,
-            session_id: None,
-            sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
-            updated_at_unix_ms: 31,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 31,
+                user_id: 31,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+                updated_at_unix_ms: 31,
+            })
+            .unwrap();
 
         let event = WalEvent {
             kind: EventKind::Insert,
@@ -1262,22 +1347,29 @@ mod tests {
         let result = engine.users(&event);
         assert!(matches!(
             result,
-            Err(DispatchError::InvalidRowArity { table_id: 1, expected: 3, got: 2 })
+            Err(DispatchError::InvalidRowArity {
+                table_id: 1,
+                expected: 3,
+                got: 2
+            })
         ));
     }
 
     #[test]
     fn test_dispatch_update_invalid_row_arity() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        engine.register(SubscriptionSpec {
-            subscription_id: 32,
-            user_id: 32,
-            session_id: None,
-            sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
-            updated_at_unix_ms: 32,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 32,
+                user_id: 32,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+                updated_at_unix_ms: 32,
+            })
+            .unwrap();
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1299,22 +1391,29 @@ mod tests {
         let result = engine.users(&event);
         assert!(matches!(
             result,
-            Err(DispatchError::InvalidRowArity { table_id: 1, expected: 3, got: 2 })
+            Err(DispatchError::InvalidRowArity {
+                table_id: 1,
+                expected: 3,
+                got: 2
+            })
         ));
     }
 
     #[test]
     fn test_dispatch_delete_invalid_row_arity() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        engine.register(SubscriptionSpec {
-            subscription_id: 33,
-            user_id: 33,
-            session_id: None,
-            sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
-            updated_at_unix_ms: 33,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 33,
+                user_id: 33,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+                updated_at_unix_ms: 33,
+            })
+            .unwrap();
 
         let event = WalEvent {
             kind: EventKind::Delete,
@@ -1334,7 +1433,11 @@ mod tests {
         let result = engine.users(&event);
         assert!(matches!(
             result,
-            Err(DispatchError::InvalidRowArity { table_id: 1, expected: 3, got: 2 })
+            Err(DispatchError::InvalidRowArity {
+                table_id: 1,
+                expected: 3,
+                got: 2
+            })
         ));
     }
 
@@ -1345,11 +1448,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
 
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::with_storage(
-            catalog.clone(),
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        ).unwrap();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog.clone(),
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
 
         // Set very low rotation threshold so it triggers
         engine.set_rotation_threshold(1);
@@ -1384,7 +1489,8 @@ mod tests {
     #[test]
     fn test_unregister_session_empty() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Unregister session with no subscriptions
         let report = engine.unregister_session(999);
@@ -1394,23 +1500,28 @@ mod tests {
     #[test]
     fn test_unregister_session_reports_removed_predicates_when_last_binding_removed() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        engine.register(SubscriptionSpec {
-            subscription_id: 10,
-            user_id: 1,
-            session_id: Some(42),
-            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
-            updated_at_unix_ms: 10,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 10,
+                user_id: 1,
+                session_id: Some(42),
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 10,
+            })
+            .unwrap();
 
-        engine.register(SubscriptionSpec {
-            subscription_id: 11,
-            user_id: 1,
-            session_id: Some(42),
-            sql: "SELECT * FROM orders WHERE amount < 10".to_string(),
-            updated_at_unix_ms: 11,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 11,
+                user_id: 1,
+                session_id: Some(42),
+                sql: "SELECT * FROM orders WHERE amount < 10".to_string(),
+                updated_at_unix_ms: 11,
+            })
+            .unwrap();
 
         let report = engine.unregister_session(42);
         assert_eq!(report.removed_bindings, 2);
@@ -1423,25 +1534,30 @@ mod tests {
     #[test]
     fn test_unregister_session_does_not_count_predicate_removed_when_other_bindings_remain() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Session-bound binding
-        engine.register(SubscriptionSpec {
-            subscription_id: 20,
-            user_id: 1,
-            session_id: Some(43),
-            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
-            updated_at_unix_ms: 20,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 20,
+                user_id: 1,
+                session_id: Some(43),
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 20,
+            })
+            .unwrap();
 
         // Durable binding keeps predicate alive
-        engine.register(SubscriptionSpec {
-            subscription_id: 21,
-            user_id: 2,
-            session_id: None,
-            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
-            updated_at_unix_ms: 21,
-        }).unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 21,
+                user_id: 2,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 21,
+            })
+            .unwrap();
 
         let report = engine.unregister_session(43);
         assert_eq!(report.removed_bindings, 1);
@@ -1450,11 +1566,11 @@ mod tests {
 
     #[test]
     fn test_load_shard_with_orphan_binding() {
-        use tempfile::TempDir;
         use crate::persistence::shard::{
-            serialize_shard, ShardPayload, PredicateData, BindingData, UserDictData,
+            serialize_shard, BindingData, PredicateData, ShardPayload, UserDictData,
         };
         use crate::DefaultIds;
+        use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
@@ -1465,13 +1581,14 @@ mod tests {
             predicates: vec![PredicateData {
                 hash: 0xAAAA,
                 normalized_sql: "amount > 100".to_string(),
-                bytecode_instructions: bincode::serialize(
-                    &crate::compiler::BytecodeProgram::new(vec![
+                bytecode_instructions: bincode::serialize(&crate::compiler::BytecodeProgram::new(
+                    vec![
                         crate::compiler::Instruction::LoadColumn(1),
                         crate::compiler::Instruction::PushLiteral(Cell::Int(100)),
                         crate::compiler::Instruction::GreaterThan,
-                    ])
-                ).unwrap(),
+                    ],
+                ))
+                .unwrap(),
                 dependency_columns: vec![1],
                 refcount: 1,
                 updated_at_unix_ms: 1000,
@@ -1508,17 +1625,19 @@ mod tests {
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         // Try to load — should fail with Corrupt error about unknown predicate hash
-        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> = SubscriptionEngine::with_storage(
-            catalog,
-            PostgreSqlDialect {},
-            temp_dir.path().to_path_buf(),
-        );
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            );
 
         assert!(result.is_err());
         match result {
             Err(ref e) => assert!(
                 format!("{:?}", e).contains("unknown predicate hash"),
-                "Expected corrupt shard error about unknown predicate hash, got: {:?}", e
+                "Expected corrupt shard error about unknown predicate hash, got: {:?}",
+                e
             ),
             Ok(_) => panic!("Expected error loading corrupt shard"),
         }

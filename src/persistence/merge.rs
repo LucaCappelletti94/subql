@@ -1,10 +1,10 @@
 //! Background merge operations with atomic swap
 
+use super::shard::{deserialize_shard, BindingData, PredicateData, ShardPayload, UserDictData};
+use crate::{DefaultIds, IdTypes, MergeError, MergeJobId, MergeReport, SchemaCatalog, TableId};
+use ahash::AHashMap;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use ahash::AHashMap;
-use crate::{IdTypes, DefaultIds, TableId, MergeJobId, MergeError, MergeReport, SchemaCatalog};
-use super::shard::{ShardPayload, BindingData, deserialize_shard, PredicateData, UserDictData};
 
 /// Merged shard ready for swap
 #[derive(Debug)]
@@ -74,9 +74,7 @@ impl<I: IdTypes> MergeManager<I> {
             }
         });
 
-        self.jobs.insert(job_id, MergeJob {
-            receiver: rx,
-        });
+        self.jobs.insert(job_id, MergeJob { receiver: rx });
 
         Ok(job_id)
     }
@@ -84,8 +82,13 @@ impl<I: IdTypes> MergeManager<I> {
     /// Check if merge is complete and return result
     ///
     /// Returns Some(result) if merge complete, None if still running.
-    pub fn try_get_result(&mut self, job_id: MergeJobId) -> Result<Option<MergedShard<I>>, MergeError> {
-        let job = self.jobs.get_mut(&job_id)
+    pub fn try_get_result(
+        &mut self,
+        job_id: MergeJobId,
+    ) -> Result<Option<MergedShard<I>>, MergeError> {
+        let job = self
+            .jobs
+            .get_mut(&job_id)
             .ok_or(MergeError::UnknownJob(job_id))?;
 
         match job.receiver.try_recv() {
@@ -249,9 +252,9 @@ impl From<MergeStats> for MergeReport {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shard::{serialize_shard, PredicateData, UserDictData};
     use super::*;
     use std::collections::HashMap;
-    use super::super::shard::{serialize_shard, PredicateData, UserDictData};
 
     struct MockCatalog {
         fingerprints: HashMap<TableId, u64>,
@@ -298,14 +301,18 @@ mod tests {
         let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred.clone()],
             bindings: vec![],
-            user_dict: UserDictData { ordinal_to_user: vec![] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
             created_at_unix_ms: 1000,
         };
 
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred],
             bindings: vec![],
-            user_dict: UserDictData { ordinal_to_user: vec![] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
             created_at_unix_ms: 2000,
         };
 
@@ -333,14 +340,18 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData { ordinal_to_user: vec![10, 20] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![10, 20],
+            },
             created_at_unix_ms: 1000,
         };
 
         let mock_catalog = make_catalog();
         let shard = serialize_shard(1, &payload, &mock_catalog).unwrap();
 
-        let job_id = manager.merge_shards_background(1, vec![shard], catalog).unwrap();
+        let job_id = manager
+            .merge_shards_background(1, vec![shard], catalog)
+            .unwrap();
 
         // Wait a bit for merge to complete
         thread::sleep(std::time::Duration::from_millis(100));
@@ -385,14 +396,18 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData { ordinal_to_user: vec![] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
             created_at_unix_ms: 1000,
         };
 
         let mock_catalog = make_catalog();
         let shard = serialize_shard(1, &payload, &mock_catalog).unwrap();
 
-        let _job_id = manager.merge_shards_background(1, vec![shard], catalog).unwrap();
+        let _job_id = manager
+            .merge_shards_background(1, vec![shard], catalog)
+            .unwrap();
 
         // Should have 1 active job
         assert_eq!(manager.active_jobs(), 1);
@@ -415,14 +430,18 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData { ordinal_to_user: vec![] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
             created_at_unix_ms: 1000,
         };
 
         let mock_catalog = make_catalog();
         let shard = serialize_shard(1, &payload, &mock_catalog).unwrap();
 
-        let job_id = manager.merge_shards_background(1, vec![shard], catalog).unwrap();
+        let job_id = manager
+            .merge_shards_background(1, vec![shard], catalog)
+            .unwrap();
 
         // Immediately check - might still be running
         let result = manager.try_get_result(job_id);
@@ -456,14 +475,18 @@ mod tests {
         let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_old],
             bindings: vec![],
-            user_dict: UserDictData { ordinal_to_user: vec![] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
             created_at_unix_ms: 1000,
         };
 
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_new],
             bindings: vec![],
-            user_dict: UserDictData { ordinal_to_user: vec![] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
             created_at_unix_ms: 2000,
         };
 
@@ -479,7 +502,10 @@ mod tests {
         // Should keep the newer one
         assert_eq!(merged.payload.predicates.len(), 1);
         assert_eq!(merged.payload.predicates[0].updated_at_unix_ms, 2000);
-        assert_eq!(merged.payload.predicates[0].normalized_sql, "age > 18 (updated)");
+        assert_eq!(
+            merged.payload.predicates[0].normalized_sql,
+            "age > 18 (updated)"
+        );
     }
 
     #[test]
@@ -499,21 +525,25 @@ mod tests {
             subscription_id: 100, // Same sub_id
             predicate_hash: 0x1234,
             user_id: 42,
-            session_id: Some(2000), // Different session
+            session_id: Some(2000),   // Different session
             updated_at_unix_ms: 2000, // Newer
         };
 
         let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![binding_old],
-            user_dict: UserDictData { ordinal_to_user: vec![] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
             created_at_unix_ms: 1000,
         };
 
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![binding_new],
-            user_dict: UserDictData { ordinal_to_user: vec![] },
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
             created_at_unix_ms: 2000,
         };
 
@@ -555,7 +585,9 @@ mod tests {
         // Invalid shard bytes - will fail to deserialize
         let invalid_shard = vec![0u8, 1, 2, 3, 4, 5];
 
-        let job_id = manager.merge_shards_background(1, vec![invalid_shard], catalog).unwrap();
+        let job_id = manager
+            .merge_shards_background(1, vec![invalid_shard], catalog)
+            .unwrap();
 
         // Wait for merge to fail
         thread::sleep(std::time::Duration::from_millis(100));
@@ -579,7 +611,9 @@ mod tests {
 
         // Now try_get_result should see Disconnected
         let result = manager.try_get_result(job_id);
-        assert!(matches!(result, Err(MergeError::BuildFailed(ref msg)) if msg == "Thread panicked"));
+        assert!(
+            matches!(result, Err(MergeError::BuildFailed(ref msg)) if msg == "Thread panicked")
+        );
     }
 
     #[test]
@@ -603,7 +637,9 @@ mod tests {
             payload: ShardPayload {
                 predicates: vec![],
                 bindings: vec![],
-                user_dict: UserDictData { ordinal_to_user: vec![] },
+                user_dict: UserDictData {
+                    ordinal_to_user: vec![],
+                },
                 created_at_unix_ms: 1000,
             },
             stats: MergeStats {

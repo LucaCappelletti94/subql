@@ -1,7 +1,7 @@
 //! Error types for subql
 
+use crate::{MergeJobId, TableId};
 use thiserror::Error;
-use crate::{TableId, MergeJobId};
 
 /// Errors during subscription registration
 #[derive(Error, Clone, Debug)]
@@ -24,10 +24,7 @@ pub enum RegisterError {
 
     /// Column name not found in table
     #[error("Unknown column '{column}' in table {table_id}")]
-    UnknownColumn {
-        table_id: TableId,
-        column: String,
-    },
+    UnknownColumn { table_id: TableId, column: String },
 
     /// Type mismatch in expression
     #[error("Type error: {0}")]
@@ -83,10 +80,7 @@ pub enum StorageError {
 
     /// Shard version incompatible
     #[error("Version mismatch: expected {expected}, got {got}")]
-    VersionMismatch {
-        expected: u16,
-        got: u16,
-    },
+    VersionMismatch { expected: u16, got: u16 },
 
     /// Schema fingerprint doesn't match
     #[error("Schema mismatch for table {table_id}: expected fingerprint {expected:016x}, got {got:016x}")]
