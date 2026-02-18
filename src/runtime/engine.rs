@@ -6,8 +6,8 @@ use ahash::AHashMap;
 use sqlparser::dialect::Dialect;
 use crate::{
     IdTypes, TableId,
-    SubscriptionSpec, RegisterResult, PruneReport, WalEvent,
-    RegisterError, DispatchError, StorageError,
+    SubscriptionSpec, RegisterResult, PruneReport, MergeReport, WalEvent, MergeJobId,
+    RegisterError, DispatchError, StorageError, MergeError,
     SchemaCatalog,
     compiler::{Vm, parse_and_compile, canonicalize, BytecodeProgram},
     persistence::{
@@ -22,6 +22,24 @@ use super::{
     dispatch::{UserDictionary, MatchedUsers, dispatch_users},
     indexes::extract_indexable_atoms,
 };
+
+/// Wrapper to pass `Arc<dyn SchemaCatalog>` as `Box<dyn SchemaCatalog + Send>`.
+struct CatalogRef(Arc<dyn SchemaCatalog>);
+
+impl SchemaCatalog for CatalogRef {
+    fn table_id(&self, table_name: &str) -> Option<TableId> {
+        self.0.table_id(table_name)
+    }
+    fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
+        self.0.column_id(table_id, column_name)
+    }
+    fn table_arity(&self, table_id: TableId) -> Option<usize> {
+        self.0.table_arity(table_id)
+    }
+    fn schema_fingerprint(&self, table_id: TableId) -> Option<u64> {
+        self.0.schema_fingerprint(table_id)
+    }
+}
 
 /// Main subscription engine
 ///
@@ -42,8 +60,8 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
     storage_path: Option<PathBuf>,
     /// Shard rotation threshold (bytes)
     rotation_threshold: usize,
-    /// Reserved for background merge compaction (not yet wired up)
-    _merge_manager: MergeManager,
+    /// Background merge compaction manager
+    merge_manager: MergeManager<I>,
 }
 
 impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
@@ -58,7 +76,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             vm: Vm::new(),
             storage_path: None,
             rotation_threshold: 10 * 1024 * 1024, // 10 MB default
-            _merge_manager: MergeManager::new(),
+            merge_manager: MergeManager::new(),
         }
     }
 
@@ -79,7 +97,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             vm: Vm::new(),
             storage_path: Some(storage_path.clone()),
             rotation_threshold: 10 * 1024 * 1024, // 10 MB default
-            _merge_manager: MergeManager::new(),
+            merge_manager: MergeManager::new(),
         };
 
         // Create storage directory if it doesn't exist
@@ -471,6 +489,126 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     #[must_use]
     pub const fn rotation_threshold(&self) -> usize {
         self.rotation_threshold
+    }
+
+    // ========================================================================
+    // Merge Methods
+    // ========================================================================
+
+    /// Start background merge of shard files for a table
+    ///
+    /// Reads the given shard files from the storage directory, spawns a background
+    /// merge thread, and returns a job ID. Use `try_complete_merge` to poll for
+    /// completion and swap the merged shard in.
+    pub fn merge_shards_background(
+        &mut self,
+        table_id: TableId,
+        shard_paths: &[PathBuf],
+    ) -> Result<MergeJobId, MergeError> {
+        // Read shard bytes from disk
+        let mut shard_bytes = Vec::with_capacity(shard_paths.len());
+        for path in shard_paths {
+            let bytes = std::fs::read(path)
+                .map_err(|e| MergeError::Storage(StorageError::Io(
+                    format!("Failed to read shard for merge: {e}")
+                )))?;
+            shard_bytes.push(bytes);
+        }
+
+        // Delegate to merge manager
+        self.merge_manager.merge_shards_background(
+            table_id,
+            shard_bytes,
+            Box::new(CatalogRef(Arc::clone(&self.catalog))),
+        )
+    }
+
+    /// Poll for merge completion and swap the result into the live partition
+    ///
+    /// Returns `Some(report)` if the merge finished and was swapped in,
+    /// `None` if still running.
+    pub fn try_complete_merge(
+        &mut self,
+        job_id: MergeJobId,
+    ) -> Result<Option<MergeReport>, MergeError> {
+        let merged = match self.merge_manager.try_get_result(job_id)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let table_id = merged.table_id;
+
+        // Load merged payload into partition
+        let partition = self.partitions.entry(table_id)
+            .or_insert_with(|| TablePartition::new(table_id));
+        let user_dict = self.user_dictionaries.entry(table_id)
+            .or_default();
+
+        // Restore user dictionary from merged shard
+        for &user_id in &merged.payload.user_dict.ordinal_to_user {
+            user_dict.get_or_create(user_id);
+        }
+
+        // Build hash → PredicateData map
+        let mut pred_hash_to_data: AHashMap<u128, &PredicateData> = AHashMap::new();
+        for pred_data in &merged.payload.predicates {
+            pred_hash_to_data.insert(pred_data.hash, pred_data);
+        }
+
+        // Restore predicates and bindings from merged payload
+        let mut hash_to_pred_id: AHashMap<u128, PredicateId> = AHashMap::new();
+
+        for binding_data in &merged.payload.bindings {
+            let pred_data = pred_hash_to_data.get(&binding_data.predicate_hash)
+                .ok_or_else(|| MergeError::BuildFailed(
+                    format!("Merged binding references unknown predicate hash: {:016x}", binding_data.predicate_hash)
+                ))?;
+
+            let pred_id = if let Some(&existing_id) = hash_to_pred_id.get(&pred_data.hash) {
+                existing_id
+            } else {
+                let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
+                    .map_err(|e| MergeError::BuildFailed(format!("Bytecode deserialize error: {e}")))?;
+
+                let snapshot = partition.load_snapshot();
+                let pred_id = PredicateId::from_slab_index(snapshot.predicates.predicates.len());
+
+                let pred = Predicate {
+                    id: pred_id,
+                    hash: pred_data.hash,
+                    normalized_sql: pred_data.normalized_sql.clone().into(),
+                    bytecode: Arc::new(bytecode.clone()),
+                    dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
+                    refcount: 0,
+                    updated_at_unix_ms: pred_data.updated_at_unix_ms,
+                };
+
+                let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
+                partition.add_predicate(pred, atoms);
+
+                hash_to_pred_id.insert(pred_data.hash, pred_id);
+                pred_id
+            };
+
+            let user_ord = user_dict.get_or_create(binding_data.user_id);
+            let binding = Binding {
+                subscription_id: binding_data.subscription_id,
+                predicate_id: pred_id,
+                user_id: binding_data.user_id,
+                user_ordinal: user_ord,
+                session_id: binding_data.session_id,
+                updated_at_unix_ms: binding_data.updated_at_unix_ms,
+            };
+            partition.add_binding(binding, pred_id);
+        }
+
+        Ok(Some(merged.stats.into()))
+    }
+
+    /// Get number of active merge jobs
+    #[must_use]
+    pub fn active_merge_jobs(&self) -> usize {
+        self.merge_manager.active_jobs()
     }
 }
 

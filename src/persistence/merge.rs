@@ -6,9 +6,6 @@ use ahash::AHashMap;
 use crate::{IdTypes, DefaultIds, TableId, MergeJobId, MergeError, MergeReport, SchemaCatalog};
 use super::shard::{ShardPayload, BindingData, deserialize_shard, PredicateData, UserDictData};
 
-/// Merge job result
-type MergeResult = Result<MergedShard<DefaultIds>, String>;
-
 /// Merged shard ready for swap
 #[derive(Debug)]
 pub struct MergedShard<I: IdTypes> {
@@ -29,17 +26,17 @@ pub struct MergeStats {
 }
 
 /// Background merge job
-struct MergeJob {
-    receiver: Receiver<MergeResult>,
+struct MergeJob<I: IdTypes> {
+    receiver: Receiver<Result<MergedShard<I>, String>>,
 }
 
 /// Manager for background merge operations
-pub struct MergeManager {
-    jobs: AHashMap<MergeJobId, MergeJob>,
+pub struct MergeManager<I: IdTypes = DefaultIds> {
+    jobs: AHashMap<MergeJobId, MergeJob<I>>,
     next_job_id: MergeJobId,
 }
 
-impl MergeManager {
+impl<I: IdTypes> MergeManager<I> {
     /// Create new merge manager
     #[must_use]
     pub fn new() -> Self {
@@ -68,7 +65,7 @@ impl MergeManager {
             let start = std::time::Instant::now();
 
             // Perform merge
-            let result = merge_shards_impl(table_id, &shard_bytes, &*catalog, start);
+            let result = merge_shards_impl::<I>(table_id, &shard_bytes, &*catalog, start);
 
             // Send result — receiver may have been dropped if caller discarded the job
             if tx.send(result).is_err() {
@@ -87,7 +84,7 @@ impl MergeManager {
     /// Check if merge is complete and return result
     ///
     /// Returns Some(result) if merge complete, None if still running.
-    pub fn try_get_result(&mut self, job_id: MergeJobId) -> Result<Option<MergedShard<DefaultIds>>, MergeError> {
+    pub fn try_get_result(&mut self, job_id: MergeJobId) -> Result<Option<MergedShard<I>>, MergeError> {
         let job = self.jobs.get_mut(&job_id)
             .ok_or(MergeError::UnknownJob(job_id))?;
 
@@ -121,7 +118,7 @@ impl MergeManager {
     }
 }
 
-impl Default for MergeManager {
+impl<I: IdTypes> Default for MergeManager<I> {
     fn default() -> Self {
         Self::new()
     }
@@ -330,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_merge_manager() {
-        let mut manager = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
         let catalog = Box::new(make_catalog());
         let payload: ShardPayload<DefaultIds> = ShardPayload {
@@ -375,13 +372,13 @@ mod tests {
 
     #[test]
     fn test_merge_manager_default() {
-        let manager = MergeManager::default();
+        let manager: MergeManager<DefaultIds> = MergeManager::default();
         assert_eq!(manager.active_jobs(), 0);
     }
 
     #[test]
     fn test_merge_manager_active_jobs() {
-        let mut manager = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
         assert_eq!(manager.active_jobs(), 0);
 
         let catalog = Box::new(make_catalog());
@@ -403,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_merge_manager_unknown_job() {
-        let mut manager = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
         // Try to get result for non-existent job
         let result = manager.try_get_result(999);
@@ -412,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_merge_manager_still_running() {
-        let mut manager = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
         let catalog = Box::new(make_catalog());
         let payload: ShardPayload<DefaultIds> = ShardPayload {
@@ -552,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_merge_with_invalid_shard_bytes() {
-        let mut manager = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
         let catalog = Box::new(make_catalog());
         // Invalid shard bytes - will fail to deserialize
@@ -570,9 +567,9 @@ mod tests {
     #[test]
     fn test_merge_thread_disconnected() {
         // Simulate thread panic by manually creating a job with a disconnected channel
-        let mut manager = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
-        let (tx, rx) = mpsc::channel::<MergeResult>();
+        let (tx, rx) = mpsc::channel::<Result<MergedShard<DefaultIds>, String>>();
         // Drop the sender immediately — simulates thread panic
         drop(tx);
 
@@ -588,9 +585,9 @@ mod tests {
     #[test]
     fn test_merge_still_running() {
         // Create a channel where sender is alive but hasn't sent yet
-        let mut manager = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
-        let (tx, rx) = mpsc::channel::<MergeResult>();
+        let (tx, rx) = mpsc::channel::<Result<MergedShard<DefaultIds>, String>>();
 
         let job_id = manager.next_job_id;
         manager.next_job_id += 1;
