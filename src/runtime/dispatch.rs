@@ -85,7 +85,7 @@ pub struct MatchedUsers<'a, I: IdTypes> {
     dict: &'a UserDictionary<I>,
 }
 
-impl<'a, I: IdTypes> Iterator for MatchedUsers<'a, I> {
+impl<I: IdTypes> Iterator for MatchedUsers<'_, I> {
     type Item = I::UserId;
 
     fn next(&mut self) -> Option<Self::Item> {
