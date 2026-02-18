@@ -180,7 +180,7 @@ fn merge_shards_impl<I: IdTypes>(
             .entry(binding.subscription_id)
             .and_modify(|existing| {
                 if binding.updated_at_unix_ms > existing.updated_at_unix_ms {
-                    *existing = binding.clone();
+                    *existing = binding;
                 }
             })
             .or_insert(binding);
@@ -279,7 +279,7 @@ mod tests {
 
     fn make_catalog() -> MockCatalog {
         let mut fingerprints = HashMap::new();
-        fingerprints.insert(1, 0x1234567890ABCDEF);
+        fingerprints.insert(1, 0x1234_5678_90AB_CDEF);
         MockCatalog { fingerprints }
     }
 

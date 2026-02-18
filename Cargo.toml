@@ -3,10 +3,10 @@ name = "subql"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Your Name <you@example.com>"]
+authors = ["Luca"]
 license = "MIT OR Apache-2.0"
 description = "SQL subscription dispatch engine for CDC event fanout"
-repository = "https://github.com/yourusername/subql"
+repository = "https://github.com/luca/subql"
 readme = "README.md"
 keywords = ["sql", "cdc", "subscription", "postgres", "streaming"]
 categories = ["database", "parser-implementations"]
@@ -50,7 +50,6 @@ lz4 = "1.24"           # Fast compression
 
 # Error handling
 thiserror = "2.0"
-anyhow = "1.0"
 
 # Configuration
 toml = "0.9.8"
@@ -64,9 +63,6 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 # Benchmarking
 criterion = { version = "0.8.2", features = ["html_reports"] }
 
-# Property testing
-proptest = "1.4"
-
 # Temporary directories for shard tests
 tempfile = "3.8"
 
@@ -77,9 +73,6 @@ arbitrary = { version = "1", features = ["derive"] }
 default = []
 testing = ["dep:arbitrary"]
 observability = ["dep:tracing"]
-
-# Performance profiling
-profiling = []
 
 # Memory profiling with dhat
 dhat-heap = ["dep:dhat"]

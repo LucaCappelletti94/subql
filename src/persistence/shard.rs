@@ -249,7 +249,7 @@ mod tests {
 
     fn make_catalog() -> MockCatalog {
         let mut fingerprints = HashMap::new();
-        fingerprints.insert(1, 0x1234567890ABCDEF);
+        fingerprints.insert(1, 0x1234_5678_90AB_CDEF);
         MockCatalog { fingerprints }
     }
 
@@ -270,7 +270,7 @@ mod tests {
         let (header, decoded_payload) = deserialize_shard::<DefaultIds>(&bytes, &catalog).unwrap();
 
         assert_eq!(header.table_id, 1);
-        assert_eq!(header.schema_fingerprint, 0x1234567890ABCDEF);
+        assert_eq!(header.schema_fingerprint, 0x1234_5678_90AB_CDEF);
         assert_eq!(decoded_payload.user_dict.ordinal_to_user, vec![10, 20, 30]);
     }
 
@@ -289,7 +289,7 @@ mod tests {
     fn test_version_mismatch() {
         let catalog = make_catalog();
 
-        let mut header = ShardHeader::new(1, 0x1234567890ABCDEF, 100, 80);
+        let mut header = ShardHeader::new(1, 0x1234_5678_90AB_CDEF, 100, 80);
         header.version = 999;
 
         let result = header.validate(&catalog);

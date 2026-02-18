@@ -121,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "Slab index too large")]
     fn test_predicate_id_max_index_panics() {
         let _ = PredicateId::from_slab_index(u32::MAX as usize);
     }
