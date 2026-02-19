@@ -74,6 +74,9 @@ arbitrary = { version = "1", features = ["derive"] }
 diesel = { version = "2", features = ["postgres", "mysql"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 
+# Property-based testing
+proptest = "1"
+
 [features]
 default = []
 testing = ["dep:arbitrary"]

@@ -102,6 +102,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

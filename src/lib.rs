@@ -13,7 +13,7 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use subql::{SubscriptionEngine, SubscriptionSpec, WalEvent, DefaultIds};
 //! use sqlparser::dialect::PostgreSqlDialect;
 //!
@@ -40,7 +40,10 @@
 pub use errors::*;
 pub use runtime::{MatchedUsers, SubscriptionEngine};
 pub use types::*;
-pub use wal::{DebeziumParser, MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Parser, WalParseError, WalParser};
+pub use wal::{
+    DebeziumParser, MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Parser,
+    WalParseError, WalParser,
+};
 
 // Internal modules
 mod errors;

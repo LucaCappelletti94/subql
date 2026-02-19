@@ -260,6 +260,52 @@ impl<I: IdTypes> TablePartition<I> {
         candidates
     }
 
+    /// Add multiple predicates and bindings in a single batch
+    ///
+    /// Performs one COW clone, inserts all predicates and bindings, rebuilds
+    /// indexes once, and performs a single atomic snapshot swap.
+    /// Much more efficient than calling `add_predicate`/`add_binding` in a loop.
+    #[allow(clippy::type_complexity)]
+    pub fn add_batch(&mut self, entries: &[(Predicate, Vec<IndexableAtom>, Vec<Binding<I>>)]) {
+        if entries.is_empty() {
+            return;
+        }
+
+        // Single COW clone for the entire batch
+        let store = Arc::make_mut(&mut self.mutable_predicates);
+
+        for (predicate, _atoms, bindings) in entries {
+            let pred_id = store.add_predicate(Predicate::clone(predicate));
+
+            for binding in bindings {
+                let mut b = *binding;
+                b.predicate_id = pred_id;
+                store.add_binding(b);
+                store.increment_refcount(pred_id);
+            }
+        }
+
+        // Single index rebuild for all predicates
+        let mut new_indexes = HybridIndexes::new();
+
+        for (idx, pred) in &self.mutable_predicates.predicates {
+            let pred_deps = pred.dependency_columns.to_vec();
+            let pred_atoms = super::indexes::extract_indexable_atoms(&pred.bytecode, &pred_deps);
+            new_indexes.add_predicate(PredicateId::from_slab_index(idx), &pred_atoms, &pred_deps);
+        }
+
+        new_indexes.finalize_ranges();
+
+        // Single atomic snapshot swap
+        let new_snapshot = TablePartitionSnapshot {
+            table_id: self.table_id,
+            indexes: new_indexes,
+            predicates: Arc::clone(&self.mutable_predicates),
+        };
+
+        self.snapshot.store(Arc::new(new_snapshot));
+    }
+
     /// Get table ID
     #[must_use]
     pub const fn table_id(&self) -> TableId {

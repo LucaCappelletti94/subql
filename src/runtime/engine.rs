@@ -1,5 +1,6 @@
 //! Subscription engine - main public API
 
+use super::indexes::IndexableAtom;
 use super::{
     dispatch::{dispatch_users, MatchedUsers, UserDictionary},
     ids::PredicateId,
@@ -21,6 +22,8 @@ use crate::{
 };
 use ahash::AHashMap;
 use sqlparser::dialect::Dialect;
+
+type BatchEntries<I> = Vec<(Predicate, Vec<IndexableAtom>, Vec<Binding<I>>)>;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -189,6 +192,160 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             predicate_hash: hash,
             created_new_predicate: created_new,
         })
+    }
+
+    /// Register multiple subscriptions in a single batch
+    ///
+    /// Significantly more efficient than calling `register()` in a loop:
+    /// performs a single COW clone and single snapshot swap per table instead
+    /// of one per subscription. Ideal for bulk loading at startup.
+    ///
+    /// Returns results in the same order as the input specs.
+    /// On error, already-registered subscriptions in this batch are NOT rolled back.
+    #[allow(clippy::too_many_lines)]
+    pub fn register_batch(
+        &mut self,
+        specs: Vec<SubscriptionSpec<I>>,
+    ) -> Vec<Result<RegisterResult, RegisterError>> {
+        // Phase 1: Parse and compile all specs (can fail individually)
+        struct Compiled<I: IdTypes> {
+            spec: SubscriptionSpec<I>,
+            table_id: TableId,
+            bytecode: BytecodeProgram,
+            normalized: String,
+            hash: u128,
+        }
+
+        let mut compiled: Vec<Option<Compiled<I>>> = Vec::with_capacity(specs.len());
+        let mut results: Vec<Result<RegisterResult, RegisterError>> =
+            Vec::with_capacity(specs.len());
+
+        for spec in specs {
+            match parse_and_compile(&spec.sql, &self.dialect, &*self.catalog) {
+                Ok((table_id, bytecode)) => {
+                    match canonicalize::normalize_sql(&spec.sql, &self.dialect) {
+                        Ok(normalized) => {
+                            let hash = canonicalize::hash_sql(&normalized);
+                            compiled.push(Some(Compiled {
+                                spec,
+                                table_id,
+                                bytecode,
+                                normalized,
+                                hash,
+                            }));
+                            results.push(Ok(RegisterResult {
+                                table_id,
+                                normalized_sql: String::new(), // filled in phase 2
+                                predicate_hash: hash,
+                                created_new_predicate: false, // filled in phase 2
+                            }));
+                        }
+                        Err(e) => {
+                            compiled.push(None);
+                            results.push(Err(e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    compiled.push(None);
+                    results.push(Err(e));
+                }
+            }
+        }
+
+        // Phase 2: Group by table and batch-insert
+        let mut table_entries: AHashMap<TableId, BatchEntries<I>> = AHashMap::new();
+
+        // Track which hashes we've already prepared (dedup within batch)
+        let mut batch_hash_to_idx: AHashMap<(TableId, u128), usize> = AHashMap::new();
+
+        for (i, entry) in compiled.into_iter().enumerate() {
+            let Some(c) = entry else { continue };
+
+            let partition = self
+                .partitions
+                .entry(c.table_id)
+                .or_insert_with(|| TablePartition::new(c.table_id));
+            let user_dict = self.user_dictionaries.entry(c.table_id).or_default();
+            let user_ord = user_dict.get_or_create(c.spec.user_id);
+
+            // Check if predicate already exists in current snapshot
+            let snapshot = partition.load_snapshot();
+            let existing = snapshot.predicates.find_by_hash(c.hash);
+
+            let created_new;
+
+            if let Some(pred_id) = existing {
+                // Predicate exists in the live partition — add binding directly
+                // (cannot batch this since it references an existing pred_id)
+                let binding = Binding {
+                    subscription_id: c.spec.subscription_id,
+                    predicate_id: pred_id,
+                    user_id: c.spec.user_id,
+                    user_ordinal: user_ord,
+                    session_id: c.spec.session_id,
+                    updated_at_unix_ms: c.spec.updated_at_unix_ms,
+                };
+                partition.add_binding(binding, pred_id);
+                created_new = false;
+            } else if let Some(&batch_idx) = batch_hash_to_idx.get(&(c.table_id, c.hash)) {
+                // Deduplicated within this batch — add binding to existing batch entry
+                let entries = table_entries.get_mut(&c.table_id).expect("table exists");
+                let binding = Binding {
+                    subscription_id: c.spec.subscription_id,
+                    predicate_id: PredicateId::from_slab_index(0), // placeholder
+                    user_id: c.spec.user_id,
+                    user_ordinal: user_ord,
+                    session_id: c.spec.session_id,
+                    updated_at_unix_ms: c.spec.updated_at_unix_ms,
+                };
+                entries[batch_idx].2.push(binding);
+                created_new = false;
+            } else {
+                // New predicate — create batch entry
+                let pred = super::predicate::Predicate {
+                    id: PredicateId::from_slab_index(0),
+                    hash: c.hash,
+                    normalized_sql: c.normalized.clone().into(),
+                    bytecode: Arc::new(c.bytecode.clone()),
+                    dependency_columns: Arc::from(c.bytecode.dependency_columns.as_slice()),
+                    refcount: 0,
+                    updated_at_unix_ms: c.spec.updated_at_unix_ms,
+                };
+                let atoms = extract_indexable_atoms(&c.bytecode, &c.bytecode.dependency_columns);
+                let binding = Binding {
+                    subscription_id: c.spec.subscription_id,
+                    predicate_id: PredicateId::from_slab_index(0), // placeholder
+                    user_id: c.spec.user_id,
+                    user_ordinal: user_ord,
+                    session_id: c.spec.session_id,
+                    updated_at_unix_ms: c.spec.updated_at_unix_ms,
+                };
+
+                let entries = table_entries.entry(c.table_id).or_default();
+                let batch_idx = entries.len();
+                entries.push((pred, atoms, vec![binding]));
+                batch_hash_to_idx.insert((c.table_id, c.hash), batch_idx);
+                created_new = true;
+            }
+
+            // Fill in the result
+            if let Ok(ref mut result) = results[i] {
+                result.normalized_sql = c.normalized;
+                result.created_new_predicate = created_new;
+            }
+        }
+
+        // Phase 3: Batch-insert into partitions (single COW + single swap per table)
+        for (table_id, entries) in table_entries {
+            let partition = self
+                .partitions
+                .get_mut(&table_id)
+                .expect("partition created above");
+            partition.add_batch(&entries);
+        }
+
+        results
     }
 
     /// Unregister a subscription
@@ -593,9 +750,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         &mut self,
         job_id: MergeJobId,
     ) -> Result<Option<MergeReport>, MergeError> {
-        let merged = match self.merge_manager.try_get_result(job_id)? {
-            Some(m) => m,
-            None => return Ok(None),
+        let Some(merged) = self.merge_manager.try_get_result(job_id)? else {
+            return Ok(None);
         };
 
         let table_id = merged.table_id;
@@ -680,6 +836,13 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::uninlined_format_args,
+    clippy::clone_on_ref_ptr,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 mod tests {
     use super::*;
     use crate::testing::MockCatalog;
@@ -1641,5 +1804,211 @@ mod tests {
             ),
             Ok(_) => panic!("Expected error loading corrupt shard"),
         }
+    }
+
+    // ========================================================================
+    // Batch Registration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_register_batch_basic() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let specs = vec![
+            SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 100,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            },
+            SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 200,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
+                updated_at_unix_ms: 0,
+            },
+        ];
+
+        let results = engine.register_batch(specs);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+
+        assert_eq!(engine.subscription_count(), 2);
+        assert_eq!(engine.predicate_count(1), 2);
+    }
+
+    #[test]
+    fn test_register_batch_deduplication_within_batch() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Two users with the same predicate in a single batch
+        let specs = vec![
+            SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 100,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            },
+            SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 200,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            },
+        ];
+
+        let results = engine.register_batch(specs);
+        assert!(results[0].as_ref().unwrap().created_new_predicate);
+        assert!(!results[1].as_ref().unwrap().created_new_predicate);
+
+        assert_eq!(engine.subscription_count(), 2);
+        assert_eq!(engine.predicate_count(1), 1); // Deduplicated
+    }
+
+    #[test]
+    fn test_register_batch_partial_failure() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let specs = vec![
+            SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 100,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            },
+            SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 200,
+                session_id: None,
+                sql: "SELECT * FROM nonexistent WHERE id = 1".to_string(), // bad table
+                updated_at_unix_ms: 0,
+            },
+            SubscriptionSpec {
+                subscription_id: 3,
+                user_id: 300,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount = 42".to_string(),
+                updated_at_unix_ms: 0,
+            },
+        ];
+
+        let results = engine.register_batch(specs);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err()); // Unknown table
+        assert!(results[2].is_ok());
+
+        assert_eq!(engine.subscription_count(), 2); // Only 2 succeeded
+    }
+
+    #[test]
+    fn test_register_batch_empty() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let results = engine.register_batch(vec![]);
+        assert!(results.is_empty());
+        assert_eq!(engine.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_register_batch_dispatch_works() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let specs = vec![
+            SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            },
+            SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 99,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
+                updated_at_unix_ms: 0,
+            },
+        ];
+
+        engine.register_batch(specs);
+
+        // Dispatch event with amount = 200 (should match user 42 but not 99)
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        assert!(users.contains(&42));
+        assert!(!users.contains(&99));
+    }
+
+    #[test]
+    fn test_register_batch_dedup_with_existing() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Register one subscription individually
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 100,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        // Batch register with same predicate + a new one
+        let specs = vec![
+            SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 200,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(), // dedup with existing
+                updated_at_unix_ms: 0,
+            },
+            SubscriptionSpec {
+                subscription_id: 3,
+                user_id: 300,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 50".to_string(), // new
+                updated_at_unix_ms: 0,
+            },
+        ];
+
+        let results = engine.register_batch(specs);
+        assert!(!results[0].as_ref().unwrap().created_new_predicate);
+        assert!(results[1].as_ref().unwrap().created_new_predicate);
+
+        assert_eq!(engine.subscription_count(), 3);
+        assert_eq!(engine.predicate_count(1), 2); // Original + new
     }
 }

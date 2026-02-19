@@ -1,4 +1,6 @@
 //! Dispatch performance benchmarks
+#![allow(clippy::unwrap_used, clippy::unreadable_literal)]
+#![allow(clippy::cast_sign_loss)]
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use sqlparser::dialect::PostgreSqlDialect;

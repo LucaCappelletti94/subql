@@ -52,14 +52,18 @@ struct Wal2JsonV1OldKeys {
 #[derive(Deserialize)]
 struct Wal2JsonV2Message {
     pub action: String,
-    pub schema: String,
-    pub table: String,
+    /// Schema name (absent on transaction boundary messages: B, C, M).
+    #[serde(default)]
+    pub schema: Option<String>,
+    /// Table name (absent on transaction boundary messages: B, C, M).
+    #[serde(default)]
+    pub table: Option<String>,
     #[serde(default)]
     pub columns: Option<Vec<Wal2JsonV2Column>>,
     #[serde(default)]
     pub identity: Option<Vec<Wal2JsonV2Column>>,
     #[serde(default)]
-    pub pk: Option<Wal2JsonV2Pk>,
+    pub pk: Option<Vec<Wal2JsonV2PkColumn>>,
 }
 
 #[derive(Deserialize)]
@@ -70,11 +74,13 @@ struct Wal2JsonV2Column {
     pub value: serde_json::Value,
 }
 
+/// v2 PK column entry: `{"name": "col_name", "type": "col_type"}`
 #[derive(Deserialize)]
-struct Wal2JsonV2Pk {
-    pub keynames: Vec<String>,
+struct Wal2JsonV2PkColumn {
+    pub name: String,
     #[allow(dead_code)]
-    pub keytypes: Vec<String>,
+    #[serde(rename = "type")]
+    pub type_name: String,
 }
 
 // ============================================================================
@@ -118,6 +124,12 @@ impl WalParser for Wal2JsonV2Parser {
 
         let msg: Wal2JsonV2Message =
             serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
+
+        // Skip transaction boundary messages (B=begin, C=commit, M=message)
+        match msg.action.as_str() {
+            "I" | "U" | "D" => {}
+            _ => return Ok(Vec::new()),
+        }
 
         let event = convert_v2_message(&msg, catalog)?;
         Ok(vec![event])
@@ -344,7 +356,12 @@ fn convert_v2_message(
     catalog: &dyn SchemaCatalog,
 ) -> Result<WalEvent, WalParseError> {
     let kind = parse_v2_kind(&msg.action)?;
-    let table_id = resolve_table(&msg.schema, &msg.table, catalog)?;
+
+    let schema = msg.schema.as_deref().unwrap_or("");
+    let table = msg.table.as_deref().ok_or_else(|| {
+        WalParseError::JsonError("data message (I/U/D) missing 'table' field".to_string())
+    })?;
+    let table_id = resolve_table(schema, table, catalog)?;
 
     let (new_row, new_resolved) = if let Some(ref columns) = msg.columns {
         let (row, resolved) = build_row_from_v2_columns(columns, table_id, catalog)?;
@@ -365,11 +382,10 @@ fn convert_v2_message(
     #[allow(clippy::option_if_let_else)]
     let pk = if !identity_resolved.is_empty() {
         // Use identity columns as PK source (UPDATE/DELETE)
-        if let Some(ref pk_meta) = msg.pk {
-            let pk_col_ids: Vec<ColumnId> = pk_meta
-                .keynames
+        if let Some(ref pk_cols) = msg.pk {
+            let pk_col_ids: Vec<ColumnId> = pk_cols
                 .iter()
-                .filter_map(|name| catalog.column_id(table_id, name))
+                .filter_map(|c| catalog.column_id(table_id, &c.name))
                 .collect();
             build_pk_from_resolved(&identity_resolved, &pk_col_ids)
         } else {
@@ -381,12 +397,11 @@ fn convert_v2_message(
                 values: Arc::from(vals),
             }
         }
-    } else if let Some(ref pk_meta) = msg.pk {
+    } else if let Some(ref pk_cols) = msg.pk {
         // INSERT — extract PK from new row using pk metadata
-        let pk_col_ids: Vec<ColumnId> = pk_meta
-            .keynames
+        let pk_col_ids: Vec<ColumnId> = pk_cols
             .iter()
-            .filter_map(|name| catalog.column_id(table_id, name))
+            .filter_map(|c| catalog.column_id(table_id, &c.name))
             .collect();
         build_pk_from_resolved(&new_resolved, &pk_col_ids)
     } else {
@@ -720,10 +735,9 @@ mod tests {
                 {"name": "amount", "type": "numeric", "value": 99.95},
                 {"name": "status", "type": "text", "value": "pending"}
             ],
-            "pk": {
-                "keynames": ["id"],
-                "keytypes": ["integer"]
-            }
+            "pk": [
+                {"name": "id", "type": "integer"}
+            ]
         }"#;
 
         let events = parser
@@ -766,10 +780,9 @@ mod tests {
             "identity": [
                 {"name": "id", "type": "integer", "value": 1}
             ],
-            "pk": {
-                "keynames": ["id"],
-                "keytypes": ["integer"]
-            }
+            "pk": [
+                {"name": "id", "type": "integer"}
+            ]
         }"#;
 
         let events = parser
@@ -802,10 +815,9 @@ mod tests {
             "identity": [
                 {"name": "id", "type": "integer", "value": 42}
             ],
-            "pk": {
-                "keynames": ["id"],
-                "keytypes": ["integer"]
-            }
+            "pk": [
+                {"name": "id", "type": "integer"}
+            ]
         }"#;
 
         let events = parser
@@ -914,20 +926,21 @@ mod tests {
     }
 
     #[test]
-    fn error_unknown_event_kind_v2() {
+    fn v2_non_data_actions_skipped() {
         let catalog = TestCatalog::orders();
         let parser = Wal2JsonV2Parser;
 
-        let json = r#"{
-            "action": "T",
-            "schema": "public",
-            "table": "orders"
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+        // Truncate (T), Begin (B), Commit (C), Message (M) are silently skipped
+        for action in &["T", "B", "C", "M"] {
+            let json = format!(r#"{{"action": "{action}"}}"#);
+            let events = parser
+                .parse_wal_message(json.as_bytes(), &catalog)
+                .expect("non-data messages should not error");
+            assert!(
+                events.is_empty(),
+                "action '{action}' should return empty vec"
+            );
+        }
     }
 
     // -- Trait object safety --------------------------------------------------
@@ -1127,10 +1140,9 @@ mod tests {
                 {"name": "amount", "type": "numeric", "value": 149.95},
                 {"name": "status", "type": "text", "value": "shipped"}
             ],
-            "pk": {
-                "keynames": ["id"],
-                "keytypes": ["integer"]
-            }
+            "pk": [
+                {"name": "id", "type": "integer"}
+            ]
         }"#;
 
         let events = parser

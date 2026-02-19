@@ -32,13 +32,7 @@ pub fn json_value_to_cell(value: &serde_json::Value, pg_type: &str) -> Cell {
         // Boolean
         "boolean" | "bool" => bool_cell(value),
 
-        // Everything else → String
-        "text" | "varchar" | "character varying" | "char" | "bpchar" | "name" | "uuid" | "date"
-        | "time" | "timetz" | "timestamp" | "timestamptz" | "interval" | "json" | "jsonb"
-        | "xml" | "bytea" | "inet" | "cidr" | "macaddr" | "point" | "line" | "box" | "path"
-        | "polygon" | "circle" | "tsquery" | "tsvector" | "bit" | "varbit" => string_cell(value),
-
-        // Unknown type → best-effort String
+        // Everything else → String (including known text-like types)
         _ => string_cell(value),
     }
 }
@@ -205,10 +199,10 @@ mod tests {
 
     #[test]
     fn float_types() {
-        assert_eq!(json_value_to_cell(&json!(3.14), "real"), Cell::Float(3.14));
+        assert_eq!(json_value_to_cell(&json!(3.15), "real"), Cell::Float(3.15));
         assert_eq!(
-            json_value_to_cell(&json!(2.718), "double precision"),
-            Cell::Float(2.718)
+            json_value_to_cell(&json!(2.719), "double precision"),
+            Cell::Float(2.719)
         );
     }
 
@@ -388,9 +382,9 @@ mod tests {
     #[test]
     fn text_to_cell_floats() {
         // float4 (OID 700)
-        assert_eq!(text_to_cell("3.14", 700), Cell::Float(3.14));
+        assert_eq!(text_to_cell("3.15", 700), Cell::Float(3.15));
         // float8 (OID 701)
-        assert_eq!(text_to_cell("2.718", 701), Cell::Float(2.718));
+        assert_eq!(text_to_cell("2.719", 701), Cell::Float(2.719));
         // numeric (OID 1700)
         assert_eq!(text_to_cell("99.95", 1700), Cell::Float(99.95));
         // Non-numeric → String fallback
@@ -466,8 +460,8 @@ mod tests {
         );
         // jsonb (OID 3802)
         assert_eq!(
-            text_to_cell(r#"[1,2,3]"#, 3802),
-            Cell::String(Arc::from(r#"[1,2,3]"#))
+            text_to_cell(r"[1,2,3]", 3802),
+            Cell::String(Arc::from(r"[1,2,3]"))
         );
     }
 

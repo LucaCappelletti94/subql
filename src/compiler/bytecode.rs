@@ -154,6 +154,27 @@ pub enum Instruction {
     ///
     /// Stack: [..., string, pattern] → [..., Tri]
     Like { case_sensitive: bool },
+
+    // ========================================================================
+    // Control Flow (short-circuit evaluation)
+    // ========================================================================
+    /// Jump forward if top of stack is Tri::False (for AND short-circuit)
+    ///
+    /// Peeks at TOS. If False, jumps forward by `offset` instructions (skipping
+    /// the second AND operand + the And instruction). The False stays on stack
+    /// as the result. If not False, execution continues normally.
+    ///
+    /// Stack: [..., tri] → [..., tri] (no change, just control flow)
+    JumpIfFalse(usize),
+
+    /// Jump forward if top of stack is Tri::True (for OR short-circuit)
+    ///
+    /// Peeks at TOS. If True, jumps forward by `offset` instructions (skipping
+    /// the second OR operand + the Or instruction). The True stays on stack
+    /// as the result. If not True, execution continues normally.
+    ///
+    /// Stack: [..., tri] → [..., tri] (no change, just control flow)
+    JumpIfTrue(usize),
 }
 
 /// Compiled bytecode program

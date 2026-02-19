@@ -233,6 +233,7 @@ impl<I: IdTypes> Default for PredicateStore<I> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::clone_on_copy)]
 mod tests {
     use super::*;
     use crate::compiler::Instruction;

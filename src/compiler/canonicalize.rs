@@ -182,6 +182,7 @@ fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
     normalize_expr_inner(expr, 0)
 }
 
+#[allow(clippy::too_many_lines)]
 fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterError> {
     if depth > MAX_EXPR_DEPTH {
         return Err(RegisterError::UnsupportedSql(
@@ -361,6 +362,11 @@ const fn unary_op_to_string(op: &sqlparser::ast::UnaryOperator) -> &'static str 
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::uninlined_format_args,
+    clippy::single_char_pattern
+)]
 mod tests {
     use super::*;
     use sqlparser::dialect::PostgreSqlDialect;

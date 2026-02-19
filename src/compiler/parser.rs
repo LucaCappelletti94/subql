@@ -170,35 +170,73 @@ fn compile_expr_recursive(
         // Binary Operations
         // ====================================================================
         Expr::BinaryOp { left, op, right } => {
-            // Compile operands (left then right, stack order)
-            compile_expr_recursive(left, table_id, catalog, out, depth + 1)?;
-            compile_expr_recursive(right, table_id, catalog, out, depth + 1)?;
-
-            // Emit comparison/logical/arithmetic operator
             match op {
-                // Comparison operators
-                BinaryOperator::Eq => out.push(Instruction::Equal),
-                BinaryOperator::NotEq => out.push(Instruction::NotEqual),
-                BinaryOperator::Lt => out.push(Instruction::LessThan),
-                BinaryOperator::LtEq => out.push(Instruction::LessThanOrEqual),
-                BinaryOperator::Gt => out.push(Instruction::GreaterThan),
-                BinaryOperator::GtEq => out.push(Instruction::GreaterThanOrEqual),
+                // Short-circuit logical operators
+                BinaryOperator::And => {
+                    // Compile left operand
+                    compile_expr_recursive(left, table_id, catalog, out, depth + 1)?;
 
-                // Logical operators
-                BinaryOperator::And => out.push(Instruction::And),
-                BinaryOperator::Or => out.push(Instruction::Or),
+                    // Emit placeholder jump (patched below)
+                    let jump_idx = out.len();
+                    out.push(Instruction::JumpIfFalse(0)); // placeholder
 
-                // Arithmetic operators
-                BinaryOperator::Plus => out.push(Instruction::Add),
-                BinaryOperator::Minus => out.push(Instruction::Subtract),
-                BinaryOperator::Multiply => out.push(Instruction::Multiply),
-                BinaryOperator::Divide => out.push(Instruction::Divide),
-                BinaryOperator::Modulo => out.push(Instruction::Modulo),
+                    // Compile right operand
+                    let rhs_start = out.len();
+                    compile_expr_recursive(right, table_id, catalog, out, depth + 1)?;
 
+                    // Emit And
+                    out.push(Instruction::And);
+
+                    // Patch jump offset: skip rhs instructions + And instruction
+                    let rhs_len = out.len() - rhs_start;
+                    out[jump_idx] = Instruction::JumpIfFalse(rhs_len + 1);
+                }
+                BinaryOperator::Or => {
+                    // Compile left operand
+                    compile_expr_recursive(left, table_id, catalog, out, depth + 1)?;
+
+                    // Emit placeholder jump (patched below)
+                    let jump_idx = out.len();
+                    out.push(Instruction::JumpIfTrue(0)); // placeholder
+
+                    // Compile right operand
+                    let rhs_start = out.len();
+                    compile_expr_recursive(right, table_id, catalog, out, depth + 1)?;
+
+                    // Emit Or
+                    out.push(Instruction::Or);
+
+                    // Patch jump offset: skip rhs instructions + Or instruction
+                    let rhs_len = out.len() - rhs_start;
+                    out[jump_idx] = Instruction::JumpIfTrue(rhs_len + 1);
+                }
                 _ => {
-                    return Err(RegisterError::UnsupportedSql(format!(
-                        "Binary operator {op:?} not supported"
-                    )));
+                    // All non-short-circuit operators: compile both sides, emit op
+                    compile_expr_recursive(left, table_id, catalog, out, depth + 1)?;
+                    compile_expr_recursive(right, table_id, catalog, out, depth + 1)?;
+
+                    match op {
+                        // Comparison operators
+                        BinaryOperator::Eq => out.push(Instruction::Equal),
+                        BinaryOperator::NotEq => out.push(Instruction::NotEqual),
+                        BinaryOperator::Lt => out.push(Instruction::LessThan),
+                        BinaryOperator::LtEq => out.push(Instruction::LessThanOrEqual),
+                        BinaryOperator::Gt => out.push(Instruction::GreaterThan),
+                        BinaryOperator::GtEq => out.push(Instruction::GreaterThanOrEqual),
+
+                        // Arithmetic operators
+                        BinaryOperator::Plus => out.push(Instruction::Add),
+                        BinaryOperator::Minus => out.push(Instruction::Subtract),
+                        BinaryOperator::Multiply => out.push(Instruction::Multiply),
+                        BinaryOperator::Divide => out.push(Instruction::Divide),
+                        BinaryOperator::Modulo => out.push(Instruction::Modulo),
+
+                        _ => {
+                            return Err(RegisterError::UnsupportedSql(format!(
+                                "Binary operator {op:?} not supported"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -438,6 +476,7 @@ fn value_to_cell(val: &sqlparser::ast::Value) -> Result<Cell, RegisterError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
     use crate::testing::MockCatalog;
@@ -617,7 +656,8 @@ mod tests {
                 Instruction::LoadColumn(1), // age
                 Instruction::PushLiteral(Cell::Int(18)),
                 Instruction::GreaterThan,
-                Instruction::LoadColumn(0), // id
+                Instruction::JumpIfFalse(5), // skip rhs (3 instr) + And + jump itself
+                Instruction::LoadColumn(0),  // id
                 Instruction::PushLiteral(Cell::Int(42)),
                 Instruction::Equal,
                 Instruction::And,
@@ -641,6 +681,7 @@ mod tests {
                 Instruction::LoadColumn(1), // age
                 Instruction::PushLiteral(Cell::Int(18)),
                 Instruction::LessThan,
+                Instruction::JumpIfTrue(5), // skip rhs (3 instr) + Or + jump itself
                 Instruction::LoadColumn(1), // age again
                 Instruction::PushLiteral(Cell::Int(65)),
                 Instruction::GreaterThan,
@@ -849,10 +890,12 @@ mod tests {
                 Instruction::LoadColumn(1), // age
                 Instruction::PushLiteral(Cell::Int(18)),
                 Instruction::GreaterThan,
+                Instruction::JumpIfTrue(4), // skip IsNull + Or (2 instr) + jump itself
                 Instruction::LoadColumn(1), // age
                 Instruction::IsNull,
                 Instruction::Or,
-                Instruction::LoadColumn(2), // email
+                Instruction::JumpIfFalse(4), // skip IsNotNull + And (2 instr) + jump itself
+                Instruction::LoadColumn(2),  // email
                 Instruction::IsNotNull,
                 Instruction::And,
             ]

@@ -251,6 +251,7 @@ impl From<MergeStats> for MergeReport {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::super::shard::{serialize_shard, PredicateData, UserDictData};
     use super::*;

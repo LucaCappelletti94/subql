@@ -116,6 +116,7 @@ impl std::ops::Not for Tri {
 }
 
 #[cfg(test)]
+#[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
 

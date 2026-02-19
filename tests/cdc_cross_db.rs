@@ -117,9 +117,46 @@ impl SchemaCatalog for IoTCatalog {
 // Container setup
 // ============================================================================
 
-/// Start PostgreSQL with wal2json plugin (debezium image).
+const PG_IMAGE: &str = "subql-test/postgres-wal2json";
+const PG_TAG: &str = "16";
+
+/// Build the custom Postgres image with wal2json (cached by Docker layer cache).
+fn ensure_postgres_image() {
+    let output = std::process::Command::new("docker")
+        .args(["images", "-q", &format!("{PG_IMAGE}:{PG_TAG}")])
+        .output()
+        .expect("docker images");
+
+    if !output.stdout.is_empty() {
+        return; // Already built
+    }
+
+    let dockerfile = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/Dockerfile.postgres"
+    );
+    let build_out = std::process::Command::new("docker")
+        .args([
+            "build",
+            "-t",
+            &format!("{PG_IMAGE}:{PG_TAG}"),
+            "-f",
+            dockerfile,
+            ".",
+        ])
+        .output()
+        .expect("docker build");
+    assert!(
+        build_out.status.success(),
+        "Failed to build postgres-wal2json image"
+    );
+}
+
+/// Start PostgreSQL with wal2json plugin.
 fn start_postgres() -> testcontainers::Container<GenericImage> {
-    GenericImage::new("debezium/postgres", "16")
+    ensure_postgres_image();
+
+    GenericImage::new(PG_IMAGE, PG_TAG)
         .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
         .with_exposed_port(5432.tcp())
         .with_env_var("POSTGRES_USER", "subql_test")
@@ -127,9 +164,12 @@ fn start_postgres() -> testcontainers::Container<GenericImage> {
         .with_env_var("POSTGRES_DB", "testdb")
         .with_cmd([
             "postgres",
-            "-c", "wal_level=logical",
-            "-c", "max_wal_senders=4",
-            "-c", "max_replication_slots=4",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_wal_senders=4",
+            "-c",
+            "max_replication_slots=4",
         ])
         .with_startup_timeout(Duration::from_secs(60))
         .start()
@@ -140,8 +180,11 @@ fn start_postgres() -> testcontainers::Container<GenericImage> {
 ///
 /// Uses `with_container_name` so Maxwell can reach it as `mysql` on the shared network.
 fn start_mysql(network: &str, container_name: &str) -> testcontainers::Container<GenericImage> {
+    // Note: MySQL 8.0 prints "ready for connections" twice during startup
+    // (once for temp server, once for real). We match "port: 3306" which
+    // only appears in the final ready message.
     GenericImage::new("mysql", "8.0")
-        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
+        .with_wait_for(WaitFor::message_on_stderr("port: 3306"))
         .with_exposed_port(3306.tcp())
         .with_env_var("MYSQL_ROOT_PASSWORD", "subql_test")
         .with_env_var("MYSQL_DATABASE", "testdb")
@@ -155,7 +198,7 @@ fn start_mysql(network: &str, container_name: &str) -> testcontainers::Container
         ])
         .with_network(network)
         .with_container_name(container_name)
-        .with_startup_timeout(Duration::from_secs(90))
+        .with_startup_timeout(Duration::from_secs(120))
         .start()
         .expect("start mysql")
 }
@@ -168,7 +211,7 @@ fn start_maxwell(
 ) -> testcontainers::Container<GenericImage> {
     let host_flag = format!("--host={mysql_name}");
     GenericImage::new("zendesk/maxwell", "latest")
-        .with_wait_for(WaitFor::seconds(5))
+        .with_wait_for(WaitFor::message_on_stderr("Binlog connected"))
         .with_network(network)
         .with_mount(Mount::bind_mount(output_dir, "/output"))
         .with_cmd([
@@ -181,7 +224,7 @@ fn start_maxwell(
             "--user=root",
             "--password=subql_test",
         ])
-        .with_startup_timeout(Duration::from_secs(60))
+        .with_startup_timeout(Duration::from_secs(90))
         .start()
         .expect("start maxwell")
 }
@@ -206,11 +249,9 @@ fn setup_postgres(pg: &mut PgConnection) {
         .execute(pg)
         .expect("PG REPLICA IDENTITY FULL");
 
-    diesel::sql_query(
-        "SELECT pg_create_logical_replication_slot('subql_test', 'wal2json')",
-    )
-    .execute(pg)
-    .expect("PG create replication slot");
+    diesel::sql_query("SELECT pg_create_logical_replication_slot('subql_test', 'wal2json')")
+        .execute(pg)
+        .expect("PG create replication slot");
 }
 
 fn setup_mysql(my: &mut MysqlConnection) {
@@ -357,7 +398,11 @@ fn setup_engine(
     let mut engine = SubscriptionEngine::new(Arc::clone(catalog), PostgreSqlDialect {});
 
     let subscriptions = [
-        (1_u64, 1_u64, "SELECT * FROM readings WHERE temperature > 30"),
+        (
+            1_u64,
+            1_u64,
+            "SELECT * FROM readings WHERE temperature > 30",
+        ),
         (
             2,
             2,
@@ -423,14 +468,45 @@ fn dispatch_events(
 #[ignore = "requires Docker; run with: cargo test --test cdc_cross_db -- --ignored"]
 #[allow(clippy::print_stderr)]
 fn cross_db_cdc_parity() {
+    // Guard to ensure Docker network cleanup even on panic.
+    struct NetworkGuard(String);
+    impl Drop for NetworkGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["network", "rm", &self.0])
+                .output();
+        }
+    }
+
     // Unique names to avoid collisions with parallel test runs
     let pid = std::process::id();
     let network = format!("subql-test-{pid}");
     let mysql_name = format!("subql-mysql-{pid}");
 
-    // Maxwell output directory (bind-mounted into the container)
+    // Create Docker network for MySQL ↔ Maxwell communication.
+    let net_output = std::process::Command::new("docker")
+        .args(["network", "create", &network])
+        .output()
+        .expect("docker network create");
+    assert!(
+        net_output.status.success(),
+        "Failed to create Docker network"
+    );
+    let _net_guard = NetworkGuard(network.clone());
+
+    // Maxwell output directory (bind-mounted into the container).
+    // Must be world-writable so the Maxwell process inside the container can write.
     let maxwell_dir = tempfile::tempdir().expect("create maxwell tempdir");
-    let maxwell_path = maxwell_dir.path().to_str().expect("tempdir path").to_string();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(maxwell_dir.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("chmod maxwell dir");
+    }
+    let maxwell_path = maxwell_dir
+        .path()
+        .to_str()
+        .expect("tempdir path")
+        .to_string();
 
     // Start containers (PG is standalone; MySQL + Maxwell share a network)
     let pg_container = start_postgres();
@@ -472,15 +548,6 @@ fn cross_db_cdc_parity() {
     let pg_messages = pg_read_changes(&mut pg);
     let mx_messages = maxwell_read_changes(&maxwell_path, 4);
 
-    eprintln!("PG messages ({}):", pg_messages.len());
-    for (i, m) in pg_messages.iter().enumerate() {
-        eprintln!("  [{i}] {m}");
-    }
-    eprintln!("Maxwell messages ({}):", mx_messages.len());
-    for (i, m) in mx_messages.iter().enumerate() {
-        eprintln!("  [{i}] {m}");
-    }
-
     // Set up engines — one per CDC source
     let catalog: Arc<dyn SchemaCatalog> = Arc::new(IoTCatalog::new());
     let mut pg_engine = setup_engine(&catalog);
@@ -490,12 +557,17 @@ fn cross_db_cdc_parity() {
     let pg_results = dispatch_events(&mut pg_engine, &Wal2JsonV2Parser, &pg_messages, &*catalog);
     let mx_results = dispatch_events(&mut mx_engine, &MaxwellParser, &mx_messages, &*catalog);
 
-    // Expected matched user IDs per event
+    // Expected matched user IDs per event.
+    //
+    // UPDATE optimization: only predicates depending on changed columns are
+    // re-evaluated, so the UPDATE below (only temperature changed) only
+    // matches user 1 (temperature > 30), not user 2 (location) or user 4
+    // (sensor_id) even though the row still matches their predicates.
     let expected: Vec<BTreeSet<u64>> = vec![
         BTreeSet::from([1, 2, 4]), // INSERT (1, 35, 45, 'warehouse-A'): temp>30, loc match, sensor match
         BTreeSet::from([3]),       // INSERT (2, 28, 35, 'warehouse-B'): hum<40 AND temp>25
-        BTreeSet::from([1, 2, 4]), // UPDATE sensor_id=1 temp=40: 40>30, loc still wh-A, sensor match
-        BTreeSet::from([3]),       // DELETE sensor_id=2: old row matches hum<40 AND temp>25
+        BTreeSet::from([1]), // UPDATE sensor_id=1 temp=40: only temp changed → only temp>30 re-evaluated
+        BTreeSet::from([3]), // DELETE sensor_id=2: old row matches hum<40 AND temp>25
     ];
 
     // Assert parity between PG and Maxwell results
@@ -524,11 +596,6 @@ fn cross_db_cdc_parity() {
             pg, mx,
             "Event {i} parity failure: PG={pg:?}, Maxwell={mx:?}"
         );
-        assert_eq!(
-            pg, exp,
-            "Event {i} expected {exp:?}, got PG={pg:?}"
-        );
+        assert_eq!(pg, exp, "Event {i} expected {exp:?}, got PG={pg:?}");
     }
-
-    eprintln!("All 4 events match across PG and Maxwell CDC sources");
 }

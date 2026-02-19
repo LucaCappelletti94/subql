@@ -45,6 +45,7 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Storage
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};

@@ -1,6 +1,8 @@
 //! Memory profiling with dhat
 //!
 //! Run with: cargo run --release --features dhat-heap --bin memory_profile
+#![allow(clippy::unwrap_used, clippy::unreadable_literal)]
+#![allow(clippy::print_stdout, clippy::unnecessary_cast)]
 
 use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::HashMap;

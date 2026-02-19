@@ -175,6 +175,7 @@ pub fn dispatch_users<'a, I: IdTypes>(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::needless_collect)]
 mod tests {
     use super::*;
     use crate::DefaultIds;

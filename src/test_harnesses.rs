@@ -185,6 +185,7 @@ pub fn harness_codec_decode(data: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::manual_let_else)]
 mod regression_tests {
     use super::*;
     use std::fs;

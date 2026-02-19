@@ -253,9 +253,36 @@ pub fn extract_indexable_atoms(
     let mut atoms = Vec::new();
     let instructions = &bytecode.instructions;
 
+    // Safety: OR predicates require ALL branches to be indexed for correctness.
+    // If any branch isn't indexed, the predicate could be missed during candidate
+    // selection. Add Fallback to ensure OR predicates are always VM-evaluated.
+    let has_or = instructions
+        .iter()
+        .any(|instr| matches!(instr, Instruction::Or | Instruction::JumpIfTrue(_)));
+    if has_or {
+        atoms.push(IndexableAtom::Fallback);
+    }
+
     // Pattern matching on instruction sequences
     let mut i = 0;
     while i < instructions.len() {
+        // Check for 5-instruction patterns (BETWEEN with negated bound)
+        // Pattern: LoadColumn, PushLiteral, Negate, PushLiteral, Between
+        if let Some(
+            [Instruction::LoadColumn(col), Instruction::PushLiteral(lower), Instruction::Negate, Instruction::PushLiteral(upper), Instruction::Between],
+        ) = instructions.get(i..i.saturating_add(5))
+        {
+            if let (Cell::Int(lower_val), Cell::Int(upper_val)) = (lower, upper) {
+                atoms.push(IndexableAtom::Range {
+                    column_id: *col,
+                    lower: Some(-lower_val),
+                    upper: Some(*upper_val),
+                });
+            }
+            i += 5;
+            continue;
+        }
+
         // Check for 4-instruction patterns first (BETWEEN)
         if let Some(
             [Instruction::LoadColumn(col), Instruction::PushLiteral(lower), Instruction::PushLiteral(upper), Instruction::Between],
@@ -404,6 +431,7 @@ pub fn extract_indexable_atoms(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::approx_constant)]
 mod tests {
     use super::*;
 

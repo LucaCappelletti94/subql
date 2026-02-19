@@ -614,7 +614,7 @@ mod tests {
         push_cstring(&mut buf, namespace);
         push_cstring(&mut buf, name);
         push_u8(&mut buf, 0); // replica identity
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         push_i16(&mut buf, columns.len() as i16);
         for &(col_name, type_oid, flags) in columns {
             push_u8(&mut buf, flags);
@@ -634,7 +634,7 @@ mod tests {
     /// Build raw tuple data bytes (without the leading tag like 'N'/'K'/'O').
     fn build_tuple_data(cols: &[TupleCol]) -> Vec<u8> {
         let mut buf = Vec::new();
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         push_i16(&mut buf, cols.len() as i16);
         for col in cols {
             match col {
@@ -642,7 +642,7 @@ mod tests {
                 TupleCol::Unchanged => push_u8(&mut buf, b'u'),
                 TupleCol::Text(s) => {
                     push_u8(&mut buf, b't');
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     push_i32(&mut buf, s.len() as i32);
                     buf.extend_from_slice(s.as_bytes());
                 }
@@ -970,7 +970,7 @@ mod tests {
         let catalog = TestCatalog::orders();
         let parser = PgOutputParser::new();
 
-        for &tag in &[b'B', b'C', b'O', b'Y', b'T'] {
+        for &tag in b"BCOYT" {
             let msg = vec![tag, 0, 0, 0, 0]; // tag + some padding
             let events = parser
                 .parse_wal_message(&msg, &catalog)
@@ -1013,10 +1013,7 @@ mod tests {
         let catalog = TestCatalog::orders();
         let parser = PgOutputParser::new();
 
-        let insert_msg = build_insert_msg(
-            99999,
-            &[TupleCol::Text("1".into())],
-        );
+        let insert_msg = build_insert_msg(99999, &[TupleCol::Text("1".into())]);
         let err = parser
             .parse_wal_message(&insert_msg, &catalog)
             .expect_err("should fail");
@@ -1035,10 +1032,7 @@ mod tests {
         let err = parser
             .parse_wal_message(&msg, &catalog)
             .expect_err("should fail");
-        assert!(matches!(
-            err,
-            WalParseError::TruncatedMessage { .. }
-        ));
+        assert!(matches!(err, WalParseError::TruncatedMessage { .. }));
     }
 
     // -- Test 12: NULL columns ('n' tag) → Cell::Null ------------------------
@@ -1141,7 +1135,7 @@ mod tests {
             &[
                 TupleCol::Text("42".into()),
                 TupleCol::Text("bob".into()),
-                TupleCol::Text("3.14".into()),
+                TupleCol::Text("3.15".into()),
                 TupleCol::Text("t".into()),
             ],
         );
@@ -1153,7 +1147,7 @@ mod tests {
         let new = events[0].new_row.as_ref().expect("should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(42)));
         assert_eq!(new.get(1), Some(&Cell::String(Arc::from("bob"))));
-        assert_eq!(new.get(2), Some(&Cell::Float(3.14)));
+        assert_eq!(new.get(2), Some(&Cell::Float(3.15)));
         assert_eq!(new.get(3), Some(&Cell::Bool(true)));
     }
 

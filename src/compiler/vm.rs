@@ -50,9 +50,34 @@ impl Vm {
     pub fn eval(&mut self, program: &BytecodeProgram, row: &RowImage) -> Result<Tri, VmError> {
         self.stack.clear();
 
-        // Execute each instruction
-        for instruction in &program.instructions {
-            self.execute(instruction, row)?;
+        let instructions = &program.instructions;
+        let len = instructions.len();
+        let mut ip = 0;
+
+        // Execute instructions with explicit instruction pointer (supports jumps)
+        while ip < len {
+            match &instructions[ip] {
+                Instruction::JumpIfFalse(offset) => {
+                    // Peek at TOS without popping
+                    let top = self.peek_tri()?;
+                    if top == Tri::False {
+                        ip += offset;
+                        continue;
+                    }
+                }
+                Instruction::JumpIfTrue(offset) => {
+                    // Peek at TOS without popping
+                    let top = self.peek_tri()?;
+                    if top == Tri::True {
+                        ip += offset;
+                        continue;
+                    }
+                }
+                other => {
+                    self.execute(other, row)?;
+                }
+            }
+            ip += 1;
         }
 
         // Final stack should have exactly one Tri value
@@ -251,6 +276,9 @@ impl Vm {
                 let result = arithmetic_negate(a);
                 self.stack.push(StackValue::Cell(result));
             }
+
+            // Jump instructions are handled in eval() before execute() is called
+            Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_) => {}
         }
 
         Ok(())
@@ -277,6 +305,17 @@ impl Vm {
     fn pop_tri(&mut self) -> Result<Tri, VmError> {
         match self.stack.pop() {
             Some(StackValue::Tri(t)) => Ok(t),
+            Some(StackValue::Cell(_)) => Err(VmError::TypeMismatch {
+                expected: "Tri",
+                got: "Cell",
+            }),
+            None => Err(VmError::StackUnderflow),
+        }
+    }
+
+    fn peek_tri(&self) -> Result<Tri, VmError> {
+        match self.stack.last() {
+            Some(StackValue::Tri(t)) => Ok(*t),
             Some(StackValue::Cell(_)) => Err(VmError::TypeMismatch {
                 expected: "Tri",
                 got: "Cell",
@@ -546,6 +585,7 @@ fn arithmetic_negate(a: Cell) -> Cell {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -2190,5 +2230,124 @@ mod tests {
         ]);
 
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    // ========================================================================
+    // Short-circuit evaluation tests
+    // ========================================================================
+
+    #[test]
+    fn test_short_circuit_and_false_skips_rhs() {
+        let mut vm = Vm::new();
+
+        // False AND (expensive: column load + comparison)
+        // JumpIfFalse skips: LoadColumn + PushLiteral + Equal + And = 4 instructions
+        // offset = 5 (lands past And since continue skips ip += 1)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(false)),
+            Instruction::PushLiteral(Cell::Bool(false)),
+            Instruction::Equal, // Tri::True (false == false)
+            Instruction::Not,   // Tri::False
+            Instruction::JumpIfFalse(5),
+            // These should NOT execute:
+            Instruction::LoadColumn(999), // would be Missing
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::Equal,
+            Instruction::And,
+        ]);
+
+        let row = make_row(vec![]);
+        // Should be False (short-circuited, never evaluated rhs)
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_short_circuit_or_true_skips_rhs() {
+        let mut vm = Vm::new();
+
+        // True OR (expensive rhs)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::Equal, // Tri::True
+            Instruction::JumpIfTrue(5),
+            // These should NOT execute:
+            Instruction::LoadColumn(999),
+            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::Equal,
+            Instruction::Or,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_short_circuit_and_unknown_evaluates_rhs() {
+        let mut vm = Vm::new();
+
+        // Unknown AND True = Unknown (rhs must be evaluated)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal, // Tri::Unknown (NULL = 1)
+            Instruction::JumpIfFalse(5),
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::Equal, // Tri::True
+            Instruction::And,   // Unknown AND True = Unknown
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_short_circuit_or_unknown_evaluates_rhs() {
+        let mut vm = Vm::new();
+
+        // Unknown OR False = Unknown (rhs must be evaluated)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Null),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal, // Tri::Unknown
+            Instruction::JumpIfTrue(5),
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::PushLiteral(Cell::Bool(false)),
+            Instruction::Equal, // Tri::False
+            Instruction::Or,    // Unknown OR False = Unknown
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+    }
+
+    #[test]
+    fn test_short_circuit_and_false_in_chain() {
+        let mut vm = Vm::new();
+
+        // False AND True AND True → short-circuits at first False
+        // The first JumpIfFalse must skip the entire rest of the program
+        let program = BytecodeProgram::new(vec![
+            // First: push False
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::Equal, // False (1 != 2)
+            // Inner AND
+            Instruction::JumpIfFalse(5),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal, // True (1 == 1)
+            Instruction::And,
+            // Outer AND
+            Instruction::JumpIfFalse(5),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal,
+            Instruction::And,
+        ]);
+
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
     }
 }

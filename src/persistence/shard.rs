@@ -221,6 +221,7 @@ pub fn deserialize_shard<I: IdTypes>(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::unreadable_literal)]
 mod tests {
     use super::*;
     use crate::DefaultIds;
