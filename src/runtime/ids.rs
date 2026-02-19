@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 
 /// Predicate identifier (slab index)
 ///
-/// Uses NonZeroU32 for Option<PredicateId> optimization (no extra byte).
+/// Uses NonZeroU32 for `Option<PredicateId>` optimization (no extra byte).
 /// Slab allocates stable IDs that don't change during predicate lifetime.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PredicateId(NonZeroU32);

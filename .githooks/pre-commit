@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+staged_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+if ! grep -Eq '((^|/)Cargo\.(toml|lock)$|\.rs$)' <<<"$staged_files"; then
+  echo "[pre-commit] No staged Rust/Cargo changes. Skipping Rust checks."
+  exit 0
+fi
+
+echo "[pre-commit] Running rustfmt check..."
+cargo fmt --all --check
+
+echo "[pre-commit] Running clippy (deny warnings)..."
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+if [[ "${SUBQL_PRECOMMIT_SKIP_TESTS:-0}" == "1" ]]; then
+  echo "[pre-commit] SUBQL_PRECOMMIT_SKIP_TESTS=1, skipping unit tests."
+  exit 0
+fi
+
+echo "[pre-commit] Running unit+integration (non-ignored) tests..."
+cargo test --workspace --lib --tests --locked

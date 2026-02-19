@@ -71,7 +71,7 @@ pub fn parse_compile_and_normalize<D: Dialect>(
 
     // Compile WHERE clause to bytecode
     let program = if let Some(expr) = where_clause.as_ref() {
-        compile_expression(&expr, table_id, catalog)?
+        compile_expression(expr, table_id, catalog)?
     } else {
         // No WHERE clause = always match
         // Push True onto stack

@@ -86,7 +86,7 @@ impl Tri {
         }
     }
 
-    /// Converts to Option<bool> (Unknown → None)
+    /// Converts to `Option<bool>` (Unknown → None)
     #[must_use]
     pub const fn to_option(self) -> Option<bool> {
         match self {
@@ -96,7 +96,7 @@ impl Tri {
         }
     }
 
-    /// Converts from Option<bool> (None → Unknown)
+    /// Converts from `Option<bool>` (None → Unknown)
     #[must_use]
     pub const fn from_option(opt: Option<bool>) -> Self {
         match opt {

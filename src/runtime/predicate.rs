@@ -65,9 +65,9 @@ pub struct PredicateStore<I: IdTypes> {
     pub hash_index: AHashMap<PredicateHash, PredicateId>,
     /// SubscriptionId → Binding
     pub bindings: AHashMap<I::SubscriptionId, Binding<I>>,
-    /// SessionId → Vec<SubscriptionId> (for session cleanup)
+    /// SessionId → `Vec<SubscriptionId>` (for session cleanup)
     pub session_index: AHashMap<I::SessionId, Vec<I::SubscriptionId>>,
-    /// PredicateId → RoaringBitmap<UserOrdinal> (users interested in this predicate)
+    /// PredicateId → `RoaringBitmap<UserOrdinal>` (users interested in this predicate)
     pub predicate_users: AHashMap<PredicateId, RoaringBitmap>,
 }
 

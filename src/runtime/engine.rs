@@ -24,6 +24,15 @@ use ahash::AHashMap;
 use sqlparser::dialect::Dialect;
 
 type BatchEntries<I> = Vec<(Predicate, Vec<IndexableAtom>, Vec<Binding<I>>)>;
+
+struct CompiledBatchEntry<I: IdTypes> {
+    spec: SubscriptionSpec<I>,
+    table_id: TableId,
+    bytecode: BytecodeProgram,
+    normalized: String,
+    hash: u128,
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -229,15 +238,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Phase 1: Parse and compile all specs (can fail individually)
-        struct Compiled<I: IdTypes> {
-            spec: SubscriptionSpec<I>,
-            table_id: TableId,
-            bytecode: BytecodeProgram,
-            normalized: String,
-            hash: u128,
-        }
-
-        let mut compiled: Vec<Option<Compiled<I>>> = Vec::with_capacity(specs.len());
+        let mut compiled: Vec<Option<CompiledBatchEntry<I>>> = Vec::with_capacity(specs.len());
         let mut results: Vec<Result<RegisterResult, RegisterError>> =
             Vec::with_capacity(specs.len());
 
@@ -245,7 +246,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             match parse_compile_and_normalize(&spec.sql, &self.dialect, &*self.catalog) {
                 Ok((table_id, bytecode, normalized)) => {
                     let hash = canonicalize::hash_sql(&normalized);
-                    compiled.push(Some(Compiled {
+                    compiled.push(Some(CompiledBatchEntry {
                         spec,
                         table_id,
                         bytecode,

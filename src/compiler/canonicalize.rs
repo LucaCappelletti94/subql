@@ -72,10 +72,7 @@ pub fn normalize_sql(sql: &str, dialect: &dyn Dialect) -> Result<String, Registe
 /// reparsing SQL text.
 pub(crate) fn normalize_where_clause(where_expr: Option<&Expr>) -> Result<String, RegisterError> {
     // No WHERE clause = always-true predicate
-    match where_expr {
-        Some(expr) => normalize_expr(expr),
-        None => Ok("TRUE".to_string()),
-    }
+    where_expr.map_or_else(|| Ok("TRUE".to_string()), normalize_expr)
 }
 
 /// Hash normalized SQL for fast predicate lookup

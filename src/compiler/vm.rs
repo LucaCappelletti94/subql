@@ -364,7 +364,9 @@ fn cells_equal(a: &Cell, b: &Cell) -> bool {
     match (a, b) {
         (Cell::Bool(x), Cell::Bool(y)) => x == y,
         (Cell::Int(x), Cell::Int(y)) => x == y,
-        (Cell::Float(x), Cell::Float(y)) => x == y,
+        (Cell::Float(x), Cell::Float(y)) => x
+            .partial_cmp(y)
+            .is_some_and(|ord| ord == std::cmp::Ordering::Equal),
         (Cell::String(x), Cell::String(y)) => x == y,
         // NULL = NULL is Unknown, not True!
         _ => false,

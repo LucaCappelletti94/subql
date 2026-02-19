@@ -86,19 +86,19 @@ pub enum IndexableAtom {
 /// Hybrid indexes for candidate selection
 #[derive(Clone)]
 pub struct HybridIndexes {
-    /// Equality: (col, val) → RoaringBitmap<PredicateId>
+    /// Equality: (col, val) → `RoaringBitmap<PredicateId>`
     pub equality: AHashMap<EqualityKey, RoaringBitmap>,
 
-    /// Range: col → Vec<RangeEntry> (sorted by lower bound)
+    /// Range: col → `Vec<RangeEntry>` (sorted by lower bound)
     pub range: AHashMap<ColumnId, Vec<RangeEntry>>,
 
-    /// NULL: (col, kind) → RoaringBitmap<PredicateId>
+    /// NULL: (col, kind) → `RoaringBitmap<PredicateId>`
     pub null_checks: AHashMap<(ColumnId, NullKind), RoaringBitmap>,
 
     /// Fallback: unindexable predicates
     pub fallback: RoaringBitmap,
 
-    /// Dependency: col → RoaringBitmap<PredicateId> (for UPDATE optimization)
+    /// Dependency: col → `RoaringBitmap<PredicateId>` (for UPDATE optimization)
     pub dependency: AHashMap<ColumnId, RoaringBitmap>,
 
     /// Predicates with no dependency columns (must always be considered for UPDATEs)
@@ -212,9 +212,8 @@ impl HybridIndexes {
         let mut result = RoaringBitmap::new();
 
         // Only works for numeric values; NaN never matches ordered ranges.
-        let numeric = match NumericValue::from_indexable(value) {
-            Some(v) => v,
-            None => return result,
+        let Some(numeric) = NumericValue::from_indexable(value) else {
+            return result;
         };
 
         if let Some(entries) = self.range.get(&col_id) {
