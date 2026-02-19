@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::pg_type::json_value_to_cell;
-use super::{WalParseError, WalParser};
+use super::{build_pk_from_resolved, changed_columns, resolve_table, WalParseError, WalParser};
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
 // ============================================================================
@@ -128,24 +128,6 @@ impl WalParser for Wal2JsonV2Parser {
 // Shared helpers
 // ============================================================================
 
-/// Resolve table name through catalog, trying `table` then `schema.table`.
-fn resolve_table(
-    schema: &str,
-    table: &str,
-    catalog: &dyn SchemaCatalog,
-) -> Result<TableId, WalParseError> {
-    if let Some(id) = catalog.table_id(table) {
-        return Ok(id);
-    }
-    let qualified = format!("{schema}.{table}");
-    catalog
-        .table_id(&qualified)
-        .ok_or_else(|| WalParseError::UnknownTable {
-            schema: schema.to_string(),
-            table: table.to_string(),
-        })
-}
-
 /// Parse event kind from v1 string.
 fn parse_v1_kind(kind: &str) -> Result<EventKind, WalParseError> {
     match kind {
@@ -249,25 +231,6 @@ fn build_row_from_v2_columns(
     ))
 }
 
-/// Build a [`PrimaryKey`] from resolved column/value pairs, filtering to only
-/// the columns listed in `pk_col_ids`.
-fn build_pk_from_resolved(resolved: &[(ColumnId, Cell)], pk_col_ids: &[ColumnId]) -> PrimaryKey {
-    let mut columns = Vec::with_capacity(pk_col_ids.len());
-    let mut values = Vec::with_capacity(pk_col_ids.len());
-
-    for &pk_col in pk_col_ids {
-        if let Some((_, cell)) = resolved.iter().find(|(c, _)| *c == pk_col) {
-            columns.push(pk_col);
-            values.push(cell.clone());
-        }
-    }
-
-    PrimaryKey {
-        columns: Arc::from(columns),
-        values: Arc::from(values),
-    }
-}
-
 /// Build a [`PrimaryKey`] from the old-keys section (names resolved through catalog).
 fn build_pk_from_key_arrays(
     names: &[String],
@@ -295,24 +258,6 @@ fn build_pk_from_key_arrays(
         columns: Arc::from(pk_cols),
         values: Arc::from(pk_vals),
     })
-}
-
-/// Compute changed columns between old and new row images.
-fn changed_columns(old: &RowImage, new: &RowImage) -> Vec<ColumnId> {
-    let len = old.cells.len().min(new.cells.len());
-    let mut changed = Vec::new();
-
-    for i in 0..len {
-        let old_cell = &old.cells[i];
-        let new_cell = &new.cells[i];
-        // Only compare columns present in both images
-        if !old_cell.is_missing() && !new_cell.is_missing() && old_cell != new_cell {
-            #[allow(clippy::cast_possible_truncation)]
-            changed.push(i as ColumnId);
-        }
-    }
-
-    changed
 }
 
 // ============================================================================

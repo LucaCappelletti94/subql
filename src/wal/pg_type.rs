@@ -105,6 +105,75 @@ fn string_cell(value: &serde_json::Value) -> Cell {
     }
 }
 
+/// Infer a [`Cell`] from a JSON value without type metadata.
+///
+/// Used by CDC formats (e.g. Maxwell) that provide no column type info.
+/// Maps JSON primitives directly: null→Null, bool→Bool, integer→Int,
+/// float→Float, string→String. Arrays and objects are JSON-serialized
+/// to a String fallback.
+#[must_use]
+pub fn infer_cell_from_json(value: &serde_json::Value) -> Cell {
+    match value {
+        serde_json::Value::Null => Cell::Null,
+        serde_json::Value::Bool(b) => Cell::Bool(*b),
+        #[allow(clippy::option_if_let_else)]
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Cell::Int(i)
+            } else if let Some(u) = n.as_u64() {
+                #[allow(clippy::cast_possible_wrap)]
+                Cell::Int(u as i64)
+            } else {
+                n.as_f64().map_or(Cell::Null, Cell::Float)
+            }
+        }
+        serde_json::Value::String(s) => Cell::String(Arc::from(s.as_str())),
+        // Arrays and objects: JSON-serialize as fallback
+        other => Cell::String(Arc::from(other.to_string().as_str())),
+    }
+}
+
+/// Convert a text-format column value to a [`Cell`] given the PostgreSQL type OID.
+///
+/// Used by the pgoutput binary protocol parser, where columns are transmitted as
+/// UTF-8 text alongside their type OID (from `pg_type`).
+#[must_use]
+pub fn text_to_cell(text: &str, type_oid: u32) -> Cell {
+    #[allow(clippy::match_same_arms)]
+    match type_oid {
+        // bool
+        16 => match text {
+            "t" => Cell::Bool(true),
+            "f" => Cell::Bool(false),
+            _ => Cell::String(Arc::from(text)),
+        },
+        // int8, int2, int4, oid
+        20 | 21 | 23 | 26 => parse_int(text),
+        // float4, float8, numeric
+        700 | 701 | 1700 => parse_float(text),
+        // text, bpchar, varchar, name, uuid
+        25 | 1042 | 1043 | 19 | 2950 => Cell::String(Arc::from(text)),
+        // date, time, timestamp, timestamptz, timetz, interval
+        1082 | 1083 | 1114 | 1184 | 1266 | 1186 => Cell::String(Arc::from(text)),
+        // json, jsonb
+        114 | 3802 => Cell::String(Arc::from(text)),
+        // everything else → String fallback
+        _ => Cell::String(Arc::from(text)),
+    }
+}
+
+/// Parse integer from text, falling back to `Cell::String` on failure.
+fn parse_int(text: &str) -> Cell {
+    text.parse::<i64>()
+        .map_or_else(|_| Cell::String(Arc::from(text)), Cell::Int)
+}
+
+/// Parse float from text, falling back to `Cell::String` on failure.
+fn parse_float(text: &str) -> Cell {
+    text.parse::<f64>()
+        .map_or_else(|_| Cell::String(Arc::from(text)), Cell::Float)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +357,188 @@ mod tests {
         // Exercise the null branch in string_cell directly
         // (normally unreachable via json_value_to_cell's early return)
         assert_eq!(string_cell(&json!(null)), Cell::Null);
+    }
+
+    // ========================================================================
+    // text_to_cell tests (OID-based, for pgoutput)
+    // ========================================================================
+
+    #[test]
+    fn text_to_cell_bool() {
+        assert_eq!(text_to_cell("t", 16), Cell::Bool(true));
+        assert_eq!(text_to_cell("f", 16), Cell::Bool(false));
+        // Unrecognized bool text → String
+        assert_eq!(text_to_cell("yes", 16), Cell::String(Arc::from("yes")));
+    }
+
+    #[test]
+    fn text_to_cell_integers() {
+        // int2 (OID 21)
+        assert_eq!(text_to_cell("42", 21), Cell::Int(42));
+        // int4 (OID 23)
+        assert_eq!(text_to_cell("-1", 23), Cell::Int(-1));
+        // int8 (OID 20)
+        assert_eq!(text_to_cell("9999999999", 20), Cell::Int(9_999_999_999));
+        // oid (OID 26)
+        assert_eq!(text_to_cell("12345", 26), Cell::Int(12345));
+        // Non-numeric → String fallback
+        assert_eq!(text_to_cell("abc", 23), Cell::String(Arc::from("abc")));
+    }
+
+    #[test]
+    fn text_to_cell_floats() {
+        // float4 (OID 700)
+        assert_eq!(text_to_cell("3.14", 700), Cell::Float(3.14));
+        // float8 (OID 701)
+        assert_eq!(text_to_cell("2.718", 701), Cell::Float(2.718));
+        // numeric (OID 1700)
+        assert_eq!(text_to_cell("99.95", 1700), Cell::Float(99.95));
+        // Non-numeric → String fallback
+        assert_eq!(
+            text_to_cell("NaN-ish", 700),
+            Cell::String(Arc::from("NaN-ish"))
+        );
+    }
+
+    #[test]
+    fn text_to_cell_strings() {
+        // text (OID 25)
+        assert_eq!(text_to_cell("hello", 25), Cell::String(Arc::from("hello")));
+        // varchar (OID 1043)
+        assert_eq!(
+            text_to_cell("world", 1043),
+            Cell::String(Arc::from("world"))
+        );
+        // bpchar (OID 1042)
+        assert_eq!(text_to_cell("x", 1042), Cell::String(Arc::from("x")));
+        // name (OID 19)
+        assert_eq!(
+            text_to_cell("colname", 19),
+            Cell::String(Arc::from("colname"))
+        );
+        // uuid (OID 2950)
+        assert_eq!(
+            text_to_cell("550e8400-e29b-41d4-a716-446655440000", 2950),
+            Cell::String(Arc::from("550e8400-e29b-41d4-a716-446655440000"))
+        );
+    }
+
+    #[test]
+    fn text_to_cell_temporal() {
+        // date (OID 1082)
+        assert_eq!(
+            text_to_cell("2024-01-01", 1082),
+            Cell::String(Arc::from("2024-01-01"))
+        );
+        // timestamp (OID 1114)
+        assert_eq!(
+            text_to_cell("2024-01-01 12:00:00", 1114),
+            Cell::String(Arc::from("2024-01-01 12:00:00"))
+        );
+        // timestamptz (OID 1184)
+        assert_eq!(
+            text_to_cell("2024-01-01 12:00:00+00", 1184),
+            Cell::String(Arc::from("2024-01-01 12:00:00+00"))
+        );
+        // time (OID 1083)
+        assert_eq!(
+            text_to_cell("12:00:00", 1083),
+            Cell::String(Arc::from("12:00:00"))
+        );
+        // timetz (OID 1266)
+        assert_eq!(
+            text_to_cell("12:00:00+00", 1266),
+            Cell::String(Arc::from("12:00:00+00"))
+        );
+        // interval (OID 1186)
+        assert_eq!(
+            text_to_cell("1 day", 1186),
+            Cell::String(Arc::from("1 day"))
+        );
+    }
+
+    #[test]
+    fn text_to_cell_json() {
+        // json (OID 114)
+        assert_eq!(
+            text_to_cell(r#"{"a":1}"#, 114),
+            Cell::String(Arc::from(r#"{"a":1}"#))
+        );
+        // jsonb (OID 3802)
+        assert_eq!(
+            text_to_cell(r#"[1,2,3]"#, 3802),
+            Cell::String(Arc::from(r#"[1,2,3]"#))
+        );
+    }
+
+    #[test]
+    fn text_to_cell_unknown_oid() {
+        // Unknown OID → String fallback
+        assert_eq!(
+            text_to_cell("anything", 99999),
+            Cell::String(Arc::from("anything"))
+        );
+    }
+
+    // ========================================================================
+    // infer_cell_from_json tests (type inference without metadata)
+    // ========================================================================
+
+    #[test]
+    fn infer_null() {
+        assert_eq!(infer_cell_from_json(&json!(null)), Cell::Null);
+    }
+
+    #[test]
+    fn infer_bool() {
+        assert_eq!(infer_cell_from_json(&json!(true)), Cell::Bool(true));
+        assert_eq!(infer_cell_from_json(&json!(false)), Cell::Bool(false));
+    }
+
+    #[test]
+    fn infer_integer() {
+        assert_eq!(infer_cell_from_json(&json!(42)), Cell::Int(42));
+        assert_eq!(infer_cell_from_json(&json!(-7)), Cell::Int(-7));
+        assert_eq!(infer_cell_from_json(&json!(0)), Cell::Int(0));
+    }
+
+    #[test]
+    fn infer_float() {
+        assert_eq!(infer_cell_from_json(&json!(4.2341)), Cell::Float(4.2341));
+        assert_eq!(infer_cell_from_json(&json!(-0.5)), Cell::Float(-0.5));
+    }
+
+    #[test]
+    fn infer_string() {
+        assert_eq!(
+            infer_cell_from_json(&json!("hello")),
+            Cell::String(Arc::from("hello"))
+        );
+        assert_eq!(
+            infer_cell_from_json(&json!("2016-10-21 05:33:37")),
+            Cell::String(Arc::from("2016-10-21 05:33:37"))
+        );
+    }
+
+    #[test]
+    fn infer_array_fallback() {
+        assert_eq!(
+            infer_cell_from_json(&json!([1, 2, 3])),
+            Cell::String(Arc::from("[1,2,3]"))
+        );
+    }
+
+    #[test]
+    fn infer_object_fallback() {
+        assert_eq!(
+            infer_cell_from_json(&json!({"key": "val"})),
+            Cell::String(Arc::from(r#"{"key":"val"}"#))
+        );
+    }
+
+    #[test]
+    fn infer_large_u64() {
+        let large = u64::MAX;
+        assert!(matches!(infer_cell_from_json(&json!(large)), Cell::Int(_)));
     }
 }

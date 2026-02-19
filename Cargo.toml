@@ -70,6 +70,10 @@ tempfile = "3.8"
 # Structured fuzzing (needed by regression tests)
 arbitrary = { version = "1", features = ["derive"] }
 
+# Cross-DB CDC integration test
+diesel = { version = "2", features = ["postgres", "mysql"] }
+testcontainers = { version = "0.27", features = ["blocking"] }
+
 [features]
 default = []
 testing = ["dep:arbitrary"]
