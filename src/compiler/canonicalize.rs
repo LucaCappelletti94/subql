@@ -65,13 +65,17 @@ pub fn normalize_sql(sql: &str, dialect: &dyn Dialect) -> Result<String, Registe
     // Extract WHERE clause
     let where_expr = extract_where(&statements[0])?;
 
-    // No WHERE clause = always-true predicate
-    let normalized_expr = match where_expr {
-        Some(expr) => normalize_expr(&expr)?,
-        None => "TRUE".to_string(),
-    };
+    normalize_where_clause(where_expr.as_ref())
+}
 
-    Ok(normalized_expr)
+/// Normalize an already-parsed WHERE clause (or absence of one) without
+/// reparsing SQL text.
+pub(crate) fn normalize_where_clause(where_expr: Option<&Expr>) -> Result<String, RegisterError> {
+    // No WHERE clause = always-true predicate
+    match where_expr {
+        Some(expr) => normalize_expr(expr),
+        None => Ok("TRUE".to_string()),
+    }
 }
 
 /// Hash normalized SQL for fast predicate lookup

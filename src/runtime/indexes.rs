@@ -100,6 +100,9 @@ pub struct HybridIndexes {
 
     /// Dependency: col → RoaringBitmap<PredicateId> (for UPDATE optimization)
     pub dependency: AHashMap<ColumnId, RoaringBitmap>,
+
+    /// Predicates with no dependency columns (must always be considered for UPDATEs)
+    pub dependency_free: RoaringBitmap,
 }
 
 impl HybridIndexes {
@@ -112,6 +115,7 @@ impl HybridIndexes {
             null_checks: AHashMap::new(),
             fallback: RoaringBitmap::new(),
             dependency: AHashMap::new(),
+            dependency_free: RoaringBitmap::new(),
         }
     }
 
@@ -124,12 +128,18 @@ impl HybridIndexes {
     ) {
         let pred_id_u32 = pred_id.as_u32();
 
-        // Track dependencies
-        for &col_id in deps {
-            self.dependency
-                .entry(col_id)
-                .or_default()
-                .insert(pred_id_u32);
+        // Track dependencies (dependency-free predicates must always be
+        // evaluated for UPDATE events because they do not depend on changed
+        // column sets).
+        if deps.is_empty() {
+            self.dependency_free.insert(pred_id_u32);
+        } else {
+            for &col_id in deps {
+                self.dependency
+                    .entry(col_id)
+                    .or_default()
+                    .insert(pred_id_u32);
+            }
         }
 
         // If no indexable atoms, add to fallback
@@ -154,11 +164,18 @@ impl HybridIndexes {
                     lower,
                     upper,
                 } => {
-                    self.range.entry(*column_id).or_default().push(RangeEntry {
-                        predicate_id: pred_id,
-                        lower: *lower,
-                        upper: *upper,
+                    let entries = self.range.entry(*column_id).or_default();
+                    let insert_at = entries.partition_point(|existing| {
+                        lower_bound_cmp(existing.lower, *lower) != Ordering::Greater
                     });
+                    entries.insert(
+                        insert_at,
+                        RangeEntry {
+                            predicate_id: pred_id,
+                            lower: *lower,
+                            upper: *upper,
+                        },
+                    );
                 }
 
                 IndexableAtom::Null { column_id, kind } => {
@@ -191,24 +208,28 @@ impl HybridIndexes {
 
     /// Query range index (return predicates whose ranges contain value)
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn query_range(&self, col_id: ColumnId, value: &IndexableCell) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
 
-        // Only works for numeric values
-        let int_val = match value {
-            IndexableCell::Int(i) => *i,
-            IndexableCell::Float(bits) => f64::from_bits(*bits) as i64,
-            _ => return result,
+        // Only works for numeric values; NaN never matches ordered ranges.
+        let numeric = match NumericValue::from_indexable(value) {
+            Some(v) => v,
+            None => return result,
         };
 
         if let Some(entries) = self.range.get(&col_id) {
             for entry in entries {
-                // Check if int_val is in [lower, upper]
-                let in_lower = entry.lower.map_or(true, |l| int_val >= l);
-                let in_upper = entry.upper.map_or(true, |u| int_val <= u);
+                // Entries are sorted by lower bound; once lower exceeds the
+                // searched value, no later entries can match.
+                if let Some(lower) = entry.lower {
+                    if !numeric.gte_lower(lower) {
+                        break;
+                    }
+                }
 
-                if in_lower && in_upper {
+                let in_upper = entry.upper.map_or(true, |u| numeric.lte_upper(u));
+
+                if in_upper {
                     result.insert(entry.predicate_id.as_u32());
                 }
             }
@@ -220,15 +241,56 @@ impl HybridIndexes {
     /// Sort range entries by lower bound (for efficient querying)
     pub fn finalize_ranges(&mut self) {
         for entries in self.range.values_mut() {
-            entries.sort_by(|a, b| {
-                match (a.lower, b.lower) {
-                    (None, None) => Ordering::Equal,
-                    (None, Some(_)) => Ordering::Less, // Unbounded comes first
-                    (Some(_), None) => Ordering::Greater,
-                    (Some(x), Some(y)) => x.cmp(&y),
-                }
-            });
+            entries.sort_by(|a, b| lower_bound_cmp(a.lower, b.lower));
         }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum NumericValue {
+    Int(i64),
+    Float(f64),
+}
+
+impl NumericValue {
+    fn from_indexable(value: &IndexableCell) -> Option<Self> {
+        match value {
+            IndexableCell::Int(i) => Some(Self::Int(*i)),
+            IndexableCell::Float(bits) => {
+                let f = f64::from_bits(*bits);
+                if f.is_nan() {
+                    None
+                } else {
+                    Some(Self::Float(f))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn gte_lower(self, lower: i64) -> bool {
+        match self {
+            Self::Int(v) => v >= lower,
+            #[allow(clippy::cast_precision_loss)]
+            Self::Float(v) => v >= lower as f64,
+        }
+    }
+
+    fn lte_upper(self, upper: i64) -> bool {
+        match self {
+            Self::Int(v) => v <= upper,
+            #[allow(clippy::cast_precision_loss)]
+            Self::Float(v) => v <= upper as f64,
+        }
+    }
+}
+
+fn lower_bound_cmp(lhs: Option<i64>, rhs: Option<i64>) -> Ordering {
+    match (lhs, rhs) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less, // Unbounded comes first
+        (Some(_), None) => Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(&y),
     }
 }
 
@@ -546,6 +608,16 @@ mod tests {
             .get(&5)
             .unwrap()
             .contains(pred_id.as_u32()));
+    }
+
+    #[test]
+    fn test_dependency_free_tracking() {
+        let mut indexes = HybridIndexes::new();
+        let pred_id = PredicateId::from_slab_index(0);
+        indexes.add_predicate(pred_id, &[IndexableAtom::Fallback], &[]);
+
+        assert!(indexes.dependency_free.contains(pred_id.as_u32()));
+        assert!(indexes.dependency.is_empty());
     }
 
     #[test]

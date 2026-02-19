@@ -164,8 +164,8 @@ pub fn serialize_shard<I: IdTypes>(
     let uncompressed = bincode::serialize(payload)
         .map_err(|e| StorageError::Codec(format!("Payload serialize error: {e}")))?;
 
-    // Compress payload
-    let compressed = codec::encode(payload)?;
+    // Compress payload (reuse the already serialized buffer)
+    let compressed = codec::encode_serialized(&uncompressed)?;
 
     // Get schema fingerprint
     let schema_fingerprint = catalog.schema_fingerprint(table_id).ok_or_else(|| {

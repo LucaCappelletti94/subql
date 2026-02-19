@@ -1,6 +1,7 @@
 //! Predicate storage with deduplication and refcounting
 
 use super::ids::{PredicateHash, PredicateId, UserOrdinal};
+use super::indexes::IndexableAtom;
 use crate::{compiler::BytecodeProgram, ColumnId, IdTypes};
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
@@ -20,6 +21,8 @@ pub struct Predicate {
     pub bytecode: Arc<BytecodeProgram>,
     /// Columns referenced by this predicate (for UPDATE optimization)
     pub dependency_columns: Arc<[ColumnId]>,
+    /// Precomputed indexable atoms for this predicate.
+    pub index_atoms: Arc<[IndexableAtom]>,
     /// Reference count (number of subscriptions using this predicate)
     pub refcount: u32,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
@@ -168,23 +171,14 @@ impl<I: IdTypes> PredicateStore<I> {
     /// Add subscription binding
     pub fn add_binding(&mut self, binding: Binding<I>) {
         let sub_id = binding.subscription_id;
-        let pred_id = binding.predicate_id;
-        let user_ord = binding.user_ordinal;
-        let session_id = binding.session_id;
 
-        // Add to bindings
-        self.bindings.insert(sub_id, binding);
-
-        // Track session
-        if let Some(sid) = session_id {
-            self.session_index.entry(sid).or_default().push(sub_id);
+        // Overwrite-safe upsert: remove previous secondary index entries when
+        // replacing an existing subscription ID.
+        if let Some(previous) = self.bindings.insert(sub_id, binding) {
+            self.remove_binding_indexes(previous);
         }
 
-        // Track user interest in predicate
-        self.predicate_users
-            .entry(pred_id)
-            .or_default()
-            .insert(user_ord.get());
+        self.add_binding_indexes(binding);
     }
 
     /// Remove subscription binding
@@ -193,23 +187,7 @@ impl<I: IdTypes> PredicateStore<I> {
     pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> Option<Binding<I>> {
         let binding = self.bindings.remove(&sub_id)?;
 
-        // Remove from predicate_users
-        if let Some(bitmap) = self.predicate_users.get_mut(&binding.predicate_id) {
-            bitmap.remove(binding.user_ordinal.get());
-            if bitmap.is_empty() {
-                self.predicate_users.remove(&binding.predicate_id);
-            }
-        }
-
-        // Remove from session index
-        if let Some(session_id) = binding.session_id {
-            if let Some(subs) = self.session_index.get_mut(&session_id) {
-                subs.retain(|&id| id != sub_id);
-                if subs.is_empty() {
-                    self.session_index.remove(&session_id);
-                }
-            }
-        }
+        self.remove_binding_indexes(binding);
 
         Some(binding)
     }
@@ -223,6 +201,42 @@ impl<I: IdTypes> PredicateStore<I> {
         self.session_index
             .get(&session_id)
             .map(std::vec::Vec::as_slice)
+    }
+
+    fn add_binding_indexes(&mut self, binding: Binding<I>) {
+        let sub_id = binding.subscription_id;
+        let pred_id = binding.predicate_id;
+        let user_ord = binding.user_ordinal;
+        let session_id = binding.session_id;
+
+        if let Some(sid) = session_id {
+            self.session_index.entry(sid).or_default().push(sub_id);
+        }
+
+        self.predicate_users
+            .entry(pred_id)
+            .or_default()
+            .insert(user_ord.get());
+    }
+
+    fn remove_binding_indexes(&mut self, binding: Binding<I>) {
+        let sub_id = binding.subscription_id;
+
+        if let Some(bitmap) = self.predicate_users.get_mut(&binding.predicate_id) {
+            bitmap.remove(binding.user_ordinal.get());
+            if bitmap.is_empty() {
+                self.predicate_users.remove(&binding.predicate_id);
+            }
+        }
+
+        if let Some(session_id) = binding.session_id {
+            if let Some(subs) = self.session_index.get_mut(&session_id) {
+                subs.retain(|&id| id != sub_id);
+                if subs.is_empty() {
+                    self.session_index.remove(&session_id);
+                }
+            }
+        }
     }
 }
 
@@ -246,6 +260,7 @@ mod tests {
             normalized_sql: "test".into(),
             bytecode: Arc::new(BytecodeProgram::new(vec![Instruction::Not])),
             dependency_columns: Arc::from([]),
+            index_atoms: Arc::from([IndexableAtom::Fallback]),
             refcount,
             updated_at_unix_ms: 0,
         }
@@ -345,6 +360,44 @@ mod tests {
         assert!(bitmap.contains(0));
         assert!(bitmap.contains(1));
         assert_eq!(bitmap.len(), 2);
+    }
+
+    #[test]
+    fn test_add_binding_overwrite_cleans_secondary_indexes() {
+        let mut store = PredicateStore::<DefaultIds>::new();
+
+        let pred1 = make_predicate(0, 0x1111, 0);
+        let pred2 = make_predicate(1, 0x2222, 0);
+        let pred1_id = store.add_predicate(pred1);
+        let pred2_id = store.add_predicate(pred2);
+
+        store.add_binding(Binding {
+            subscription_id: 100,
+            predicate_id: pred1_id,
+            user_id: 10,
+            user_ordinal: UserOrdinal::new(0),
+            session_id: Some(500),
+            updated_at_unix_ms: 1,
+        });
+        store.add_binding(Binding {
+            subscription_id: 100, // overwrite same subscription id
+            predicate_id: pred2_id,
+            user_id: 20,
+            user_ordinal: UserOrdinal::new(1),
+            session_id: Some(600),
+            updated_at_unix_ms: 2,
+        });
+
+        assert!(!store
+            .predicate_users
+            .get(&pred1_id)
+            .is_some_and(|bitmap| bitmap.contains(0)));
+        assert!(store
+            .predicate_users
+            .get(&pred2_id)
+            .is_some_and(|bitmap| bitmap.contains(1)));
+        assert!(store.get_session_subscriptions(500).is_none());
+        assert_eq!(store.get_session_subscriptions(600), Some(&[100][..]));
     }
 
     // ========================================================================

@@ -364,7 +364,7 @@ fn cells_equal(a: &Cell, b: &Cell) -> bool {
     match (a, b) {
         (Cell::Bool(x), Cell::Bool(y)) => x == y,
         (Cell::Int(x), Cell::Int(y)) => x == y,
-        (Cell::Float(x), Cell::Float(y)) => (x - y).abs() < f64::EPSILON,
+        (Cell::Float(x), Cell::Float(y)) => x == y,
         (Cell::String(x), Cell::String(y)) => x == y,
         // NULL = NULL is Unknown, not True!
         _ => false,
@@ -1439,18 +1439,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cells_equal_float_epsilon() {
+    fn test_cells_equal_float_strict() {
         let mut vm = Vm::new();
 
-        // Test float equality with very close values
+        // Float equality is strict (SQL-style numeric equality for doubles).
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Float(1.0)),
-            Instruction::PushLiteral(Cell::Float(1.0 + f64::EPSILON / 2.0)),
+            Instruction::PushLiteral(Cell::Float(1.0 + f64::EPSILON)),
             Instruction::Equal,
         ]);
 
         let row = make_row(vec![]);
-        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
     }
 
     #[test]

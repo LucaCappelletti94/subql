@@ -396,6 +396,7 @@ mod tests {
                 Instruction::GreaterThan,
             ])),
             dependency_columns: Arc::from([1u16]),
+            index_atoms: Arc::from([IndexableAtom::Fallback]),
             refcount: 1,
             updated_at_unix_ms: 1000,
         };
@@ -460,6 +461,7 @@ mod tests {
                 Instruction::LessThan,
             ])),
             dependency_columns: Arc::from([1u16]),
+            index_atoms: Arc::from([IndexableAtom::Fallback]),
             refcount: 1,
             updated_at_unix_ms: 1000,
         };
@@ -522,6 +524,7 @@ mod tests {
                 Instruction::GreaterThan,
             ])),
             dependency_columns: Arc::from([1u16]),
+            index_atoms: Arc::from([IndexableAtom::Fallback]),
             refcount: 1,
             updated_at_unix_ms: 1000,
         };

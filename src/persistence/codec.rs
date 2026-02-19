@@ -12,13 +12,18 @@ pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
     let serialized = bincode::serialize(value)
         .map_err(|e| StorageError::Codec(format!("Bincode serialize error: {e}")))?;
 
+    encode_serialized(&serialized)
+}
+
+/// Compress already-serialized bytes with LZ4.
+pub fn encode_serialized(mut serialized: &[u8]) -> Result<Vec<u8>, StorageError> {
     // Compress with LZ4
     let mut encoder = lz4::EncoderBuilder::new()
         .level(4) // Fast compression
         .build(Vec::new())
         .map_err(|e| StorageError::Codec(format!("LZ4 encoder error: {e}")))?;
 
-    std::io::copy(&mut serialized.as_slice(), &mut encoder)
+    std::io::copy(&mut serialized, &mut encoder)
         .map_err(|e| StorageError::Codec(format!("LZ4 compression error: {e}")))?;
 
     let (compressed, result) = encoder.finish();

@@ -140,8 +140,15 @@ fn merge_shards_impl<I: IdTypes>(
 
     // 1. Load all shards
     for bytes in shard_bytes {
-        let (_header, payload) = deserialize_shard(bytes, catalog)
+        let (header, payload) = deserialize_shard(bytes, catalog)
             .map_err(|e| format!("Shard deserialize error: {e:?}"))?;
+
+        if header.table_id != table_id {
+            return Err(format!(
+                "Shard table_id mismatch: expected {table_id}, got {}",
+                header.table_id
+            ));
+        }
 
         all_predicates.extend(payload.predicates);
         all_bindings.extend(payload.bindings);
@@ -595,6 +602,29 @@ mod tests {
 
         let result = manager.try_get_result(job_id);
         assert!(matches!(result, Err(MergeError::BuildFailed(_))));
+    }
+
+    #[test]
+    fn test_merge_rejects_shard_with_wrong_table_id() {
+        let mut fingerprints = HashMap::new();
+        fingerprints.insert(1, 0x1234_5678_90AB_CDEF);
+        fingerprints.insert(2, 0xAAAA_BBBB_CCCC_DDDD);
+        let catalog = MockCatalog { fingerprints };
+
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 1000,
+        };
+
+        let shard_wrong_table = serialize_shard(2, &payload, &catalog).unwrap();
+        let start = std::time::Instant::now();
+        let result = merge_shards_impl::<DefaultIds>(1, &[shard_wrong_table], &catalog, start);
+
+        assert!(matches!(result, Err(msg) if msg.contains("table_id mismatch")));
     }
 
     #[test]

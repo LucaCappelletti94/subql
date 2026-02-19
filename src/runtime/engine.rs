@@ -9,7 +9,7 @@ use super::{
     predicate::{Binding, Predicate},
 };
 use crate::{
-    compiler::{canonicalize, parse_and_compile, BytecodeProgram, Vm},
+    compiler::{canonicalize, parse_compile_and_normalize, BytecodeProgram, Vm},
     persistence::{
         merge::MergeManager,
         shard::{
@@ -58,6 +58,8 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
     partitions: AHashMap<TableId, TablePartition<I>>,
     /// User dictionaries (TableId → UserDictionary)
     user_dictionaries: AHashMap<TableId, UserDictionary<I>>,
+    /// Subscription index for O(1) unregister/upsert lookup.
+    subscription_to_table: AHashMap<I::SubscriptionId, TableId>,
     /// VM for bytecode evaluation
     vm: Vm,
     /// Optional storage path for durability
@@ -77,6 +79,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             catalog,
             partitions: AHashMap::new(),
             user_dictionaries: AHashMap::new(),
+            subscription_to_table: AHashMap::new(),
             vm: Vm::new(),
             storage_path: None,
             rotation_threshold: 10 * 1024 * 1024, // 10 MB default
@@ -98,6 +101,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             catalog: Arc::clone(&catalog),
             partitions: AHashMap::new(),
             user_dictionaries: AHashMap::new(),
+            subscription_to_table: AHashMap::new(),
             vm: Vm::new(),
             storage_path: Some(storage_path.clone()),
             rotation_threshold: 10 * 1024 * 1024, // 10 MB default
@@ -120,12 +124,14 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// If storage is enabled and rotation threshold is exceeded, triggers snapshot.
     #[allow(clippy::needless_pass_by_value)]
     pub fn register(&mut self, spec: SubscriptionSpec<I>) -> Result<RegisterResult, RegisterError> {
-        // 1. Parse and compile SQL
-        let (table_id, bytecode) = parse_and_compile(&spec.sql, &self.dialect, &*self.catalog)?;
-
-        // 2. Canonicalize SQL and hash
-        let normalized = canonicalize::normalize_sql(&spec.sql, &self.dialect)?;
+        // 1. Parse, compile, and canonicalize in one pass.
+        let (table_id, bytecode, normalized) =
+            parse_compile_and_normalize(&spec.sql, &self.dialect, &*self.catalog)?;
         let hash = canonicalize::hash_sql(&normalized);
+
+        // 2. Upsert semantics: replace existing subscription ID atomically
+        // after new SQL has been validated.
+        let _ = self.unregister_subscription_internal(spec.subscription_id);
 
         // 3. Get/create table partition and user dictionary
         let partition = self
@@ -147,6 +153,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             (existing, false)
         } else {
             // Create new predicate
+            let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
             let pred = Predicate {
                 // Placeholder; store allocates the authoritative ID.
                 id: PredicateId::from_slab_index(0),
@@ -154,13 +161,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 normalized_sql: normalized.clone().into(),
                 bytecode: Arc::new(bytecode.clone()),
                 dependency_columns: Arc::from(bytecode.dependency_columns.as_slice()),
+                index_atoms: Arc::from(atoms.as_slice()),
                 refcount: 0, // Will be incremented via binding
                 updated_at_unix_ms: spec.updated_at_unix_ms,
             };
-
-            // Extract indexable atoms
-            let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
-
             // Add predicate to partition
             let pred_id = partition.add_predicate(pred, atoms);
 
@@ -180,7 +184,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         // Add binding to partition
         partition.add_binding(binding, pred_id);
 
-        // 7. Check if rotation needed (if storage enabled)
+        // 7. Index subscription for O(1) unregister/upsert lookups.
+        self.subscription_to_table
+            .insert(spec.subscription_id, table_id);
+
+        // 8. Check if rotation needed (if storage enabled)
         if self.storage_path.is_some() && matches!(self.should_rotate(table_id), Ok(true)) {
             // Snapshot to disk (ignore errors for now, just best-effort)
             let _ = self.snapshot_table(table_id);
@@ -207,6 +215,19 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         &mut self,
         specs: Vec<SubscriptionSpec<I>>,
     ) -> Vec<Result<RegisterResult, RegisterError>> {
+        // Preserve correctness for upsert workloads: if the batch includes
+        // existing subscription IDs or duplicate IDs within the batch, fall
+        // back to ordered per-item registration (last write wins).
+        let mut seen = AHashMap::new();
+        let requires_ordered_upsert = specs.iter().any(|spec| {
+            self.subscription_to_table
+                .contains_key(&spec.subscription_id)
+                || seen.insert(spec.subscription_id, ()).is_some()
+        });
+        if requires_ordered_upsert {
+            return specs.into_iter().map(|spec| self.register(spec)).collect();
+        }
+
         // Phase 1: Parse and compile all specs (can fail individually)
         struct Compiled<I: IdTypes> {
             spec: SubscriptionSpec<I>,
@@ -221,30 +242,22 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             Vec::with_capacity(specs.len());
 
         for spec in specs {
-            match parse_and_compile(&spec.sql, &self.dialect, &*self.catalog) {
-                Ok((table_id, bytecode)) => {
-                    match canonicalize::normalize_sql(&spec.sql, &self.dialect) {
-                        Ok(normalized) => {
-                            let hash = canonicalize::hash_sql(&normalized);
-                            compiled.push(Some(Compiled {
-                                spec,
-                                table_id,
-                                bytecode,
-                                normalized,
-                                hash,
-                            }));
-                            results.push(Ok(RegisterResult {
-                                table_id,
-                                normalized_sql: String::new(), // filled in phase 2
-                                predicate_hash: hash,
-                                created_new_predicate: false, // filled in phase 2
-                            }));
-                        }
-                        Err(e) => {
-                            compiled.push(None);
-                            results.push(Err(e));
-                        }
-                    }
+            match parse_compile_and_normalize(&spec.sql, &self.dialect, &*self.catalog) {
+                Ok((table_id, bytecode, normalized)) => {
+                    let hash = canonicalize::hash_sql(&normalized);
+                    compiled.push(Some(Compiled {
+                        spec,
+                        table_id,
+                        bytecode,
+                        normalized,
+                        hash,
+                    }));
+                    results.push(Ok(RegisterResult {
+                        table_id,
+                        normalized_sql: String::new(), // filled in phase 2
+                        predicate_hash: hash,
+                        created_new_predicate: false, // filled in phase 2
+                    }));
                 }
                 Err(e) => {
                     compiled.push(None);
@@ -287,6 +300,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                     updated_at_unix_ms: c.spec.updated_at_unix_ms,
                 };
                 partition.add_binding(binding, pred_id);
+                self.subscription_to_table
+                    .insert(c.spec.subscription_id, c.table_id);
                 created_new = false;
             } else if let Some(&batch_idx) = batch_hash_to_idx.get(&(c.table_id, c.hash)) {
                 // Deduplicated within this batch — add binding to existing batch entry
@@ -303,16 +318,17 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 created_new = false;
             } else {
                 // New predicate — create batch entry
+                let atoms = extract_indexable_atoms(&c.bytecode, &c.bytecode.dependency_columns);
                 let pred = super::predicate::Predicate {
                     id: PredicateId::from_slab_index(0),
                     hash: c.hash,
                     normalized_sql: c.normalized.clone().into(),
                     bytecode: Arc::new(c.bytecode.clone()),
                     dependency_columns: Arc::from(c.bytecode.dependency_columns.as_slice()),
+                    index_atoms: Arc::from(atoms.as_slice()),
                     refcount: 0,
                     updated_at_unix_ms: c.spec.updated_at_unix_ms,
                 };
-                let atoms = extract_indexable_atoms(&c.bytecode, &c.bytecode.dependency_columns);
                 let binding = Binding {
                     subscription_id: c.spec.subscription_id,
                     predicate_id: PredicateId::from_slab_index(0), // placeholder
@@ -343,6 +359,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 .get_mut(&table_id)
                 .expect("partition created above");
             partition.add_batch(&entries);
+            for (_, _, bindings) in &entries {
+                for binding in bindings {
+                    self.subscription_to_table
+                        .insert(binding.subscription_id, table_id);
+                }
+            }
         }
 
         results
@@ -363,13 +385,23 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         &mut self,
         subscription_id: I::SubscriptionId,
     ) -> Option<bool> {
-        // Find the binding across all partitions
-        for (_table_id, partition) in &mut self.partitions {
-            let snapshot = partition.load_snapshot();
+        // Fast path: direct lookup from subscription index.
+        if let Some(table_id) = self.subscription_to_table.get(&subscription_id).copied() {
+            if let Some(partition) = self.partitions.get_mut(&table_id) {
+                if let Some(predicate_removed) = partition.remove_binding_status(subscription_id) {
+                    self.subscription_to_table.remove(&subscription_id);
+                    return Some(predicate_removed);
+                }
+            }
 
-            if snapshot.predicates.bindings.contains_key(&subscription_id) {
-                // Remove binding and decrement refcount
-                let predicate_removed = partition.remove_binding(subscription_id);
+            // Stale index entry; clean it up and fall back to scan.
+            self.subscription_to_table.remove(&subscription_id);
+        }
+
+        // Fallback scan for pre-index or inconsistent states.
+        for (_table_id, partition) in &mut self.partitions {
+            if let Some(predicate_removed) = partition.remove_binding_status(subscription_id) {
+                self.subscription_to_table.remove(&subscription_id);
                 return Some(predicate_removed);
             }
         }
@@ -521,12 +553,19 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         // Convert bindings to serializable format
         let mut binding_data_vec = Vec::new();
         for binding in snapshot.predicates.bindings.values() {
+            let predicate_hash = snapshot
+                .predicates
+                .get_predicate(binding.predicate_id)
+                .map(|p| p.hash)
+                .ok_or_else(|| {
+                    StorageError::Corrupt(format!(
+                        "Binding {:?} references missing predicate ID {:?}",
+                        binding.subscription_id, binding.predicate_id
+                    ))
+                })?;
             let binding_data = BindingData::<I> {
                 subscription_id: binding.subscription_id,
-                predicate_hash: snapshot
-                    .predicates
-                    .get_predicate(binding.predicate_id)
-                    .map_or(0, |p| p.hash),
+                predicate_hash,
                 user_id: binding.user_id,
                 session_id: binding.session_id,
                 updated_at_unix_ms: binding.updated_at_unix_ms,
@@ -582,70 +621,73 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             user_dict.get_or_create(*user_id);
         }
 
-        // Build hash → PredicateData map
+        // Build hash → PredicateData map and validate binding references.
         let mut pred_hash_to_data: AHashMap<u128, &PredicateData> = AHashMap::new();
         for pred_data in &payload.predicates {
             pred_hash_to_data.insert(pred_data.hash, pred_data);
         }
 
-        // Restore predicates and bindings
-        let mut hash_to_pred_id: AHashMap<u128, PredicateId> = AHashMap::new();
-
+        // Build bindings grouped by predicate hash; IDs are assigned during add_batch.
+        let mut bindings_by_hash: AHashMap<u128, Vec<Binding<I>>> = AHashMap::new();
         for binding_data in &payload.bindings {
-            let pred_data = pred_hash_to_data
-                .get(&binding_data.predicate_hash)
-                .ok_or_else(|| {
-                    StorageError::Corrupt(format!(
-                        "Binding references unknown predicate hash: {:016x}",
-                        binding_data.predicate_hash
-                    ))
-                })?;
-
-            // Check if predicate already loaded
-            let pred_id = if let Some(&existing_id) = hash_to_pred_id.get(&pred_data.hash) {
-                existing_id
-            } else {
-                // Deserialize bytecode
-                let bytecode: BytecodeProgram =
-                    bincode::deserialize(&pred_data.bytecode_instructions).map_err(|e| {
-                        StorageError::Codec(format!("Bytecode deserialize error: {e}"))
-                    })?;
-
-                let pred = Predicate {
-                    // Placeholder; store allocates the authoritative ID.
-                    id: PredicateId::from_slab_index(0),
-                    hash: pred_data.hash,
-                    normalized_sql: pred_data.normalized_sql.clone().into(),
-                    bytecode: Arc::new(bytecode.clone()),
-                    dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
-                    refcount: 0, // Will be incremented via bindings
-                    updated_at_unix_ms: pred_data.updated_at_unix_ms,
-                };
-
-                // Extract indexable atoms
-                let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
-
-                // Add predicate to partition
-                let pred_id = partition.add_predicate(pred, atoms);
-
-                hash_to_pred_id.insert(pred_data.hash, pred_id);
-                pred_id
-            };
+            if !pred_hash_to_data.contains_key(&binding_data.predicate_hash) {
+                return Err(StorageError::Corrupt(format!(
+                    "Binding references unknown predicate hash: {:016x}",
+                    binding_data.predicate_hash
+                )));
+            }
 
             // Create binding
             let user_ord = user_dict.get_or_create(binding_data.user_id);
+            bindings_by_hash
+                .entry(binding_data.predicate_hash)
+                .or_default()
+                .push(Binding {
+                    subscription_id: binding_data.subscription_id,
+                    predicate_id: PredicateId::from_slab_index(0), // add_batch patches this
+                    user_id: binding_data.user_id,
+                    user_ordinal: user_ord,
+                    session_id: binding_data.session_id,
+                    updated_at_unix_ms: binding_data.updated_at_unix_ms,
+                });
+        }
 
-            let binding = Binding {
-                subscription_id: binding_data.subscription_id,
-                predicate_id: pred_id,
-                user_id: binding_data.user_id,
-                user_ordinal: user_ord,
-                session_id: binding_data.session_id,
-                updated_at_unix_ms: binding_data.updated_at_unix_ms,
+        // Build batch entries from predicates + grouped bindings.
+        let mut entries: BatchEntries<I> = Vec::new();
+        for pred_data in &payload.predicates {
+            let Some(bindings) = bindings_by_hash.remove(&pred_data.hash) else {
+                continue;
             };
 
-            // Add binding to partition
-            partition.add_binding(binding, pred_id);
+            let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
+                .map_err(|e| StorageError::Codec(format!("Bytecode deserialize error: {e}")))?;
+
+            let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
+            let pred = Predicate {
+                id: PredicateId::from_slab_index(0),
+                hash: pred_data.hash,
+                normalized_sql: pred_data.normalized_sql.clone().into(),
+                bytecode: Arc::new(bytecode.clone()),
+                dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
+                index_atoms: Arc::from(atoms.as_slice()),
+                refcount: 0, // incremented via bindings in add_batch
+                updated_at_unix_ms: pred_data.updated_at_unix_ms,
+            };
+            entries.push((pred, atoms, bindings));
+        }
+
+        if !bindings_by_hash.is_empty() {
+            return Err(StorageError::Corrupt(
+                "Orphan bindings remained after shard load".to_string(),
+            ));
+        }
+
+        partition.add_batch(&entries);
+        for (_, _, bindings) in &entries {
+            for binding in bindings {
+                self.subscription_to_table
+                    .insert(binding.subscription_id, table_id);
+            }
         }
 
         Ok(())
@@ -756,73 +798,82 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         let table_id = merged.table_id;
 
-        // Load merged payload into partition
-        let partition = self
-            .partitions
-            .entry(table_id)
-            .or_insert_with(|| TablePartition::new(table_id));
-        let user_dict = self.user_dictionaries.entry(table_id).or_default();
+        // Build merged table state off to the side, then atomically replace.
+        let mut partition = TablePartition::new(table_id);
+        let mut user_dict = UserDictionary::<I>::new();
 
-        // Restore user dictionary from merged shard
         for &user_id in &merged.payload.user_dict.ordinal_to_user {
             user_dict.get_or_create(user_id);
         }
 
-        // Build hash → PredicateData map
         let mut pred_hash_to_data: AHashMap<u128, &PredicateData> = AHashMap::new();
         for pred_data in &merged.payload.predicates {
             pred_hash_to_data.insert(pred_data.hash, pred_data);
         }
 
-        // Restore predicates and bindings from merged payload
-        let mut hash_to_pred_id: AHashMap<u128, PredicateId> = AHashMap::new();
-
+        let mut bindings_by_hash: AHashMap<u128, Vec<Binding<I>>> = AHashMap::new();
         for binding_data in &merged.payload.bindings {
-            let pred_data = pred_hash_to_data
-                .get(&binding_data.predicate_hash)
-                .ok_or_else(|| {
-                    MergeError::BuildFailed(format!(
-                        "Merged binding references unknown predicate hash: {:016x}",
-                        binding_data.predicate_hash
-                    ))
-                })?;
-
-            let pred_id = if let Some(&existing_id) = hash_to_pred_id.get(&pred_data.hash) {
-                existing_id
-            } else {
-                let bytecode: BytecodeProgram =
-                    bincode::deserialize(&pred_data.bytecode_instructions).map_err(|e| {
-                        MergeError::BuildFailed(format!("Bytecode deserialize error: {e}"))
-                    })?;
-
-                let pred = Predicate {
-                    // Placeholder; store allocates the authoritative ID.
-                    id: PredicateId::from_slab_index(0),
-                    hash: pred_data.hash,
-                    normalized_sql: pred_data.normalized_sql.clone().into(),
-                    bytecode: Arc::new(bytecode.clone()),
-                    dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
-                    refcount: 0,
-                    updated_at_unix_ms: pred_data.updated_at_unix_ms,
-                };
-
-                let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
-                let pred_id = partition.add_predicate(pred, atoms);
-
-                hash_to_pred_id.insert(pred_data.hash, pred_id);
-                pred_id
-            };
+            if !pred_hash_to_data.contains_key(&binding_data.predicate_hash) {
+                return Err(MergeError::BuildFailed(format!(
+                    "Merged binding references unknown predicate hash: {:016x}",
+                    binding_data.predicate_hash
+                )));
+            }
 
             let user_ord = user_dict.get_or_create(binding_data.user_id);
-            let binding = Binding {
-                subscription_id: binding_data.subscription_id,
-                predicate_id: pred_id,
-                user_id: binding_data.user_id,
-                user_ordinal: user_ord,
-                session_id: binding_data.session_id,
-                updated_at_unix_ms: binding_data.updated_at_unix_ms,
+            bindings_by_hash
+                .entry(binding_data.predicate_hash)
+                .or_default()
+                .push(Binding {
+                    subscription_id: binding_data.subscription_id,
+                    predicate_id: PredicateId::from_slab_index(0), // patched by add_batch
+                    user_id: binding_data.user_id,
+                    user_ordinal: user_ord,
+                    session_id: binding_data.session_id,
+                    updated_at_unix_ms: binding_data.updated_at_unix_ms,
+                });
+        }
+
+        let mut entries: BatchEntries<I> = Vec::new();
+        for pred_data in &merged.payload.predicates {
+            let Some(bindings) = bindings_by_hash.remove(&pred_data.hash) else {
+                continue;
             };
-            partition.add_binding(binding, pred_id);
+
+            let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
+                .map_err(|e| MergeError::BuildFailed(format!("Bytecode deserialize error: {e}")))?;
+
+            let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
+            let pred = Predicate {
+                id: PredicateId::from_slab_index(0),
+                hash: pred_data.hash,
+                normalized_sql: pred_data.normalized_sql.clone().into(),
+                bytecode: Arc::new(bytecode.clone()),
+                dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
+                index_atoms: Arc::from(atoms.as_slice()),
+                refcount: 0,
+                updated_at_unix_ms: pred_data.updated_at_unix_ms,
+            };
+            entries.push((pred, atoms, bindings));
+        }
+
+        if !bindings_by_hash.is_empty() {
+            return Err(MergeError::BuildFailed(
+                "Orphan bindings remained after merge reconstruction".to_string(),
+            ));
+        }
+
+        partition.add_batch(&entries);
+
+        self.partitions.insert(table_id, partition);
+        self.user_dictionaries.insert(table_id, user_dict);
+        self.subscription_to_table
+            .retain(|_, mapped_table_id| *mapped_table_id != table_id);
+        for (_, _, bindings) in &entries {
+            for binding in bindings {
+                self.subscription_to_table
+                    .insert(binding.subscription_id, table_id);
+            }
         }
 
         Ok(Some(merged.stats.into()))
@@ -1970,6 +2021,53 @@ mod tests {
     }
 
     #[test]
+    fn test_register_batch_duplicate_subscription_id_last_wins() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let specs = vec![
+            SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 1,
+            },
+            SubscriptionSpec {
+                subscription_id: 1, // same ID, replaces previous
+                user_id: 99,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
+                updated_at_unix_ms: 2,
+            },
+        ];
+
+        let results = engine.register_batch(specs);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert_eq!(engine.subscription_count(), 1);
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(25), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        assert!(users.contains(&99));
+        assert!(!users.contains(&42));
+    }
+
+    #[test]
     fn test_register_batch_dedup_with_existing() {
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
@@ -2010,5 +2108,143 @@ mod tests {
 
         assert_eq!(engine.subscription_count(), 3);
         assert_eq!(engine.predicate_count(1), 2); // Original + new
+    }
+
+    #[test]
+    fn test_register_upsert_replaces_existing_subscription_id() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: Some(10),
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 1,
+            })
+            .unwrap();
+
+        // Same subscription_id is replaced with a new predicate and user.
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 99,
+                session_id: Some(20),
+                sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
+                updated_at_unix_ms: 2,
+            })
+            .unwrap();
+
+        assert_eq!(engine.subscription_count(), 1);
+        assert_eq!(engine.predicate_count(1), 1);
+
+        let event_high = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+        let users_high: Vec<_> = engine.users(&event_high).unwrap().collect();
+        assert!(!users_high.contains(&42));
+        assert!(!users_high.contains(&99));
+
+        let event_low = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(2)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(2), Cell::Int(10), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+        let users_low: Vec<_> = engine.users(&event_low).unwrap().collect();
+        assert!(users_low.contains(&99));
+        assert!(!users_low.contains(&42));
+    }
+
+    #[test]
+    fn test_try_complete_merge_replaces_table_state() {
+        use tempfile::TempDir;
+
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
+
+        // Existing live state: amount > 100 for user 42.
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 1,
+            })
+            .unwrap();
+
+        // Build merged shard state: amount < 50 for user 99.
+        let (_table_id, program, normalized) = parse_compile_and_normalize(
+            "SELECT * FROM orders WHERE amount < 50",
+            &PostgreSqlDialect {},
+            &*catalog,
+        )
+        .unwrap();
+        let hash = canonicalize::hash_sql(&normalized);
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![PredicateData {
+                hash,
+                normalized_sql: normalized,
+                bytecode_instructions: bincode::serialize(&program).unwrap(),
+                dependency_columns: program.dependency_columns.clone(),
+                refcount: 1,
+                updated_at_unix_ms: 2,
+            }],
+            bindings: vec![BindingData {
+                subscription_id: 2,
+                predicate_hash: hash,
+                user_id: 99,
+                session_id: None,
+                updated_at_unix_ms: 2,
+            }],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![99],
+            },
+            created_at_unix_ms: 2,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let shard_path = tmp.path().join("table_1_merged.shard");
+        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        std::fs::write(&shard_path, shard_bytes).unwrap();
+
+        let job_id = engine
+            .merge_shards_background(1, &[shard_path])
+            .expect("merge job should start");
+
+        let mut report = None;
+        for _ in 0..100 {
+            report = engine.try_complete_merge(job_id).unwrap();
+            if report.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(report.is_some(), "merge job did not complete in time");
+
+        assert_eq!(engine.subscription_count(), 1);
+        assert!(!engine.unregister_subscription(1)); // old state replaced
+        assert!(engine.unregister_subscription(2));
     }
 }

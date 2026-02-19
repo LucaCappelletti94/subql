@@ -2,7 +2,7 @@
 //!
 //! Supports generic SQL dialects via sqlparser crate.
 
-use super::{BytecodeProgram, Instruction};
+use super::{canonicalize, BytecodeProgram, Instruction};
 use crate::{Cell, RegisterError, SchemaCatalog, TableId};
 use sqlparser::ast::{Expr, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::Dialect;
@@ -30,6 +30,16 @@ pub fn parse_and_compile<D: Dialect>(
     dialect: &D,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(TableId, BytecodeProgram), RegisterError> {
+    let (table_id, program, _normalized) = parse_compile_and_normalize(sql, dialect, catalog)?;
+    Ok((table_id, program))
+}
+
+/// Parse SQL once and produce compiled bytecode plus canonical normalized form.
+pub fn parse_compile_and_normalize<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+    catalog: &dyn SchemaCatalog,
+) -> Result<(TableId, BytecodeProgram, String), RegisterError> {
     if sql.len() > MAX_SQL_LEN {
         return Err(RegisterError::UnsupportedSql(
             "SQL input too long".to_string(),
@@ -60,7 +70,7 @@ pub fn parse_and_compile<D: Dialect>(
         .ok_or_else(|| RegisterError::UnknownTable(table_name.clone()))?;
 
     // Compile WHERE clause to bytecode
-    let program = if let Some(expr) = where_clause {
+    let program = if let Some(expr) = where_clause.as_ref() {
         compile_expression(&expr, table_id, catalog)?
     } else {
         // No WHERE clause = always match
@@ -68,7 +78,9 @@ pub fn parse_and_compile<D: Dialect>(
         BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(true))])
     };
 
-    Ok((table_id, program))
+    let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
+
+    Ok((table_id, program, normalized))
 }
 
 fn extract_table_and_where(stmt: &Statement) -> Result<(String, Option<Expr>), RegisterError> {
@@ -98,7 +110,7 @@ fn extract_table_and_where(stmt: &Statement) -> Result<(String, Option<Expr>), R
                             // Defensive: sqlparser never produces an empty ObjectName for
                             // TableFactor::Table (it fails at parse time), but guard against
                             // future parser changes.
-                            name.0.first()
+                            name.0.last()
                                 .and_then(|part| part.as_ident())
                                 .ok_or_else(|| RegisterError::UnsupportedSql(
                                     "Missing table name".to_string()
@@ -557,6 +569,19 @@ mod tests {
         let sql = "SELECT * FROM users WHERE age > 18";
         let result = parse_and_compile(sql, &dialect, &catalog);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_schema_qualified_table_name_uses_last_component() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT * FROM public.orders WHERE price > 10";
+        let result = parse_and_compile(sql, &dialect, &catalog);
+        assert!(result.is_ok());
+
+        let (table_id, _) = result.unwrap();
+        assert_eq!(table_id, 2);
     }
 
     #[test]

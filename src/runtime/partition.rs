@@ -71,7 +71,7 @@ impl<I: IdTypes> TablePartition<I> {
         // COW: clone-on-write if snapshot still shares this Arc
         let pred_id = Arc::make_mut(&mut self.mutable_predicates).add_predicate(predicate);
 
-        // Rebuild indexes
+        // Incrementally update indexes
         self.rebuild_indexes(&atoms, pred_id, &deps);
 
         pred_id
@@ -95,6 +95,17 @@ impl<I: IdTypes> TablePartition<I> {
     /// Returns true if predicate was removed.
     #[allow(clippy::option_if_let_else)]
     pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> bool {
+        self.remove_binding_status(sub_id).unwrap_or(false)
+    }
+
+    /// Remove binding and decrement refcount.
+    ///
+    /// Returns:
+    /// - `None` if no binding existed
+    /// - `Some(false)` if binding removed but predicate kept
+    /// - `Some(true)` if binding removed and predicate deleted
+    #[allow(clippy::option_if_let_else)]
+    pub fn remove_binding_status(&mut self, sub_id: I::SubscriptionId) -> Option<bool> {
         let store = Arc::make_mut(&mut self.mutable_predicates);
         if let Some(binding) = store.remove_binding(sub_id) {
             let removed = store.decrement_refcount(binding.predicate_id);
@@ -108,9 +119,9 @@ impl<I: IdTypes> TablePartition<I> {
                 self.update_snapshot();
             }
 
-            removed
+            Some(removed)
         } else {
-            false
+            None
         }
     }
 
@@ -127,28 +138,11 @@ impl<I: IdTypes> TablePartition<I> {
         self.snapshot.store(Arc::new(new_snapshot));
     }
 
-    /// Rebuild indexes for a single newly added predicate
-    fn rebuild_indexes(&self, atoms: &[IndexableAtom], pred_id: PredicateId, _deps: &[ColumnId]) {
-        // Build new indexes from all predicates
-        let mut new_indexes = HybridIndexes::new();
-
-        // Re-index all existing predicates
-        for (idx, pred) in &self.mutable_predicates.predicates {
-            let pred_deps = pred.dependency_columns.to_vec();
-
-            // For existing predicates, extract atoms from their bytecode
-            let pred_atoms = if PredicateId::from_slab_index(idx) == pred_id {
-                // This is the new predicate, use provided atoms
-                atoms.to_vec()
-            } else {
-                // Extract atoms from existing predicate's bytecode
-                super::indexes::extract_indexable_atoms(&pred.bytecode, &pred_deps)
-            };
-
-            new_indexes.add_predicate(PredicateId::from_slab_index(idx), &pred_atoms, &pred_deps);
-        }
-
-        new_indexes.finalize_ranges();
+    /// Incrementally update indexes for a single newly added predicate.
+    fn rebuild_indexes(&self, atoms: &[IndexableAtom], pred_id: PredicateId, deps: &[ColumnId]) {
+        let current = self.load_snapshot();
+        let mut new_indexes = current.indexes.clone();
+        new_indexes.add_predicate(pred_id, atoms, deps);
 
         let new_snapshot = TablePartitionSnapshot {
             table_id: self.table_id,
@@ -164,13 +158,12 @@ impl<I: IdTypes> TablePartition<I> {
         let mut new_indexes = HybridIndexes::new();
 
         for (idx, pred) in &self.mutable_predicates.predicates {
-            let pred_deps = pred.dependency_columns.to_vec();
-            let pred_atoms = super::indexes::extract_indexable_atoms(&pred.bytecode, &pred_deps);
-
-            new_indexes.add_predicate(PredicateId::from_slab_index(idx), &pred_atoms, &pred_deps);
+            new_indexes.add_predicate(
+                PredicateId::from_slab_index(idx),
+                &pred.index_atoms,
+                &pred.dependency_columns,
+            );
         }
-
-        new_indexes.finalize_ranges();
 
         let new_snapshot = TablePartitionSnapshot {
             table_id: self.table_id,
@@ -194,7 +187,7 @@ impl<I: IdTypes> TablePartition<I> {
     ) -> RoaringBitmap {
         let snapshot = self.load_snapshot();
         let update_filter = if kind == EventKind::Update && !changed_cols.is_empty() {
-            let mut update_candidates = RoaringBitmap::new();
+            let mut update_candidates = snapshot.indexes.dependency_free.clone();
 
             for &col in changed_cols {
                 if let Some(deps) = snapshot.indexes.dependency.get(&col) {
@@ -271,11 +264,14 @@ impl<I: IdTypes> TablePartition<I> {
             return;
         }
 
+        let current = self.load_snapshot();
+        let mut new_indexes = current.indexes.clone();
         // Single COW clone for the entire batch
         let store = Arc::make_mut(&mut self.mutable_predicates);
 
-        for (predicate, _atoms, bindings) in entries {
+        for (predicate, atoms, bindings) in entries {
             let pred_id = store.add_predicate(Predicate::clone(predicate));
+            new_indexes.add_predicate(pred_id, atoms, &predicate.dependency_columns);
 
             for binding in bindings {
                 let mut b = *binding;
@@ -284,17 +280,6 @@ impl<I: IdTypes> TablePartition<I> {
                 store.increment_refcount(pred_id);
             }
         }
-
-        // Single index rebuild for all predicates
-        let mut new_indexes = HybridIndexes::new();
-
-        for (idx, pred) in &self.mutable_predicates.predicates {
-            let pred_deps = pred.dependency_columns.to_vec();
-            let pred_atoms = super::indexes::extract_indexable_atoms(&pred.bytecode, &pred_deps);
-            new_indexes.add_predicate(PredicateId::from_slab_index(idx), &pred_atoms, &pred_deps);
-        }
-
-        new_indexes.finalize_ranges();
 
         // Single atomic snapshot swap
         let new_snapshot = TablePartitionSnapshot {
@@ -330,6 +315,7 @@ mod tests {
             normalized_sql: "test".into(),
             bytecode: Arc::new(BytecodeProgram::new(vec![Instruction::Not])),
             dependency_columns: Arc::from([1u16]),
+            index_atoms: Arc::from([IndexableAtom::Fallback]),
             refcount: 1,
             updated_at_unix_ms: 0,
         }
@@ -612,6 +598,22 @@ mod tests {
         // UPDATE changed column 0 only; no dependency overlap.
         let candidates = partition.select_candidates(&row, EventKind::Update, &[0]);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_update_keeps_dependency_free_predicates() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // Dependency-free predicate should always survive UPDATE changed-column
+        // pruning.
+        let mut pred = make_predicate(0, 0xD00D);
+        pred.dependency_columns = Arc::from([]);
+        pred.index_atoms = Arc::from([IndexableAtom::Fallback]);
+        let pred_id = partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
+
+        let row = make_row(vec![Cell::Int(1), Cell::Int(100)]);
+        let candidates = partition.select_candidates(&row, EventKind::Update, &[1]);
+        assert!(candidates.contains(pred_id.as_u32()));
     }
 
     #[test]
