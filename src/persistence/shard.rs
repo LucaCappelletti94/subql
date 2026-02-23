@@ -5,7 +5,7 @@ use crate::{IdTypes, SchemaCatalog, StorageError, TableId};
 use serde::{Deserialize, Serialize};
 
 /// Shard format version
-const SHARD_VERSION: u16 = 1;
+const SHARD_VERSION: u16 = 2;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 const MAX_SHARD_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
@@ -116,6 +116,7 @@ pub struct PredicateData {
     pub hash: u128,
     pub normalized_sql: String,
     pub bytecode_instructions: Vec<u8>, // Serialized bytecode
+    pub prefilter_plan: Vec<u8>,        // Serialized prefilter plan
     pub dependency_columns: Vec<u16>,
     pub refcount: u32,
     pub updated_at_unix_ms: u64,

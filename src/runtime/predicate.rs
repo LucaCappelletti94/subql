@@ -2,7 +2,10 @@
 
 use super::ids::{PredicateHash, PredicateId, UserOrdinal};
 use super::indexes::IndexableAtom;
-use crate::{compiler::BytecodeProgram, ColumnId, IdTypes};
+use crate::{
+    compiler::{BytecodeProgram, PrefilterPlan},
+    ColumnId, IdTypes,
+};
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
 use slab::Slab;
@@ -23,6 +26,8 @@ pub struct Predicate {
     pub dependency_columns: Arc<[ColumnId]>,
     /// Precomputed indexable atoms for this predicate.
     pub index_atoms: Arc<[IndexableAtom]>,
+    /// Planner metadata used for OR/NOT-aware candidate pruning.
+    pub prefilter_plan: Arc<PrefilterPlan>,
     /// Reference count (number of subscriptions using this predicate)
     pub refcount: u32,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
@@ -257,7 +262,7 @@ impl<I: IdTypes> Default for PredicateStore<I> {
 #[allow(clippy::unwrap_used, clippy::clone_on_copy)]
 mod tests {
     use super::*;
-    use crate::compiler::Instruction;
+    use crate::compiler::{Instruction, PrefilterPlan};
     use crate::DefaultIds;
 
     fn make_predicate(id: usize, hash: u128, refcount: u32) -> Predicate {
@@ -268,6 +273,7 @@ mod tests {
             bytecode: Arc::new(BytecodeProgram::new(vec![Instruction::Not])),
             dependency_columns: Arc::from([]),
             index_atoms: Arc::from([IndexableAtom::Fallback]),
+            prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount,
             updated_at_unix_ms: 0,
         }

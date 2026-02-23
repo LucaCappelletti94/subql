@@ -252,6 +252,8 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
+    let show_progress = std::env::var_os("SUBQL_MEMORY_BENCH_PROGRESS").is_some();
+
     println!("SubQL Memory Profiling");
     println!("======================");
     println!();
@@ -260,6 +262,9 @@ fn main() {
     let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
 
     println!("Registering 100,000 predicates with realistic tree shapes...");
+    if !show_progress {
+        println!("Progress logs disabled (set SUBQL_MEMORY_BENCH_PROGRESS=1 to enable)");
+    }
 
     for i in 0_u64..100_000 {
         let spec = SubscriptionSpec {
@@ -271,7 +276,7 @@ fn main() {
         };
         engine.register(spec).unwrap();
 
-        if (i + 1) % 10_000 == 0 {
+        if show_progress && (i + 1) % 10_000 == 0 {
             println!("  {} predicates registered", i + 1);
         }
     }
@@ -289,7 +294,7 @@ fn main() {
         let event_idx = usize::try_from(event_idx_u64).unwrap_or(0);
         let user_count = engine.users(&event_corpus[event_idx]).unwrap().count();
 
-        if (i + 1) % 100 == 0 {
+        if show_progress && (i + 1) % 100 == 0 {
             println!(
                 "  {} events dispatched (matched {} users)",
                 i + 1,

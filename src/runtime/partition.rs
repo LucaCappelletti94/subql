@@ -221,8 +221,9 @@ impl<I: IdTypes> TablePartition<I> {
                 }
 
                 // Range index
-                let range_bitmap = snapshot.indexes.query_range(col_id, &indexable);
-                candidates |= &range_bitmap;
+                snapshot
+                    .indexes
+                    .query_range_into(col_id, &indexable, &mut candidates);
             }
 
             // NULL index
@@ -304,7 +305,7 @@ mod tests {
     use super::super::indexes::{IndexableAtom, NullKind};
     use super::*;
     use crate::{
-        compiler::{BytecodeProgram, Instruction},
+        compiler::{BytecodeProgram, Instruction, PrefilterPlan},
         Cell, DefaultIds,
     };
 
@@ -316,6 +317,7 @@ mod tests {
             bytecode: Arc::new(BytecodeProgram::new(vec![Instruction::Not])),
             dependency_columns: Arc::from([1u16]),
             index_atoms: Arc::from([IndexableAtom::Fallback]),
+            prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount: 1,
             updated_at_unix_ms: 0,
         }

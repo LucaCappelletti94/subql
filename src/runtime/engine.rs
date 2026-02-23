@@ -4,12 +4,13 @@ use super::indexes::IndexableAtom;
 use super::{
     dispatch::{dispatch_users, MatchedUsers, UserDictionary},
     ids::PredicateId,
-    indexes::extract_indexable_atoms,
     partition::TablePartition,
     predicate::{Binding, Predicate},
 };
 use crate::{
-    compiler::{canonicalize, parse_compile_and_normalize, BytecodeProgram, Vm},
+    compiler::{
+        canonicalize, parse_compile_normalize_and_prefilter, BytecodeProgram, PrefilterPlan, Vm,
+    },
     persistence::{
         merge::MergeManager,
         shard::{
@@ -32,6 +33,7 @@ struct CompiledBatchEntry<I: IdTypes> {
     table_id: TableId,
     bytecode: BytecodeProgram,
     normalized: String,
+    prefilter_plan: PrefilterPlan,
     hash: u128,
 }
 
@@ -98,6 +100,20 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
 }
 
 impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
+    fn index_atoms_from_plan(plan: &PrefilterPlan) -> Vec<IndexableAtom> {
+        let mut atoms: Vec<IndexableAtom> = plan
+            .trigger_atoms
+            .iter()
+            .map(IndexableAtom::from_planner)
+            .collect();
+
+        if plan.scan_required {
+            atoms.push(IndexableAtom::Fallback);
+        }
+
+        atoms
+    }
+
     /// Create new subscription engine
     #[must_use]
     pub fn new(catalog: Arc<dyn SchemaCatalog>, dialect: D) -> Self {
@@ -154,8 +170,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     #[allow(clippy::needless_pass_by_value)]
     pub fn register(&mut self, spec: SubscriptionSpec<I>) -> Result<RegisterResult, RegisterError> {
         // 1. Parse, compile, and canonicalize in one pass.
-        let (table_id, bytecode, normalized) =
-            parse_compile_and_normalize(&spec.sql, &self.dialect, &*self.catalog)?;
+        let (table_id, bytecode, normalized, prefilter_plan) =
+            parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog)?;
         let hash = canonicalize::hash_sql(&normalized);
 
         // 2. Upsert semantics: replace existing subscription ID atomically
@@ -182,7 +198,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             (existing, false)
         } else {
             // Create new predicate
-            let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
+            let atoms = Self::index_atoms_from_plan(&prefilter_plan);
             let pred = Predicate {
                 // Placeholder; store allocates the authoritative ID.
                 id: PredicateId::from_slab_index(0),
@@ -191,6 +207,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 bytecode: Arc::new(bytecode.clone()),
                 dependency_columns: Arc::from(bytecode.dependency_columns.as_slice()),
                 index_atoms: Arc::from(atoms.as_slice()),
+                prefilter_plan: Arc::new(prefilter_plan.clone()),
                 refcount: 0, // Will be incremented via binding
                 updated_at_unix_ms: spec.updated_at_unix_ms,
             };
@@ -286,14 +303,15 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             Vec::with_capacity(specs.len());
 
         for spec in specs {
-            match parse_compile_and_normalize(&spec.sql, &self.dialect, &*self.catalog) {
-                Ok((table_id, bytecode, normalized)) => {
+            match parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog) {
+                Ok((table_id, bytecode, normalized, prefilter_plan)) => {
                     let hash = canonicalize::hash_sql(&normalized);
                     compiled.push(Some(CompiledBatchEntry {
                         spec,
                         table_id,
                         bytecode,
                         normalized,
+                        prefilter_plan,
                         hash,
                     }));
                     results.push(Ok(RegisterResult {
@@ -369,7 +387,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 created_new = false;
             } else {
                 // New predicate — create batch entry
-                let atoms = extract_indexable_atoms(&c.bytecode, &c.bytecode.dependency_columns);
+                let atoms = Self::index_atoms_from_plan(&c.prefilter_plan);
                 let pred = super::predicate::Predicate {
                     id: PredicateId::from_slab_index(0),
                     hash: c.hash,
@@ -377,6 +395,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                     bytecode: Arc::new(c.bytecode.clone()),
                     dependency_columns: Arc::from(c.bytecode.dependency_columns.as_slice()),
                     index_atoms: Arc::from(atoms.as_slice()),
+                    prefilter_plan: Arc::new(c.prefilter_plan.clone()),
                     refcount: 0,
                     updated_at_unix_ms: c.spec.updated_at_unix_ms,
                 };
@@ -684,6 +703,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 normalized_sql: pred.normalized_sql.to_string(),
                 bytecode_instructions: bincode::serialize(&*pred.bytecode)
                     .map_err(|e| StorageError::Codec(format!("Bytecode serialize error: {e}")))?,
+                prefilter_plan: bincode::serialize(&*pred.prefilter_plan)
+                    .map_err(|e| StorageError::Codec(format!("Prefilter serialize error: {e}")))?,
                 dependency_columns: pred.dependency_columns.to_vec(),
                 refcount: pred.refcount,
                 updated_at_unix_ms: pred.updated_at_unix_ms,
@@ -793,7 +814,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                     RebuildPayloadError::Codec(format!("Bytecode deserialize error: {e}"))
                 })?;
 
-            let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
+            let prefilter_plan: PrefilterPlan = bincode::deserialize(&pred_data.prefilter_plan)
+                .map_err(|e| {
+                    RebuildPayloadError::Codec(format!("Prefilter deserialize error: {e}"))
+                })?;
+            let atoms = Self::index_atoms_from_plan(&prefilter_plan);
             let pred = Predicate {
                 id: PredicateId::from_slab_index(0),
                 hash: pred_data.hash,
@@ -801,6 +826,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 bytecode: Arc::new(bytecode.clone()),
                 dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
                 index_atoms: Arc::from(atoms.as_slice()),
+                prefilter_plan: Arc::new(prefilter_plan),
                 refcount: 0, // incremented via bindings in add_batch
                 updated_at_unix_ms: pred_data.updated_at_unix_ms,
             };
@@ -2204,6 +2230,8 @@ mod tests {
                     ],
                 ))
                 .unwrap(),
+                prefilter_plan: bincode::serialize(&crate::compiler::PrefilterPlan::default())
+                    .unwrap(),
                 dependency_columns: vec![1],
                 refcount: 1,
                 updated_at_unix_ms: 1000,
@@ -2631,7 +2659,7 @@ mod tests {
             .unwrap();
 
         // Build merged shard state: amount < 50 for user 99.
-        let (_table_id, program, normalized) = parse_compile_and_normalize(
+        let (_table_id, program, normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount < 50",
             &PostgreSqlDialect {},
             &*catalog,
@@ -2643,6 +2671,8 @@ mod tests {
                 hash,
                 normalized_sql: normalized,
                 bytecode_instructions: bincode::serialize(&program).unwrap(),
+                prefilter_plan: bincode::serialize(&crate::compiler::PrefilterPlan::default())
+                    .unwrap(),
                 dependency_columns: program.dependency_columns.clone(),
                 refcount: 1,
                 updated_at_unix_ms: 2,

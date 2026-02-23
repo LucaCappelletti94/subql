@@ -2,7 +2,9 @@
 //!
 //! Supports generic SQL dialects via sqlparser crate.
 
-use super::{canonicalize, BytecodeProgram, Instruction};
+use super::{
+    canonicalize, prefilter::build_prefilter_plan, BytecodeProgram, Instruction, PrefilterPlan,
+};
 use crate::{Cell, RegisterError, SchemaCatalog, TableId};
 use sqlparser::ast::{Expr, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::Dialect;
@@ -40,6 +42,18 @@ pub fn parse_compile_and_normalize<D: Dialect>(
     dialect: &D,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(TableId, BytecodeProgram, String), RegisterError> {
+    let (table_id, program, normalized, _prefilter_plan) =
+        parse_compile_normalize_and_prefilter(sql, dialect, catalog)?;
+    Ok((table_id, program, normalized))
+}
+
+/// Parse SQL once and produce compiled bytecode, canonical normalized form,
+/// and OR/NOT-aware prefilter plan.
+pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+    catalog: &dyn SchemaCatalog,
+) -> Result<(TableId, BytecodeProgram, String, PrefilterPlan), RegisterError> {
     if sql.len() > MAX_SQL_LEN {
         return Err(RegisterError::UnsupportedSql(
             "SQL input too long".to_string(),
@@ -79,8 +93,9 @@ pub fn parse_compile_and_normalize<D: Dialect>(
     };
 
     let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
+    let prefilter_plan = build_prefilter_plan(where_clause.as_ref(), table_id, catalog);
 
-    Ok((table_id, program, normalized))
+    Ok((table_id, program, normalized, prefilter_plan))
 }
 
 fn extract_table_and_where(stmt: &Statement) -> Result<(String, Option<Expr>), RegisterError> {

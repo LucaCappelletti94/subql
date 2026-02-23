@@ -152,6 +152,12 @@ pub fn dispatch_users<'a, I: IdTypes>(
         let pred_id = super::ids::PredicateId::from_u32(pred_id_u32);
 
         if let Some(pred) = snapshot.predicates.get_predicate(pred_id) {
+            // Hybrid path: for scan-required predicates, run cheap prefilter
+            // first and skip VM if predicate cannot possibly be true.
+            if pred.prefilter_plan.requires_prefilter_eval && !pred.prefilter_plan.may_match(row) {
+                continue;
+            }
+
             // Evaluate predicate against row
             let result = vm
                 .eval(&pred.bytecode, row)
@@ -380,7 +386,7 @@ mod tests {
         use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
-        use crate::compiler::{BytecodeProgram, Instruction, Vm};
+        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
         let mut user_dict = UserDictionary::<DefaultIds>::new();
@@ -397,6 +403,7 @@ mod tests {
             ])),
             dependency_columns: Arc::from([1u16]),
             index_atoms: Arc::from([IndexableAtom::Fallback]),
+            prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount: 1,
             updated_at_unix_ms: 1000,
         };
@@ -445,7 +452,7 @@ mod tests {
         use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
-        use crate::compiler::{BytecodeProgram, Instruction, Vm};
+        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
         let mut user_dict = UserDictionary::<DefaultIds>::new();
@@ -462,6 +469,7 @@ mod tests {
             ])),
             dependency_columns: Arc::from([1u16]),
             index_atoms: Arc::from([IndexableAtom::Fallback]),
+            prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount: 1,
             updated_at_unix_ms: 1000,
         };
@@ -508,7 +516,7 @@ mod tests {
         use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
-        use crate::compiler::{BytecodeProgram, Instruction, Vm};
+        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
         let mut user_dict = UserDictionary::<DefaultIds>::new();
@@ -525,6 +533,7 @@ mod tests {
             ])),
             dependency_columns: Arc::from([1u16]),
             index_atoms: Arc::from([IndexableAtom::Fallback]),
+            prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount: 1,
             updated_at_unix_ms: 1000,
         };

@@ -8,7 +8,10 @@
 //! 5. Dependency: col → predicates referencing col (for UPDATE optimization)
 
 use super::ids::PredicateId;
-use crate::{Cell, ColumnId};
+use crate::{
+    compiler::{PlannerAtom, PlannerValue},
+    Cell, ColumnId,
+};
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
 use std::cmp::Ordering;
@@ -35,6 +38,17 @@ impl IndexableCell {
             Cell::Float(f) => Some(Self::Float(f.to_bits())),
             Cell::String(s) => Some(Self::String(Arc::clone(s))),
             Cell::Null | Cell::Missing => None,
+        }
+    }
+
+    /// Convert planner value to runtime indexable cell.
+    #[must_use]
+    pub fn from_planner(value: &PlannerValue) -> Self {
+        match value {
+            PlannerValue::Bool(b) => Self::Bool(*b),
+            PlannerValue::Int(i) => Self::Int(*i),
+            PlannerValue::Float(bits) => Self::Float(*bits),
+            PlannerValue::String(s) => Self::String(Arc::clone(s)),
         }
     }
 }
@@ -81,6 +95,36 @@ pub enum IndexableAtom {
     Null { column_id: ColumnId, kind: NullKind },
     /// Unindexable (LIKE, complex expressions)
     Fallback,
+}
+
+impl IndexableAtom {
+    /// Convert planner atom to runtime indexable atom.
+    #[must_use]
+    pub fn from_planner(atom: &PlannerAtom) -> Self {
+        match atom {
+            PlannerAtom::Equality { column_id, value } => Self::Equality {
+                column_id: *column_id,
+                value: IndexableCell::from_planner(value),
+            },
+            PlannerAtom::Range {
+                column_id,
+                lower,
+                upper,
+            } => Self::Range {
+                column_id: *column_id,
+                lower: *lower,
+                upper: *upper,
+            },
+            PlannerAtom::Null { column_id, is_null } => Self::Null {
+                column_id: *column_id,
+                kind: if *is_null {
+                    NullKind::IsNull
+                } else {
+                    NullKind::IsNotNull
+                },
+            },
+        }
+    }
 }
 
 /// Hybrid indexes for candidate selection
@@ -142,9 +186,9 @@ impl HybridIndexes {
             }
         }
 
-        // If no indexable atoms, add to fallback
+        // If no atoms were provided by the planner, this predicate has no
+        // trigger path and no unconditional scan requirement.
         if atoms.is_empty() {
-            self.fallback.insert(pred_id_u32);
             return;
         }
 
@@ -207,13 +251,15 @@ impl HybridIndexes {
     }
 
     /// Query range index (return predicates whose ranges contain value)
-    #[must_use]
-    pub fn query_range(&self, col_id: ColumnId, value: &IndexableCell) -> RoaringBitmap {
-        let mut result = RoaringBitmap::new();
-
+    pub fn query_range_into(
+        &self,
+        col_id: ColumnId,
+        value: &IndexableCell,
+        out: &mut RoaringBitmap,
+    ) {
         // Only works for numeric values; NaN never matches ordered ranges.
         let Some(numeric) = NumericValue::from_indexable(value) else {
-            return result;
+            return;
         };
 
         if let Some(entries) = self.range.get(&col_id) {
@@ -229,11 +275,17 @@ impl HybridIndexes {
                 let in_upper = entry.upper.map_or(true, |u| numeric.lte_upper(u));
 
                 if in_upper {
-                    result.insert(entry.predicate_id.as_u32());
+                    out.insert(entry.predicate_id.as_u32());
                 }
             }
         }
+    }
 
+    /// Query range index (return predicates whose ranges contain value)
+    #[must_use]
+    pub fn query_range(&self, col_id: ColumnId, value: &IndexableCell) -> RoaringBitmap {
+        let mut result = RoaringBitmap::new();
+        self.query_range_into(col_id, value, &mut result);
         result
     }
 
@@ -627,7 +679,7 @@ mod tests {
 
         indexes.add_predicate(pred_id, &[], &[]);
 
-        assert!(indexes.fallback.contains(pred_id.as_u32()));
+        assert!(!indexes.fallback.contains(pred_id.as_u32()));
     }
 
     #[test]
