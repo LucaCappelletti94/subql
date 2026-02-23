@@ -220,7 +220,7 @@ impl BytecodeProgram {
 
     /// Returns true if this program has no dependencies (always evaluates to same result)
     #[must_use]
-    pub fn is_constant(&self) -> bool {
+    pub const fn is_constant(&self) -> bool {
         self.dependency_columns.is_empty()
     }
 }

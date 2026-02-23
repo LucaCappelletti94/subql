@@ -264,7 +264,7 @@ impl HybridIndexes {
                     }
                 }
 
-                let in_upper = entry.upper.map_or(true, |u| numeric.lte_upper(u));
+                let in_upper = entry.upper.is_none_or(|u| numeric.lte_upper(u));
 
                 if in_upper {
                     out.insert(entry.predicate_id.as_u32());
@@ -296,7 +296,7 @@ enum NumericValue {
 }
 
 impl NumericValue {
-    fn from_indexable(value: &IndexableCell) -> Option<Self> {
+    const fn from_indexable(value: &IndexableCell) -> Option<Self> {
         match value {
             IndexableCell::Int(i) => Some(Self::Int(*i)),
             IndexableCell::Float(bits) => {

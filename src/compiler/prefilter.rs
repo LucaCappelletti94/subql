@@ -7,6 +7,7 @@ use super::Tri;
 use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -76,8 +77,8 @@ pub enum PrefilterExpr {
     /// Unknown / non-indexable leaf.
     Unknown,
     Atom(PlannerAtom),
-    And(Vec<PrefilterExpr>),
-    Or(Vec<PrefilterExpr>),
+    And(Vec<Self>),
+    Or(Vec<Self>),
 }
 
 impl PrefilterExpr {
@@ -227,15 +228,14 @@ fn eval_atom(atom: &PlannerAtom, row: &RowImage) -> Tri {
 
 fn eval_equality(cell: &Cell, value: &PlannerValue) -> Tri {
     match (cell, value) {
-        (Cell::Null | Cell::Missing, _) => Tri::Unknown,
         (Cell::Bool(lhs), PlannerValue::Bool(rhs)) => Tri::from_option(Some(lhs == rhs)),
         (Cell::Int(lhs), PlannerValue::Int(rhs)) => Tri::from_option(Some(lhs == rhs)),
         (Cell::Float(lhs), PlannerValue::Float(rhs_bits)) => {
             let rhs = f64::from_bits(*rhs_bits);
-            if lhs.is_nan() || rhs.is_nan() {
-                Tri::Unknown
-            } else {
-                Tri::from_option(Some(*lhs == rhs))
+            match lhs.partial_cmp(&rhs) {
+                Some(Ordering::Equal) => Tri::True,
+                Some(Ordering::Less | Ordering::Greater) => Tri::False,
+                None => Tri::Unknown,
             }
         }
         (Cell::String(lhs), PlannerValue::String(rhs)) => Tri::from_option(Some(lhs == rhs)),
@@ -245,18 +245,19 @@ fn eval_equality(cell: &Cell, value: &PlannerValue) -> Tri {
 
 fn eval_range(cell: &Cell, lower: Option<i64>, upper: Option<i64>) -> Tri {
     match cell {
-        Cell::Null | Cell::Missing => Tri::Unknown,
         Cell::Int(v) => {
-            let lower_ok = lower.map_or(true, |l| *v >= l);
-            let upper_ok = upper.map_or(true, |u| *v <= u);
+            let lower_ok = lower.is_none_or(|l| *v >= l);
+            let upper_ok = upper.is_none_or(|u| *v <= u);
             Tri::from_option(Some(lower_ok && upper_ok))
         }
         Cell::Float(v) => {
             if v.is_nan() {
                 return Tri::Unknown;
             }
-            let lower_ok = lower.map_or(true, |l| *v >= l as f64);
-            let upper_ok = upper.map_or(true, |u| *v <= u as f64);
+            #[allow(clippy::cast_precision_loss)]
+            let lower_ok = lower.is_none_or(|l| *v >= l as f64);
+            #[allow(clippy::cast_precision_loss)]
+            let upper_ok = upper.is_none_or(|u| *v <= u as f64);
             Tri::from_option(Some(lower_ok && upper_ok))
         }
         _ => Tri::Unknown,
@@ -272,7 +273,7 @@ struct Analysis {
 }
 
 impl Analysis {
-    fn constant(value: bool) -> Self {
+    const fn constant(value: bool) -> Self {
         Self {
             expr: PrefilterExpr::Const(value),
             trigger_atoms: BTreeSet::new(),
@@ -282,7 +283,7 @@ impl Analysis {
         }
     }
 
-    fn unknown() -> Self {
+    const fn unknown() -> Self {
         Self {
             expr: PrefilterExpr::Unknown,
             trigger_atoms: BTreeSet::new(),
@@ -308,10 +309,10 @@ impl Analysis {
         trigger_atoms.extend(rhs.trigger_atoms);
 
         let true_possible = lhs.true_possible && rhs.true_possible;
-        let hit_guaranteed_if_true = if !true_possible {
-            true
-        } else {
+        let hit_guaranteed_if_true = if true_possible {
             lhs.hit_guaranteed_if_true || rhs.hit_guaranteed_if_true
+        } else {
+            true
         };
 
         Self {
@@ -328,10 +329,10 @@ impl Analysis {
         trigger_atoms.extend(rhs.trigger_atoms);
 
         let true_possible = lhs.true_possible || rhs.true_possible;
-        let hit_guaranteed_if_true = if !true_possible {
-            true
-        } else {
+        let hit_guaranteed_if_true = if true_possible {
             lhs.hit_guaranteed_if_true && rhs.hit_guaranteed_if_true
+        } else {
+            true
         };
 
         Self {
@@ -351,19 +352,19 @@ fn merge_expr(
     let mut out = Vec::new();
     match lhs {
         PrefilterExpr::And(parts) if matches!(make(Vec::new()), PrefilterExpr::And(_)) => {
-            out.extend(parts)
+            out.extend(parts);
         }
         PrefilterExpr::Or(parts) if matches!(make(Vec::new()), PrefilterExpr::Or(_)) => {
-            out.extend(parts)
+            out.extend(parts);
         }
         other => out.push(other),
     }
     match rhs {
         PrefilterExpr::And(parts) if matches!(make(Vec::new()), PrefilterExpr::And(_)) => {
-            out.extend(parts)
+            out.extend(parts);
         }
         PrefilterExpr::Or(parts) if matches!(make(Vec::new()), PrefilterExpr::Or(_)) => {
-            out.extend(parts)
+            out.extend(parts);
         }
         other => out.push(other),
     }
@@ -377,10 +378,10 @@ pub fn build_prefilter_plan(
     table_id: TableId,
     catalog: &dyn SchemaCatalog,
 ) -> PrefilterPlan {
-    let analysis = match where_clause {
-        Some(expr) => analyze_expr(expr, table_id, catalog, false),
-        None => Analysis::constant(true),
-    };
+    let analysis = where_clause.map_or_else(
+        || Analysis::constant(true),
+        |expr| analyze_expr(expr, table_id, catalog, false),
+    );
 
     let scan_required = analysis.true_possible && !analysis.hit_guaranteed_if_true;
     let trigger_atoms = Arc::from(analysis.trigger_atoms.into_iter().collect::<Vec<_>>());
@@ -427,8 +428,6 @@ fn analyze_expr(
             expr,
         } => analyze_expr(expr, table_id, catalog, !negated),
 
-        Expr::UnaryOp { .. } => Analysis::unknown(),
-
         Expr::Nested(expr) => analyze_expr(expr, table_id, catalog, negated),
 
         Expr::InList {
@@ -453,12 +452,6 @@ fn analyze_expr(
 
         Expr::IsNull(expr) => analyze_null_check(expr, true ^ negated, table_id, catalog),
         Expr::IsNotNull(expr) => analyze_null_check(expr, false ^ negated, table_id, catalog),
-
-        Expr::Like { .. }
-        | Expr::ILike { .. }
-        | Expr::RLike { .. }
-        | Expr::AnyOp { .. }
-        | Expr::AllOp { .. } => Analysis::unknown(),
 
         Expr::Value(val) => match &val.value {
             Value::Boolean(b) => Analysis::constant(*b ^ negated),
@@ -523,14 +516,14 @@ fn analyze_in_list(
     }
 
     let mut disjunct_iter = disjuncts.into_iter();
-    let mut out = if let Some(first) = disjunct_iter.next() {
-        first
-    } else if has_non_indexable_true_path {
-        Analysis::unknown()
-    } else {
-        // Example: `col IN (NULL)` can never evaluate to TRUE.
-        Analysis::constant(false)
-    };
+    let mut out = disjunct_iter.next().unwrap_or_else(|| {
+        if has_non_indexable_true_path {
+            Analysis::unknown()
+        } else {
+            // Example: `col IN (NULL)` can never evaluate to TRUE.
+            Analysis::constant(false)
+        }
+    });
 
     for branch in disjunct_iter {
         out = Analysis::or(out, branch);
@@ -702,11 +695,10 @@ fn literal_int(expr: &Expr) -> Option<i64> {
     literal_cell(expr).as_ref().and_then(literal_int_cell)
 }
 
-fn literal_int_cell(cell: &Cell) -> Option<i64> {
-    if let Cell::Int(i) = cell {
-        Some(*i)
-    } else {
-        None
+const fn literal_int_cell(cell: &Cell) -> Option<i64> {
+    match cell {
+        Cell::Int(i) => Some(*i),
+        _ => None,
     }
 }
 
@@ -714,15 +706,11 @@ fn literal_cell_from_sql_value(val: &Value) -> Option<Cell> {
     match val {
         Value::Null => Some(Cell::Null),
         Value::Boolean(b) => Some(Cell::Bool(*b)),
-        Value::Number(n, _long) => {
-            if let Ok(i) = n.parse::<i64>() {
-                Some(Cell::Int(i))
-            } else if let Ok(f) = n.parse::<f64>() {
-                Some(Cell::Float(f))
-            } else {
-                None
-            }
-        }
+        Value::Number(n, _long) => n
+            .parse::<i64>()
+            .map(Cell::Int)
+            .or_else(|_| n.parse::<f64>().map(Cell::Float))
+            .ok(),
         Value::SingleQuotedString(s)
         | Value::DoubleQuotedString(s)
         | Value::NationalStringLiteral(s)

@@ -207,7 +207,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 bytecode: Arc::new(bytecode.clone()),
                 dependency_columns: Arc::from(bytecode.dependency_columns.as_slice()),
                 index_atoms: Arc::from(atoms.as_slice()),
-                prefilter_plan: Arc::new(prefilter_plan.clone()),
+                prefilter_plan: Arc::new(prefilter_plan),
                 refcount: 0, // Will be incremented via binding
                 updated_at_unix_ms: spec.updated_at_unix_ms,
             };
@@ -925,12 +925,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     }
 
     /// Set rotation threshold
-    pub fn set_rotation_threshold(&mut self, threshold: usize) {
+    pub const fn set_rotation_threshold(&mut self, threshold: usize) {
         self.rotation_threshold = threshold;
     }
 
     /// Set durability mode for registration-time persistence.
-    pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
+    pub const fn set_durability_mode(&mut self, mode: DurabilityMode) {
         self.durability_mode = mode;
     }
 

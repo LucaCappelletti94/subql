@@ -43,8 +43,11 @@ impl PredicateId {
     /// # Panics
     /// Panics if `raw` is 0.
     #[must_use]
-    pub fn from_u32(raw: u32) -> Self {
-        Self(NonZeroU32::new(raw).expect("PredicateId cannot be zero"))
+    pub const fn from_u32(raw: u32) -> Self {
+        match NonZeroU32::new(raw) {
+            Some(value) => Self(value),
+            None => panic!("PredicateId cannot be zero"),
+        }
     }
 }
 

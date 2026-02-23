@@ -25,7 +25,7 @@ const STATUS_BUCKETS: [&str; 7] = [
 const EVENT_CORPUS_SIZE: usize = 64;
 const EVENT_CORPUS_SALT: u64 = 0xA1B2_C3D4_E5F6_7788;
 
-fn mix_seed(mut value: u64) -> u64 {
+const fn mix_seed(mut value: u64) -> u64 {
     // SplitMix64 finalizer: deterministic pseudo-randomness for stable benches.
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58476d1ce4e5b9);
@@ -38,7 +38,7 @@ fn bounded_i64(seed: u64, modulo: u64) -> i64 {
     i64::try_from(mix_seed(seed) % modulo).unwrap_or(0)
 }
 
-fn status_for(seed: u64) -> &'static str {
+const fn status_for(seed: u64) -> &'static str {
     match mix_seed(seed) % 7 {
         0 => STATUS_BUCKETS[0],
         1 => STATUS_BUCKETS[1],
@@ -198,11 +198,11 @@ fn scaling_tree_sql(seed: u64) -> String {
     }
 }
 
-fn realistic_workload_seed(subscription_ix: u64) -> u64 {
+const fn realistic_workload_seed(subscription_ix: u64) -> u64 {
     // Most subscribers belong to repeatable "hot" cohorts, with a long-tail.
     let hot_cohort = subscription_ix % 2_048;
     let long_tail = mix_seed(subscription_ix ^ 0xA53A_9E37_79B9_7F4A);
-    if subscription_ix % 5 == 0 {
+    if subscription_ix.is_multiple_of(5) {
         long_tail
     } else {
         hot_cohort
@@ -289,7 +289,7 @@ fn make_test_event(seed: u64) -> WalEvent {
     let amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
     let priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
     let quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
-    let discount = if mix_seed(seed ^ 0x6F7F) % 5 == 0 {
+    let discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
         Cell::Null
     } else {
         Cell::Int(bounded_i64(seed ^ 0x7A8A, 18))
@@ -331,7 +331,7 @@ fn make_test_update_event(seed: u64) -> WalEvent {
     let old_amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
     let old_priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
     let old_quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
-    let old_discount = if mix_seed(seed ^ 0x6F7F) % 5 == 0 {
+    let old_discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
         Cell::Null
     } else {
         Cell::Int(bounded_i64(seed ^ 0x7A8A, 18))
@@ -420,7 +420,7 @@ fn make_test_delete_event(seed: u64) -> WalEvent {
     let amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
     let priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
     let quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
-    let discount = if mix_seed(seed ^ 0x6F7F) % 5 == 0 {
+    let discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
         Cell::Null
     } else {
         Cell::Int(bounded_i64(seed ^ 0x7A8A, 18))
