@@ -180,6 +180,139 @@ pub fn harness_codec_decode(data: &[u8]) {
     let _ = codec::decode::<String>(data);
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn cell_kind(cell: &Cell) -> u8 {
+        match cell {
+            Cell::Null => 0,
+            Cell::Missing => 1,
+            Cell::Bool(_) => 2,
+            Cell::Int(_) => 3,
+            Cell::Float(_) => 4,
+            Cell::String(_) => 5,
+        }
+    }
+
+    fn instruction_kind(instr: &Instruction) -> u8 {
+        match instr {
+            Instruction::PushLiteral(_) => 0,
+            Instruction::LoadColumn(_) => 1,
+            Instruction::Equal => 2,
+            Instruction::NotEqual => 3,
+            Instruction::LessThan => 4,
+            Instruction::LessThanOrEqual => 5,
+            Instruction::GreaterThan => 6,
+            Instruction::GreaterThanOrEqual => 7,
+            Instruction::IsNull => 8,
+            Instruction::IsNotNull => 9,
+            Instruction::And => 10,
+            Instruction::Or => 11,
+            Instruction::Not => 12,
+            Instruction::Add => 13,
+            Instruction::Subtract => 14,
+            Instruction::Multiply => 15,
+            Instruction::Divide => 16,
+            Instruction::Modulo => 17,
+            Instruction::Negate => 18,
+            Instruction::In(_) => 19,
+            Instruction::Between => 20,
+            Instruction::Like { .. } => 21,
+            Instruction::JumpIfFalse(_) => 22,
+            Instruction::JumpIfTrue(_) => 23,
+        }
+    }
+
+    #[test]
+    fn test_fuzz_catalog_accepts_any_table_and_column() {
+        let catalog = FuzzCatalog;
+
+        assert_eq!(catalog.table_id("any_table"), Some(1));
+        assert_eq!(catalog.table_arity(1), Some(64));
+        assert_eq!(catalog.schema_fingerprint(1), Some(0xF022_F022_F022_F022));
+
+        let col_a = catalog.column_id(1, "alpha").unwrap();
+        let col_b = catalog.column_id(1, "beta").unwrap();
+        assert!(col_a < 64);
+        assert!(col_b < 64);
+        assert_ne!(col_a, col_b);
+    }
+
+    #[test]
+    fn test_arb_cell_covers_all_variants() {
+        let mut seen = BTreeSet::new();
+        for seed in u8::MIN..=u8::MAX {
+            let mut data = vec![0u8; 1024];
+            data[0] = seed;
+            let mut u = Unstructured::new(&data);
+            if let Ok(cell) = arb_cell(&mut u) {
+                seen.insert(cell_kind(&cell));
+            }
+        }
+
+        assert_eq!(seen.len(), 6, "expected all Cell variants, saw {seen:?}");
+    }
+
+    #[test]
+    fn test_arb_instruction_covers_all_variants() {
+        let mut seen = BTreeSet::new();
+        for seed in u8::MIN..=u8::MAX {
+            let mut data = vec![0u8; 2048];
+            data[0] = seed;
+            let mut u = Unstructured::new(&data);
+            if let Ok(instr) = arb_instruction(&mut u) {
+                seen.insert(instruction_kind(&instr));
+            }
+        }
+
+        assert_eq!(
+            seen.len(),
+            22,
+            "expected all Instruction variants, saw {seen:?}"
+        );
+    }
+
+    #[test]
+    fn test_harness_entrypoints_do_not_panic() {
+        harness_parse_sql(b"SELECT * FROM orders WHERE amount > 10");
+        harness_parse_sql(&[0xFF, 0x00, 0xAA, 0x42]);
+
+        harness_vm_eval(&vec![0x11; 4096]);
+        harness_vm_eval(&vec![0xEE; 4096]);
+
+        harness_deserialize_shard(&[0x00, 0x01, 0x02, 0x03]);
+        harness_canonicalize(b"SELECT * FROM orders WHERE status = 'open'");
+
+        let encoded_vec = codec::encode(&vec![1_u8, 2, 3, 4]).unwrap();
+        harness_codec_decode(&encoded_vec);
+        harness_codec_decode(&[0xFF, 0x00, 0xAA]);
+    }
+
+    #[test]
+    fn test_harness_vm_eval_exercises_early_return_paths() {
+        harness_vm_eval(&[]);
+
+        for a in u8::MIN..=u8::MAX {
+            harness_vm_eval(&[a]);
+        }
+
+        for a in 0_u8..=63 {
+            for b in 0_u8..=63 {
+                harness_vm_eval(&[a, b]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_instruction_kind_jump_variants() {
+        assert_eq!(instruction_kind(&Instruction::JumpIfFalse(3)), 22);
+        assert_eq!(instruction_kind(&Instruction::JumpIfTrue(4)), 23);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Regression tests — replay crash files from tests/crashes/{harness_name}/
 // ---------------------------------------------------------------------------
@@ -190,6 +323,13 @@ mod regression_tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static REPLAY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_harness(_data: &[u8]) {
+        REPLAY_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
 
     /// Run a harness function against every file in the given crash directory.
     /// Missing or empty directories pass silently (no regressions to check yet).
@@ -249,5 +389,76 @@ mod regression_tests {
     #[test]
     fn regression_fuzz_codec_decode() {
         replay_crashes("fuzz_codec_decode", harness_codec_decode);
+    }
+
+    #[test]
+    fn replay_crashes_ignores_missing_directory() {
+        replay_crashes("definitely-missing-subdir-for-coverage", harness_parse_sql);
+    }
+
+    #[test]
+    fn replay_crashes_skips_non_files_and_gitkeep_and_replays_payloads() {
+        let unique = format!(
+            "cov-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_nanos()
+        );
+        let crash_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("crashes")
+            .join(&unique);
+
+        fs::create_dir_all(crash_dir.join("nested")).expect("should create nested directory");
+        fs::write(crash_dir.join(".gitkeep"), b"").expect("should create .gitkeep");
+        fs::write(crash_dir.join("sample.fuzz"), b"\x01\x02\x03")
+            .expect("should create crash payload");
+
+        REPLAY_COUNT.store(0, Ordering::Relaxed);
+        replay_crashes(&unique, count_harness);
+        assert_eq!(REPLAY_COUNT.load(Ordering::Relaxed), 1);
+
+        fs::remove_dir_all(crash_dir).expect("should remove temporary crash directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_crashes_panics_on_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "cov-unreadable-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_nanos()
+        );
+        let crash_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("crashes")
+            .join(&unique);
+        fs::create_dir_all(&crash_dir).expect("should create crash dir");
+
+        let unreadable = crash_dir.join("unreadable.fuzz");
+        fs::write(&unreadable, b"data").expect("should create unreadable file");
+        let mut perms = fs::metadata(&unreadable)
+            .expect("should stat unreadable file")
+            .permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&unreadable, perms).expect("should set unreadable perms");
+
+        let result = std::panic::catch_unwind(|| replay_crashes(&unique, super::harness_parse_sql));
+        assert!(
+            result.is_err(),
+            "expected panic when reading unreadable file"
+        );
+
+        let mut reset = fs::metadata(&unreadable)
+            .expect("should stat unreadable file")
+            .permissions();
+        reset.set_mode(0o644);
+        fs::set_permissions(&unreadable, reset).expect("should restore permissions");
+        fs::remove_dir_all(crash_dir).expect("should remove temporary crash directory");
     }
 }

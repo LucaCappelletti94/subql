@@ -145,3 +145,99 @@ pub(crate) fn changed_columns(old: &RowImage, new: &RowImage) -> Vec<ColumnId> {
 
     changed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::MockCatalog;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_resolve_table_prefers_unqualified_name() {
+        let tables = HashMap::from([
+            ("users".to_string(), (1_u32, 2_usize)),
+            ("public.users".to_string(), (2_u32, 2_usize)),
+        ]);
+        let catalog = MockCatalog {
+            tables,
+            columns: HashMap::new(),
+        };
+
+        let table_id =
+            resolve_table("public", "users", &catalog).expect("table should be resolved");
+        assert_eq!(table_id, 1);
+    }
+
+    #[test]
+    fn test_resolve_table_falls_back_to_qualified_name() {
+        let tables = HashMap::from([("public.users".to_string(), (2_u32, 2_usize))]);
+        let catalog = MockCatalog {
+            tables,
+            columns: HashMap::new(),
+        };
+
+        let table_id =
+            resolve_table("public", "users", &catalog).expect("table should be resolved");
+        assert_eq!(table_id, 2);
+    }
+
+    #[test]
+    fn test_resolve_table_unknown_table() {
+        let catalog = MockCatalog {
+            tables: HashMap::new(),
+            columns: HashMap::new(),
+        };
+
+        let err = resolve_table("public", "users", &catalog).expect_err("must fail");
+        match err {
+            WalParseError::UnknownTable { schema, table } => {
+                assert_eq!(schema, "public");
+                assert_eq!(table, "users");
+            }
+            _ => panic!("unexpected error variant"),
+        }
+    }
+
+    #[test]
+    fn test_build_pk_from_resolved_filters_and_preserves_pk_order() {
+        let resolved = vec![
+            (2_u16, Cell::Int(20)),
+            (0_u16, Cell::Int(10)),
+            (2_u16, Cell::Int(99)),
+        ];
+        let pk = build_pk_from_resolved(&resolved, &[0, 1, 2]);
+
+        assert_eq!(&*pk.columns, &[0, 2]);
+        assert_eq!(&*pk.values, &[Cell::Int(10), Cell::Int(20)]);
+    }
+
+    #[test]
+    fn test_changed_columns_skips_missing_and_out_of_range_columns() {
+        let old = RowImage {
+            cells: Arc::from(vec![
+                Cell::Int(1),
+                Cell::Missing,
+                Cell::Int(3),
+                Cell::Int(99),
+            ]),
+        };
+        let new = RowImage {
+            cells: Arc::from(vec![Cell::Int(1), Cell::Int(2), Cell::Int(4)]),
+        };
+
+        assert_eq!(changed_columns(&old, &new), vec![2]);
+    }
+
+    #[test]
+    fn test_changed_columns_ignores_missing_in_new_row() {
+        let old = RowImage {
+            cells: Arc::from(vec![Cell::Int(1)]),
+        };
+        let new = RowImage {
+            cells: Arc::from(vec![Cell::Missing]),
+        };
+
+        assert!(changed_columns(&old, &new).is_empty());
+    }
+}

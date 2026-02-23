@@ -153,4 +153,13 @@ mod tests {
 
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_decompress_with_limit_exceeded() {
+        let data = "x".repeat(8_192);
+        let encoded = encode(&data).unwrap();
+
+        let err = decompress_with_limit(&encoded, 32).expect_err("must exceed limit");
+        assert!(matches!(err, StorageError::Corrupt(message) if message.contains("exceeds limit")));
+    }
 }

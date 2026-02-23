@@ -38,14 +38,25 @@ impl PredicateId {
         self.0.get()
     }
 
+    /// Try to reconstruct PredicateId from raw u32 (inverse of as_u32).
+    ///
+    /// Returns `None` if `raw` is 0.
+    #[must_use]
+    pub const fn try_from_u32(raw: u32) -> Option<Self> {
+        match NonZeroU32::new(raw) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
     /// Reconstruct PredicateId from raw u32 (inverse of as_u32)
     ///
     /// # Panics
     /// Panics if `raw` is 0.
     #[must_use]
     pub const fn from_u32(raw: u32) -> Self {
-        match NonZeroU32::new(raw) {
-            Some(value) => Self(value),
+        match Self::try_from_u32(raw) {
+            Some(value) => value,
             None => panic!("PredicateId cannot be zero"),
         }
     }
@@ -106,6 +117,24 @@ mod tests {
     }
 
     #[test]
+    fn test_predicate_id_try_from_u32() {
+        assert!(PredicateId::try_from_u32(0).is_none());
+        assert_eq!(
+            PredicateId::try_from_u32(7)
+                .expect("non-zero raw id should construct")
+                .as_u32(),
+            7
+        );
+    }
+
+    #[test]
+    fn test_predicate_id_from_u32_roundtrip() {
+        let pid = PredicateId::from_u32(9);
+        assert_eq!(pid.as_u32(), 9);
+        assert_eq!(pid.to_slab_index(), 8);
+    }
+
+    #[test]
     fn test_user_ordinal() {
         let ord = UserOrdinal::new(42);
         assert_eq!(ord.get(), 42);
@@ -127,5 +156,11 @@ mod tests {
     #[should_panic(expected = "Slab index too large")]
     fn test_predicate_id_max_index_panics() {
         let _ = PredicateId::from_slab_index(u32::MAX as usize);
+    }
+
+    #[test]
+    #[should_panic(expected = "PredicateId cannot be zero")]
+    fn test_predicate_id_from_u32_zero_panics() {
+        let _ = PredicateId::from_u32(0);
     }
 }

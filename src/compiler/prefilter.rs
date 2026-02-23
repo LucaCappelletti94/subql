@@ -403,17 +403,13 @@ fn analyze_expr(
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And | BinaryOperator::Or => {
-                let (lhs_neg, rhs_neg, effective_or) = match (op, negated) {
-                    (BinaryOperator::And, false) => (false, false, false),
-                    (BinaryOperator::Or, false) => (false, false, true),
-                    // De Morgan when negated.
-                    (BinaryOperator::And, true) => (true, true, true),
-                    (BinaryOperator::Or, true) => (true, true, false),
-                    _ => unreachable!(),
-                };
+                // De Morgan: negating (A AND B) flips to OR of negated terms;
+                // negating (A OR B) flips to AND of negated terms.
+                let child_negated = negated;
+                let effective_or = matches!(op, BinaryOperator::Or) ^ negated;
 
-                let lhs = analyze_expr(left, table_id, catalog, lhs_neg);
-                let rhs = analyze_expr(right, table_id, catalog, rhs_neg);
+                let lhs = analyze_expr(left, table_id, catalog, child_negated);
+                let rhs = analyze_expr(right, table_id, catalog, child_negated);
                 if effective_or {
                     Analysis::or(lhs, rhs)
                 } else {
@@ -742,7 +738,7 @@ mod tests {
     use crate::compiler::parse_compile_normalize_and_prefilter;
     use crate::testing::MockCatalog;
     use sqlparser::{
-        ast::{SetExpr, Statement},
+        ast::{Expr, SetExpr, Statement},
         dialect::PostgreSqlDialect,
         parser::Parser,
     };
@@ -760,6 +756,18 @@ mod tests {
         columns.insert((1, "created_at".to_string()), 4);
 
         MockCatalog { tables, columns }
+    }
+
+    fn parse_where_expr(sql: &str) -> Expr {
+        let dialect = PostgreSqlDialect {};
+        let stmts = Parser::parse_sql(&dialect, sql).unwrap();
+        match &stmts[0] {
+            Statement::Query(q) => match q.body.as_ref() {
+                SetExpr::Select(s) => s.selection.clone().unwrap(),
+                _ => panic!("unexpected non-select body"),
+            },
+            _ => panic!("unexpected non-query statement"),
+        }
     }
 
     #[test]
@@ -849,5 +857,503 @@ mod tests {
             cells: Arc::from([Cell::Int(1), Cell::Int(7)]),
         };
         assert!(!plan.may_match(&row));
+    }
+
+    #[test]
+    fn test_not_in_requires_scan_and_no_atoms() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE amount NOT IN (10, 20)");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(plan.scan_required);
+        assert!(plan.requires_prefilter_eval);
+        assert_eq!(plan.trigger_atoms.len(), 0);
+        assert!(matches!(plan.expr, PrefilterExpr::Unknown));
+    }
+
+    #[test]
+    fn test_not_not_equal_becomes_equality_atom() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE NOT (amount <> 10)");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(!plan.scan_required);
+        assert_eq!(plan.trigger_atoms.len(), 1);
+        assert!(matches!(
+            plan.trigger_atoms[0],
+            PlannerAtom::Equality {
+                column_id: 1,
+                value: PlannerValue::Int(10)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_operand_flipped_comparison_builds_expected_range() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE 10 < amount");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(!plan.scan_required);
+        assert_eq!(plan.trigger_atoms.len(), 1);
+        assert!(matches!(
+            plan.trigger_atoms[0],
+            PlannerAtom::Range {
+                column_id: 1,
+                lower: Some(11),
+                upper: None
+            }
+        ));
+    }
+
+    #[test]
+    fn test_not_greater_than_becomes_lte_range() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE NOT (amount > 10)");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(!plan.scan_required);
+        assert_eq!(plan.trigger_atoms.len(), 1);
+        assert!(matches!(
+            plan.trigger_atoms[0],
+            PlannerAtom::Range {
+                column_id: 1,
+                lower: None,
+                upper: Some(10)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_column_to_column_comparison_is_unknown() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE amount > priority");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(plan.scan_required);
+        assert_eq!(plan.trigger_atoms.len(), 0);
+        assert!(matches!(plan.expr, PrefilterExpr::Unknown));
+    }
+
+    #[test]
+    fn test_compound_identifier_two_parts_is_indexed() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE orders.amount = 10");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(!plan.scan_required);
+        assert_eq!(plan.trigger_atoms.len(), 1);
+        assert!(matches!(
+            plan.trigger_atoms[0],
+            PlannerAtom::Equality {
+                column_id: 1,
+                value: PlannerValue::Int(10)
+            }
+        ));
+    }
+
+    #[test]
+    fn test_compound_identifier_three_parts_is_not_indexed() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE public.orders.amount = 10");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(plan.scan_required);
+        assert_eq!(plan.trigger_atoms.len(), 0);
+        assert!(matches!(plan.expr, PrefilterExpr::Unknown));
+    }
+
+    #[test]
+    fn test_is_null_and_is_not_null_eval_paths() {
+        let catalog = make_catalog();
+        let is_null_expr = parse_where_expr("SELECT * FROM orders WHERE amount IS NULL");
+        let is_not_null_expr = parse_where_expr("SELECT * FROM orders WHERE amount IS NOT NULL");
+
+        let is_null_plan = build_prefilter_plan(Some(&is_null_expr), 1, &catalog);
+        let is_not_null_plan = build_prefilter_plan(Some(&is_not_null_expr), 1, &catalog);
+
+        let row_null = RowImage {
+            cells: Arc::from([Cell::Int(1), Cell::Null]),
+        };
+        let row_missing = RowImage {
+            cells: Arc::from([Cell::Int(1), Cell::Missing]),
+        };
+        let row_present = RowImage {
+            cells: Arc::from([Cell::Int(1), Cell::Int(7)]),
+        };
+
+        assert!(is_null_plan.may_match(&row_null));
+        assert!(!is_null_plan.may_match(&row_missing));
+        assert!(!is_null_plan.may_match(&row_present));
+
+        assert!(!is_not_null_plan.may_match(&row_null));
+        assert!(!is_not_null_plan.may_match(&row_missing));
+        assert!(is_not_null_plan.may_match(&row_present));
+    }
+
+    #[test]
+    fn test_constant_true_and_false_plans() {
+        let catalog = make_catalog();
+        let expr_true = parse_where_expr("SELECT * FROM orders WHERE TRUE");
+        let expr_false = parse_where_expr("SELECT * FROM orders WHERE FALSE");
+
+        let true_plan = build_prefilter_plan(Some(&expr_true), 1, &catalog);
+        let false_plan = build_prefilter_plan(Some(&expr_false), 1, &catalog);
+        let row = RowImage {
+            cells: Arc::from([Cell::Int(1), Cell::Int(2)]),
+        };
+
+        assert!(true_plan.scan_required);
+        assert!(true_plan.may_match(&row));
+        assert_eq!(true_plan.trigger_atoms.len(), 0);
+
+        assert!(!false_plan.scan_required);
+        assert!(!false_plan.may_match(&row));
+        assert_eq!(false_plan.trigger_atoms.len(), 0);
+    }
+
+    #[test]
+    fn test_and_or_expression_flattening() {
+        let catalog = make_catalog();
+        let and_expr =
+            parse_where_expr("SELECT * FROM orders WHERE amount = 1 AND priority = 2 AND id = 3");
+        let or_expr =
+            parse_where_expr("SELECT * FROM orders WHERE amount = 1 OR priority = 2 OR id = 3");
+
+        let and_plan = build_prefilter_plan(Some(&and_expr), 1, &catalog);
+        let or_plan = build_prefilter_plan(Some(&or_expr), 1, &catalog);
+
+        assert!(matches!(and_plan.expr, PrefilterExpr::And(ref parts) if parts.len() == 3));
+        assert!(matches!(or_plan.expr, PrefilterExpr::Or(ref parts) if parts.len() == 3));
+    }
+
+    #[test]
+    fn test_float_nan_paths_do_not_report_may_match() {
+        let row = RowImage {
+            cells: Arc::from([Cell::Int(1), Cell::Float(f64::NAN)]),
+        };
+
+        let eq_nan_plan = PrefilterPlan {
+            expr: PrefilterExpr::Atom(PlannerAtom::Equality {
+                column_id: 1,
+                value: PlannerValue::Float(f64::NAN.to_bits()),
+            }),
+            trigger_atoms: Arc::from([]),
+            scan_required: true,
+            requires_prefilter_eval: true,
+        };
+        let range_nan_plan = PrefilterPlan {
+            expr: PrefilterExpr::Atom(PlannerAtom::Range {
+                column_id: 1,
+                lower: Some(0),
+                upper: Some(10),
+            }),
+            trigger_atoms: Arc::from([]),
+            scan_required: true,
+            requires_prefilter_eval: true,
+        };
+
+        assert!(!eq_nan_plan.may_match(&row));
+        assert!(!range_nan_plan.may_match(&row));
+    }
+
+    #[test]
+    fn test_tri_possibility_any_and_combine_helpers() {
+        let any = TriPossibility::any();
+        let vals = possible_tris(any);
+        assert!(vals.contains(&Tri::True));
+        assert!(vals.contains(&Tri::False));
+        assert!(vals.contains(&Tri::Unknown));
+
+        let and_poss = combine_possibilities(any, any, Tri::and);
+        assert!(and_poss.can_true);
+        assert!(and_poss.can_false);
+        assert!(and_poss.can_unknown);
+
+        let or_poss = combine_possibilities(any, any, Tri::or);
+        assert!(or_poss.can_true);
+        assert!(or_poss.can_false);
+        assert!(or_poss.can_unknown);
+    }
+
+    #[test]
+    fn test_prefilter_expr_eval_possibility_paths() {
+        let row = RowImage {
+            cells: Arc::from([Cell::Int(7)]),
+        };
+
+        assert!(PrefilterExpr::Unknown.eval_may_true(&row));
+        assert!(
+            PrefilterExpr::And(vec![PrefilterExpr::Const(true), PrefilterExpr::Unknown])
+                .eval_may_true(&row)
+        );
+        assert!(
+            PrefilterExpr::Or(vec![PrefilterExpr::Const(false), PrefilterExpr::Unknown])
+                .eval_may_true(&row)
+        );
+    }
+
+    #[test]
+    fn test_eval_atom_null_and_out_of_bounds_paths() {
+        let row = RowImage {
+            cells: Arc::from([Cell::Null, Cell::Missing, Cell::Int(1)]),
+        };
+
+        assert_eq!(
+            eval_atom(
+                &PlannerAtom::Null {
+                    column_id: 0,
+                    is_null: true
+                },
+                &row
+            ),
+            Tri::True
+        );
+        assert_eq!(
+            eval_atom(
+                &PlannerAtom::Null {
+                    column_id: 2,
+                    is_null: true
+                },
+                &row
+            ),
+            Tri::False
+        );
+        assert_eq!(
+            eval_atom(
+                &PlannerAtom::Null {
+                    column_id: 1,
+                    is_null: false
+                },
+                &row
+            ),
+            Tri::Unknown
+        );
+        assert_eq!(
+            eval_atom(
+                &PlannerAtom::Null {
+                    column_id: 0,
+                    is_null: false
+                },
+                &row
+            ),
+            Tri::False
+        );
+        assert_eq!(
+            eval_atom(
+                &PlannerAtom::Null {
+                    column_id: 2,
+                    is_null: false
+                },
+                &row
+            ),
+            Tri::True
+        );
+        assert_eq!(
+            eval_atom(
+                &PlannerAtom::Null {
+                    column_id: 9,
+                    is_null: true
+                },
+                &row
+            ),
+            Tri::Unknown
+        );
+    }
+
+    #[test]
+    fn test_eval_equality_and_range_unknown_paths() {
+        assert_eq!(
+            eval_equality(&Cell::Bool(true), &PlannerValue::Bool(true)),
+            Tri::True
+        );
+        assert_eq!(
+            eval_equality(&Cell::Float(1.0), &PlannerValue::Float(2.0_f64.to_bits())),
+            Tri::False
+        );
+        assert_eq!(
+            eval_equality(&Cell::String("x".into()), &PlannerValue::String("x".into())),
+            Tri::True
+        );
+        assert_eq!(
+            eval_equality(&Cell::Int(1), &PlannerValue::Bool(true)),
+            Tri::Unknown
+        );
+
+        assert_eq!(eval_range(&Cell::Int(5), Some(0), Some(10)), Tri::True);
+        assert_eq!(eval_range(&Cell::Float(5.5), Some(0), Some(5)), Tri::False);
+        assert_eq!(
+            eval_range(&Cell::Bool(true), Some(0), Some(1)),
+            Tri::Unknown
+        );
+    }
+
+    #[test]
+    fn test_analysis_boolean_algebra_helpers() {
+        let eq = PlannerAtom::Equality {
+            column_id: 1,
+            value: PlannerValue::Int(1),
+        };
+
+        let both_false = Analysis::or(Analysis::constant(false), Analysis::constant(false));
+        assert!(!both_false.true_possible);
+        assert!(both_false.hit_guaranteed_if_true);
+
+        let and_with_false = Analysis::and(Analysis::constant(false), Analysis::indexed_atom(eq));
+        assert!(!and_with_false.true_possible);
+        assert!(and_with_false.hit_guaranteed_if_true);
+    }
+
+    #[test]
+    fn test_apply_negation_and_flip_helpers() {
+        assert!(matches!(
+            apply_negation_to_comparison(BinaryOperator::Eq, true),
+            BinaryOperator::NotEq
+        ));
+        assert!(matches!(
+            apply_negation_to_comparison(BinaryOperator::NotEq, true),
+            BinaryOperator::Eq
+        ));
+        assert!(matches!(
+            apply_negation_to_comparison(BinaryOperator::Gt, true),
+            BinaryOperator::LtEq
+        ));
+        assert!(matches!(
+            apply_negation_to_comparison(BinaryOperator::GtEq, true),
+            BinaryOperator::Lt
+        ));
+        assert!(matches!(
+            apply_negation_to_comparison(BinaryOperator::Lt, true),
+            BinaryOperator::GtEq
+        ));
+        assert!(matches!(
+            apply_negation_to_comparison(BinaryOperator::LtEq, true),
+            BinaryOperator::Gt
+        ));
+        assert!(matches!(
+            apply_negation_to_comparison(BinaryOperator::Plus, true),
+            BinaryOperator::Plus
+        ));
+
+        assert!(matches!(
+            flip_comparison(BinaryOperator::Gt),
+            BinaryOperator::Lt
+        ));
+        assert!(matches!(
+            flip_comparison(BinaryOperator::GtEq),
+            BinaryOperator::LtEq
+        ));
+        assert!(matches!(
+            flip_comparison(BinaryOperator::Lt),
+            BinaryOperator::Gt
+        ));
+        assert!(matches!(
+            flip_comparison(BinaryOperator::LtEq),
+            BinaryOperator::GtEq
+        ));
+        assert!(matches!(
+            flip_comparison(BinaryOperator::Eq),
+            BinaryOperator::Eq
+        ));
+    }
+
+    #[test]
+    fn test_literal_and_planner_value_helpers() {
+        assert_eq!(literal_int_cell(&Cell::Int(9)), Some(9));
+        assert_eq!(literal_int_cell(&Cell::Float(9.0)), None);
+
+        assert_eq!(literal_cell_from_sql_value(&Value::Null), Some(Cell::Null));
+        assert_eq!(
+            literal_cell_from_sql_value(&Value::Boolean(true)),
+            Some(Cell::Bool(true))
+        );
+        assert_eq!(
+            literal_cell_from_sql_value(&Value::Number("123".to_string(), false)),
+            Some(Cell::Int(123))
+        );
+        assert_eq!(
+            literal_cell_from_sql_value(&Value::Number("1.5".to_string(), false)),
+            Some(Cell::Float(1.5))
+        );
+        assert_eq!(
+            literal_cell_from_sql_value(&Value::SingleQuotedString("x".to_string())),
+            Some(Cell::String("x".into()))
+        );
+        assert_eq!(
+            literal_cell_from_sql_value(&Value::DoubleQuotedString("x".to_string())),
+            Some(Cell::String("x".into()))
+        );
+        assert_eq!(
+            literal_cell_from_sql_value(&Value::NationalStringLiteral("x".to_string())),
+            Some(Cell::String("x".into()))
+        );
+        assert_eq!(
+            literal_cell_from_sql_value(&Value::HexStringLiteral("DEAD".to_string())),
+            Some(Cell::String("DEAD".into()))
+        );
+
+        assert_eq!(
+            planner_value_from_cell(&Cell::Bool(true)),
+            Some(PlannerValue::Bool(true))
+        );
+        assert_eq!(
+            planner_value_from_cell(&Cell::Int(7)),
+            Some(PlannerValue::Int(7))
+        );
+        assert_eq!(
+            planner_value_from_cell(&Cell::Float(3.0)),
+            Some(PlannerValue::Float(3.0_f64.to_bits()))
+        );
+        assert_eq!(
+            planner_value_from_cell(&Cell::String("abc".into())),
+            Some(PlannerValue::String("abc".into()))
+        );
+        assert_eq!(planner_value_from_cell(&Cell::Null), None);
+        assert_eq!(planner_value_from_cell(&Cell::Missing), None);
+    }
+
+    #[test]
+    fn test_in_list_empty_and_unknown_column_paths() {
+        let catalog = make_catalog();
+        let mut expr = parse_where_expr("SELECT * FROM orders WHERE amount IN (1)");
+
+        if let Expr::InList { list, .. } = &mut expr {
+            list.clear();
+        } else {
+            panic!("expected IN list expression");
+        }
+
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        assert!(!plan.scan_required);
+        assert!(!plan.may_match(&RowImage {
+            cells: Arc::from([Cell::Int(1)])
+        }));
+
+        let unknown_col = parse_where_expr("SELECT * FROM orders WHERE nope IN (1)");
+        let unknown_plan = build_prefilter_plan(Some(&unknown_col), 1, &catalog);
+        assert!(unknown_plan.scan_required);
+        assert!(matches!(unknown_plan.expr, PrefilterExpr::Unknown));
+    }
+
+    #[test]
+    fn test_between_non_numeric_bounds_is_unknown() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE amount BETWEEN 'a' AND 10");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(plan.scan_required);
+        assert!(matches!(plan.expr, PrefilterExpr::Unknown));
+    }
+
+    #[test]
+    fn test_boolean_negation_path_in_analyze_expr() {
+        let catalog = make_catalog();
+        let expr = parse_where_expr("SELECT * FROM orders WHERE NOT TRUE");
+        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+
+        assert!(!plan.scan_required);
+        assert!(!plan.may_match(&RowImage {
+            cells: Arc::from([Cell::Int(1)])
+        }));
     }
 }

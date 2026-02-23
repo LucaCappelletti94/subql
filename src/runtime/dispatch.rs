@@ -149,7 +149,11 @@ pub fn dispatch_users<'a, I: IdTypes>(
     let mut matching_ordinals = RoaringBitmap::new();
 
     for pred_id_u32 in &candidates {
-        let pred_id = super::ids::PredicateId::from_u32(pred_id_u32);
+        let Some(pred_id) = super::ids::PredicateId::try_from_u32(pred_id_u32) else {
+            // Candidate IDs are engine-generated and expected to be non-zero.
+            // Ignore invalid values defensively instead of panicking.
+            continue;
+        };
 
         if let Some(pred) = snapshot.predicates.get_predicate(pred_id) {
             // Hybrid path: for scan-required predicates, run cheap prefilter

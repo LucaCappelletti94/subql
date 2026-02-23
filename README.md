@@ -5,7 +5,7 @@
 [![crates.io](https://img.shields.io/crates/v/subql.svg)](https://crates.io/crates/subql)
 [![docs.rs](https://docs.rs/subql/badge.svg)](https://docs.rs/subql)
 [![MSRV](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)]([LICENSE](https://raw.githubusercontent.com/LucaCappelletti94/subql/refs/heads/main/LICENSE))
 
 SQL subscription dispatch engine for Change Data Capture fanout.
 
