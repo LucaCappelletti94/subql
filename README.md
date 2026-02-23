@@ -12,7 +12,7 @@ The GitHub Actions workflow in `.github/workflows/ci.yml` runs a full Rust quali
 - `cargo test --locked` matrix (`default`, `--all-features`)
 - ignored cross-DB integration test (`cdc_cross_db`)
 - docs + doctests with rustdoc warnings denied
-- MSRV check (`1.75`)
+- MSRV check (`1.88`)
 - bench compile check (`cargo bench --no-run`)
 - fuzz target compile check (`fuzz/Cargo.toml`)
 - `cargo audit`

@@ -2,7 +2,7 @@
 name = "subql"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 authors = ["Luca"]
 license = "MIT OR Apache-2.0"
 description = "SQL subscription dispatch engine for CDC event fanout"

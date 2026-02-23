@@ -53,13 +53,6 @@ impl IndexableCell {
     }
 }
 
-/// Equality index key
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct EqualityKey {
-    pub column_id: ColumnId,
-    pub value: IndexableCell,
-}
-
 /// Range index entry (sorted by lower bound)
 #[derive(Clone, Debug)]
 pub struct RangeEntry {
@@ -130,8 +123,8 @@ impl IndexableAtom {
 /// Hybrid indexes for candidate selection
 #[derive(Clone)]
 pub struct HybridIndexes {
-    /// Equality: (col, val) → `RoaringBitmap<PredicateId>`
-    pub equality: AHashMap<EqualityKey, RoaringBitmap>,
+    /// Equality: col → (val → `RoaringBitmap<PredicateId>`)
+    pub equality: AHashMap<ColumnId, AHashMap<IndexableCell, RoaringBitmap>>,
 
     /// Range: col → `Vec<RangeEntry>` (sorted by lower bound)
     pub range: AHashMap<ColumnId, Vec<RangeEntry>>,
@@ -196,11 +189,12 @@ impl HybridIndexes {
         for atom in atoms {
             match atom {
                 IndexableAtom::Equality { column_id, value } => {
-                    let key = EqualityKey {
-                        column_id: *column_id,
-                        value: value.clone(),
-                    };
-                    self.equality.entry(key).or_default().insert(pred_id_u32);
+                    self.equality
+                        .entry(*column_id)
+                        .or_default()
+                        .entry(value.clone())
+                        .or_default()
+                        .insert(pred_id_u32);
                 }
 
                 IndexableAtom::Range {
@@ -243,11 +237,9 @@ impl HybridIndexes {
         col_id: ColumnId,
         value: &IndexableCell,
     ) -> Option<&RoaringBitmap> {
-        let key = EqualityKey {
-            column_id: col_id,
-            value: value.clone(),
-        };
-        self.equality.get(&key)
+        self.equality
+            .get(&col_id)
+            .and_then(|per_col| per_col.get(value))
     }
 
     /// Query range index (return predicates whose ranges contain value)
@@ -582,6 +574,44 @@ mod tests {
 
         let result = indexes.query_equality(5, &IndexableCell::Int(99));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_equality_index_column_scoping() {
+        let mut indexes = HybridIndexes::new();
+
+        let pred_a = PredicateId::from_slab_index(0);
+        indexes.add_predicate(
+            pred_a,
+            &[IndexableAtom::Equality {
+                column_id: 5,
+                value: IndexableCell::Int(42),
+            }],
+            &[5],
+        );
+
+        let pred_b = PredicateId::from_slab_index(1);
+        indexes.add_predicate(
+            pred_b,
+            &[IndexableAtom::Equality {
+                column_id: 6,
+                value: IndexableCell::Int(42),
+            }],
+            &[6],
+        );
+
+        let hit_col_5 = indexes.query_equality(5, &IndexableCell::Int(42)).unwrap();
+        assert!(hit_col_5.contains(pred_a.as_u32()));
+        assert!(!hit_col_5.contains(pred_b.as_u32()));
+
+        let hit_col_6 = indexes.query_equality(6, &IndexableCell::Int(42)).unwrap();
+        assert!(hit_col_6.contains(pred_b.as_u32()));
+        assert!(!hit_col_6.contains(pred_a.as_u32()));
+
+        assert!(indexes.query_equality(7, &IndexableCell::Int(42)).is_none());
+        assert!(indexes
+            .query_equality(5, &IndexableCell::Int(999))
+            .is_none());
     }
 
     #[test]
