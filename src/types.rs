@@ -3,6 +3,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 // ============================================================================
@@ -274,6 +275,16 @@ pub struct RegisterResult {
     pub created_new_predicate: bool,
 }
 
+/// Durability policy for registration writes when storage is enabled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityMode {
+    /// Registration succeeds even if snapshot/rotation persistence fails.
+    BestEffort,
+    /// Registration fails (and is rolled back) if persistence fails.
+    Required,
+}
+
 /// Report from pruning session subscriptions
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PruneReport {
@@ -335,7 +346,7 @@ pub trait SchemaCatalog: Send + Sync {
 }
 
 /// Subscription registration operations
-pub trait SubscriptionRegistration<I: IdTypes>: Send + Sync {
+pub trait SubscriptionRegistration<I: IdTypes>: Send {
     /// Register a new subscription
     ///
     /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds user.
@@ -353,7 +364,7 @@ pub trait SubscriptionRegistration<I: IdTypes>: Send + Sync {
 }
 
 /// Event dispatch operations
-pub trait SubscriptionDispatch<I: IdTypes>: Send + Sync {
+pub trait SubscriptionDispatch<I: IdTypes>: Send {
     /// Iterator over matched user IDs
     type UserIter<'a>: Iterator<Item = I::UserId>
     where
@@ -366,7 +377,7 @@ pub trait SubscriptionDispatch<I: IdTypes>: Send + Sync {
 }
 
 /// Session lifecycle operations
-pub trait SubscriptionPruning<I: IdTypes>: Send + Sync {
+pub trait SubscriptionPruning<I: IdTypes>: Send {
     /// Unregister all subscriptions for a session
     ///
     /// Removes all session-bound subscriptions, decrements refcounts, prunes predicates.
@@ -375,34 +386,22 @@ pub trait SubscriptionPruning<I: IdTypes>: Send + Sync {
 }
 
 /// Durable shard storage operations
-pub trait DurableShardStore: Send + Sync {
-    /// Serialize table partition to bytes
-    ///
-    /// Returns bincode + LZ4 compressed shard.
-    fn snapshot_table(&self, table_id: TableId) -> Result<Vec<u8>, crate::StorageError>;
-
-    /// Load shard from bytes and return ShardId
-    ///
-    /// Validates version, fingerprint, and codec. Merges loaded predicates into runtime.
-    fn load_shard(&mut self, shard_bytes: &[u8]) -> Result<ShardId, crate::StorageError>;
+pub trait DurableShardStore: Send {
+    /// Snapshot a table partition to durable storage.
+    fn snapshot_table(&self, table_id: TableId) -> Result<(), crate::StorageError>;
 }
 
 /// Background merge operations
-pub trait DurableShardMerge: Send + Sync {
-    /// Start background merge of shards for a table
-    ///
-    /// Returns job ID immediately. Merge runs in background thread.
+pub trait DurableShardMerge: Send {
+    /// Start background merge of shard files for a table.
     fn merge_shards_background(
-        &self,
+        &mut self,
         table_id: TableId,
-        shard_ids: &[ShardId],
+        shard_paths: &[PathBuf],
     ) -> Result<MergeJobId, crate::MergeError>;
 
-    /// Check if merge is complete and swap if ready
-    ///
-    /// Returns Some(report) if merge complete and swap succeeded.
-    /// Returns None if merge still running.
-    fn try_swap_merged(
+    /// Check whether merge has completed and atomically swap if ready.
+    fn try_complete_merge(
         &mut self,
         job_id: MergeJobId,
     ) -> Result<Option<MergeReport>, crate::MergeError>;

@@ -1,5 +1,6 @@
 //! Configuration management for SubQL service
 
+use crate::DurabilityMode;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -33,6 +34,10 @@ pub struct Config {
     /// Merge settings
     #[serde(default)]
     pub merge: MergeConfig,
+
+    /// Durability policy for register/register_batch persistence.
+    #[serde(default = "default_durability_mode")]
+    pub durability_mode: DurabilityMode,
 
     /// Schema catalog configuration
     pub catalog: CatalogConfig,
@@ -78,6 +83,10 @@ fn default_dialect() -> String {
     "postgres".to_string()
 }
 
+const fn default_durability_mode() -> DurabilityMode {
+    DurabilityMode::Required
+}
+
 impl Default for MergeConfig {
     fn default() -> Self {
         Self {
@@ -119,6 +128,7 @@ mod tests {
                 shard_threshold: 10,
                 interval_secs: 7200,
             },
+            durability_mode: DurabilityMode::Required,
             catalog: CatalogConfig {
                 database_url: "postgresql://localhost/test".to_string(),
                 dialect: "postgres".to_string(),
@@ -150,6 +160,7 @@ mod tests {
         assert_eq!(config.rotation_threshold, 10 * 1024 * 1024);
         assert_eq!(config.merge.shard_threshold, 5);
         assert_eq!(config.merge.interval_secs, 3600);
+        assert_eq!(config.durability_mode, DurabilityMode::Required);
         assert_eq!(config.catalog.dialect, "postgres");
     }
 }

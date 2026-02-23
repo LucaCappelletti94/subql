@@ -16,6 +16,9 @@ use super::pg_type::text_to_cell;
 use super::{build_pk_from_resolved, changed_columns, resolve_table, WalParseError, WalParser};
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
+/// Defensive bound to prevent pathological allocations from malformed input.
+const MAX_COLUMNS_PER_MESSAGE: usize = 10_000;
+
 // ============================================================================
 // Cached relation metadata
 // ============================================================================
@@ -59,10 +62,13 @@ impl<'a> Cursor<'a> {
         self.data.len() - self.pos
     }
 
-    const fn check(&self, n: usize) -> Result<(), WalParseError> {
+    fn check(&self, n: usize) -> Result<(), WalParseError> {
+        let expected = self.pos.checked_add(n).ok_or_else(|| {
+            WalParseError::MalformedPayload("binary cursor length overflow".to_string())
+        })?;
         if self.remaining() < n {
             return Err(WalParseError::TruncatedMessage {
-                expected: self.pos + n,
+                expected,
                 actual: self.data.len(),
             });
         }
@@ -183,6 +189,23 @@ impl PgOutputParser {
         Self::default()
     }
 
+    fn parse_column_count(count: i16, context: &str) -> Result<usize, WalParseError> {
+        if count < 0 {
+            return Err(WalParseError::MalformedPayload(format!(
+                "negative column count in {context}: {count}"
+            )));
+        }
+        let count = usize::try_from(count).map_err(|_| {
+            WalParseError::MalformedPayload(format!("invalid column count in {context}: {count}"))
+        })?;
+        if count > MAX_COLUMNS_PER_MESSAGE {
+            return Err(WalParseError::MalformedPayload(format!(
+                "column count too large in {context}: {count}"
+            )));
+        }
+        Ok(count)
+    }
+
     /// Handle Relation message: parse schema and cache for later DML lookups.
     fn handle_relation(
         &self,
@@ -193,10 +216,9 @@ impl PgOutputParser {
         let namespace = cur.read_cstring()?.to_string();
         let name = cur.read_cstring()?.to_string();
         let _replica_identity = cur.read_u8()?;
-        let num_columns = cur.read_i16()?;
+        let num_columns = Self::parse_column_count(cur.read_i16()?, "Relation")?;
 
-        #[allow(clippy::cast_sign_loss)]
-        let mut columns = Vec::with_capacity(num_columns as usize);
+        let mut columns = Vec::with_capacity(num_columns);
         for _ in 0..num_columns {
             let flags = cur.read_u8()?;
             let col_name = cur.read_cstring()?.to_string();
@@ -274,20 +296,35 @@ impl PgOutputParser {
         cur: &mut Cursor<'_>,
         rel: &CachedRelation,
     ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-        let num_columns = cur.read_i16()?;
-        let mut cells = vec![Cell::Missing; rel.arity];
-        #[allow(clippy::cast_sign_loss)]
-        let mut resolved = Vec::with_capacity(num_columns as usize);
+        let num_columns = Self::parse_column_count(cur.read_i16()?, "TupleData")?;
+        if num_columns > rel.columns.len() || num_columns > rel.column_ids.len() {
+            return Err(WalParseError::MalformedPayload(format!(
+                "tuple column count {} exceeds relation column count {}",
+                num_columns,
+                rel.columns.len()
+            )));
+        }
 
-        #[allow(clippy::cast_sign_loss)]
-        for i in 0..num_columns as usize {
+        let mut cells = vec![Cell::Missing; rel.arity];
+        let mut resolved = Vec::with_capacity(num_columns);
+
+        for i in 0..num_columns {
             let tag = cur.read_u8()?;
             let cell = match tag {
                 b'n' => Cell::Null,
                 b'u' => Cell::Missing,
                 b't' => {
-                    #[allow(clippy::cast_sign_loss)]
-                    let len = cur.read_i32()? as usize;
+                    let len_i32 = cur.read_i32()?;
+                    if len_i32 < 0 {
+                        return Err(WalParseError::MalformedPayload(format!(
+                            "negative tuple text length: {len_i32}"
+                        )));
+                    }
+                    let len = usize::try_from(len_i32).map_err(|_| {
+                        WalParseError::MalformedPayload(format!(
+                            "invalid tuple text length: {len_i32}"
+                        ))
+                    })?;
                     let bytes = cur.read_bytes(len)?;
                     let text = std::str::from_utf8(bytes)
                         .map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
@@ -1303,5 +1340,61 @@ mod tests {
         let ev = &events[0];
         // All columns used as PK since no identity columns
         assert_eq!(ev.pk.columns.len(), 4);
+    }
+
+    #[test]
+    fn relation_negative_column_count_does_not_panic() {
+        let catalog = TestCatalog::orders();
+        let parser = PgOutputParser::new();
+
+        let mut msg = Vec::new();
+        msg.push(b'R');
+        push_u32(&mut msg, 16384);
+        push_cstring(&mut msg, "public");
+        push_cstring(&mut msg, "orders");
+        msg.push(b'd');
+        push_i16(&mut msg, -1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.parse_wal_message(&msg, &catalog)
+        }));
+
+        assert!(
+            result.is_ok(),
+            "parser must not panic on malformed relation"
+        );
+        let parse_result = result.expect("catch_unwind should be Ok");
+        assert!(
+            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
+            "parser should return MalformedPayload"
+        );
+    }
+
+    #[test]
+    fn tuple_negative_column_count_does_not_panic() {
+        let catalog = TestCatalog::orders();
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let mut msg = Vec::new();
+        msg.push(b'I');
+        push_u32(&mut msg, 16384);
+        msg.push(b'N');
+        push_i16(&mut msg, -1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.parse_wal_message(&msg, &catalog)
+        }));
+
+        assert!(result.is_ok(), "parser must not panic on malformed tuple");
+        let parse_result = result.expect("catch_unwind should be Ok");
+        assert!(
+            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
+            "parser should return MalformedPayload"
+        );
     }
 }

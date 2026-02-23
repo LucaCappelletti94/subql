@@ -18,7 +18,7 @@ path = "src/lib.rs"
 # Memory profiling binary
 [[bin]]
 name = "memory_profile"
-path = "benches/memory.rs"
+path = "src/bin/memory_profile.rs"
 required-features = ["dhat-heap"]
 
 # Benchmark harness

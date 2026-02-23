@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::pg_type::infer_cell_from_json;
+use super::row_build::build_row_from_map_with;
 use super::{build_pk_from_resolved, changed_columns, resolve_table, WalParseError, WalParser};
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
@@ -171,37 +172,7 @@ fn build_row_from_map(
     table_id: TableId,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    let arity = catalog
-        .table_arity(table_id)
-        .ok_or_else(|| WalParseError::UnknownTable {
-            schema: String::new(),
-            table: format!("table_id={table_id}"),
-        })?;
-
-    let mut cells = vec![Cell::Missing; arity];
-    let mut resolved = Vec::with_capacity(map.len());
-
-    for (name, value) in map {
-        let col_id =
-            catalog
-                .column_id(table_id, name)
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
-                })?;
-        let cell = infer_cell_from_json(value);
-        if (col_id as usize) < arity {
-            cells[col_id as usize] = cell.clone();
-        }
-        resolved.push((col_id, cell));
-    }
-
-    Ok((
-        RowImage {
-            cells: Arc::from(cells),
-        },
-        resolved,
-    ))
+    build_row_from_map_with(map, table_id, catalog, infer_cell_from_json)
 }
 
 // ============================================================================

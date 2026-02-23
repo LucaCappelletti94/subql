@@ -119,6 +119,8 @@ impl SchemaCatalog for IoTCatalog {
 
 const PG_IMAGE: &str = "subql-test/postgres-wal2json";
 const PG_TAG: &str = "16";
+const MAXWELL_IMAGE: &str = "zendesk/maxwell";
+const MAXWELL_TAG: &str = "v1.44.0";
 
 /// Build the custom Postgres image with wal2json (cached by Docker layer cache).
 fn ensure_postgres_image() {
@@ -200,7 +202,9 @@ fn start_mysql(network: &str, container_name: &str) -> testcontainers::Container
         .with_container_name(container_name)
         .with_startup_timeout(Duration::from_secs(120))
         .start()
-        .expect("start mysql")
+        .unwrap_or_else(|e| {
+            panic!("start mysql network={network} container_name={container_name}: {e}")
+        })
 }
 
 /// Start Maxwell daemon, reading from MySQL on the shared network.
@@ -210,7 +214,7 @@ fn start_maxwell(
     output_dir: &str,
 ) -> testcontainers::Container<GenericImage> {
     let host_flag = format!("--host={mysql_name}");
-    GenericImage::new("zendesk/maxwell", "latest")
+    GenericImage::new(MAXWELL_IMAGE, MAXWELL_TAG)
         .with_wait_for(WaitFor::message_on_stderr("Binlog connected"))
         .with_network(network)
         .with_mount(Mount::bind_mount(output_dir, "/output"))
@@ -226,7 +230,29 @@ fn start_maxwell(
         ])
         .with_startup_timeout(Duration::from_secs(90))
         .start()
-        .expect("start maxwell")
+        .unwrap_or_else(|e| {
+            panic!(
+                "start maxwell image={MAXWELL_IMAGE} tag={MAXWELL_TAG} network={network} \
+                 mysql_name={mysql_name}: {e}"
+            )
+        })
+}
+
+/// Fail fast with actionable diagnostics if Docker is unavailable.
+fn assert_docker_available() {
+    let output = std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .output()
+        .unwrap_or_else(|e| panic!("docker preflight: failed to execute `docker info`: {e}"));
+
+    assert!(
+        output.status.success(),
+        "docker preflight failed: `docker info` exited with status {}.\nstdout: {}\nstderr: {}\n\
+         Ensure Docker daemon is running and this user can access /var/run/docker.sock.",
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
 }
 
 // ============================================================================
@@ -468,31 +494,12 @@ fn dispatch_events(
 #[ignore = "requires Docker; run with: cargo test --test cdc_cross_db -- --ignored"]
 #[allow(clippy::print_stderr)]
 fn cross_db_cdc_parity() {
-    // Guard to ensure Docker network cleanup even on panic.
-    struct NetworkGuard(String);
-    impl Drop for NetworkGuard {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("docker")
-                .args(["network", "rm", &self.0])
-                .output();
-        }
-    }
+    assert_docker_available();
 
     // Unique names to avoid collisions with parallel test runs
     let pid = std::process::id();
     let network = format!("subql-test-{pid}");
     let mysql_name = format!("subql-mysql-{pid}");
-
-    // Create Docker network for MySQL ↔ Maxwell communication.
-    let net_output = std::process::Command::new("docker")
-        .args(["network", "create", &network])
-        .output()
-        .expect("docker network create");
-    assert!(
-        net_output.status.success(),
-        "Failed to create Docker network"
-    );
-    let _net_guard = NetworkGuard(network.clone());
 
     // Maxwell output directory (bind-mounted into the container).
     // Must be world-writable so the Maxwell process inside the container can write.

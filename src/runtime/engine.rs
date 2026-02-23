@@ -17,10 +17,12 @@ use crate::{
             UserDictData,
         },
     },
-    DispatchError, IdTypes, MergeError, MergeJobId, MergeReport, PruneReport, RegisterError,
-    RegisterResult, SchemaCatalog, StorageError, SubscriptionSpec, TableId, WalEvent,
+    DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, IdTypes, MergeError,
+    MergeJobId, MergeReport, PruneReport, RegisterError, RegisterResult, SchemaCatalog,
+    StorageError, SubscriptionDispatch, SubscriptionPruning, SubscriptionRegistration,
+    SubscriptionSpec, TableId, WalEvent,
 };
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use sqlparser::dialect::Dialect;
 
 type BatchEntries<I> = Vec<(Predicate, Vec<IndexableAtom>, Vec<Binding<I>>)>;
@@ -38,6 +40,20 @@ use std::sync::Arc;
 
 /// Wrapper to pass `Arc<dyn SchemaCatalog>` as `Box<dyn SchemaCatalog + Send>`.
 struct CatalogRef(Arc<dyn SchemaCatalog>);
+
+#[derive(Debug)]
+enum RebuildPayloadError {
+    Codec(String),
+    Corrupt(String),
+}
+
+impl std::fmt::Display for RebuildPayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Codec(msg) | Self::Corrupt(msg) => f.write_str(msg),
+        }
+    }
+}
 
 impl SchemaCatalog for CatalogRef {
     fn table_id(&self, table_name: &str) -> Option<TableId> {
@@ -77,6 +93,8 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
     rotation_threshold: usize,
     /// Background merge compaction manager
     merge_manager: MergeManager<I>,
+    /// Persistence strictness policy for registration.
+    durability_mode: DurabilityMode,
 }
 
 impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
@@ -93,6 +111,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             storage_path: None,
             rotation_threshold: 10 * 1024 * 1024, // 10 MB default
             merge_manager: MergeManager::new(),
+            durability_mode: DurabilityMode::Required,
         }
     }
 
@@ -115,6 +134,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             storage_path: Some(storage_path.clone()),
             rotation_threshold: 10 * 1024 * 1024, // 10 MB default
             merge_manager: MergeManager::new(),
+            durability_mode: DurabilityMode::Required,
         };
 
         // Create storage directory if it doesn't exist
@@ -198,9 +218,32 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .insert(spec.subscription_id, table_id);
 
         // 8. Check if rotation needed (if storage enabled)
-        if self.storage_path.is_some() && matches!(self.should_rotate(table_id), Ok(true)) {
-            // Snapshot to disk (ignore errors for now, just best-effort)
-            let _ = self.snapshot_table(table_id);
+        if self.storage_path.is_some() {
+            let should_rotate = self.should_rotate(table_id).map_err(|e| {
+                RegisterError::Storage(format!("Rotation check failed for table {table_id}: {e}"))
+            })?;
+            if should_rotate {
+                match self.snapshot_table(table_id) {
+                    Ok(()) => {}
+                    Err(snapshot_err) if self.durability_mode == DurabilityMode::BestEffort => {
+                        #[cfg(feature = "observability")]
+                        tracing::warn!(
+                            "Best-effort durability: snapshot failed for table {}: {}",
+                            table_id,
+                            snapshot_err
+                        );
+                        #[cfg(not(feature = "observability"))]
+                        let _ = snapshot_err;
+                    }
+                    Err(e) => {
+                        // Roll back this registration so Required durability is atomic.
+                        let _ = self.unregister_subscription_internal(spec.subscription_id);
+                        return Err(RegisterError::Storage(format!(
+                            "Snapshot failed for table {table_id}: {e}"
+                        )));
+                    }
+                }
+            }
         }
 
         Ok(RegisterResult {
@@ -269,6 +312,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         // Phase 2: Group by table and batch-insert
         let mut table_entries: AHashMap<TableId, BatchEntries<I>> = AHashMap::new();
+        let mut table_result_indices: AHashMap<TableId, Vec<usize>> = AHashMap::new();
+        let mut table_inserted_sub_ids: AHashMap<TableId, Vec<I::SubscriptionId>> = AHashMap::new();
 
         // Track which hashes we've already prepared (dedup within batch)
         let mut batch_hash_to_idx: AHashMap<(TableId, u128), usize> = AHashMap::new();
@@ -282,6 +327,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 .or_insert_with(|| TablePartition::new(c.table_id));
             let user_dict = self.user_dictionaries.entry(c.table_id).or_default();
             let user_ord = user_dict.get_or_create(c.spec.user_id);
+            table_result_indices.entry(c.table_id).or_default().push(i);
+            table_inserted_sub_ids
+                .entry(c.table_id)
+                .or_default()
+                .push(c.spec.subscription_id);
 
             // Check if predicate already exists in current snapshot
             let snapshot = partition.load_snapshot();
@@ -364,6 +414,66 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 for binding in bindings {
                     self.subscription_to_table
                         .insert(binding.subscription_id, table_id);
+                }
+            }
+        }
+
+        if self.storage_path.is_some() {
+            let mut failures: Vec<(TableId, String)> = Vec::new();
+
+            for &table_id in table_result_indices.keys() {
+                let should_rotate = match self.should_rotate(table_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if self.durability_mode == DurabilityMode::BestEffort {
+                            #[cfg(feature = "observability")]
+                            tracing::warn!(
+                                "Best-effort durability: rotation check failed for table {}: {}",
+                                table_id,
+                                e
+                            );
+                        } else {
+                            failures.push((
+                                table_id,
+                                format!("Rotation check failed for table {table_id}: {e}"),
+                            ));
+                        }
+                        false
+                    }
+                };
+                if !should_rotate {
+                    continue;
+                }
+
+                if let Err(e) = self.snapshot_table(table_id) {
+                    if self.durability_mode == DurabilityMode::BestEffort {
+                        #[cfg(feature = "observability")]
+                        tracing::warn!(
+                            "Best-effort durability: snapshot failed for table {}: {}",
+                            table_id,
+                            e
+                        );
+                    } else {
+                        failures.push((
+                            table_id,
+                            format!("Snapshot failed for table {table_id}: {e}"),
+                        ));
+                    }
+                }
+            }
+
+            if !failures.is_empty() && self.durability_mode == DurabilityMode::Required {
+                for (table_id, message) in failures {
+                    if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
+                        for &sub_id in sub_ids {
+                            let _ = self.unregister_subscription_internal(sub_id);
+                        }
+                    }
+                    if let Some(indices) = table_result_indices.get(&table_id) {
+                        for &idx in indices {
+                            results[idx] = Err(RegisterError::Storage(message.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -462,17 +572,24 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     pub fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport {
         let mut removed_bindings = 0;
         let mut removed_predicates = 0;
-        let removed_users = 0;
+        let mut removed_users = 0;
 
         // Collect subscription IDs to remove
         let mut to_remove = Vec::new();
+        let mut removed_user_candidates: AHashMap<TableId, AHashSet<I::UserId>> = AHashMap::new();
 
-        for (_table_id, partition) in &self.partitions {
+        for (&table_id, partition) in &self.partitions {
             let snapshot = partition.load_snapshot();
 
             if let Some(sub_ids) = snapshot.predicates.get_session_subscriptions(session_id) {
                 removed_bindings += sub_ids.len();
                 to_remove.extend_from_slice(sub_ids);
+                let users = removed_user_candidates.entry(table_id).or_default();
+                for sub_id in sub_ids {
+                    if let Some(binding) = snapshot.predicates.bindings.get(sub_id) {
+                        users.insert(binding.user_id);
+                    }
+                }
             }
         }
 
@@ -480,6 +597,29 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         for sub_id in to_remove {
             if self.unregister_subscription_internal(sub_id) == Some(true) {
                 removed_predicates += 1;
+            }
+        }
+
+        for (table_id, users) in removed_user_candidates {
+            let Some(partition) = self.partitions.get(&table_id) else {
+                continue;
+            };
+            let Some(user_dict) = self.user_dictionaries.get_mut(&table_id) else {
+                continue;
+            };
+
+            let snapshot = partition.load_snapshot();
+            let active_users: AHashSet<I::UserId> = snapshot
+                .predicates
+                .bindings
+                .values()
+                .map(|binding| binding.user_id)
+                .collect();
+
+            for user_id in users {
+                if !active_users.contains(&user_id) && user_dict.remove(user_id).is_some() {
+                    removed_users += 1;
+                }
             }
         }
 
@@ -602,27 +742,16 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         Ok(())
     }
 
-    /// Load shard from disk into partition
-    fn load_shard(&mut self, table_id: TableId, path: &Path) -> Result<(), StorageError> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| StorageError::Io(format!("Failed to read shard: {e}")))?;
+    fn rebuild_entries_from_payload(
+        payload: &ShardPayload<I>,
+    ) -> Result<(UserDictionary<I>, BatchEntries<I>), RebuildPayloadError> {
+        let mut user_dict = UserDictionary::<I>::new();
 
-        let (_header, payload) = deserialize_shard::<I>(&bytes, &*self.catalog)?;
-
-        // Create or get partition
-        let partition = self
-            .partitions
-            .entry(table_id)
-            .or_insert_with(|| TablePartition::new(table_id));
-
-        let user_dict = self.user_dictionaries.entry(table_id).or_default();
-
-        // Restore user dictionary
         for user_id in &payload.user_dict.ordinal_to_user {
             user_dict.get_or_create(*user_id);
         }
 
-        // Build hash → PredicateData map and validate binding references.
+        // Build hash -> predicate map and validate binding references.
         let mut pred_hash_to_data: AHashMap<u128, &PredicateData> = AHashMap::new();
         for pred_data in &payload.predicates {
             pred_hash_to_data.insert(pred_data.hash, pred_data);
@@ -632,13 +761,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let mut bindings_by_hash: AHashMap<u128, Vec<Binding<I>>> = AHashMap::new();
         for binding_data in &payload.bindings {
             if !pred_hash_to_data.contains_key(&binding_data.predicate_hash) {
-                return Err(StorageError::Corrupt(format!(
+                return Err(RebuildPayloadError::Corrupt(format!(
                     "Binding references unknown predicate hash: {:016x}",
                     binding_data.predicate_hash
                 )));
             }
 
-            // Create binding
             let user_ord = user_dict.get_or_create(binding_data.user_id);
             bindings_by_hash
                 .entry(binding_data.predicate_hash)
@@ -661,7 +789,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             };
 
             let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
-                .map_err(|e| StorageError::Codec(format!("Bytecode deserialize error: {e}")))?;
+                .map_err(|e| {
+                    RebuildPayloadError::Codec(format!("Bytecode deserialize error: {e}"))
+                })?;
 
             let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
             let pred = Predicate {
@@ -678,12 +808,33 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         if !bindings_by_hash.is_empty() {
-            return Err(StorageError::Corrupt(
-                "Orphan bindings remained after shard load".to_string(),
+            return Err(RebuildPayloadError::Corrupt(
+                "Orphan bindings remained after reconstruction".to_string(),
             ));
         }
 
+        Ok((user_dict, entries))
+    }
+
+    /// Load shard from disk into partition
+    fn load_shard(&mut self, table_id: TableId, path: &Path) -> Result<(), StorageError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| StorageError::Io(format!("Failed to read shard: {e}")))?;
+
+        let (_header, payload) = deserialize_shard::<I>(&bytes, &*self.catalog)?;
+
+        let (user_dict, entries) =
+            Self::rebuild_entries_from_payload(&payload).map_err(|e| match e {
+                RebuildPayloadError::Codec(msg) => StorageError::Codec(msg),
+                RebuildPayloadError::Corrupt(msg) => StorageError::Corrupt(msg),
+            })?;
+
+        let mut partition = TablePartition::new(table_id);
         partition.add_batch(&entries);
+        self.partitions.insert(table_id, partition);
+        self.user_dictionaries.insert(table_id, user_dict);
+        self.subscription_to_table
+            .retain(|_, mapped_table_id| *mapped_table_id != table_id);
         for (_, _, bindings) in &entries {
             for binding in bindings {
                 self.subscription_to_table
@@ -746,10 +897,21 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         self.rotation_threshold = threshold;
     }
 
+    /// Set durability mode for registration-time persistence.
+    pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
+        self.durability_mode = mode;
+    }
+
     /// Get current rotation threshold
     #[must_use]
     pub const fn rotation_threshold(&self) -> usize {
         self.rotation_threshold
+    }
+
+    /// Get current durability mode.
+    #[must_use]
+    pub const fn durability_mode(&self) -> DurabilityMode {
+        self.durability_mode
     }
 
     // ========================================================================
@@ -801,68 +963,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         // Build merged table state off to the side, then atomically replace.
         let mut partition = TablePartition::new(table_id);
-        let mut user_dict = UserDictionary::<I>::new();
-
-        for &user_id in &merged.payload.user_dict.ordinal_to_user {
-            user_dict.get_or_create(user_id);
-        }
-
-        let mut pred_hash_to_data: AHashMap<u128, &PredicateData> = AHashMap::new();
-        for pred_data in &merged.payload.predicates {
-            pred_hash_to_data.insert(pred_data.hash, pred_data);
-        }
-
-        let mut bindings_by_hash: AHashMap<u128, Vec<Binding<I>>> = AHashMap::new();
-        for binding_data in &merged.payload.bindings {
-            if !pred_hash_to_data.contains_key(&binding_data.predicate_hash) {
-                return Err(MergeError::BuildFailed(format!(
-                    "Merged binding references unknown predicate hash: {:016x}",
-                    binding_data.predicate_hash
-                )));
-            }
-
-            let user_ord = user_dict.get_or_create(binding_data.user_id);
-            bindings_by_hash
-                .entry(binding_data.predicate_hash)
-                .or_default()
-                .push(Binding {
-                    subscription_id: binding_data.subscription_id,
-                    predicate_id: PredicateId::from_slab_index(0), // patched by add_batch
-                    user_id: binding_data.user_id,
-                    user_ordinal: user_ord,
-                    session_id: binding_data.session_id,
-                    updated_at_unix_ms: binding_data.updated_at_unix_ms,
-                });
-        }
-
-        let mut entries: BatchEntries<I> = Vec::new();
-        for pred_data in &merged.payload.predicates {
-            let Some(bindings) = bindings_by_hash.remove(&pred_data.hash) else {
-                continue;
-            };
-
-            let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
-                .map_err(|e| MergeError::BuildFailed(format!("Bytecode deserialize error: {e}")))?;
-
-            let atoms = extract_indexable_atoms(&bytecode, &bytecode.dependency_columns);
-            let pred = Predicate {
-                id: PredicateId::from_slab_index(0),
-                hash: pred_data.hash,
-                normalized_sql: pred_data.normalized_sql.clone().into(),
-                bytecode: Arc::new(bytecode.clone()),
-                dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
-                index_atoms: Arc::from(atoms.as_slice()),
-                refcount: 0,
-                updated_at_unix_ms: pred_data.updated_at_unix_ms,
-            };
-            entries.push((pred, atoms, bindings));
-        }
-
-        if !bindings_by_hash.is_empty() {
-            return Err(MergeError::BuildFailed(
-                "Orphan bindings remained after merge reconstruction".to_string(),
-            ));
-        }
+        let (user_dict, entries) = Self::rebuild_entries_from_payload(&merged.payload)
+            .map_err(|e| MergeError::BuildFailed(e.to_string()))?;
 
         partition.add_batch(&entries);
 
@@ -887,6 +989,58 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     }
 }
 
+impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionRegistration<I>
+    for SubscriptionEngine<D, I>
+{
+    fn register(&mut self, spec: SubscriptionSpec<I>) -> Result<RegisterResult, RegisterError> {
+        Self::register(self, spec)
+    }
+
+    fn unregister_subscription(&mut self, subscription_id: I::SubscriptionId) -> bool {
+        Self::unregister_subscription(self, subscription_id)
+    }
+}
+
+impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionDispatch<I> for SubscriptionEngine<D, I> {
+    type UserIter<'a>
+        = MatchedUsers<'a, I>
+    where
+        Self: 'a;
+
+    fn users(&mut self, event: &WalEvent) -> Result<Self::UserIter<'_>, DispatchError> {
+        Self::users(self, event)
+    }
+}
+
+impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionPruning<I> for SubscriptionEngine<D, I> {
+    fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport {
+        Self::unregister_session(self, session_id)
+    }
+}
+
+impl<D: Dialect + Send + Sync, I: IdTypes> DurableShardStore for SubscriptionEngine<D, I> {
+    fn snapshot_table(&self, table_id: TableId) -> Result<(), StorageError> {
+        Self::snapshot_table(self, table_id)
+    }
+}
+
+impl<D: Dialect + Send + Sync, I: IdTypes> DurableShardMerge for SubscriptionEngine<D, I> {
+    fn merge_shards_background(
+        &mut self,
+        table_id: TableId,
+        shard_paths: &[PathBuf],
+    ) -> Result<MergeJobId, MergeError> {
+        Self::merge_shards_background(self, table_id, shard_paths)
+    }
+
+    fn try_complete_merge(
+        &mut self,
+        job_id: MergeJobId,
+    ) -> Result<Option<MergeReport>, MergeError> {
+        Self::try_complete_merge(self, job_id)
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -901,6 +1055,8 @@ mod tests {
     use crate::{Cell, DefaultIds, EventKind, PrimaryKey, RowImage};
     use sqlparser::dialect::PostgreSqlDialect;
     use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::path::Path;
 
     fn make_catalog() -> Arc<MockCatalog> {
         let mut tables = HashMap::new();
@@ -912,6 +1068,15 @@ mod tests {
         columns.insert((1, "status".to_string()), 2);
 
         Arc::new(MockCatalog { tables, columns })
+    }
+
+    #[cfg(unix)]
+    fn set_dir_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(mode);
+        std::fs::set_permissions(path, perms).unwrap();
     }
 
     #[test]
@@ -1701,6 +1866,119 @@ mod tests {
         assert!(shard_path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_register_required_durability_rolls_back_on_snapshot_failure() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        engine.set_rotation_threshold(1);
+        engine.set_durability_mode(DurabilityMode::Required);
+        set_dir_mode(temp_dir.path(), 0o500); // read + execute, no write
+
+        let result = engine.register(SubscriptionSpec {
+            subscription_id: 1000,
+            user_id: 42,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+            updated_at_unix_ms: 1,
+        });
+
+        set_dir_mode(temp_dir.path(), 0o700);
+
+        assert!(matches!(result, Err(RegisterError::Storage(_))));
+        assert_eq!(engine.subscription_count(), 0);
+        assert!(!engine.unregister_subscription(1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_register_batch_required_durability_rolls_back_on_snapshot_failure() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        engine.set_rotation_threshold(1);
+        engine.set_durability_mode(DurabilityMode::Required);
+        set_dir_mode(temp_dir.path(), 0o500);
+
+        let results = engine.register_batch(vec![
+            SubscriptionSpec {
+                subscription_id: 2000,
+                user_id: 10,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 1,
+            },
+            SubscriptionSpec {
+                subscription_id: 2001,
+                user_id: 11,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 20".to_string(),
+                updated_at_unix_ms: 1,
+            },
+        ]);
+
+        set_dir_mode(temp_dir.path(), 0o700);
+
+        assert_eq!(results.len(), 2);
+        assert!(matches!(results[0], Err(RegisterError::Storage(_))));
+        assert!(matches!(results[1], Err(RegisterError::Storage(_))));
+        assert_eq!(engine.subscription_count(), 0);
+        assert!(!engine.unregister_subscription(2000));
+        assert!(!engine.unregister_subscription(2001));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_register_best_effort_allows_snapshot_failure() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        engine.set_rotation_threshold(1);
+        engine.set_durability_mode(DurabilityMode::BestEffort);
+        set_dir_mode(temp_dir.path(), 0o500);
+
+        let result = engine.register(SubscriptionSpec {
+            subscription_id: 3000,
+            user_id: 12,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 1".to_string(),
+            updated_at_unix_ms: 1,
+        });
+
+        set_dir_mode(temp_dir.path(), 0o700);
+
+        assert!(result.is_ok());
+        assert_eq!(engine.subscription_count(), 1);
+    }
+
     #[test]
     fn test_unregister_session_empty() {
         let catalog = make_catalog();
@@ -1710,6 +1988,7 @@ mod tests {
         // Unregister session with no subscriptions
         let report = engine.unregister_session(999);
         assert_eq!(report.removed_bindings, 0);
+        assert_eq!(report.removed_users, 0);
     }
 
     #[test]
@@ -1744,6 +2023,7 @@ mod tests {
             report.removed_predicates, 2,
             "both predicates should be removed when their last bindings are session-bound"
         );
+        assert_eq!(report.removed_users, 1);
     }
 
     #[test]
@@ -1777,6 +2057,41 @@ mod tests {
         let report = engine.unregister_session(43);
         assert_eq!(report.removed_bindings, 1);
         assert_eq!(report.removed_predicates, 0);
+        assert_eq!(report.removed_users, 1);
+    }
+
+    #[test]
+    fn test_unregister_session_keeps_user_when_other_binding_for_same_user_remains() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Session-bound binding
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 30,
+                user_id: 1,
+                session_id: Some(44),
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 30,
+            })
+            .unwrap();
+
+        // Durable binding for the same user should keep dictionary entry alive.
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 31,
+                user_id: 1,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 10".to_string(),
+                updated_at_unix_ms: 31,
+            })
+            .unwrap();
+
+        let report = engine.unregister_session(44);
+        assert_eq!(report.removed_bindings, 1);
+        assert_eq!(report.removed_predicates, 1);
+        assert_eq!(report.removed_users, 0);
     }
 
     #[test]

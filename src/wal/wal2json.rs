@@ -10,6 +10,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::pg_type::json_value_to_cell;
+use super::row_build::{build_pk_from_typed_arrays_with, build_row_from_typed_arrays_with};
 use super::{build_pk_from_resolved, changed_columns, resolve_table, WalParseError, WalParser};
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
@@ -171,37 +172,15 @@ fn build_row_from_arrays(
     table_id: TableId,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    let arity = catalog
-        .table_arity(table_id)
-        .ok_or_else(|| WalParseError::UnknownTable {
-            schema: String::new(),
-            table: format!("table_id={table_id}"),
-        })?;
-
-    let mut cells = vec![Cell::Missing; arity];
-    let mut resolved = Vec::with_capacity(names.len());
-
-    for (i, name) in names.iter().enumerate() {
-        let col_id =
-            catalog
-                .column_id(table_id, name)
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
-                })?;
-        let cell = json_value_to_cell(&values[i], &types[i]);
-        if (col_id as usize) < arity {
-            cells[col_id as usize] = cell.clone();
-        }
-        resolved.push((col_id, cell));
-    }
-
-    Ok((
-        RowImage {
-            cells: Arc::from(cells),
-        },
-        resolved,
-    ))
+    build_row_from_typed_arrays_with(
+        names,
+        types,
+        values,
+        table_id,
+        catalog,
+        "column",
+        json_value_to_cell,
+    )
 }
 
 /// Build a [`RowImage`] from v2 column structs.
@@ -251,25 +230,15 @@ fn build_pk_from_key_arrays(
     table_id: TableId,
     catalog: &dyn SchemaCatalog,
 ) -> Result<PrimaryKey, WalParseError> {
-    let mut pk_cols = Vec::with_capacity(names.len());
-    let mut pk_vals = Vec::with_capacity(names.len());
-
-    for (i, name) in names.iter().enumerate() {
-        let col_id =
-            catalog
-                .column_id(table_id, name)
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
-                })?;
-        pk_cols.push(col_id);
-        pk_vals.push(json_value_to_cell(&values[i], &types[i]));
-    }
-
-    Ok(PrimaryKey {
-        columns: Arc::from(pk_cols),
-        values: Arc::from(pk_vals),
-    })
+    build_pk_from_typed_arrays_with(
+        names,
+        types,
+        values,
+        table_id,
+        catalog,
+        "oldkeys",
+        json_value_to_cell,
+    )
 }
 
 // ============================================================================
@@ -1323,5 +1292,63 @@ mod tests {
         let err = build_pk_from_key_arrays(&names, &types, &values, 1, &catalog)
             .expect_err("should fail");
         assert!(matches!(err, WalParseError::UnknownColumn { .. }));
+    }
+
+    #[test]
+    fn error_mismatched_column_array_lengths_v1_does_not_panic() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV1Parser;
+
+        let json = r#"{
+            "change": [{
+                "kind": "insert",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer"],
+                "columntypes": ["integer"],
+                "columnvalues": [1, "alice"]
+            }]
+        }"#;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.parse_wal_message(json.as_bytes(), &catalog)
+        }));
+
+        assert!(result.is_ok(), "parser must not panic on malformed payload");
+        let parse_result = result.expect("catch_unwind should be Ok");
+        assert!(
+            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
+            "parser should return MalformedPayload"
+        );
+    }
+
+    #[test]
+    fn error_mismatched_oldkeys_array_lengths_v1_does_not_panic() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV1Parser;
+
+        let json = r#"{
+            "change": [{
+                "kind": "delete",
+                "schema": "public",
+                "table": "orders",
+                "oldkeys": {
+                    "keynames": ["id", "customer"],
+                    "keytypes": ["integer"],
+                    "keyvalues": [1, "alice"]
+                }
+            }]
+        }"#;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.parse_wal_message(json.as_bytes(), &catalog)
+        }));
+
+        assert!(result.is_ok(), "parser must not panic on malformed payload");
+        let parse_result = result.expect("catch_unwind should be Ok");
+        assert!(
+            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
+            "parser should return MalformedPayload"
+        );
     }
 }

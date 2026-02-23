@@ -8,6 +8,7 @@ mod debezium;
 mod maxwell;
 mod pg_type;
 mod pgoutput;
+mod row_build;
 mod wal2json;
 
 pub use debezium::DebeziumParser;
@@ -57,6 +58,10 @@ pub enum WalParseError {
     /// A required JSON field was absent.
     #[error("Missing field: {0}")]
     MissingField(String),
+
+    /// Payload structure is malformed (mismatched lengths, invalid counts, etc.).
+    #[error("Malformed payload: {0}")]
+    MalformedPayload(String),
 
     /// WAL column count does not match catalog arity.
     #[error("Arity mismatch for table {table_id}: WAL has {wal_count} columns, catalog has {catalog_arity}")]

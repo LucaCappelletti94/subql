@@ -33,6 +33,10 @@ pub enum RegisterError {
     /// Schema catalog error
     #[error("Schema catalog error: {0}")]
     SchemaCatalog(String),
+
+    /// Storage/persistence error during registration
+    #[error("Storage error during registration: {0}")]
+    Storage(String),
 }
 
 /// Errors during event dispatch
