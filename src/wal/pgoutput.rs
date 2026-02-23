@@ -13,7 +13,10 @@ use std::sync::{Arc, Mutex};
 use ahash::AHashMap;
 
 use super::pg_type::text_to_cell;
-use super::{build_pk_from_resolved, changed_columns, resolve_table, WalParseError, WalParser};
+use super::{
+    build_pk_from_resolved, changed_columns, pk_from_catalog_or_empty, resolve_table,
+    WalParseError, WalParser,
+};
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
 /// Defensive bound to prevent pathological allocations from malformed input.
@@ -206,6 +209,16 @@ impl PgOutputParser {
         Ok(count)
     }
 
+    fn expected_tag(tag: u8, expected: u8, context: &str) -> Result<(), WalParseError> {
+        if tag == expected {
+            Ok(())
+        } else {
+            Err(WalParseError::MalformedPayload(format!(
+                "invalid {context} tag: expected 0x{expected:02X}, got 0x{tag:02X}"
+            )))
+        }
+    }
+
     /// Handle Relation message: parse schema and cache for later DML lookups.
     fn handle_relation(
         &self,
@@ -359,17 +372,10 @@ impl PgOutputParser {
 
         // Consume the 'N' tag (new tuple marker)
         let tag = cur.read_u8()?;
-        debug_assert_eq!(tag, b'N');
+        Self::expected_tag(tag, b'N', "INSERT tuple")?;
 
         let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel)?;
-
-        let pk = catalog.primary_key_columns(rel.table_id).map_or_else(
-            || PrimaryKey {
-                columns: Arc::from([]),
-                values: Arc::from([]),
-            },
-            |pk_cols| build_pk_from_resolved(&new_resolved, pk_cols),
-        );
+        let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog);
 
         Ok(WalEvent {
             kind: EventKind::Insert,
@@ -398,12 +404,15 @@ impl PgOutputParser {
             let (row, resolved) = Self::parse_tuple_data(cur, &rel)?;
             // Now consume the 'N' tag for the new tuple
             let n_tag = cur.read_u8()?;
-            debug_assert_eq!(n_tag, b'N');
+            Self::expected_tag(n_tag, b'N', "UPDATE new tuple")?;
             (Some(row), resolved)
-        } else {
+        } else if tag == b'N' {
             // tag is 'N' — no old tuple, directly the new tuple
-            debug_assert_eq!(tag, b'N');
             (None, Vec::new())
+        } else {
+            return Err(WalParseError::MalformedPayload(format!(
+                "invalid UPDATE tuple tag: expected 0x4B ('K'), 0x4F ('O'), or 0x4E ('N'), got 0x{tag:02X}"
+            )));
         };
 
         let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel)?;
@@ -411,13 +420,7 @@ impl PgOutputParser {
         // PK: prefer identity columns from old row, then catalog fallback.
         let pk = if old_resolved.is_empty() {
             // No old row — extract PK from new row via catalog
-            catalog.primary_key_columns(rel.table_id).map_or_else(
-                || PrimaryKey {
-                    columns: Arc::from([]),
-                    values: Arc::from([]),
-                },
-                |pk_cols| build_pk_from_resolved(&new_resolved, pk_cols),
-            )
+            pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)
         } else if rel.identity_columns.is_empty() {
             // No identity columns marked — use all old columns as PK
             let cols: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
@@ -462,7 +465,12 @@ impl PgOutputParser {
         let rel = self.get_relation(oid)?;
 
         // Read tag: 'K' (key) or 'O' (full old row)
-        let _tag = cur.read_u8()?;
+        let tag = cur.read_u8()?;
+        if tag != b'K' && tag != b'O' {
+            return Err(WalParseError::MalformedPayload(format!(
+                "invalid DELETE tuple tag: expected 0x4B ('K') or 0x4F ('O'), got 0x{tag:02X}"
+            )));
+        }
 
         let (old_row, old_resolved) = Self::parse_tuple_data(cur, &rel)?;
 
@@ -1396,5 +1404,114 @@ mod tests {
             matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
             "parser should return MalformedPayload"
         );
+    }
+
+    #[test]
+    fn insert_invalid_tuple_tag_does_not_panic() {
+        let catalog = TestCatalog::orders();
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let mut msg = build_insert_msg(16384, &[TupleCol::Text("1".into())]);
+        msg[5] = b'X';
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.parse_wal_message(&msg, &catalog)
+        }));
+
+        assert!(
+            result.is_ok(),
+            "parser must not panic on invalid insert tuple tag"
+        );
+        let parse_result = result.expect("catch_unwind should be Ok");
+        assert!(
+            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
+            "parser should return MalformedPayload"
+        );
+    }
+
+    #[test]
+    fn update_invalid_initial_tuple_tag_does_not_panic() {
+        let catalog = TestCatalog::orders();
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let mut msg = build_update_msg_no_old(16384, &[TupleCol::Text("1".into())]);
+        msg[5] = b'X';
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.parse_wal_message(&msg, &catalog)
+        }));
+
+        assert!(
+            result.is_ok(),
+            "parser must not panic on invalid update tuple tag"
+        );
+        let parse_result = result.expect("catch_unwind should be Ok");
+        assert!(
+            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
+            "parser should return MalformedPayload"
+        );
+    }
+
+    #[test]
+    fn update_invalid_new_tuple_tag_after_old_does_not_panic() {
+        let catalog = TestCatalog::orders();
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let old_cols = [
+            TupleCol::Text("1".into()),
+            TupleCol::Unchanged,
+            TupleCol::Unchanged,
+            TupleCol::Unchanged,
+        ];
+        let mut msg =
+            build_update_msg_with_old(16384, b'K', &old_cols, &[TupleCol::Text("1".into())]);
+        let new_tag_idx = 1 + 4 + 1 + build_tuple_data(&old_cols).len();
+        msg[new_tag_idx] = b'X';
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.parse_wal_message(&msg, &catalog)
+        }));
+
+        assert!(
+            result.is_ok(),
+            "parser must not panic on invalid post-old update tuple tag"
+        );
+        let parse_result = result.expect("catch_unwind should be Ok");
+        assert!(
+            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
+            "parser should return MalformedPayload"
+        );
+    }
+
+    #[test]
+    fn delete_invalid_tuple_tag_returns_malformed_payload() {
+        let catalog = TestCatalog::orders();
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let msg = build_delete_msg(16384, b'X', &[TupleCol::Text("1".into())]);
+        let err = parser
+            .parse_wal_message(&msg, &catalog)
+            .expect_err("should fail");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 }

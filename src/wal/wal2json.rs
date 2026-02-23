@@ -5,13 +5,16 @@
 //! changes in a transaction into a single message; version 2 emits one message
 //! per change.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use serde::Deserialize;
 
 use super::pg_type::json_value_to_cell;
 use super::row_build::{build_pk_from_typed_arrays_with, build_row_from_typed_arrays_with};
-use super::{build_pk_from_resolved, changed_columns, resolve_table, WalParseError, WalParser};
+use super::{
+    build_pk_from_resolved, changed_columns, pk_from_catalog_or_empty, resolve_table,
+    WalParseError, WalParser,
+};
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
 // ============================================================================
@@ -126,10 +129,10 @@ impl WalParser for Wal2JsonV2Parser {
         let msg: Wal2JsonV2Message =
             serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
 
-        // Skip transaction boundary messages (B=begin, C=commit, M=message)
+        // Skip non-row messages (transaction boundaries and truncate).
         match msg.action.as_str() {
-            "I" | "U" | "D" => {}
-            _ => return Ok(Vec::new()),
+            "B" | "C" | "M" | "T" => return Ok(Vec::new()),
+            _ => {}
         }
 
         let event = convert_v2_message(&msg, catalog)?;
@@ -198,6 +201,7 @@ fn build_row_from_v2_columns(
 
     let mut cells = vec![Cell::Missing; arity];
     let mut resolved = Vec::with_capacity(columns.len());
+    let mut seen = HashSet::with_capacity(columns.len());
 
     for col in columns {
         let col_id =
@@ -207,6 +211,12 @@ fn build_row_from_v2_columns(
                     table_id,
                     column: col.name.clone(),
                 })?;
+        if !seen.insert(col_id) {
+            return Err(WalParseError::MalformedPayload(format!(
+                "v2 columns contain duplicate column id {col_id} ('{}')",
+                col.name
+            )));
+        }
         let cell = json_value_to_cell(&col.value, &col.type_name);
         if (col_id as usize) < arity {
             cells[col_id as usize] = cell.clone();
@@ -286,13 +296,7 @@ fn convert_v1_change(
         (Some(row), pk)
     } else {
         // INSERT without oldkeys — extract PK from new row using catalog metadata
-        let pk = catalog.primary_key_columns(table_id).map_or_else(
-            || PrimaryKey {
-                columns: Arc::from([]),
-                values: Arc::from([]),
-            },
-            |pk_cols| build_pk_from_resolved(&new_resolved, pk_cols),
-        );
+        let pk = pk_from_catalog_or_empty(&new_resolved, table_id, catalog);
         (None, pk)
     };
 
@@ -374,13 +378,7 @@ fn convert_v2_message(
             .collect();
         build_pk_from_resolved(&new_resolved, &pk_col_ids)
     } else {
-        catalog.primary_key_columns(table_id).map_or_else(
-            || PrimaryKey {
-                columns: Arc::from([]),
-                values: Arc::from([]),
-            },
-            |pk_cols| build_pk_from_resolved(&new_resolved, pk_cols),
-        )
+        pk_from_catalog_or_empty(&new_resolved, table_id, catalog)
     };
 
     let changed = if kind == EventKind::Update {
@@ -729,6 +727,30 @@ mod tests {
         assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
     }
 
+    #[test]
+    fn v2_insert_duplicate_columns_returns_error() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{
+            "action": "I",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "id", "type": "integer", "value": 1},
+                {"name": "id", "type": "integer", "value": 2}
+            ],
+            "pk": [
+                {"name": "id", "type": "integer"}
+            ]
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("duplicate v2 columns should fail");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
     // -- v2 UPDATE -----------------------------------------------------------
 
     #[test]
@@ -899,7 +921,7 @@ mod tests {
         let catalog = TestCatalog::orders();
         let parser = Wal2JsonV2Parser;
 
-        // Truncate (T), Begin (B), Commit (C), Message (M) are silently skipped
+        // Truncate (T), Begin (B), Commit (C), Message (M) are silently skipped.
         for action in &["T", "B", "C", "M"] {
             let json = format!(r#"{{"action": "{action}"}}"#);
             let events = parser
@@ -910,6 +932,18 @@ mod tests {
                 "action '{action}' should return empty vec"
             );
         }
+    }
+
+    #[test]
+    fn v2_unknown_action_returns_error() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{"action":"X","schema":"public","table":"orders"}"#;
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("unknown action should fail");
+        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
     }
 
     // -- Trait object safety --------------------------------------------------

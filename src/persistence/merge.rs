@@ -340,20 +340,6 @@ mod tests {
         MockCatalog { fingerprints }
     }
 
-    #[cfg(target_os = "linux")]
-    fn linux_thread_count() -> usize {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap();
-        let line = status
-            .lines()
-            .find(|l| l.starts_with("Threads:"))
-            .expect("Threads field should exist in /proc/self/status");
-        line.split_whitespace()
-            .nth(1)
-            .expect("Threads value")
-            .parse::<usize>()
-            .expect("Threads should parse as usize")
-    }
-
     #[test]
     fn test_merge_deduplication() {
         let catalog = make_catalog();
@@ -754,7 +740,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_merge_uses_bounded_worker_threads() {
         struct SlowCatalog;
         impl SchemaCatalog for SlowCatalog {
@@ -788,23 +773,13 @@ mod tests {
         };
         let shard = serialize_shard(1, &payload, &catalog).unwrap();
 
-        let baseline_threads = linux_thread_count();
         let job_count = 12;
+        let start = Instant::now();
         for _ in 0..job_count {
             manager
                 .merge_shards_background(1, vec![shard.clone()], Box::new(SlowCatalog))
                 .unwrap();
         }
-
-        std::thread::sleep(Duration::from_millis(30));
-        let during_threads = linux_thread_count();
-        let increase = during_threads.saturating_sub(baseline_threads);
-
-        // A bounded pool should not create one thread per queued job.
-        assert!(
-            increase <= 8,
-            "expected bounded merge workers; baseline={baseline_threads}, during={during_threads}, increase={increase}"
-        );
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while manager.active_jobs() > 0 && Instant::now() < deadline {
@@ -815,5 +790,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(manager.active_jobs(), 0);
+
+        let elapsed = start.elapsed();
+
+        // With one thread per queued job, these 12 slow jobs would complete in
+        // roughly one 200ms wave. With a bounded worker pool, completion must
+        // take meaningfully longer than that.
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "expected bounded merge workers; elapsed={elapsed:?} for {job_count} jobs"
+        );
     }
 }

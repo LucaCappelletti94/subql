@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use super::pg_type::infer_cell_from_json;
 use super::row_build::build_row_from_map_with;
-use super::{build_pk_from_resolved, changed_columns, resolve_table, WalParseError, WalParser};
+use super::{changed_columns, pk_from_catalog_or_empty, resolve_table, WalParseError, WalParser};
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
 // ============================================================================
@@ -181,13 +181,7 @@ fn build_debezium_pk(
     table_id: TableId,
     catalog: &dyn SchemaCatalog,
 ) -> PrimaryKey {
-    catalog.primary_key_columns(table_id).map_or_else(
-        || PrimaryKey {
-            columns: Arc::from([]),
-            values: Arc::from([]),
-        },
-        |pk_cols| build_pk_from_resolved(resolved, pk_cols),
-    )
+    pk_from_catalog_or_empty(resolved, table_id, catalog)
 }
 
 // ============================================================================

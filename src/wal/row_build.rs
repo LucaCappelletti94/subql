@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
@@ -79,6 +79,7 @@ where
 
     let mut cells = vec![Cell::Missing; arity];
     let mut resolved = Vec::with_capacity(names.len());
+    let mut seen = HashSet::with_capacity(names.len());
 
     for ((name, ty), value) in names.iter().zip(types).zip(values) {
         let col_id =
@@ -88,6 +89,11 @@ where
                     table_id,
                     column: name.clone(),
                 })?;
+        if !seen.insert(col_id) {
+            return Err(WalParseError::MalformedPayload(format!(
+                "{context} contains duplicate column id {col_id} ('{name}')"
+            )));
+        }
         let cell = value_to_cell(value, ty);
         if (col_id as usize) < arity {
             cells[col_id as usize] = cell.clone();
@@ -127,6 +133,7 @@ where
 
     let mut pk_cols = Vec::with_capacity(names.len());
     let mut pk_vals = Vec::with_capacity(names.len());
+    let mut seen = HashSet::with_capacity(names.len());
 
     for ((name, ty), value) in names.iter().zip(types).zip(values) {
         let col_id =
@@ -136,6 +143,11 @@ where
                     table_id,
                     column: name.clone(),
                 })?;
+        if !seen.insert(col_id) {
+            return Err(WalParseError::MalformedPayload(format!(
+                "{context} contains duplicate column id {col_id} ('{name}')"
+            )));
+        }
         pk_cols.push(col_id);
         pk_vals.push(value_to_cell(value, ty));
     }
@@ -371,5 +383,47 @@ mod tests {
 
         assert_eq!(&*pk.columns, &[0, 2]);
         assert_eq!(&*pk.values, &[Cell::Int(10), Cell::Int(42)]);
+    }
+
+    #[test]
+    fn test_build_row_from_typed_arrays_with_duplicate_column_id() {
+        let catalog = make_catalog();
+        let names = vec!["id".to_string(), "id".to_string()];
+        let types = vec!["int4".to_string(), "int4".to_string()];
+        let values = vec![json!(10), json!(20)];
+
+        let err = build_row_from_typed_arrays_with(
+            &names,
+            &types,
+            &values,
+            1,
+            &catalog,
+            "new_row",
+            |value, _| json_to_cell(value),
+        )
+        .expect_err("duplicate column IDs should fail");
+
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn test_build_pk_from_typed_arrays_with_duplicate_column_id() {
+        let catalog = make_catalog();
+        let names = vec!["id".to_string(), "id".to_string()];
+        let types = vec!["int4".to_string(), "int4".to_string()];
+        let values = vec![json!(10), json!(20)];
+
+        let err = build_pk_from_typed_arrays_with(
+            &names,
+            &types,
+            &values,
+            1,
+            &catalog,
+            "oldkeys",
+            |value, _| json_to_cell(value),
+        )
+        .expect_err("duplicate column IDs should fail");
+
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 }

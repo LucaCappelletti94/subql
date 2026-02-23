@@ -226,6 +226,23 @@ pub struct PrimaryKey {
     pub values: Arc<[Cell]>,
 }
 
+impl PrimaryKey {
+    /// Empty primary key (used when PK metadata is unavailable).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            columns: Arc::from([]),
+            values: Arc::from([]),
+        }
+    }
+
+    /// Returns true when no PK columns/values are present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty() && self.values.is_empty()
+    }
+}
+
 /// WAL event from PostgreSQL CDC
 #[derive(Clone, Debug)]
 pub struct WalEvent {

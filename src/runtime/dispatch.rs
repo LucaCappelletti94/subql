@@ -65,7 +65,13 @@ impl<I: IdTypes> UserDictionary<I> {
     /// Get ordinal_to_user vector for serialization
     #[must_use]
     pub fn ordinal_to_user_vec(&self) -> Vec<I::UserId> {
-        self.ordinal_to_user.clone()
+        let mut by_ordinal: Vec<(u32, I::UserId)> = self
+            .user_to_ordinal
+            .iter()
+            .map(|(&user_id, ordinal)| (ordinal.get(), user_id))
+            .collect();
+        by_ordinal.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        by_ordinal.into_iter().map(|(_, user_id)| user_id).collect()
     }
 }
 
@@ -364,6 +370,19 @@ mod tests {
 
         let vec = dict.ordinal_to_user_vec();
         assert_eq!(vec, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_user_dictionary_ordinal_to_user_vec_excludes_removed_users() {
+        let mut dict = UserDictionary::<DefaultIds>::new();
+        dict.get_or_create(10);
+        dict.get_or_create(20);
+        dict.get_or_create(30);
+
+        dict.remove(20);
+
+        let vec = dict.ordinal_to_user_vec();
+        assert_eq!(vec, vec![10, 30]);
     }
 
     #[test]

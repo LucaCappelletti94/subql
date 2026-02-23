@@ -128,6 +128,19 @@ pub(crate) fn build_pk_from_resolved(
     }
 }
 
+/// Build PK from catalog metadata, or return an empty PK when metadata is unavailable.
+pub(crate) fn pk_from_catalog_or_empty(
+    resolved: &[(ColumnId, Cell)],
+    table_id: TableId,
+    catalog: &dyn SchemaCatalog,
+) -> PrimaryKey {
+    catalog
+        .primary_key_columns(table_id)
+        .map_or_else(PrimaryKey::empty, |pk_cols| {
+            build_pk_from_resolved(resolved, pk_cols)
+        })
+}
+
 /// Compute changed columns between old and new row images.
 pub(crate) fn changed_columns(old: &RowImage, new: &RowImage) -> Vec<ColumnId> {
     let len = old.cells.len().min(new.cells.len());

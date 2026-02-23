@@ -843,6 +843,25 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         Ok((user_dict, entries))
     }
 
+    fn replace_table_state(
+        &mut self,
+        table_id: TableId,
+        partition: TablePartition<I>,
+        user_dict: UserDictionary<I>,
+        entries: &BatchEntries<I>,
+    ) {
+        self.partitions.insert(table_id, partition);
+        self.user_dictionaries.insert(table_id, user_dict);
+        self.subscription_to_table
+            .retain(|_, mapped_table_id| *mapped_table_id != table_id);
+        for (_, _, bindings) in entries {
+            for binding in bindings {
+                self.subscription_to_table
+                    .insert(binding.subscription_id, table_id);
+            }
+        }
+    }
+
     /// Load shard from disk into partition
     fn load_shard(&mut self, table_id: TableId, path: &Path) -> Result<(), StorageError> {
         let bytes = std::fs::read(path)
@@ -864,16 +883,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         let mut partition = TablePartition::new(table_id);
         partition.add_batch(&entries);
-        self.partitions.insert(table_id, partition);
-        self.user_dictionaries.insert(table_id, user_dict);
-        self.subscription_to_table
-            .retain(|_, mapped_table_id| *mapped_table_id != table_id);
-        for (_, _, bindings) in &entries {
-            for binding in bindings {
-                self.subscription_to_table
-                    .insert(binding.subscription_id, table_id);
-            }
-        }
+        self.replace_table_state(table_id, partition, user_dict, &entries);
 
         Ok(())
     }
@@ -1000,17 +1010,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .map_err(|e| MergeError::BuildFailed(e.to_string()))?;
 
         partition.add_batch(&entries);
-
-        self.partitions.insert(table_id, partition);
-        self.user_dictionaries.insert(table_id, user_dict);
-        self.subscription_to_table
-            .retain(|_, mapped_table_id| *mapped_table_id != table_id);
-        for (_, _, bindings) in &entries {
-            for binding in bindings {
-                self.subscription_to_table
-                    .insert(binding.subscription_id, table_id);
-            }
-        }
+        self.replace_table_state(table_id, partition, user_dict, &entries);
 
         Ok(Some(merged.stats.into()))
     }
