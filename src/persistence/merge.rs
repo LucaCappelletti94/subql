@@ -73,8 +73,12 @@ impl<I: IdTypes> MergeManager<I> {
                     };
 
                     let start = std::time::Instant::now();
-                    let result =
-                        merge_shards_impl::<I>(task.table_id, &task.shard_bytes, &*task.catalog, start);
+                    let result = merge_shards_impl::<I>(
+                        task.table_id,
+                        &task.shard_bytes,
+                        &*task.catalog,
+                        start,
+                    );
 
                     // Receiver may have been dropped if caller discarded the job.
                     if task.result_sender.send(result).is_err() {
@@ -112,9 +116,9 @@ impl<I: IdTypes> MergeManager<I> {
             catalog,
             result_sender: tx,
         };
-        self.task_sender.send(task).map_err(|_| {
-            MergeError::BuildFailed("Merge worker pool is unavailable".to_string())
-        })?;
+        self.task_sender
+            .send(task)
+            .map_err(|_| MergeError::BuildFailed("Merge worker pool is unavailable".to_string()))?;
 
         self.jobs.insert(job_id, MergeJob { receiver: rx });
 

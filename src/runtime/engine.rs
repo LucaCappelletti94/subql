@@ -1215,11 +1215,7 @@ mod tests {
             },
             old_row: None,
             new_row: Some(RowImage {
-                cells: Arc::from([
-                    Cell::Int(1),
-                    Cell::Int(200),
-                    Cell::String("pending".into()),
-                ]),
+                cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("pending".into())]),
             }),
             changed_columns: Arc::from([]),
         };
@@ -1323,11 +1319,7 @@ mod tests {
             },
             old_row: None,
             new_row: Some(RowImage {
-                cells: Arc::from([
-                    Cell::Int(1),
-                    Cell::Int(200),
-                    Cell::String("paid".into()),
-                ]),
+                cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("paid".into())]),
             }),
             changed_columns: Arc::from([]),
         };

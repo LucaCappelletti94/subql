@@ -306,17 +306,15 @@ impl Vm {
     fn pop_tri(&mut self) -> Result<Tri, VmError> {
         match self.stack.pop() {
             Some(StackValue::Tri(t)) => Ok(t),
-            Some(StackValue::Cell(cell)) => {
-                predicate_tri_from_cell(&cell).map_or_else(
-                    || {
-                        Err(VmError::TypeMismatch {
-                            expected: "Tri",
-                            got: "Cell",
-                        })
-                    },
-                    Ok,
-                )
-            }
+            Some(StackValue::Cell(cell)) => predicate_tri_from_cell(&cell).map_or_else(
+                || {
+                    Err(VmError::TypeMismatch {
+                        expected: "Tri",
+                        got: "Cell",
+                    })
+                },
+                Ok,
+            ),
             None => Err(VmError::StackUnderflow),
         }
     }
@@ -324,17 +322,15 @@ impl Vm {
     fn peek_tri(&self) -> Result<Tri, VmError> {
         match self.stack.last() {
             Some(StackValue::Tri(t)) => Ok(*t),
-            Some(StackValue::Cell(cell)) => {
-                predicate_tri_from_cell(cell).map_or_else(
-                    || {
-                        Err(VmError::TypeMismatch {
-                            expected: "Tri",
-                            got: "Cell",
-                        })
-                    },
-                    Ok,
-                )
-            }
+            Some(StackValue::Cell(cell)) => predicate_tri_from_cell(cell).map_or_else(
+                || {
+                    Err(VmError::TypeMismatch {
+                        expected: "Tri",
+                        got: "Cell",
+                    })
+                },
+                Ok,
+            ),
             None => Err(VmError::StackUnderflow),
         }
     }
