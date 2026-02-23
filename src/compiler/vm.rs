@@ -90,9 +90,10 @@ impl Vm {
                     Ok(Tri::Unknown)
                 }
             }
-            Some(StackValue::Cell(_)) => {
-                // Top of stack is cell, not tri - treat as Unknown
-                Ok(Tri::Unknown)
+            Some(StackValue::Cell(cell)) => {
+                // Top-level predicates may evaluate to a boolean (e.g. WHERE true
+                // or WHERE bool_col). Coerce known boolean/null forms to Tri.
+                Ok(predicate_tri_from_cell(&cell).unwrap_or(Tri::Unknown))
             }
             None => Err(VmError::StackUnderflow),
         }
@@ -305,10 +306,17 @@ impl Vm {
     fn pop_tri(&mut self) -> Result<Tri, VmError> {
         match self.stack.pop() {
             Some(StackValue::Tri(t)) => Ok(t),
-            Some(StackValue::Cell(_)) => Err(VmError::TypeMismatch {
-                expected: "Tri",
-                got: "Cell",
-            }),
+            Some(StackValue::Cell(cell)) => {
+                predicate_tri_from_cell(&cell).map_or_else(
+                    || {
+                        Err(VmError::TypeMismatch {
+                            expected: "Tri",
+                            got: "Cell",
+                        })
+                    },
+                    Ok,
+                )
+            }
             None => Err(VmError::StackUnderflow),
         }
     }
@@ -316,10 +324,17 @@ impl Vm {
     fn peek_tri(&self) -> Result<Tri, VmError> {
         match self.stack.last() {
             Some(StackValue::Tri(t)) => Ok(*t),
-            Some(StackValue::Cell(_)) => Err(VmError::TypeMismatch {
-                expected: "Tri",
-                got: "Cell",
-            }),
+            Some(StackValue::Cell(cell)) => {
+                predicate_tri_from_cell(cell).map_or_else(
+                    || {
+                        Err(VmError::TypeMismatch {
+                            expected: "Tri",
+                            got: "Cell",
+                        })
+                    },
+                    Ok,
+                )
+            }
             None => Err(VmError::StackUnderflow),
         }
     }
@@ -414,6 +429,15 @@ where
         Tri::True
     } else {
         Tri::False
+    }
+}
+
+const fn predicate_tri_from_cell(cell: &Cell) -> Option<Tri> {
+    match cell {
+        Cell::Bool(true) => Some(Tri::True),
+        Cell::Bool(false) => Some(Tri::False),
+        Cell::Null | Cell::Missing => Some(Tri::Unknown),
+        _ => None,
     }
 }
 
@@ -1438,6 +1462,54 @@ mod tests {
     fn test_default_vm() {
         let vm = Vm::default();
         assert!(vm.stack.is_empty());
+    }
+
+    #[test]
+    fn test_boolean_literal_predicate_truthiness() {
+        let mut vm = Vm::new();
+        let row = make_row(vec![]);
+
+        let program_true = BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(true))]);
+        assert_eq!(vm.eval(&program_true, &row).unwrap(), Tri::True);
+
+        let program_false = BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(false))]);
+        assert_eq!(vm.eval(&program_false, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_not_boolean_literal_predicate() {
+        let mut vm = Vm::new();
+        let row = make_row(vec![]);
+
+        let program_not_true = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::Not,
+        ]);
+        assert_eq!(vm.eval(&program_not_true, &row).unwrap(), Tri::False);
+
+        let program_not_false = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(false)),
+            Instruction::Not,
+        ]);
+        assert_eq!(vm.eval(&program_not_false, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_boolean_column_predicate_truthiness() {
+        let mut vm = Vm::new();
+        let program = BytecodeProgram::new(vec![Instruction::LoadColumn(0)]);
+
+        let row_true = make_row(vec![Cell::Bool(true)]);
+        assert_eq!(vm.eval(&program, &row_true).unwrap(), Tri::True);
+
+        let row_false = make_row(vec![Cell::Bool(false)]);
+        assert_eq!(vm.eval(&program, &row_false).unwrap(), Tri::False);
+
+        let row_null = make_row(vec![Cell::Null]);
+        assert_eq!(vm.eval(&program, &row_null).unwrap(), Tri::Unknown);
+
+        let row_missing = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row_missing).unwrap(), Tri::Unknown);
     }
 
     #[test]

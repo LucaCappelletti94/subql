@@ -32,17 +32,49 @@ pub fn encode_serialized(mut serialized: &[u8]) -> Result<Vec<u8>, StorageError>
     Ok(compressed)
 }
 
-/// Decompress and deserialize data
-///
-/// Decompresses LZ4, then deserializes with bincode.
-pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
+fn decompress_internal(bytes: &[u8], max_output: Option<usize>) -> Result<Vec<u8>, StorageError> {
     // Decompress with LZ4
     let mut decoder = lz4::Decoder::new(bytes)
         .map_err(|e| StorageError::Codec(format!("LZ4 decoder error: {e}")))?;
 
     let mut decompressed = Vec::new();
-    std::io::copy(&mut decoder, &mut decompressed)
-        .map_err(|e| StorageError::Codec(format!("LZ4 decompression error: {e}")))?;
+    let mut chunk = [0_u8; 8 * 1024];
+
+    loop {
+        let read = std::io::Read::read(&mut decoder, &mut chunk)
+            .map_err(|e| StorageError::Codec(format!("LZ4 decompression error: {e}")))?;
+        if read == 0 {
+            break;
+        }
+
+        if let Some(limit) = max_output {
+            let new_len = decompressed.len().saturating_add(read);
+            if new_len > limit {
+                return Err(StorageError::Corrupt(format!(
+                    "Decompressed payload exceeds limit: {new_len} > {limit}"
+                )));
+            }
+        }
+
+        decompressed.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(decompressed)
+}
+
+/// Decompress bytes with an explicit maximum output size.
+pub(crate) fn decompress_with_limit(
+    bytes: &[u8],
+    max_output: usize,
+) -> Result<Vec<u8>, StorageError> {
+    decompress_internal(bytes, Some(max_output))
+}
+
+/// Decompress and deserialize data
+///
+/// Decompresses LZ4, then deserializes with bincode.
+pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
+    let decompressed = decompress_internal(bytes, None)?;
 
     // Deserialize with bincode
     bincode::deserialize(&decompressed)

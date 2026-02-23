@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Shard format version
 const SHARD_VERSION: u16 = 1;
 
+/// Hard cap for decompressed shard payload size (defense in depth).
+const MAX_SHARD_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
+
 /// Magic bytes for shard identification
 const MAGIC: &[u8; 5] = b"SUBQL";
 
@@ -205,6 +208,13 @@ pub fn deserialize_shard<I: IdTypes>(
     // Validate header
     header.validate(catalog)?;
 
+    if header.uncompressed_size > MAX_SHARD_UNCOMPRESSED_SIZE {
+        return Err(StorageError::Corrupt(format!(
+            "Uncompressed payload too large: {} > {}",
+            header.uncompressed_size, MAX_SHARD_UNCOMPRESSED_SIZE
+        )));
+    }
+
     // Extract payload bytes (skip header)
     let header_size = bincode::serialized_size(&header)
         .map_err(|e| StorageError::Codec(format!("Header size error: {e}")))?;
@@ -214,8 +224,30 @@ pub fn deserialize_shard<I: IdTypes>(
         .get(header_size as usize..)
         .ok_or_else(|| StorageError::Corrupt("Truncated shard".to_string()))?;
 
-    // Decompress and deserialize payload
-    let payload: ShardPayload<I> = codec::decode(payload_bytes)?;
+    let expected_compressed = usize::try_from(header.compressed_size)
+        .map_err(|_| StorageError::Corrupt("Compressed size does not fit usize".to_string()))?;
+    if payload_bytes.len() != expected_compressed {
+        return Err(StorageError::Corrupt(format!(
+            "Compressed payload size mismatch: header {}, actual {}",
+            expected_compressed,
+            payload_bytes.len()
+        )));
+    }
+
+    let expected_uncompressed = usize::try_from(header.uncompressed_size)
+        .map_err(|_| StorageError::Corrupt("Uncompressed size does not fit usize".to_string()))?;
+    let decompressed = codec::decompress_with_limit(payload_bytes, expected_uncompressed)?;
+    if decompressed.len() != expected_uncompressed {
+        return Err(StorageError::Corrupt(format!(
+            "Uncompressed payload size mismatch: header {}, actual {}",
+            expected_uncompressed,
+            decompressed.len()
+        )));
+    }
+
+    // Deserialize payload
+    let payload: ShardPayload<I> = bincode::deserialize(&decompressed)
+        .map_err(|e| StorageError::Codec(format!("Bincode deserialize error: {e}")))?;
 
     Ok((header, payload))
 }
@@ -325,6 +357,81 @@ mod tests {
         };
 
         let result = serialize_shard(1, &payload, &catalog);
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_compressed_size_mismatch() {
+        let catalog = make_catalog();
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![1, 2, 3],
+            },
+            created_at_unix_ms: 1,
+        };
+
+        let bytes = serialize_shard(1, &payload, &catalog).unwrap();
+        let header: ShardHeader = bincode::deserialize(&bytes).unwrap();
+        let header_size = usize::try_from(bincode::serialized_size(&header).unwrap()).unwrap();
+
+        let mut tampered_header = header;
+        tampered_header.compressed_size = tampered_header.compressed_size.saturating_add(1);
+        let mut tampered = bincode::serialize(&tampered_header).unwrap();
+        tampered.extend_from_slice(&bytes[header_size..]);
+
+        let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_uncompressed_size_mismatch() {
+        let catalog = make_catalog();
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![7, 8],
+            },
+            created_at_unix_ms: 2,
+        };
+
+        let bytes = serialize_shard(1, &payload, &catalog).unwrap();
+        let header: ShardHeader = bincode::deserialize(&bytes).unwrap();
+        let header_size = usize::try_from(bincode::serialized_size(&header).unwrap()).unwrap();
+
+        let mut tampered_header = header;
+        tampered_header.uncompressed_size = tampered_header.uncompressed_size.saturating_add(1);
+        let mut tampered = bincode::serialize(&tampered_header).unwrap();
+        tampered.extend_from_slice(&bytes[header_size..]);
+
+        let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_uncompressed_header() {
+        let catalog = make_catalog();
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![42],
+            },
+            created_at_unix_ms: 3,
+        };
+
+        let bytes = serialize_shard(1, &payload, &catalog).unwrap();
+        let header: ShardHeader = bincode::deserialize(&bytes).unwrap();
+        let header_size = usize::try_from(bincode::serialized_size(&header).unwrap()).unwrap();
+
+        let mut tampered_header = header;
+        tampered_header.uncompressed_size = u64::MAX;
+        let mut tampered = bincode::serialize(&tampered_header).unwrap();
+        tampered.extend_from_slice(&bytes[header_size..]);
+
+        let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
     }
 }

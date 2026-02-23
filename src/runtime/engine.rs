@@ -821,7 +821,13 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let bytes = std::fs::read(path)
             .map_err(|e| StorageError::Io(format!("Failed to read shard: {e}")))?;
 
-        let (_header, payload) = deserialize_shard::<I>(&bytes, &*self.catalog)?;
+        let (header, payload) = deserialize_shard::<I>(&bytes, &*self.catalog)?;
+        if header.table_id != table_id {
+            return Err(StorageError::Corrupt(format!(
+                "Shard table ID mismatch: filename table_id {table_id}, header table_id {}",
+                header.table_id
+            )));
+        }
 
         let (user_dict, entries) =
             Self::rebuild_entries_from_payload(&payload).map_err(|e| match e {
@@ -1186,6 +1192,43 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_no_where_matches_all_rows() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let spec = SubscriptionSpec {
+            subscription_id: 1,
+            user_id: 42,
+            session_id: None,
+            sql: "SELECT * FROM orders".to_string(),
+            updated_at_unix_ms: 0,
+        };
+        engine.register(spec).unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([
+                    Cell::Int(1),
+                    Cell::Int(200),
+                    Cell::String("pending".into()),
+                ]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        assert_eq!(users, vec![42]);
+    }
+
+    #[test]
     fn test_bindings_persist() {
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
@@ -1241,6 +1284,56 @@ mod tests {
         let partition = engine.partitions.get(&1).unwrap();
         let snapshot = partition.load_snapshot();
         assert!(!snapshot.predicates.bindings.contains_key(&100));
+    }
+
+    #[test]
+    fn test_unregister_one_of_duplicate_user_bindings_keeps_dispatch_match() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1000,
+                user_id: 7,
+                session_id: None,
+                sql: sql.clone(),
+                updated_at_unix_ms: 1,
+            })
+            .unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1001,
+                user_id: 7,
+                session_id: None,
+                sql,
+                updated_at_unix_ms: 2,
+            })
+            .unwrap();
+
+        assert!(engine.unregister_subscription(1000));
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([
+                    Cell::Int(1),
+                    Cell::Int(200),
+                    Cell::String("paid".into()),
+                ]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        assert_eq!(users, vec![7]);
     }
 
     #[test]
@@ -2171,6 +2264,41 @@ mod tests {
             ),
             Ok(_) => panic!("Expected error loading corrupt shard"),
         }
+    }
+
+    #[test]
+    fn test_load_shard_rejects_filename_header_table_id_mismatch() {
+        use crate::persistence::shard::{serialize_shard, ShardPayload, UserDictData};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 0,
+        };
+
+        // Header table_id = 2, filename implies table_id = 1.
+        let shard_bytes = serialize_shard::<DefaultIds>(2, &payload, &*catalog).unwrap();
+        let shard_path = temp_dir.path().join("table_1.shard");
+        std::fs::write(&shard_path, shard_bytes).unwrap();
+
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Corrupt(ref msg)) if msg.contains("table ID mismatch")
+        ));
     }
 
     // ========================================================================

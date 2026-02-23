@@ -222,10 +222,17 @@ impl<I: IdTypes> PredicateStore<I> {
     fn remove_binding_indexes(&mut self, binding: Binding<I>) {
         let sub_id = binding.subscription_id;
 
-        if let Some(bitmap) = self.predicate_users.get_mut(&binding.predicate_id) {
-            bitmap.remove(binding.user_ordinal.get());
-            if bitmap.is_empty() {
-                self.predicate_users.remove(&binding.predicate_id);
+        let has_other_same_user_binding = self.bindings.values().any(|existing| {
+            existing.predicate_id == binding.predicate_id
+                && existing.user_ordinal == binding.user_ordinal
+        });
+
+        if !has_other_same_user_binding {
+            if let Some(bitmap) = self.predicate_users.get_mut(&binding.predicate_id) {
+                bitmap.remove(binding.user_ordinal.get());
+                if bitmap.is_empty() {
+                    self.predicate_users.remove(&binding.predicate_id);
+                }
             }
         }
 
@@ -398,6 +405,44 @@ mod tests {
             .is_some_and(|bitmap| bitmap.contains(1)));
         assert!(store.get_session_subscriptions(500).is_none());
         assert_eq!(store.get_session_subscriptions(600), Some(&[100][..]));
+    }
+
+    #[test]
+    fn test_remove_binding_keeps_bitmap_when_same_user_has_another_binding() {
+        let mut store = PredicateStore::<DefaultIds>::new();
+
+        let pred = make_predicate(0, 0x3333, 0);
+        let pred_id = store.add_predicate(pred);
+
+        store.add_binding(Binding {
+            subscription_id: 201,
+            predicate_id: pred_id,
+            user_id: 42,
+            user_ordinal: UserOrdinal::new(0),
+            session_id: None,
+            updated_at_unix_ms: 1,
+        });
+        store.add_binding(Binding {
+            subscription_id: 202,
+            predicate_id: pred_id,
+            user_id: 42,
+            user_ordinal: UserOrdinal::new(0),
+            session_id: None,
+            updated_at_unix_ms: 2,
+        });
+
+        let _ = store.remove_binding(201);
+        let bitmap = store
+            .predicate_users
+            .get(&pred_id)
+            .expect("bitmap should remain while one binding still exists");
+        assert!(bitmap.contains(0));
+
+        let _ = store.remove_binding(202);
+        assert!(
+            !store.predicate_users.contains_key(&pred_id),
+            "bitmap should be removed after last binding is removed"
+        );
     }
 
     // ========================================================================

@@ -3,8 +3,14 @@
 use super::shard::{deserialize_shard, BindingData, PredicateData, ShardPayload, UserDictData};
 use crate::{DefaultIds, IdTypes, MergeError, MergeJobId, MergeReport, SchemaCatalog, TableId};
 use ahash::AHashMap;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{
+    mpsc::{self, Receiver, Sender, TryRecvError},
+    Arc, Mutex,
+};
 use std::thread;
+
+/// Fixed worker count for background merge tasks.
+const MERGE_WORKER_COUNT: usize = 4;
 
 /// Merged shard ready for swap
 #[derive(Debug)]
@@ -30,19 +36,59 @@ struct MergeJob<I: IdTypes> {
     receiver: Receiver<Result<MergedShard<I>, String>>,
 }
 
+struct MergeTask<I: IdTypes> {
+    table_id: TableId,
+    shard_bytes: Vec<Vec<u8>>,
+    catalog: Box<dyn SchemaCatalog + Send>,
+    result_sender: Sender<Result<MergedShard<I>, String>>,
+}
+
 /// Manager for background merge operations
 pub struct MergeManager<I: IdTypes = DefaultIds> {
     jobs: AHashMap<MergeJobId, MergeJob<I>>,
     next_job_id: MergeJobId,
+    task_sender: Sender<MergeTask<I>>,
 }
 
 impl<I: IdTypes> MergeManager<I> {
     /// Create new merge manager
     #[must_use]
     pub fn new() -> Self {
+        let (task_sender, task_receiver) = mpsc::channel::<MergeTask<I>>();
+        let shared_receiver = Arc::new(Mutex::new(task_receiver));
+
+        for _ in 0..MERGE_WORKER_COUNT {
+            let receiver = Arc::clone(&shared_receiver);
+            thread::spawn(move || {
+                loop {
+                    let task = {
+                        let lock = receiver
+                            .lock()
+                            .expect("merge worker task receiver mutex poisoned");
+                        lock.recv()
+                    };
+
+                    let Ok(task) = task else {
+                        break;
+                    };
+
+                    let start = std::time::Instant::now();
+                    let result =
+                        merge_shards_impl::<I>(task.table_id, &task.shard_bytes, &*task.catalog, start);
+
+                    // Receiver may have been dropped if caller discarded the job.
+                    if task.result_sender.send(result).is_err() {
+                        #[cfg(feature = "observability")]
+                        tracing::warn!("Merge result receiver dropped before result was sent");
+                    }
+                }
+            });
+        }
+
         Self {
             jobs: AHashMap::new(),
             next_job_id: 1,
+            task_sender,
         }
     }
 
@@ -60,19 +106,15 @@ impl<I: IdTypes> MergeManager<I> {
 
         let (tx, rx) = mpsc::channel();
 
-        // Spawn background thread
-        thread::spawn(move || {
-            let start = std::time::Instant::now();
-
-            // Perform merge
-            let result = merge_shards_impl::<I>(table_id, &shard_bytes, &*catalog, start);
-
-            // Send result — receiver may have been dropped if caller discarded the job
-            if tx.send(result).is_err() {
-                #[cfg(feature = "observability")]
-                tracing::warn!("Merge result receiver dropped before result was sent");
-            }
-        });
+        let task = MergeTask {
+            table_id,
+            shard_bytes,
+            catalog,
+            result_sender: tx,
+        };
+        self.task_sender.send(task).map_err(|_| {
+            MergeError::BuildFailed("Merge worker pool is unavailable".to_string())
+        })?;
 
         self.jobs.insert(job_id, MergeJob { receiver: rx });
 
@@ -263,6 +305,7 @@ mod tests {
     use super::super::shard::{serialize_shard, PredicateData, UserDictData};
     use super::*;
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     struct MockCatalog {
         fingerprints: HashMap<TableId, u64>,
@@ -290,6 +333,20 @@ mod tests {
         let mut fingerprints = HashMap::new();
         fingerprints.insert(1, 0x1234_5678_90AB_CDEF);
         MockCatalog { fingerprints }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_thread_count() -> usize {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("Threads:"))
+            .expect("Threads field should exist in /proc/self/status");
+        line.split_whitespace()
+            .nth(1)
+            .expect("Threads value")
+            .parse::<usize>()
+            .expect("Threads should parse as usize")
     }
 
     #[test]
@@ -686,5 +743,69 @@ mod tests {
         let result = manager.try_get_result(job_id);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_merge_uses_bounded_worker_threads() {
+        struct SlowCatalog;
+        impl SchemaCatalog for SlowCatalog {
+            fn table_id(&self, _table_name: &str) -> Option<TableId> {
+                Some(1)
+            }
+
+            fn column_id(&self, _table_id: TableId, _column_name: &str) -> Option<u16> {
+                Some(0)
+            }
+
+            fn table_arity(&self, _table_id: TableId) -> Option<usize> {
+                Some(1)
+            }
+
+            fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
+                std::thread::sleep(Duration::from_millis(200));
+                Some(0x1234_5678_90AB_CDEF)
+            }
+        }
+
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
+        let catalog = make_catalog();
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 1000,
+        };
+        let shard = serialize_shard(1, &payload, &catalog).unwrap();
+
+        let baseline_threads = linux_thread_count();
+        let job_count = 12;
+        for _ in 0..job_count {
+            manager
+                .merge_shards_background(1, vec![shard.clone()], Box::new(SlowCatalog))
+                .unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(30));
+        let during_threads = linux_thread_count();
+        let increase = during_threads.saturating_sub(baseline_threads);
+
+        // A bounded pool should not create one thread per queued job.
+        assert!(
+            increase <= 8,
+            "expected bounded merge workers; baseline={baseline_threads}, during={during_threads}, increase={increase}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while manager.active_jobs() > 0 && Instant::now() < deadline {
+            let ids: Vec<_> = manager.jobs.keys().copied().collect();
+            for job_id in ids {
+                let _ = manager.try_get_result(job_id);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(manager.active_jobs(), 0);
     }
 }
