@@ -6,14 +6,16 @@
 //! metadata, so we use type inference via [`infer_cell_from_json`].
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::pg_type::infer_cell_from_json;
-use super::row_build::build_row_from_map_with;
-use super::{changed_columns, pk_from_catalog_or_empty, resolve_table, WalParseError, WalParser};
-use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use super::map_cdc::{convert_map_cdc_event, parse_event_kind};
+use super::{resolve_table, WalParseError, WalParser};
+#[cfg(test)]
+use crate::{Cell, ColumnId, TableId};
+use crate::{EventKind, SchemaCatalog, WalEvent};
 
 // ============================================================================
 // Serde structs
@@ -69,12 +71,7 @@ impl WalParser for DebeziumParser {
 // ============================================================================
 
 fn parse_debezium_op(op: &str) -> Result<EventKind, WalParseError> {
-    match op {
-        "c" | "r" => Ok(EventKind::Insert),
-        "u" => Ok(EventKind::Update),
-        "d" => Ok(EventKind::Delete),
-        other => Err(WalParseError::UnknownEventKind(other.to_string())),
-    }
+    parse_event_kind(op, &["c", "r"], &["u"], &["d"])
 }
 
 fn convert_debezium_envelope(
@@ -87,101 +84,18 @@ fn convert_debezium_envelope(
     let table_id = resolve_table(&env.source.schema, &env.source.table, catalog)
         .or_else(|_| resolve_table(&env.source.db, &env.source.table, catalog))?;
 
-    match kind {
-        EventKind::Insert => {
-            let after = env
-                .after
-                .as_ref()
-                .ok_or_else(|| WalParseError::MissingField("after".to_string()))?;
-
-            let (new_row, resolved) = build_row_from_map(after, table_id, catalog)?;
-            let pk = build_debezium_pk(&resolved, table_id, catalog);
-
-            Ok(WalEvent {
-                kind,
-                table_id,
-                pk,
-                old_row: None,
-                new_row: Some(new_row),
-                changed_columns: Arc::from([]),
-            })
-        }
-
-        EventKind::Update => {
-            let after = env
-                .after
-                .as_ref()
-                .ok_or_else(|| WalParseError::MissingField("after".to_string()))?;
-
-            let (new_row, new_resolved) = build_row_from_map(after, table_id, catalog)?;
-
-            let (old_row, changed) = if let Some(ref before) = env.before {
-                let (old_img, _) = build_row_from_map(before, table_id, catalog)?;
-                let ch = changed_columns(&old_img, &new_row);
-                (Some(old_img), ch)
-            } else {
-                (None, Vec::new())
-            };
-
-            let pk = build_debezium_pk(&new_resolved, table_id, catalog);
-
-            Ok(WalEvent {
-                kind,
-                table_id,
-                pk,
-                old_row,
-                new_row: Some(new_row),
-                changed_columns: Arc::from(changed),
-            })
-        }
-
-        EventKind::Delete => {
-            let before = env
-                .before
-                .as_ref()
-                .ok_or_else(|| WalParseError::MissingField("before".to_string()))?;
-
-            let (old_row, resolved) = build_row_from_map(before, table_id, catalog)?;
-            let pk = build_debezium_pk(&resolved, table_id, catalog);
-
-            Ok(WalEvent {
-                kind,
-                table_id,
-                pk,
-                old_row: Some(old_row),
-                new_row: None,
-                changed_columns: Arc::from([]),
-            })
-        }
-    }
-}
-
-// ============================================================================
-// Row building
-// ============================================================================
-
-/// Build a [`RowImage`] from a Debezium column→value map.
-///
-/// Returns `(row_image, Vec<(ColumnId, Cell)>)` for PK extraction.
-fn build_row_from_map(
-    map: &HashMap<String, serde_json::Value>,
-    table_id: TableId,
-    catalog: &dyn SchemaCatalog,
-) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    build_row_from_map_with(map, table_id, catalog, infer_cell_from_json)
-}
-
-// ============================================================================
-// PK helper
-// ============================================================================
-
-/// Build PK from catalog metadata (Debezium's simplified envelope has no PK field).
-fn build_debezium_pk(
-    resolved: &[(ColumnId, Cell)],
-    table_id: TableId,
-    catalog: &dyn SchemaCatalog,
-) -> PrimaryKey {
-    pk_from_catalog_or_empty(resolved, table_id, catalog)
+    convert_map_cdc_event(
+        kind,
+        table_id,
+        env.after.as_ref(),
+        env.before.as_ref(),
+        "after",
+        "before",
+        "debezium.after",
+        "debezium.before",
+        None,
+        catalog,
+    )
 }
 
 // ============================================================================
@@ -587,6 +501,25 @@ mod tests {
             .parse_wal_message(json.as_bytes(), &catalog)
             .expect_err("should fail");
         assert!(matches!(err, WalParseError::MissingField(_)));
+    }
+
+    #[test]
+    fn error_numeric_overflow() {
+        let catalog = TestCatalog::orders();
+        let parser = DebeziumParser;
+
+        let json = r#"{
+            "before": null,
+            "after": {"id": 18446744073709551615},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "c",
+            "ts_ms": 1234567890
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("overflow should fail");
+        assert!(matches!(err, WalParseError::NumericOverflow { .. }));
     }
 
     // -- Trait checks -------------------------------------------------------

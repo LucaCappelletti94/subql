@@ -4,15 +4,25 @@
 
 use std::sync::Arc;
 
+use super::WalParseError;
 use crate::Cell;
 
-/// Convert a JSON value to a [`Cell`] given the PostgreSQL type name.
-///
-/// Handles wal2json quirks such as numeric values encoded as JSON strings.
+/// Test-only lossy converter retained for unit tests.
+#[cfg(test)]
 #[must_use]
-pub fn json_value_to_cell(value: &serde_json::Value, pg_type: &str) -> Cell {
+fn json_value_to_cell(value: &serde_json::Value, pg_type: &str) -> Cell {
+    json_value_to_cell_strict(value, pg_type, "value").unwrap_or_else(|_| string_cell(value))
+}
+
+/// Strict variant of [`json_value_to_cell`] that reports lossy numeric
+/// conversions as parse errors.
+pub(super) fn json_value_to_cell_strict(
+    value: &serde_json::Value,
+    pg_type: &str,
+    field: &str,
+) -> Result<Cell, WalParseError> {
     if value.is_null() {
-        return Cell::Null;
+        return Ok(Cell::Null);
     }
 
     // Normalize: lowercase, strip leading underscore (array indicator)
@@ -22,46 +32,56 @@ pub fn json_value_to_cell(value: &serde_json::Value, pg_type: &str) -> Cell {
     match ty {
         // Integer types
         "integer" | "int" | "int2" | "int4" | "int8" | "smallint" | "bigint" | "serial"
-        | "bigserial" | "smallserial" | "oid" => int_cell(value),
+        | "bigserial" | "smallserial" | "oid" => int_cell_strict(value, field),
 
         // Floating-point / numeric types
         "real" | "float4" | "double precision" | "float8" | "numeric" | "decimal" | "money" => {
-            float_cell(value)
+            Ok(float_cell(value))
         }
 
         // Boolean
-        "boolean" | "bool" => bool_cell(value),
+        "boolean" | "bool" => Ok(bool_cell(value)),
 
         // Everything else → String (including known text-like types)
-        _ => string_cell(value),
+        _ => Ok(string_cell(value)),
     }
 }
 
 /// Parse an integer cell. Handles JSON number and string encodings.
-fn int_cell(value: &serde_json::Value) -> Cell {
+fn int_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalParseError> {
     match value {
-        serde_json::Value::Number(n) => n.as_i64().map_or_else(
-            || {
-                n.as_u64().map_or_else(
-                    || {
-                        // Fractional number in an integer column — truncate.
-                        #[allow(clippy::cast_possible_truncation)]
-                        n.as_f64().map_or(Cell::Null, |f| Cell::Int(f as i64))
-                    },
-                    |u| {
-                        // u64 values that fit in i64 were already caught;
-                        // for values > i64::MAX, saturate.
-                        #[allow(clippy::cast_possible_wrap)]
-                        Cell::Int(u as i64)
-                    },
-                )
-            },
-            Cell::Int,
-        ),
-        serde_json::Value::String(s) => s
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                return Ok(Cell::Int(i));
+            }
+
+            if let Some(u) = n.as_u64() {
+                let i = i64::try_from(u).map_err(|_| WalParseError::NumericOverflow {
+                    field: field.to_string(),
+                    value: u.to_string(),
+                    target: "i64",
+                })?;
+                return Ok(Cell::Int(i));
+            }
+
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            if let Some(f) = n.as_f64() {
+                if f > i64::MAX as f64 || f < i64::MIN as f64 {
+                    return Err(WalParseError::NumericOverflow {
+                        field: field.to_string(),
+                        value: n.to_string(),
+                        target: "i64",
+                    });
+                }
+                return Ok(Cell::Int(f as i64));
+            }
+
+            Ok(Cell::Null)
+        }
+        serde_json::Value::String(s) => Ok(s
             .parse::<i64>()
-            .map_or_else(|_| Cell::String(Arc::from(s.as_str())), Cell::Int),
-        _ => string_cell(value),
+            .map_or_else(|_| Cell::String(Arc::from(s.as_str())), Cell::Int)),
+        _ => Ok(string_cell(value)),
     }
 }
 
@@ -99,31 +119,40 @@ fn string_cell(value: &serde_json::Value) -> Cell {
     }
 }
 
-/// Infer a [`Cell`] from a JSON value without type metadata.
-///
-/// Used by CDC formats (e.g. Maxwell) that provide no column type info.
-/// Maps JSON primitives directly: null→Null, bool→Bool, integer→Int,
-/// float→Float, string→String. Arrays and objects are JSON-serialized
-/// to a String fallback.
+/// Test-only lossy converter retained for unit tests.
+#[cfg(test)]
 #[must_use]
-pub fn infer_cell_from_json(value: &serde_json::Value) -> Cell {
+fn infer_cell_from_json(value: &serde_json::Value) -> Cell {
+    infer_cell_from_json_strict(value, "value").unwrap_or_else(|_| string_cell(value))
+}
+
+/// Strict variant of [`infer_cell_from_json`] that errors on unsigned values
+/// that do not fit into i64.
+pub(super) fn infer_cell_from_json_strict(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Cell, WalParseError> {
     match value {
-        serde_json::Value::Null => Cell::Null,
-        serde_json::Value::Bool(b) => Cell::Bool(*b),
+        serde_json::Value::Null => Ok(Cell::Null),
+        serde_json::Value::Bool(b) => Ok(Cell::Bool(*b)),
         #[allow(clippy::option_if_let_else)]
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Cell::Int(i)
+                Ok(Cell::Int(i))
             } else if let Some(u) = n.as_u64() {
-                #[allow(clippy::cast_possible_wrap)]
-                Cell::Int(u as i64)
+                let i = i64::try_from(u).map_err(|_| WalParseError::NumericOverflow {
+                    field: field.to_string(),
+                    value: u.to_string(),
+                    target: "i64",
+                })?;
+                Ok(Cell::Int(i))
             } else {
-                n.as_f64().map_or(Cell::Null, Cell::Float)
+                Ok(n.as_f64().map_or(Cell::Null, Cell::Float))
             }
         }
-        serde_json::Value::String(s) => Cell::String(Arc::from(s.as_str())),
+        serde_json::Value::String(s) => Ok(Cell::String(Arc::from(s.as_str()))),
         // Arrays and objects: JSON-serialize as fallback
-        other => Cell::String(Arc::from(other.to_string().as_str())),
+        other => Ok(Cell::String(Arc::from(other.to_string().as_str()))),
     }
 }
 
@@ -278,11 +307,26 @@ mod tests {
 
     #[test]
     fn int_large_u64() {
-        // u64 value exceeding i64::MAX triggers the u64 branch
+        // Non-strict helper falls back to a lossless string representation.
         let large = u64::MAX;
-        assert!(matches!(
+        assert_eq!(
             json_value_to_cell(&json!(large), "bigint"),
-            Cell::Int(_)
+            Cell::String(Arc::from(large.to_string()))
+        );
+    }
+
+    #[test]
+    fn int_large_u64_strict_errors() {
+        let large = u64::MAX;
+        let err = json_value_to_cell_strict(&json!(large), "bigint", "test.bigint")
+            .expect_err("overflow should fail in strict mode");
+        assert!(matches!(
+            err,
+            WalParseError::NumericOverflow {
+                field,
+                target: "i64",
+                ..
+            } if field == "test.bigint"
         ));
     }
 
@@ -533,6 +577,24 @@ mod tests {
     #[test]
     fn infer_large_u64() {
         let large = u64::MAX;
-        assert!(matches!(infer_cell_from_json(&json!(large)), Cell::Int(_)));
+        assert_eq!(
+            infer_cell_from_json(&json!(large)),
+            Cell::String(Arc::from(large.to_string()))
+        );
+    }
+
+    #[test]
+    fn infer_large_u64_strict_errors() {
+        let large = u64::MAX;
+        let err = infer_cell_from_json_strict(&json!(large), "test.value")
+            .expect_err("overflow should fail in strict mode");
+        assert!(matches!(
+            err,
+            WalParseError::NumericOverflow {
+                field,
+                target: "i64",
+                ..
+            } if field == "test.value"
+        ));
     }
 }

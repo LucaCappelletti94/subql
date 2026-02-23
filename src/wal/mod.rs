@@ -5,6 +5,7 @@
 //! messages and receive typed events.
 
 mod debezium;
+mod map_cdc;
 mod maxwell;
 mod pg_type;
 mod pgoutput;
@@ -16,7 +17,8 @@ pub use maxwell::MaxwellParser;
 pub use pgoutput::PgOutputParser;
 pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Parser};
 
-use crate::{Cell, ColumnId, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// Trait for converting raw WAL bytes into typed [`WalEvent`]s.
@@ -62,6 +64,14 @@ pub enum WalParseError {
     /// Payload structure is malformed (mismatched lengths, invalid counts, etc.).
     #[error("Malformed payload: {0}")]
     MalformedPayload(String),
+
+    /// Numeric value cannot be represented in target runtime type.
+    #[error("Numeric overflow in '{field}': value {value} does not fit into {target}")]
+    NumericOverflow {
+        field: String,
+        value: String,
+        target: &'static str,
+    },
 
     /// WAL column count does not match catalog arity.
     #[error("Arity mismatch for table {table_id}: WAL has {wal_count} columns, catalog has {catalog_arity}")]
@@ -128,6 +138,45 @@ pub(crate) fn build_pk_from_resolved(
     }
 }
 
+/// Resolve PK metadata names to column IDs and require each resolved PK column
+/// to be present in the provided row image data.
+pub(crate) fn strict_pk_column_ids_from_names(
+    table_id: TableId,
+    pk_col_names: &[String],
+    resolved: &[(ColumnId, Cell)],
+    catalog: &dyn SchemaCatalog,
+    context: &str,
+) -> Result<Vec<ColumnId>, WalParseError> {
+    let mut pk_col_ids = Vec::with_capacity(pk_col_names.len());
+    let mut seen = HashSet::with_capacity(pk_col_names.len());
+
+    for name in pk_col_names {
+        let col_id =
+            catalog
+                .column_id(table_id, name)
+                .ok_or_else(|| WalParseError::UnknownColumn {
+                    table_id,
+                    column: name.clone(),
+                })?;
+        if !seen.insert(col_id) {
+            return Err(WalParseError::MalformedPayload(format!(
+                "{context} contains duplicate column '{name}' (id {col_id})"
+            )));
+        }
+        if !resolved
+            .iter()
+            .any(|(resolved_col_id, _)| *resolved_col_id == col_id)
+        {
+            return Err(WalParseError::MalformedPayload(format!(
+                "{context} column '{name}' (id {col_id}) missing from row data"
+            )));
+        }
+        pk_col_ids.push(col_id);
+    }
+
+    Ok(pk_col_ids)
+}
+
 /// Build PK from catalog metadata, or return an empty PK when metadata is unavailable.
 pub(crate) fn pk_from_catalog_or_empty(
     resolved: &[(ColumnId, Cell)],
@@ -157,6 +206,53 @@ pub(crate) fn changed_columns(old: &RowImage, new: &RowImage) -> Vec<ColumnId> {
     }
 
     changed
+}
+
+/// Build INSERT event with consistent defaults.
+pub(crate) fn insert_event(table_id: TableId, pk: PrimaryKey, new_row: RowImage) -> WalEvent {
+    WalEvent {
+        kind: EventKind::Insert,
+        table_id,
+        pk,
+        old_row: None,
+        new_row: Some(new_row),
+        changed_columns: std::sync::Arc::from([]),
+    }
+}
+
+/// Build UPDATE event with consistent changed-column derivation.
+pub(crate) fn update_event(
+    table_id: TableId,
+    pk: PrimaryKey,
+    old_row: Option<RowImage>,
+    new_row: RowImage,
+) -> WalEvent {
+    let changed = if let Some(ref old) = old_row {
+        changed_columns(old, &new_row)
+    } else {
+        Vec::new()
+    };
+
+    WalEvent {
+        kind: EventKind::Update,
+        table_id,
+        pk,
+        old_row,
+        new_row: Some(new_row),
+        changed_columns: std::sync::Arc::from(changed),
+    }
+}
+
+/// Build DELETE event with consistent defaults.
+pub(crate) fn delete_event(table_id: TableId, pk: PrimaryKey, old_row: RowImage) -> WalEvent {
+    WalEvent {
+        kind: EventKind::Delete,
+        table_id,
+        pk,
+        old_row: Some(old_row),
+        new_row: None,
+        changed_columns: std::sync::Arc::from([]),
+    }
 }
 
 #[cfg(test)]

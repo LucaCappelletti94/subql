@@ -5,18 +5,16 @@
 //! column type information — values are bare JSON primitives, so we use
 //! type inference via [`infer_cell_from_json`].
 
+use serde::Deserialize;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 
-use serde::Deserialize;
-
-use super::pg_type::infer_cell_from_json;
-use super::row_build::build_row_from_map_with;
-use super::{
-    build_pk_from_resolved, changed_columns, pk_from_catalog_or_empty, resolve_table,
-    WalParseError, WalParser,
-};
-use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use super::map_cdc::{convert_map_cdc_event, parse_event_kind};
+use super::{resolve_table, WalParseError, WalParser};
+#[cfg(test)]
+use crate::{Cell, ColumnId, TableId};
+use crate::{EventKind, SchemaCatalog, WalEvent};
 
 // ============================================================================
 // Serde structs
@@ -74,12 +72,7 @@ impl WalParser for MaxwellParser {
 // ============================================================================
 
 fn parse_maxwell_kind(event_type: &str) -> Result<EventKind, WalParseError> {
-    match event_type {
-        "insert" => Ok(EventKind::Insert),
-        "update" => Ok(EventKind::Update),
-        "delete" => Ok(EventKind::Delete),
-        other => Err(WalParseError::UnknownEventKind(other.to_string())),
-    }
+    parse_event_kind(event_type, &["insert"], &["update"], &["delete"])
 }
 
 fn convert_maxwell_message(
@@ -89,118 +82,27 @@ fn convert_maxwell_message(
     let kind = parse_maxwell_kind(&msg.event_type)?;
     let table_id = resolve_table(&msg.database, &msg.table, catalog)?;
 
-    let data = msg
-        .data
-        .as_ref()
-        .ok_or_else(|| WalParseError::MissingField("data".to_string()))?;
+    let old_map = match kind {
+        EventKind::Delete => msg.data.as_ref(),
+        _ => msg.old.as_ref(),
+    };
+    let old_prefix = match kind {
+        EventKind::Delete => "maxwell.data",
+        _ => "maxwell.old",
+    };
 
-    match kind {
-        EventKind::Insert => {
-            let (new_row, resolved) = build_row_from_map(data, table_id, catalog)?;
-            let pk = build_maxwell_pk(
-                msg.primary_key_columns.as_deref(),
-                &resolved,
-                table_id,
-                catalog,
-            );
-
-            Ok(WalEvent {
-                kind,
-                table_id,
-                pk,
-                old_row: None,
-                new_row: Some(new_row),
-                changed_columns: Arc::from([]),
-            })
-        }
-
-        EventKind::Update => {
-            let (new_row, new_resolved) = build_row_from_map(data, table_id, catalog)?;
-
-            let (old_row, changed) = if let Some(ref old_map) = msg.old {
-                let (old_img, _) = build_row_from_map(old_map, table_id, catalog)?;
-                let ch = changed_columns(&old_img, &new_row);
-                (Some(old_img), ch)
-            } else {
-                (None, Vec::new())
-            };
-
-            let pk = build_maxwell_pk(
-                msg.primary_key_columns.as_deref(),
-                &new_resolved,
-                table_id,
-                catalog,
-            );
-
-            Ok(WalEvent {
-                kind,
-                table_id,
-                pk,
-                old_row,
-                new_row: Some(new_row),
-                changed_columns: Arc::from(changed),
-            })
-        }
-
-        EventKind::Delete => {
-            let (old_row, resolved) = build_row_from_map(data, table_id, catalog)?;
-            let pk = build_maxwell_pk(
-                msg.primary_key_columns.as_deref(),
-                &resolved,
-                table_id,
-                catalog,
-            );
-
-            Ok(WalEvent {
-                kind,
-                table_id,
-                pk,
-                old_row: Some(old_row),
-                new_row: None,
-                changed_columns: Arc::from([]),
-            })
-        }
-    }
-}
-
-// ============================================================================
-// Row building
-// ============================================================================
-
-/// Build a [`RowImage`] from a Maxwell column→value map.
-///
-/// Returns `(row_image, Vec<(ColumnId, Cell)>)` for PK extraction.
-fn build_row_from_map(
-    map: &HashMap<String, serde_json::Value>,
-    table_id: TableId,
-    catalog: &dyn SchemaCatalog,
-) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    build_row_from_map_with(map, table_id, catalog, infer_cell_from_json)
-}
-
-// ============================================================================
-// PK helper
-// ============================================================================
-
-/// Build PK from Maxwell message data.
-///
-/// Priority: message `primary_key_columns` → `catalog.primary_key_columns()` → empty PK.
-fn build_maxwell_pk(
-    pk_col_names: Option<&[String]>,
-    resolved: &[(ColumnId, Cell)],
-    table_id: TableId,
-    catalog: &dyn SchemaCatalog,
-) -> PrimaryKey {
-    if let Some(names) = pk_col_names {
-        // Resolve PK column names to IDs, then extract values from resolved data
-        let pk_col_ids: Vec<ColumnId> = names
-            .iter()
-            .filter_map(|name| catalog.column_id(table_id, name))
-            .collect();
-        return build_pk_from_resolved(resolved, &pk_col_ids);
-    }
-
-    pk_from_catalog_or_empty(resolved, table_id, catalog)
+    convert_map_cdc_event(
+        kind,
+        table_id,
+        msg.data.as_ref(),
+        old_map,
+        "data",
+        "data",
+        "maxwell.data",
+        old_prefix,
+        msg.primary_key_columns.as_deref(),
+        catalog,
+    )
 }
 
 // ============================================================================
@@ -584,6 +486,56 @@ mod tests {
             .parse_wal_message(json.as_bytes(), &catalog)
             .expect_err("should fail");
         assert!(matches!(err, WalParseError::MissingField(_)));
+    }
+
+    #[test]
+    fn error_numeric_overflow() {
+        let catalog = TestCatalog::maxwell_e();
+        let parser = MaxwellParser;
+
+        let json = r#"{
+            "database":"test","table":"e","type":"insert",
+            "data":{"id":18446744073709551615}
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("overflow should fail");
+        assert!(matches!(err, WalParseError::NumericOverflow { .. }));
+    }
+
+    #[test]
+    fn error_pk_metadata_unknown_column() {
+        let catalog = TestCatalog::maxwell_e();
+        let parser = MaxwellParser;
+
+        let json = r#"{
+            "database":"test","table":"e","type":"insert",
+            "data":{"id":1,"m":4.2,"c":"2020-01-01","comment":"hello"},
+            "primary_key_columns":["id","does_not_exist"]
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("unknown PK metadata column should fail");
+        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
+    }
+
+    #[test]
+    fn error_pk_metadata_column_missing_in_row() {
+        let catalog = TestCatalog::maxwell_e();
+        let parser = MaxwellParser;
+
+        let json = r#"{
+            "database":"test","table":"e","type":"insert",
+            "data":{"m":4.2,"c":"2020-01-01","comment":"hello"},
+            "primary_key_columns":["id"]
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("missing PK value in row should fail");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 
     // -- Trait checks -------------------------------------------------------

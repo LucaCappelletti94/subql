@@ -5,15 +5,19 @@
 //! changes in a transaction into a single message; version 2 emits one message
 //! per change.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::pg_type::json_value_to_cell;
-use super::row_build::{build_pk_from_typed_arrays_with, build_row_from_typed_arrays_with};
+use super::map_cdc::parse_event_kind;
+use super::pg_type::json_value_to_cell_strict;
+use super::row_build::{
+    build_pk_from_typed_arrays_with, build_row_from_named_typed_values_with,
+    build_row_from_typed_arrays_with,
+};
 use super::{
-    build_pk_from_resolved, changed_columns, pk_from_catalog_or_empty, resolve_table,
-    WalParseError, WalParser,
+    build_pk_from_resolved, delete_event, insert_event, pk_from_catalog_or_empty, resolve_table,
+    strict_pk_column_ids_from_names, update_event, WalParseError, WalParser,
 };
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
@@ -146,22 +150,12 @@ impl WalParser for Wal2JsonV2Parser {
 
 /// Parse event kind from v1 string.
 fn parse_v1_kind(kind: &str) -> Result<EventKind, WalParseError> {
-    match kind {
-        "insert" => Ok(EventKind::Insert),
-        "update" => Ok(EventKind::Update),
-        "delete" => Ok(EventKind::Delete),
-        other => Err(WalParseError::UnknownEventKind(other.to_string())),
-    }
+    parse_event_kind(kind, &["insert"], &["update"], &["delete"])
 }
 
 /// Parse event kind from v2 single-char action.
 fn parse_v2_kind(action: &str) -> Result<EventKind, WalParseError> {
-    match action {
-        "I" => Ok(EventKind::Insert),
-        "U" => Ok(EventKind::Update),
-        "D" => Ok(EventKind::Delete),
-        other => Err(WalParseError::UnknownEventKind(other.to_string())),
-    }
+    parse_event_kind(action, &["I"], &["U"], &["D"])
 }
 
 /// Build a [`RowImage`] from parallel name/type/value arrays.
@@ -182,7 +176,7 @@ fn build_row_from_arrays(
         table_id,
         catalog,
         "column",
-        json_value_to_cell,
+        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.column.{name}")),
     )
 }
 
@@ -192,44 +186,17 @@ fn build_row_from_v2_columns(
     table_id: TableId,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    let arity = catalog
-        .table_arity(table_id)
-        .ok_or_else(|| WalParseError::UnknownTable {
-            schema: String::new(),
-            table: format!("table_id={table_id}"),
-        })?;
-
-    let mut cells = vec![Cell::Missing; arity];
-    let mut resolved = Vec::with_capacity(columns.len());
-    let mut seen = HashSet::with_capacity(columns.len());
-
-    for col in columns {
-        let col_id =
-            catalog
-                .column_id(table_id, &col.name)
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: col.name.clone(),
-                })?;
-        if !seen.insert(col_id) {
-            return Err(WalParseError::MalformedPayload(format!(
-                "v2 columns contain duplicate column id {col_id} ('{}')",
-                col.name
-            )));
-        }
-        let cell = json_value_to_cell(&col.value, &col.type_name);
-        if (col_id as usize) < arity {
-            cells[col_id as usize] = cell.clone();
-        }
-        resolved.push((col_id, cell));
-    }
-
-    Ok((
-        RowImage {
-            cells: Arc::from(cells),
-        },
-        resolved,
-    ))
+    let typed_columns: Vec<(&str, &str, &serde_json::Value)> = columns
+        .iter()
+        .map(|col| (col.name.as_str(), col.type_name.as_str(), &col.value))
+        .collect();
+    build_row_from_named_typed_values_with(
+        &typed_columns,
+        table_id,
+        catalog,
+        "v2 columns",
+        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.column.{name}")),
+    )
 }
 
 /// Build a [`PrimaryKey`] from the old-keys section (names resolved through catalog).
@@ -247,7 +214,7 @@ fn build_pk_from_key_arrays(
         table_id,
         catalog,
         "oldkeys",
-        json_value_to_cell,
+        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.oldkeys.{name}")),
     )
 }
 
@@ -261,6 +228,20 @@ fn convert_v1_change(
 ) -> Result<WalEvent, WalParseError> {
     let kind = parse_v1_kind(&change.kind)?;
     let table_id = resolve_table(&change.schema, &change.table, catalog)?;
+
+    if matches!(kind, EventKind::Insert | EventKind::Update)
+        && change.columnnames.is_empty()
+        && change.columntypes.is_empty()
+        && change.columnvalues.is_empty()
+    {
+        return Err(WalParseError::MissingField(
+            "columnnames/columntypes/columnvalues".to_string(),
+        ));
+    }
+
+    if kind == EventKind::Delete && change.oldkeys.is_none() {
+        return Err(WalParseError::MissingField("oldkeys".to_string()));
+    }
 
     let (new_row, new_resolved) = if kind == EventKind::Insert || kind == EventKind::Update {
         let (row, resolved) = build_row_from_arrays(
@@ -300,24 +281,25 @@ fn convert_v1_change(
         (None, pk)
     };
 
-    let changed = if kind == EventKind::Update {
-        if let (Some(ref old), Some(ref new)) = (&old_row, &new_row) {
-            changed_columns(old, new)
-        } else {
-            Vec::new()
+    match kind {
+        EventKind::Insert => {
+            let new_row = new_row.ok_or_else(|| {
+                WalParseError::MissingField("columnnames/columntypes/columnvalues".to_string())
+            })?;
+            Ok(insert_event(table_id, pk, new_row))
         }
-    } else {
-        Vec::new()
-    };
-
-    Ok(WalEvent {
-        kind,
-        table_id,
-        pk,
-        old_row,
-        new_row,
-        changed_columns: Arc::from(changed),
-    })
+        EventKind::Update => {
+            let new_row = new_row.ok_or_else(|| {
+                WalParseError::MissingField("columnnames/columntypes/columnvalues".to_string())
+            })?;
+            Ok(update_event(table_id, pk, old_row, new_row))
+        }
+        EventKind::Delete => {
+            let old_row =
+                old_row.ok_or_else(|| WalParseError::MissingField("oldkeys".to_string()))?;
+            Ok(delete_event(table_id, pk, old_row))
+        }
+    }
 }
 
 // ============================================================================
@@ -336,18 +318,42 @@ fn convert_v2_message(
     })?;
     let table_id = resolve_table(schema, table, catalog)?;
 
-    let (new_row, new_resolved) = if let Some(ref columns) = msg.columns {
-        let (row, resolved) = build_row_from_v2_columns(columns, table_id, catalog)?;
-        (Some(row), resolved)
-    } else {
-        (None, Vec::new())
+    let (new_row, new_resolved) = match kind {
+        EventKind::Insert | EventKind::Update => {
+            let columns = msg
+                .columns
+                .as_ref()
+                .filter(|columns| !columns.is_empty())
+                .ok_or_else(|| WalParseError::MissingField("columns".to_string()))?;
+            let (row, resolved) = build_row_from_v2_columns(columns, table_id, catalog)?;
+            (Some(row), resolved)
+        }
+        EventKind::Delete => (None, Vec::new()),
     };
 
-    let (old_row, identity_resolved) = if let Some(ref identity) = msg.identity {
-        let (row, resolved) = build_row_from_v2_columns(identity, table_id, catalog)?;
-        (Some(row), resolved)
-    } else {
-        (None, Vec::new())
+    let (old_row, identity_resolved) = match kind {
+        EventKind::Delete => {
+            let identity = msg
+                .identity
+                .as_ref()
+                .filter(|identity| !identity.is_empty())
+                .ok_or_else(|| WalParseError::MissingField("identity".to_string()))?;
+            let (row, resolved) = build_row_from_v2_columns(identity, table_id, catalog)?;
+            (Some(row), resolved)
+        }
+        EventKind::Update => {
+            if let Some(identity) = msg
+                .identity
+                .as_ref()
+                .filter(|identity| !identity.is_empty())
+            {
+                let (row, resolved) = build_row_from_v2_columns(identity, table_id, catalog)?;
+                (Some(row), resolved)
+            } else {
+                (None, Vec::new())
+            }
+        }
+        EventKind::Insert => (None, Vec::new()),
     };
 
     // Build PK: prefer identity columns, then pk metadata, then catalog.
@@ -356,10 +362,14 @@ fn convert_v2_message(
     let pk = if !identity_resolved.is_empty() {
         // Use identity columns as PK source (UPDATE/DELETE)
         if let Some(ref pk_cols) = msg.pk {
-            let pk_col_ids: Vec<ColumnId> = pk_cols
-                .iter()
-                .filter_map(|c| catalog.column_id(table_id, &c.name))
-                .collect();
+            let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
+            let pk_col_ids = strict_pk_column_ids_from_names(
+                table_id,
+                &pk_names,
+                &identity_resolved,
+                catalog,
+                "pk",
+            )?;
             build_pk_from_resolved(&identity_resolved, &pk_col_ids)
         } else {
             // No pk metadata — use all identity columns as PK
@@ -372,33 +382,31 @@ fn convert_v2_message(
         }
     } else if let Some(ref pk_cols) = msg.pk {
         // INSERT — extract PK from new row using pk metadata
-        let pk_col_ids: Vec<ColumnId> = pk_cols
-            .iter()
-            .filter_map(|c| catalog.column_id(table_id, &c.name))
-            .collect();
+        let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
+        let pk_col_ids =
+            strict_pk_column_ids_from_names(table_id, &pk_names, &new_resolved, catalog, "pk")?;
         build_pk_from_resolved(&new_resolved, &pk_col_ids)
     } else {
         pk_from_catalog_or_empty(&new_resolved, table_id, catalog)
     };
 
-    let changed = if kind == EventKind::Update {
-        if let (Some(ref old), Some(ref new)) = (&old_row, &new_row) {
-            changed_columns(old, new)
-        } else {
-            Vec::new()
+    match kind {
+        EventKind::Insert => {
+            let new_row =
+                new_row.ok_or_else(|| WalParseError::MissingField("columns".to_string()))?;
+            Ok(insert_event(table_id, pk, new_row))
         }
-    } else {
-        Vec::new()
-    };
-
-    Ok(WalEvent {
-        kind,
-        table_id,
-        pk,
-        old_row,
-        new_row,
-        changed_columns: Arc::from(changed),
-    })
+        EventKind::Update => {
+            let new_row =
+                new_row.ok_or_else(|| WalParseError::MissingField("columns".to_string()))?;
+            Ok(update_event(table_id, pk, old_row, new_row))
+        }
+        EventKind::Delete => {
+            let old_row =
+                old_row.ok_or_else(|| WalParseError::MissingField("identity".to_string()))?;
+            Ok(delete_event(table_id, pk, old_row))
+        }
+    }
 }
 
 // ============================================================================
@@ -1310,6 +1318,147 @@ mod tests {
             .parse_wal_message(json.as_bytes(), &catalog)
             .expect_err("should fail");
         assert!(matches!(err, WalParseError::UnknownColumn { .. }));
+    }
+
+    #[test]
+    fn error_v1_delete_missing_oldkeys() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV1Parser;
+
+        let json = r#"{
+            "change": [{
+                "kind": "delete",
+                "schema": "public",
+                "table": "orders"
+            }]
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("delete without oldkeys should fail");
+        assert!(matches!(err, WalParseError::MissingField(field) if field == "oldkeys"));
+    }
+
+    #[test]
+    fn error_v2_insert_missing_columns() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{
+            "action": "I",
+            "schema": "public",
+            "table": "orders"
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("insert without columns should fail");
+        assert!(matches!(err, WalParseError::MissingField(field) if field == "columns"));
+    }
+
+    #[test]
+    fn error_v2_update_missing_columns() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{
+            "action": "U",
+            "schema": "public",
+            "table": "orders",
+            "identity": [
+                {"name": "id", "type": "integer", "value": 1}
+            ]
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("update without columns should fail");
+        assert!(matches!(err, WalParseError::MissingField(field) if field == "columns"));
+    }
+
+    #[test]
+    fn error_v2_delete_missing_identity() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{
+            "action": "D",
+            "schema": "public",
+            "table": "orders"
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("delete without identity should fail");
+        assert!(matches!(err, WalParseError::MissingField(field) if field == "identity"));
+    }
+
+    #[test]
+    fn error_v2_numeric_overflow() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{
+            "action": "I",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "id", "type": "bigint", "value": 18446744073709551615}
+            ]
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("overflow should fail");
+        assert!(matches!(err, WalParseError::NumericOverflow { .. }));
+    }
+
+    #[test]
+    fn error_v2_pk_metadata_unknown_column() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{
+            "action": "I",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "id", "type": "bigint", "value": 1},
+                {"name": "amount", "type": "numeric", "value": 12.5}
+            ],
+            "pk": [
+                {"name": "id", "type": "bigint"},
+                {"name": "missing_pk_col", "type": "bigint"}
+            ]
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("unknown PK metadata column should fail");
+        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
+    }
+
+    #[test]
+    fn error_v2_pk_metadata_column_missing_in_row() {
+        let catalog = TestCatalog::orders();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{
+            "action": "I",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "amount", "type": "numeric", "value": 12.5}
+            ],
+            "pk": [
+                {"name": "id", "type": "bigint"}
+            ]
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("missing PK value in row should fail");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 
     // -- Direct test: build_pk_from_key_arrays with unknown column -----------

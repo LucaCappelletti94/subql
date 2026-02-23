@@ -3,7 +3,7 @@
 use super::{ids::UserOrdinal, partition::TablePartition};
 use crate::{
     compiler::{Tri, Vm},
-    DispatchError, EventKind, IdTypes, WalEvent,
+    DispatchError, EventKind, IdTypes, RowImage, WalEvent,
 };
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
@@ -104,6 +104,30 @@ impl<I: IdTypes> Iterator for MatchedUsers<'_, I> {
     }
 }
 
+/// Select the row image used for dispatch based on event kind.
+pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchError> {
+    match event.kind {
+        EventKind::Insert => event
+            .new_row
+            .as_ref()
+            .ok_or(DispatchError::MissingRequiredRowImage(
+                "INSERT requires new_row",
+            )),
+        EventKind::Update => event
+            .new_row
+            .as_ref()
+            .ok_or(DispatchError::MissingRequiredRowImage(
+                "UPDATE requires new_row",
+            )),
+        EventKind::Delete => event
+            .old_row
+            .as_ref()
+            .ok_or(DispatchError::MissingRequiredRowImage(
+                "DELETE requires old_row",
+            )),
+    }
+}
+
 /// Dispatch event to interested users
 ///
 /// Main dispatch algorithm:
@@ -120,33 +144,18 @@ pub fn dispatch_users<'a, I: IdTypes>(
     vm: &mut Vm,
 ) -> Result<MatchedUsers<'a, I>, DispatchError> {
     // 1. Get row image based on event kind (validates presence)
-    let row = match event.kind {
-        EventKind::Insert => {
-            event
-                .new_row
-                .as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage(
-                    "INSERT requires new_row",
-                ))?
-        }
-        EventKind::Update => {
-            event
-                .new_row
-                .as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage(
-                    "UPDATE requires new_row",
-                ))?
-        }
-        EventKind::Delete => {
-            event
-                .old_row
-                .as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage(
-                    "DELETE requires old_row",
-                ))?
-        }
-    };
+    let row = select_event_row(event)?;
 
+    dispatch_users_with_row(event, row, partition, user_dict, vm)
+}
+
+pub(crate) fn dispatch_users_with_row<'a, I: IdTypes>(
+    event: &WalEvent,
+    row: &RowImage,
+    partition: &TablePartition<I>,
+    user_dict: &'a UserDictionary<I>,
+    vm: &mut Vm,
+) -> Result<MatchedUsers<'a, I>, DispatchError> {
     // 2. Select candidates (index lookups + fallback)
     let candidates = partition.select_candidates(row, event.kind, &event.changed_columns);
 

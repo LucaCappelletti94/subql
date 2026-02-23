@@ -2,8 +2,8 @@
 
 use super::indexes::IndexableAtom;
 use super::{
-    dispatch::{dispatch_users, MatchedUsers, UserDictionary},
-    ids::PredicateId,
+    dispatch::{dispatch_users_with_row, select_event_row, MatchedUsers, UserDictionary},
+    ids::{PredicateId, UserOrdinal},
     partition::TablePartition,
     predicate::{Binding, Predicate},
 };
@@ -26,10 +26,15 @@ use crate::{
 };
 use ahash::{AHashMap, AHashSet};
 use sqlparser::dialect::Dialect;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::io::Write;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 type BatchEntries<I> = Vec<(Predicate, Vec<IndexableAtom>, Vec<Binding<I>>)>;
 
-struct CompiledBatchEntry<I: IdTypes> {
+struct CompiledSpec<I: IdTypes> {
     spec: SubscriptionSpec<I>,
     table_id: TableId,
     bytecode: BytecodeProgram,
@@ -48,6 +53,14 @@ struct CatalogRef(Arc<dyn SchemaCatalog>);
 enum RebuildPayloadError {
     Codec(String),
     Corrupt(String),
+}
+
+#[cfg(test)]
+static INJECT_PARENT_DIR_SYNC_FAILURE_DIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
+fn injected_parent_dir_sync_failure_dirs() -> &'static Mutex<HashSet<PathBuf>> {
+    INJECT_PARENT_DIR_SYNC_FAILURE_DIRS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 impl std::fmt::Display for RebuildPayloadError {
@@ -115,6 +128,70 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         atoms
     }
 
+    fn compile_spec(&self, spec: SubscriptionSpec<I>) -> Result<CompiledSpec<I>, RegisterError> {
+        let (table_id, bytecode, normalized, prefilter_plan) =
+            parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog)?;
+        let hash = canonicalize::hash_sql(&normalized);
+
+        Ok(CompiledSpec {
+            spec,
+            table_id,
+            bytecode,
+            normalized,
+            prefilter_plan,
+            hash,
+        })
+    }
+
+    fn make_predicate_from_compiled(compiled: &CompiledSpec<I>) -> (Predicate, Vec<IndexableAtom>) {
+        let atoms = Self::index_atoms_from_plan(&compiled.prefilter_plan);
+        let pred = Predicate {
+            // Placeholder; store allocates the authoritative ID.
+            id: PredicateId::from_slab_index(0),
+            hash: compiled.hash,
+            normalized_sql: compiled.normalized.clone().into(),
+            bytecode: Arc::new(compiled.bytecode.clone()),
+            dependency_columns: Arc::from(compiled.bytecode.dependency_columns.as_slice()),
+            index_atoms: Arc::from(atoms.as_slice()),
+            prefilter_plan: Arc::new(compiled.prefilter_plan.clone()),
+            refcount: 0, // Will be incremented via binding
+            updated_at_unix_ms: compiled.spec.updated_at_unix_ms,
+        };
+        (pred, atoms)
+    }
+
+    fn make_binding(
+        spec: &SubscriptionSpec<I>,
+        pred_id: PredicateId,
+        user_ord: UserOrdinal,
+    ) -> Binding<I> {
+        Binding {
+            subscription_id: spec.subscription_id,
+            predicate_id: pred_id,
+            user_id: spec.user_id,
+            user_ordinal: user_ord,
+            session_id: spec.session_id,
+            updated_at_unix_ms: spec.updated_at_unix_ms,
+        }
+    }
+
+    fn is_post_commit_dirsync_error(err: &StorageError) -> bool {
+        matches!(err, StorageError::Io(msg) if msg.starts_with("post_commit_dirsync:"))
+    }
+
+    #[cfg(test)]
+    fn should_inject_parent_dir_sync_failure(path: &Path) -> bool {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let lock = injected_parent_dir_sync_failure_dirs();
+        let guard = match lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.contains(parent)
+    }
+
     /// Create new subscription engine
     #[must_use]
     pub fn new(catalog: Arc<dyn SchemaCatalog>, dialect: D) -> Self {
@@ -171,13 +248,13 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     #[allow(clippy::needless_pass_by_value)]
     pub fn register(&mut self, spec: SubscriptionSpec<I>) -> Result<RegisterResult, RegisterError> {
         // 1. Parse, compile, and canonicalize in one pass.
-        let (table_id, bytecode, normalized, prefilter_plan) =
-            parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog)?;
-        let hash = canonicalize::hash_sql(&normalized);
+        let compiled = self.compile_spec(spec)?;
+        let table_id = compiled.table_id;
+        let hash = compiled.hash;
 
         // 2. Upsert semantics: replace existing subscription ID atomically
         // after new SQL has been validated.
-        let _ = self.unregister_subscription_internal(spec.subscription_id);
+        let _ = self.unregister_subscription_internal(compiled.spec.subscription_id);
 
         // 3. Get/create table partition and user dictionary
         let partition = self
@@ -188,7 +265,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let user_dict = self.user_dictionaries.entry(table_id).or_default();
 
         // 4. Get user ordinal
-        let user_ord = user_dict.get_or_create(spec.user_id);
+        let user_ord = user_dict.get_or_create(compiled.spec.user_id);
 
         // 5. Check if predicate exists (deduplication)
         let snapshot = partition.load_snapshot();
@@ -199,19 +276,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             (existing, false)
         } else {
             // Create new predicate
-            let atoms = Self::index_atoms_from_plan(&prefilter_plan);
-            let pred = Predicate {
-                // Placeholder; store allocates the authoritative ID.
-                id: PredicateId::from_slab_index(0),
-                hash,
-                normalized_sql: normalized.clone().into(),
-                bytecode: Arc::new(bytecode.clone()),
-                dependency_columns: Arc::from(bytecode.dependency_columns.as_slice()),
-                index_atoms: Arc::from(atoms.as_slice()),
-                prefilter_plan: Arc::new(prefilter_plan),
-                refcount: 0, // Will be incremented via binding
-                updated_at_unix_ms: spec.updated_at_unix_ms,
-            };
+            let (pred, atoms) = Self::make_predicate_from_compiled(&compiled);
             // Add predicate to partition
             let pred_id = partition.add_predicate(pred, atoms);
 
@@ -219,21 +284,14 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         };
 
         // 6. Create binding
-        let binding = Binding {
-            subscription_id: spec.subscription_id,
-            predicate_id: pred_id,
-            user_id: spec.user_id,
-            user_ordinal: user_ord,
-            session_id: spec.session_id,
-            updated_at_unix_ms: spec.updated_at_unix_ms,
-        };
+        let binding = Self::make_binding(&compiled.spec, pred_id, user_ord);
 
         // Add binding to partition
         partition.add_binding(binding, pred_id);
 
         // 7. Index subscription for O(1) unregister/upsert lookups.
         self.subscription_to_table
-            .insert(spec.subscription_id, table_id);
+            .insert(compiled.spec.subscription_id, table_id);
 
         // 8. Check if rotation needed (if storage enabled)
         if self.storage_path.is_some() {
@@ -254,8 +312,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                         let _ = snapshot_err;
                     }
                     Err(e) => {
-                        // Roll back this registration so Required durability is atomic.
-                        let _ = self.unregister_subscription_internal(spec.subscription_id);
+                        // Pre-commit durability failures can be rolled back safely.
+                        // Post-commit dir-sync failures mean data was already renamed.
+                        if !Self::is_post_commit_dirsync_error(&e) {
+                            let _ = self
+                                .unregister_subscription_internal(compiled.spec.subscription_id);
+                        }
                         return Err(RegisterError::Storage(format!(
                             "Snapshot failed for table {table_id}: {e}"
                         )));
@@ -266,7 +328,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         Ok(RegisterResult {
             table_id,
-            normalized_sql: normalized,
+            normalized_sql: compiled.normalized,
             predicate_hash: hash,
             created_new_predicate: created_new,
         })
@@ -299,28 +361,20 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Phase 1: Parse and compile all specs (can fail individually)
-        let mut compiled: Vec<Option<CompiledBatchEntry<I>>> = Vec::with_capacity(specs.len());
+        let mut compiled: Vec<Option<CompiledSpec<I>>> = Vec::with_capacity(specs.len());
         let mut results: Vec<Result<RegisterResult, RegisterError>> =
             Vec::with_capacity(specs.len());
 
         for spec in specs {
-            match parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog) {
-                Ok((table_id, bytecode, normalized, prefilter_plan)) => {
-                    let hash = canonicalize::hash_sql(&normalized);
-                    compiled.push(Some(CompiledBatchEntry {
-                        spec,
-                        table_id,
-                        bytecode,
-                        normalized,
-                        prefilter_plan,
-                        hash,
-                    }));
+            match self.compile_spec(spec) {
+                Ok(compiled_spec) => {
                     results.push(Ok(RegisterResult {
-                        table_id,
+                        table_id: compiled_spec.table_id,
                         normalized_sql: String::new(), // filled in phase 2
-                        predicate_hash: hash,
+                        predicate_hash: compiled_spec.hash,
                         created_new_predicate: false, // filled in phase 2
                     }));
+                    compiled.push(Some(compiled_spec));
                 }
                 Err(e) => {
                     compiled.push(None);
@@ -361,14 +415,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             if let Some(pred_id) = existing {
                 // Predicate exists in the live partition — add binding directly
                 // (cannot batch this since it references an existing pred_id)
-                let binding = Binding {
-                    subscription_id: c.spec.subscription_id,
-                    predicate_id: pred_id,
-                    user_id: c.spec.user_id,
-                    user_ordinal: user_ord,
-                    session_id: c.spec.session_id,
-                    updated_at_unix_ms: c.spec.updated_at_unix_ms,
-                };
+                let binding = Self::make_binding(&c.spec, pred_id, user_ord);
                 partition.add_binding(binding, pred_id);
                 self.subscription_to_table
                     .insert(c.spec.subscription_id, c.table_id);
@@ -376,38 +423,15 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             } else if let Some(&batch_idx) = batch_hash_to_idx.get(&(c.table_id, c.hash)) {
                 // Deduplicated within this batch — add binding to existing batch entry
                 let entries = table_entries.get_mut(&c.table_id).expect("table exists");
-                let binding = Binding {
-                    subscription_id: c.spec.subscription_id,
-                    predicate_id: PredicateId::from_slab_index(0), // placeholder
-                    user_id: c.spec.user_id,
-                    user_ordinal: user_ord,
-                    session_id: c.spec.session_id,
-                    updated_at_unix_ms: c.spec.updated_at_unix_ms,
-                };
+                let binding =
+                    Self::make_binding(&c.spec, PredicateId::from_slab_index(0), user_ord);
                 entries[batch_idx].2.push(binding);
                 created_new = false;
             } else {
                 // New predicate — create batch entry
-                let atoms = Self::index_atoms_from_plan(&c.prefilter_plan);
-                let pred = super::predicate::Predicate {
-                    id: PredicateId::from_slab_index(0),
-                    hash: c.hash,
-                    normalized_sql: c.normalized.clone().into(),
-                    bytecode: Arc::new(c.bytecode.clone()),
-                    dependency_columns: Arc::from(c.bytecode.dependency_columns.as_slice()),
-                    index_atoms: Arc::from(atoms.as_slice()),
-                    prefilter_plan: Arc::new(c.prefilter_plan.clone()),
-                    refcount: 0,
-                    updated_at_unix_ms: c.spec.updated_at_unix_ms,
-                };
-                let binding = Binding {
-                    subscription_id: c.spec.subscription_id,
-                    predicate_id: PredicateId::from_slab_index(0), // placeholder
-                    user_id: c.spec.user_id,
-                    user_ordinal: user_ord,
-                    session_id: c.spec.session_id,
-                    updated_at_unix_ms: c.spec.updated_at_unix_ms,
-                };
+                let (pred, atoms) = Self::make_predicate_from_compiled(&c);
+                let binding =
+                    Self::make_binding(&c.spec, PredicateId::from_slab_index(0), user_ord);
 
                 let entries = table_entries.entry(c.table_id).or_default();
                 let batch_idx = entries.len();
@@ -439,7 +463,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         if self.storage_path.is_some() {
-            let mut failures: Vec<(TableId, String)> = Vec::new();
+            let mut failures: Vec<(TableId, String, bool)> = Vec::new();
 
             for &table_id in table_result_indices.keys() {
                 let should_rotate = match self.should_rotate(table_id) {
@@ -456,6 +480,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                             failures.push((
                                 table_id,
                                 format!("Rotation check failed for table {table_id}: {e}"),
+                                false,
                             ));
                         }
                         false
@@ -477,16 +502,19 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                         failures.push((
                             table_id,
                             format!("Snapshot failed for table {table_id}: {e}"),
+                            Self::is_post_commit_dirsync_error(&e),
                         ));
                     }
                 }
             }
 
             if !failures.is_empty() && self.durability_mode == DurabilityMode::Required {
-                for (table_id, message) in failures {
-                    if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
-                        for &sub_id in sub_ids {
-                            let _ = self.unregister_subscription_internal(sub_id);
+                for (table_id, message, post_commit) in failures {
+                    if !post_commit {
+                        if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
+                            for &sub_id in sub_ids {
+                                let _ = self.unregister_subscription_internal(sub_id);
+                            }
                         }
                     }
                     if let Some(indices) = table_result_indices.get(&table_id) {
@@ -555,23 +583,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
         // Validate selected row image arity against schema catalog.
-        let row =
-            match event.kind {
-                crate::EventKind::Insert | crate::EventKind::Update => event
-                    .new_row
-                    .as_ref()
-                    .ok_or(DispatchError::MissingRequiredRowImage(
-                        "INSERT/UPDATE requires new_row",
-                    ))?,
-                crate::EventKind::Delete => {
-                    event
-                        .old_row
-                        .as_ref()
-                        .ok_or(DispatchError::MissingRequiredRowImage(
-                            "DELETE requires old_row",
-                        ))?
-                }
-            };
+        let row = select_event_row(event)?;
 
         if let Some(expected) = self.catalog.table_arity(event.table_id) {
             let got = row.len();
@@ -585,7 +597,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Dispatch
-        dispatch_users(event, partition, user_dict, &mut self.vm)
+        dispatch_users_with_row(event, row, partition, user_dict, &mut self.vm)
     }
 
     /// Unregister all subscriptions for a session
@@ -675,6 +687,109 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     // Persistence Methods
     // ========================================================================
 
+    fn sync_parent_dir(path: &Path) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if Self::should_inject_parent_dir_sync_failure(path) {
+            return Err(StorageError::Io("injected failure".to_string()));
+        }
+
+        #[cfg(unix)]
+        {
+            let parent = path.parent().ok_or_else(|| {
+                StorageError::Io(format!("Path has no parent directory: {}", path.display()))
+            })?;
+            let dir = std::fs::File::open(parent).map_err(|e| {
+                StorageError::Io(format!(
+                    "Failed to open parent directory '{}': {e}",
+                    parent.display()
+                ))
+            })?;
+            dir.sync_all().map_err(|e| {
+                StorageError::Io(format!(
+                    "Failed to sync parent directory '{}': {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        #[cfg(not(unix))]
+        let _ = path;
+
+        Ok(())
+    }
+
+    fn durable_atomic_replace(
+        storage_path: &Path,
+        shard_path: &Path,
+        tmp_stem: &str,
+        bytes: &[u8],
+        seed_ms: u64,
+    ) -> Result<(), StorageError> {
+        const MAX_ATTEMPTS: u32 = 32;
+        let pid = std::process::id();
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let tmp_name = format!("{tmp_stem}.shard.tmp.{pid}.{seed_ms}.{attempt}");
+            let tmp_path = storage_path.join(tmp_name);
+
+            let file = match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(StorageError::Io(format!(
+                        "pre_commit: Failed to create temp shard '{}': {e}",
+                        tmp_path.display()
+                    )));
+                }
+            };
+
+            let write_result = (|| -> Result<(), StorageError> {
+                let mut file = file;
+                file.write_all(bytes).map_err(|e| {
+                    StorageError::Io(format!(
+                        "pre_commit: Failed to write temp shard '{}': {e}",
+                        tmp_path.display()
+                    ))
+                })?;
+                file.sync_all().map_err(|e| {
+                    StorageError::Io(format!(
+                        "pre_commit: Failed to sync temp shard '{}': {e}",
+                        tmp_path.display()
+                    ))
+                })?;
+                drop(file);
+
+                std::fs::rename(&tmp_path, shard_path).map_err(|e| {
+                    StorageError::Io(format!(
+                        "pre_commit: Failed to rename '{}' -> '{}': {e}",
+                        tmp_path.display(),
+                        shard_path.display()
+                    ))
+                })?;
+
+                Self::sync_parent_dir(shard_path)
+                    .map_err(|e| StorageError::Io(format!("post_commit_dirsync: {e}")))?;
+                Ok(())
+            })();
+
+            if let Err(e) = write_result {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+
+            return Ok(());
+        }
+
+        Err(StorageError::Io(format!(
+            "pre_commit: Failed to allocate unique temp shard path for '{}'",
+            shard_path.display()
+        )))
+    }
+
     /// Snapshot table partition to disk
     ///
     /// Serializes all predicates, bindings, and user dictionary to a shard file.
@@ -756,12 +871,15 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         // Serialize shard
         let bytes = serialize_shard::<I>(table_id, &payload, &*self.catalog)?;
 
-        // Write to disk
+        // Write to disk atomically (temp file + fsync + rename + parent-dir fsync).
         let shard_path = storage_path.join(format!("table_{table_id}.shard"));
-        std::fs::write(&shard_path, bytes)
-            .map_err(|e| StorageError::Io(format!("Failed to write shard: {e}")))?;
-
-        Ok(())
+        Self::durable_atomic_replace(
+            storage_path,
+            &shard_path,
+            &format!("table_{table_id}"),
+            &bytes,
+            payload.created_at_unix_ms,
+        )
     }
 
     fn rebuild_entries_from_payload(
@@ -1088,8 +1206,7 @@ mod tests {
     use crate::{Cell, DefaultIds, EventKind, PrimaryKey, RowImage};
     use sqlparser::dialect::PostgreSqlDialect;
     use std::collections::HashMap;
-    #[cfg(unix)]
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn make_catalog() -> Arc<MockCatalog> {
         let mut tables = HashMap::new();
@@ -1110,6 +1227,34 @@ mod tests {
         let mut perms = std::fs::metadata(path).unwrap().permissions();
         perms.set_mode(mode);
         std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    struct ParentDirSyncFailureGuard {
+        dir: PathBuf,
+    }
+
+    impl ParentDirSyncFailureGuard {
+        fn for_dir(dir: &Path) -> Self {
+            let dir = dir.to_path_buf();
+            let lock = injected_parent_dir_sync_failure_dirs();
+            let mut guard = match lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert(dir.clone());
+            Self { dir }
+        }
+    }
+
+    impl Drop for ParentDirSyncFailureGuard {
+        fn drop(&mut self) {
+            let lock = injected_parent_dir_sync_failure_dirs();
+            let mut guard = match lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.remove(&self.dir);
+        }
     }
 
     #[test]
@@ -1497,6 +1642,12 @@ mod tests {
         // Verify shard file exists
         let shard_path = temp_dir.path().join("table_1.shard");
         assert!(shard_path.exists());
+        let temp_shards: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".shard.tmp."))
+            .collect();
+        assert!(temp_shards.is_empty());
 
         // Create new engine, load from disk
         let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
@@ -1517,6 +1668,39 @@ mod tests {
         let binding = snapshot.predicates.bindings.get(&1).unwrap();
         assert_eq!(binding.user_id, 42);
         assert_eq!(binding.subscription_id, 1);
+    }
+
+    #[test]
+    fn test_durable_atomic_replace_retries_on_temp_name_collision() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let shard_path = temp_dir.path().join("table_1.shard");
+        let seed = 42_u64;
+        let pid = std::process::id();
+        let colliding_tmp = temp_dir
+            .path()
+            .join(format!("table_1.shard.tmp.{pid}.{seed}.0"));
+        std::fs::write(&colliding_tmp, b"collision").unwrap();
+
+        SubscriptionEngine::<PostgreSqlDialect, DefaultIds>::durable_atomic_replace(
+            temp_dir.path(),
+            &shard_path,
+            "table_1",
+            b"payload",
+            seed,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&shard_path).unwrap(), b"payload");
+
+        let temp_shards: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".shard.tmp."))
+            .collect();
+        assert_eq!(temp_shards.len(), 1);
+        assert_eq!(temp_shards[0].path(), colliding_tmp);
     }
 
     #[test]
@@ -1949,7 +2133,7 @@ mod tests {
             .unwrap();
 
         // Set very low rotation threshold so it triggers
-        engine.set_rotation_threshold(1);
+        engine.set_rotation_threshold(0);
 
         // Register subscription (should trigger rotation)
         let spec = SubscriptionSpec {
@@ -2012,6 +2196,41 @@ mod tests {
         assert!(!engine.unregister_subscription(1000));
     }
 
+    #[test]
+    fn test_register_required_post_commit_dirsync_failure_does_not_rollback() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        engine.set_rotation_threshold(1);
+        engine.set_durability_mode(DurabilityMode::Required);
+        let _inject_failure = ParentDirSyncFailureGuard::for_dir(temp_dir.path());
+
+        let result = engine.register(SubscriptionSpec {
+            subscription_id: 1001,
+            user_id: 77,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+            updated_at_unix_ms: 1,
+        });
+
+        assert!(
+            matches!(result, Err(RegisterError::Storage(ref msg)) if msg.contains("post_commit_dirsync")),
+            "expected explicit post_commit_dirsync storage error"
+        );
+        assert_eq!(engine.subscription_count(), 1);
+        assert!(engine.unregister_subscription(1001));
+        assert!(temp_dir.path().join("table_1.shard").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_register_batch_required_durability_rolls_back_on_snapshot_failure() {
@@ -2056,6 +2275,54 @@ mod tests {
         assert_eq!(engine.subscription_count(), 0);
         assert!(!engine.unregister_subscription(2000));
         assert!(!engine.unregister_subscription(2001));
+    }
+
+    #[test]
+    fn test_register_batch_required_post_commit_dirsync_failure_does_not_rollback() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        engine.set_rotation_threshold(1);
+        engine.set_durability_mode(DurabilityMode::Required);
+        let _inject_failure = ParentDirSyncFailureGuard::for_dir(temp_dir.path());
+
+        let results = engine.register_batch(vec![
+            SubscriptionSpec {
+                subscription_id: 2100,
+                user_id: 10,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 1,
+            },
+            SubscriptionSpec {
+                subscription_id: 2101,
+                user_id: 11,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 20".to_string(),
+                updated_at_unix_ms: 1,
+            },
+        ]);
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(
+                |result| matches!(result, Err(RegisterError::Storage(msg)) if msg.contains("post_commit_dirsync"))
+            ),
+            "unexpected batch results: {results:?}"
+        );
+        assert_eq!(engine.subscription_count(), 2);
+        assert!(engine.unregister_subscription(2100));
+        assert!(engine.unregister_subscription(2101));
+        assert!(temp_dir.path().join("table_1.shard").exists());
     }
 
     #[cfg(unix)]
@@ -2356,6 +2623,60 @@ mod tests {
 
         assert_eq!(engine.subscription_count(), 2);
         assert_eq!(engine.predicate_count(1), 2);
+    }
+
+    #[test]
+    fn test_register_batch_single_matches_register() {
+        let single_spec = SubscriptionSpec {
+            subscription_id: 1,
+            user_id: 100,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+            updated_at_unix_ms: 0,
+        };
+
+        let mut single_engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        let single_result = single_engine.register(single_spec).unwrap();
+        assert_eq!(single_engine.subscription_count(), 1);
+
+        let batch_spec = SubscriptionSpec {
+            subscription_id: 1,
+            user_id: 100,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+            updated_at_unix_ms: 0,
+        };
+        let mut batch_engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        let mut batch_results = batch_engine.register_batch(vec![batch_spec]);
+        assert_eq!(batch_results.len(), 1);
+        let batch_result = batch_results.remove(0).unwrap();
+        assert_eq!(batch_engine.subscription_count(), 1);
+
+        assert_eq!(single_result, batch_result);
+
+        let event = WalEvent {
+            kind: crate::EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(crate::RowImage {
+                cells: Arc::from([
+                    crate::Cell::Int(1),
+                    crate::Cell::Float(150.0),
+                    crate::Cell::String("open".into()),
+                ]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let single_users: Vec<_> = single_engine.users(&event).unwrap().collect();
+        let batch_users: Vec<_> = batch_engine.users(&event).unwrap().collect();
+        assert_eq!(single_users, batch_users);
     }
 
     #[test]
