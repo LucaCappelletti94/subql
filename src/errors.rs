@@ -74,7 +74,7 @@ pub enum StorageError {
     #[error("Config error: {0}")]
     Config(String),
 
-    /// Codec error (bincode/LZ4)
+    /// Codec error (postcard/LZ4)
     #[error("Codec error: {0}")]
     Codec(String),
 

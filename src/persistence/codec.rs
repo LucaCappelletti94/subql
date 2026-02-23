@@ -1,16 +1,25 @@
 //! Serialization codec with compression
 
 use crate::StorageError;
-use bincode;
 use lz4;
+
+/// Serialize a value to binary bytes.
+pub fn serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
+    postcard::to_stdvec(value)
+        .map_err(|e| StorageError::Codec(format!("Postcard serialize error: {e}")))
+}
+
+/// Deserialize a value from binary bytes.
+pub fn deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
+    postcard::from_bytes(bytes)
+        .map_err(|e| StorageError::Codec(format!("Postcard deserialize error: {e}")))
+}
 
 /// Serialize and compress data
 ///
-/// Uses bincode for efficient binary encoding, then LZ4 for fast compression.
+/// Uses postcard for efficient binary encoding, then LZ4 for fast compression.
 pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
-    // Serialize with bincode
-    let serialized = bincode::serialize(value)
-        .map_err(|e| StorageError::Codec(format!("Bincode serialize error: {e}")))?;
+    let serialized = serialize(value)?;
 
     encode_serialized(&serialized)
 }
@@ -72,13 +81,10 @@ pub(crate) fn decompress_with_limit(
 
 /// Decompress and deserialize data
 ///
-/// Decompresses LZ4, then deserializes with bincode.
+/// Decompresses LZ4, then deserializes with postcard.
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
     let decompressed = decompress_internal(bytes, None)?;
-
-    // Deserialize with bincode
-    bincode::deserialize(&decompressed)
-        .map_err(|e| StorageError::Codec(format!("Bincode deserialize error: {e}")))
+    deserialize(&decompressed)
 }
 
 #[cfg(test)]
@@ -114,7 +120,7 @@ mod tests {
         let data = vec![42u32; 1000];
 
         let encoded = encode(&data).unwrap();
-        let uncompressed = bincode::serialize(&data).unwrap();
+        let uncompressed = serialize(&data).unwrap();
 
         // Compressed should be much smaller
         assert!(encoded.len() < uncompressed.len());

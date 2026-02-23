@@ -12,6 +12,7 @@ use crate::{
         canonicalize, parse_compile_normalize_and_prefilter, BytecodeProgram, PrefilterPlan, Vm,
     },
     persistence::{
+        codec,
         merge::MergeManager,
         shard::{
             deserialize_shard, serialize_shard, BindingData, PredicateData, ShardPayload,
@@ -701,9 +702,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             let pred_data = PredicateData {
                 hash: pred.hash,
                 normalized_sql: pred.normalized_sql.to_string(),
-                bytecode_instructions: bincode::serialize(&*pred.bytecode)
+                bytecode_instructions: codec::serialize(&*pred.bytecode)
                     .map_err(|e| StorageError::Codec(format!("Bytecode serialize error: {e}")))?,
-                prefilter_plan: bincode::serialize(&*pred.prefilter_plan)
+                prefilter_plan: codec::serialize(&*pred.prefilter_plan)
                     .map_err(|e| StorageError::Codec(format!("Prefilter serialize error: {e}")))?,
                 dependency_columns: pred.dependency_columns.to_vec(),
                 refcount: pred.refcount,
@@ -809,12 +810,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 continue;
             };
 
-            let bytecode: BytecodeProgram = bincode::deserialize(&pred_data.bytecode_instructions)
+            let bytecode: BytecodeProgram = codec::deserialize(&pred_data.bytecode_instructions)
                 .map_err(|e| {
                     RebuildPayloadError::Codec(format!("Bytecode deserialize error: {e}"))
                 })?;
 
-            let prefilter_plan: PrefilterPlan = bincode::deserialize(&pred_data.prefilter_plan)
+            let prefilter_plan: PrefilterPlan = codec::deserialize(&pred_data.prefilter_plan)
                 .map_err(|e| {
                     RebuildPayloadError::Codec(format!("Prefilter deserialize error: {e}"))
                 })?;
@@ -2222,7 +2223,7 @@ mod tests {
             predicates: vec![PredicateData {
                 hash: 0xAAAA,
                 normalized_sql: "amount > 100".to_string(),
-                bytecode_instructions: bincode::serialize(&crate::compiler::BytecodeProgram::new(
+                bytecode_instructions: codec::serialize(&crate::compiler::BytecodeProgram::new(
                     vec![
                         crate::compiler::Instruction::LoadColumn(1),
                         crate::compiler::Instruction::PushLiteral(Cell::Int(100)),
@@ -2230,7 +2231,7 @@ mod tests {
                     ],
                 ))
                 .unwrap(),
-                prefilter_plan: bincode::serialize(&crate::compiler::PrefilterPlan::default())
+                prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
                     .unwrap(),
                 dependency_columns: vec![1],
                 refcount: 1,
@@ -2670,8 +2671,8 @@ mod tests {
             predicates: vec![PredicateData {
                 hash,
                 normalized_sql: normalized,
-                bytecode_instructions: bincode::serialize(&program).unwrap(),
-                prefilter_plan: bincode::serialize(&crate::compiler::PrefilterPlan::default())
+                bytecode_instructions: codec::serialize(&program).unwrap(),
+                prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
                     .unwrap(),
                 dependency_columns: program.dependency_columns.clone(),
                 refcount: 1,

@@ -306,6 +306,7 @@ impl From<MergeStats> for MergeReport {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
+    use super::super::codec;
     use super::super::shard::{serialize_shard, PredicateData, UserDictData};
     use super::*;
     use std::collections::HashMap;
@@ -362,7 +363,7 @@ mod tests {
             hash: 0x1234,
             normalized_sql: "age > 18".to_string(),
             bytecode_instructions: vec![],
-            prefilter_plan: bincode::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
+            prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
             refcount: 1,
             updated_at_unix_ms: 1000,
@@ -528,7 +529,7 @@ mod tests {
             hash: 0x1234,
             normalized_sql: "age > 18".to_string(),
             bytecode_instructions: vec![],
-            prefilter_plan: bincode::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
+            prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
             refcount: 1,
             updated_at_unix_ms: 1000, // Older
@@ -538,7 +539,7 @@ mod tests {
             hash: 0x1234, // Same hash
             normalized_sql: "age > 18 (updated)".to_string(),
             bytecode_instructions: vec![1, 2, 3],
-            prefilter_plan: bincode::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
+            prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
             refcount: 2,
             updated_at_unix_ms: 2000, // Newer
