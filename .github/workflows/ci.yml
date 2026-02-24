@@ -192,7 +192,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      # Pinned to commit SHA for supply-chain security (v2.0.0)
-      - uses: rustsec/audit-check@c1e9e1c3e4b4f5eb1e47c43c0e2fe9e2e8c75fd9
+      # Pinned to commit SHA for supply-chain security (HEAD as of 2025-10-30)
+      - uses: rustsec/audit-check@3ae01282e2311f82d96cc2181b31c4fbe3dd00c0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
