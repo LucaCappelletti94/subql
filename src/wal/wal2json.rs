@@ -17,7 +17,8 @@ use super::row_build::{
 };
 use super::{
     build_pk_from_resolved, delete_event, insert_event, pk_from_catalog_or_empty, resolve_table,
-    strict_pk_column_ids_from_names, update_event, WalParseError, WalParser,
+    strict_pk_column_ids_from_names, truncate_event, update_event_with_old_row_completeness,
+    WalParseError, WalParser,
 };
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
@@ -107,7 +108,11 @@ impl WalParser for Wal2JsonV1Parser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let msg: Wal2JsonV1Message = super::parse_json_message(data)?;
+        let msg: Option<Wal2JsonV1Message> = super::parse_json_message_or_tombstone(data)?;
+        let Some(msg) = msg else {
+            // wal2json topics may emit tombstone messages ("null") for compaction.
+            return Ok(Vec::new());
+        };
 
         let mut events = Vec::with_capacity(msg.change.len());
         for change in &msg.change {
@@ -123,11 +128,15 @@ impl WalParser for Wal2JsonV2Parser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let msg: Wal2JsonV2Message = super::parse_json_message(data)?;
+        let msg: Option<Wal2JsonV2Message> = super::parse_json_message_or_tombstone(data)?;
+        let Some(msg) = msg else {
+            // wal2json topics may emit tombstone messages ("null") for compaction.
+            return Ok(Vec::new());
+        };
 
-        // Skip non-row messages (transaction boundaries and truncate).
+        // Skip non-row transactional metadata messages.
         match msg.action.as_str() {
-            "B" | "C" | "M" | "T" => return Ok(Vec::new()),
+            "B" | "C" | "M" => return Ok(Vec::new()),
             _ => {}
         }
 
@@ -142,12 +151,12 @@ impl WalParser for Wal2JsonV2Parser {
 
 /// Parse event kind from v1 string.
 fn parse_v1_kind(kind: &str) -> Result<EventKind, WalParseError> {
-    parse_event_kind(kind, &["insert"], &["update"], &["delete"])
+    parse_event_kind(kind, &["insert"], &["update"], &["delete"], &["truncate"])
 }
 
 /// Parse event kind from v2 single-char action.
 fn parse_v2_kind(action: &str) -> Result<EventKind, WalParseError> {
-    parse_event_kind(action, &["I"], &["U"], &["D"])
+    parse_event_kind(action, &["I"], &["U"], &["D"], &["T"])
 }
 
 /// Build a [`RowImage`] from parallel name/type/value arrays.
@@ -221,6 +230,10 @@ fn convert_v1_change(
     let kind = parse_v1_kind(&change.kind)?;
     let table_id = resolve_table(&change.schema, &change.table, catalog)?;
 
+    if kind == EventKind::Truncate {
+        return Ok(truncate_event(table_id));
+    }
+
     if matches!(kind, EventKind::Insert | EventKind::Update)
         && change.columnnames.is_empty()
         && change.columntypes.is_empty()
@@ -272,6 +285,9 @@ fn convert_v1_change(
         let pk = pk_from_catalog_or_empty(&new_resolved, table_id, catalog)?;
         (None, pk)
     };
+    let old_row_complete = old_row
+        .as_ref()
+        .is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()));
 
     match kind {
         EventKind::Insert => {
@@ -284,13 +300,20 @@ fn convert_v1_change(
             let new_row = new_row.ok_or_else(|| {
                 WalParseError::MissingField("columnnames/columntypes/columnvalues".to_string())
             })?;
-            Ok(update_event(table_id, pk, old_row, new_row))
+            Ok(update_event_with_old_row_completeness(
+                table_id,
+                pk,
+                old_row,
+                new_row,
+                old_row_complete,
+            ))
         }
         EventKind::Delete => {
             let old_row =
                 old_row.ok_or_else(|| WalParseError::MissingField("oldkeys".to_string()))?;
             Ok(delete_event(table_id, pk, old_row))
         }
+        EventKind::Truncate => Ok(truncate_event(table_id)),
     }
 }
 
@@ -320,7 +343,7 @@ fn convert_v2_message(
             let (row, resolved) = build_row_from_v2_columns(columns, table_id, catalog)?;
             (Some(row), resolved)
         }
-        EventKind::Delete => (None, Vec::new()),
+        EventKind::Delete | EventKind::Truncate => (None, Vec::new()),
     };
 
     let (old_row, identity_resolved) = match kind {
@@ -345,13 +368,18 @@ fn convert_v2_message(
                 (None, Vec::new())
             }
         }
-        EventKind::Insert => (None, Vec::new()),
+        EventKind::Insert | EventKind::Truncate => (None, Vec::new()),
     };
+    let old_row_complete = old_row
+        .as_ref()
+        .is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()));
 
     // Build PK: prefer identity columns, then pk metadata, then catalog.
     // The three-way branching is clearer as if-let chains than map_or_else.
     #[allow(clippy::option_if_let_else)]
-    let pk = if !identity_resolved.is_empty() {
+    let pk = if kind == EventKind::Truncate {
+        PrimaryKey::empty()
+    } else if !identity_resolved.is_empty() {
         // Use identity columns as PK source (UPDATE/DELETE)
         if let Some(ref pk_cols) = msg.pk {
             let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
@@ -391,13 +419,20 @@ fn convert_v2_message(
         EventKind::Update => {
             let new_row =
                 new_row.ok_or_else(|| WalParseError::MissingField("columns".to_string()))?;
-            Ok(update_event(table_id, pk, old_row, new_row))
+            Ok(update_event_with_old_row_completeness(
+                table_id,
+                pk,
+                old_row,
+                new_row,
+                old_row_complete,
+            ))
         }
         EventKind::Delete => {
             let old_row =
                 old_row.ok_or_else(|| WalParseError::MissingField("identity".to_string()))?;
             Ok(delete_event(table_id, pk, old_row))
         }
+        EventKind::Truncate => Ok(truncate_event(table_id)),
     }
 }
 
@@ -861,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn error_unknown_event_kind() {
+    fn v1_truncate_kind_emits_truncate_event() {
         let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
@@ -876,10 +911,17 @@ mod tests {
             }]
         }"#;
 
-        let err = parser
+        let events = parser
             .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+            .expect("truncate should parse");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Truncate);
+        assert_eq!(ev.table_id, 1);
+        assert!(ev.pk.is_empty());
+        assert!(ev.old_row.is_none());
+        assert!(ev.new_row.is_none());
+        assert!(ev.changed_columns.is_empty());
     }
 
     #[test]
@@ -887,8 +929,8 @@ mod tests {
         let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
-        // Truncate (T), Begin (B), Commit (C), Message (M) are silently skipped.
-        for action in &["T", "B", "C", "M"] {
+        // Begin (B), Commit (C), Message (M) are silently skipped.
+        for action in &["B", "C", "M"] {
             let json = format!(r#"{{"action": "{action}"}}"#);
             let events = parser
                 .parse_wal_message(json.as_bytes(), &catalog)
@@ -898,6 +940,50 @@ mod tests {
                 "action '{action}' should return empty vec"
             );
         }
+    }
+
+    #[test]
+    fn v2_truncate_action_emits_truncate_event() {
+        let catalog = orders_catalog();
+        let parser = Wal2JsonV2Parser;
+
+        let json = r#"{
+            "action": "T",
+            "schema": "public",
+            "table": "orders"
+        }"#;
+
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("truncate action should parse");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Truncate);
+        assert_eq!(ev.table_id, 1);
+        assert!(ev.pk.is_empty());
+        assert!(ev.old_row.is_none());
+        assert!(ev.new_row.is_none());
+        assert!(ev.changed_columns.is_empty());
+    }
+
+    #[test]
+    fn v1_tombstone_null_is_ignored() {
+        let catalog = orders_catalog();
+        let parser = Wal2JsonV1Parser;
+        let events = parser
+            .parse_wal_message(b"null", &catalog)
+            .expect("tombstone should be ignored");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn v2_tombstone_null_is_ignored() {
+        let catalog = orders_catalog();
+        let parser = Wal2JsonV2Parser;
+        let events = parser
+            .parse_wal_message(b"null", &catalog)
+            .expect("tombstone should be ignored");
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1000,6 +1086,42 @@ mod tests {
         // No oldkeys → no old_row → changed_columns is empty
         assert!(ev.old_row.is_none());
         assert!(ev.changed_columns.is_empty());
+    }
+
+    #[test]
+    fn v1_update_with_partial_oldkeys_keeps_changed_columns_empty_for_safety() {
+        let catalog = orders_catalog();
+        let parser = Wal2JsonV1Parser;
+
+        // oldkeys includes only the PK. New row changes both PK and amount.
+        // The old row is partial, so changed-columns must be treated as unknown.
+        let json = r#"{
+            "change": [{
+                "kind": "update",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer", "amount", "status"],
+                "columntypes": ["integer", "text", "numeric", "text"],
+                "columnvalues": [2, "alice", 149.95, "shipped"],
+                "oldkeys": {
+                    "keynames": ["id"],
+                    "keytypes": ["integer"],
+                    "keyvalues": [1]
+                }
+            }]
+        }"#;
+
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("parse should succeed");
+
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Update);
+        assert!(ev.old_row.is_some());
+        assert!(
+            ev.changed_columns.is_empty(),
+            "partial oldkeys must disable changed-columns pruning"
+        );
     }
 
     // -- v1 INSERT without catalog PK columns --------------------------------

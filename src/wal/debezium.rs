@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::map_cdc::{convert_map_cdc_event, parse_event_kind, MapCdcConfig};
-use super::{resolve_table, WalParseError, WalParser};
+use super::{resolve_table, truncate_event, WalParseError, WalParser};
 #[cfg(test)]
 use crate::{Cell, ColumnId};
 use crate::{EventKind, SchemaCatalog, WalEvent};
@@ -55,7 +55,7 @@ impl WalParser for DebeziumParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let env: Option<DebeziumEnvelope> = super::parse_json_message(data)?;
+        let env: Option<DebeziumEnvelope> = super::parse_json_message_or_tombstone(data)?;
         let Some(env) = env else {
             // Debezium Kafka topics may emit tombstone messages ("null") for compaction.
             return Ok(Vec::new());
@@ -71,7 +71,7 @@ impl WalParser for DebeziumParser {
 // ============================================================================
 
 fn parse_debezium_op(op: &str) -> Result<EventKind, WalParseError> {
-    parse_event_kind(op, &["c", "r"], &["u"], &["d"])
+    parse_event_kind(op, &["c", "r"], &["u"], &["d"], &["t"])
 }
 
 fn convert_debezium_envelope(
@@ -88,6 +88,10 @@ fn convert_debezium_envelope(
         }
         Err(err) => return Err(err),
     };
+
+    if kind == EventKind::Truncate {
+        return Ok(truncate_event(table_id));
+    }
 
     convert_map_cdc_event(
         kind,
@@ -304,6 +308,33 @@ mod tests {
         assert_eq!(ev.pk.columns.as_ref(), &[0]);
         assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
 
+        assert!(ev.changed_columns.is_empty());
+    }
+
+    #[test]
+    fn debezium_truncate() {
+        let catalog = orders_catalog();
+        let parser = DebeziumParser;
+
+        let json = r#"{
+            "before": null,
+            "after": null,
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "t",
+            "ts_ms": 1234567893
+        }"#;
+
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("parse should succeed");
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Truncate);
+        assert_eq!(ev.table_id, 1);
+        assert!(ev.pk.is_empty());
+        assert!(ev.old_row.is_none());
+        assert!(ev.new_row.is_none());
         assert!(ev.changed_columns.is_empty());
     }
 

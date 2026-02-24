@@ -15,10 +15,12 @@ use std::collections::{HashSet, VecDeque};
 
 use super::pg_type::text_to_cell_strict;
 use super::{
-    build_pk_from_resolved_strict, changed_columns, pk_from_catalog_or_empty, resolve_table,
-    WalParseError, WalParser,
+    build_pk_from_resolved_strict, delete_event, insert_event, pk_from_catalog_or_empty,
+    resolve_table, truncate_event, update_event_with_old_row_completeness, WalParseError, WalParser,
 };
-use crate::{Cell, ColumnId, EventKind, RowImage, SchemaCatalog, TableId, WalEvent};
+use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId, WalEvent};
+#[cfg(test)]
+use crate::EventKind;
 
 /// Defensive bound to prevent pathological allocations from malformed input.
 const MAX_COLUMNS_PER_MESSAGE: usize = 10_000;
@@ -241,6 +243,23 @@ impl PgOutputParser {
         if count > MAX_COLUMNS_PER_MESSAGE {
             return Err(WalParseError::MalformedPayload(format!(
                 "column count too large in {context}: {count}"
+            )));
+        }
+        Ok(count)
+    }
+
+    fn parse_relation_count(count: i32, context: &str) -> Result<usize, WalParseError> {
+        if count < 0 {
+            return Err(WalParseError::MalformedPayload(format!(
+                "negative relation count in {context}: {count}"
+            )));
+        }
+        let count = usize::try_from(count).map_err(|_| {
+            WalParseError::MalformedPayload(format!("invalid relation count in {context}: {count}"))
+        })?;
+        if count > MAX_CACHED_RELATIONS {
+            return Err(WalParseError::MalformedPayload(format!(
+                "relation count too large in {context}: {count}"
             )));
         }
         Ok(count)
@@ -489,14 +508,7 @@ impl PgOutputParser {
         let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel)?;
         let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?;
 
-        Ok(WalEvent {
-            kind: EventKind::Insert,
-            table_id: rel.table_id,
-            pk,
-            old_row: None,
-            new_row: Some(new_row),
-            changed_columns: Arc::from([]),
-        })
+        Ok(insert_event(rel.table_id, pk, new_row))
     }
 
     /// Handle Update message.
@@ -552,20 +564,17 @@ impl PgOutputParser {
             build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "replica identity")?
         };
 
-        let changed = if let (Some(ref old), new) = (&old_row, &new_row) {
-            changed_columns(old, new)
-        } else {
-            Vec::new()
-        };
+        let old_row_complete = old_row
+            .as_ref()
+            .is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()));
 
-        Ok(WalEvent {
-            kind: EventKind::Update,
-            table_id: rel.table_id,
+        Ok(update_event_with_old_row_completeness(
+            rel.table_id,
             pk,
             old_row,
-            new_row: Some(new_row),
-            changed_columns: Arc::from(changed),
-        })
+            new_row,
+            old_row_complete,
+        ))
     }
 
     /// Handle Delete message.
@@ -606,14 +615,22 @@ impl PgOutputParser {
             build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "replica identity")?
         };
 
-        Ok(WalEvent {
-            kind: EventKind::Delete,
-            table_id: rel.table_id,
-            pk,
-            old_row: Some(old_row),
-            new_row: None,
-            changed_columns: Arc::from([]),
-        })
+        Ok(delete_event(rel.table_id, pk, old_row))
+    }
+
+    /// Handle Truncate message.
+    fn handle_truncate(&self, cur: &mut Cursor<'_>) -> Result<Vec<WalEvent>, WalParseError> {
+        let rel_count = Self::parse_relation_count(cur.read_i32()?, "Truncate")?;
+        let _options = cur.read_u8()?;
+
+        let mut events = Vec::with_capacity(rel_count);
+        for _ in 0..rel_count {
+            let oid = cur.read_u32()?;
+            let rel = self.get_relation(oid)?;
+            events.push(truncate_event(rel.table_id));
+        }
+
+        Ok(events)
     }
 }
 
@@ -632,7 +649,7 @@ impl WalParser for PgOutputParser {
 
         match msg_type {
             // Metadata messages — skip
-            b'B' | b'C' | b'O' | b'Y' | b'T' => Ok(vec![]),
+            b'B' | b'C' | b'O' | b'Y' | b'M' | b'S' | b'E' | b'c' | b'A' => Ok(vec![]),
 
             // Relation message — cache, no events
             b'R' => {
@@ -660,6 +677,13 @@ impl WalParser for PgOutputParser {
                 let event = self.handle_delete(&mut cur, catalog)?;
                 Self::ensure_fully_consumed(&cur, "Delete message")?;
                 Ok(vec![event])
+            }
+
+            // Truncate
+            b'T' => {
+                let events = self.handle_truncate(&mut cur)?;
+                Self::ensure_fully_consumed(&cur, "Truncate message")?;
+                Ok(events)
             }
 
             other => Err(WalParseError::UnknownEventKind(format!(
@@ -815,6 +839,17 @@ mod tests {
         push_u32(&mut buf, oid);
         push_u8(&mut buf, tag);
         buf.extend_from_slice(&build_tuple_data(old_tuple));
+        buf
+    }
+
+    fn build_truncate_msg(option_bits: u8, relation_oids: &[u32]) -> Vec<u8> {
+        let mut buf = vec![b'T'];
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        push_i32(&mut buf, relation_oids.len() as i32);
+        push_u8(&mut buf, option_bits);
+        for &oid in relation_oids {
+            push_u32(&mut buf, oid);
+        }
         buf
     }
 
@@ -999,6 +1034,44 @@ mod tests {
         // PK from identity column (id, flags=1)
         assert_eq!(ev.pk.columns.as_ref(), &[0]);
         assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+    }
+
+    #[test]
+    fn update_with_partial_key_tuple_keeps_changed_columns_empty_for_safety() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        // Key tuple contains only the identity column. New tuple changes both id and amount.
+        // Old row is partial, so changed-columns must be treated as unknown.
+        let update_msg = build_update_msg_with_old(
+            16384,
+            b'K',
+            &[TupleCol::Text("1".into())],
+            &[
+                TupleCol::Text("2".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Text("149.95".into()),
+                TupleCol::Text("shipped".into()),
+            ],
+        );
+
+        let events = parser
+            .parse_wal_message(&update_msg, &catalog)
+            .expect("update should parse");
+        assert_eq!(events.len(), 1);
+
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Update);
+        assert!(ev.old_row.is_some());
+        assert!(
+            ev.changed_columns.is_empty(),
+            "partial key tuple must disable changed-columns pruning"
+        );
     }
 
     #[test]
@@ -1247,13 +1320,53 @@ mod tests {
         let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
-        for &tag in b"BCOYT" {
+        for &tag in b"BCOY" {
             let msg = vec![tag, 0, 0, 0, 0]; // tag + some padding
             let events = parser
                 .parse_wal_message(&msg, &catalog)
                 .expect("metadata should be skipped");
             assert!(events.is_empty(), "tag 0x{tag:02X} should return empty");
         }
+    }
+
+    #[test]
+    fn non_row_control_messages_return_empty() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        // M = Logical decoding message; S/E/c/A = stream control/transaction wrappers.
+        for &tag in b"MSEcA" {
+            let msg = vec![tag, 0, 0, 0, 0];
+            let events = parser
+                .parse_wal_message(&msg, &catalog)
+                .expect("non-row control message should be skipped");
+            assert!(events.is_empty(), "tag 0x{tag:02X} should return empty");
+        }
+    }
+
+    #[test]
+    fn truncate_message_emits_events_per_relation() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        let relation_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        let events = parser
+            .parse_wal_message(&relation_msg, &catalog)
+            .expect("relation should parse");
+        assert!(events.is_empty());
+
+        let truncate_msg = build_truncate_msg(0, &[16384]);
+        let events = parser
+            .parse_wal_message(&truncate_msg, &catalog)
+            .expect("truncate should parse");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Truncate);
+        assert_eq!(ev.table_id, 1);
+        assert!(ev.pk.is_empty());
+        assert!(ev.old_row.is_none());
+        assert!(ev.new_row.is_none());
+        assert!(ev.changed_columns.is_empty());
     }
 
     // -- Test 8: Empty input returns empty vec --------------------------------

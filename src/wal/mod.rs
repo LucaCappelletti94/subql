@@ -45,6 +45,14 @@ where
     serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))
 }
 
+/// Parse JSON payloads that may legally be tombstones (`null`) in CDC streams.
+pub(crate) fn parse_json_message_or_tombstone<T>(data: &[u8]) -> Result<Option<T>, WalParseError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    parse_json_message(data)
+}
+
 /// Errors that can occur during WAL message parsing.
 #[derive(Error, Clone, Debug)]
 pub enum WalParseError {
@@ -304,8 +312,22 @@ pub(crate) fn update_event(
     old_row: Option<RowImage>,
     new_row: RowImage,
 ) -> WalEvent {
-    let changed = if let Some(ref old) = old_row {
-        changed_columns(old, &new_row)
+    update_event_with_old_row_completeness(table_id, pk, old_row, new_row, true)
+}
+
+/// Build UPDATE event while allowing parsers to disable changed-column
+/// derivation when old-row images are known to be partial.
+pub(crate) fn update_event_with_old_row_completeness(
+    table_id: TableId,
+    pk: PrimaryKey,
+    old_row: Option<RowImage>,
+    new_row: RowImage,
+    old_row_complete: bool,
+) -> WalEvent {
+    let changed = if old_row_complete {
+        old_row
+            .as_ref()
+            .map_or_else(Vec::new, |old| changed_columns(old, &new_row))
     } else {
         Vec::new()
     };
@@ -327,6 +349,18 @@ pub(crate) fn delete_event(table_id: TableId, pk: PrimaryKey, old_row: RowImage)
         table_id,
         pk,
         old_row: Some(old_row),
+        new_row: None,
+        changed_columns: std::sync::Arc::from([]),
+    }
+}
+
+/// Build TRUNCATE event with consistent defaults.
+pub(crate) fn truncate_event(table_id: TableId) -> WalEvent {
+    WalEvent {
+        kind: EventKind::Truncate,
+        table_id,
+        pk: PrimaryKey::empty(),
+        old_row: None,
         new_row: None,
         changed_columns: std::sync::Arc::from([]),
     }
@@ -467,5 +501,12 @@ mod tests {
         let parsed: Option<serde_json::Value> =
             parse_json_message(b"null").expect("tombstone should parse to None");
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_parse_json_message_or_tombstone_object() {
+        let parsed: Option<serde_json::Value> =
+            parse_json_message_or_tombstone(br#"{"x":1}"#).expect("object should parse");
+        assert!(parsed.is_some());
     }
 }

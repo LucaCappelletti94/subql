@@ -17,6 +17,21 @@ fn resolve_table_arity(
         })
 }
 
+fn validate_typed_arrays_lengths(
+    names_len: usize,
+    types_len: usize,
+    values_len: usize,
+    context: &str,
+) -> Result<(), WalParseError> {
+    if names_len != types_len || names_len != values_len {
+        return Err(WalParseError::MalformedPayload(format!(
+            "{context} arrays length mismatch: names={names_len}, types={types_len}, values={values_len}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Build a row image from a column->value map and return resolved `(ColumnId, Cell)` pairs.
 pub(super) fn build_row_from_map_with<F>(
     map: &HashMap<String, serde_json::Value>,
@@ -131,14 +146,7 @@ pub(super) fn build_row_from_typed_arrays_with<F>(
 where
     F: FnMut(&serde_json::Value, &str, &str) -> Result<Cell, WalParseError>,
 {
-    if names.len() != types.len() || names.len() != values.len() {
-        return Err(WalParseError::MalformedPayload(format!(
-            "{context} arrays length mismatch: names={}, types={}, values={}",
-            names.len(),
-            types.len(),
-            values.len()
-        )));
-    }
+    validate_typed_arrays_lengths(names.len(), types.len(), values.len(), context)?;
 
     let columns: Vec<(&str, &str, &serde_json::Value)> = names
         .iter()
@@ -163,14 +171,7 @@ pub(super) fn build_pk_from_typed_arrays_with<F>(
 where
     F: FnMut(&serde_json::Value, &str, &str) -> Result<Cell, WalParseError>,
 {
-    if names.len() != types.len() || names.len() != values.len() {
-        return Err(WalParseError::MalformedPayload(format!(
-            "{context} arrays length mismatch: names={}, types={}, values={}",
-            names.len(),
-            types.len(),
-            values.len()
-        )));
-    }
+    validate_typed_arrays_lengths(names.len(), types.len(), values.len(), context)?;
 
     let mut pk_cols = Vec::with_capacity(names.len());
     let mut pk_vals = Vec::with_capacity(names.len());
