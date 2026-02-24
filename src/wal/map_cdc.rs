@@ -107,11 +107,7 @@ pub(super) fn convert_map_cdc_event(
             // non-Missing columns are compared, and if none differ the result
             // is empty — which falls through to a conservative full re-evaluation.
             Ok(update_event_with_old_row_completeness(
-                table_id,
-                pk,
-                old_row,
-                new_row,
-                true,
+                table_id, pk, old_row, new_row, true,
             ))
         }
         EventKind::Delete => {
