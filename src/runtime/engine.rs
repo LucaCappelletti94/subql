@@ -2,7 +2,7 @@
 
 use super::indexes::IndexableAtom;
 use super::{
-    dispatch::{dispatch_users_with_row, select_event_row, MatchedUsers, UserDictionary},
+    dispatch::{dispatch_users, dispatch_users_with_row, select_event_row, MatchedUsers, UserDictionary},
     ids::{PredicateId, UserOrdinal},
     partition::TablePartition,
     predicate::{Binding, Predicate},
@@ -19,7 +19,7 @@ use crate::{
             UserDictData,
         },
     },
-    DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, IdTypes, MergeError,
+    DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, EventKind, IdTypes, MergeError,
     MergeJobId, MergeReport, PruneReport, RegisterError, RegisterResult, SchemaCatalog,
     StorageError, SubscriptionDispatch, SubscriptionPruning, SubscriptionRegistration,
     SubscriptionSpec, TableId, WalEvent,
@@ -65,6 +65,11 @@ static INJECT_PARENT_DIR_SYNC_FAILURE_DIRS: OnceLock<Mutex<HashSet<PathBuf>>> = 
 #[cfg(test)]
 static INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES: OnceLock<Mutex<HashSet<TableId>>> =
     OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static INJECT_COMPILE_HASH_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, u128>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
 
 #[cfg(test)]
 fn injected_parent_dir_sync_failure_dirs() -> &'static Mutex<HashSet<PathBuf>> {
@@ -74,6 +79,21 @@ fn injected_parent_dir_sync_failure_dirs() -> &'static Mutex<HashSet<PathBuf>> {
 #[cfg(test)]
 fn injected_batch_phase3_partition_drop_tables() -> &'static Mutex<HashSet<TableId>> {
     INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(test)]
+fn with_injected_compile_hash_overrides<R>(
+    f: impl FnOnce(&mut std::collections::HashMap<String, u128>) -> R,
+) -> R {
+    INJECT_COMPILE_HASH_OVERRIDES.with(|cell| {
+        let mut map = cell.borrow_mut();
+        f(&mut map)
+    })
+}
+
+#[cfg(test)]
+fn injected_compile_hash_override(normalized: &str) -> Option<u128> {
+    INJECT_COMPILE_HASH_OVERRIDES.with(|cell| cell.borrow().get(normalized).copied())
 }
 
 impl std::fmt::Display for RebuildPayloadError {
@@ -145,6 +165,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let (table_id, bytecode, normalized, prefilter_plan) =
             parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog)?;
         let hash = canonicalize::hash_sql(&normalized);
+        #[cfg(test)]
+        let hash = injected_compile_hash_override(&normalized).unwrap_or(hash);
 
         Ok(CompiledSpec {
             spec,
@@ -342,7 +364,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         // 5. Check if predicate exists (deduplication)
         let snapshot = partition.load_snapshot();
-        let (pred_id, created_new) = if let Some(existing) = snapshot.predicates.find_by_hash(hash)
+        let (pred_id, created_new) = if let Some(existing) = snapshot
+            .predicates
+            .find_by_hash_and_sql(hash, &compiled.normalized)
         {
             // Predicate exists, increment refcount
             // (We need mutable access, so we'll do this via the partition's mutable store)
@@ -444,7 +468,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let mut table_inserted_sub_ids: AHashMap<TableId, Vec<I::SubscriptionId>> = AHashMap::new();
 
         // Track which hashes we've already prepared (dedup within batch)
-        let mut batch_hash_to_idx: AHashMap<(TableId, u128), usize> = AHashMap::new();
+        let mut batch_hash_to_idx: AHashMap<(TableId, u128, String), usize> = AHashMap::new();
 
         for (i, entry) in compiled.into_iter().enumerate() {
             let Some(c) = entry else { continue };
@@ -469,9 +493,13 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
             // Check if predicate already exists in current snapshot
             let snapshot = partition.load_snapshot();
-            let existing = snapshot.predicates.find_by_hash(c.hash);
+            let existing = snapshot
+                .predicates
+                .find_by_hash_and_sql(c.hash, &c.normalized);
 
             let created_new;
+
+            let dedup_key = (c.table_id, c.hash, c.normalized.clone());
 
             if let Some(pred_id) = existing {
                 // Predicate exists in the live partition — add binding directly
@@ -481,7 +509,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 self.subscription_to_table
                     .insert(c.spec.subscription_id, c.table_id);
                 created_new = false;
-            } else if let Some(&batch_idx) = batch_hash_to_idx.get(&(c.table_id, c.hash)) {
+            } else if let Some(&batch_idx) = batch_hash_to_idx.get(&dedup_key) {
                 // Deduplicated within this batch — add binding to existing batch entry
                 let Some(entries) = table_entries.get_mut(&c.table_id) else {
                     results[i] = Err(RegisterError::Storage(format!(
@@ -503,7 +531,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 let entries = table_entries.entry(c.table_id).or_default();
                 let batch_idx = entries.len();
                 entries.push((pred, atoms, vec![binding]));
-                batch_hash_to_idx.insert((c.table_id, c.hash), batch_idx);
+                batch_hash_to_idx.insert(dedup_key, batch_idx);
                 created_new = true;
             }
 
@@ -659,6 +687,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .user_dictionaries
             .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
+
+        if event.kind == EventKind::Truncate {
+            return dispatch_users(event, partition, user_dict, &mut self.vm);
+        }
 
         // Validate selected row image arity against schema catalog.
         let row = select_event_row(event)?;
@@ -979,7 +1011,19 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         // Build hash -> predicate map and validate binding references.
         let mut pred_hash_to_data: AHashMap<u128, &PredicateData> = AHashMap::new();
         for pred_data in &payload.predicates {
-            pred_hash_to_data.insert(pred_data.hash, pred_data);
+            if let Some(existing) = pred_hash_to_data.get(&pred_data.hash) {
+                if !Self::predicate_data_equivalent(existing, pred_data) {
+                    return Err(RebuildPayloadError::Corrupt(format!(
+                        "predicate hash collision for hash {:016x} with non-equivalent payload",
+                        pred_data.hash
+                    )));
+                }
+                if pred_data.updated_at_unix_ms > existing.updated_at_unix_ms {
+                    pred_hash_to_data.insert(pred_data.hash, pred_data);
+                }
+            } else {
+                pred_hash_to_data.insert(pred_data.hash, pred_data);
+            }
         }
 
         // Build bindings grouped by predicate hash; IDs are assigned during add_batch.
@@ -1007,8 +1051,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Build batch entries from predicates + grouped bindings.
+        let mut chosen_predicates: Vec<&PredicateData> = pred_hash_to_data.values().copied().collect();
+        chosen_predicates.sort_unstable_by_key(|pred_data| pred_data.hash);
+
         let mut entries: BatchEntries<I> = Vec::new();
-        for pred_data in &payload.predicates {
+        for pred_data in chosen_predicates {
             let Some(bindings) = bindings_by_hash.remove(&pred_data.hash) else {
                 continue;
             };
@@ -1044,6 +1091,13 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         Ok((user_dict, entries))
+    }
+
+    fn predicate_data_equivalent(left: &PredicateData, right: &PredicateData) -> bool {
+        left.normalized_sql == right.normalized_sql
+            && left.bytecode_instructions == right.bytecode_instructions
+            && left.prefilter_plan == right.prefilter_plan
+            && left.dependency_columns == right.dependency_columns
     }
 
     fn replace_table_state(
@@ -1398,6 +1452,34 @@ mod tests {
                 Err(poisoned) => poisoned.into_inner(),
             };
             guard.remove(&self.table_id);
+        }
+    }
+
+    struct CompileHashOverrideGuard {
+        normalized_keys: Vec<String>,
+    }
+
+    impl CompileHashOverrideGuard {
+        fn force(hash_by_normalized: Vec<(String, u128)>) -> Self {
+            let mut normalized_keys = Vec::with_capacity(hash_by_normalized.len());
+            with_injected_compile_hash_overrides(|overrides| {
+                for (normalized, hash) in hash_by_normalized {
+                    overrides.insert(normalized.clone(), hash);
+                    normalized_keys.push(normalized);
+                }
+            });
+
+            Self { normalized_keys }
+        }
+    }
+
+    impl Drop for CompileHashOverrideGuard {
+        fn drop(&mut self) {
+            with_injected_compile_hash_overrides(|overrides| {
+                for normalized in &self.normalized_keys {
+                    overrides.remove(normalized);
+                }
+            });
         }
     }
 
@@ -2274,6 +2356,48 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_truncate_does_not_require_row_images_or_arity() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 34,
+                user_id: 340,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+                updated_at_unix_ms: 34,
+            })
+            .unwrap();
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 35,
+                user_id: 350,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE status = 'pending'".to_string(),
+                updated_at_unix_ms: 35,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Truncate,
+            table_id: 1,
+            pk: PrimaryKey::empty(),
+            old_row: None,
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let mut users: Vec<_> = engine
+            .users(&event)
+            .expect("truncate should dispatch")
+            .collect();
+        users.sort_unstable();
+        assert_eq!(users, vec![340, 350]);
+    }
+
+    #[test]
     fn test_storage_rotation_triggers_snapshot() {
         use tempfile::TempDir;
 
@@ -2735,6 +2859,69 @@ mod tests {
     }
 
     #[test]
+    fn test_load_shard_rejects_non_equivalent_duplicate_predicate_hashes() {
+        use crate::persistence::shard::{
+            serialize_shard, BindingData, PredicateData, ShardPayload, UserDictData,
+        };
+        use crate::DefaultIds;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![
+                PredicateData {
+                    hash: 0xABCD,
+                    normalized_sql: "amount > 100".to_string(),
+                    bytecode_instructions: vec![1],
+                    prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
+                        .unwrap(),
+                    dependency_columns: vec![1],
+                    refcount: 1,
+                    updated_at_unix_ms: 1000,
+                },
+                PredicateData {
+                    hash: 0xABCD, // duplicate hash, different predicate payload
+                    normalized_sql: "status = 'pending'".to_string(),
+                    bytecode_instructions: vec![2],
+                    prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
+                        .unwrap(),
+                    dependency_columns: vec![2],
+                    refcount: 1,
+                    updated_at_unix_ms: 2000,
+                },
+            ],
+            bindings: vec![BindingData {
+                subscription_id: 1,
+                predicate_hash: 0xABCD,
+                user_id: 42,
+                session_id: None,
+                updated_at_unix_ms: 2000,
+            }],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![42],
+            },
+            created_at_unix_ms: 2000,
+        };
+
+        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        std::fs::write(temp_dir.path().join("table_1.shard"), shard_bytes).unwrap();
+
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Corrupt(ref msg)) if msg.contains("hash collision")
+        ));
+    }
+
+    #[test]
     fn test_load_shard_rejects_filename_header_table_id_mismatch() {
         use crate::persistence::shard::{serialize_shard, ShardPayload, UserDictData};
         use tempfile::TempDir;
@@ -2945,6 +3132,98 @@ mod tests {
 
         assert_eq!(engine.subscription_count(), 2);
         assert_eq!(engine.predicate_count(1), 1); // Deduplicated
+    }
+
+    #[test]
+    fn test_register_batch_hash_collision_non_equivalent_predicates_do_not_dedup() {
+        let _test_lock = injection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
+
+        let (_, _, normalized_for_gt_sql) = crate::compiler::parse_compile_and_normalize(
+            "SELECT * FROM orders WHERE amount > 100",
+            &PostgreSqlDialect {},
+            &*catalog,
+        )
+        .expect("normalization for gt SQL should succeed");
+        let (_, _, normalized_for_lt_sql) = crate::compiler::parse_compile_and_normalize(
+            "SELECT * FROM orders WHERE amount < 50",
+            &PostgreSqlDialect {},
+            &*catalog,
+        )
+        .expect("normalization for lt SQL should succeed");
+
+        let _hash_guard = CompileHashOverrideGuard::force(vec![
+            (normalized_for_gt_sql, 0xCAFE_BABE_u128),
+            (normalized_for_lt_sql, 0xCAFE_BABE_u128),
+        ]);
+
+        let specs = vec![
+            SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            },
+            SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 99,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
+                updated_at_unix_ms: 0,
+            },
+        ];
+
+        let results = engine.register_batch(specs);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert!(
+            results[0].as_ref().is_ok_and(|r| r.created_new_predicate),
+            "first predicate should be new"
+        );
+        assert!(
+            results[1].as_ref().is_ok_and(|r| r.created_new_predicate),
+            "second non-equivalent predicate must not be deduplicated on hash collision"
+        );
+        assert_eq!(engine.predicate_count(1), 2);
+
+        let high_amount_event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+        let high_users: Vec<_> = engine.users(&high_amount_event).unwrap().collect();
+        assert!(high_users.contains(&42));
+        assert!(!high_users.contains(&99));
+
+        let low_amount_event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(2)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(2), Cell::Int(25), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+        let low_users: Vec<_> = engine.users(&low_amount_event).unwrap().collect();
+        assert!(!low_users.contains(&42));
+        assert!(low_users.contains(&99));
     }
 
     #[test]
