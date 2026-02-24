@@ -217,12 +217,8 @@ mod tests {
         MockCatalog { tables, columns }
     }
 
-    fn json_to_cell(
-        value: &serde_json::Value,
-        _ty: &str,
-        _name: &str,
-    ) -> Result<Cell, WalParseError> {
-        Ok(match value {
+    fn json_to_cell(value: &serde_json::Value, _ty: &str, _name: &str) -> Cell {
+        match value {
             serde_json::Value::Null => Cell::Null,
             serde_json::Value::Bool(b) => Cell::Bool(*b),
             serde_json::Value::Number(n) => n
@@ -230,7 +226,7 @@ mod tests {
                 .map_or_else(|| n.as_f64().map_or(Cell::Missing, Cell::Float), Cell::Int),
             serde_json::Value::String(s) => Cell::String(s.clone().into()),
             _ => Cell::Missing,
-        })
+        }
     }
 
     #[test]
@@ -242,7 +238,7 @@ mod tests {
         ]);
 
         let (row, resolved) = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
-            json_to_cell(value, "", "")
+            Ok(json_to_cell(value, "", ""))
         })
         .expect("map should build a row image");
 
@@ -266,7 +262,7 @@ mod tests {
         let map = HashMap::from([("id".to_string(), json!(10)), ("ID".to_string(), json!(11))]);
 
         let err = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
-            json_to_cell(value, "", "")
+            Ok(json_to_cell(value, "", ""))
         })
         .expect_err("duplicate resolved column IDs should fail");
 
@@ -279,7 +275,7 @@ mod tests {
         let map = HashMap::from([("id".to_string(), json!(10))]);
 
         let err = build_row_from_map_with(&map, 999, &catalog, |value, _name| {
-            json_to_cell(value, "", "")
+            Ok(json_to_cell(value, "", ""))
         })
         .expect_err("must fail");
         match err {
@@ -297,7 +293,7 @@ mod tests {
         let map = HashMap::from([("missing".to_string(), json!(10))]);
 
         let err = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
-            json_to_cell(value, "", "")
+            Ok(json_to_cell(value, "", ""))
         })
         .expect_err("must fail");
         match err {
@@ -315,7 +311,7 @@ mod tests {
         let map = HashMap::from([("ghost".to_string(), json!(99))]);
 
         let err = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
-            json_to_cell(value, "", "")
+            Ok(json_to_cell(value, "", ""))
         })
         .expect_err("out-of-range column id should fail");
 
@@ -341,7 +337,7 @@ mod tests {
             1,
             &catalog,
             "columns",
-            |value, ty, col| json_to_cell(value, ty, col),
+            |value, ty, col| Ok(json_to_cell(value, ty, col)),
         )
         .expect("typed values should build row");
 
@@ -363,7 +359,7 @@ mod tests {
             1,
             &catalog,
             "columns",
-            |value, ty, col| json_to_cell(value, ty, col),
+            |value, ty, col| Ok(json_to_cell(value, ty, col)),
         )
         .expect_err("duplicate typed column should fail");
 
@@ -384,7 +380,7 @@ mod tests {
             1,
             &catalog,
             "new_row",
-            |value, ty, name| json_to_cell(value, ty, name),
+            |value, ty, name| Ok(json_to_cell(value, ty, name)),
         )
         .expect_err("must fail");
 
@@ -413,7 +409,7 @@ mod tests {
             1,
             &catalog,
             "new_row",
-            |value, ty, name| json_to_cell(value, ty, name),
+            |value, ty, name| Ok(json_to_cell(value, ty, name)),
         )
         .expect_err("out-of-range column id should fail");
 
@@ -441,7 +437,7 @@ mod tests {
             1,
             &catalog,
             "oldkeys",
-            |value, ty, name| json_to_cell(value, ty, name),
+            |value, ty, name| Ok(json_to_cell(value, ty, name)),
         )
         .expect_err("must fail");
 
@@ -470,7 +466,7 @@ mod tests {
             1,
             &catalog,
             "oldkeys",
-            |value, ty, name| json_to_cell(value, ty, name),
+            |value, ty, name| Ok(json_to_cell(value, ty, name)),
         )
         .expect_err("must fail");
 
@@ -497,7 +493,7 @@ mod tests {
             1,
             &catalog,
             "oldkeys",
-            |value, ty, name| json_to_cell(value, ty, name),
+            |value, ty, name| Ok(json_to_cell(value, ty, name)),
         )
         .expect("pk should be built");
 
@@ -519,7 +515,7 @@ mod tests {
             1,
             &catalog,
             "new_row",
-            |value, ty, name| json_to_cell(value, ty, name),
+            |value, ty, name| Ok(json_to_cell(value, ty, name)),
         )
         .expect_err("duplicate column IDs should fail");
 
@@ -540,7 +536,7 @@ mod tests {
             1,
             &catalog,
             "oldkeys",
-            |value, ty, name| json_to_cell(value, ty, name),
+            |value, ty, name| Ok(json_to_cell(value, ty, name)),
         )
         .expect_err("duplicate column IDs should fail");
 

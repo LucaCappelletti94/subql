@@ -25,9 +25,14 @@ pub(super) fn json_value_to_cell_strict(
         return Ok(Cell::Null);
     }
 
-    // Normalize: lowercase, strip leading underscore (array indicator)
+    // Detect array types (PostgreSQL prefix '_') — not yet supported
     let ty = pg_type.to_ascii_lowercase();
-    let ty = ty.strip_prefix('_').unwrap_or(&ty);
+    if ty.starts_with('_') {
+        return Err(WalParseError::MalformedPayload(format!(
+            "array columns not yet supported: '{pg_type}'"
+        )));
+    }
+    let ty = ty.as_str();
 
     match ty {
         // Integer types
@@ -318,8 +323,28 @@ mod tests {
 
     #[test]
     fn array_type_prefix_stripped() {
-        // _int4 is an int4 array type — prefix stripped, treated as int
-        assert_eq!(json_value_to_cell(&json!(42), "_int4"), Cell::Int(42));
+        // _int4 is an int4 array type — now returns error in strict mode,
+        // non-strict falls back to string
+        assert_eq!(
+            json_value_to_cell(&json!(42), "_int4"),
+            Cell::String(Arc::from("42"))
+        );
+    }
+
+    // -- B9: Array type returns MalformedPayload (strict mode) ----------
+
+    #[test]
+    fn array_type_returns_malformed_payload() {
+        let val = serde_json::Value::Array(vec![
+            serde_json::Value::Number(1.into()),
+            serde_json::Value::Number(2.into()),
+        ]);
+        let err =
+            json_value_to_cell_strict(&val, "_int4", "col").expect_err("array should fail strict");
+        assert!(
+            matches!(err, WalParseError::MalformedPayload(_)),
+            "Expected MalformedPayload for array type, got: {err:?}"
+        );
     }
 
     #[test]

@@ -16,11 +16,12 @@ use std::collections::{HashSet, VecDeque};
 use super::pg_type::text_to_cell_strict;
 use super::{
     build_pk_from_resolved_strict, delete_event, insert_event, pk_from_catalog_or_empty,
-    resolve_table, truncate_event, update_event_with_old_row_completeness, WalParseError, WalParser,
+    resolve_table, truncate_event, update_event_with_old_row_completeness, WalParseError,
+    WalParser,
 };
-use crate::{Cell, ColumnId, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 #[cfg(test)]
 use crate::EventKind;
+use crate::{Cell, ColumnId, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
 /// Defensive bound to prevent pathological allocations from malformed input.
 const MAX_COLUMNS_PER_MESSAGE: usize = 10_000;
@@ -430,6 +431,13 @@ impl PgOutputParser {
         rel: &CachedRelation,
     ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
         let num_columns = Self::parse_column_count(cur.read_i16()?, "TupleData")?;
+        if num_columns != rel.arity {
+            return Err(WalParseError::ArityMismatch {
+                table_id: rel.table_id,
+                wal_count: num_columns,
+                catalog_arity: rel.arity,
+            });
+        }
         let positions: Vec<usize> = (0..num_columns).collect();
         Self::parse_tuple_data_with_positions(cur, rel, &positions, "tuple")
     }
@@ -640,8 +648,9 @@ impl WalParser for PgOutputParser {
         let mut cur = Cursor::new(&data[1..]);
 
         match msg_type {
-            // Metadata messages — skip
-            b'B' | b'C' | b'O' | b'Y' | b'M' | b'S' | b'E' | b'c' | b'A' => Ok(vec![]),
+            // Metadata, 2PC, keepalive, and replication protocol messages — skip
+            b'B' | b'C' | b'O' | b'Y' | b'M' | b'S' | b'E' | b'c' | b'A' | b'P' | b'K' | b'r'
+            | b'b' | b'p' => Ok(vec![]),
 
             // Relation message — cache, no events
             b'R' => {
@@ -938,7 +947,7 @@ mod tests {
 
         let total_relations = MAX_CACHED_RELATIONS + 5;
         for i in 0..total_relations {
-            let oid = 20_000_u32 + (i as u32);
+            let oid = 20_000_u32 + u32::try_from(i).expect("loop index fits u32");
             let rel_msg = build_relation_msg(oid, "public", "orders", &orders_columns());
             parser
                 .parse_wal_message(&rel_msg, &catalog)
@@ -967,7 +976,7 @@ mod tests {
             .expect_err("oldest relation should be evicted");
         assert!(matches!(err, WalParseError::UnknownRelationOid(oid) if oid == oldest_oid));
 
-        let newest_oid = 20_000_u32 + ((total_relations - 1) as u32);
+        let newest_oid = 20_000_u32 + u32::try_from(total_relations - 1).expect("index fits u32");
         let newest_insert = build_insert_msg(
             newest_oid,
             &[
@@ -1985,5 +1994,177 @@ mod tests {
             .parse_wal_message(&msg, &catalog)
             .expect_err("should fail");
         assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+    // -- B3: skip 2PC/keepalive/replication protocol messages ----------------
+
+    #[test]
+    fn skip_2pc_keepalive_messages() {
+        let parser = PgOutputParser::new();
+        let catalog = orders_catalog();
+        // b'P' = Prepare (2PC)
+        assert!(
+            parser
+                .parse_wal_message(b"P", &catalog)
+                .expect("P should parse")
+                .is_empty(),
+            "P should yield no events"
+        );
+        // b'K' = Keepalive
+        assert!(
+            parser
+                .parse_wal_message(b"K", &catalog)
+                .expect("K should parse")
+                .is_empty(),
+            "K should yield no events"
+        );
+        // b'r' = standby status update
+        assert!(
+            parser
+                .parse_wal_message(b"r", &catalog)
+                .expect("r should parse")
+                .is_empty(),
+            "r should yield no events"
+        );
+        // b'b' = begin prepared
+        assert!(
+            parser
+                .parse_wal_message(b"b", &catalog)
+                .expect("b should parse")
+                .is_empty(),
+            "b should yield no events"
+        );
+        // b'p' = commit prepared
+        assert!(
+            parser
+                .parse_wal_message(b"p", &catalog)
+                .expect("p should parse")
+                .is_empty(),
+            "p should yield no events"
+        );
+    }
+
+    // -- B4: under-arity normal tuples are rejected --------------------------
+
+    #[test]
+    fn insert_underarity_tuple_rejected() {
+        // Register a 4-column relation (orders), then send an INSERT with only 1 column.
+        let parser = PgOutputParser::new();
+        let catalog = orders_catalog();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        // Build an INSERT with only 1 column in the tuple (arity mismatch: 4 expected)
+        let insert_msg = build_insert_msg(16384, &[TupleCol::Text("1".into())]);
+        let err = parser
+            .parse_wal_message(&insert_msg, &catalog)
+            .expect_err("under-arity tuple should fail");
+        assert!(
+            matches!(err, WalParseError::ArityMismatch { .. })
+                || matches!(err, WalParseError::MalformedPayload(_)),
+            "Expected ArityMismatch or MalformedPayload, got: {err:?}"
+        );
+    }
+
+    // -- B5: LRU eviction boundary -------------------------------------------
+
+    #[test]
+    fn lru_eviction_boundary() {
+        // MAX_CACHED_RELATIONS = 32 in test mode.
+        // Register 33 relations (OIDs 0..=32), then OID 0 should be evicted.
+        let parser = PgOutputParser::new();
+        let catalog = orders_catalog();
+
+        // Register 33 relations: OIDs 0..=32
+        for oid in 0u32..=32u32 {
+            let rel_msg = build_relation_msg(oid, "public", "orders", &orders_columns());
+            parser
+                .parse_wal_message(&rel_msg, &catalog)
+                .expect("relation should parse");
+        }
+
+        // Now try to INSERT using OID 0 — it should have been evicted
+        let insert_msg = build_insert_msg(
+            0,
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Text("99.95".into()),
+                TupleCol::Text("pending".into()),
+            ],
+        );
+        let err = parser
+            .parse_wal_message(&insert_msg, &catalog)
+            .expect_err("OID 0 should have been evicted");
+        assert!(
+            matches!(err, WalParseError::UnknownRelationOid(0)),
+            "Expected UnknownRelationOid(0), got: {err:?}"
+        );
+    }
+
+    // -- B6: TRUNCATE edge cases: zero relations, unknown OID ----------------
+
+    #[test]
+    fn truncate_zero_relations() {
+        // TRUNCATE with rel_count=0 should produce no events
+        let parser = PgOutputParser::new();
+        let catalog = orders_catalog();
+
+        let msg = build_truncate_msg(0, &[]);
+        let events = parser
+            .parse_wal_message(&msg, &catalog)
+            .expect("zero-relation truncate should parse");
+        assert!(
+            events.is_empty(),
+            "Expected empty events for zero-relation truncate"
+        );
+    }
+
+    #[test]
+    fn truncate_unknown_oid_errors() {
+        // TRUNCATE referencing an unknown OID should fail
+        let parser = PgOutputParser::new();
+        let catalog = orders_catalog();
+
+        let msg = build_truncate_msg(0, &[9999]);
+        let err = parser
+            .parse_wal_message(&msg, &catalog)
+            .expect_err("unknown OID should fail");
+        assert!(
+            matches!(err, WalParseError::UnknownRelationOid(_)),
+            "Expected UnknownRelationOid, got: {err:?}"
+        );
+    }
+
+    // -- B7: UnknownTupleTag error path --------------------------------------
+
+    #[test]
+    fn unknown_tuple_tag_errors() {
+        // Build an INSERT whose tuple-data column tag is 0xFF (not 'n', 'u', or 't')
+        let parser = PgOutputParser::new();
+        let catalog = orders_catalog();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        // Build a raw INSERT message:
+        //   b'I', OID(4 bytes), b'N', num_cols(i16=4), then tag 0xFF for col 0
+        let mut msg = vec![b'I'];
+        push_u32(&mut msg, 16384u32);
+        push_u8(&mut msg, b'N'); // new tuple tag
+        push_i16(&mut msg, 4i16); // 4 columns matching arity
+        push_u8(&mut msg, 0xFF); // unknown column data tag
+
+        let err = parser
+            .parse_wal_message(&msg, &catalog)
+            .expect_err("unknown tuple tag should fail");
+        assert!(
+            matches!(err, WalParseError::UnknownTupleTag(0xFF)),
+            "Expected UnknownTupleTag(0xFF), got: {err:?}"
+        );
     }
 }

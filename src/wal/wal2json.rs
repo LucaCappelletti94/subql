@@ -219,12 +219,11 @@ fn build_pk_from_key_arrays(
     )
 }
 
-fn old_row_is_complete(old_row: &Option<RowImage>) -> bool {
-    old_row
-        .as_ref()
-        .is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()))
+fn old_row_is_complete(old_row: Option<&RowImage>) -> bool {
+    old_row.is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_event_from_rows(
     kind: EventKind,
     table_id: TableId,
@@ -327,7 +326,7 @@ fn convert_v1_change(
         let pk = pk_from_catalog_or_empty(&new_resolved, table_id, catalog)?;
         (None, pk)
     };
-    let old_row_complete = old_row_is_complete(&old_row);
+    let old_row_complete = old_row_is_complete(old_row.as_ref());
     build_event_from_rows(
         kind,
         table_id,
@@ -393,7 +392,7 @@ fn convert_v2_message(
         }
         EventKind::Insert | EventKind::Truncate => (None, Vec::new()),
     };
-    let old_row_complete = old_row_is_complete(&old_row);
+    let old_row_complete = old_row_is_complete(old_row.as_ref());
 
     // Build PK: prefer identity columns, then pk metadata, then catalog.
     // The three-way branching is clearer as if-let chains than map_or_else.
@@ -1003,6 +1002,39 @@ mod tests {
             .parse_wal_message(json.as_bytes(), &catalog)
             .expect_err("unknown action should fail");
         assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+    }
+
+    // -- B1: v1 unknown kind is error ----------------------------------------
+
+    #[test]
+    fn v1_unknown_kind_is_error() {
+        let catalog = orders_catalog();
+        let parser = Wal2JsonV1Parser;
+        // "schema_change" is not insert/update/delete
+        let json = r#"{"change":[{"kind":"schema_change","schema":"public","table":"orders","columnnames":["id"],"columntypes":["integer"],"columnvalues":[1]}]}"#;
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("unknown kind should fail");
+        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+    }
+
+    // -- B2: v2 missing table on data action ---------------------------------
+
+    #[test]
+    fn v2_missing_table_on_data_action() {
+        let catalog = orders_catalog();
+        let parser = Wal2JsonV2Parser;
+        // "action": "I" with no table should fail
+        let json = r#"{"action":"I","schema":"public","columnnames":["id"],"columntypes":["integer"],"columnvalues":[1]}"#;
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("missing table should fail");
+        assert!(
+            matches!(err, WalParseError::MissingField(_))
+                || matches!(err, WalParseError::JsonError(_))
+                || matches!(err, WalParseError::UnknownTable { .. }),
+            "Expected error for missing table, got: {err:?}"
+        );
     }
 
     // -- Trait object safety --------------------------------------------------

@@ -55,9 +55,15 @@ impl WalParser for DebeziumParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        super::parse_single_json_event::<DebeziumEnvelope, _>(data, |env| {
-            convert_debezium_envelope(env, catalog)
-        })
+        let message: Option<DebeziumEnvelope> = super::parse_json_message_or_tombstone(data)?;
+        let Some(message) = message else {
+            return Ok(Vec::new());
+        };
+        // Skip message/heartbeat ops — they contain no row data
+        if message.op == "m" {
+            return Ok(vec![]);
+        }
+        Ok(vec![convert_debezium_envelope(&message, catalog)?])
     }
 }
 
@@ -93,7 +99,7 @@ fn convert_debezium_envelope(
         table_id,
         env.after.as_ref(),
         env.before.as_ref(),
-        MapCdcConfig {
+        &MapCdcConfig {
             required_new_field: "after",
             required_old_field: "before",
             new_field_prefix: "debezium.after",
@@ -584,5 +590,19 @@ mod tests {
     fn send_sync_check() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DebeziumParser>();
+    }
+    // -- B8: Debezium message op is skipped ----------------------------------
+
+    #[test]
+    fn debezium_message_op_is_skipped() {
+        let catalog = orders_catalog();
+        let parser = DebeziumParser;
+
+        // "m" is the Debezium message/heartbeat op
+        let json = r#"{"before":null,"after":null,"source":{"db":"testdb","schema":"public","table":"orders"},"op":"m","ts_ms":1000}"#;
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("Message op should be skipped, not errored");
+        assert!(events.is_empty(), "Message ops should produce no output");
     }
 }

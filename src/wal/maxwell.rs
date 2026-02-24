@@ -56,9 +56,23 @@ impl WalParser for MaxwellParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        super::parse_single_json_event::<MaxwellMessage, _>(data, |msg| {
-            convert_maxwell_message(msg, catalog)
-        })
+        let message: Option<MaxwellMessage> = super::parse_json_message_or_tombstone(data)?;
+        let Some(message) = message else {
+            return Ok(Vec::new());
+        };
+        // Skip DDL/schema events — they contain no row data
+        if matches!(
+            message.event_type.as_str(),
+            "ddl"
+                | "table-create"
+                | "table-drop"
+                | "table-alter"
+                | "database-create"
+                | "database-drop"
+        ) {
+            return Ok(vec![]);
+        }
+        Ok(vec![convert_maxwell_message(&message, catalog)?])
     }
 }
 
@@ -91,7 +105,7 @@ fn convert_maxwell_message(
         table_id,
         msg.data.as_ref(),
         old_map,
-        MapCdcConfig {
+        &MapCdcConfig {
             required_new_field: "data",
             required_old_field: "data",
             new_field_prefix: "maxwell.data",
@@ -530,5 +544,33 @@ mod tests {
     fn send_sync_check() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MaxwellParser>();
+    }
+    // -- B8: Maxwell DDL events are skipped ---------------------------------
+
+    #[test]
+    fn maxwell_ddl_event_is_skipped() {
+        let catalog = maxwell_e_catalog();
+        let parser = MaxwellParser;
+
+        let json = r#"{"type":"ddl","database":"test","table":"e","def":"ALTER TABLE e ADD COLUMN x INT"}"#;
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("DDL event should be skipped, not errored");
+        assert!(events.is_empty(), "DDL events should produce no output");
+    }
+
+    #[test]
+    fn maxwell_table_create_is_skipped() {
+        let catalog = maxwell_e_catalog();
+        let parser = MaxwellParser;
+
+        let json = r#"{"type":"table-create","database":"test","table":"e","def":"CREATE TABLE e (id INT)"}"#;
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("table-create event should be skipped");
+        assert!(
+            events.is_empty(),
+            "table-create events should produce no output"
+        );
     }
 }

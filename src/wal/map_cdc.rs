@@ -75,7 +75,7 @@ pub(super) fn convert_map_cdc_event(
     table_id: TableId,
     new_map: Option<&HashMap<String, serde_json::Value>>,
     old_map: Option<&HashMap<String, serde_json::Value>>,
-    config: MapCdcConfig<'_>,
+    config: &MapCdcConfig<'_>,
     catalog: &dyn SchemaCatalog,
 ) -> Result<WalEvent, WalParseError> {
     match kind {
@@ -165,7 +165,7 @@ mod tests {
             1,
             None,
             None,
-            MapCdcConfig {
+            &MapCdcConfig {
                 required_new_field: "after",
                 required_old_field: "before",
                 new_field_prefix: "after",
@@ -190,7 +190,7 @@ mod tests {
             1,
             Some(&new_map),
             None,
-            MapCdcConfig {
+            &MapCdcConfig {
                 required_new_field: "after",
                 required_old_field: "before",
                 new_field_prefix: "after",
@@ -220,7 +220,7 @@ mod tests {
             1,
             Some(&new_map),
             Some(&old_map),
-            MapCdcConfig {
+            &MapCdcConfig {
                 required_new_field: "after",
                 required_old_field: "before",
                 new_field_prefix: "after",
@@ -252,7 +252,7 @@ mod tests {
             1,
             Some(&new_map),
             None,
-            MapCdcConfig {
+            &MapCdcConfig {
                 required_new_field: "after",
                 required_old_field: "before",
                 new_field_prefix: "after",

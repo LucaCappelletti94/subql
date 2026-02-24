@@ -54,7 +54,7 @@ where
     parse_json_message(data)
 }
 
-/// Parse tombstone-capable JSON and map a non-null message into a single event.
+#[cfg(test)]
 pub(crate) fn parse_single_json_event<T, F>(
     data: &[u8],
     build_event: F,
