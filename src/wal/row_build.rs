@@ -5,6 +5,18 @@ use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
 
 use super::WalParseError;
 
+fn resolve_table_arity(
+    table_id: TableId,
+    catalog: &dyn SchemaCatalog,
+) -> Result<usize, WalParseError> {
+    catalog
+        .table_arity(table_id)
+        .ok_or_else(|| WalParseError::UnknownTable {
+            schema: String::new(),
+            table: format!("table_id={table_id}"),
+        })
+}
+
 /// Build a row image from a column->value map and return resolved `(ColumnId, Cell)` pairs.
 pub(super) fn build_row_from_map_with<F>(
     map: &HashMap<String, serde_json::Value>,
@@ -15,15 +27,11 @@ pub(super) fn build_row_from_map_with<F>(
 where
     F: FnMut(&serde_json::Value, &str) -> Result<Cell, WalParseError>,
 {
-    let arity = catalog
-        .table_arity(table_id)
-        .ok_or_else(|| WalParseError::UnknownTable {
-            schema: String::new(),
-            table: format!("table_id={table_id}"),
-        })?;
+    let arity = resolve_table_arity(table_id, catalog)?;
 
     let mut cells = vec![Cell::Missing; arity];
     let mut resolved = Vec::with_capacity(map.len());
+    let mut seen = HashSet::with_capacity(map.len());
 
     for (name, value) in map {
         let col_id =
@@ -33,6 +41,11 @@ where
                     table_id,
                     column: name.clone(),
                 })?;
+        if !seen.insert(col_id) {
+            return Err(WalParseError::MalformedPayload(format!(
+                "map row contains duplicate column id {col_id} ('{name}')"
+            )));
+        }
         if (col_id as usize) >= arity {
             return Err(WalParseError::ArityMismatch {
                 table_id,
@@ -65,12 +78,7 @@ pub(super) fn build_row_from_named_typed_values_with<F>(
 where
     F: FnMut(&serde_json::Value, &str, &str) -> Result<Cell, WalParseError>,
 {
-    let arity = catalog
-        .table_arity(table_id)
-        .ok_or_else(|| WalParseError::UnknownTable {
-            schema: String::new(),
-            table: format!("table_id={table_id}"),
-        })?;
+    let arity = resolve_table_arity(table_id, catalog)?;
 
     let mut cells = vec![Cell::Missing; arity];
     let mut resolved = Vec::with_capacity(columns.len());
@@ -247,6 +255,21 @@ mod tests {
         assert!(resolved
             .iter()
             .any(|(col, cell)| *col == 1 && *cell == Cell::String("alice".into())));
+    }
+
+    #[test]
+    fn test_build_row_from_map_with_duplicate_resolved_column_id() {
+        let mut catalog = make_catalog();
+        catalog.columns.insert((1_u32, "ID".to_string()), 0_u16);
+
+        let map = HashMap::from([("id".to_string(), json!(10)), ("ID".to_string(), json!(11))]);
+
+        let err = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
+            json_to_cell(value, "", "")
+        })
+        .expect_err("duplicate resolved column IDs should fail");
+
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 
     #[test]

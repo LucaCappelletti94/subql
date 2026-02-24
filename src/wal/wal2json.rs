@@ -107,11 +107,7 @@ impl WalParser for Wal2JsonV1Parser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let text =
-            std::str::from_utf8(data).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-
-        let msg: Wal2JsonV1Message =
-            serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
+        let msg: Wal2JsonV1Message = super::parse_json_message(data)?;
 
         let mut events = Vec::with_capacity(msg.change.len());
         for change in &msg.change {
@@ -127,11 +123,7 @@ impl WalParser for Wal2JsonV2Parser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let text =
-            std::str::from_utf8(data).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-
-        let msg: Wal2JsonV2Message =
-            serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
+        let msg: Wal2JsonV2Message = super::parse_json_message(data)?;
 
         // Skip non-row messages (transaction boundaries and truncate).
         match msg.action.as_str() {
@@ -277,7 +269,7 @@ fn convert_v1_change(
         (Some(row), pk)
     } else {
         // INSERT without oldkeys — extract PK from new row using catalog metadata
-        let pk = pk_from_catalog_or_empty(&new_resolved, table_id, catalog);
+        let pk = pk_from_catalog_or_empty(&new_resolved, table_id, catalog)?;
         (None, pk)
     };
 
@@ -387,7 +379,7 @@ fn convert_v2_message(
             strict_pk_column_ids_from_names(table_id, &pk_names, &new_resolved, catalog, "pk")?;
         build_pk_from_resolved(&new_resolved, &pk_col_ids)
     } else {
-        pk_from_catalog_or_empty(&new_resolved, table_id, catalog)
+        pk_from_catalog_or_empty(&new_resolved, table_id, catalog)?
     };
 
     match kind {
@@ -415,46 +407,39 @@ fn convert_v2_message(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::TestCatalog;
     use super::*;
     use std::collections::HashMap;
 
     // -- Test catalog --------------------------------------------------------
 
-    struct TestCatalog {
-        tables: HashMap<String, (TableId, usize)>,
-        columns: HashMap<(TableId, String), ColumnId>,
-        primary_keys: HashMap<TableId, Vec<ColumnId>>,
+    fn orders_catalog() -> TestCatalog {
+        let mut tables = HashMap::new();
+        tables.insert("orders".to_string(), (1, 4));
+        tables.insert("public.orders".to_string(), (1, 4));
+
+        let mut columns = HashMap::new();
+        // id=0, customer=1, amount=2, status=3
+        columns.insert((1, "id".to_string()), 0);
+        columns.insert((1, "customer".to_string()), 1);
+        columns.insert((1, "amount".to_string()), 2);
+        columns.insert((1, "status".to_string()), 3);
+
+        let mut primary_keys = HashMap::new();
+        primary_keys.insert(1, vec![0]); // id is PK
+
+        TestCatalog {
+            tables,
+            columns,
+            primary_keys,
+        }
     }
 
-    impl TestCatalog {
-        fn orders() -> Self {
-            let mut tables = HashMap::new();
-            tables.insert("orders".to_string(), (1, 4));
-            tables.insert("public.orders".to_string(), (1, 4));
-
-            let mut columns = HashMap::new();
-            // id=0, customer=1, amount=2, status=3
-            columns.insert((1, "id".to_string()), 0);
-            columns.insert((1, "customer".to_string()), 1);
-            columns.insert((1, "amount".to_string()), 2);
-            columns.insert((1, "status".to_string()), 3);
-
-            let mut primary_keys = HashMap::new();
-            primary_keys.insert(1, vec![0]); // id is PK
-
-            Self {
-                tables,
-                columns,
-                primary_keys,
-            }
-        }
-
-        /// Same schema as `orders()` but without primary key metadata.
-        fn orders_no_pk() -> Self {
-            let mut cat = Self::orders();
-            cat.primary_keys.clear();
-            cat
-        }
+    /// Same schema as `orders_catalog()` but without primary key metadata.
+    fn orders_no_pk_catalog() -> TestCatalog {
+        let mut cat = orders_catalog();
+        cat.primary_keys.clear();
+        cat
     }
 
     /// Catalog where table_id resolves but table_arity returns None.
@@ -482,38 +467,11 @@ mod tests {
         }
     }
 
-    impl SchemaCatalog for TestCatalog {
-        fn table_id(&self, table_name: &str) -> Option<TableId> {
-            self.tables.get(table_name).map(|(id, _)| *id)
-        }
-
-        fn column_id(&self, table_id: TableId, column_name: &str) -> Option<ColumnId> {
-            self.columns
-                .get(&(table_id, column_name.to_string()))
-                .copied()
-        }
-
-        fn table_arity(&self, table_id: TableId) -> Option<usize> {
-            self.tables
-                .values()
-                .find(|(id, _)| *id == table_id)
-                .map(|(_, arity)| *arity)
-        }
-
-        fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-            Some(0)
-        }
-
-        fn primary_key_columns(&self, table_id: TableId) -> Option<&[ColumnId]> {
-            self.primary_keys.get(&table_id).map(Vec::as_slice)
-        }
-    }
-
     // -- v1 INSERT -----------------------------------------------------------
 
     #[test]
     fn v1_insert() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -559,7 +517,7 @@ mod tests {
 
     #[test]
     fn v1_update() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -606,7 +564,7 @@ mod tests {
 
     #[test]
     fn v1_delete() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -643,7 +601,7 @@ mod tests {
 
     #[test]
     fn v1_multi_change() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -697,7 +655,7 @@ mod tests {
 
     #[test]
     fn v2_insert() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -737,7 +695,7 @@ mod tests {
 
     #[test]
     fn v2_insert_duplicate_columns_returns_error() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -763,7 +721,7 @@ mod tests {
 
     #[test]
     fn v2_update() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -804,7 +762,7 @@ mod tests {
 
     #[test]
     fn v2_delete() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -837,7 +795,7 @@ mod tests {
 
     #[test]
     fn error_invalid_utf8() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
         let bad_bytes: &[u8] = &[0xFF, 0xFE, 0xFD];
 
@@ -849,7 +807,7 @@ mod tests {
 
     #[test]
     fn error_malformed_json() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let err = parser
@@ -860,7 +818,7 @@ mod tests {
 
     #[test]
     fn error_unknown_table() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -882,7 +840,7 @@ mod tests {
 
     #[test]
     fn error_unknown_column() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -904,7 +862,7 @@ mod tests {
 
     #[test]
     fn error_unknown_event_kind() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -926,7 +884,7 @@ mod tests {
 
     #[test]
     fn v2_non_data_actions_skipped() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         // Truncate (T), Begin (B), Commit (C), Message (M) are silently skipped.
@@ -944,7 +902,7 @@ mod tests {
 
     #[test]
     fn v2_unknown_action_returns_error() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{"action":"X","schema":"public","table":"orders"}"#;
@@ -959,7 +917,7 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let parser: &dyn WalParser = &Wal2JsonV1Parser;
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
 
         let json = r#"{
             "change": [{
@@ -980,7 +938,7 @@ mod tests {
 
     #[test]
     fn v1_update_with_changed_columns() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         // Simulate REPLICA IDENTITY FULL: oldkeys contains all columns
@@ -1019,7 +977,7 @@ mod tests {
 
     #[test]
     fn v1_update_without_oldkeys() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -1048,7 +1006,7 @@ mod tests {
 
     #[test]
     fn v1_insert_no_catalog_pk() {
-        let catalog = TestCatalog::orders_no_pk();
+        let catalog = orders_no_pk_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -1076,7 +1034,7 @@ mod tests {
 
     #[test]
     fn v2_update_identity_no_pk_metadata() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1109,7 +1067,7 @@ mod tests {
 
     #[test]
     fn v2_insert_no_pk_no_catalog() {
-        let catalog = TestCatalog::orders_no_pk();
+        let catalog = orders_no_pk_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1138,7 +1096,7 @@ mod tests {
 
     #[test]
     fn v2_update_without_identity() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1171,7 +1129,7 @@ mod tests {
 
     #[test]
     fn error_unknown_column_v2() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1194,7 +1152,7 @@ mod tests {
 
     #[test]
     fn v1_null_values() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -1223,7 +1181,7 @@ mod tests {
 
     #[test]
     fn v2_insert_no_pk_metadata() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1298,7 +1256,7 @@ mod tests {
 
     #[test]
     fn error_unknown_column_in_oldkeys() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -1322,7 +1280,7 @@ mod tests {
 
     #[test]
     fn error_v1_delete_missing_oldkeys() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -1341,7 +1299,7 @@ mod tests {
 
     #[test]
     fn error_v2_insert_missing_columns() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1358,7 +1316,7 @@ mod tests {
 
     #[test]
     fn error_v2_update_missing_columns() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1378,7 +1336,7 @@ mod tests {
 
     #[test]
     fn error_v2_delete_missing_identity() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1395,7 +1353,7 @@ mod tests {
 
     #[test]
     fn error_v2_numeric_overflow() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1415,7 +1373,7 @@ mod tests {
 
     #[test]
     fn error_v2_pk_metadata_unknown_column() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1440,7 +1398,7 @@ mod tests {
 
     #[test]
     fn error_v2_pk_metadata_column_missing_in_row() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
         let json = r#"{
@@ -1467,7 +1425,7 @@ mod tests {
     fn error_build_pk_unknown_column() {
         // Exercise build_pk_from_key_arrays directly (normally preempted
         // by build_row_from_arrays checking the same columns first).
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let names = vec!["nonexistent".to_string()];
         let types = vec!["integer".to_string()];
         let values = vec![serde_json::json!(1)];
@@ -1479,7 +1437,7 @@ mod tests {
 
     #[test]
     fn error_mismatched_column_array_lengths_v1_does_not_panic() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{
@@ -1507,7 +1465,7 @@ mod tests {
 
     #[test]
     fn error_mismatched_oldkeys_array_lengths_v1_does_not_panic() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
 
         let json = r#"{

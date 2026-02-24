@@ -11,16 +11,21 @@
 use std::sync::{Arc, Mutex};
 
 use ahash::AHashMap;
+use std::collections::{HashSet, VecDeque};
 
-use super::pg_type::text_to_cell;
+use super::pg_type::text_to_cell_strict;
 use super::{
-    build_pk_from_resolved, changed_columns, pk_from_catalog_or_empty, resolve_table,
+    build_pk_from_resolved_strict, changed_columns, pk_from_catalog_or_empty, resolve_table,
     WalParseError, WalParser,
 };
-use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use crate::{Cell, ColumnId, EventKind, RowImage, SchemaCatalog, TableId, WalEvent};
 
 /// Defensive bound to prevent pathological allocations from malformed input.
 const MAX_COLUMNS_PER_MESSAGE: usize = 10_000;
+#[cfg(not(test))]
+const MAX_CACHED_RELATIONS: usize = 65_536;
+#[cfg(test)]
+const MAX_CACHED_RELATIONS: usize = 32;
 
 // ============================================================================
 // Cached relation metadata
@@ -45,6 +50,38 @@ struct CachedRelation {
     arity: usize,
     /// Indices into `columns` where `flags & 1 != 0` (replica identity).
     identity_columns: Vec<usize>,
+}
+
+#[derive(Default)]
+struct RelationCache {
+    map: AHashMap<u32, CachedRelation>,
+    insertion_order: VecDeque<u32>,
+}
+
+impl RelationCache {
+    fn insert(&mut self, oid: u32, relation: CachedRelation) {
+        if self.map.contains_key(&oid) {
+            self.map.insert(oid, relation);
+            if let Some(pos) = self
+                .insertion_order
+                .iter()
+                .position(|existing| *existing == oid)
+            {
+                let _ = self.insertion_order.remove(pos);
+            }
+            self.insertion_order.push_back(oid);
+            return;
+        }
+
+        if self.map.len() >= MAX_CACHED_RELATIONS {
+            if let Some(oldest_oid) = self.insertion_order.pop_front() {
+                self.map.remove(&oldest_oid);
+            }
+        }
+
+        self.map.insert(oid, relation);
+        self.insertion_order.push_back(oid);
+    }
 }
 
 // ============================================================================
@@ -175,13 +212,13 @@ impl<'a> Cursor<'a> {
 /// Stateful: caches Relation messages so that subsequent DML messages can
 /// reference table schemas by OID.
 pub struct PgOutputParser {
-    relations: Mutex<AHashMap<u32, CachedRelation>>,
+    relations: Mutex<RelationCache>,
 }
 
 impl Default for PgOutputParser {
     fn default() -> Self {
         Self {
-            relations: Mutex::new(AHashMap::new()),
+            relations: Mutex::new(RelationCache::default()),
         }
     }
 }
@@ -219,6 +256,16 @@ impl PgOutputParser {
         }
     }
 
+    fn ensure_fully_consumed(cur: &Cursor<'_>, context: &str) -> Result<(), WalParseError> {
+        let trailing = cur.remaining();
+        if trailing == 0 {
+            return Ok(());
+        }
+        Err(WalParseError::MalformedPayload(format!(
+            "trailing bytes after {context}: {trailing}"
+        )))
+    }
+
     /// Handle Relation message: parse schema and cache for later DML lookups.
     fn handle_relation(
         &self,
@@ -253,6 +300,7 @@ impl PgOutputParser {
             })?;
 
         let mut column_ids = Vec::with_capacity(columns.len());
+        let mut seen_column_ids = HashSet::with_capacity(columns.len());
         for col in &columns {
             let col_id = catalog.column_id(table_id, &col.name).ok_or_else(|| {
                 WalParseError::UnknownColumn {
@@ -260,6 +308,18 @@ impl PgOutputParser {
                     column: col.name.clone(),
                 }
             })?;
+            if !seen_column_ids.insert(col_id) {
+                return Err(WalParseError::MalformedPayload(format!(
+                    "relation '{}' column '{}' resolves to duplicate column id {} for table {}",
+                    name, col.name, col_id, table_id
+                )));
+            }
+            if (col_id as usize) >= arity {
+                return Err(WalParseError::MalformedPayload(format!(
+                    "relation column '{}' resolved to out-of-range column id {} for table {} (arity {})",
+                    col.name, col_id, table_id, arity
+                )));
+            }
             column_ids.push(col_id);
         }
 
@@ -299,7 +359,8 @@ impl PgOutputParser {
             .relations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(&oid)
+        map.map
+            .get(&oid)
             .cloned()
             .ok_or(WalParseError::UnknownRelationOid(oid))
     }
@@ -322,31 +383,82 @@ impl PgOutputParser {
         let mut resolved = Vec::with_capacity(num_columns);
 
         for i in 0..num_columns {
-            let tag = cur.read_u8()?;
-            let cell = match tag {
-                b'n' => Cell::Null,
-                b'u' => Cell::Missing,
-                b't' => {
-                    let len_i32 = cur.read_i32()?;
-                    if len_i32 < 0 {
-                        return Err(WalParseError::MalformedPayload(format!(
-                            "negative tuple text length: {len_i32}"
-                        )));
-                    }
-                    let len = usize::try_from(len_i32).map_err(|_| {
-                        WalParseError::MalformedPayload(format!(
-                            "invalid tuple text length: {len_i32}"
-                        ))
-                    })?;
-                    let bytes = cur.read_bytes(len)?;
-                    let text = std::str::from_utf8(bytes)
-                        .map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-                    text_to_cell(text, rel.columns[i].type_oid)
-                }
-                other => return Err(WalParseError::UnknownTupleTag(other)),
-            };
+            let cell = Self::parse_tuple_cell(cur, rel.columns[i].type_oid)?;
 
             let col_id = rel.column_ids[i];
+            if (col_id as usize) < rel.arity {
+                cells[col_id as usize] = cell.clone();
+            }
+            resolved.push((col_id, cell));
+        }
+
+        Ok((
+            RowImage {
+                cells: Arc::from(cells),
+            },
+            resolved,
+        ))
+    }
+
+    fn parse_tuple_cell(cur: &mut Cursor<'_>, type_oid: u32) -> Result<Cell, WalParseError> {
+        let tag = cur.read_u8()?;
+        match tag {
+            b'n' => Ok(Cell::Null),
+            b'u' => Ok(Cell::Missing),
+            b't' => {
+                let len_i32 = cur.read_i32()?;
+                if len_i32 < 0 {
+                    return Err(WalParseError::MalformedPayload(format!(
+                        "negative tuple text length: {len_i32}"
+                    )));
+                }
+                let len = usize::try_from(len_i32).map_err(|_| {
+                    WalParseError::MalformedPayload(format!("invalid tuple text length: {len_i32}"))
+                })?;
+                let bytes = cur.read_bytes(len)?;
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
+                text_to_cell_strict(text, type_oid)
+            }
+            other => Err(WalParseError::UnknownTupleTag(other)),
+        }
+    }
+
+    /// Parse an UPDATE/DELETE old-key tuple (`'K'`): supports both full-width
+    /// tuple encoding and compact key-only encoding mapped by replica identity.
+    fn parse_key_tuple_data(
+        cur: &mut Cursor<'_>,
+        rel: &CachedRelation,
+    ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
+        let num_columns = Self::parse_column_count(cur.read_i16()?, "TupleData")?;
+        if num_columns > rel.columns.len() || num_columns > rel.column_ids.len() {
+            return Err(WalParseError::MalformedPayload(format!(
+                "key tuple column count {} exceeds relation column count {}",
+                num_columns,
+                rel.columns.len()
+            )));
+        }
+
+        let mapped_positions: Vec<usize> = if !rel.identity_columns.is_empty()
+            && num_columns == rel.identity_columns.len()
+        {
+            rel.identity_columns.clone()
+        } else if num_columns == rel.columns.len() {
+            (0..num_columns).collect()
+        } else {
+            return Err(WalParseError::MalformedPayload(format!(
+                "key tuple column count {num_columns} does not match identity column count {} or relation column count {}",
+                rel.identity_columns.len(),
+                rel.columns.len()
+            )));
+        };
+
+        let mut cells = vec![Cell::Missing; rel.arity];
+        let mut resolved = Vec::with_capacity(num_columns);
+
+        for rel_idx in mapped_positions {
+            let cell = Self::parse_tuple_cell(cur, rel.columns[rel_idx].type_oid)?;
+            let col_id = rel.column_ids[rel_idx];
             if (col_id as usize) < rel.arity {
                 cells[col_id as usize] = cell.clone();
             }
@@ -375,7 +487,7 @@ impl PgOutputParser {
         Self::expected_tag(tag, b'N', "INSERT tuple")?;
 
         let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel)?;
-        let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog);
+        let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?;
 
         Ok(WalEvent {
             kind: EventKind::Insert,
@@ -401,7 +513,11 @@ impl PgOutputParser {
 
         let (old_row, old_resolved) = if tag == b'K' || tag == b'O' {
             // Old tuple present (K = key, O = full old row)
-            let (row, resolved) = Self::parse_tuple_data(cur, &rel)?;
+            let (row, resolved) = if tag == b'K' {
+                Self::parse_key_tuple_data(cur, &rel)?
+            } else {
+                Self::parse_tuple_data(cur, &rel)?
+            };
             // Now consume the 'N' tag for the new tuple
             let n_tag = cur.read_u8()?;
             Self::expected_tag(n_tag, b'N', "UPDATE new tuple")?;
@@ -420,15 +536,12 @@ impl PgOutputParser {
         // PK: prefer identity columns from old row, then catalog fallback.
         let pk = if old_resolved.is_empty() {
             // No old row — extract PK from new row via catalog
-            pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)
+            pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?
         } else if rel.identity_columns.is_empty() {
-            // No identity columns marked — use all old columns as PK
-            let cols: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
-            let vals: Vec<Cell> = old_resolved.iter().map(|(_, v)| v.clone()).collect();
-            PrimaryKey {
-                columns: Arc::from(cols),
-                values: Arc::from(vals),
-            }
+            // No identity columns marked — use old tuple values as fallback key.
+            // Require concrete values to avoid emitting PKs containing Missing.
+            let pk_col_ids: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
+            build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "old tuple fallback key")?
         } else {
             // Use identity columns from old row
             let pk_col_ids: Vec<ColumnId> = rel
@@ -436,7 +549,7 @@ impl PgOutputParser {
                 .iter()
                 .map(|&i| rel.column_ids[i])
                 .collect();
-            build_pk_from_resolved(&old_resolved, &pk_col_ids)
+            build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "replica identity")?
         };
 
         let changed = if let (Some(ref old), new) = (&old_row, &new_row) {
@@ -472,24 +585,25 @@ impl PgOutputParser {
             )));
         }
 
-        let (old_row, old_resolved) = Self::parse_tuple_data(cur, &rel)?;
+        let (old_row, old_resolved) = if tag == b'K' {
+            Self::parse_key_tuple_data(cur, &rel)?
+        } else {
+            Self::parse_tuple_data(cur, &rel)?
+        };
 
         // PK from identity columns
         let pk = if rel.identity_columns.is_empty() {
-            // No identity columns — use all columns
-            let cols: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
-            let vals: Vec<Cell> = old_resolved.iter().map(|(_, v)| v.clone()).collect();
-            PrimaryKey {
-                columns: Arc::from(cols),
-                values: Arc::from(vals),
-            }
+            // No identity columns — use old tuple values as fallback key.
+            // Require concrete values to avoid emitting PKs containing Missing.
+            let pk_col_ids: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
+            build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "old tuple fallback key")?
         } else {
             let pk_col_ids: Vec<ColumnId> = rel
                 .identity_columns
                 .iter()
                 .map(|&i| rel.column_ids[i])
                 .collect();
-            build_pk_from_resolved(&old_resolved, &pk_col_ids)
+            build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "replica identity")?
         };
 
         Ok(WalEvent {
@@ -523,24 +637,28 @@ impl WalParser for PgOutputParser {
             // Relation message — cache, no events
             b'R' => {
                 self.handle_relation(&mut cur, catalog)?;
+                Self::ensure_fully_consumed(&cur, "Relation message")?;
                 Ok(vec![])
             }
 
             // Insert
             b'I' => {
                 let event = self.handle_insert(&mut cur, catalog)?;
+                Self::ensure_fully_consumed(&cur, "Insert message")?;
                 Ok(vec![event])
             }
 
             // Update
             b'U' => {
                 let event = self.handle_update(&mut cur, catalog)?;
+                Self::ensure_fully_consumed(&cur, "Update message")?;
                 Ok(vec![event])
             }
 
             // Delete
             b'D' => {
                 let event = self.handle_delete(&mut cur, catalog)?;
+                Self::ensure_fully_consumed(&cur, "Delete message")?;
                 Ok(vec![event])
             }
 
@@ -557,73 +675,38 @@ impl WalParser for PgOutputParser {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::TestCatalog;
     use super::*;
     use std::collections::HashMap;
 
     // -- Test catalog --------------------------------------------------------
 
-    struct TestCatalog {
-        tables: HashMap<String, (TableId, usize)>,
-        columns: HashMap<(TableId, String), ColumnId>,
-        primary_keys: HashMap<TableId, Vec<ColumnId>>,
-    }
+    fn orders_catalog() -> TestCatalog {
+        let mut tables = HashMap::new();
+        tables.insert("orders".to_string(), (1, 4));
+        tables.insert("public.orders".to_string(), (1, 4));
 
-    impl TestCatalog {
-        fn orders() -> Self {
-            let mut tables = HashMap::new();
-            tables.insert("orders".to_string(), (1, 4));
-            tables.insert("public.orders".to_string(), (1, 4));
+        let mut columns = HashMap::new();
+        columns.insert((1, "id".to_string()), 0);
+        columns.insert((1, "customer".to_string()), 1);
+        columns.insert((1, "amount".to_string()), 2);
+        columns.insert((1, "status".to_string()), 3);
 
-            let mut columns = HashMap::new();
-            columns.insert((1, "id".to_string()), 0);
-            columns.insert((1, "customer".to_string()), 1);
-            columns.insert((1, "amount".to_string()), 2);
-            columns.insert((1, "status".to_string()), 3);
+        let mut primary_keys = HashMap::new();
+        primary_keys.insert(1, vec![0]); // id is PK
 
-            let mut primary_keys = HashMap::new();
-            primary_keys.insert(1, vec![0]); // id is PK
-
-            Self {
-                tables,
-                columns,
-                primary_keys,
-            }
-        }
-
-        fn orders_no_pk() -> Self {
-            let mut cat = Self::orders();
-            cat.primary_keys.clear();
-            cat
+        TestCatalog {
+            tables,
+            columns,
+            primary_keys,
         }
     }
 
-    impl SchemaCatalog for TestCatalog {
-        fn table_id(&self, table_name: &str) -> Option<TableId> {
-            self.tables.get(table_name).map(|(id, _)| *id)
-        }
-
-        fn column_id(&self, table_id: TableId, column_name: &str) -> Option<ColumnId> {
-            self.columns
-                .get(&(table_id, column_name.to_string()))
-                .copied()
-        }
-
-        fn table_arity(&self, table_id: TableId) -> Option<usize> {
-            self.tables
-                .values()
-                .find(|(id, _)| *id == table_id)
-                .map(|(_, arity)| *arity)
-        }
-
-        fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-            Some(0)
-        }
-
-        fn primary_key_columns(&self, table_id: TableId) -> Option<&[ColumnId]> {
-            self.primary_keys.get(&table_id).map(Vec::as_slice)
-        }
+    fn orders_no_pk_catalog() -> TestCatalog {
+        let mut cat = orders_catalog();
+        cat.primary_keys.clear();
+        cat
     }
-
     // -- Binary message builders ---------------------------------------------
 
     fn push_cstring(buf: &mut Vec<u8>, s: &str) {
@@ -749,7 +832,7 @@ mod tests {
 
     #[test]
     fn relation_caching_and_insert() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         // Send Relation message
@@ -793,11 +876,91 @@ mod tests {
         assert!(ev.changed_columns.is_empty());
     }
 
+    #[test]
+    fn relation_with_out_of_range_catalog_column_id_errors() {
+        let mut catalog = orders_catalog();
+        // Force one relation column to resolve outside table arity.
+        catalog.columns.insert((1, "status".to_string()), 99);
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        let err = parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect_err("out-of-range resolved column ID should fail");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn relation_with_duplicate_catalog_column_id_errors() {
+        let mut catalog = orders_catalog();
+        // Force two relation columns to resolve to the same catalog column id.
+        catalog.columns.insert((1, "customer".to_string()), 0);
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        let err = parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect_err("duplicate resolved column ID should fail");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn relation_cache_is_bounded_and_evicts_oldest() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        let total_relations = MAX_CACHED_RELATIONS + 5;
+        for i in 0..total_relations {
+            let oid = 20_000_u32 + (i as u32);
+            let rel_msg = build_relation_msg(oid, "public", "orders", &orders_columns());
+            parser
+                .parse_wal_message(&rel_msg, &catalog)
+                .expect("relation should parse");
+        }
+
+        let cache = parser
+            .relations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(cache.map.len(), MAX_CACHED_RELATIONS);
+        drop(cache);
+
+        let oldest_oid = 20_000_u32;
+        let oldest_insert = build_insert_msg(
+            oldest_oid,
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Text("99.95".into()),
+                TupleCol::Text("pending".into()),
+            ],
+        );
+        let err = parser
+            .parse_wal_message(&oldest_insert, &catalog)
+            .expect_err("oldest relation should be evicted");
+        assert!(matches!(err, WalParseError::UnknownRelationOid(oid) if oid == oldest_oid));
+
+        let newest_oid = 20_000_u32 + ((total_relations - 1) as u32);
+        let newest_insert = build_insert_msg(
+            newest_oid,
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Text("99.95".into()),
+                TupleCol::Text("pending".into()),
+            ],
+        );
+        let events = parser
+            .parse_wal_message(&newest_insert, &catalog)
+            .expect("newest relation should remain cached");
+        assert_eq!(events.len(), 1);
+    }
+
     // -- Test 2: Update with 'K' old key (DEFAULT replica identity) ----------
 
     #[test]
     fn update_with_key_old_tuple() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -838,11 +1001,51 @@ mod tests {
         assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
     }
 
+    #[test]
+    fn update_with_key_old_tuple_sparse_identity_maps_correctly() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        // Identity is on `customer` (column index 1), not the first column.
+        let cols: Vec<(&str, u32, u8)> = vec![
+            ("id", 23, 0),
+            ("customer", 25, 1),
+            ("amount", 1700, 0),
+            ("status", 25, 0),
+        ];
+        let rel_msg = build_relation_msg(16384, "public", "orders", &cols);
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        // Sparse key tuple where only the identity column value is present.
+        let update_msg = build_update_msg_with_old(
+            16384,
+            b'K',
+            &[TupleCol::Text("alice".into())],
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Text("149.95".into()),
+                TupleCol::Text("shipped".into()),
+            ],
+        );
+
+        let events = parser
+            .parse_wal_message(&update_msg, &catalog)
+            .expect("sparse key tuple should map onto identity columns");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.pk.columns.as_ref(), &[1]);
+        assert_eq!(ev.pk.values.as_ref(), &[Cell::String(Arc::from("alice"))]);
+    }
+
     // -- Test 3: Update with 'O' full old row (FULL replica identity) --------
 
     #[test]
     fn update_with_full_old_row() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         // All columns have flags=1 for FULL replica identity
@@ -897,7 +1100,7 @@ mod tests {
 
     #[test]
     fn update_without_old_tuple() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -933,7 +1136,7 @@ mod tests {
 
     #[test]
     fn delete_with_key() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -969,11 +1172,40 @@ mod tests {
         assert!(ev.changed_columns.is_empty());
     }
 
+    #[test]
+    fn delete_with_key_sparse_identity_maps_correctly() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        // Identity is on `customer` (column index 1), not the first column.
+        let cols: Vec<(&str, u32, u8)> = vec![
+            ("id", 23, 0),
+            ("customer", 25, 1),
+            ("amount", 1700, 0),
+            ("status", 25, 0),
+        ];
+        let rel_msg = build_relation_msg(16384, "public", "orders", &cols);
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let delete_msg = build_delete_msg(16384, b'K', &[TupleCol::Text("bob".into())]);
+
+        let events = parser
+            .parse_wal_message(&delete_msg, &catalog)
+            .expect("sparse key tuple should map onto identity columns");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Delete);
+        assert_eq!(ev.pk.columns.as_ref(), &[1]);
+        assert_eq!(ev.pk.values.as_ref(), &[Cell::String(Arc::from("bob"))]);
+    }
+
     // -- Test 6: Delete with 'O' full old row --------------------------------
 
     #[test]
     fn delete_with_full_old_row() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1012,7 +1244,7 @@ mod tests {
 
     #[test]
     fn metadata_messages_return_empty() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         for &tag in b"BCOYT" {
@@ -1028,7 +1260,7 @@ mod tests {
 
     #[test]
     fn empty_input_returns_empty() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let events = parser
@@ -1041,7 +1273,7 @@ mod tests {
 
     #[test]
     fn unknown_message_type_error() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let msg = vec![0xFF, 0, 0, 0, 0];
@@ -1055,7 +1287,7 @@ mod tests {
 
     #[test]
     fn insert_without_relation_error() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let insert_msg = build_insert_msg(99999, &[TupleCol::Text("1".into())]);
@@ -1069,7 +1301,7 @@ mod tests {
 
     #[test]
     fn truncated_message_error() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         // Insert with only 2 bytes after the type tag (needs at least 4 for OID)
@@ -1080,11 +1312,39 @@ mod tests {
         assert!(matches!(err, WalParseError::TruncatedMessage { .. }));
     }
 
+    #[test]
+    fn insert_with_trailing_bytes_errors() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let mut insert_msg = build_insert_msg(
+            16384,
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Text("99.95".into()),
+                TupleCol::Text("pending".into()),
+            ],
+        );
+        insert_msg.push(0xAA);
+        insert_msg.push(0xBB);
+
+        let err = parser
+            .parse_wal_message(&insert_msg, &catalog)
+            .expect_err("trailing bytes should fail");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
     // -- Test 12: NULL columns ('n' tag) → Cell::Null ------------------------
 
     #[test]
     fn null_column_tag() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1117,7 +1377,7 @@ mod tests {
 
     #[test]
     fn unchanged_toast_tag() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1160,7 +1420,7 @@ mod tests {
 
     #[test]
     fn type_conversion_oids() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         // Custom columns with different types
@@ -1196,11 +1456,43 @@ mod tests {
         assert_eq!(new.get(3), Some(&Cell::Bool(true)));
     }
 
+    #[test]
+    fn type_conversion_invalid_typed_text_errors() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        let cols: Vec<(&str, u32, u8)> = vec![
+            ("id", 23, 1),       // int4
+            ("customer", 25, 0), // text
+            ("amount", 701, 0),  // float8
+            ("status", 16, 0),   // bool
+        ];
+        let rel_msg = build_relation_msg(16384, "public", "orders", &cols);
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let insert_msg = build_insert_msg(
+            16384,
+            &[
+                TupleCol::Text("not-an-int".into()),
+                TupleCol::Text("bob".into()),
+                TupleCol::Text("3.15".into()),
+                TupleCol::Text("t".into()),
+            ],
+        );
+
+        let err = parser
+            .parse_wal_message(&insert_msg, &catalog)
+            .expect_err("invalid int4 tuple text should fail");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
     // -- Test 15: changed_columns computed correctly for FULL update ----------
 
     #[test]
     fn changed_columns_full_update() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         // All columns have flags=1 for FULL replica identity
@@ -1249,7 +1541,7 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let parser: &dyn WalParser = &PgOutputParser::new();
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
 
         // Should compile and work as a trait object
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1269,7 +1561,7 @@ mod tests {
 
     #[test]
     fn insert_no_catalog_pk() {
-        let catalog = TestCatalog::orders_no_pk();
+        let catalog = orders_no_pk_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1300,7 +1592,7 @@ mod tests {
 
     #[test]
     fn truncated_relation_message() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         // Relation message with only the OID (truncated before namespace)
@@ -1315,7 +1607,7 @@ mod tests {
 
     #[test]
     fn delete_no_identity_columns() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         // No identity flags (all flags = 0)
@@ -1351,8 +1643,41 @@ mod tests {
     }
 
     #[test]
+    fn delete_no_identity_columns_with_missing_old_value_errors() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        let no_identity_cols: Vec<(&str, u32, u8)> = vec![
+            ("id", 23, 0),
+            ("customer", 25, 0),
+            ("amount", 1700, 0),
+            ("status", 25, 0),
+        ];
+        let rel_msg = build_relation_msg(16384, "public", "orders", &no_identity_cols);
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let delete_msg = build_delete_msg(
+            16384,
+            b'O',
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Unchanged,
+                TupleCol::Text("pending".into()),
+            ],
+        );
+
+        let err = parser
+            .parse_wal_message(&delete_msg, &catalog)
+            .expect_err("missing old tuple value should fail for fallback PK");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
     fn relation_negative_column_count_does_not_panic() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let mut msg = Vec::new();
@@ -1380,7 +1705,7 @@ mod tests {
 
     #[test]
     fn tuple_negative_column_count_does_not_panic() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1408,7 +1733,7 @@ mod tests {
 
     #[test]
     fn insert_invalid_tuple_tag_does_not_panic() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1436,7 +1761,7 @@ mod tests {
 
     #[test]
     fn update_invalid_initial_tuple_tag_does_not_panic() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1464,7 +1789,7 @@ mod tests {
 
     #[test]
     fn update_invalid_new_tuple_tag_after_old_does_not_panic() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -1500,7 +1825,7 @@ mod tests {
 
     #[test]
     fn delete_invalid_tuple_tag_returns_malformed_payload() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());

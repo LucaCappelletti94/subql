@@ -36,11 +36,11 @@ pub(super) fn json_value_to_cell_strict(
 
         // Floating-point / numeric types
         "real" | "float4" | "double precision" | "float8" | "numeric" | "decimal" | "money" => {
-            Ok(float_cell(value))
+            float_cell_strict(value, field)
         }
 
         // Boolean
-        "boolean" | "bool" => Ok(bool_cell(value)),
+        "boolean" | "bool" => bool_cell_strict(value, field),
 
         // Everything else → String (including known text-like types)
         _ => Ok(string_cell(value)),
@@ -66,6 +66,11 @@ fn int_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalPa
 
             #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             if let Some(f) = n.as_f64() {
+                if f.fract() != 0.0 {
+                    return Err(WalParseError::MalformedPayload(format!(
+                        "fractional numeric value in integer field '{field}': {n}"
+                    )));
+                }
                 if f > i64::MAX as f64 || f < i64::MIN as f64 {
                     return Err(WalParseError::NumericOverflow {
                         field: field.to_string(),
@@ -78,35 +83,50 @@ fn int_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalPa
 
             Ok(Cell::Null)
         }
-        serde_json::Value::String(s) => Ok(s
-            .parse::<i64>()
-            .map_or_else(|_| Cell::String(Arc::from(s.as_str())), Cell::Int)),
-        _ => Ok(string_cell(value)),
+        serde_json::Value::String(s) => Ok(s.parse::<i64>().map(Cell::Int).map_err(|_| {
+            WalParseError::MalformedPayload(format!(
+                "invalid integer value in field '{field}': {s}"
+            ))
+        })?),
+        _ => Err(WalParseError::MalformedPayload(format!(
+            "invalid integer value in field '{field}': {value}"
+        ))),
     }
 }
 
-/// Parse a float cell. Handles JSON number and string encodings
-/// (wal2json sometimes encodes `numeric` as a string).
-fn float_cell(value: &serde_json::Value) -> Cell {
+fn float_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalParseError> {
     match value {
-        serde_json::Value::Number(n) => n.as_f64().map_or(Cell::Null, Cell::Float),
-        serde_json::Value::String(s) => s
-            .parse::<f64>()
-            .map_or_else(|_| Cell::String(Arc::from(s.as_str())), Cell::Float),
-        _ => string_cell(value),
+        serde_json::Value::Number(n) => n.as_f64().map(Cell::Float).ok_or_else(|| {
+            WalParseError::MalformedPayload(format!(
+                "invalid floating value in field '{field}': {n}"
+            ))
+        }),
+        serde_json::Value::String(s) => s.parse::<f64>().map(Cell::Float).map_err(|_| {
+            WalParseError::MalformedPayload(format!(
+                "invalid floating value in field '{field}': {s}"
+            ))
+        }),
+        _ => Err(WalParseError::MalformedPayload(format!(
+            "invalid floating value in field '{field}': {value}"
+        ))),
     }
 }
 
-/// Parse a boolean cell. Handles `true`/`false`, `"t"`/`"f"` string encoding.
-fn bool_cell(value: &serde_json::Value) -> Cell {
+/// Parse a boolean cell strictly. Accepts JSON booleans and common textual
+/// encodings; rejects all other values.
+fn bool_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalParseError> {
     match value {
-        serde_json::Value::Bool(b) => Cell::Bool(*b),
+        serde_json::Value::Bool(b) => Ok(Cell::Bool(*b)),
         serde_json::Value::String(s) => match s.as_str() {
-            "t" | "true" | "TRUE" | "True" | "1" => Cell::Bool(true),
-            "f" | "false" | "FALSE" | "False" | "0" => Cell::Bool(false),
-            _ => Cell::String(Arc::from(s.as_str())),
+            "t" | "true" | "TRUE" | "True" | "1" => Ok(Cell::Bool(true)),
+            "f" | "false" | "FALSE" | "False" | "0" => Ok(Cell::Bool(false)),
+            _ => Err(WalParseError::MalformedPayload(format!(
+                "invalid boolean value in field '{field}': {s}"
+            ))),
         },
-        _ => string_cell(value),
+        _ => Err(WalParseError::MalformedPayload(format!(
+            "invalid boolean value in field '{field}': {value}"
+        ))),
     }
 }
 
@@ -156,45 +176,42 @@ pub(super) fn infer_cell_from_json_strict(
     }
 }
 
-/// Convert a text-format column value to a [`Cell`] given the PostgreSQL type OID.
+/// Text-format converter for pgoutput parsing.
 ///
-/// Used by the pgoutput binary protocol parser, where columns are transmitted as
-/// UTF-8 text alongside their type OID (from `pg_type`).
-#[must_use]
-pub fn text_to_cell(text: &str, type_oid: u32) -> Cell {
+/// Returns [`WalParseError::MalformedPayload`] when typed scalar values are not
+/// valid textual encodings for the declared PostgreSQL type OID.
+pub(super) fn text_to_cell_strict(text: &str, type_oid: u32) -> Result<Cell, WalParseError> {
     #[allow(clippy::match_same_arms)]
     match type_oid {
         // bool
         16 => match text {
-            "t" => Cell::Bool(true),
-            "f" => Cell::Bool(false),
-            _ => Cell::String(Arc::from(text)),
+            "t" => Ok(Cell::Bool(true)),
+            "f" => Ok(Cell::Bool(false)),
+            _ => Err(WalParseError::MalformedPayload(format!(
+                "invalid boolean text value for type oid {type_oid}: {text}"
+            ))),
         },
         // int8, int2, int4, oid
-        20 | 21 | 23 | 26 => parse_int(text),
+        20 | 21 | 23 | 26 => text.parse::<i64>().map(Cell::Int).map_err(|_| {
+            WalParseError::MalformedPayload(format!(
+                "invalid integer text value for type oid {type_oid}: {text}"
+            ))
+        }),
         // float4, float8, numeric
-        700 | 701 | 1700 => parse_float(text),
+        700 | 701 | 1700 => text.parse::<f64>().map(Cell::Float).map_err(|_| {
+            WalParseError::MalformedPayload(format!(
+                "invalid floating text value for type oid {type_oid}: {text}"
+            ))
+        }),
         // text, bpchar, varchar, name, uuid
-        25 | 1042 | 1043 | 19 | 2950 => Cell::String(Arc::from(text)),
+        25 | 1042 | 1043 | 19 | 2950 => Ok(Cell::String(Arc::from(text))),
         // date, time, timestamp, timestamptz, timetz, interval
-        1082 | 1083 | 1114 | 1184 | 1266 | 1186 => Cell::String(Arc::from(text)),
+        1082 | 1083 | 1114 | 1184 | 1266 | 1186 => Ok(Cell::String(Arc::from(text))),
         // json, jsonb
-        114 | 3802 => Cell::String(Arc::from(text)),
+        114 | 3802 => Ok(Cell::String(Arc::from(text))),
         // everything else → String fallback
-        _ => Cell::String(Arc::from(text)),
+        _ => Ok(Cell::String(Arc::from(text))),
     }
-}
-
-/// Parse integer from text, falling back to `Cell::String` on failure.
-fn parse_int(text: &str) -> Cell {
-    text.parse::<i64>()
-        .map_or_else(|_| Cell::String(Arc::from(text)), Cell::Int)
-}
-
-/// Parse float from text, falling back to `Cell::String` on failure.
-fn parse_float(text: &str) -> Cell {
-    text.parse::<f64>()
-        .map_or_else(|_| Cell::String(Arc::from(text)), Cell::Float)
 }
 
 #[cfg(test)]
@@ -331,9 +348,19 @@ mod tests {
     }
 
     #[test]
-    fn int_fractional_truncation() {
-        // Fractional JSON number in integer column — truncated to i64
-        assert_eq!(json_value_to_cell(&json!(3.7), "int4"), Cell::Int(3));
+    fn int_fractional_non_strict_falls_back_to_string() {
+        // Strict conversion rejects fractional ints; non-strict helper falls back to string.
+        assert_eq!(
+            json_value_to_cell(&json!(3.7), "int4"),
+            Cell::String(Arc::from("3.7"))
+        );
+    }
+
+    #[test]
+    fn int_fractional_strict_errors() {
+        let err = json_value_to_cell_strict(&json!(3.7), "int4", "test.int4")
+            .expect_err("fractional value should fail in strict mode");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 
     #[test]
@@ -346,12 +373,26 @@ mod tests {
     }
 
     #[test]
+    fn int_non_numeric_string_strict_errors() {
+        let err = json_value_to_cell_strict(&json!("hello"), "int4", "test.int4")
+            .expect_err("non-numeric integer string should fail in strict mode");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
     fn int_array_value_fallback() {
         // JSON array/object for integer type goes to catch-all string_cell
         assert_eq!(
             json_value_to_cell(&json!([1, 2]), "int4"),
             Cell::String(Arc::from("[1,2]"))
         );
+    }
+
+    #[test]
+    fn int_non_scalar_strict_errors() {
+        let err = json_value_to_cell_strict(&json!([1, 2]), "int4", "test.int4")
+            .expect_err("non-scalar integer value should fail in strict mode");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 
     #[test]
@@ -364,12 +405,26 @@ mod tests {
     }
 
     #[test]
+    fn float_non_numeric_string_strict_errors() {
+        let err = json_value_to_cell_strict(&json!("not_a_number"), "numeric", "test.numeric")
+            .expect_err("non-numeric float string should fail in strict mode");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
     fn float_array_value_fallback() {
         // JSON array for float type goes to catch-all string_cell
         assert_eq!(
             json_value_to_cell(&json!({"x": 1}), "float8"),
             Cell::String(Arc::from(r#"{"x":1}"#))
         );
+    }
+
+    #[test]
+    fn float_non_scalar_strict_errors() {
+        let err = json_value_to_cell_strict(&json!({"x": 1}), "numeric", "test.numeric")
+            .expect_err("non-scalar float value should fail in strict mode");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 
     #[test]
@@ -382,12 +437,26 @@ mod tests {
     }
 
     #[test]
+    fn bool_unknown_string_strict_errors() {
+        let err = json_value_to_cell_strict(&json!("maybe"), "boolean", "test.boolean")
+            .expect_err("invalid boolean string should fail in strict mode");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
     fn bool_non_bool_non_string_fallback() {
         // JSON number for boolean type goes to catch-all string_cell
         assert_eq!(
             json_value_to_cell(&json!(42), "boolean"),
             Cell::String(Arc::from("42"))
         );
+    }
+
+    #[test]
+    fn bool_non_scalar_strict_errors() {
+        let err = json_value_to_cell_strict(&json!({"value": true}), "boolean", "test.boolean")
+            .expect_err("non-boolean value should fail in strict mode");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }
 
     #[test]
@@ -398,123 +467,128 @@ mod tests {
     }
 
     // ========================================================================
-    // text_to_cell tests (OID-based, for pgoutput)
+    // text_to_cell_strict tests (OID-based, for pgoutput)
     // ========================================================================
 
     #[test]
-    fn text_to_cell_bool() {
-        assert_eq!(text_to_cell("t", 16), Cell::Bool(true));
-        assert_eq!(text_to_cell("f", 16), Cell::Bool(false));
-        // Unrecognized bool text → String
-        assert_eq!(text_to_cell("yes", 16), Cell::String(Arc::from("yes")));
+    fn text_to_cell_strict_bool() {
+        assert_eq!(text_to_cell_strict("t", 16).ok(), Some(Cell::Bool(true)));
+        assert_eq!(text_to_cell_strict("f", 16).ok(), Some(Cell::Bool(false)));
+        assert!(matches!(
+            text_to_cell_strict("yes", 16),
+            Err(WalParseError::MalformedPayload(_))
+        ));
     }
 
     #[test]
-    fn text_to_cell_integers() {
-        // int2 (OID 21)
-        assert_eq!(text_to_cell("42", 21), Cell::Int(42));
-        // int4 (OID 23)
-        assert_eq!(text_to_cell("-1", 23), Cell::Int(-1));
-        // int8 (OID 20)
-        assert_eq!(text_to_cell("9999999999", 20), Cell::Int(9_999_999_999));
-        // oid (OID 26)
-        assert_eq!(text_to_cell("12345", 26), Cell::Int(12345));
-        // Non-numeric → String fallback
-        assert_eq!(text_to_cell("abc", 23), Cell::String(Arc::from("abc")));
+    fn text_to_cell_strict_integers() {
+        assert_eq!(text_to_cell_strict("42", 21).ok(), Some(Cell::Int(42)));
+        assert_eq!(text_to_cell_strict("-1", 23).ok(), Some(Cell::Int(-1)));
+        assert_eq!(
+            text_to_cell_strict("9999999999", 20).ok(),
+            Some(Cell::Int(9_999_999_999))
+        );
+        assert_eq!(
+            text_to_cell_strict("12345", 26).ok(),
+            Some(Cell::Int(12345))
+        );
+        assert!(matches!(
+            text_to_cell_strict("abc", 23),
+            Err(WalParseError::MalformedPayload(_))
+        ));
     }
 
     #[test]
-    fn text_to_cell_floats() {
-        // float4 (OID 700)
-        assert_eq!(text_to_cell("3.15", 700), Cell::Float(3.15));
-        // float8 (OID 701)
-        assert_eq!(text_to_cell("2.719", 701), Cell::Float(2.719));
-        // numeric (OID 1700)
-        assert_eq!(text_to_cell("99.95", 1700), Cell::Float(99.95));
-        // Non-numeric → String fallback
+    fn text_to_cell_strict_floats() {
         assert_eq!(
-            text_to_cell("NaN-ish", 700),
-            Cell::String(Arc::from("NaN-ish"))
+            text_to_cell_strict("3.15", 700).ok(),
+            Some(Cell::Float(3.15))
         );
+        assert_eq!(
+            text_to_cell_strict("2.719", 701).ok(),
+            Some(Cell::Float(2.719))
+        );
+        assert_eq!(
+            text_to_cell_strict("99.95", 1700).ok(),
+            Some(Cell::Float(99.95))
+        );
+        assert!(matches!(
+            text_to_cell_strict("NaN-ish", 700),
+            Err(WalParseError::MalformedPayload(_))
+        ));
     }
 
     #[test]
-    fn text_to_cell_strings() {
-        // text (OID 25)
-        assert_eq!(text_to_cell("hello", 25), Cell::String(Arc::from("hello")));
-        // varchar (OID 1043)
+    fn text_to_cell_strict_strings() {
         assert_eq!(
-            text_to_cell("world", 1043),
-            Cell::String(Arc::from("world"))
+            text_to_cell_strict("hello", 25).ok(),
+            Some(Cell::String(Arc::from("hello")))
         );
-        // bpchar (OID 1042)
-        assert_eq!(text_to_cell("x", 1042), Cell::String(Arc::from("x")));
-        // name (OID 19)
         assert_eq!(
-            text_to_cell("colname", 19),
-            Cell::String(Arc::from("colname"))
+            text_to_cell_strict("world", 1043).ok(),
+            Some(Cell::String(Arc::from("world")))
         );
-        // uuid (OID 2950)
         assert_eq!(
-            text_to_cell("550e8400-e29b-41d4-a716-446655440000", 2950),
-            Cell::String(Arc::from("550e8400-e29b-41d4-a716-446655440000"))
+            text_to_cell_strict("x", 1042).ok(),
+            Some(Cell::String(Arc::from("x")))
         );
-    }
-
-    #[test]
-    fn text_to_cell_temporal() {
-        // date (OID 1082)
         assert_eq!(
-            text_to_cell("2024-01-01", 1082),
-            Cell::String(Arc::from("2024-01-01"))
+            text_to_cell_strict("colname", 19).ok(),
+            Some(Cell::String(Arc::from("colname")))
         );
-        // timestamp (OID 1114)
         assert_eq!(
-            text_to_cell("2024-01-01 12:00:00", 1114),
-            Cell::String(Arc::from("2024-01-01 12:00:00"))
-        );
-        // timestamptz (OID 1184)
-        assert_eq!(
-            text_to_cell("2024-01-01 12:00:00+00", 1184),
-            Cell::String(Arc::from("2024-01-01 12:00:00+00"))
-        );
-        // time (OID 1083)
-        assert_eq!(
-            text_to_cell("12:00:00", 1083),
-            Cell::String(Arc::from("12:00:00"))
-        );
-        // timetz (OID 1266)
-        assert_eq!(
-            text_to_cell("12:00:00+00", 1266),
-            Cell::String(Arc::from("12:00:00+00"))
-        );
-        // interval (OID 1186)
-        assert_eq!(
-            text_to_cell("1 day", 1186),
-            Cell::String(Arc::from("1 day"))
+            text_to_cell_strict("550e8400-e29b-41d4-a716-446655440000", 2950).ok(),
+            Some(Cell::String(Arc::from(
+                "550e8400-e29b-41d4-a716-446655440000"
+            )))
         );
     }
 
     #[test]
-    fn text_to_cell_json() {
-        // json (OID 114)
+    fn text_to_cell_strict_temporal() {
         assert_eq!(
-            text_to_cell(r#"{"a":1}"#, 114),
-            Cell::String(Arc::from(r#"{"a":1}"#))
+            text_to_cell_strict("2024-01-01", 1082).ok(),
+            Some(Cell::String(Arc::from("2024-01-01")))
         );
-        // jsonb (OID 3802)
         assert_eq!(
-            text_to_cell(r"[1,2,3]", 3802),
-            Cell::String(Arc::from(r"[1,2,3]"))
+            text_to_cell_strict("2024-01-01 12:00:00", 1114).ok(),
+            Some(Cell::String(Arc::from("2024-01-01 12:00:00")))
+        );
+        assert_eq!(
+            text_to_cell_strict("2024-01-01 12:00:00+00", 1184).ok(),
+            Some(Cell::String(Arc::from("2024-01-01 12:00:00+00")))
+        );
+        assert_eq!(
+            text_to_cell_strict("12:00:00", 1083).ok(),
+            Some(Cell::String(Arc::from("12:00:00")))
+        );
+        assert_eq!(
+            text_to_cell_strict("12:00:00+00", 1266).ok(),
+            Some(Cell::String(Arc::from("12:00:00+00")))
+        );
+        assert_eq!(
+            text_to_cell_strict("1 day", 1186).ok(),
+            Some(Cell::String(Arc::from("1 day")))
         );
     }
 
     #[test]
-    fn text_to_cell_unknown_oid() {
-        // Unknown OID → String fallback
+    fn text_to_cell_strict_json() {
         assert_eq!(
-            text_to_cell("anything", 99999),
-            Cell::String(Arc::from("anything"))
+            text_to_cell_strict(r#"{"a":1}"#, 114).ok(),
+            Some(Cell::String(Arc::from(r#"{"a":1}"#)))
+        );
+        assert_eq!(
+            text_to_cell_strict(r"[1,2,3]", 3802).ok(),
+            Some(Cell::String(Arc::from(r"[1,2,3]")))
+        );
+    }
+
+    #[test]
+    fn text_to_cell_strict_unknown_oid() {
+        assert_eq!(
+            text_to_cell_strict("anything", 99999).ok(),
+            Some(Cell::String(Arc::from("anything")))
         );
     }
 
