@@ -14,6 +14,7 @@ use crate::{
     persistence::{
         codec,
         merge::MergeManager,
+        predicate_data::predicate_data_equivalent,
         shard::{
             deserialize_shard, serialize_shard, BindingData, PredicateData, ShardPayload,
             UserDictData,
@@ -694,16 +695,18 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         // Validate selected row image arity against schema catalog.
         let row = select_event_row(event)?;
+        let expected = self
+            .catalog
+            .table_arity(event.table_id)
+            .ok_or(DispatchError::UnknownTableArity(event.table_id))?;
 
-        if let Some(expected) = self.catalog.table_arity(event.table_id) {
-            let got = row.len();
-            if got != expected {
-                return Err(DispatchError::InvalidRowArity {
-                    table_id: event.table_id,
-                    expected,
-                    got,
-                });
-            }
+        let got = row.len();
+        if got != expected {
+            return Err(DispatchError::InvalidRowArity {
+                table_id: event.table_id,
+                expected,
+                got,
+            });
         }
 
         // Dispatch
@@ -1012,7 +1015,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let mut pred_hash_to_data: AHashMap<u128, &PredicateData> = AHashMap::new();
         for pred_data in &payload.predicates {
             if let Some(existing) = pred_hash_to_data.get(&pred_data.hash) {
-                if !Self::predicate_data_equivalent(existing, pred_data) {
+                if !predicate_data_equivalent(existing, pred_data) {
                     return Err(RebuildPayloadError::Corrupt(format!(
                         "predicate hash collision for hash {:016x} with non-equivalent payload",
                         pred_data.hash
@@ -1093,13 +1096,6 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         Ok((user_dict, entries))
     }
 
-    fn predicate_data_equivalent(left: &PredicateData, right: &PredicateData) -> bool {
-        left.normalized_sql == right.normalized_sql
-            && left.bytecode_instructions == right.bytecode_instructions
-            && left.prefilter_plan == right.prefilter_plan
-            && left.dependency_columns == right.dependency_columns
-    }
-
     fn replace_table_state(
         &mut self,
         table_id: TableId,
@@ -1153,24 +1149,29 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         Ok(())
     }
 
-    fn parse_table_id_from_shard_path(path: &Path) -> Result<Option<TableId>, StorageError> {
+    fn parse_table_id_from_shard_path(path: &Path) -> Option<Result<TableId, String>> {
         if path.extension().and_then(|s| s.to_str()) != Some("shard") {
-            return Ok(None);
+            return None;
         }
 
-        let filename = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
-            StorageError::Corrupt(format!("invalid shard filename '{}'", path.display()))
-        })?;
+        let filename = path.file_stem().and_then(|s| s.to_str())?;
+        let table_id_str = filename.strip_prefix("table_")?;
+        Some(
+            table_id_str
+                .parse::<TableId>()
+                .map_err(|_| "invalid table id".to_string()),
+        )
+    }
 
-        let table_id_str = filename.strip_prefix("table_").ok_or_else(|| {
-            StorageError::Corrupt(format!("invalid shard filename '{}'", path.display()))
-        })?;
-
-        let table_id = table_id_str.parse::<TableId>().map_err(|_| {
-            StorageError::Corrupt(format!("invalid shard filename '{}'", path.display()))
-        })?;
-
-        Ok(Some(table_id))
+    fn log_ignored_shard_filename(path: &Path, reason: &str) {
+        #[cfg(feature = "observability")]
+        tracing::warn!(
+            "Ignoring malformed shard filename '{}': {}",
+            path.display(),
+            reason
+        );
+        #[cfg(not(feature = "observability"))]
+        let _ = (path, reason);
     }
 
     /// Load all shards from storage directory
@@ -1189,10 +1190,15 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             let entry = entry
                 .map_err(|e| StorageError::Io(format!("Failed to read directory entry: {e}")))?;
             let path = entry.path();
-            let Some(table_id) = Self::parse_table_id_from_shard_path(&path)? else {
-                continue;
-            };
-            shard_files.push((table_id, path));
+            match Self::parse_table_id_from_shard_path(&path) {
+                None => {
+                    if path.extension().and_then(|s| s.to_str()) == Some("shard") {
+                        Self::log_ignored_shard_filename(&path, "expected format table_<id>.shard");
+                    }
+                }
+                Some(Ok(table_id)) => shard_files.push((table_id, path)),
+                Some(Err(reason)) => Self::log_ignored_shard_filename(&path, &reason),
+            }
         }
 
         shard_files.sort_by(|(_, left), (_, right)| left.cmp(right));
@@ -2270,6 +2276,71 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_insert_missing_catalog_arity_returns_error() {
+        struct MissingArityCatalog;
+
+        impl SchemaCatalog for MissingArityCatalog {
+            fn table_id(&self, table_name: &str) -> Option<TableId> {
+                (table_name == "orders").then_some(1)
+            }
+
+            fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
+                if table_id != 1 {
+                    return None;
+                }
+                match column_name {
+                    "id" => Some(0),
+                    "amount" => Some(1),
+                    "status" => Some(2),
+                    _ => None,
+                }
+            }
+
+            fn table_arity(&self, _table_id: TableId) -> Option<usize> {
+                None
+            }
+
+            fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
+                Some(0xABCD_1234_5678_9ABC)
+            }
+        }
+
+        let catalog: Arc<dyn SchemaCatalog> = Arc::new(MissingArityCatalog);
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 31_001,
+                user_id: 31_001,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+                updated_at_unix_ms: 31_001,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(5), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let result = engine.users(&event);
+        assert!(matches!(
+            result,
+            Err(DispatchError::UnknownTableArity(1))
+        ));
+    }
+
+    #[test]
     fn test_dispatch_update_invalid_row_arity() {
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
@@ -2957,12 +3028,39 @@ mod tests {
     }
 
     #[test]
-    fn test_load_all_shards_rejects_invalid_shard_filename() {
+    fn test_load_all_shards_ignores_invalid_shard_filename() {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
 
+        std::fs::write(temp_dir.path().join("not_a_table_id.shard"), b"junk").unwrap();
+
+        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(catalog, PostgreSqlDialect {}, temp_dir.path().to_path_buf())
+                .expect("invalid shard filename should be ignored");
+        assert_eq!(engine.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_load_all_shards_skips_invalid_shard_filename_and_loads_valid_shards() {
+        use crate::persistence::shard::{serialize_shard, ShardPayload, UserDictData};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 0,
+        };
+        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+
+        std::fs::write(temp_dir.path().join("table_1.shard"), &shard_bytes).unwrap();
         std::fs::write(temp_dir.path().join("not_a_table_id.shard"), b"junk").unwrap();
 
         let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
@@ -2972,10 +3070,10 @@ mod tests {
                 temp_dir.path().to_path_buf(),
             );
 
-        assert!(matches!(
-            result,
-            Err(StorageError::Corrupt(ref msg)) if msg.contains("invalid shard filename")
-        ));
+        assert!(
+            result.is_ok(),
+            "invalid shard filenames should be skipped while valid shards load"
+        );
     }
 
     #[test]

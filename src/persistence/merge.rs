@@ -1,5 +1,6 @@
 //! Background merge operations with atomic swap
 
+use super::predicate_data::predicate_data_equivalent;
 use super::shard::{deserialize_shard, BindingData, PredicateData, ShardPayload, UserDictData};
 use crate::{DefaultIds, IdTypes, MergeError, MergeJobId, MergeReport, SchemaCatalog, TableId};
 use ahash::AHashMap;
@@ -226,15 +227,21 @@ fn merge_shards_impl<I: IdTypes>(
     let mut unique_predicates: AHashMap<u128, PredicateData> = AHashMap::new();
 
     for pred in all_predicates {
-        unique_predicates
-            .entry(pred.hash)
-            .and_modify(|existing| {
-                // Keep most recent
-                if pred.updated_at_unix_ms > existing.updated_at_unix_ms {
-                    *existing = pred.clone();
-                }
-            })
-            .or_insert(pred);
+        if let Some(existing) = unique_predicates.get_mut(&pred.hash) {
+            if !predicate_data_equivalent(existing, &pred) {
+                return Err(format!(
+                    "predicate hash collision for hash {:016x} with non-equivalent payload",
+                    pred.hash
+                ));
+            }
+
+            // Keep most recent
+            if pred.updated_at_unix_ms > existing.updated_at_unix_ms {
+                *existing = pred;
+            }
+        } else {
+            unique_predicates.insert(pred.hash, pred);
+        }
     }
 
     // 3. Collect final predicates
@@ -522,7 +529,7 @@ mod tests {
         let pred_old = PredicateData {
             hash: 0x1234,
             normalized_sql: "age > 18".to_string(),
-            bytecode_instructions: vec![],
+            bytecode_instructions: vec![7, 8, 9],
             prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
             refcount: 1,
@@ -531,8 +538,8 @@ mod tests {
 
         let pred_new = PredicateData {
             hash: 0x1234, // Same hash
-            normalized_sql: "age > 18 (updated)".to_string(),
-            bytecode_instructions: vec![1, 2, 3],
+            normalized_sql: "age > 18".to_string(),
+            bytecode_instructions: vec![7, 8, 9],
             prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
             refcount: 2,
@@ -569,10 +576,76 @@ mod tests {
         // Should keep the newer one
         assert_eq!(merged.payload.predicates.len(), 1);
         assert_eq!(merged.payload.predicates[0].updated_at_unix_ms, 2000);
-        assert_eq!(
-            merged.payload.predicates[0].normalized_sql,
-            "age > 18 (updated)"
-        );
+        assert_eq!(merged.payload.predicates[0].normalized_sql, "age > 18");
+    }
+
+    #[test]
+    fn test_merge_rejects_non_equivalent_predicates_with_same_hash() {
+        let catalog = make_catalog();
+
+        let pred_a = PredicateData {
+            hash: 0x2222,
+            normalized_sql: "age > 18".to_string(),
+            bytecode_instructions: vec![1],
+            prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
+            dependency_columns: vec![1],
+            refcount: 1,
+            updated_at_unix_ms: 1000,
+        };
+
+        let pred_b = PredicateData {
+            hash: 0x2222, // same hash, different predicate payload
+            normalized_sql: "status = 'active'".to_string(),
+            bytecode_instructions: vec![2],
+            prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
+            dependency_columns: vec![2],
+            refcount: 1,
+            updated_at_unix_ms: 2000,
+        };
+
+        let payload1: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![pred_a],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 1000,
+        };
+
+        let payload2: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![pred_b],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 2000,
+        };
+
+        let shard1 = serialize_shard(1, &payload1, &catalog).unwrap();
+        let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = merge_shards_impl::<DefaultIds>(1, &[shard1, shard2], &catalog, start);
+        assert!(matches!(result, Err(msg) if msg.contains("hash collision")));
+    }
+
+    #[test]
+    fn test_shared_predicate_equivalence_helper_detects_mismatch() {
+        let left = PredicateData {
+            hash: 0x0101,
+            normalized_sql: "age > 18".to_string(),
+            bytecode_instructions: vec![1, 2, 3],
+            prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
+            dependency_columns: vec![1],
+            refcount: 1,
+            updated_at_unix_ms: 10,
+        };
+        let mut right = left.clone();
+        right.bytecode_instructions = vec![9, 9, 9];
+
+        assert!(!crate::persistence::predicate_data::predicate_data_equivalent(
+            &left, &right
+        ));
     }
 
     #[test]

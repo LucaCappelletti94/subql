@@ -56,6 +56,10 @@ pub enum DispatchError {
     #[error("Unknown table ID: {0}")]
     UnknownTableId(TableId),
 
+    /// Table arity missing in schema catalog
+    #[error("Unknown table arity for table ID: {0}")]
+    UnknownTableArity(TableId),
+
     /// Event missing required row image
     #[error("Missing required row image: {0}")]
     MissingRequiredRowImage(&'static str),
@@ -184,6 +188,10 @@ mod tests {
         assert_eq!(
             DispatchError::UnknownTableId(42).to_string(),
             "Unknown table ID: 42"
+        );
+        assert_eq!(
+            DispatchError::UnknownTableArity(42).to_string(),
+            "Unknown table arity for table ID: 42"
         );
         assert_eq!(
             DispatchError::MissingRequiredRowImage("old_row").to_string(),
