@@ -73,14 +73,27 @@ impl ShardHeader {
             });
         }
 
-        // Check schema fingerprint
-        if let Some(expected_fp) = catalog.schema_fingerprint(self.table_id) {
-            if expected_fp != self.schema_fingerprint {
-                return Err(StorageError::SchemaMismatch {
-                    table_id: self.table_id,
-                    expected: expected_fp,
-                    got: self.schema_fingerprint,
-                });
+        // Check schema fingerprint.
+        // If the shard has a recorded fingerprint but the catalog returns None
+        // (unknown table), reject the shard to prevent silent bypass.
+        match catalog.schema_fingerprint(self.table_id) {
+            Some(expected_fp) => {
+                if expected_fp != self.schema_fingerprint {
+                    return Err(StorageError::SchemaMismatch {
+                        table_id: self.table_id,
+                        expected: expected_fp,
+                        got: self.schema_fingerprint,
+                    });
+                }
+            }
+            None => {
+                if self.schema_fingerprint != 0 {
+                    return Err(StorageError::SchemaMismatch {
+                        table_id: self.table_id,
+                        expected: 0,
+                        got: self.schema_fingerprint,
+                    });
+                }
             }
         }
 
@@ -467,5 +480,69 @@ mod tests {
 
         let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
+    }
+
+    // =========================================================================
+    // D5 — Schema fingerprint bypass must be blocked
+    // =========================================================================
+
+    #[test]
+    fn test_fingerprint_bypass_blocked_when_catalog_returns_none() {
+        // Build a shard with a non-zero fingerprint using a catalog that knows the table.
+        let catalog_with_fingerprint = make_catalog(); // returns Some(0x1234_5678_90AB_CDEF) for table 1
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 1000,
+        };
+        let bytes = serialize_shard(1, &payload, &catalog_with_fingerprint).unwrap();
+
+        // Now try to deserialize with a catalog that returns None for the same table.
+        let catalog_without_fingerprint = MockCatalog {
+            fingerprints: HashMap::new(), // returns None for all tables
+        };
+
+        let result = deserialize_shard::<DefaultIds>(&bytes, &catalog_without_fingerprint);
+        assert!(
+            matches!(result, Err(StorageError::SchemaMismatch { .. })),
+            "Must reject shard with fingerprint when catalog returns None"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_zero_shard_accepted_when_catalog_returns_none() {
+        // A shard with fingerprint=0 should still be accepted if catalog returns None.
+        // This covers the case where fingerprinting was not enabled.
+        let catalog_with_fingerprint = make_catalog();
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 1000,
+        };
+
+        // Build a shard header with fingerprint=0 manually
+        let bytes = serialize_shard(1, &payload, &catalog_with_fingerprint).unwrap();
+        let header_size = SHARD_HEADER_SIZE;
+        let mut hdr = decode_header(&bytes).unwrap();
+        hdr.schema_fingerprint = 0;
+        let mut modified = encode_header(&hdr).to_vec();
+        modified.extend_from_slice(&bytes[header_size..]);
+
+        let catalog_without_fingerprint = MockCatalog {
+            fingerprints: HashMap::new(),
+        };
+
+        // Fingerprint=0 with catalog returning None should succeed (no fingerprint set)
+        let result = deserialize_shard::<DefaultIds>(&modified, &catalog_without_fingerprint);
+        assert!(
+            result.is_ok(),
+            "Zero fingerprint with None catalog should succeed"
+        );
     }
 }

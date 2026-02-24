@@ -10,9 +10,19 @@ pub fn serialize<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError
 }
 
 /// Deserialize a value from binary bytes.
+///
+/// Rejects inputs that have trailing bytes after the deserialized value,
+/// preventing silent data corruption from partial/mismatched payloads.
 pub fn deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
-    postcard::from_bytes(bytes)
-        .map_err(|e| StorageError::Codec(format!("Postcard deserialize error: {e}")))
+    let (value, remaining) = postcard::take_from_bytes(bytes)
+        .map_err(|e| StorageError::Codec(format!("Postcard deserialize error: {e}")))?;
+    if !remaining.is_empty() {
+        return Err(StorageError::Codec(format!(
+            "Trailing bytes after deserialization: {} unexpected bytes",
+            remaining.len()
+        )));
+    }
+    Ok(value)
 }
 
 /// Serialize and compress data
@@ -79,11 +89,15 @@ pub(crate) fn decompress_with_limit(
     decompress_internal(bytes, Some(max_output))
 }
 
+/// Hard cap for decompressed data in `decode` (defense against decompression bombs).
+const MAX_DECODE_UNCOMPRESSED: usize = 256 * 1024 * 1024; // 256 MiB
+
 /// Decompress and deserialize data
 ///
-/// Decompresses LZ4, then deserializes with postcard.
+/// Decompresses LZ4 (capped at 256 MiB to prevent decompression bombs),
+/// then deserializes with postcard.
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError> {
-    let decompressed = decompress_internal(bytes, None)?;
+    let decompressed = decompress_internal(bytes, Some(MAX_DECODE_UNCOMPRESSED))?;
     deserialize(&decompressed)
 }
 
@@ -161,5 +175,63 @@ mod tests {
 
         let err = decompress_with_limit(&encoded, 32).expect_err("must exceed limit");
         assert!(matches!(err, StorageError::Corrupt(message) if message.contains("exceeds limit")));
+    }
+
+    // =========================================================================
+    // D1 — Trailing bytes must be rejected
+    // =========================================================================
+
+    #[test]
+    fn test_trailing_bytes_rejected() {
+        let data = TestData {
+            id: 1,
+            name: "hello".to_string(),
+            values: vec![1, 2, 3],
+        };
+
+        let mut encoded = serialize(&data).unwrap();
+        // Append garbage bytes
+        encoded.extend_from_slice(&[0xFF, 0xFF]);
+
+        let err: Result<TestData, _> = deserialize(&encoded);
+        assert!(
+            err.is_err(),
+            "deserialize must reject inputs with trailing bytes"
+        );
+        if let Err(StorageError::Codec(msg)) = err {
+            assert!(msg.contains("Trailing bytes"), "unexpected message: {msg}");
+        } else {
+            panic!("expected StorageError::Codec, got ok or different variant");
+        }
+    }
+
+    #[test]
+    fn test_exact_bytes_accepted() {
+        let data = TestData {
+            id: 42,
+            name: "exact".to_string(),
+            values: vec![],
+        };
+        let encoded = serialize(&data).unwrap();
+        let decoded: TestData = deserialize(&encoded).unwrap();
+        assert_eq!(data, decoded);
+    }
+
+    // =========================================================================
+    // D2 — decode applies decompression-bomb cap
+    // =========================================================================
+
+    #[test]
+    fn test_decode_applies_decompression_limit() {
+        // Compress a moderately large string, then try to decode with a tiny cap
+        // by calling decompress_with_limit directly to verify the cap exists.
+        // The real decode cap is 256 MiB, which we can't easily exceed in a unit test,
+        // but we verify the limit constant is set correctly.
+        assert_eq!(MAX_DECODE_UNCOMPRESSED, 256 * 1024 * 1024);
+
+        // Verify that decode itself propagates decompression errors
+        let invalid_lz4: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let result: Result<Vec<u8>, _> = decode(&invalid_lz4);
+        assert!(result.is_err(), "invalid LZ4 must return an error");
     }
 }

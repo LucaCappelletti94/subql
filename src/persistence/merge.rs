@@ -244,24 +244,32 @@ fn merge_shards_impl<I: IdTypes>(
         }
     }
 
-    // 3. Collect final predicates
-    let output_predicates: Vec<PredicateData> = unique_predicates.into_values().collect();
+    // 3. Collect final predicates, sorted by hash for deterministic output.
+    let mut output_predicates: Vec<PredicateData> = unique_predicates.into_values().collect();
+    output_predicates.sort_unstable_by_key(|p| p.hash);
 
-    // 4. Filter bindings (remove duplicates)
+    // 4. Filter bindings (remove duplicates, keep most recent by timestamp;
+    //    break ties deterministically by predicate_hash so output is stable
+    //    regardless of shard input order).
     let mut unique_bindings: AHashMap<I::SubscriptionId, BindingData<I>> = AHashMap::new();
 
     for binding in all_bindings {
         unique_bindings
             .entry(binding.subscription_id)
             .and_modify(|existing| {
-                if binding.updated_at_unix_ms > existing.updated_at_unix_ms {
+                let newer_ts = binding.updated_at_unix_ms > existing.updated_at_unix_ms;
+                let same_ts_higher_hash = binding.updated_at_unix_ms == existing.updated_at_unix_ms
+                    && binding.predicate_hash > existing.predicate_hash;
+                if newer_ts || same_ts_higher_hash {
                     *existing = binding;
                 }
             })
             .or_insert(binding);
     }
 
-    let output_bindings: Vec<_> = unique_bindings.into_values().collect();
+    // Sort bindings by subscription_id for deterministic output order.
+    let mut output_bindings: Vec<_> = unique_bindings.into_values().collect();
+    output_bindings.sort_unstable_by_key(|b| b.subscription_id);
 
     let created_at_unix_ms = unix_ms_from(std::time::SystemTime::now())?;
 
@@ -643,9 +651,7 @@ mod tests {
         let mut right = left.clone();
         right.bytecode_instructions = vec![9, 9, 9];
 
-        assert!(!crate::persistence::predicate_data::predicate_data_equivalent(
-            &left, &right
-        ));
+        assert!(!crate::persistence::predicate_data::predicate_data_equivalent(&left, &right));
     }
 
     #[test]
@@ -866,11 +872,14 @@ mod tests {
             })
             .unwrap();
 
-        let received = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let catch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             MergeManager::<DefaultIds>::recv_task(&receiver)
         }));
-        assert!(received.is_ok(), "poisoned mutex should not panic");
-        assert!(received.unwrap().is_some(), "task should still be received");
+        assert!(catch_result.is_ok(), "poisoned mutex should not panic");
+        assert!(
+            catch_result.unwrap().is_some(),
+            "task should still be received"
+        );
     }
 
     #[test]
@@ -989,6 +998,177 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(350),
             "expected bounded merge workers; elapsed={elapsed:?} for {job_count} jobs"
+        );
+    }
+
+    // =========================================================================
+    // D3 — Merge determinism: equal-timestamp tie-breaking
+    // =========================================================================
+
+    #[test]
+    fn test_binding_tie_break_equal_timestamp() {
+        use super::super::shard::BindingData;
+
+        let catalog = make_catalog();
+
+        let prefilter = codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap();
+
+        let pred = PredicateData {
+            hash: 0xAAAA,
+            normalized_sql: "age > 18".to_string(),
+            bytecode_instructions: vec![],
+            prefilter_plan: prefilter,
+            dependency_columns: vec![0],
+            refcount: 1,
+            updated_at_unix_ms: 1000,
+        };
+
+        // Two bindings with same subscription_id and identical updated_at_unix_ms
+        // but different predicate_hash — output must be deterministic.
+        let binding_a = BindingData::<DefaultIds> {
+            subscription_id: 42,
+            predicate_hash: 0xAAAA,
+            user_id: 1,
+            session_id: None,
+            updated_at_unix_ms: 5000,
+        };
+        let binding_b = BindingData::<DefaultIds> {
+            subscription_id: 42,
+            predicate_hash: 0xBBBB, // different hash
+            user_id: 1,
+            session_id: None,
+            updated_at_unix_ms: 5000, // same timestamp
+        };
+
+        let payload1: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![pred.clone()],
+            bindings: vec![binding_a],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![1],
+            },
+            created_at_unix_ms: 1000,
+        };
+        let payload2: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![pred],
+            bindings: vec![binding_b],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![1],
+            },
+            created_at_unix_ms: 2000,
+        };
+
+        let shard1 = serialize_shard(1, &payload1, &catalog).unwrap();
+        let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
+
+        let start = Instant::now();
+
+        // Run merge twice in both shard orders — result must be identical
+        let result_fwd =
+            merge_shards_impl::<DefaultIds>(1, &[shard1.clone(), shard2.clone()], &catalog, start)
+                .unwrap();
+        let result_rev =
+            merge_shards_impl::<DefaultIds>(1, &[shard2, shard1], &catalog, start).unwrap();
+
+        // Both runs must pick the same winner (higher predicate_hash wins on tie)
+        assert_eq!(result_fwd.payload.bindings.len(), 1);
+        assert_eq!(result_rev.payload.bindings.len(), 1);
+        assert_eq!(
+            result_fwd.payload.bindings[0].predicate_hash,
+            result_rev.payload.bindings[0].predicate_hash,
+            "tie-break result must not depend on shard order"
+        );
+    }
+
+    // =========================================================================
+    // D4 — Merge output ordering is deterministic
+    // =========================================================================
+
+    #[test]
+    fn test_merge_output_ordering_deterministic() {
+        use super::super::shard::BindingData;
+
+        let catalog = make_catalog();
+        let prefilter = codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap();
+
+        // Build two predicates with different hashes
+        let pred_a = PredicateData {
+            hash: 0x2000,
+            normalized_sql: "a = 1".to_string(),
+            bytecode_instructions: vec![],
+            prefilter_plan: prefilter.clone(),
+            dependency_columns: vec![0],
+            refcount: 1,
+            updated_at_unix_ms: 1000,
+        };
+        let pred_b = PredicateData {
+            hash: 0x1000,
+            normalized_sql: "b = 2".to_string(),
+            bytecode_instructions: vec![],
+            prefilter_plan: prefilter,
+            dependency_columns: vec![1],
+            refcount: 1,
+            updated_at_unix_ms: 1000,
+        };
+
+        let binding_1 = BindingData::<DefaultIds> {
+            subscription_id: 10,
+            predicate_hash: 0x2000,
+            user_id: 1,
+            session_id: None,
+            updated_at_unix_ms: 1000,
+        };
+        let binding_2 = BindingData::<DefaultIds> {
+            subscription_id: 5, // lower subscription_id
+            predicate_hash: 0x1000,
+            user_id: 2,
+            session_id: None,
+            updated_at_unix_ms: 1000,
+        };
+
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![pred_a, pred_b],
+            bindings: vec![binding_1, binding_2],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![1, 2],
+            },
+            created_at_unix_ms: 1000,
+        };
+
+        let shard = serialize_shard(1, &payload, &catalog).unwrap();
+        let start = Instant::now();
+
+        // Run merge twice
+        let r1 = merge_shards_impl::<DefaultIds>(1, std::slice::from_ref(&shard), &catalog, start)
+            .unwrap();
+        let r2 = merge_shards_impl::<DefaultIds>(1, std::slice::from_ref(&shard), &catalog, start)
+            .unwrap();
+
+        // Predicates must be sorted by hash
+        let hashes1: Vec<_> = r1.payload.predicates.iter().map(|p| p.hash).collect();
+        let hashes2: Vec<_> = r2.payload.predicates.iter().map(|p| p.hash).collect();
+        assert_eq!(hashes1, hashes2, "predicate order must be deterministic");
+        assert!(
+            hashes1.windows(2).all(|w| w[0] <= w[1]),
+            "predicates must be sorted by hash"
+        );
+
+        // Bindings must be sorted by subscription_id
+        let sub_ids1: Vec<_> = r1
+            .payload
+            .bindings
+            .iter()
+            .map(|b| b.subscription_id)
+            .collect();
+        let sub_ids2: Vec<_> = r2
+            .payload
+            .bindings
+            .iter()
+            .map(|b| b.subscription_id)
+            .collect();
+        assert_eq!(sub_ids1, sub_ids2, "binding order must be deterministic");
+        assert!(
+            sub_ids1.windows(2).all(|w| w[0] <= w[1]),
+            "bindings must be sorted by subscription_id"
         );
     }
 }
