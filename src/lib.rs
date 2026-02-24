@@ -18,6 +18,8 @@ mod types;
 
 pub mod compiler;
 pub mod config;
+#[doc(hidden)]
+pub mod memory_profile_workload;
 pub mod persistence;
 pub mod runtime;
 pub mod wal;
