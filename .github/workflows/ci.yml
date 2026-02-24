@@ -103,7 +103,7 @@ jobs:
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
@@ -111,7 +111,7 @@ jobs:
         with:
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo test --workspace --lib --tests --locked
 
   bench-check:
     name: bench compile check
@@ -134,12 +134,65 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
 
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo llvm-cov --workspace --all-features --locked --codecov --output-path codecov.json
+      - uses: codecov/codecov-action@v4
+        with:
+          files: codecov.json
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
+
+  udeps:
+    name: Unused Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-udeps --locked
+      - run: cargo +nightly udeps --all-targets --workspace
+
+  scripts:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if compgen -G "scripts/*.sh" > /dev/null 2>&1; then
+            shellcheck scripts/*.sh
+          else
+            echo "No shell scripts found, skipping"
+          fi
+
   audit:
     name: security audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      # Pinned to commit SHA for supply-chain security (v2.0.0)
+      - uses: rustsec/audit-check@c1e9e1c3e4b4f5eb1e47c43c0e2fe9e2e8c75fd9
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
