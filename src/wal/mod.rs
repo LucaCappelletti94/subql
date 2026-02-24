@@ -10,6 +10,8 @@ mod maxwell;
 mod pg_type;
 mod pgoutput;
 mod row_build;
+#[cfg(test)]
+mod test_support;
 mod wal2json;
 
 pub use debezium::DebeziumParser;
@@ -34,6 +36,15 @@ pub trait WalParser: Send + Sync {
     ) -> Result<Vec<WalEvent>, WalParseError>;
 }
 
+/// Parse a UTF-8 JSON message into a typed payload.
+pub(crate) fn parse_json_message<T>(data: &[u8]) -> Result<T, WalParseError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let text = std::str::from_utf8(data).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
+    serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))
+}
+
 /// Errors that can occur during WAL message parsing.
 #[derive(Error, Clone, Debug)]
 pub enum WalParseError {
@@ -52,6 +63,18 @@ pub enum WalParseError {
     /// Table not found in schema catalog.
     #[error("Unknown table: {schema}.{table}")]
     UnknownTable { schema: String, table: String },
+
+    /// Table reference resolves to conflicting qualified/unqualified IDs.
+    #[error(
+        "Ambiguous table resolution for {schema}.{table}: qualified '{qualified}' -> {qualified_id}, unqualified '{table}' -> {unqualified_id}"
+    )]
+    AmbiguousTable {
+        schema: String,
+        table: String,
+        qualified: String,
+        qualified_id: TableId,
+        unqualified_id: TableId,
+    },
 
     /// Column name not found in schema catalog.
     #[error("Unknown column '{column}' in table {table_id}")]
@@ -98,22 +121,40 @@ pub enum WalParseError {
 // Shared helpers (used by wal2json and pgoutput)
 // ============================================================================
 
-/// Resolve table name through catalog, trying `table` then `schema.table`.
+/// Resolve table name through catalog with qualified-first semantics.
+///
+/// Resolution rules:
+/// 1. If `schema.table` resolves, it is preferred.
+/// 2. If only `table` resolves, use it.
+/// 3. If both resolve to different IDs, return ambiguity instead of guessing.
 pub(crate) fn resolve_table(
     schema: &str,
     table: &str,
     catalog: &dyn SchemaCatalog,
 ) -> Result<TableId, WalParseError> {
-    if let Some(id) = catalog.table_id(table) {
-        return Ok(id);
-    }
     let qualified = format!("{schema}.{table}");
-    catalog
-        .table_id(&qualified)
-        .ok_or_else(|| WalParseError::UnknownTable {
+    let qualified_id = if schema.is_empty() {
+        None
+    } else {
+        catalog.table_id(&qualified)
+    };
+    let unqualified_id = catalog.table_id(table);
+
+    match (qualified_id, unqualified_id) {
+        (Some(q), Some(u)) if q != u => Err(WalParseError::AmbiguousTable {
             schema: schema.to_string(),
             table: table.to_string(),
-        })
+            qualified,
+            qualified_id: q,
+            unqualified_id: u,
+        }),
+        (Some(q), _) => Ok(q),
+        (None, Some(u)) => Ok(u),
+        (None, None) => Err(WalParseError::UnknownTable {
+            schema: schema.to_string(),
+            table: table.to_string(),
+        }),
+    }
 }
 
 /// Build a [`PrimaryKey`] from resolved column/value pairs, filtering to only
@@ -136,6 +177,43 @@ pub(crate) fn build_pk_from_resolved(
         columns: std::sync::Arc::from(columns),
         values: std::sync::Arc::from(values),
     }
+}
+
+/// Build a [`PrimaryKey`] from resolved column/value pairs, requiring every
+/// `pk_col_ids` entry to be present (and not `Cell::Missing`).
+pub(crate) fn build_pk_from_resolved_strict(
+    resolved: &[(ColumnId, Cell)],
+    pk_col_ids: &[ColumnId],
+    context: &str,
+) -> Result<PrimaryKey, WalParseError> {
+    let mut columns = Vec::with_capacity(pk_col_ids.len());
+    let mut values = Vec::with_capacity(pk_col_ids.len());
+    let mut seen = HashSet::with_capacity(pk_col_ids.len());
+
+    for &pk_col in pk_col_ids {
+        if !seen.insert(pk_col) {
+            return Err(WalParseError::MalformedPayload(format!(
+                "{context} contains duplicate column id {pk_col}"
+            )));
+        }
+        let Some((_, cell)) = resolved.iter().find(|(c, _)| *c == pk_col) else {
+            return Err(WalParseError::MalformedPayload(format!(
+                "{context} column id {pk_col} missing from row data"
+            )));
+        };
+        if cell.is_missing() {
+            return Err(WalParseError::MalformedPayload(format!(
+                "{context} column id {pk_col} is missing in row data"
+            )));
+        }
+        columns.push(pk_col);
+        values.push(cell.clone());
+    }
+
+    Ok(PrimaryKey {
+        columns: std::sync::Arc::from(columns),
+        values: std::sync::Arc::from(values),
+    })
 }
 
 /// Resolve PK metadata names to column IDs and require each resolved PK column
@@ -182,12 +260,11 @@ pub(crate) fn pk_from_catalog_or_empty(
     resolved: &[(ColumnId, Cell)],
     table_id: TableId,
     catalog: &dyn SchemaCatalog,
-) -> PrimaryKey {
-    catalog
-        .primary_key_columns(table_id)
-        .map_or_else(PrimaryKey::empty, |pk_cols| {
-            build_pk_from_resolved(resolved, pk_cols)
-        })
+) -> Result<PrimaryKey, WalParseError> {
+    catalog.primary_key_columns(table_id).map_or_else(
+        || Ok(PrimaryKey::empty()),
+        |pk_cols| build_pk_from_resolved_strict(resolved, pk_cols, "catalog primary key"),
+    )
 }
 
 /// Compute changed columns between old and new row images.
@@ -263,11 +340,32 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_resolve_table_prefers_unqualified_name() {
+    fn test_resolve_table_conflicting_matches_errors() {
         let tables = HashMap::from([
             ("users".to_string(), (1_u32, 2_usize)),
             ("public.users".to_string(), (2_u32, 2_usize)),
         ]);
+        let catalog = MockCatalog {
+            tables,
+            columns: HashMap::new(),
+        };
+
+        let err = resolve_table("public", "users", &catalog).expect_err("must fail");
+        assert!(matches!(
+            err,
+            WalParseError::AmbiguousTable {
+                schema,
+                table,
+                qualified,
+                qualified_id: 2,
+                unqualified_id: 1,
+            } if schema == "public" && table == "users" && qualified == "public.users"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_table_falls_back_to_unqualified_name() {
+        let tables = HashMap::from([("users".to_string(), (1_u32, 2_usize))]);
         let catalog = MockCatalog {
             tables,
             columns: HashMap::new(),
@@ -279,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_table_falls_back_to_qualified_name() {
+    fn test_resolve_table_uses_qualified_when_available() {
         let tables = HashMap::from([("public.users".to_string(), (2_u32, 2_usize))]);
         let catalog = MockCatalog {
             tables,
@@ -348,5 +446,26 @@ mod tests {
         };
 
         assert!(changed_columns(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_message_invalid_utf8() {
+        let err = parse_json_message::<serde_json::Value>(&[0xFF])
+            .expect_err("invalid UTF-8 should fail");
+        assert!(matches!(err, WalParseError::InvalidUtf8(_)));
+    }
+
+    #[test]
+    fn test_parse_json_message_invalid_json() {
+        let err =
+            parse_json_message::<serde_json::Value>(b"{").expect_err("malformed JSON should fail");
+        assert!(matches!(err, WalParseError::JsonError(_)));
+    }
+
+    #[test]
+    fn test_parse_json_message_allows_tombstone_option() {
+        let parsed: Option<serde_json::Value> =
+            parse_json_message(b"null").expect("tombstone should parse to None");
+        assert!(parsed.is_none());
     }
 }

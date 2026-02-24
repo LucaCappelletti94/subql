@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::map_cdc::{convert_map_cdc_event, parse_event_kind};
+use super::map_cdc::{convert_map_cdc_event, parse_event_kind, MapCdcConfig};
 use super::{resolve_table, WalParseError, WalParser};
 #[cfg(test)]
-use crate::{Cell, ColumnId, TableId};
+use crate::{Cell, ColumnId};
 use crate::{EventKind, SchemaCatalog, WalEvent};
 
 // ============================================================================
@@ -55,11 +55,11 @@ impl WalParser for DebeziumParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let text =
-            std::str::from_utf8(data).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-
-        let env: DebeziumEnvelope =
-            serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
+        let env: Option<DebeziumEnvelope> = super::parse_json_message(data)?;
+        let Some(env) = env else {
+            // Debezium Kafka topics may emit tombstone messages ("null") for compaction.
+            return Ok(Vec::new());
+        };
 
         let event = convert_debezium_envelope(&env, catalog)?;
         Ok(vec![event])
@@ -80,20 +80,27 @@ fn convert_debezium_envelope(
 ) -> Result<WalEvent, WalParseError> {
     let kind = parse_debezium_op(&env.op)?;
 
-    // Try schema.table first, then fall back to db.table
-    let table_id = resolve_table(&env.source.schema, &env.source.table, catalog)
-        .or_else(|_| resolve_table(&env.source.db, &env.source.table, catalog))?;
+    // Try schema.table first, then fall back to db.table only when table is unknown.
+    let table_id = match resolve_table(&env.source.schema, &env.source.table, catalog) {
+        Ok(table_id) => table_id,
+        Err(WalParseError::UnknownTable { .. }) => {
+            resolve_table(&env.source.db, &env.source.table, catalog)?
+        }
+        Err(err) => return Err(err),
+    };
 
     convert_map_cdc_event(
         kind,
         table_id,
         env.after.as_ref(),
         env.before.as_ref(),
-        "after",
-        "before",
-        "debezium.after",
-        "debezium.before",
-        None,
+        MapCdcConfig {
+            required_new_field: "after",
+            required_old_field: "before",
+            new_field_prefix: "debezium.after",
+            old_field_prefix: "debezium.before",
+            pk_col_names: None,
+        },
         catalog,
     )
 }
@@ -104,81 +111,47 @@ fn convert_debezium_envelope(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::TestCatalog;
     use super::*;
     use std::collections::HashMap;
 
     // -- Test catalog --------------------------------------------------------
 
-    struct TestCatalog {
-        tables: HashMap<String, (TableId, usize)>,
-        columns: HashMap<(TableId, String), ColumnId>,
-        primary_keys: HashMap<TableId, Vec<ColumnId>>,
-    }
+    /// Debezium test table: schema="public", table="orders",
+    /// columns: id=0, amount=1, status=2, comment=3, PK=[id].
+    fn orders_catalog() -> TestCatalog {
+        let mut tables = HashMap::new();
+        tables.insert("orders".to_string(), (1, 4));
+        tables.insert("public.orders".to_string(), (1, 4));
+        tables.insert("mydb.orders".to_string(), (1, 4));
 
-    impl TestCatalog {
-        /// Debezium test table: schema="public", table="orders",
-        /// columns: id=0, amount=1, status=2, comment=3, PK=[id].
-        fn orders() -> Self {
-            let mut tables = HashMap::new();
-            tables.insert("orders".to_string(), (1, 4));
-            tables.insert("public.orders".to_string(), (1, 4));
-            tables.insert("mydb.orders".to_string(), (1, 4));
+        let mut columns = HashMap::new();
+        columns.insert((1, "id".to_string()), 0);
+        columns.insert((1, "amount".to_string()), 1);
+        columns.insert((1, "status".to_string()), 2);
+        columns.insert((1, "comment".to_string()), 3);
 
-            let mut columns = HashMap::new();
-            columns.insert((1, "id".to_string()), 0);
-            columns.insert((1, "amount".to_string()), 1);
-            columns.insert((1, "status".to_string()), 2);
-            columns.insert((1, "comment".to_string()), 3);
+        let mut primary_keys = HashMap::new();
+        primary_keys.insert(1, vec![0]); // id is PK
 
-            let mut primary_keys = HashMap::new();
-            primary_keys.insert(1, vec![0]); // id is PK
-
-            Self {
-                tables,
-                columns,
-                primary_keys,
-            }
-        }
-
-        fn orders_no_pk() -> Self {
-            let mut cat = Self::orders();
-            cat.primary_keys.clear();
-            cat
+        TestCatalog {
+            tables,
+            columns,
+            primary_keys,
         }
     }
 
-    impl SchemaCatalog for TestCatalog {
-        fn table_id(&self, table_name: &str) -> Option<TableId> {
-            self.tables.get(table_name).map(|(id, _)| *id)
-        }
-
-        fn column_id(&self, table_id: TableId, column_name: &str) -> Option<ColumnId> {
-            self.columns
-                .get(&(table_id, column_name.to_string()))
-                .copied()
-        }
-
-        fn table_arity(&self, table_id: TableId) -> Option<usize> {
-            self.tables
-                .values()
-                .find(|(id, _)| *id == table_id)
-                .map(|(_, arity)| *arity)
-        }
-
-        fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-            Some(0)
-        }
-
-        fn primary_key_columns(&self, table_id: TableId) -> Option<&[ColumnId]> {
-            self.primary_keys.get(&table_id).map(Vec::as_slice)
-        }
+    fn orders_no_pk_catalog() -> TestCatalog {
+        let mut cat = orders_catalog();
+        cat.primary_keys.clear();
+        cat
     }
 
     // -- INSERT tests -------------------------------------------------------
 
     #[test]
     fn debezium_insert() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -215,7 +188,7 @@ mod tests {
 
     #[test]
     fn debezium_snapshot_read_as_insert() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -241,7 +214,7 @@ mod tests {
 
     #[test]
     fn debezium_update_with_before() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -278,7 +251,7 @@ mod tests {
 
     #[test]
     fn debezium_update_without_before() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -304,7 +277,7 @@ mod tests {
 
     #[test]
     fn debezium_delete() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -338,7 +311,7 @@ mod tests {
 
     #[test]
     fn debezium_null_values() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -362,7 +335,7 @@ mod tests {
 
     #[test]
     fn debezium_insert_no_catalog_pk() {
-        let catalog = TestCatalog::orders_no_pk();
+        let catalog = orders_no_pk_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -387,7 +360,7 @@ mod tests {
 
     #[test]
     fn error_invalid_utf8() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
         let bad_bytes: &[u8] = &[0xFF, 0xFE, 0xFD];
 
@@ -399,7 +372,7 @@ mod tests {
 
     #[test]
     fn error_malformed_json() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let err = parser
@@ -409,8 +382,19 @@ mod tests {
     }
 
     #[test]
+    fn debezium_tombstone_null_is_ignored() {
+        let catalog = orders_catalog();
+        let parser = DebeziumParser;
+
+        let events = parser
+            .parse_wal_message(b"null", &catalog)
+            .expect("tombstone should be ignored");
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn error_unknown_table() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -428,8 +412,37 @@ mod tests {
     }
 
     #[test]
+    fn error_ambiguous_table_does_not_fallback_to_db_name() {
+        let mut catalog = orders_catalog();
+        catalog.tables.insert("public.orders".to_string(), (2, 4));
+        let parser = DebeziumParser;
+
+        let json = r#"{
+            "before": null,
+            "after": {"id": 1},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "c",
+            "ts_ms": 1234567890
+        }"#;
+
+        let err = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect_err("ambiguous schema.table vs table should fail");
+        assert!(matches!(
+            err,
+            WalParseError::AmbiguousTable {
+                schema,
+                table,
+                qualified,
+                qualified_id: 2,
+                unqualified_id: 1,
+            } if schema == "public" && table == "orders" && qualified == "public.orders"
+        ));
+    }
+
+    #[test]
     fn error_unknown_column() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -448,7 +461,7 @@ mod tests {
 
     #[test]
     fn error_unknown_op() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -467,7 +480,7 @@ mod tests {
 
     #[test]
     fn error_missing_after_on_insert() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -486,7 +499,7 @@ mod tests {
 
     #[test]
     fn error_missing_before_on_delete() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -505,7 +518,7 @@ mod tests {
 
     #[test]
     fn error_numeric_overflow() {
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
         let parser = DebeziumParser;
 
         let json = r#"{
@@ -527,7 +540,7 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let parser: &dyn WalParser = &DebeziumParser;
-        let catalog = TestCatalog::orders();
+        let catalog = orders_catalog();
 
         let json = r#"{
             "before": null,

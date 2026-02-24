@@ -22,6 +22,16 @@ pub enum RegisterError {
     #[error("Unknown table: {0}")]
     UnknownTable(String),
 
+    /// Table reference resolves to conflicting qualified/unqualified names
+    #[error(
+        "Ambiguous table reference '{reference}': matches both '{qualified}' and '{unqualified}'"
+    )]
+    AmbiguousTable {
+        reference: String,
+        qualified: String,
+        unqualified: String,
+    },
+
     /// Column name not found in table
     #[error("Unknown column '{column}' in table {table_id}")]
     UnknownColumn { table_id: TableId, column: String },
@@ -69,6 +79,10 @@ pub enum StorageError {
     /// I/O error during shard read/write
     #[error("I/O error: {0}")]
     Io(String),
+
+    /// Parent directory fsync failed after shard rename (data is already committed).
+    #[error("post_commit_dirsync: {0}")]
+    PostCommitDirSync(String),
 
     /// Configuration error (e.g., missing storage path)
     #[error("Config error: {0}")]
@@ -135,6 +149,15 @@ mod tests {
             "Unknown table: users"
         );
         assert_eq!(
+            RegisterError::AmbiguousTable {
+                reference: "public.orders".to_string(),
+                qualified: "public.orders".to_string(),
+                unqualified: "orders".to_string(),
+            }
+            .to_string(),
+            "Ambiguous table reference 'public.orders': matches both 'public.orders' and 'orders'"
+        );
+        assert_eq!(
             RegisterError::UnknownColumn {
                 table_id: 9,
                 column: "tenant_id".to_string()
@@ -186,6 +209,10 @@ mod tests {
         assert_eq!(
             StorageError::Io("permission denied".to_string()).to_string(),
             "I/O error: permission denied"
+        );
+        assert_eq!(
+            StorageError::PostCommitDirSync("I/O error: injected failure".to_string()).to_string(),
+            "post_commit_dirsync: I/O error: injected failure"
         );
         assert_eq!(
             StorageError::Config("missing storage path".to_string()).to_string(),

@@ -6,7 +6,7 @@ use super::{
     canonicalize, prefilter::build_prefilter_plan, BytecodeProgram, Instruction, PrefilterPlan,
 };
 use crate::{Cell, RegisterError, SchemaCatalog, TableId};
-use sqlparser::ast::{Expr, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{Expr, ObjectName, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 
@@ -15,6 +15,38 @@ const MAX_EXPR_DEPTH: usize = 512;
 
 /// Maximum SQL input length (defense-in-depth against pathological inputs).
 const MAX_SQL_LEN: usize = 8192;
+
+struct SqlTableName {
+    unqualified: String,
+    qualified: Option<String>,
+}
+
+impl SqlTableName {
+    fn from_object_name(name: &ObjectName) -> Result<Self, RegisterError> {
+        let mut parts = Vec::with_capacity(name.0.len());
+        for part in &name.0 {
+            let ident = part
+                .as_ident()
+                .ok_or_else(|| RegisterError::UnsupportedSql("Missing table name".to_string()))?;
+            parts.push(ident.value.clone());
+        }
+
+        let unqualified = parts
+            .last()
+            .cloned()
+            .ok_or_else(|| RegisterError::UnsupportedSql("Missing table name".to_string()))?;
+        let qualified = if parts.len() > 1 {
+            Some(parts.join("."))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            unqualified,
+            qualified,
+        })
+    }
+}
 
 /// Parse and compile SQL SELECT statement to bytecode
 ///
@@ -79,9 +111,7 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     let (table_name, where_clause) = extract_table_and_where(stmt)?;
 
     // Resolve table ID
-    let table_id = catalog
-        .table_id(&table_name)
-        .ok_or_else(|| RegisterError::UnknownTable(table_name.clone()))?;
+    let table_id = resolve_table_id(&table_name, catalog)?;
 
     // Compile WHERE clause to bytecode
     let program = if let Some(expr) = where_clause.as_ref() {
@@ -98,7 +128,32 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     Ok((table_id, program, normalized, prefilter_plan))
 }
 
-fn extract_table_and_where(stmt: &Statement) -> Result<(String, Option<Expr>), RegisterError> {
+fn resolve_table_id(
+    table_name: &SqlTableName,
+    catalog: &dyn SchemaCatalog,
+) -> Result<TableId, RegisterError> {
+    let unqualified_id = catalog.table_id(&table_name.unqualified);
+
+    if let Some(qualified) = table_name.qualified.as_deref() {
+        let qualified_id = catalog.table_id(qualified);
+        return match (qualified_id, unqualified_id) {
+            (Some(q), Some(u)) if q != u => Err(RegisterError::AmbiguousTable {
+                reference: qualified.to_string(),
+                qualified: qualified.to_string(),
+                unqualified: table_name.unqualified.clone(),
+            }),
+            (Some(q), _) => Ok(q),
+            (None, Some(u)) => Ok(u),
+            (None, None) => Err(RegisterError::UnknownTable(qualified.to_string())),
+        };
+    }
+
+    unqualified_id.ok_or_else(|| RegisterError::UnknownTable(table_name.unqualified.clone()))
+}
+
+fn extract_table_and_where(
+    stmt: &Statement,
+) -> Result<(SqlTableName, Option<Expr>), RegisterError> {
     match stmt {
         Statement::Query(query) => {
             match query.body.as_ref() {
@@ -121,17 +176,7 @@ fn extract_table_and_where(stmt: &Statement) -> Result<(String, Option<Expr>), R
 
                     let table_factor = &select.from[0].relation;
                     let table_name = match table_factor {
-                        TableFactor::Table { name, .. } => {
-                            // Defensive: sqlparser never produces an empty ObjectName for
-                            // TableFactor::Table (it fails at parse time), but guard against
-                            // future parser changes.
-                            name.0.last()
-                                .and_then(|part| part.as_ident())
-                                .ok_or_else(|| RegisterError::UnsupportedSql(
-                                    "Missing table name".to_string()
-                                ))?
-                                .value.clone()
-                        }
+                        TableFactor::Table { name, .. } => SqlTableName::from_object_name(name)?,
                         _ => return Err(RegisterError::UnsupportedSql(
                             "Subqueries and derived tables not supported - SubQL is for single-table WHERE clauses. \
                              Run this as a regular SQL query in your database instead."
@@ -587,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_qualified_table_name_uses_last_component() {
+    fn test_schema_qualified_table_name_falls_back_to_unqualified() {
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
 
@@ -597,6 +642,28 @@ mod tests {
 
         let (table_id, _) = result.unwrap();
         assert_eq!(table_id, 2);
+    }
+
+    #[test]
+    fn test_schema_qualified_table_name_ambiguity_errors() {
+        let mut catalog = make_catalog();
+        catalog.tables.insert("public.orders".to_string(), (99, 7));
+        catalog.columns.insert((99, "price".to_string()), 1);
+
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT * FROM public.orders WHERE price > 10";
+
+        let result = parse_and_compile(sql, &dialect, &catalog);
+        assert!(matches!(
+            result,
+            Err(RegisterError::AmbiguousTable {
+                reference,
+                qualified,
+                unqualified,
+            }) if reference == "public.orders"
+                && qualified == "public.orders"
+                && unqualified == "orders"
+        ));
     }
 
     #[test]
