@@ -4,6 +4,7 @@ pub mod bytecode;
 pub mod canonicalize;
 pub mod parser;
 pub mod prefilter;
+mod sql_shape;
 pub mod tristate;
 pub mod vm;
 

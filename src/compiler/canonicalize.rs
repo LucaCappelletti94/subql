@@ -1,18 +1,12 @@
 //! SQL normalization and hashing for predicate deduplication
 
+use super::sql_shape;
 use crate::RegisterError;
 use seahash::SeaHasher;
 use sqlparser::ast::{BinaryOperator, Expr, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
 use std::hash::{Hash, Hasher};
-
-/// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
-/// 128 is sufficient for any real-world SQL; lower values reduce stack usage.
-const MAX_EXPR_DEPTH: usize = 128;
-
-/// Maximum SQL input length (defense-in-depth against pathological inputs).
-const MAX_SQL_LEN: usize = 8192;
 
 /// Predicate hash (128-bit, deterministic)
 pub type PredicateHash = u128;
@@ -40,7 +34,7 @@ pub type PredicateHash = u128;
 /// assert_eq!(norm1, norm2); // Same predicate
 /// ```
 pub fn normalize_sql(sql: &str, dialect: &dyn Dialect) -> Result<String, RegisterError> {
-    if sql.len() > MAX_SQL_LEN {
+    if sql.len() > sql_shape::MAX_SQL_LEN {
         return Err(RegisterError::UnsupportedSql(
             "SQL input too long".to_string(),
         ));
@@ -130,7 +124,9 @@ fn check_sql_depth(sql: &str) -> Result<(), RegisterError> {
             }
         }
 
-        if paren_depth > MAX_EXPR_DEPTH || consecutive_ops > MAX_EXPR_DEPTH {
+        if paren_depth > sql_shape::MAX_EXPR_DEPTH
+            || consecutive_ops > sql_shape::MAX_EXPR_DEPTH
+        {
             return Err(RegisterError::UnsupportedSql(
                 "Expression nesting too deep".to_string(),
             ));
@@ -141,36 +137,8 @@ fn check_sql_depth(sql: &str) -> Result<(), RegisterError> {
 
 /// Extract WHERE clause from SELECT statement
 fn extract_where(stmt: &Statement) -> Result<Option<Expr>, RegisterError> {
-    use sqlparser::ast::SetExpr;
-
-    match stmt {
-        Statement::Query(query) => {
-            match query.body.as_ref() {
-                SetExpr::Select(select) => {
-                    // Validate single table (no joins)
-                    if select.from.len() != 1 {
-                        return Err(RegisterError::UnsupportedSql(
-                            "Exactly one table required".to_string(),
-                        ));
-                    }
-
-                    if !select.from[0].joins.is_empty() {
-                        return Err(RegisterError::UnsupportedSql(
-                            "Joins not supported".to_string(),
-                        ));
-                    }
-
-                    Ok(select.selection.clone())
-                }
-                _ => Err(RegisterError::UnsupportedSql(
-                    "Only SELECT supported".to_string(),
-                )),
-            }
-        }
-        _ => Err(RegisterError::UnsupportedSql(
-            "Only SELECT supported".to_string(),
-        )),
-    }
+    let (_table_name, where_clause) = sql_shape::extract_single_table_and_where(stmt)?;
+    Ok(where_clause)
 }
 
 /// Normalize expression recursively
@@ -185,7 +153,7 @@ fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
 
 #[allow(clippy::too_many_lines)]
 fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterError> {
-    if depth > MAX_EXPR_DEPTH {
+    if depth > sql_shape::MAX_EXPR_DEPTH {
         return Err(RegisterError::UnsupportedSql(
             "Expression nesting too deep".to_string(),
         ));
@@ -647,7 +615,18 @@ mod tests {
         let result = normalize_sql(sql, &dialect);
         assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
         if let Err(RegisterError::UnsupportedSql(msg)) = result {
-            assert!(msg.contains("Joins not supported"));
+            assert!(msg.contains("JOINs not supported"));
+        }
+    }
+
+    #[test]
+    fn test_normalize_error_derived_table() {
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT * FROM (SELECT * FROM t1) AS d WHERE d.a = 1";
+        let result = normalize_sql(sql, &dialect);
+        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
+        if let Err(RegisterError::UnsupportedSql(msg)) = result {
+            assert!(msg.contains("Subqueries and derived tables not supported"));
         }
     }
 

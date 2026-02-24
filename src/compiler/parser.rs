@@ -3,18 +3,13 @@
 //! Supports generic SQL dialects via sqlparser crate.
 
 use super::{
-    canonicalize, prefilter::build_prefilter_plan, BytecodeProgram, Instruction, PrefilterPlan,
+    canonicalize, prefilter::build_prefilter_plan, sql_shape, BytecodeProgram, Instruction,
+    PrefilterPlan,
 };
 use crate::{Cell, RegisterError, SchemaCatalog, TableId};
-use sqlparser::ast::{Expr, ObjectName, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{Expr, ObjectName, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
-
-/// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
-const MAX_EXPR_DEPTH: usize = 512;
-
-/// Maximum SQL input length (defense-in-depth against pathological inputs).
-const MAX_SQL_LEN: usize = 8192;
 
 struct SqlTableName {
     unqualified: String,
@@ -86,7 +81,7 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     dialect: &D,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(TableId, BytecodeProgram, String, PrefilterPlan), RegisterError> {
-    if sql.len() > MAX_SQL_LEN {
+    if sql.len() > sql_shape::MAX_SQL_LEN {
         return Err(RegisterError::UnsupportedSql(
             "SQL input too long".to_string(),
         ));
@@ -154,54 +149,8 @@ fn resolve_table_id(
 fn extract_table_and_where(
     stmt: &Statement,
 ) -> Result<(SqlTableName, Option<Expr>), RegisterError> {
-    match stmt {
-        Statement::Query(query) => {
-            match query.body.as_ref() {
-                SetExpr::Select(select) => {
-                    // Must have exactly one table
-                    if select.from.len() != 1 {
-                        return Err(RegisterError::UnsupportedSql(
-                            "Exactly one table required (no joins)".to_string()
-                        ));
-                    }
-
-                    // Check for JOINs
-                    if !select.from[0].joins.is_empty() {
-                        return Err(RegisterError::UnsupportedSql(
-                            "JOINs not supported - SubQL is for single-table CDC event filtering. \
-                             For multi-table queries, run this as a regular SQL query in your database."
-                                .to_string()
-                        ));
-                    }
-
-                    let table_factor = &select.from[0].relation;
-                    let table_name = match table_factor {
-                        TableFactor::Table { name, .. } => SqlTableName::from_object_name(name)?,
-                        _ => return Err(RegisterError::UnsupportedSql(
-                            "Subqueries and derived tables not supported - SubQL is for single-table WHERE clauses. \
-                             Run this as a regular SQL query in your database instead."
-                                .to_string()
-                        )),
-                    };
-
-                    // Extract WHERE clause
-                    let where_clause = select.selection.clone();
-
-                    Ok((table_name, where_clause))
-                }
-                _ => Err(RegisterError::UnsupportedSql(
-                    "Set operations (UNION, INTERSECT, EXCEPT) not supported - SubQL is for single-table CDC event filtering. \
-                     For queries combining multiple result sets, run this as a regular SQL query in your database."
-                        .to_string()
-                )),
-            }
-        }
-        _ => Err(RegisterError::UnsupportedSql(
-            "Only SELECT statements supported - SubQL is for querying CDC events, not modifying data. \
-             For INSERT, UPDATE, DELETE, or DDL operations, use your database directly."
-                .to_string()
-        )),
-    }
+    let (table_name, where_clause) = sql_shape::extract_single_table_and_where(stmt)?;
+    Ok((SqlTableName::from_object_name(&table_name)?, where_clause))
 }
 
 /// Compile SQL expression to bytecode
@@ -231,7 +180,7 @@ fn compile_expr_recursive(
 ) -> Result<(), RegisterError> {
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
 
-    if depth > MAX_EXPR_DEPTH {
+    if depth > sql_shape::MAX_EXPR_DEPTH {
         return Err(RegisterError::UnsupportedSql(
             "Expression nesting too deep".to_string(),
         ));
