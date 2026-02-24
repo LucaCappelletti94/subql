@@ -13,6 +13,7 @@ pub use wal::{
 
 // Internal modules
 mod errors;
+mod table_resolution;
 mod types;
 
 pub mod compiler;

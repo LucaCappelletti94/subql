@@ -6,6 +6,7 @@ use super::{
     canonicalize, prefilter::build_prefilter_plan, sql_shape, BytecodeProgram, Instruction,
     PrefilterPlan,
 };
+use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{Cell, RegisterError, SchemaCatalog, TableId};
 use sqlparser::ast::{Expr, ObjectName, Statement};
 use sqlparser::dialect::Dialect;
@@ -127,23 +128,26 @@ fn resolve_table_id(
     table_name: &SqlTableName,
     catalog: &dyn SchemaCatalog,
 ) -> Result<TableId, RegisterError> {
-    let unqualified_id = catalog.table_id(&table_name.unqualified);
-
-    if let Some(qualified) = table_name.qualified.as_deref() {
-        let qualified_id = catalog.table_id(qualified);
-        return match (qualified_id, unqualified_id) {
-            (Some(q), Some(u)) if q != u => Err(RegisterError::AmbiguousTable {
-                reference: qualified.to_string(),
-                qualified: qualified.to_string(),
-                unqualified: table_name.unqualified.clone(),
-            }),
-            (Some(q), _) => Ok(q),
-            (None, Some(u)) => Ok(u),
-            (None, None) => Err(RegisterError::UnknownTable(qualified.to_string())),
-        };
-    }
-
-    unqualified_id.ok_or_else(|| RegisterError::UnknownTable(table_name.unqualified.clone()))
+    resolve_table_reference(
+        table_name.qualified.as_deref(),
+        &table_name.unqualified,
+        catalog,
+    )
+    .map_err(|err| match err {
+        TableResolutionError::Ambiguous {
+            qualified,
+            unqualified,
+            ..
+        } => RegisterError::AmbiguousTable {
+            reference: qualified.clone(),
+            qualified,
+            unqualified,
+        },
+        TableResolutionError::Unknown {
+            qualified,
+            unqualified,
+        } => RegisterError::UnknownTable(qualified.unwrap_or(unqualified)),
+    })
 }
 
 fn extract_table_and_where(

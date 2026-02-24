@@ -19,6 +19,7 @@ pub use maxwell::MaxwellParser;
 pub use pgoutput::PgOutputParser;
 pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Parser};
 
+use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 use std::collections::HashSet;
 use thiserror::Error;
@@ -156,29 +157,25 @@ pub(crate) fn resolve_table(
     table: &str,
     catalog: &dyn SchemaCatalog,
 ) -> Result<TableId, WalParseError> {
-    let qualified = format!("{schema}.{table}");
-    let qualified_id = if schema.is_empty() {
-        None
-    } else {
-        catalog.table_id(&qualified)
-    };
-    let unqualified_id = catalog.table_id(table);
-
-    match (qualified_id, unqualified_id) {
-        (Some(q), Some(u)) if q != u => Err(WalParseError::AmbiguousTable {
+    let qualified = (!schema.is_empty()).then(|| format!("{schema}.{table}"));
+    resolve_table_reference(qualified.as_deref(), table, catalog).map_err(|err| match err {
+        TableResolutionError::Ambiguous {
+            qualified,
+            qualified_id,
+            unqualified_id,
+            ..
+        } => WalParseError::AmbiguousTable {
             schema: schema.to_string(),
             table: table.to_string(),
             qualified,
-            qualified_id: q,
-            unqualified_id: u,
-        }),
-        (Some(q), _) => Ok(q),
-        (None, Some(u)) => Ok(u),
-        (None, None) => Err(WalParseError::UnknownTable {
+            qualified_id,
+            unqualified_id,
+        },
+        TableResolutionError::Unknown { .. } => WalParseError::UnknownTable {
             schema: schema.to_string(),
             table: table.to_string(),
-        }),
-    }
+        },
+    })
 }
 
 /// Build a [`PrimaryKey`] from resolved column/value pairs, filtering to only
@@ -319,16 +316,6 @@ pub(crate) fn insert_event(table_id: TableId, pk: PrimaryKey, new_row: RowImage)
         new_row: Some(new_row),
         changed_columns: std::sync::Arc::from([]),
     }
-}
-
-/// Build UPDATE event with consistent changed-column derivation.
-pub(crate) fn update_event(
-    table_id: TableId,
-    pk: PrimaryKey,
-    old_row: Option<RowImage>,
-    new_row: RowImage,
-) -> WalEvent {
-    update_event_with_old_row_completeness(table_id, pk, old_row, new_row, true)
 }
 
 /// Build UPDATE event while allowing parsers to disable changed-column
@@ -528,10 +515,9 @@ mod tests {
 
     #[test]
     fn test_parse_single_json_event_tombstone_returns_empty() {
-        let events = parse_single_json_event::<serde_json::Value, _>(b"null", |_| {
-            Ok(truncate_event(1))
-        })
-        .expect("tombstone should be ignored");
+        let events =
+            parse_single_json_event::<serde_json::Value, _>(b"null", |_| Ok(truncate_event(1)))
+                .expect("tombstone should be ignored");
         assert!(events.is_empty());
     }
 
