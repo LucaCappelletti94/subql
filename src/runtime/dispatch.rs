@@ -2,7 +2,10 @@
 
 use super::{ids::UserOrdinal, partition::TablePartition};
 use crate::{
-    compiler::{Tri, Vm},
+    compiler::{
+        sql_shape::{AggSpec, QueryProjection},
+        Tri, Vm,
+    },
     DispatchError, EventKind, IdTypes, RowImage, WalEvent,
 };
 use ahash::AHashMap;
@@ -241,6 +244,130 @@ pub(crate) fn dispatch_users_with_row<'a, I: IdTypes>(
         bitmap_iter: matching_ordinals.into_iter(),
         dict: user_dict,
     })
+}
+
+/// Compute signed count deltas for aggregate (COUNT(*)) subscriptions.
+///
+/// Delta normalization per event kind:
+/// - `Insert`   → `[(+1, new_row)]`
+/// - `Delete`   → `[(-1, old_row)]`
+/// - `Update`   → `[(-1, old_row), (+1, new_row)]`
+/// - `Truncate` → `Err(TruncateRequiresReset)`
+///
+/// For each `(weight, row)` pair the function selects agg candidate
+/// predicates, prefilters, VM-evaluates, and accumulates weight per user.
+/// Zero-net entries are filtered out before returning.
+pub(crate) fn compute_agg_deltas<I: IdTypes>(
+    event: &WalEvent,
+    partition: &TablePartition<I>,
+    user_dict: &UserDictionary<I>,
+    vm: &mut Vm,
+) -> Result<Vec<(I::UserId, i64)>, DispatchError> {
+    use crate::runtime::ids::PredicateId;
+
+    if event.kind == EventKind::Truncate {
+        return Err(DispatchError::TruncateRequiresReset(event.table_id));
+    }
+
+    // Build (weight, row) pairs based on event kind.
+    let deltas: Vec<(i64, &RowImage)> = match event.kind {
+        EventKind::Insert => {
+            let new_row = event
+                .new_row
+                .as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage(
+                    "INSERT requires new_row",
+                ))?;
+            vec![(1, new_row)]
+        }
+        EventKind::Delete => {
+            let old_row = event
+                .old_row
+                .as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage(
+                    "DELETE requires old_row",
+                ))?;
+            vec![(-1, old_row)]
+        }
+        EventKind::Update => {
+            let old_row = event
+                .old_row
+                .as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage(
+                    "UPDATE requires old_row",
+                ))?;
+            let new_row = event
+                .new_row
+                .as_ref()
+                .ok_or(DispatchError::MissingRequiredRowImage(
+                    "UPDATE requires new_row",
+                ))?;
+            vec![(-1, old_row), (1, new_row)]
+        }
+        EventKind::Truncate => unreachable!("handled above"),
+    };
+
+    // Accumulate weight per user ordinal.
+    let mut user_weights: AHashMap<UserOrdinal, i64> = AHashMap::new();
+
+    let snapshot = partition.load_snapshot();
+
+    // For UPDATE, use dependency-aware candidate selection; for INSERT/DELETE
+    // pass empty changed_cols to get all agg candidates.
+    let changed_cols = if event.kind == EventKind::Update {
+        &event.changed_columns[..]
+    } else {
+        &[]
+    };
+    let candidates = partition.select_agg_candidates(event.kind, changed_cols);
+
+    for (weight, row) in deltas {
+        for pred_id_u32 in &candidates {
+            let Some(pred_id) = PredicateId::try_from_u32(pred_id_u32) else {
+                continue;
+            };
+
+            if let Some(pred) = snapshot.predicates.get_predicate(pred_id) {
+                // Only process aggregate predicates.
+                if !matches!(
+                    pred.projection,
+                    QueryProjection::Aggregate(AggSpec::CountStar)
+                ) {
+                    continue;
+                }
+
+                // Prefilter check
+                if pred.prefilter_plan.requires_prefilter_eval
+                    && !pred.prefilter_plan.may_match(row)
+                {
+                    continue;
+                }
+
+                // VM evaluation
+                let result = vm
+                    .eval(&pred.bytecode, row)
+                    .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
+
+                if result == Tri::True {
+                    if let Some(bitmap) = snapshot.predicates.predicate_users.get(&pred_id) {
+                        for ord_u32 in bitmap {
+                            let ord = UserOrdinal::new(ord_u32);
+                            *user_weights.entry(ord).or_default() += weight;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Translate ordinals to user IDs; filter out zero-net entries.
+    let result = user_weights
+        .into_iter()
+        .filter(|(_, delta)| *delta != 0)
+        .filter_map(|(ord, delta)| user_dict.get_user(ord).map(|uid| (uid, delta)))
+        .collect();
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -532,6 +659,7 @@ mod tests {
                 Instruction::GreaterThan,
             ])),
             dependency_columns: Arc::from([1u16]),
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             index_atoms: Arc::from([IndexableAtom::Fallback]),
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount: 1,
@@ -598,6 +726,7 @@ mod tests {
                 Instruction::LessThan,
             ])),
             dependency_columns: Arc::from([1u16]),
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             index_atoms: Arc::from([IndexableAtom::Fallback]),
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount: 1,
@@ -641,6 +770,347 @@ mod tests {
         );
     }
 
+    // --- Aggregate dispatch tests ---
+
+    fn make_count_pred_and_binding(
+        pred_slab: usize,
+        sub_id: u64,
+        user_id: u64,
+        partition: &mut super::super::partition::TablePartition<DefaultIds>,
+        user_dict: &mut UserDictionary<DefaultIds>,
+    ) -> super::super::ids::PredicateId {
+        use super::super::indexes::IndexableAtom;
+        use super::super::predicate::{Binding, Predicate};
+        use crate::compiler::sql_shape::{AggSpec, QueryProjection};
+        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
+
+        // WHERE amount > 10
+        let pred = Predicate {
+            id: super::super::ids::PredicateId::from_slab_index(pred_slab),
+            hash: 0xCCCC + pred_slab as u128,
+            normalized_sql: "amount > 10".into(),
+            bytecode: Arc::new(BytecodeProgram::new(vec![
+                Instruction::LoadColumn(1),
+                Instruction::PushLiteral(crate::Cell::Int(10)),
+                Instruction::GreaterThan,
+            ])),
+            dependency_columns: Arc::from([1u16]),
+            projection: QueryProjection::Aggregate(AggSpec::CountStar),
+            index_atoms: Arc::from([IndexableAtom::Fallback]),
+            prefilter_plan: Arc::new(PrefilterPlan::default()),
+            refcount: 1,
+            updated_at_unix_ms: 1000,
+        };
+        let pred_id = pred.id;
+        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
+
+        let ord = user_dict.get_or_create(user_id);
+        partition.add_binding(
+            Binding {
+                subscription_id: sub_id,
+                predicate_id: pred_id,
+                user_id,
+                user_ordinal: ord,
+                session_id: None,
+                updated_at_unix_ms: 1000,
+            },
+            pred_id,
+        );
+        pred_id
+    }
+
+    /// Helper: row with cells [id=1, amount=value]
+    fn make_row(amount: i64) -> crate::RowImage {
+        crate::RowImage {
+            cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(amount)]),
+        }
+    }
+
+    #[test]
+    fn test_agg_insert_matching_gives_plus_one() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(make_row(20)), // 20 > 10 → matches
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(
+            deltas,
+            vec![(42, 1)],
+            "INSERT matching predicate should yield delta +1"
+        );
+    }
+
+    #[test]
+    fn test_agg_insert_non_matching_gives_no_delta() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(make_row(5)), // 5 ≤ 10 → no match
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert!(
+            deltas.is_empty(),
+            "INSERT not matching predicate should yield no delta"
+        );
+    }
+
+    #[test]
+    fn test_agg_delete_matching_gives_minus_one() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Delete,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_row(20)), // was matching
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(
+            deltas,
+            vec![(42, -1)],
+            "DELETE of matching row should yield delta -1"
+        );
+    }
+
+    #[test]
+    fn test_agg_update_old_matches_new_does_not_gives_minus_one() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_row(20)), // was matching (20 > 10)
+            new_row: Some(make_row(5)),  // no longer matches (5 ≤ 10)
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(
+            deltas,
+            vec![(42, -1)],
+            "UPDATE leaving predicate should yield delta -1"
+        );
+    }
+
+    #[test]
+    fn test_agg_update_old_does_not_match_new_does_gives_plus_one() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_row(5)),  // was not matching
+            new_row: Some(make_row(20)), // now matches
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(
+            deltas,
+            vec![(42, 1)],
+            "UPDATE entering predicate should yield delta +1"
+        );
+    }
+
+    #[test]
+    fn test_agg_update_both_match_gives_zero_net_no_entry() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_row(15)), // matches (15 > 10)
+            new_row: Some(make_row(20)), // also matches (20 > 10)
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert!(
+            deltas.is_empty(),
+            "UPDATE where both old and new match should yield zero net delta (no entry)"
+        );
+    }
+
+    #[test]
+    fn test_agg_truncate_returns_requires_reset_error() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Truncate,
+            table_id: 1,
+            pk: crate::PrimaryKey::empty(),
+            old_row: None,
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let err = compute_agg_deltas(&event, &partition, &user_dict, &mut vm)
+            .expect_err("TRUNCATE should return TruncateRequiresReset");
+        assert!(
+            matches!(err, DispatchError::TruncateRequiresReset(1)),
+            "expected TruncateRequiresReset(1), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_agg_users_dispatch_skips_count_predicates() {
+        use super::super::indexes::IndexableAtom;
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        // Register a COUNT predicate for user 42
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        // Also register a Rows predicate for user 99 (to ensure dispatch still works)
+        {
+            use super::super::predicate::{Binding, Predicate};
+            use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
+            let pred = Predicate {
+                id: super::super::ids::PredicateId::from_slab_index(1),
+                hash: 0xAAAA,
+                normalized_sql: "amount > 5".into(),
+                bytecode: Arc::new(BytecodeProgram::new(vec![
+                    Instruction::LoadColumn(1),
+                    Instruction::PushLiteral(crate::Cell::Int(5)),
+                    Instruction::GreaterThan,
+                ])),
+                dependency_columns: Arc::from([1u16]),
+                projection: crate::compiler::sql_shape::QueryProjection::Rows,
+                index_atoms: Arc::from([IndexableAtom::Fallback]),
+                prefilter_plan: Arc::new(PrefilterPlan::default()),
+                refcount: 1,
+                updated_at_unix_ms: 1000,
+            };
+            let pred_id = pred.id;
+            partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
+            let ord = user_dict.get_or_create(99);
+            partition.add_binding(
+                Binding {
+                    subscription_id: 2,
+                    predicate_id: pred_id,
+                    user_id: 99,
+                    user_ordinal: ord,
+                    session_id: None,
+                    updated_at_unix_ms: 1000,
+                },
+                pred_id,
+            );
+        }
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(make_row(20)), // matches both predicates
+            changed_columns: Arc::from([]),
+        };
+
+        let users: Vec<_> = dispatch_users(&event, &partition, &user_dict, &mut vm)
+            .expect("dispatch_users should succeed")
+            .collect();
+
+        // User 99 (Rows predicate) should appear; user 42 (COUNT predicate) must NOT
+        assert!(users.contains(&99), "Rows subscriber should be dispatched");
+        assert!(
+            !users.contains(&42),
+            "COUNT subscriber must not appear in users() dispatch"
+        );
+    }
+
     #[test]
     fn test_dispatch_users_no_match() {
         use super::super::indexes::IndexableAtom;
@@ -662,6 +1132,7 @@ mod tests {
                 Instruction::GreaterThan,
             ])),
             dependency_columns: Arc::from([1u16]),
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             index_atoms: Arc::from([IndexableAtom::Fallback]),
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount: 1,

@@ -11,7 +11,9 @@ use super::{
 };
 use crate::{
     compiler::{
-        canonicalize, parse_compile_normalize_and_prefilter, BytecodeProgram, PrefilterPlan, Vm,
+        canonicalize, parse_compile_normalize_and_prefilter,
+        sql_shape::{AggSpec, QueryProjection},
+        BytecodeProgram, PrefilterPlan, Vm,
     },
     persistence::{
         codec,
@@ -43,6 +45,7 @@ struct CompiledSpec<I: IdTypes> {
     bytecode: BytecodeProgram,
     normalized: String,
     prefilter_plan: PrefilterPlan,
+    projection: QueryProjection,
     hash: u128,
 }
 
@@ -165,9 +168,18 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     }
 
     fn compile_spec(&self, spec: SubscriptionSpec<I>) -> Result<CompiledSpec<I>, RegisterError> {
-        let (table_id, bytecode, normalized, prefilter_plan) =
+        let (table_id, bytecode, normalized, prefilter_plan, projection) =
             parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog)?;
-        let hash = canonicalize::hash_sql(&normalized);
+
+        // Disambiguate hash: same WHERE clause with different projection kind
+        // (e.g. SELECT * vs SELECT COUNT(*)) must map to distinct predicates.
+        let hash_input = match &projection {
+            QueryProjection::Rows => normalized.clone(),
+            QueryProjection::Aggregate(AggSpec::CountStar) => {
+                format!("{normalized}\x00COUNT(*)")
+            }
+        };
+        let hash = canonicalize::hash_sql(&hash_input);
         #[cfg(test)]
         let hash = injected_compile_hash_override(&normalized).unwrap_or(hash);
 
@@ -177,6 +189,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             bytecode,
             normalized,
             prefilter_plan,
+            projection,
             hash,
         })
     }
@@ -192,6 +205,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             dependency_columns: Arc::from(compiled.bytecode.dependency_columns.as_slice()),
             index_atoms: Arc::from(atoms.as_slice()),
             prefilter_plan: Arc::new(compiled.prefilter_plan.clone()),
+            projection: compiled.projection.clone(),
             refcount: 0, // Will be incremented via binding
             updated_at_unix_ms: compiled.spec.updated_at_unix_ms,
         };
@@ -217,7 +231,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         matches!(err, StorageError::PostCommitDirSync(_))
     }
 
-    fn log_best_effort_durability(message: &str) {
+    const fn log_best_effort_durability(message: &str) {
         #[cfg(feature = "observability")]
         tracing::warn!("{message}");
         #[cfg(not(feature = "observability"))]
@@ -413,6 +427,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             normalized_sql: compiled.normalized,
             predicate_hash: hash,
             created_new_predicate: created_new,
+            projection: compiled.projection,
         })
     }
 
@@ -456,6 +471,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                         normalized_sql: String::new(), // filled in phase 2
                         predicate_hash: compiled_spec.hash,
                         created_new_predicate: false, // filled in phase 2
+                        projection: compiled_spec.projection.clone(),
                     }));
                     compiled.push(Some(compiled_spec));
                 }
@@ -716,6 +732,35 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         dispatch_users_with_row(event, row, partition, user_dict, &mut self.vm)
     }
 
+    /// Compute signed count deltas for aggregate (COUNT) subscriptions.
+    ///
+    /// Returns `Vec<(UserId, delta)>` where `delta` is the net signed change
+    /// in the count for that user's COUNT predicate.
+    ///
+    /// # Caller contract
+    /// - Bootstrap: query the DB for the initial count **before** subscribing.
+    /// - Accumulate: `running_count += delta` on each call.
+    /// - Reset on policy change: RLS/ACL changes produce no WAL events;
+    ///   re-query the DB and replace the stored count.
+    /// - Reset on TRUNCATE: engine returns `Err(TruncateRequiresReset)`;
+    ///   caller must re-query and replace.
+    pub fn count_deltas(
+        &mut self,
+        event: &WalEvent,
+    ) -> Result<Vec<(I::UserId, i64)>, DispatchError> {
+        let partition = self
+            .partitions
+            .get(&event.table_id)
+            .ok_or(DispatchError::UnknownTableId(event.table_id))?;
+
+        let user_dict = self
+            .user_dictionaries
+            .get(&event.table_id)
+            .ok_or(DispatchError::UnknownTableId(event.table_id))?;
+
+        super::dispatch::compute_agg_deltas(event, partition, user_dict, &mut self.vm)
+    }
+
     /// Unregister all subscriptions for a session
     pub fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport {
         let mut removed_bindings = 0;
@@ -945,6 +990,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 prefilter_plan: codec::serialize(&*pred.prefilter_plan)
                     .map_err(|e| StorageError::Codec(format!("Prefilter serialize error: {e}")))?,
                 dependency_columns: pred.dependency_columns.to_vec(),
+                projection: pred.projection.clone(),
                 refcount: pred.refcount,
                 updated_at_unix_ms: pred.updated_at_unix_ms,
             };
@@ -1097,6 +1143,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
                 index_atoms: Arc::from(atoms.as_slice()),
                 prefilter_plan: Arc::new(prefilter_plan),
+                projection: pred_data.projection.clone(),
                 refcount: 0, // incremented via bindings in add_batch
                 updated_at_unix_ms: pred_data.updated_at_unix_ms,
             };
@@ -1179,7 +1226,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         )
     }
 
-    fn log_ignored_shard_filename(path: &Path, reason: &str) {
+    const fn log_ignored_shard_filename(path: &Path, reason: &str) {
         #[cfg(feature = "observability")]
         tracing::warn!(
             "Ignoring malformed shard filename '{}': {}",
@@ -1394,6 +1441,14 @@ impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionDispatch<I> for Subscript
 impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionPruning<I> for SubscriptionEngine<D, I> {
     fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport {
         Self::unregister_session(self, session_id)
+    }
+}
+
+impl<D: Dialect + Send + Sync, I: IdTypes> crate::AggregateDispatch<I>
+    for SubscriptionEngine<D, I>
+{
+    fn count_deltas(&mut self, event: &WalEvent) -> Result<Vec<(I::UserId, i64)>, DispatchError> {
+        Self::count_deltas(self, event)
     }
 }
 
@@ -2924,6 +2979,7 @@ mod tests {
                 prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
                     .unwrap(),
                 dependency_columns: vec![1],
+                projection: QueryProjection::Rows,
                 refcount: 1,
                 updated_at_unix_ms: 1000,
             }],
@@ -2997,6 +3053,7 @@ mod tests {
                     prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
                         .unwrap(),
                     dependency_columns: vec![1],
+                    projection: QueryProjection::Rows,
                     refcount: 1,
                     updated_at_unix_ms: 1000,
                 },
@@ -3007,6 +3064,7 @@ mod tests {
                     prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
                         .unwrap(),
                     dependency_columns: vec![2],
+                    projection: QueryProjection::Rows,
                     refcount: 1,
                     updated_at_unix_ms: 2000,
                 },
@@ -3695,6 +3753,7 @@ mod tests {
                 prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
                     .unwrap(),
                 dependency_columns: program.dependency_columns.clone(),
+                projection: QueryProjection::Rows,
                 refcount: 1,
                 updated_at_unix_ms: 2,
             }],
@@ -3775,6 +3834,7 @@ mod tests {
                 prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
                     .unwrap(),
                 dependency_columns: program.dependency_columns.clone(),
+                projection: QueryProjection::Rows,
                 refcount: 1,
                 updated_at_unix_ms: 2,
             }],
@@ -3852,6 +3912,7 @@ mod tests {
                 prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
                     .unwrap(),
                 dependency_columns: program.dependency_columns.clone(),
+                projection: QueryProjection::Rows,
                 refcount: 1,
                 updated_at_unix_ms: 1,
             }],
@@ -4013,5 +4074,184 @@ mod tests {
             assert_eq!(engine.subscription_count(), 0);
         }
         // Err(_) case: expected — corrupt shard returns an error
+    }
+
+    // --- Aggregate-specific engine tests ---
+
+    fn make_wal_event(
+        kind: EventKind,
+        old_amount: Option<i64>,
+        new_amount: Option<i64>,
+    ) -> WalEvent {
+        WalEvent {
+            kind,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: old_amount.map(|v| RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(v), Cell::String("done".into())]),
+            }),
+            new_row: new_amount.map(|v| RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(v), Cell::String("done".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        }
+    }
+
+    #[test]
+    fn test_count_star_insert_delta() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = make_wal_event(EventKind::Insert, None, Some(20));
+        let deltas = engine.count_deltas(&event).unwrap();
+        assert_eq!(deltas, vec![(42, 1)]);
+    }
+
+    #[test]
+    fn test_count_star_delete_delta() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = make_wal_event(EventKind::Delete, Some(20), None);
+        let deltas = engine.count_deltas(&event).unwrap();
+        assert_eq!(deltas, vec![(42, -1)]);
+    }
+
+    #[test]
+    fn test_count_star_truncate_error() {
+        use crate::DispatchError;
+
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Truncate,
+            table_id: 1,
+            pk: PrimaryKey::empty(),
+            old_row: None,
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+        let err = engine
+            .count_deltas(&event)
+            .expect_err("TRUNCATE must return error");
+        assert!(matches!(err, DispatchError::TruncateRequiresReset(1)));
+    }
+
+    #[test]
+    fn test_same_where_different_projection_yields_two_predicates() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Same WHERE clause, but different projections
+        let r1 = engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 1,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let r2 = engine
+            .register(SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 2,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        // Both should be new (separate predicates), hash must differ
+        assert!(r1.created_new_predicate, "SELECT * predicate should be new");
+        assert!(r2.created_new_predicate, "COUNT(*) predicate should be new");
+        assert_ne!(
+            r1.predicate_hash, r2.predicate_hash,
+            "SELECT * and SELECT COUNT(*) with same WHERE must have different predicate hashes"
+        );
+        assert_eq!(r1.projection, crate::QueryProjection::Rows);
+        assert_eq!(
+            r2.projection,
+            crate::QueryProjection::Aggregate(crate::AggSpec::CountStar)
+        );
+    }
+
+    #[test]
+    fn test_users_dispatch_skips_count_subscriptions() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // User 1: SELECT * subscription
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 1,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        // User 2: SELECT COUNT(*) subscription
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 2,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = make_wal_event(EventKind::Insert, None, Some(20));
+        let mut users: Vec<_> = engine.users(&event).unwrap().collect();
+        users.sort_unstable();
+
+        // Only user 1 (Rows) should appear; user 2 (COUNT) must not
+        assert_eq!(
+            users,
+            vec![1u64],
+            "COUNT subscribers must not appear in users() dispatch"
+        );
     }
 }
