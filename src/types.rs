@@ -298,6 +298,8 @@ pub struct RegisterResult {
     pub predicate_hash: u128,
     /// True if a new predicate was created, false if reused existing
     pub created_new_predicate: bool,
+    /// Projection kind for this subscription
+    pub projection: crate::compiler::sql_shape::QueryProjection,
 }
 
 /// Durability policy for registration writes when storage is enabled.
@@ -414,6 +416,35 @@ pub trait SubscriptionPruning<I: IdTypes>: Send {
 pub trait DurableShardStore: Send {
     /// Snapshot a table partition to durable storage.
     fn snapshot_table(&self, table_id: TableId) -> Result<(), crate::StorageError>;
+}
+
+/// Aggregate dispatch — delivers signed count deltas for COUNT(*) subscriptions.
+///
+/// Separate from [`SubscriptionDispatch`] because:
+/// - UPDATE events require evaluating **both** the old row and the new row.
+/// - Returns signed deltas, not user bitmaps.
+/// - COUNT predicates are **never** included in `users()` results.
+///
+/// # Caller contract
+///
+/// The engine handles only WAL-driven deltas. Callers must:
+/// 1. **Bootstrap** — query the DB for the initial count **before** subscribing.
+/// 2. **Accumulate** — `running_count += delta` on each call.
+/// 3. **Reset on policy change** — RLS/ACL changes produce no WAL events;
+///    re-query the DB and replace the stored count.
+/// 4. **Reset on TRUNCATE** — engine returns `Err(TruncateRequiresReset)`;
+///    caller must re-query and replace the stored count.
+pub trait AggregateDispatch<I: IdTypes>: Send {
+    /// Compute signed count deltas for all matching COUNT(*) subscriptions.
+    ///
+    /// Returns `Vec<(UserId, delta)>` where `delta` is the signed change
+    /// in the matching row count for that user's subscription.
+    /// Zero-net entries (e.g. UPDATE where both old and new rows match) are
+    /// omitted.
+    fn count_deltas(
+        &mut self,
+        event: &WalEvent,
+    ) -> Result<Vec<(I::UserId, i64)>, crate::DispatchError>;
 }
 
 /// Background merge operations

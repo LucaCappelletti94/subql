@@ -5,7 +5,9 @@ use super::{
     indexes::{HybridIndexes, IndexableAtom, IndexableCell},
     predicate::{Binding, Predicate, PredicateStore},
 };
-use crate::{ColumnId, EventKind, IdTypes, RowImage, TableId};
+use crate::{
+    compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, RowImage, TableId,
+};
 use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
 use std::sync::Arc;
@@ -72,12 +74,13 @@ impl<I: IdTypes> TablePartition<I> {
         atoms: Vec<IndexableAtom>,
     ) -> PredicateId {
         let deps = predicate.dependency_columns.to_vec();
+        let is_agg = matches!(predicate.projection, QueryProjection::Aggregate(_));
 
         // COW: clone-on-write if snapshot still shares this Arc
         let pred_id = Arc::make_mut(&mut self.mutable_predicates).add_predicate(predicate);
 
         // Incrementally update indexes
-        self.rebuild_indexes(&atoms, pred_id, &deps);
+        self.rebuild_indexes(&atoms, pred_id, &deps, is_agg);
 
         pred_id
     }
@@ -155,10 +158,16 @@ impl<I: IdTypes> TablePartition<I> {
     }
 
     /// Incrementally update indexes for a single newly added predicate.
-    fn rebuild_indexes(&self, atoms: &[IndexableAtom], pred_id: PredicateId, deps: &[ColumnId]) {
+    fn rebuild_indexes(
+        &self,
+        atoms: &[IndexableAtom],
+        pred_id: PredicateId,
+        deps: &[ColumnId],
+        is_agg: bool,
+    ) {
         let current = self.load_snapshot();
         let mut new_indexes = current.indexes.clone();
-        new_indexes.add_predicate(pred_id, atoms, deps);
+        new_indexes.add_predicate(pred_id, atoms, deps, is_agg);
 
         let new_snapshot = TablePartitionSnapshot {
             table_id: self.table_id,
@@ -174,10 +183,12 @@ impl<I: IdTypes> TablePartition<I> {
         let mut new_indexes = HybridIndexes::new();
 
         for (idx, pred) in &self.mutable_predicates.predicates {
+            let is_agg = matches!(pred.projection, QueryProjection::Aggregate(_));
             new_indexes.add_predicate(
                 PredicateId::from_slab_index(idx),
                 &pred.index_atoms,
                 &pred.dependency_columns,
+                is_agg,
             );
         }
 
@@ -282,8 +293,9 @@ impl<I: IdTypes> TablePartition<I> {
         let store = Arc::make_mut(&mut self.mutable_predicates);
 
         for (predicate, atoms, bindings) in entries {
+            let is_agg = matches!(predicate.projection, QueryProjection::Aggregate(_));
             let pred_id = store.add_predicate(Predicate::clone(predicate));
-            new_indexes.add_predicate(pred_id, atoms, &predicate.dependency_columns);
+            new_indexes.add_predicate(pred_id, atoms, &predicate.dependency_columns, is_agg);
 
             for binding in bindings {
                 let mut b = *binding;
@@ -301,6 +313,19 @@ impl<I: IdTypes> TablePartition<I> {
         };
 
         self.snapshot.store(Arc::new(new_snapshot));
+    }
+
+    /// Select candidate agg predicates for an event.
+    ///
+    /// Delegates to `HybridIndexes::select_agg_candidates`.
+    #[must_use]
+    pub fn select_agg_candidates(
+        &self,
+        kind: EventKind,
+        changed_cols: &[ColumnId],
+    ) -> roaring::RoaringBitmap {
+        let snapshot = self.load_snapshot();
+        snapshot.indexes.select_agg_candidates(kind, changed_cols)
     }
 
     /// Get table ID
@@ -325,6 +350,7 @@ mod tests {
     }
 
     fn make_predicate_on_col(id: usize, hash: u128, col: ColumnId) -> Predicate {
+        use crate::compiler::sql_shape::QueryProjection;
         Predicate {
             id: PredicateId::from_slab_index(id),
             hash,
@@ -333,6 +359,7 @@ mod tests {
             dependency_columns: Arc::from([col]),
             index_atoms: Arc::from([IndexableAtom::Fallback]),
             prefilter_plan: Arc::new(PrefilterPlan::default()),
+            projection: QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 0,
         }

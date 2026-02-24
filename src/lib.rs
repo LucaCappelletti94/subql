@@ -3,8 +3,9 @@
 // Lint configuration is in [lints] section of Cargo.toml
 
 // Re-export public API
+pub use compiler::{AggSpec, QueryProjection};
 pub use errors::*;
-pub use runtime::{MatchedUsers, SubscriptionEngine};
+pub use runtime::{AggKernel, CountKernel, MatchedUsers, SubscriptionEngine};
 pub use types::*;
 pub use wal::{
     DebeziumParser, MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Parser,

@@ -140,6 +140,20 @@ pub struct HybridIndexes {
 
     /// Predicates with no dependency columns (must always be considered for UPDATEs)
     pub dependency_free: RoaringBitmap,
+
+    // -----------------------------------------------------------------------
+    // Aggregate (COUNT/SUM/…) predicate indexes — parallel to row indexes.
+    // Kept separate so `select_candidates` never returns agg predicates and
+    // `select_agg_candidates` never returns row predicates.
+    // -----------------------------------------------------------------------
+    /// Aggregate predicates (all of them, for INSERT/DELETE dispatch)
+    pub agg_fallback: RoaringBitmap,
+
+    /// col → aggregate predicates referencing that column (UPDATE optimization)
+    pub agg_dependency: AHashMap<ColumnId, RoaringBitmap>,
+
+    /// Aggregate predicates with no dependency columns (always re-evaluated)
+    pub agg_dependency_free: RoaringBitmap,
 }
 
 impl HybridIndexes {
@@ -153,17 +167,41 @@ impl HybridIndexes {
             fallback: RoaringBitmap::new(),
             dependency: AHashMap::new(),
             dependency_free: RoaringBitmap::new(),
+            agg_fallback: RoaringBitmap::new(),
+            agg_dependency: AHashMap::new(),
+            agg_dependency_free: RoaringBitmap::new(),
         }
     }
 
-    /// Add predicate to indexes based on indexable atoms
+    /// Add predicate to indexes based on indexable atoms.
+    ///
+    /// When `is_agg` is `true`, the predicate is routed into the parallel agg
+    /// bitmaps and does **not** appear in row-dispatch bitmaps.
     pub fn add_predicate(
         &mut self,
         pred_id: PredicateId,
         atoms: &[IndexableAtom],
         deps: &[ColumnId],
+        is_agg: bool,
     ) {
         let pred_id_u32 = pred_id.as_u32();
+
+        if is_agg {
+            // Aggregate predicates live in the parallel agg bitmaps.
+            if deps.is_empty() {
+                self.agg_dependency_free.insert(pred_id_u32);
+            } else {
+                for &col_id in deps {
+                    self.agg_dependency
+                        .entry(col_id)
+                        .or_default()
+                        .insert(pred_id_u32);
+                }
+            }
+            // All agg predicates go in agg_fallback so INSERT/DELETE picks them up.
+            self.agg_fallback.insert(pred_id_u32);
+            return;
+        }
 
         // Track dependencies (dependency-free predicates must always be
         // evaluated for UPDATE events because they do not depend on changed
@@ -228,6 +266,31 @@ impl HybridIndexes {
                 }
             }
         }
+    }
+
+    /// Select candidate agg predicates for a row/event.
+    ///
+    /// For UPDATE events with non-empty `changed_cols`: returns the union of
+    /// `agg_dependency_free` and agg predicates depending on changed columns.
+    ///
+    /// For INSERT/DELETE (or UPDATE with empty changed_cols): returns all agg
+    /// predicates (`agg_fallback`).
+    #[must_use]
+    pub fn select_agg_candidates(
+        &self,
+        kind: crate::EventKind,
+        changed_cols: &[ColumnId],
+    ) -> RoaringBitmap {
+        if kind == crate::EventKind::Update && !changed_cols.is_empty() {
+            let mut candidates = self.agg_dependency_free.clone();
+            for &col in changed_cols {
+                if let Some(deps) = self.agg_dependency.get(&col) {
+                    candidates |= deps;
+                }
+            }
+            return candidates;
+        }
+        self.agg_fallback.clone()
     }
 
     /// Query equality index
@@ -566,7 +629,7 @@ mod tests {
             value: IndexableCell::Int(42),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[5]);
+        indexes.add_predicate(pred_id, &atoms, &[5], false);
 
         let result = indexes.query_equality(5, &IndexableCell::Int(42));
         assert!(result.is_some());
@@ -588,6 +651,7 @@ mod tests {
                 value: IndexableCell::Int(42),
             }],
             &[5],
+            false,
         );
 
         let pred_b = PredicateId::from_slab_index(1);
@@ -598,6 +662,7 @@ mod tests {
                 value: IndexableCell::Int(42),
             }],
             &[6],
+            false,
         );
 
         let hit_col_5 = indexes.query_equality(5, &IndexableCell::Int(42)).unwrap();
@@ -625,7 +690,7 @@ mod tests {
             upper: Some(20),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3]);
+        indexes.add_predicate(pred_id, &atoms, &[3], false);
 
         // Value in range
         let result = indexes.query_range(3, &IndexableCell::Int(15));
@@ -646,7 +711,7 @@ mod tests {
             kind: NullKind::IsNull,
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[7]);
+        indexes.add_predicate(pred_id, &atoms, &[7], false);
 
         let bitmap = indexes.null_checks.get(&(7, NullKind::IsNull));
         assert!(bitmap.is_some());
@@ -660,7 +725,7 @@ mod tests {
         let pred_id = PredicateId::from_slab_index(0);
         let atoms = vec![IndexableAtom::Fallback];
 
-        indexes.add_predicate(pred_id, &atoms, &[]);
+        indexes.add_predicate(pred_id, &atoms, &[], false);
 
         assert!(indexes.fallback.contains(pred_id.as_u32()));
     }
@@ -672,7 +737,7 @@ mod tests {
         let pred_id = PredicateId::from_slab_index(0);
         let atoms = vec![IndexableAtom::Fallback];
 
-        indexes.add_predicate(pred_id, &atoms, &[1, 2, 5]);
+        indexes.add_predicate(pred_id, &atoms, &[1, 2, 5], false);
 
         assert!(indexes
             .dependency
@@ -695,7 +760,7 @@ mod tests {
     fn test_dependency_free_tracking() {
         let mut indexes = HybridIndexes::new();
         let pred_id = PredicateId::from_slab_index(0);
-        indexes.add_predicate(pred_id, &[IndexableAtom::Fallback], &[]);
+        indexes.add_predicate(pred_id, &[IndexableAtom::Fallback], &[], false);
 
         assert!(indexes.dependency_free.contains(pred_id.as_u32()));
         assert!(indexes.dependency.is_empty());
@@ -707,7 +772,7 @@ mod tests {
 
         let pred_id = PredicateId::from_slab_index(0);
 
-        indexes.add_predicate(pred_id, &[], &[]);
+        indexes.add_predicate(pred_id, &[], &[], false);
 
         assert!(!indexes.fallback.contains(pred_id.as_u32()));
     }
@@ -891,7 +956,7 @@ mod tests {
             upper: Some(20),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3]);
+        indexes.add_predicate(pred_id, &atoms, &[3], false);
 
         // Query with float value (gets converted to int for range)
         let result = indexes.query_range(3, &IndexableCell::Float(15.5f64.to_bits()));
@@ -909,7 +974,7 @@ mod tests {
             upper: Some(20),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3]);
+        indexes.add_predicate(pred_id, &atoms, &[3], false);
 
         // Query with string value (doesn't match range, returns empty)
         let result = indexes.query_range(3, &IndexableCell::String("test".into()));
@@ -927,7 +992,7 @@ mod tests {
             upper: Some(20),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3]);
+        indexes.add_predicate(pred_id, &atoms, &[3], false);
 
         // Value below upper bound
         let result = indexes.query_range(3, &IndexableCell::Int(10));
@@ -949,7 +1014,7 @@ mod tests {
             upper: None, // Unbounded upper
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3]);
+        indexes.add_predicate(pred_id, &atoms, &[3], false);
 
         // Value above lower bound
         let result = indexes.query_range(3, &IndexableCell::Int(15));
@@ -971,7 +1036,7 @@ mod tests {
             upper: None, // Fully unbounded
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3]);
+        indexes.add_predicate(pred_id, &atoms, &[3], false);
 
         // Any value should match
         let result = indexes.query_range(3, &IndexableCell::Int(100));
@@ -995,6 +1060,7 @@ mod tests {
                 value: IndexableCell::Bool(true),
             }],
             &[1],
+            false,
         );
 
         // Add equality for String
@@ -1006,6 +1072,7 @@ mod tests {
                 value: IndexableCell::String("test".into()),
             }],
             &[2],
+            false,
         );
 
         // Query bool
@@ -1027,7 +1094,7 @@ mod tests {
             kind: NullKind::IsNotNull,
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[5]);
+        indexes.add_predicate(pred_id, &atoms, &[5], false);
 
         let bitmap = indexes.null_checks.get(&(5, NullKind::IsNotNull));
         assert!(bitmap.is_some());
@@ -1218,6 +1285,7 @@ mod tests {
                 upper: Some(100),
             }],
             &[1],
+            false,
         );
 
         // Bounded lower (should come last)
@@ -1229,6 +1297,7 @@ mod tests {
                 upper: Some(200),
             }],
             &[1],
+            false,
         );
 
         // Another unbounded lower (None,None case)
@@ -1240,6 +1309,7 @@ mod tests {
                 upper: None,
             }],
             &[1],
+            false,
         );
 
         indexes.finalize_ranges();

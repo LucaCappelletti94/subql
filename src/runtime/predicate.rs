@@ -3,7 +3,7 @@
 use super::ids::{PredicateHash, PredicateId, UserOrdinal};
 use super::indexes::IndexableAtom;
 use crate::{
-    compiler::{BytecodeProgram, PrefilterPlan},
+    compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
     ColumnId, IdTypes,
 };
 use ahash::AHashMap;
@@ -28,6 +28,8 @@ pub struct Predicate {
     pub index_atoms: Arc<[IndexableAtom]>,
     /// Planner metadata used for OR/NOT-aware candidate pruning.
     pub prefilter_plan: Arc<PrefilterPlan>,
+    /// Projection kind: row events or aggregate deltas.
+    pub projection: QueryProjection,
     /// Reference count (number of subscriptions using this predicate)
     pub refcount: u32,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
@@ -295,6 +297,7 @@ mod tests {
             dependency_columns: Arc::from([]),
             index_atoms: Arc::from([IndexableAtom::Fallback]),
             prefilter_plan: Arc::new(PrefilterPlan::default()),
+            projection: QueryProjection::Rows,
             refcount,
             updated_at_unix_ms: 0,
         }

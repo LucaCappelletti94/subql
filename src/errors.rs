@@ -77,6 +77,13 @@ pub enum DispatchError {
     /// VM evaluation error
     #[error("VM evaluation error: {0}")]
     VmError(String),
+
+    /// TRUNCATE received while aggregate subscriptions are active.
+    ///
+    /// The engine cannot compute count deltas for TRUNCATE (no row images).
+    /// Caller must re-query the database to obtain the correct count.
+    #[error("TRUNCATE on table {0} requires aggregate count reset — re-query the database")]
+    TruncateRequiresReset(crate::TableId),
 }
 
 /// Errors during persistence operations
