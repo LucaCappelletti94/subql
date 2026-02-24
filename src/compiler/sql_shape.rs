@@ -1,5 +1,138 @@
 use crate::RegisterError;
-use sqlparser::ast::{Expr, ObjectName, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{
+    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+    SelectItem, SetExpr, Statement, TableFactor,
+};
+
+/// Projection kind for a subscription SQL statement.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum QueryProjection {
+    /// `SELECT *` — deliver row events (default, current behaviour).
+    Rows,
+    /// `SELECT <aggregate>` — deliver signed count deltas.
+    Aggregate(AggSpec),
+}
+
+/// Aggregate function specification.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AggSpec {
+    /// `SELECT COUNT(*)`
+    CountStar,
+    // Future: Sum { column: ColumnId }, Min { column: ColumnId }, …
+}
+
+/// Extract the `QueryProjection` from a parsed SELECT statement.
+///
+/// Accepts:
+/// - `SELECT *`                         → `QueryProjection::Rows`
+/// - `SELECT COUNT(*) [AS alias]`       → `QueryProjection::Aggregate(AggSpec::CountStar)`
+///
+/// Returns `Err(UnsupportedSql)` for any other projection.
+pub(super) fn extract_projection(stmt: &Statement) -> Result<QueryProjection, RegisterError> {
+    let select = match stmt {
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Select(s) => s,
+            _ => {
+                return Ok(QueryProjection::Rows);
+            }
+        },
+        _ => return Ok(QueryProjection::Rows),
+    };
+
+    let items = &select.projection;
+
+    // SELECT * — single wildcard item
+    if items.len() == 1 {
+        if let SelectItem::Wildcard(_) = &items[0] {
+            return Ok(QueryProjection::Rows);
+        }
+    }
+
+    // Single expression (with or without alias)
+    if items.len() == 1 {
+        let expr = match &items[0] {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            SelectItem::QualifiedWildcard(_, _) => {
+                return Err(RegisterError::UnsupportedSql(
+                    "Qualified wildcard (e.g. table.*) not supported in projection".to_string(),
+                ));
+            }
+            SelectItem::Wildcard(_) => unreachable!("handled above"),
+        };
+
+        if let Expr::Function(f) = expr {
+            // Get the (unqualified) function name — last ObjectName part.
+            let func_name = f
+                .name
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| ident.value.to_lowercase());
+
+            match func_name.as_deref() {
+                Some("count") => {
+                    // Must be COUNT(*) — no FILTER, no OVER, no DISTINCT.
+                    if f.filter.is_some() {
+                        return Err(RegisterError::UnsupportedSql(
+                            "COUNT(*) FILTER (WHERE ...) not supported".to_string(),
+                        ));
+                    }
+                    if f.over.is_some() {
+                        return Err(RegisterError::UnsupportedSql(
+                            "Window functions not supported".to_string(),
+                        ));
+                    }
+
+                    match &f.args {
+                        FunctionArguments::List(list) => {
+                            // Reject DISTINCT
+                            if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+                                return Err(RegisterError::UnsupportedSql(
+                                    "COUNT(DISTINCT ...) not supported — only COUNT(*) is"
+                                        .to_string(),
+                                ));
+                            }
+                            // Must be exactly one arg: the wildcard `*`
+                            if list.args.len() == 1
+                                && matches!(
+                                    &list.args[0],
+                                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                                )
+                            {
+                                return Ok(QueryProjection::Aggregate(AggSpec::CountStar));
+                            }
+                            Err(RegisterError::UnsupportedSql(
+                                "Only COUNT(*) is supported, not COUNT(expression)".to_string(),
+                            ))
+                        }
+                        _ => Err(RegisterError::UnsupportedSql(
+                            "Only COUNT(*) is supported".to_string(),
+                        )),
+                    }
+                }
+                Some(name @ ("sum" | "avg" | "min" | "max")) => {
+                    Err(RegisterError::UnsupportedSql(format!(
+                        "{} aggregate not yet supported — only COUNT(*) is implemented",
+                        name.to_uppercase()
+                    )))
+                }
+                _ => Err(RegisterError::UnsupportedSql(
+                    "Unsupported projection: only SELECT * or SELECT COUNT(*) are supported"
+                        .to_string(),
+                )),
+            }
+        } else {
+            Err(RegisterError::UnsupportedSql(
+                "Unsupported projection: only SELECT * or SELECT COUNT(*) are supported"
+                    .to_string(),
+            ))
+        }
+    } else {
+        Err(RegisterError::UnsupportedSql(
+            "Unsupported projection: only SELECT * or SELECT COUNT(*) are supported".to_string(),
+        ))
+    }
+}
 
 /// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
 pub(super) const MAX_EXPR_DEPTH: usize = 128;

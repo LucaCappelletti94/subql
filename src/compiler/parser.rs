@@ -6,6 +6,7 @@ use super::{
     canonicalize, prefilter::build_prefilter_plan, sql_shape, BytecodeProgram, Instruction,
     PrefilterPlan,
 };
+use crate::compiler::sql_shape::QueryProjection;
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{Cell, RegisterError, SchemaCatalog, TableId};
 use sqlparser::ast::{Expr, ObjectName, Statement};
@@ -60,7 +61,8 @@ pub fn parse_and_compile<D: Dialect>(
     dialect: &D,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(TableId, BytecodeProgram), RegisterError> {
-    let (table_id, program, _normalized) = parse_compile_and_normalize(sql, dialect, catalog)?;
+    let (table_id, program, _normalized, _, _) =
+        parse_compile_normalize_and_prefilter(sql, dialect, catalog)?;
     Ok((table_id, program))
 }
 
@@ -70,18 +72,27 @@ pub fn parse_compile_and_normalize<D: Dialect>(
     dialect: &D,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(TableId, BytecodeProgram, String), RegisterError> {
-    let (table_id, program, normalized, _prefilter_plan) =
+    let (table_id, program, normalized, _, _) =
         parse_compile_normalize_and_prefilter(sql, dialect, catalog)?;
     Ok((table_id, program, normalized))
 }
 
 /// Parse SQL once and produce compiled bytecode, canonical normalized form,
-/// and OR/NOT-aware prefilter plan.
+/// OR/NOT-aware prefilter plan, and projection kind.
 pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     sql: &str,
     dialect: &D,
     catalog: &dyn SchemaCatalog,
-) -> Result<(TableId, BytecodeProgram, String, PrefilterPlan), RegisterError> {
+) -> Result<
+    (
+        TableId,
+        BytecodeProgram,
+        String,
+        PrefilterPlan,
+        QueryProjection,
+    ),
+    RegisterError,
+> {
     if sql.len() > sql_shape::MAX_SQL_LEN {
         return Err(RegisterError::UnsupportedSql(
             "SQL input too long".to_string(),
@@ -106,6 +117,9 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     // Extract SELECT ... FROM table WHERE predicate
     let (table_name, where_clause) = extract_table_and_where(stmt)?;
 
+    // Extract projection (SELECT * vs SELECT COUNT(*))
+    let projection = sql_shape::extract_projection(stmt)?;
+
     // Resolve table ID
     let table_id = resolve_table_id(&table_name, catalog)?;
 
@@ -121,7 +135,7 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
     let prefilter_plan = build_prefilter_plan(where_clause.as_ref(), table_id, catalog);
 
-    Ok((table_id, program, normalized, prefilter_plan))
+    Ok((table_id, program, normalized, prefilter_plan, projection))
 }
 
 fn resolve_table_id(
@@ -1591,5 +1605,91 @@ mod tests {
         let sql = "SELECT * FROM users WHERE email = X'CAFE'";
         let result = parse_and_compile(sql, &dialect, &catalog);
         assert!(result.is_ok());
+    }
+
+    // --- Projection tests ---
+
+    #[test]
+    fn test_projection_count_star() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT COUNT(*) FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(
+            projection,
+            QueryProjection::Aggregate(crate::compiler::sql_shape::AggSpec::CountStar)
+        );
+    }
+
+    #[test]
+    fn test_projection_select_star() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT * FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(projection, QueryProjection::Rows);
+    }
+
+    #[test]
+    fn test_projection_count_star_with_alias() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT COUNT(*) AS total FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(
+            projection,
+            QueryProjection::Aggregate(crate::compiler::sql_shape::AggSpec::CountStar)
+        );
+    }
+
+    #[test]
+    fn test_projection_sum_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT SUM(price) FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_projection_count_distinct_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT COUNT(DISTINCT id) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_projection_count_column_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT COUNT(price) FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql, got: {:?}",
+            result
+        );
     }
 }

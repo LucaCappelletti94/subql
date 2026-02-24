@@ -412,7 +412,7 @@ proptest! {
 
         for pred in &predicates {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
-            let Ok((_table_id, bytecode, _norm, prefilter)) =
+            let Ok((_table_id, bytecode, _norm, prefilter, _projection)) =
                 parse_compile_normalize_and_prefilter(&sql, &dialect, &catalog)
             else {
                 continue; // skip predicates that fail to compile

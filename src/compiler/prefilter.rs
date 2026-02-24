@@ -775,7 +775,7 @@ mod tests {
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
         let sql = "SELECT * FROM orders WHERE amount = 10 OR amount = 20";
-        let (_, _, _, plan) =
+        let (_, _, _, plan, _) =
             parse_compile_normalize_and_prefilter(sql, &dialect, &catalog).unwrap();
 
         assert!(!plan.scan_required);
@@ -787,7 +787,7 @@ mod tests {
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
         let sql = "SELECT * FROM orders WHERE amount = 10 OR status LIKE 'a%'";
-        let (_, _, _, plan) =
+        let (_, _, _, plan, _) =
             parse_compile_normalize_and_prefilter(sql, &dialect, &catalog).unwrap();
 
         assert!(plan.scan_required);
@@ -799,7 +799,7 @@ mod tests {
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
         let sql = "SELECT * FROM orders WHERE amount NOT BETWEEN 10 AND 20";
-        let (_, _, _, plan) =
+        let (_, _, _, plan, _) =
             parse_compile_normalize_and_prefilter(sql, &dialect, &catalog).unwrap();
 
         assert!(!plan.scan_required);
@@ -830,7 +830,7 @@ mod tests {
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
         let sql = "SELECT * FROM orders WHERE amount IN (NULL)";
-        let (_, _, _, plan) =
+        let (_, _, _, plan, _) =
             parse_compile_normalize_and_prefilter(sql, &dialect, &catalog).unwrap();
 
         assert!(!plan.scan_required);

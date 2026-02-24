@@ -4,7 +4,7 @@ pub mod bytecode;
 pub mod canonicalize;
 pub mod parser;
 pub mod prefilter;
-mod sql_shape;
+pub mod sql_shape;
 pub mod tristate;
 pub mod vm;
 
@@ -14,5 +14,6 @@ pub use parser::{
     parse_and_compile, parse_compile_and_normalize, parse_compile_normalize_and_prefilter,
 };
 pub use prefilter::{PlannerAtom, PlannerValue, PrefilterPlan};
+pub use sql_shape::{AggSpec, QueryProjection};
 pub use tristate::Tri;
 pub use vm::{Vm, VmError};
