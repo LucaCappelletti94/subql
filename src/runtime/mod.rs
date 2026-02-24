@@ -8,6 +8,6 @@ pub mod indexes;
 pub mod partition;
 pub mod predicate;
 
-pub use agg::{AggKernel, CountKernel};
+pub use agg::{AggKernel, AvgKernel, CountColumnKernel, CountKernel, SumKernel};
 pub use dispatch::MatchedUsers;
 pub use engine::SubscriptionEngine;

@@ -5,7 +5,7 @@ use crate::{compiler::sql_shape::QueryProjection, IdTypes, SchemaCatalog, Storag
 use serde::{Deserialize, Serialize};
 
 /// Shard format version
-const SHARD_VERSION: u16 = 4;
+const SHARD_VERSION: u16 = 6; // v6: AggSpec::CountColumn, AggSpec::Avg added
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 const MAX_SHARD_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB

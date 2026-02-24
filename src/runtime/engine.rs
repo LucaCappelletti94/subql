@@ -171,12 +171,21 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let (table_id, bytecode, normalized, prefilter_plan, projection) =
             parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog)?;
 
-        // Disambiguate hash: same WHERE clause with different projection kind
-        // (e.g. SELECT * vs SELECT COUNT(*)) must map to distinct predicates.
+        // Disambiguate hash: same WHERE clause with different projection kind must map to
+        // distinct predicates.
         let hash_input = match &projection {
             QueryProjection::Rows => normalized.clone(),
             QueryProjection::Aggregate(AggSpec::CountStar) => {
                 format!("{normalized}\x00COUNT(*)")
+            }
+            QueryProjection::Aggregate(AggSpec::CountColumn { column }) => {
+                format!("{normalized}\x00COUNT({column})")
+            }
+            QueryProjection::Aggregate(AggSpec::Sum { column }) => {
+                format!("{normalized}\x00SUM({column})")
+            }
+            QueryProjection::Aggregate(AggSpec::Avg { column }) => {
+                format!("{normalized}\x00AVG({column})")
             }
         };
         let hash = canonicalize::hash_sql(&hash_input);
@@ -196,13 +205,36 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
     fn make_predicate_from_compiled(compiled: &CompiledSpec<I>) -> (Predicate, Vec<IndexableAtom>) {
         let atoms = Self::index_atoms_from_plan(&compiled.prefilter_plan);
+
+        // For SUM/AVG/COUNT(col) subscriptions, augment dependency_columns with the
+        // aggregate column. This ensures UPDATE events that change only the aggregate column
+        // (not any WHERE column) are still dispatched to the aggregate pipeline.
+        let dependency_columns: Arc<[u16]> = {
+            let mut dep_cols = compiled.bytecode.dependency_columns.clone();
+            let agg_col = match &compiled.projection {
+                QueryProjection::Aggregate(
+                    AggSpec::Sum { column }
+                    | AggSpec::Avg { column }
+                    | AggSpec::CountColumn { column },
+                ) => Some(*column),
+                _ => None,
+            };
+            if let Some(column) = agg_col {
+                if !dep_cols.contains(&column) {
+                    dep_cols.push(column);
+                    dep_cols.sort_unstable();
+                }
+            }
+            Arc::from(dep_cols.as_slice())
+        };
+
         let pred = Predicate {
             // Placeholder; store allocates the authoritative ID.
             id: PredicateId::from_slab_index(0),
             hash: compiled.hash,
             normalized_sql: compiled.normalized.clone().into(),
             bytecode: Arc::new(compiled.bytecode.clone()),
-            dependency_columns: Arc::from(compiled.bytecode.dependency_columns.as_slice()),
+            dependency_columns,
             index_atoms: Arc::from(atoms.as_slice()),
             prefilter_plan: Arc::new(compiled.prefilter_plan.clone()),
             projection: compiled.projection.clone(),
@@ -732,22 +764,23 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         dispatch_users_with_row(event, row, partition, user_dict, &mut self.vm)
     }
 
-    /// Compute signed count deltas for aggregate (COUNT) subscriptions.
+    /// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), …).
     ///
-    /// Returns `Vec<(UserId, delta)>` where `delta` is the net signed change
-    /// in the count for that user's COUNT predicate.
+    /// Returns `Vec<(UserId, AggDelta)>` where each entry is the net signed change
+    /// for that user's aggregate predicate. Zero-net entries are omitted.
+    /// The same user may appear multiple times (once per aggregate kind).
     ///
     /// # Caller contract
-    /// - Bootstrap: query the DB for the initial count **before** subscribing.
-    /// - Accumulate: `running_count += delta` on each call.
+    /// - Bootstrap: query the DB for the initial aggregate **before** subscribing.
+    /// - Accumulate: `running_value += delta` on each call.
     /// - Reset on policy change: RLS/ACL changes produce no WAL events;
-    ///   re-query the DB and replace the stored count.
+    ///   re-query the DB and replace the stored value.
     /// - Reset on TRUNCATE: engine returns `Err(TruncateRequiresReset)`;
     ///   caller must re-query and replace.
-    pub fn count_deltas(
+    pub fn aggregate_deltas(
         &mut self,
         event: &WalEvent,
-    ) -> Result<Vec<(I::UserId, i64)>, DispatchError> {
+    ) -> Result<Vec<(I::UserId, crate::AggDelta)>, DispatchError> {
         let partition = self
             .partitions
             .get(&event.table_id)
@@ -1447,8 +1480,11 @@ impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionPruning<I> for Subscripti
 impl<D: Dialect + Send + Sync, I: IdTypes> crate::AggregateDispatch<I>
     for SubscriptionEngine<D, I>
 {
-    fn count_deltas(&mut self, event: &WalEvent) -> Result<Vec<(I::UserId, i64)>, DispatchError> {
-        Self::count_deltas(self, event)
+    fn aggregate_deltas(
+        &mut self,
+        event: &WalEvent,
+    ) -> Result<Vec<(I::UserId, crate::AggDelta)>, DispatchError> {
+        Self::aggregate_deltas(self, event)
     }
 }
 
@@ -4117,8 +4153,8 @@ mod tests {
             .unwrap();
 
         let event = make_wal_event(EventKind::Insert, None, Some(20));
-        let deltas = engine.count_deltas(&event).unwrap();
-        assert_eq!(deltas, vec![(42, 1)]);
+        let deltas = engine.aggregate_deltas(&event).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Count(1))]);
     }
 
     #[test]
@@ -4138,8 +4174,8 @@ mod tests {
             .unwrap();
 
         let event = make_wal_event(EventKind::Delete, Some(20), None);
-        let deltas = engine.count_deltas(&event).unwrap();
-        assert_eq!(deltas, vec![(42, -1)]);
+        let deltas = engine.aggregate_deltas(&event).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Count(-1))]);
     }
 
     #[test]
@@ -4169,7 +4205,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
         let err = engine
-            .count_deltas(&event)
+            .aggregate_deltas(&event)
             .expect_err("TRUNCATE must return error");
         assert!(matches!(err, DispatchError::TruncateRequiresReset(1)));
     }
@@ -4252,6 +4288,289 @@ mod tests {
             users,
             vec![1u64],
             "COUNT subscribers must not appear in users() dispatch"
+        );
+    }
+
+    // --- SUM engine integration tests ---
+
+    #[test]
+    fn test_sum_column_insert_delta() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(50), Cell::String("active".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = engine.aggregate_deltas(&event).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(50.0))]);
+    }
+
+    #[test]
+    fn test_sum_column_delete_delta() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Delete,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(50), Cell::String("active".into())]),
+            }),
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = engine.aggregate_deltas(&event).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-50.0))]);
+    }
+
+    #[test]
+    fn test_sum_column_update_delta() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(20), Cell::String("active".into())]),
+            }),
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("active".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let deltas = engine.aggregate_deltas(&event).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(10.0))]);
+    }
+
+    #[test]
+    fn test_sum_null_amount_no_delta() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                // WHERE amount > 0 with NULL amount → WHERE doesn't match → no delta
+                sql: "SELECT SUM(amount) FROM orders WHERE amount > 0".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Null, Cell::String("active".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = engine.aggregate_deltas(&event).unwrap();
+        assert!(deltas.is_empty(), "NULL amount should produce no delta");
+    }
+
+    #[test]
+    fn test_sum_and_count_same_where_different_hashes() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let r_count = engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 1,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let r_sum = engine
+            .register(SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 2,
+                session_id: None,
+                sql: "SELECT SUM(amount) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        assert!(r_count.created_new_predicate);
+        assert!(r_sum.created_new_predicate);
+        assert_ne!(
+            r_count.predicate_hash, r_sum.predicate_hash,
+            "COUNT(*) and SUM(amount) with same WHERE must have different hashes"
+        );
+        assert_eq!(
+            r_sum.projection,
+            crate::QueryProjection::Aggregate(crate::AggSpec::Sum { column: 1 })
+        );
+    }
+
+    #[test]
+    fn test_two_sum_columns_different_hashes() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let r1 = engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 1,
+                session_id: None,
+                sql: "SELECT SUM(amount) FROM orders WHERE amount > 0".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let r2 = engine
+            .register(SubscriptionSpec {
+                subscription_id: 2,
+                user_id: 2,
+                session_id: None,
+                sql: "SELECT SUM(id) FROM orders WHERE amount > 0".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        assert!(r1.created_new_predicate);
+        assert!(r2.created_new_predicate);
+        assert_ne!(
+            r1.predicate_hash, r2.predicate_hash,
+            "SUM(amount) and SUM(id) must have different predicate hashes"
+        );
+    }
+
+    #[test]
+    fn test_sum_not_returned_by_users() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // SUM subscriber
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT SUM(amount) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = make_wal_event(EventKind::Insert, None, Some(20));
+        let users: Vec<_> = engine.users(&event).unwrap().collect();
+
+        assert!(
+            !users.contains(&42),
+            "SUM subscriber must not appear in users() dispatch"
+        );
+    }
+
+    #[test]
+    fn test_sum_column_not_in_where_update_triggers() {
+        // SUM(amount) WHERE status = 'active'
+        // UPDATE changes only amount (not status) → delta must still be emitted
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        // UPDATE: status unchanged (still 'active'), only amount changes 20 → 30
+        // changed_columns = [1] (amount column)
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(20), Cell::String("active".into())]),
+            }),
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("active".into())]),
+            }),
+            changed_columns: Arc::from([1u16]), // only amount changed
+        };
+
+        let deltas = engine.aggregate_deltas(&event).unwrap();
+        assert_eq!(
+            deltas,
+            vec![(42, crate::AggDelta::Sum(10.0))],
+            "UPDATE changing only SUM column must still emit delta"
         );
     }
 }

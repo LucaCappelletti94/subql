@@ -6,7 +6,7 @@ use crate::{
         sql_shape::{AggSpec, QueryProjection},
         Tri, Vm,
     },
-    DispatchError, EventKind, IdTypes, RowImage, WalEvent,
+    AggDelta, Cell, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
 };
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
@@ -246,7 +246,7 @@ pub(crate) fn dispatch_users_with_row<'a, I: IdTypes>(
     })
 }
 
-/// Compute signed count deltas for aggregate (COUNT(*)) subscriptions.
+/// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), …).
 ///
 /// Delta normalization per event kind:
 /// - `Insert`   → `[(+1, new_row)]`
@@ -257,12 +257,14 @@ pub(crate) fn dispatch_users_with_row<'a, I: IdTypes>(
 /// For each `(weight, row)` pair the function selects agg candidate
 /// predicates, prefilters, VM-evaluates, and accumulates weight per user.
 /// Zero-net entries are filtered out before returning.
+/// The same user may appear multiple times (once per aggregate kind).
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 pub(crate) fn compute_agg_deltas<I: IdTypes>(
     event: &WalEvent,
     partition: &TablePartition<I>,
     user_dict: &UserDictionary<I>,
     vm: &mut Vm,
-) -> Result<Vec<(I::UserId, i64)>, DispatchError> {
+) -> Result<Vec<(I::UserId, AggDelta)>, DispatchError> {
     use crate::runtime::ids::PredicateId;
 
     if event.kind == EventKind::Truncate {
@@ -270,7 +272,7 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
     }
 
     // Build (weight, row) pairs based on event kind.
-    let deltas: Vec<(i64, &RowImage)> = match event.kind {
+    let weighted_rows: Vec<(i64, &RowImage)> = match event.kind {
         EventKind::Insert => {
             let new_row = event
                 .new_row
@@ -307,8 +309,11 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
         EventKind::Truncate => unreachable!("handled above"),
     };
 
-    // Accumulate weight per user ordinal.
-    let mut user_weights: AHashMap<UserOrdinal, i64> = AHashMap::new();
+    // Separate accumulators for each aggregate kind (avoids mixed-type confusion).
+    let mut count_weights: AHashMap<UserOrdinal, i64> = AHashMap::new();
+    let mut sum_weights: AHashMap<UserOrdinal, f64> = AHashMap::new();
+    // AVG accumulator: (sum_delta, count_delta)
+    let mut avg_accum: AHashMap<UserOrdinal, (f64, i64)> = AHashMap::new();
 
     let snapshot = partition.load_snapshot();
 
@@ -321,7 +326,7 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
     };
     let candidates = partition.select_agg_candidates(event.kind, changed_cols);
 
-    for (weight, row) in deltas {
+    for (weight, row) in weighted_rows {
         for pred_id_u32 in &candidates {
             let Some(pred_id) = PredicateId::try_from_u32(pred_id_u32) else {
                 continue;
@@ -329,12 +334,9 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
 
             if let Some(pred) = snapshot.predicates.get_predicate(pred_id) {
                 // Only process aggregate predicates.
-                if !matches!(
-                    pred.projection,
-                    QueryProjection::Aggregate(AggSpec::CountStar)
-                ) {
+                let QueryProjection::Aggregate(ref spec) = pred.projection else {
                     continue;
-                }
+                };
 
                 // Prefilter check
                 if pred.prefilter_plan.requires_prefilter_eval
@@ -350,9 +352,60 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
 
                 if result == Tri::True {
                     if let Some(bitmap) = snapshot.predicates.predicate_users.get(&pred_id) {
-                        for ord_u32 in bitmap {
-                            let ord = UserOrdinal::new(ord_u32);
-                            *user_weights.entry(ord).or_default() += weight;
+                        match spec {
+                            AggSpec::CountStar => {
+                                for ord_u32 in bitmap {
+                                    let ord = UserOrdinal::new(ord_u32);
+                                    *count_weights.entry(ord).or_default() += weight;
+                                }
+                            }
+                            AggSpec::CountColumn { column } => {
+                                // Only count non-NULL, non-Missing values (SQL semantics).
+                                match row.get(*column) {
+                                    Some(Cell::Null) | None => {}
+                                    Some(_) => {
+                                        for ord_u32 in bitmap {
+                                            let ord = UserOrdinal::new(ord_u32);
+                                            *count_weights.entry(ord).or_default() += weight;
+                                        }
+                                    }
+                                }
+                            }
+                            AggSpec::Sum { column } => {
+                                let v = match row.get(*column) {
+                                    Some(Cell::Int(v)) => (*v as f64) * (weight as f64),
+                                    Some(Cell::Float(v)) => {
+                                        if v.is_finite() {
+                                            v * (weight as f64)
+                                        } else {
+                                            0.0
+                                        }
+                                    }
+                                    _ => 0.0,
+                                };
+                                if v != 0.0 {
+                                    for ord_u32 in bitmap {
+                                        let ord = UserOrdinal::new(ord_u32);
+                                        *sum_weights.entry(ord).or_default() += v;
+                                    }
+                                }
+                            }
+                            AggSpec::Avg { column } => {
+                                let cell_val = match row.get(*column) {
+                                    Some(Cell::Int(v)) => Some(*v as f64),
+                                    Some(Cell::Float(v)) if v.is_finite() => Some(*v),
+                                    _ => None, // NULL, Missing, NaN, Inf → skip
+                                };
+                                if let Some(v) = cell_val {
+                                    let s_contrib = v * weight as f64;
+                                    for ord_u32 in bitmap {
+                                        let ord = UserOrdinal::new(ord_u32);
+                                        let entry = avg_accum.entry(ord).or_default();
+                                        entry.0 += s_contrib;
+                                        entry.1 += weight;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -361,11 +414,32 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
     }
 
     // Translate ordinals to user IDs; filter out zero-net entries.
-    let result = user_weights
+    // Same user may appear multiple times (once per AggDelta variant).
+    let mut result: Vec<(I::UserId, AggDelta)> = Vec::new();
+    for (ord, n) in count_weights.into_iter().filter(|(_, n)| *n != 0) {
+        if let Some(uid) = user_dict.get_user(ord) {
+            result.push((uid, AggDelta::Count(n)));
+        }
+    }
+    for (ord, v) in sum_weights.into_iter().filter(|(_, v)| *v != 0.0) {
+        if let Some(uid) = user_dict.get_user(ord) {
+            result.push((uid, AggDelta::Sum(v)));
+        }
+    }
+    for (ord, (s, c)) in avg_accum
         .into_iter()
-        .filter(|(_, delta)| *delta != 0)
-        .filter_map(|(ord, delta)| user_dict.get_user(ord).map(|uid| (uid, delta)))
-        .collect();
+        .filter(|(_, (s, c))| *s != 0.0 || *c != 0)
+    {
+        if let Some(uid) = user_dict.get_user(ord) {
+            result.push((
+                uid,
+                AggDelta::Avg {
+                    sum_delta: s,
+                    count_delta: c,
+                },
+            ));
+        }
+    }
 
     Ok(result)
 }
@@ -852,7 +926,7 @@ mod tests {
         let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
         assert_eq!(
             deltas,
-            vec![(42, 1)],
+            vec![(42, crate::AggDelta::Count(1))],
             "INSERT matching predicate should yield delta +1"
         );
     }
@@ -913,7 +987,7 @@ mod tests {
         let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
         assert_eq!(
             deltas,
-            vec![(42, -1)],
+            vec![(42, crate::AggDelta::Count(-1))],
             "DELETE of matching row should yield delta -1"
         );
     }
@@ -944,7 +1018,7 @@ mod tests {
         let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
         assert_eq!(
             deltas,
-            vec![(42, -1)],
+            vec![(42, crate::AggDelta::Count(-1))],
             "UPDATE leaving predicate should yield delta -1"
         );
     }
@@ -975,7 +1049,7 @@ mod tests {
         let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
         assert_eq!(
             deltas,
-            vec![(42, 1)],
+            vec![(42, crate::AggDelta::Count(1))],
             "UPDATE entering predicate should yield delta +1"
         );
     }
@@ -1008,6 +1082,343 @@ mod tests {
             deltas.is_empty(),
             "UPDATE where both old and new match should yield zero net delta (no entry)"
         );
+    }
+
+    // --- SUM aggregate dispatch tests ---
+
+    /// Helper: create a SUM predicate (WHERE amount > 10, SUM on column 1) and bind user.
+    fn make_sum_pred_and_binding(
+        pred_slab: usize,
+        sub_id: u64,
+        user_id: u64,
+        sum_col: u16,
+        partition: &mut super::super::partition::TablePartition<DefaultIds>,
+        user_dict: &mut UserDictionary<DefaultIds>,
+    ) -> super::super::ids::PredicateId {
+        use super::super::indexes::IndexableAtom;
+        use super::super::predicate::{Binding, Predicate};
+        use crate::compiler::sql_shape::{AggSpec, QueryProjection};
+        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
+
+        // WHERE amount > 10 (column 1), SUM on sum_col
+        let pred = Predicate {
+            id: super::super::ids::PredicateId::from_slab_index(pred_slab),
+            hash: 0xDDDD + pred_slab as u128,
+            normalized_sql: "amount > 10".into(),
+            bytecode: Arc::new(BytecodeProgram::new(vec![
+                Instruction::LoadColumn(1),
+                Instruction::PushLiteral(crate::Cell::Int(10)),
+                Instruction::GreaterThan,
+            ])),
+            dependency_columns: Arc::from([1u16, sum_col]),
+            projection: QueryProjection::Aggregate(AggSpec::Sum { column: sum_col }),
+            index_atoms: Arc::from([IndexableAtom::Fallback]),
+            prefilter_plan: Arc::new(PrefilterPlan::default()),
+            refcount: 1,
+            updated_at_unix_ms: 1000,
+        };
+        let pred_id = pred.id;
+        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
+
+        let ord = user_dict.get_or_create(user_id);
+        partition.add_binding(
+            Binding {
+                subscription_id: sub_id,
+                predicate_id: pred_id,
+                user_id,
+                user_ordinal: ord,
+                session_id: None,
+                updated_at_unix_ms: 1000,
+            },
+            pred_id,
+        );
+        pred_id
+    }
+
+    /// Helper: row with cells [id=1, amount=value]
+    fn make_sum_row(amount: crate::Cell) -> crate::RowImage {
+        crate::RowImage {
+            cells: Arc::from([crate::Cell::Int(1), amount]),
+        }
+    }
+
+    #[test]
+    fn test_sum_insert_matching_gives_value_delta() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(make_sum_row(crate::Cell::Int(20))), // 20 > 10 → matches
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
+    }
+
+    #[test]
+    fn test_sum_insert_non_matching_no_delta() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(make_sum_row(crate::Cell::Int(5))), // 5 ≤ 10 → no match
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert!(deltas.is_empty());
+    }
+
+    #[test]
+    fn test_sum_delete_matching_gives_neg_delta() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Delete,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_sum_row(crate::Cell::Int(20))),
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-20.0))]);
+    }
+
+    #[test]
+    fn test_sum_update_both_match_value_change() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_sum_row(crate::Cell::Int(15))), // matches, contributes -15
+            new_row: Some(make_sum_row(crate::Cell::Int(25))), // matches, contributes +25
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(10.0))]);
+    }
+
+    #[test]
+    fn test_sum_update_same_value_zero_net() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_sum_row(crate::Cell::Int(20))),
+            new_row: Some(make_sum_row(crate::Cell::Int(20))),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert!(
+            deltas.is_empty(),
+            "zero net SUM delta should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_sum_update_old_match_new_no_match() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_sum_row(crate::Cell::Int(20))), // matches → -20
+            new_row: Some(make_sum_row(crate::Cell::Int(5))),  // no match → 0
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-20.0))]);
+    }
+
+    #[test]
+    fn test_sum_update_old_no_match_new_match() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(make_sum_row(crate::Cell::Int(5))), // no match
+            new_row: Some(make_sum_row(crate::Cell::Int(20))), // matches → +20
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
+    }
+
+    #[test]
+    fn test_sum_null_cell_gives_no_delta() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        // WHERE amount > 10 won't match NULL, so no delta
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(make_sum_row(crate::Cell::Null)),
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert!(deltas.is_empty());
+    }
+
+    #[test]
+    fn test_sum_missing_cell_gives_no_delta() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        // Row too short — column 1 (amount) is missing
+        // WHERE amount > 10 evaluates to Unknown → no match
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(crate::RowImage {
+                cells: Arc::from([crate::Cell::Int(1)]), // only col 0, col 1 missing
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert!(deltas.is_empty());
+    }
+
+    #[test]
+    fn test_sum_float_cell_value() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(make_sum_row(crate::Cell::Float(2.5))),
+            changed_columns: Arc::from([]),
+        };
+
+        // WHERE amount > 10 won't match 2.5, so no delta
+        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        assert!(deltas.is_empty(), "2.5 ≤ 10, so WHERE does not match");
     }
 
     #[test]
