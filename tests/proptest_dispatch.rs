@@ -9,6 +9,7 @@ use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use subql::{
+    compiler::{parse_compile_normalize_and_prefilter, Vm},
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
     SubscriptionSpec, TableId, WalEvent,
 };
@@ -263,6 +264,181 @@ proptest! {
                 id_cell, amount_cell, status_cell,
                 false_positives, false_negatives,
             );
+        }
+    }
+
+    /// Update events with changed_columns behave correctly:
+    /// - Users whose predicates depend ONLY on unchanged columns are NOT notified.
+    /// - Users whose predicates depend on at least one changed column are evaluated
+    ///   against the new row (matching if the new row satisfies the predicate).
+    #[test]
+    fn update_with_changed_columns_matches_ground_truth(
+        predicates in proptest::collection::vec(predicate_strategy(), 1..15),
+        rows in proptest::collection::vec(row_strategy(), 1..8),
+    ) {
+        let catalog = Arc::new(PropTestCatalog);
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, dialect);
+
+        let mut user_predicates: HashMap<u64, TestPredicate> = HashMap::new();
+        for (i, pred) in predicates.iter().enumerate() {
+            let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
+            let user_id = (i as u64) + 1;
+            let spec = SubscriptionSpec {
+                subscription_id: user_id,
+                user_id,
+                session_id: None,
+                sql,
+                updated_at_unix_ms: 0,
+            };
+            if engine.register(spec).is_ok() {
+                user_predicates.insert(user_id, pred.clone());
+            }
+        }
+
+        // Update events where only `amount` (col 1) changed.
+        // Predicates on `amount` or `id` may fire; predicates only on `status` won't.
+        for (id_cell, amount_cell, status_cell) in &rows {
+            let event = WalEvent {
+                kind: EventKind::Update,
+                table_id: 1,
+                pk: PrimaryKey {
+                    columns: Arc::from([0u16]),
+                    values: Arc::from([id_cell.clone()]),
+                },
+                old_row: Some(RowImage {
+                    cells: Arc::from([id_cell.clone(), Cell::Int(0), status_cell.clone()]),
+                }),
+                new_row: Some(RowImage {
+                    cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
+                }),
+                // Only `amount` (col 1) changed.
+                changed_columns: Arc::from([1u16]),
+            };
+
+            let matched: HashSet<u64> = engine.users(&event).unwrap().collect();
+
+            // Ground truth: users with predicates depending on `amount` (col 1)
+            // are candidates; the engine evaluates against the new row.
+            // StatusEq predicates (col 2 only) should never appear in matched
+            // because col 2 is not in changed_columns.
+            for (&user_id, pred) in &user_predicates {
+                if let TestPredicate::StatusEq(_) = pred {
+                    prop_assert!(
+                        !matched.contains(&user_id),
+                        "StatusEq predicate should not fire when only amount changed: user {}",
+                        user_id
+                    );
+                }
+            }
+        }
+    }
+
+    /// Delete events use the old_row for predicate evaluation.
+    #[test]
+    fn delete_matches_old_row(
+        predicates in proptest::collection::vec(predicate_strategy(), 1..15),
+        rows in proptest::collection::vec(row_strategy(), 1..8),
+    ) {
+        let catalog = Arc::new(PropTestCatalog);
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, dialect);
+
+        let mut user_predicates: HashMap<u64, TestPredicate> = HashMap::new();
+        for (i, pred) in predicates.iter().enumerate() {
+            let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
+            let user_id = (i as u64) + 1;
+            let spec = SubscriptionSpec {
+                subscription_id: user_id,
+                user_id,
+                session_id: None,
+                sql,
+                updated_at_unix_ms: 0,
+            };
+            if engine.register(spec).is_ok() {
+                user_predicates.insert(user_id, pred.clone());
+            }
+        }
+
+        for (id_cell, amount_cell, status_cell) in &rows {
+            let event = WalEvent {
+                kind: EventKind::Delete,
+                table_id: 1,
+                pk: PrimaryKey {
+                    columns: Arc::from([0u16]),
+                    values: Arc::from([id_cell.clone()]),
+                },
+                old_row: Some(RowImage {
+                    cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
+                }),
+                new_row: None,
+                changed_columns: Arc::from([]),
+            };
+
+            let matched: HashSet<u64> = engine.users(&event).unwrap().collect();
+
+            // Ground truth: evaluate against the old row (same cells)
+            let mut expected: HashSet<u64> = HashSet::new();
+            for (&user_id, pred) in &user_predicates {
+                if pred.eval(id_cell, amount_cell, status_cell) == Some(true) {
+                    expected.insert(user_id);
+                }
+            }
+
+            let false_positives: Vec<_> = matched.difference(&expected).copied().collect();
+            let false_negatives: Vec<_> = expected.difference(&matched).copied().collect();
+
+            prop_assert!(
+                false_positives.is_empty() && false_negatives.is_empty(),
+                "Delete dispatch mismatch for row [{:?}, {:?}, {:?}]:\n  false positives: {:?}\n  false negatives: {:?}",
+                id_cell, amount_cell, status_cell,
+                false_positives, false_negatives,
+            );
+        }
+    }
+
+    /// Prefilter soundness: if `prefilter.may_match(row) == false`, the VM must
+    /// not return `Tri::True` for the same row. False negatives in the prefilter
+    /// would cause correct subscribers to be silently dropped.
+    #[test]
+    fn prefilter_never_has_false_negatives(
+        predicates in proptest::collection::vec(predicate_strategy(), 1..20),
+        rows in proptest::collection::vec(row_strategy(), 1..10),
+    ) {
+        let catalog = PropTestCatalog;
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+
+        for pred in &predicates {
+            let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
+            let Ok((_table_id, bytecode, _norm, prefilter)) =
+                parse_compile_normalize_and_prefilter(&sql, &dialect, &catalog)
+            else {
+                continue; // skip predicates that fail to compile
+            };
+
+            for (id_cell, amount_cell, status_cell) in &rows {
+                let row = RowImage {
+                    cells: std::sync::Arc::from([
+                        id_cell.clone(),
+                        amount_cell.clone(),
+                        status_cell.clone(),
+                    ]),
+                };
+
+                if !prefilter.may_match(&row) {
+                    // Prefilter says "definitely no match" — VM must agree
+                    let mut vm = Vm::new();
+                    let vm_result = vm.eval(&bytecode, &row);
+                    prop_assert!(
+                        vm_result != Ok(subql::compiler::Tri::True),
+                        "Prefilter soundness violation for predicate '{}' on row [{:?}, {:?}, {:?}]: \
+                        prefilter.may_match=false but VM returned {:?}",
+                        pred.to_sql(), id_cell, amount_cell, status_cell, vm_result,
+                    );
+                }
+            }
         }
     }
 

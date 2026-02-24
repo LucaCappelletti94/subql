@@ -13,7 +13,7 @@ impl PredicateId {
     /// Try to create `PredicateId` from slab index.
     ///
     /// Returns error when index would overflow the internal non-zero u32 layout.
-    pub fn try_from_slab_index(index: usize) -> Result<Self, &'static str> {
+    pub const fn try_from_slab_index(index: usize) -> Result<Self, &'static str> {
         if index >= u32::MAX as usize {
             return Err("Slab index too large");
         }

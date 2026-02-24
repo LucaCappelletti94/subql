@@ -98,10 +98,9 @@ impl<I: IdTypes> TablePartition<I> {
     ///
     /// If refcount reaches 0, predicate is removed and indexes are rebuilt.
     /// Returns true if predicate was removed.
-    #[allow(clippy::option_if_let_else)]
     pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> bool {
         self.remove_binding_detail(sub_id)
-            .map_or(false, |removal| removal.predicate_removed)
+            .is_some_and(|removal| removal.predicate_removed)
     }
 
     /// Remove binding and decrement refcount.
@@ -110,12 +109,12 @@ impl<I: IdTypes> TablePartition<I> {
     /// - `None` if no binding existed
     /// - `Some(false)` if binding removed but predicate kept
     /// - `Some(true)` if binding removed and predicate deleted
-    #[allow(clippy::option_if_let_else)]
     pub fn remove_binding_status(&mut self, sub_id: I::SubscriptionId) -> Option<bool> {
         self.remove_binding_detail(sub_id)
             .map(|removal| removal.predicate_removed)
     }
 
+    #[allow(clippy::option_if_let_else)]
     pub(super) fn remove_binding_detail(
         &mut self,
         sub_id: I::SubscriptionId,
@@ -203,23 +202,23 @@ impl<I: IdTypes> TablePartition<I> {
         changed_cols: &[ColumnId],
     ) -> RoaringBitmap {
         let snapshot = self.load_snapshot();
-        let update_filter = if kind == EventKind::Update && !changed_cols.is_empty() {
-            let mut update_candidates = snapshot.indexes.dependency_free.clone();
 
+        // For Update events with a non-empty changed_cols list, return exactly the
+        // set of predicates that depend on at least one changed column.  We cannot
+        // restrict further using the index (which reflects only the *new* row's
+        // values): a predicate might have matched the *old* value (e.g. an IS NULL
+        // predicate when the column transitions NULL → non-NULL) and still needs
+        // re-evaluation. Returning the full dependency set is always safe because
+        // the VM will evaluate every candidate.
+        if kind == EventKind::Update && !changed_cols.is_empty() {
+            let mut update_candidates = snapshot.indexes.dependency_free.clone();
             for &col in changed_cols {
                 if let Some(deps) = snapshot.indexes.dependency.get(&col) {
                     update_candidates |= deps;
                 }
             }
-
-            if update_candidates.is_empty() {
-                // No predicates depend on changed columns
-                return RoaringBitmap::new();
-            }
-            Some(update_candidates)
-        } else {
-            None
-        };
+            return update_candidates;
+        }
 
         let mut candidates = RoaringBitmap::new();
 
@@ -261,11 +260,6 @@ impl<I: IdTypes> TablePartition<I> {
                     candidates |= bitmap;
                 }
             }
-        }
-
-        // UPDATE optimization: only predicates depending on changed columns.
-        if let Some(update_candidates) = update_filter {
-            candidates &= &update_candidates;
         }
 
         candidates
@@ -327,12 +321,16 @@ mod tests {
     };
 
     fn make_predicate(id: usize, hash: u128) -> Predicate {
+        make_predicate_on_col(id, hash, 1)
+    }
+
+    fn make_predicate_on_col(id: usize, hash: u128, col: ColumnId) -> Predicate {
         Predicate {
             id: PredicateId::from_slab_index(id),
             hash,
             normalized_sql: "test".into(),
             bytecode: Arc::new(BytecodeProgram::new(vec![Instruction::Not])),
-            dependency_columns: Arc::from([1u16]),
+            dependency_columns: Arc::from([col]),
             index_atoms: Arc::from([IndexableAtom::Fallback]),
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             refcount: 1,
@@ -668,6 +666,215 @@ mod tests {
         assert!(
             !candidates.contains(pred_unchanged_id.as_u32()),
             "predicates with no changed-column overlap must be excluded on UPDATE"
+        );
+    }
+
+    // =========================================================================
+    // C2 — Index × event kind matrix
+    // =========================================================================
+
+    #[test]
+    fn test_equality_index_on_insert_and_delete() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // Equality predicate on col 0 == 42
+        let pred = make_predicate_on_col(0, 0xAAAA, 0);
+        let pred_id = partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Equality {
+                column_id: 0,
+                value: IndexableCell::Int(42),
+            }],
+        );
+
+        // INSERT row with matching value
+        let row = make_row(vec![Cell::Int(42)]);
+        let candidates = partition.select_candidates(&row, EventKind::Insert, &[]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "equality index must include predicate on INSERT with matching value"
+        );
+
+        // INSERT row with non-matching value
+        let row_nomatch = make_row(vec![Cell::Int(99)]);
+        let candidates = partition.select_candidates(&row_nomatch, EventKind::Insert, &[]);
+        assert!(
+            !candidates.contains(pred_id.as_u32()),
+            "equality index must exclude predicate on INSERT with non-matching value"
+        );
+
+        // DELETE row with matching value
+        let candidates = partition.select_candidates(&row, EventKind::Delete, &[]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "equality index must include predicate on DELETE with matching value"
+        );
+    }
+
+    #[test]
+    fn test_range_index_on_insert_update_delete() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // Range predicate: col 0 > 10  (lower bound is inclusive 11)
+        let pred = make_predicate_on_col(0, 0xBBBB, 0);
+        let pred_id = partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Range {
+                column_id: 0,
+                lower: Some(11),
+                upper: None,
+            }],
+        );
+
+        // INSERT row satisfying range
+        let row = make_row(vec![Cell::Int(20)]);
+        let candidates = partition.select_candidates(&row, EventKind::Insert, &[]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "range index must include predicate on INSERT with value in range"
+        );
+
+        // INSERT row outside range
+        let row_out = make_row(vec![Cell::Int(5)]);
+        let candidates = partition.select_candidates(&row_out, EventKind::Insert, &[]);
+        assert!(
+            !candidates.contains(pred_id.as_u32()),
+            "range index must exclude predicate on INSERT with value outside range"
+        );
+
+        // UPDATE with changed_columns containing col 0
+        let candidates = partition.select_candidates(&row, EventKind::Update, &[0]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "range index must include predicate on UPDATE when indexed column changed"
+        );
+
+        // DELETE row in range
+        let candidates = partition.select_candidates(&row, EventKind::Delete, &[]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "range index must include predicate on DELETE with matching row"
+        );
+    }
+
+    #[test]
+    fn test_null_index_on_insert_update_delete() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // IS NULL predicate on col 0
+        let pred = make_predicate_on_col(0, 0xCCCC, 0);
+        let pred_id = partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Null {
+                column_id: 0,
+                kind: NullKind::IsNull,
+            }],
+        );
+
+        // INSERT with NULL value — should be candidate
+        let row_null = make_row(vec![Cell::Null]);
+        let candidates = partition.select_candidates(&row_null, EventKind::Insert, &[]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "null index must include predicate on INSERT with NULL value"
+        );
+
+        // INSERT with non-NULL value — should not be candidate
+        let row_non_null = make_row(vec![Cell::Int(5)]);
+        let candidates = partition.select_candidates(&row_non_null, EventKind::Insert, &[]);
+        assert!(
+            !candidates.contains(pred_id.as_u32()),
+            "null index must exclude IS NULL predicate on INSERT with non-NULL value"
+        );
+
+        // UPDATE with changed_columns containing col 0
+        let candidates = partition.select_candidates(&row_null, EventKind::Update, &[0]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "null index must include predicate on UPDATE when indexed column changed"
+        );
+
+        // DELETE with NULL value
+        let candidates = partition.select_candidates(&row_null, EventKind::Delete, &[]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "null index must include predicate on DELETE with NULL value"
+        );
+    }
+
+    // =========================================================================
+    // C3 — NULL transition updates under changed_columns
+    // =========================================================================
+
+    #[test]
+    fn test_null_transition_null_to_value_with_changed_column() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // IS NULL predicate on col 0
+        let pred = make_predicate_on_col(0, 0xDDDD, 0);
+        let pred_id = partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Null {
+                column_id: 0,
+                kind: NullKind::IsNull,
+            }],
+        );
+
+        // UPDATE: NULL → value, changed_columns = [0]
+        // New row has non-NULL value but changed_columns contains col 0,
+        // so predicate must still be a candidate (old row may have been NULL).
+        let new_row = make_row(vec![Cell::Int(10)]);
+        let candidates = partition.select_candidates(&new_row, EventKind::Update, &[0]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "IS NULL predicate must be a candidate on NULL→value update when col 0 in changed_columns"
+        );
+    }
+
+    #[test]
+    fn test_null_transition_value_to_null_with_changed_column() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // IS NULL predicate on col 0
+        let pred = make_predicate_on_col(0, 0xEEEE, 0);
+        let pred_id = partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Null {
+                column_id: 0,
+                kind: NullKind::IsNull,
+            }],
+        );
+
+        // UPDATE: value → NULL, changed_columns = [0]
+        // New row has NULL; predicate must be candidate.
+        let new_row = make_row(vec![Cell::Null]);
+        let candidates = partition.select_candidates(&new_row, EventKind::Update, &[0]);
+        assert!(
+            candidates.contains(pred_id.as_u32()),
+            "IS NULL predicate must be a candidate on value→NULL update when col 0 in changed_columns"
+        );
+    }
+
+    #[test]
+    fn test_null_transition_not_in_changed_columns_prunes_candidate() {
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+
+        // IS NULL predicate on col 1
+        let pred = make_predicate(0, 0xFFFF);
+        let pred_id = partition.add_predicate(
+            pred,
+            vec![IndexableAtom::Null {
+                column_id: 1,
+                kind: NullKind::IsNull,
+            }],
+        );
+
+        // UPDATE: changed_columns does NOT include col 1
+        let row = make_row(vec![Cell::Int(5), Cell::Null]);
+        let candidates = partition.select_candidates(&row, EventKind::Update, &[0]); // changed col 0, not col 1
+        assert!(
+            !candidates.contains(pred_id.as_u32()),
+            "null-indexed predicate must be pruned when its column is not in changed_columns"
         );
     }
 }

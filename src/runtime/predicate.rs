@@ -104,7 +104,9 @@ impl<I: IdTypes> PredicateStore<I> {
     /// Find predicate by hash (for deduplication)
     #[must_use]
     pub fn find_by_hash(&self, hash: PredicateHash) -> Option<PredicateId> {
-        self.hash_index.get(&hash).and_then(|ids| ids.first().copied())
+        self.hash_index
+            .get(&hash)
+            .and_then(|ids| ids.first().copied())
     }
 
     /// Find predicate by hash and normalized SQL.

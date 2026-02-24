@@ -198,7 +198,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         (pred, atoms)
     }
 
-    fn make_binding(
+    const fn make_binding(
         spec: &SubscriptionSpec<I>,
         pred_id: PredicateId,
         user_ord: UserOrdinal,
@@ -213,7 +213,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
     }
 
-    fn is_post_commit_dirsync_error(err: &StorageError) -> bool {
+    const fn is_post_commit_dirsync_error(err: &StorageError) -> bool {
         matches!(err, StorageError::PostCommitDirSync(_))
     }
 
@@ -224,7 +224,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let _ = message;
     }
 
-    fn enforce_table_durability(&mut self, table_id: TableId) -> DurabilityCheckOutcome {
+    fn enforce_table_durability(&self, table_id: TableId) -> DurabilityCheckOutcome {
         if self.storage_path.is_none() {
             return DurabilityCheckOutcome::Ok;
         }
@@ -252,8 +252,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             Err(snapshot_err) => {
                 if self.durability_mode == DurabilityMode::BestEffort {
                     Self::log_best_effort_durability(&format!(
-                        "Best-effort durability: snapshot failed for table {}: {}",
-                        table_id, snapshot_err
+                        "Best-effort durability: snapshot failed for table {table_id}: {snapshot_err}"
                     ));
                     return DurabilityCheckOutcome::Ok;
                 }
@@ -367,21 +366,23 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         // 5. Check if predicate exists (deduplication)
         let snapshot = partition.load_snapshot();
-        let (pred_id, created_new) = if let Some(existing) = snapshot
+        let (pred_id, created_new) = snapshot
             .predicates
             .find_by_hash_and_sql(hash, &compiled.normalized)
-        {
-            // Predicate exists, increment refcount
-            // (We need mutable access, so we'll do this via the partition's mutable store)
-            (existing, false)
-        } else {
-            // Create new predicate
-            let (pred, atoms) = Self::make_predicate_from_compiled(&compiled);
-            // Add predicate to partition
-            let pred_id = partition.add_predicate(pred, atoms);
-
-            (pred_id, true)
-        };
+            .map_or_else(
+                || {
+                    // Create new predicate
+                    let (pred, atoms) = Self::make_predicate_from_compiled(&compiled);
+                    // Add predicate to partition
+                    let pred_id = partition.add_predicate(pred, atoms);
+                    (pred_id, true)
+                },
+                |existing| {
+                    // Predicate exists, increment refcount
+                    // (We need mutable access, so we'll do this via the partition's mutable store)
+                    (existing, false)
+                },
+            );
 
         // 6. Create binding
         let binding = Self::make_binding(&compiled.spec, pred_id, user_ord);
@@ -1464,11 +1465,11 @@ mod tests {
         fn for_dir(dir: &Path) -> Self {
             let dir = dir.to_path_buf();
             let lock = injected_parent_dir_sync_failure_dirs();
-            let mut guard = match lock.lock() {
+            match lock.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.insert(dir.clone());
+            }
+            .insert(dir.clone());
             Self { dir }
         }
     }
@@ -1491,11 +1492,11 @@ mod tests {
     impl BatchPhase3PartitionDropGuard {
         fn for_table(table_id: TableId) -> Self {
             let lock = injected_batch_phase3_partition_drop_tables();
-            let mut guard = match lock.lock() {
+            match lock.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.insert(table_id);
+            }
+            .insert(table_id);
             Self { table_id }
         }
     }
@@ -3292,13 +3293,13 @@ mod tests {
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
 
-        let (_, _, normalized_for_gt_sql) = crate::compiler::parse_compile_and_normalize(
+        let (_, _, gt_sql_normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount > 100",
             &PostgreSqlDialect {},
             &*catalog,
         )
         .expect("normalization for gt SQL should succeed");
-        let (_, _, normalized_for_lt_sql) = crate::compiler::parse_compile_and_normalize(
+        let (_, _, lt_sql_normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount < 50",
             &PostgreSqlDialect {},
             &*catalog,
@@ -3306,8 +3307,8 @@ mod tests {
         .expect("normalization for lt SQL should succeed");
 
         let _hash_guard = CompileHashOverrideGuard::force(vec![
-            (normalized_for_gt_sql, 0xCAFE_BABE_u128),
-            (normalized_for_lt_sql, 0xCAFE_BABE_u128),
+            (gt_sql_normalized, 0xCAFE_BABE_u128),
+            (lt_sql_normalized, 0xCAFE_BABE_u128),
         ]);
 
         let specs = vec![
@@ -3904,5 +3905,113 @@ mod tests {
             !engine.unregister_subscription(1),
             "stale merge payload must not resurrect deleted subscription"
         );
+    }
+
+    // =========================================================================
+    // C1 — TRUNCATE must exclude unregistered users (no ghost recipients)
+    // =========================================================================
+
+    #[test]
+    fn test_truncate_excludes_unregistered_users() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Register user 42 on table 1 (orders)
+        let spec = SubscriptionSpec {
+            subscription_id: 100,
+            user_id: 42,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
+            updated_at_unix_ms: 0,
+        };
+        engine.register(spec).unwrap();
+
+        // Unregister user 42
+        engine.unregister_subscription(100);
+
+        // Dispatch TRUNCATE on table 1
+        let event = WalEvent {
+            table_id: 1,
+            kind: EventKind::Truncate,
+            new_row: None,
+            old_row: None,
+            pk: PrimaryKey {
+                columns: Arc::from([]),
+                values: Arc::from([]),
+            },
+            changed_columns: Arc::from([]),
+        };
+
+        let users: Vec<u64> = engine.users(&event).unwrap().collect();
+        assert!(
+            users.is_empty(),
+            "TRUNCATE must not fan out to unregistered user 42; got: {users:?}"
+        );
+    }
+
+    // =========================================================================
+    // D6 — Crash recovery: partial shard write on startup
+    // =========================================================================
+
+    #[test]
+    fn test_partial_shard_file_on_startup_is_handled_gracefully() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+
+        // Write a zero-byte file at the shard path
+        let shard_path = temp_dir.path().join("table_1.shard");
+        std::fs::write(&shard_path, b"").unwrap();
+
+        // Engine startup must not panic; it should either skip or return error gracefully.
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            );
+
+        // Either Ok (zero-byte skipped) or a storage error — but no panic
+        match result {
+            Ok(engine) => {
+                // Graceful skip: engine starts with no subscriptions
+                assert_eq!(
+                    engine.subscription_count(),
+                    0,
+                    "zero-byte shard must not corrupt engine state"
+                );
+            }
+            Err(e) => {
+                // Graceful error: must be a storage/codec error, not a panic
+                let _ = e; // Just confirm we got an error, not a panic
+            }
+        }
+    }
+
+    #[test]
+    fn test_partial_shard_file_garbage_content_handled_gracefully() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+
+        // Write a partial/corrupt shard file
+        let shard_path = temp_dir.path().join("table_1.shard");
+        std::fs::write(&shard_path, b"\xDE\xAD\xBE\xEF\x00\x01").unwrap();
+
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            );
+
+        // Must not panic — either a storage error or graceful skip
+        if let Ok(engine) = result {
+            assert_eq!(engine.subscription_count(), 0);
+        }
+        // Err(_) case: expected — corrupt shard returns an error
     }
 }

@@ -180,6 +180,7 @@ pub fn dispatch_users<'a, I: IdTypes>(
     user_dict: &'a UserDictionary<I>,
     vm: &mut Vm,
 ) -> Result<MatchedUsers<'a, I>, DispatchError> {
+    // TRUNCATE events fan-out to all table subscribers.
     if event.kind == EventKind::Truncate {
         let _ = partition;
         let _ = vm;
@@ -266,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_user_dictionary_next_ordinal_overflow_errors() {
-        let err = UserDictionary::<DefaultIds>::next_ordinal_for_len((u32::MAX as u64) + 1)
+        let err = UserDictionary::<DefaultIds>::next_ordinal_for_len(u64::from(u32::MAX) + 1)
             .expect_err("ordinal allocation beyond u32::MAX should fail");
         assert!(err.contains("ordinal capacity exceeded"));
     }
