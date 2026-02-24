@@ -43,6 +43,11 @@ struct CompiledSpec<I: IdTypes> {
     hash: u128,
 }
 
+enum DurabilityCheckOutcome {
+    Ok,
+    RequiredFailure { message: String, post_commit: bool },
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,10 +62,18 @@ enum RebuildPayloadError {
 
 #[cfg(test)]
 static INJECT_PARENT_DIR_SYNC_FAILURE_DIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES: OnceLock<Mutex<HashSet<TableId>>> =
+    OnceLock::new();
 
 #[cfg(test)]
 fn injected_parent_dir_sync_failure_dirs() -> &'static Mutex<HashSet<PathBuf>> {
     INJECT_PARENT_DIR_SYNC_FAILURE_DIRS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(test)]
+fn injected_batch_phase3_partition_drop_tables() -> &'static Mutex<HashSet<TableId>> {
+    INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 impl std::fmt::Display for RebuildPayloadError {
@@ -176,7 +189,55 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     }
 
     fn is_post_commit_dirsync_error(err: &StorageError) -> bool {
-        matches!(err, StorageError::Io(msg) if msg.starts_with("post_commit_dirsync:"))
+        matches!(err, StorageError::PostCommitDirSync(_))
+    }
+
+    fn log_best_effort_durability(message: &str) {
+        #[cfg(feature = "observability")]
+        tracing::warn!("{message}");
+        #[cfg(not(feature = "observability"))]
+        let _ = message;
+    }
+
+    fn enforce_table_durability(&mut self, table_id: TableId) -> DurabilityCheckOutcome {
+        if self.storage_path.is_none() {
+            return DurabilityCheckOutcome::Ok;
+        }
+
+        let should_rotate = match self.should_rotate(table_id) {
+            Ok(v) => v,
+            Err(e) => {
+                let message = format!("Rotation check failed for table {table_id}: {e}");
+                if self.durability_mode == DurabilityMode::BestEffort {
+                    Self::log_best_effort_durability(&format!("Best-effort durability: {message}"));
+                    return DurabilityCheckOutcome::Ok;
+                }
+                return DurabilityCheckOutcome::RequiredFailure {
+                    message,
+                    post_commit: false,
+                };
+            }
+        };
+        if !should_rotate {
+            return DurabilityCheckOutcome::Ok;
+        }
+
+        match self.snapshot_table(table_id) {
+            Ok(()) => DurabilityCheckOutcome::Ok,
+            Err(snapshot_err) => {
+                if self.durability_mode == DurabilityMode::BestEffort {
+                    Self::log_best_effort_durability(&format!(
+                        "Best-effort durability: snapshot failed for table {}: {}",
+                        table_id, snapshot_err
+                    ));
+                    return DurabilityCheckOutcome::Ok;
+                }
+                DurabilityCheckOutcome::RequiredFailure {
+                    message: format!("Snapshot failed for table {table_id}: {snapshot_err}"),
+                    post_commit: Self::is_post_commit_dirsync_error(&snapshot_err),
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -190,6 +251,16 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.contains(parent)
+    }
+
+    #[cfg(test)]
+    fn should_inject_batch_phase3_partition_drop(table_id: TableId) -> bool {
+        let lock = injected_batch_phase3_partition_drop_tables();
+        let guard = match lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.contains(&table_id)
     }
 
     /// Create new subscription engine
@@ -265,7 +336,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let user_dict = self.user_dictionaries.entry(table_id).or_default();
 
         // 4. Get user ordinal
-        let user_ord = user_dict.get_or_create(compiled.spec.user_id);
+        let user_ord = user_dict
+            .try_get_or_create(compiled.spec.user_id)
+            .map_err(|e| RegisterError::Storage(e.to_string()))?;
 
         // 5. Check if predicate exists (deduplication)
         let snapshot = partition.load_snapshot();
@@ -293,37 +366,18 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         self.subscription_to_table
             .insert(compiled.spec.subscription_id, table_id);
 
-        // 8. Check if rotation needed (if storage enabled)
-        if self.storage_path.is_some() {
-            let should_rotate = self.should_rotate(table_id).map_err(|e| {
-                RegisterError::Storage(format!("Rotation check failed for table {table_id}: {e}"))
-            })?;
-            if should_rotate {
-                match self.snapshot_table(table_id) {
-                    Ok(()) => {}
-                    Err(snapshot_err) if self.durability_mode == DurabilityMode::BestEffort => {
-                        #[cfg(feature = "observability")]
-                        tracing::warn!(
-                            "Best-effort durability: snapshot failed for table {}: {}",
-                            table_id,
-                            snapshot_err
-                        );
-                        #[cfg(not(feature = "observability"))]
-                        let _ = snapshot_err;
-                    }
-                    Err(e) => {
-                        // Pre-commit durability failures can be rolled back safely.
-                        // Post-commit dir-sync failures mean data was already renamed.
-                        if !Self::is_post_commit_dirsync_error(&e) {
-                            let _ = self
-                                .unregister_subscription_internal(compiled.spec.subscription_id);
-                        }
-                        return Err(RegisterError::Storage(format!(
-                            "Snapshot failed for table {table_id}: {e}"
-                        )));
-                    }
-                }
+        // 8. Enforce durability policy for this table.
+        if let DurabilityCheckOutcome::RequiredFailure {
+            message,
+            post_commit,
+        } = self.enforce_table_durability(table_id)
+        {
+            // Pre-commit durability failures can be rolled back safely.
+            // Post-commit dir-sync failures mean data was already renamed.
+            if !post_commit {
+                let _ = self.unregister_subscription_internal(compiled.spec.subscription_id);
             }
+            return Err(RegisterError::Storage(message));
         }
 
         Ok(RegisterResult {
@@ -341,7 +395,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// of one per subscription. Ideal for bulk loading at startup.
     ///
     /// Returns results in the same order as the input specs.
-    /// On error, already-registered subscriptions in this batch are NOT rolled back.
+    /// In required durability mode, pre-commit snapshot failures are rolled back.
+    /// Post-commit directory fsync failures are surfaced but not rolled back.
     #[allow(clippy::too_many_lines)]
     pub fn register_batch(
         &mut self,
@@ -399,7 +454,13 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 .entry(c.table_id)
                 .or_insert_with(|| TablePartition::new(c.table_id));
             let user_dict = self.user_dictionaries.entry(c.table_id).or_default();
-            let user_ord = user_dict.get_or_create(c.spec.user_id);
+            let user_ord = match user_dict.try_get_or_create(c.spec.user_id) {
+                Ok(ord) => ord,
+                Err(e) => {
+                    results[i] = Err(RegisterError::Storage(e.to_string()));
+                    continue;
+                }
+            };
             table_result_indices.entry(c.table_id).or_default().push(i);
             table_inserted_sub_ids
                 .entry(c.table_id)
@@ -422,7 +483,13 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 created_new = false;
             } else if let Some(&batch_idx) = batch_hash_to_idx.get(&(c.table_id, c.hash)) {
                 // Deduplicated within this batch — add binding to existing batch entry
-                let entries = table_entries.get_mut(&c.table_id).expect("table exists");
+                let Some(entries) = table_entries.get_mut(&c.table_id) else {
+                    results[i] = Err(RegisterError::Storage(format!(
+                        "Batch register failed for table {}: missing batch entries",
+                        c.table_id
+                    )));
+                    continue;
+                };
                 let binding =
                     Self::make_binding(&c.spec, PredicateId::from_slab_index(0), user_ord);
                 entries[batch_idx].2.push(binding);
@@ -447,12 +514,29 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             }
         }
 
+        #[cfg(test)]
+        {
+            for &table_id in table_result_indices.keys() {
+                if Self::should_inject_batch_phase3_partition_drop(table_id) {
+                    self.partitions.remove(&table_id);
+                }
+            }
+        }
+
         // Phase 3: Batch-insert into partitions (single COW + single swap per table)
+        let mut phase3_failed_tables = AHashSet::new();
         for (table_id, entries) in table_entries {
-            let partition = self
-                .partitions
-                .get_mut(&table_id)
-                .expect("partition created above");
+            let Some(partition) = self.partitions.get_mut(&table_id) else {
+                phase3_failed_tables.insert(table_id);
+                if let Some(indices) = table_result_indices.get(&table_id) {
+                    for &idx in indices {
+                        results[idx] = Err(RegisterError::Storage(format!(
+                            "Batch register failed for table {table_id}: missing partition during phase3"
+                        )));
+                    }
+                }
+                continue;
+            };
             partition.add_batch(&entries);
             for (_, _, bindings) in &entries {
                 for binding in bindings {
@@ -462,65 +546,32 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             }
         }
 
-        if self.storage_path.is_some() {
-            let mut failures: Vec<(TableId, String, bool)> = Vec::new();
-
-            for &table_id in table_result_indices.keys() {
-                let should_rotate = match self.should_rotate(table_id) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if self.durability_mode == DurabilityMode::BestEffort {
-                            #[cfg(feature = "observability")]
-                            tracing::warn!(
-                                "Best-effort durability: rotation check failed for table {}: {}",
-                                table_id,
-                                e
-                            );
-                        } else {
-                            failures.push((
-                                table_id,
-                                format!("Rotation check failed for table {table_id}: {e}"),
-                                false,
-                            ));
-                        }
-                        false
-                    }
-                };
-                if !should_rotate {
-                    continue;
-                }
-
-                if let Err(e) = self.snapshot_table(table_id) {
-                    if self.durability_mode == DurabilityMode::BestEffort {
-                        #[cfg(feature = "observability")]
-                        tracing::warn!(
-                            "Best-effort durability: snapshot failed for table {}: {}",
-                            table_id,
-                            e
-                        );
-                    } else {
-                        failures.push((
-                            table_id,
-                            format!("Snapshot failed for table {table_id}: {e}"),
-                            Self::is_post_commit_dirsync_error(&e),
-                        ));
-                    }
-                }
+        let mut failures: Vec<(TableId, String, bool)> = Vec::new();
+        for &table_id in table_result_indices.keys() {
+            if phase3_failed_tables.contains(&table_id) {
+                continue;
             }
+            if let DurabilityCheckOutcome::RequiredFailure {
+                message,
+                post_commit,
+            } = self.enforce_table_durability(table_id)
+            {
+                failures.push((table_id, message, post_commit));
+            }
+        }
 
-            if !failures.is_empty() && self.durability_mode == DurabilityMode::Required {
-                for (table_id, message, post_commit) in failures {
-                    if !post_commit {
-                        if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
-                            for &sub_id in sub_ids {
-                                let _ = self.unregister_subscription_internal(sub_id);
-                            }
+        if !failures.is_empty() && self.durability_mode == DurabilityMode::Required {
+            for (table_id, message, post_commit) in failures {
+                if !post_commit {
+                    if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
+                        for &sub_id in sub_ids {
+                            let _ = self.unregister_subscription_internal(sub_id);
                         }
                     }
-                    if let Some(indices) = table_result_indices.get(&table_id) {
-                        for &idx in indices {
-                            results[idx] = Err(RegisterError::Storage(message.clone()));
-                        }
+                }
+                if let Some(indices) = table_result_indices.get(&table_id) {
+                    for &idx in indices {
+                        results[idx] = Err(RegisterError::Storage(message.clone()));
                     }
                 }
             }
@@ -537,6 +588,23 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .is_some()
     }
 
+    fn cleanup_user_if_unreferenced(&mut self, table_id: TableId, user_id: I::UserId) {
+        let has_active_bindings = self.partitions.get(&table_id).is_some_and(|partition| {
+            let snapshot = partition.load_snapshot();
+            snapshot
+                .predicates
+                .bindings
+                .values()
+                .any(|binding| binding.user_id == user_id)
+        });
+
+        if !has_active_bindings {
+            if let Some(user_dict) = self.user_dictionaries.get_mut(&table_id) {
+                let _ = user_dict.remove(user_id);
+            }
+        }
+    }
+
     /// Internal unregister helper.
     ///
     /// Returns `Some(predicate_removed)` if subscription existed, else `None`.
@@ -546,11 +614,14 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ) -> Option<bool> {
         // Fast path: direct lookup from subscription index.
         if let Some(table_id) = self.subscription_to_table.get(&subscription_id).copied() {
-            if let Some(partition) = self.partitions.get_mut(&table_id) {
-                if let Some(predicate_removed) = partition.remove_binding_status(subscription_id) {
-                    self.subscription_to_table.remove(&subscription_id);
-                    return Some(predicate_removed);
-                }
+            let removal = self
+                .partitions
+                .get_mut(&table_id)
+                .and_then(|partition| partition.remove_binding_detail(subscription_id));
+            if let Some(removal) = removal {
+                self.subscription_to_table.remove(&subscription_id);
+                self.cleanup_user_if_unreferenced(table_id, removal.user_id);
+                return Some(removal.predicate_removed);
             }
 
             // Stale index entry; clean it up and fall back to scan.
@@ -558,11 +629,18 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Fallback scan for pre-index or inconsistent states.
-        for (_table_id, partition) in &mut self.partitions {
-            if let Some(predicate_removed) = partition.remove_binding_status(subscription_id) {
-                self.subscription_to_table.remove(&subscription_id);
-                return Some(predicate_removed);
+        let mut removed = None;
+        for (&table_id, partition) in &mut self.partitions {
+            if let Some(removal) = partition.remove_binding_detail(subscription_id) {
+                removed = Some((table_id, removal));
+                break;
             }
+        }
+
+        if let Some((table_id, removal)) = removed {
+            self.subscription_to_table.remove(&subscription_id);
+            self.cleanup_user_if_unreferenced(table_id, removal.user_id);
+            return Some(removal.predicate_removed);
         }
 
         None
@@ -633,23 +711,30 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         for (table_id, users) in removed_user_candidates {
-            let Some(partition) = self.partitions.get(&table_id) else {
-                continue;
-            };
             let Some(user_dict) = self.user_dictionaries.get_mut(&table_id) else {
                 continue;
             };
 
-            let snapshot = partition.load_snapshot();
-            let active_users: AHashSet<I::UserId> = snapshot
-                .predicates
-                .bindings
-                .values()
-                .map(|binding| binding.user_id)
-                .collect();
+            let active_users: AHashSet<I::UserId> = self
+                .partitions
+                .get(&table_id)
+                .map(|partition| {
+                    let snapshot = partition.load_snapshot();
+                    snapshot
+                        .predicates
+                        .bindings
+                        .values()
+                        .map(|binding| binding.user_id)
+                        .collect()
+                })
+                .unwrap_or_default();
 
             for user_id in users {
-                if !active_users.contains(&user_id) && user_dict.remove(user_id).is_some() {
+                if !active_users.contains(&user_id) {
+                    let was_present = user_dict.get(user_id).is_some();
+                    if was_present {
+                        let _ = user_dict.remove(user_id);
+                    }
                     removed_users += 1;
                 }
             }
@@ -772,7 +857,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 })?;
 
                 Self::sync_parent_dir(shard_path)
-                    .map_err(|e| StorageError::Io(format!("post_commit_dirsync: {e}")))?;
+                    .map_err(|e| StorageError::PostCommitDirSync(e.to_string()))?;
                 Ok(())
             })();
 
@@ -980,6 +1065,18 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
     }
 
+    fn rebuild_and_replace_table_state(
+        &mut self,
+        table_id: TableId,
+        payload: &ShardPayload<I>,
+    ) -> Result<(), RebuildPayloadError> {
+        let (user_dict, entries) = Self::rebuild_entries_from_payload(payload)?;
+        let mut partition = TablePartition::new(table_id);
+        partition.add_batch(&entries);
+        self.replace_table_state(table_id, partition, user_dict, &entries);
+        Ok(())
+    }
+
     /// Load shard from disk into partition
     fn load_shard(&mut self, table_id: TableId, path: &Path) -> Result<(), StorageError> {
         let bytes = std::fs::read(path)
@@ -993,17 +1090,33 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             )));
         }
 
-        let (user_dict, entries) =
-            Self::rebuild_entries_from_payload(&payload).map_err(|e| match e {
+        self.rebuild_and_replace_table_state(table_id, &payload)
+            .map_err(|e| match e {
                 RebuildPayloadError::Codec(msg) => StorageError::Codec(msg),
                 RebuildPayloadError::Corrupt(msg) => StorageError::Corrupt(msg),
             })?;
 
-        let mut partition = TablePartition::new(table_id);
-        partition.add_batch(&entries);
-        self.replace_table_state(table_id, partition, user_dict, &entries);
-
         Ok(())
+    }
+
+    fn parse_table_id_from_shard_path(path: &Path) -> Result<Option<TableId>, StorageError> {
+        if path.extension().and_then(|s| s.to_str()) != Some("shard") {
+            return Ok(None);
+        }
+
+        let filename = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+            StorageError::Corrupt(format!("invalid shard filename '{}'", path.display()))
+        })?;
+
+        let table_id_str = filename.strip_prefix("table_").ok_or_else(|| {
+            StorageError::Corrupt(format!("invalid shard filename '{}'", path.display()))
+        })?;
+
+        let table_id = table_id_str.parse::<TableId>().map_err(|_| {
+            StorageError::Corrupt(format!("invalid shard filename '{}'", path.display()))
+        })?;
+
+        Ok(Some(table_id))
     }
 
     /// Load all shards from storage directory
@@ -1017,21 +1130,32 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let entries = std::fs::read_dir(storage_path)
             .map_err(|e| StorageError::Io(format!("Failed to read storage directory: {e}")))?;
 
+        let mut shard_files: Vec<(TableId, PathBuf)> = Vec::new();
         for entry in entries {
             let entry = entry
                 .map_err(|e| StorageError::Io(format!("Failed to read directory entry: {e}")))?;
             let path = entry.path();
+            let Some(table_id) = Self::parse_table_id_from_shard_path(&path)? else {
+                continue;
+            };
+            shard_files.push((table_id, path));
+        }
 
-            if path.extension().and_then(|s| s.to_str()) == Some("shard") {
-                // Parse table ID from filename (e.g., "table_1.shard")
-                if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Some(table_id_str) = filename.strip_prefix("table_") {
-                        if let Ok(table_id) = table_id_str.parse::<TableId>() {
-                            self.load_shard(table_id, &path)?;
-                        }
-                    }
-                }
+        shard_files.sort_by(|(_, left), (_, right)| left.cmp(right));
+
+        let mut seen_tables: AHashMap<TableId, PathBuf> = AHashMap::new();
+        for (table_id, path) in &shard_files {
+            if let Some(first_path) = seen_tables.insert(*table_id, path.clone()) {
+                return Err(StorageError::Corrupt(format!(
+                    "duplicate shard table id {table_id} in '{}' and '{}'",
+                    first_path.display(),
+                    path.display()
+                )));
             }
+        }
+
+        for (table_id, path) in shard_files {
+            self.load_shard(table_id, &path)?;
         }
 
         Ok(())
@@ -1120,15 +1244,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             return Ok(None);
         };
 
-        let table_id = merged.table_id;
-
-        // Build merged table state off to the side, then atomically replace.
-        let mut partition = TablePartition::new(table_id);
-        let (user_dict, entries) = Self::rebuild_entries_from_payload(&merged.payload)
+        self.rebuild_and_replace_table_state(merged.table_id, &merged.payload)
             .map_err(|e| MergeError::BuildFailed(e.to_string()))?;
-
-        partition.add_batch(&entries);
-        self.replace_table_state(table_id, partition, user_dict, &entries);
 
         Ok(Some(merged.stats.into()))
     }
@@ -1255,6 +1372,39 @@ mod tests {
             };
             guard.remove(&self.dir);
         }
+    }
+
+    struct BatchPhase3PartitionDropGuard {
+        table_id: TableId,
+    }
+
+    impl BatchPhase3PartitionDropGuard {
+        fn for_table(table_id: TableId) -> Self {
+            let lock = injected_batch_phase3_partition_drop_tables();
+            let mut guard = match lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert(table_id);
+            Self { table_id }
+        }
+    }
+
+    impl Drop for BatchPhase3PartitionDropGuard {
+        fn drop(&mut self) {
+            let lock = injected_batch_phase3_partition_drop_tables();
+            let mut guard = match lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.remove(&self.table_id);
+        }
+    }
+
+    static INJECTION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn injection_test_lock() -> &'static Mutex<()> {
+        INJECTION_TEST_LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[test]
@@ -1452,6 +1602,9 @@ mod tests {
         let partition = engine.partitions.get(&1).unwrap();
         let snapshot = partition.load_snapshot();
         assert!(!snapshot.predicates.bindings.contains_key(&100));
+
+        let user_dict = engine.user_dictionaries.get(&1).unwrap();
+        assert!(user_dict.get(42).is_none());
     }
 
     #[test]
@@ -1498,6 +1651,9 @@ mod tests {
 
         let users: Vec<_> = engine.users(&event).unwrap().collect();
         assert_eq!(users, vec![7]);
+
+        let user_dict = engine.user_dictionaries.get(&1).unwrap();
+        assert!(user_dict.get(7).is_some());
     }
 
     #[test]
@@ -2194,11 +2350,17 @@ mod tests {
         assert!(matches!(result, Err(RegisterError::Storage(_))));
         assert_eq!(engine.subscription_count(), 0);
         assert!(!engine.unregister_subscription(1000));
+        let user_dict = engine.user_dictionaries.get(&1).unwrap();
+        assert!(user_dict.get(42).is_none());
     }
 
     #[test]
     fn test_register_required_post_commit_dirsync_failure_does_not_rollback() {
         use tempfile::TempDir;
+
+        let _test_lock = injection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
@@ -2275,11 +2437,29 @@ mod tests {
         assert_eq!(engine.subscription_count(), 0);
         assert!(!engine.unregister_subscription(2000));
         assert!(!engine.unregister_subscription(2001));
+        let user_dict = engine.user_dictionaries.get(&1).unwrap();
+        assert!(user_dict.get(10).is_none());
+        assert!(user_dict.get(11).is_none());
+    }
+
+    #[test]
+    fn test_post_commit_detection_is_not_message_prefix_based() {
+        let forged = StorageError::Io("post_commit_dirsync: forged".to_string());
+        assert!(
+            !SubscriptionEngine::<PostgreSqlDialect, DefaultIds>::is_post_commit_dirsync_error(
+                &forged
+            ),
+            "raw Io messages should not be treated as post-commit durability failures"
+        );
     }
 
     #[test]
     fn test_register_batch_required_post_commit_dirsync_failure_does_not_rollback() {
         use tempfile::TempDir;
+
+        let _test_lock = injection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
@@ -2589,6 +2769,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_load_all_shards_rejects_invalid_shard_filename() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+
+        std::fs::write(temp_dir.path().join("not_a_table_id.shard"), b"junk").unwrap();
+
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Corrupt(ref msg)) if msg.contains("invalid shard filename")
+        ));
+    }
+
+    #[test]
+    fn test_load_all_shards_rejects_duplicate_table_ids() {
+        use crate::persistence::shard::{serialize_shard, ShardPayload, UserDictData};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 0,
+        };
+        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+
+        std::fs::write(temp_dir.path().join("table_1.shard"), &shard_bytes).unwrap();
+        std::fs::write(temp_dir.path().join("table_001.shard"), &shard_bytes).unwrap();
+
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Corrupt(ref msg)) if msg.contains("duplicate shard table id")
+        ));
+    }
+
     // ========================================================================
     // Batch Registration Tests
     // ========================================================================
@@ -2759,6 +2995,39 @@ mod tests {
         let results = engine.register_batch(vec![]);
         assert!(results.is_empty());
         assert_eq!(engine.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_register_batch_phase3_missing_partition_returns_error_not_panic() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        let _test_lock = injection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = BatchPhase3PartitionDropGuard::for_table(1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.register_batch(vec![SubscriptionSpec {
+                subscription_id: 7,
+                user_id: 700,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            }])
+        }));
+
+        assert!(result.is_ok(), "register_batch should not panic");
+        let results = result.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                &results[0],
+                Err(RegisterError::Storage(msg))
+                    if msg.contains("missing partition during phase3")
+            ),
+            "unexpected result: {results:?}"
+        );
     }
 
     #[test]

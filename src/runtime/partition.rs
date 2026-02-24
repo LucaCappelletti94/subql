@@ -20,6 +20,11 @@ pub struct TablePartitionSnapshot<I: IdTypes> {
     pub predicates: Arc<PredicateStore<I>>,
 }
 
+pub(super) struct BindingRemoval<I: IdTypes> {
+    pub predicate_removed: bool,
+    pub user_id: I::UserId,
+}
+
 /// Table partition with atomic swap
 ///
 /// Partitions predicates by table for efficient dispatch.
@@ -95,7 +100,8 @@ impl<I: IdTypes> TablePartition<I> {
     /// Returns true if predicate was removed.
     #[allow(clippy::option_if_let_else)]
     pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> bool {
-        self.remove_binding_status(sub_id).unwrap_or(false)
+        self.remove_binding_detail(sub_id)
+            .map_or(false, |removal| removal.predicate_removed)
     }
 
     /// Remove binding and decrement refcount.
@@ -106,6 +112,14 @@ impl<I: IdTypes> TablePartition<I> {
     /// - `Some(true)` if binding removed and predicate deleted
     #[allow(clippy::option_if_let_else)]
     pub fn remove_binding_status(&mut self, sub_id: I::SubscriptionId) -> Option<bool> {
+        self.remove_binding_detail(sub_id)
+            .map(|removal| removal.predicate_removed)
+    }
+
+    pub(super) fn remove_binding_detail(
+        &mut self,
+        sub_id: I::SubscriptionId,
+    ) -> Option<BindingRemoval<I>> {
         let store = Arc::make_mut(&mut self.mutable_predicates);
         if let Some(binding) = store.remove_binding(sub_id) {
             let removed = store.decrement_refcount(binding.predicate_id);
@@ -119,7 +133,10 @@ impl<I: IdTypes> TablePartition<I> {
                 self.update_snapshot();
             }
 
-            Some(removed)
+            Some(BindingRemoval {
+                predicate_removed: removed,
+                user_id: binding.user_id,
+            })
         } else {
             None
         }

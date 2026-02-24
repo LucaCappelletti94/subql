@@ -15,12 +15,18 @@ use roaring::RoaringBitmap;
 #[derive(Clone, Debug)]
 pub struct UserDictionary<I: IdTypes> {
     /// UserOrdinal → UserId (dense, 0-indexed)
-    ordinal_to_user: Vec<I::UserId>,
+    ordinal_to_user: Vec<Option<I::UserId>>,
     /// UserId → UserOrdinal (for reverse lookup)
     user_to_ordinal: AHashMap<I::UserId, UserOrdinal>,
 }
 
 impl<I: IdTypes> UserDictionary<I> {
+    fn next_ordinal_for_len(len: u64) -> Result<UserOrdinal, &'static str> {
+        let ordinal =
+            u32::try_from(len).map_err(|_| "user ordinal capacity exceeded (u32::MAX)")?;
+        Ok(UserOrdinal::new(ordinal))
+    }
+
     /// Create new empty dictionary
     #[must_use]
     pub fn new() -> Self {
@@ -30,19 +36,23 @@ impl<I: IdTypes> UserDictionary<I> {
         }
     }
 
-    /// Get or create ordinal for user
-    pub fn get_or_create(&mut self, user_id: I::UserId) -> UserOrdinal {
+    /// Try to get/create ordinal for user, returning an error when capacity is exceeded.
+    pub fn try_get_or_create(&mut self, user_id: I::UserId) -> Result<UserOrdinal, &'static str> {
         if let Some(&ordinal) = self.user_to_ordinal.get(&user_id) {
-            return ordinal;
+            return Ok(ordinal);
         }
 
-        // Allocate new ordinal
-        #[allow(clippy::cast_possible_truncation)]
-        let ordinal = UserOrdinal::new(self.ordinal_to_user.len() as u32);
-        self.ordinal_to_user.push(user_id);
+        let ordinal = Self::next_ordinal_for_len(self.ordinal_to_user.len() as u64)?;
+        self.ordinal_to_user.push(Some(user_id));
         self.user_to_ordinal.insert(user_id, ordinal);
 
-        ordinal
+        Ok(ordinal)
+    }
+
+    /// Get or create ordinal for user
+    pub fn get_or_create(&mut self, user_id: I::UserId) -> UserOrdinal {
+        self.try_get_or_create(user_id)
+            .unwrap_or_else(|msg| panic!("{msg}"))
     }
 
     /// Get ordinal for user (if exists)
@@ -54,12 +64,19 @@ impl<I: IdTypes> UserDictionary<I> {
     /// Get user by ordinal
     #[must_use]
     pub fn get_user(&self, ordinal: UserOrdinal) -> Option<I::UserId> {
-        self.ordinal_to_user.get(ordinal.get() as usize).copied()
+        self.ordinal_to_user
+            .get(ordinal.get() as usize)
+            .copied()
+            .flatten()
     }
 
     /// Remove user (for cleanup)
     pub fn remove(&mut self, user_id: I::UserId) -> Option<UserOrdinal> {
-        self.user_to_ordinal.remove(&user_id)
+        let ordinal = self.user_to_ordinal.remove(&user_id)?;
+        if let Some(slot) = self.ordinal_to_user.get_mut(ordinal.get() as usize) {
+            *slot = None;
+        }
+        Some(ordinal)
     }
 
     /// Get ordinal_to_user vector for serialization
@@ -96,7 +113,13 @@ impl<I: IdTypes> Iterator for MatchedUsers<'_, I> {
 
     fn next(&mut self) -> Option<Self::Item> {
         for ord in self.bitmap_iter.by_ref() {
-            if let Some(user_id) = self.dict.ordinal_to_user.get(ord as usize).copied() {
+            if let Some(user_id) = self
+                .dict
+                .ordinal_to_user
+                .get(ord as usize)
+                .copied()
+                .flatten()
+            {
                 return Some(user_id);
             }
         }
@@ -222,6 +245,22 @@ mod tests {
     }
 
     #[test]
+    fn test_user_dictionary_next_ordinal_overflow_errors() {
+        let err = UserDictionary::<DefaultIds>::next_ordinal_for_len((u32::MAX as u64) + 1)
+            .expect_err("ordinal allocation beyond u32::MAX should fail");
+        assert!(err.contains("ordinal capacity exceeded"));
+    }
+
+    #[test]
+    fn test_user_dictionary_try_get_or_create_success() {
+        let mut dict = UserDictionary::<DefaultIds>::new();
+        let ord = dict
+            .try_get_or_create(123)
+            .expect("small dictionaries should allocate ordinals");
+        assert_eq!(ord.get(), 0);
+    }
+
+    #[test]
     fn test_user_dictionary_get() {
         let mut dict = UserDictionary::<DefaultIds>::new();
 
@@ -293,6 +332,17 @@ mod tests {
 
         dict.remove(42);
         assert_eq!(dict.get(42), None);
+    }
+
+    #[test]
+    fn test_user_dictionary_remove_clears_ordinal_lookup() {
+        let mut dict = UserDictionary::<DefaultIds>::new();
+
+        let ord = dict.get_or_create(42);
+        assert_eq!(dict.get_user(ord), Some(42));
+
+        dict.remove(42);
+        assert_eq!(dict.get_user(ord), None);
     }
 
     #[test]

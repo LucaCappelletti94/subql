@@ -10,20 +10,29 @@ use std::num::NonZeroU32;
 pub struct PredicateId(NonZeroU32);
 
 impl PredicateId {
+    /// Try to create `PredicateId` from slab index.
+    ///
+    /// Returns error when index would overflow the internal non-zero u32 layout.
+    pub fn try_from_slab_index(index: usize) -> Result<Self, &'static str> {
+        if index >= u32::MAX as usize {
+            return Err("Slab index too large");
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let raw = (index as u32) + 1;
+        match NonZeroU32::new(raw) {
+            Some(inner) => Ok(Self(inner)),
+            None => Err("Slab index too large"),
+        }
+    }
+
     /// Create PredicateId from slab index
     ///
     /// # Panics
     /// Panics if index is `usize::MAX` (reserved for None representation)
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn from_slab_index(index: usize) -> Self {
-        assert!(index < u32::MAX as usize, "Slab index too large");
-        // slab indices start at 0, but NonZeroU32 requires non-zero
-        // So we use index + 1 for storage
-        // Safety: the assert above guarantees index < u32::MAX, so index+1 is non-zero
-        #[allow(clippy::unwrap_used)]
-        let inner = NonZeroU32::new((index as u32) + 1).unwrap();
-        Self(inner)
+        Self::try_from_slab_index(index).unwrap_or_else(|msg| panic!("{msg}"))
     }
 
     /// Convert back to slab index
@@ -59,6 +68,22 @@ impl PredicateId {
             Some(value) => value,
             None => panic!("PredicateId cannot be zero"),
         }
+    }
+}
+
+impl TryFrom<u32> for PredicateId {
+    type Error = &'static str;
+
+    fn try_from(raw: u32) -> Result<Self, Self::Error> {
+        Self::try_from_u32(raw).ok_or("PredicateId cannot be zero")
+    }
+}
+
+impl TryFrom<usize> for PredicateId {
+    type Error = &'static str;
+
+    fn try_from(index: usize) -> Result<Self, Self::Error> {
+        Self::try_from_slab_index(index)
     }
 }
 
@@ -125,6 +150,29 @@ mod tests {
                 .as_u32(),
             7
         );
+    }
+
+    #[test]
+    fn test_predicate_id_try_from_slab_index_success() {
+        let pid = PredicateId::try_from_slab_index(7).expect("small slab index should construct");
+        assert_eq!(pid.as_u32(), 8);
+        assert_eq!(pid.to_slab_index(), 7);
+    }
+
+    #[test]
+    fn test_predicate_id_try_from_slab_index_overflow_errors() {
+        assert!(PredicateId::try_from_slab_index(u32::MAX as usize).is_err());
+    }
+
+    #[test]
+    fn test_predicate_id_try_from_trait() {
+        let pid = PredicateId::try_from(7_u32).expect("non-zero raw id should construct");
+        assert_eq!(pid.as_u32(), 7);
+    }
+
+    #[test]
+    fn test_predicate_id_try_from_trait_zero_errors() {
+        assert!(PredicateId::try_from(0_u32).is_err());
     }
 
     #[test]
