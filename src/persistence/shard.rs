@@ -1,11 +1,11 @@
 //! Shard format with header and validation
 
 use super::codec;
-use crate::{IdTypes, SchemaCatalog, StorageError, TableId};
+use crate::{compiler::sql_shape::QueryProjection, IdTypes, SchemaCatalog, StorageError, TableId};
 use serde::{Deserialize, Serialize};
 
 /// Shard format version
-const SHARD_VERSION: u16 = 3;
+const SHARD_VERSION: u16 = 4;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 const MAX_SHARD_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
@@ -174,6 +174,7 @@ pub struct PredicateData {
     pub bytecode_instructions: Vec<u8>, // Serialized bytecode
     pub prefilter_plan: Vec<u8>,        // Serialized prefilter plan
     pub dependency_columns: Vec<u16>,
+    pub projection: QueryProjection,
     pub refcount: u32,
     pub updated_at_unix_ms: u64,
 }

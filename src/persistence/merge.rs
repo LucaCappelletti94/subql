@@ -374,6 +374,7 @@ mod tests {
             bytecode_instructions: vec![],
             prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 1000,
         };
@@ -540,6 +541,7 @@ mod tests {
             bytecode_instructions: vec![7, 8, 9],
             prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 1000, // Older
         };
@@ -550,6 +552,7 @@ mod tests {
             bytecode_instructions: vec![7, 8, 9],
             prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 2,
             updated_at_unix_ms: 2000, // Newer
         };
@@ -597,6 +600,7 @@ mod tests {
             bytecode_instructions: vec![1],
             prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 1000,
         };
@@ -607,6 +611,7 @@ mod tests {
             bytecode_instructions: vec![2],
             prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![2],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 2000,
         };
@@ -645,6 +650,7 @@ mod tests {
             bytecode_instructions: vec![1, 2, 3],
             prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default()).unwrap(),
             dependency_columns: vec![1],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 10,
         };
@@ -1019,6 +1025,7 @@ mod tests {
             bytecode_instructions: vec![],
             prefilter_plan: prefilter,
             dependency_columns: vec![0],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 1000,
         };
@@ -1097,6 +1104,7 @@ mod tests {
             bytecode_instructions: vec![],
             prefilter_plan: prefilter.clone(),
             dependency_columns: vec![0],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 1000,
         };
@@ -1106,6 +1114,7 @@ mod tests {
             bytecode_instructions: vec![],
             prefilter_plan: prefilter,
             dependency_columns: vec![1],
+            projection: crate::compiler::sql_shape::QueryProjection::Rows,
             refcount: 1,
             updated_at_unix_ms: 1000,
         };

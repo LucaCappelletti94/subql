@@ -9,4 +9,5 @@ pub fn predicate_data_equivalent(left: &PredicateData, right: &PredicateData) ->
         && left.bytecode_instructions == right.bytecode_instructions
         && left.prefilter_plan == right.prefilter_plan
         && left.dependency_columns == right.dependency_columns
+        && left.projection == right.projection
 }
