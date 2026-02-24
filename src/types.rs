@@ -370,6 +370,16 @@ pub trait SchemaCatalog: Send + Sync {
     fn primary_key_columns(&self, _table_id: TableId) -> Option<&[ColumnId]> {
         None
     }
+
+    /// Get the value type of a column (optional, for aggregate validation).
+    ///
+    /// When this returns `Some(ColumnType::Bool | ColumnType::String)`, the
+    /// engine rejects `SUM(col)` and `AVG(col)` subscriptions at registration
+    /// with `RegisterError::UnsupportedSql`. Catalogs that cannot provide type
+    /// information should return `None` (the default), which disables the check.
+    fn column_type(&self, _table_id: TableId, _column_id: ColumnId) -> Option<ColumnType> {
+        None
+    }
 }
 
 /// Subscription registration operations
@@ -418,33 +428,68 @@ pub trait DurableShardStore: Send {
     fn snapshot_table(&self, table_id: TableId) -> Result<(), crate::StorageError>;
 }
 
-/// Aggregate dispatch — delivers signed count deltas for COUNT(*) subscriptions.
+/// Column value type for aggregate validation at registration time.
+///
+/// Returned by [`SchemaCatalog::column_type`]. Catalogs that cannot provide
+/// type information return `None` (the default), which disables type checking.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ColumnType {
+    /// 64-bit signed integer
+    Int,
+    /// 64-bit float
+    Float,
+    /// Boolean
+    Bool,
+    /// UTF-8 string
+    String,
+    /// Unknown or mixed type (treated as potentially numeric — no error)
+    Unknown,
+}
+
+/// Typed signed delta from an aggregate subscription.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AggDelta {
+    /// COUNT(*) / COUNT(column) delta — always ±1 per matching (non-NULL) row.
+    Count(i64),
+    /// SUM(column) delta — signed change in the column sum.
+    Sum(f64),
+    /// AVG(column) delta — both components needed to update a running average.
+    ///
+    /// Caller maintains `running_sum` and `running_count` separately:
+    /// ```text
+    /// running_sum   += sum_delta
+    /// running_count += count_delta
+    /// avg            = running_sum / running_count  (when running_count > 0)
+    /// ```
+    Avg { sum_delta: f64, count_delta: i64 },
+}
+
+/// Aggregate dispatch — delivers typed signed deltas for aggregate subscriptions.
 ///
 /// Separate from [`SubscriptionDispatch`] because:
 /// - UPDATE events require evaluating **both** the old row and the new row.
 /// - Returns signed deltas, not user bitmaps.
-/// - COUNT predicates are **never** included in `users()` results.
+/// - Aggregate predicates are **never** included in `users()` results.
 ///
 /// # Caller contract
 ///
 /// The engine handles only WAL-driven deltas. Callers must:
-/// 1. **Bootstrap** — query the DB for the initial count **before** subscribing.
-/// 2. **Accumulate** — `running_count += delta` on each call.
+/// 1. **Bootstrap** — query the DB for the initial aggregate **before** subscribing.
+/// 2. **Accumulate** — `running_value += delta` on each call.
 /// 3. **Reset on policy change** — RLS/ACL changes produce no WAL events;
-///    re-query the DB and replace the stored count.
+///    re-query the DB and replace the stored value.
 /// 4. **Reset on TRUNCATE** — engine returns `Err(TruncateRequiresReset)`;
-///    caller must re-query and replace the stored count.
+///    caller must re-query and replace the stored value.
 pub trait AggregateDispatch<I: IdTypes>: Send {
-    /// Compute signed count deltas for all matching COUNT(*) subscriptions.
+    /// Compute typed signed deltas for all matching aggregate subscriptions.
     ///
-    /// Returns `Vec<(UserId, delta)>` where `delta` is the signed change
-    /// in the matching row count for that user's subscription.
-    /// Zero-net entries (e.g. UPDATE where both old and new rows match) are
-    /// omitted.
-    fn count_deltas(
+    /// Returns `Vec<(UserId, AggDelta)>` where each entry is the signed change
+    /// for that user's subscription. Zero-net entries are omitted.
+    /// The same user may appear multiple times (once per aggregate kind).
+    fn aggregate_deltas(
         &mut self,
         event: &WalEvent,
-    ) -> Result<Vec<(I::UserId, i64)>, crate::DispatchError>;
+    ) -> Result<Vec<(I::UserId, AggDelta)>, crate::DispatchError>;
 }
 
 /// Background merge operations

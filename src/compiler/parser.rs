@@ -117,11 +117,12 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     // Extract SELECT ... FROM table WHERE predicate
     let (table_name, where_clause) = extract_table_and_where(stmt)?;
 
-    // Extract projection (SELECT * vs SELECT COUNT(*))
-    let projection = sql_shape::extract_projection(stmt)?;
-
     // Resolve table ID
     let table_id = resolve_table_id(&table_name, catalog)?;
+
+    // Extract projection (SELECT * vs SELECT COUNT(*) vs SELECT SUM(col))
+    // Must come after table resolution so SUM can resolve column names.
+    let projection = sql_shape::extract_projection(stmt, table_id, catalog)?;
 
     // Compile WHERE clause to bytecode
     let program = if let Some(expr) = where_clause.as_ref() {
@@ -1652,15 +1653,92 @@ mod tests {
     }
 
     #[test]
-    fn test_projection_sum_unsupported() {
+    fn test_projection_sum_known_column() {
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
 
+        // orders table: id=0, price=1, quantity=2
         let sql = "SELECT SUM(price) FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(result.is_ok(), "SUM(price) should succeed, got: {result:?}");
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(
+            projection,
+            crate::compiler::sql_shape::QueryProjection::Aggregate(
+                crate::compiler::sql_shape::AggSpec::Sum { column: 1 }
+            )
+        );
+    }
+
+    #[test]
+    fn test_projection_sum_with_alias() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT SUM(price) AS revenue FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            result.is_ok(),
+            "SUM(price) AS alias should succeed, got: {result:?}"
+        );
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(
+            projection,
+            crate::compiler::sql_shape::QueryProjection::Aggregate(
+                crate::compiler::sql_shape::AggSpec::Sum { column: 1 }
+            )
+        );
+    }
+
+    #[test]
+    fn test_projection_sum_unknown_column() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT SUM(nonexistent) FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnknownColumn { .. })),
+            "expected UnknownColumn for unknown SUM column, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_sum_star_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT SUM(*) FROM orders";
         let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
         assert!(
             matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql, got: {:?}",
+            "expected UnsupportedSql for SUM(*), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_sum_distinct_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT SUM(DISTINCT price) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for SUM(DISTINCT ...), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_sum_expression_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT SUM(price * 2) FROM orders WHERE price > 10";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for SUM(expression), got: {:?}",
             result
         );
     }
@@ -1680,16 +1758,196 @@ mod tests {
     }
 
     #[test]
-    fn test_projection_count_column_unsupported() {
+    fn test_projection_count_column_known_column() {
+        // COUNT(col) is now supported — counts non-NULL values
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
 
+        // orders table: id=0, price=1, quantity=2
         let sql = "SELECT COUNT(price) FROM orders WHERE price > 10";
         let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
         assert!(
+            result.is_ok(),
+            "COUNT(price) should succeed, got: {result:?}"
+        );
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(
+            projection,
+            crate::compiler::sql_shape::QueryProjection::Aggregate(
+                crate::compiler::sql_shape::AggSpec::CountColumn { column: 1 }
+            )
+        );
+    }
+
+    #[test]
+    fn test_projection_count_column_unknown_column() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT COUNT(nonexistent) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnknownColumn { .. })),
+            "expected UnknownColumn for unknown COUNT column, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_count_column_distinct_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT COUNT(DISTINCT price) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
             matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql, got: {:?}",
-            result
+            "expected UnsupportedSql for COUNT(DISTINCT ...), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_avg_known_column() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT AVG(price) FROM orders WHERE price > 0";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(result.is_ok(), "AVG(price) should succeed, got: {result:?}");
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(
+            projection,
+            crate::compiler::sql_shape::QueryProjection::Aggregate(
+                crate::compiler::sql_shape::AggSpec::Avg { column: 1 }
+            )
+        );
+    }
+
+    #[test]
+    fn test_projection_avg_with_alias() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT AVG(price) AS mean_price FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            result.is_ok(),
+            "AVG(price) AS alias should succeed, got: {result:?}"
+        );
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(
+            projection,
+            crate::compiler::sql_shape::QueryProjection::Aggregate(
+                crate::compiler::sql_shape::AggSpec::Avg { column: 1 }
+            )
+        );
+    }
+
+    #[test]
+    fn test_projection_avg_unknown_column() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT AVG(nonexistent) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnknownColumn { .. })),
+            "expected UnknownColumn, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_avg_expression_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT AVG(price * 2) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for AVG(expression), got: {result:?}"
+        );
+    }
+
+    // Inline typed catalog for column_type() tests
+    struct TypedMockCatalog {
+        tables: std::collections::HashMap<String, (u32, usize)>,
+        columns: std::collections::HashMap<(u32, String), u16>,
+        column_types: std::collections::HashMap<(u32, u16), crate::ColumnType>,
+    }
+    impl crate::SchemaCatalog for TypedMockCatalog {
+        fn table_id(&self, n: &str) -> Option<u32> {
+            self.tables.get(n).map(|(id, _)| *id)
+        }
+        fn column_id(&self, tid: u32, col: &str) -> Option<u16> {
+            self.columns.get(&(tid, col.to_string())).copied()
+        }
+        fn table_arity(&self, tid: u32) -> Option<usize> {
+            self.tables
+                .values()
+                .find(|(id, _)| *id == tid)
+                .map(|(_, a)| *a)
+        }
+        fn schema_fingerprint(&self, _: u32) -> Option<u64> {
+            None
+        }
+        fn column_type(&self, tid: u32, col_id: u16) -> Option<crate::ColumnType> {
+            self.column_types.get(&(tid, col_id)).copied()
+        }
+    }
+
+    fn make_typed_catalog() -> TypedMockCatalog {
+        let mut tables = std::collections::HashMap::new();
+        tables.insert("orders".to_string(), (2u32, 3usize));
+        let mut columns = std::collections::HashMap::new();
+        columns.insert((2u32, "id".to_string()), 0u16);
+        columns.insert((2u32, "amount".to_string()), 1u16);
+        columns.insert((2u32, "status".to_string()), 2u16);
+        let mut column_types = std::collections::HashMap::new();
+        column_types.insert((2u32, 1u16), crate::ColumnType::Int);
+        column_types.insert((2u32, 2u16), crate::ColumnType::String);
+        TypedMockCatalog {
+            tables,
+            columns,
+            column_types,
+        }
+    }
+
+    #[test]
+    fn test_projection_sum_non_numeric_type_rejected() {
+        let catalog = make_typed_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT SUM(status) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for SUM on String column, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_avg_non_numeric_type_rejected() {
+        let catalog = make_typed_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT AVG(status) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for AVG on String column, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_sum_numeric_type_accepted() {
+        let catalog = make_typed_catalog();
+        let dialect = PostgreSqlDialect {};
+
+        let sql = "SELECT SUM(amount) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            result.is_ok(),
+            "SUM on Int column should be accepted, got: {result:?}"
         );
     }
 }

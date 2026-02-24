@@ -11,19 +11,22 @@
 //!     .add_column(1, "status", 2);
 //! ```
 
-use crate::{ColumnId, SchemaCatalog, TableId};
+use crate::{ColumnId, ColumnType, SchemaCatalog, TableId};
 use std::collections::HashMap;
 
 /// A simple builder-style catalog for use in tests and examples.
 ///
 /// Tables and columns are registered via the builder methods
 /// [`add_table`](SimpleCatalog::add_table) and [`add_column`](SimpleCatalog::add_column).
+/// Column types can optionally be registered via [`add_column_typed`](SimpleCatalog::add_column_typed).
 #[derive(Debug, Default, Clone)]
 pub struct SimpleCatalog {
     /// name → (table_id, arity)
     tables: HashMap<String, (TableId, usize)>,
     /// (table_id, column_name) → column_id
     columns: HashMap<(TableId, String), ColumnId>,
+    /// (table_id, column_id) → ColumnType (optional)
+    column_types: HashMap<(TableId, ColumnId), ColumnType>,
 }
 
 impl SimpleCatalog {
@@ -54,6 +57,28 @@ impl SimpleCatalog {
         self.columns.insert((table_id, name.to_string()), id);
         self
     }
+
+    /// Register a column with a known type. Returns `self` for chaining.
+    ///
+    /// Enables type-checking for `SUM(col)` and `AVG(col)` at registration time.
+    /// The engine will reject non-numeric column types with `RegisterError::UnsupportedSql`.
+    ///
+    /// - `table_id`: the table this column belongs to
+    /// - `name`: the SQL column name
+    /// - `id`: the zero-based column index in a [`RowImage`](crate::RowImage)
+    /// - `col_type`: the [`ColumnType`] for aggregate validation
+    #[must_use]
+    pub fn add_column_typed(
+        mut self,
+        table_id: TableId,
+        name: &str,
+        id: ColumnId,
+        col_type: ColumnType,
+    ) -> Self {
+        self.columns.insert((table_id, name.to_string()), id);
+        self.column_types.insert((table_id, id), col_type);
+        self
+    }
 }
 
 impl SchemaCatalog for SimpleCatalog {
@@ -76,6 +101,10 @@ impl SchemaCatalog for SimpleCatalog {
 
     fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
         None
+    }
+
+    fn column_type(&self, table_id: TableId, column_id: ColumnId) -> Option<ColumnType> {
+        self.column_types.get(&(table_id, column_id)).copied()
     }
 }
 

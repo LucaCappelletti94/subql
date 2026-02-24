@@ -18,7 +18,27 @@ pub enum QueryProjection {
 pub enum AggSpec {
     /// `SELECT COUNT(*)`
     CountStar,
-    // Future: Sum { column: ColumnId }, Min { column: ColumnId }, …
+    /// `SELECT COUNT(column_name)` — counts non-NULL values; column resolved at registration.
+    CountColumn { column: crate::ColumnId },
+    /// `SELECT SUM(column_name)` — column resolved to ColumnId at registration.
+    Sum { column: crate::ColumnId },
+    /// `SELECT AVG(column_name)` — emits both sum and count deltas; column resolved at registration.
+    Avg { column: crate::ColumnId },
+}
+
+/// Extract a plain column name from a function argument, if it is a bare
+/// identifier or a two-part `table.column` compound identifier.
+/// Returns `None` for wildcards, expressions, or anything else.
+fn extract_column_arg(arg: &FunctionArg) -> Option<String> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+            Some(ident.value.clone())
+        }
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
+            parts.last().map(|p| p.value.clone())
+        }
+        _ => None,
+    }
 }
 
 /// Extract the `QueryProjection` from a parsed SELECT statement.
@@ -26,9 +46,20 @@ pub enum AggSpec {
 /// Accepts:
 /// - `SELECT *`                         → `QueryProjection::Rows`
 /// - `SELECT COUNT(*) [AS alias]`       → `QueryProjection::Aggregate(AggSpec::CountStar)`
+/// - `SELECT COUNT(col) [AS alias]`     → `QueryProjection::Aggregate(AggSpec::CountColumn { column })`
+/// - `SELECT SUM(col) [AS alias]`       → `QueryProjection::Aggregate(AggSpec::Sum { column })`
+/// - `SELECT AVG(col) [AS alias]`       → `QueryProjection::Aggregate(AggSpec::Avg { column })`
 ///
 /// Returns `Err(UnsupportedSql)` for any other projection.
-pub(super) fn extract_projection(stmt: &Statement) -> Result<QueryProjection, RegisterError> {
+/// Returns `Err(UnknownColumn)` when the aggregate column does not exist in the catalog.
+/// Returns `Err(UnsupportedSql)` when `SUM`/`AVG` is used on a non-numeric column type
+/// (only when the catalog implements [`crate::SchemaCatalog::column_type`]).
+#[allow(clippy::too_many_lines)]
+pub(super) fn extract_projection(
+    stmt: &Statement,
+    table_id: crate::TableId,
+    catalog: &dyn crate::SchemaCatalog,
+) -> Result<QueryProjection, RegisterError> {
     let select = match stmt {
         Statement::Query(query) => match query.body.as_ref() {
             SetExpr::Select(s) => s,
@@ -71,10 +102,10 @@ pub(super) fn extract_projection(stmt: &Statement) -> Result<QueryProjection, Re
 
             match func_name.as_deref() {
                 Some("count") => {
-                    // Must be COUNT(*) — no FILTER, no OVER, no DISTINCT.
+                    // Supports COUNT(*) and COUNT(column) — no FILTER, OVER, or DISTINCT.
                     if f.filter.is_some() {
                         return Err(RegisterError::UnsupportedSql(
-                            "COUNT(*) FILTER (WHERE ...) not supported".to_string(),
+                            "COUNT FILTER (WHERE ...) not supported".to_string(),
                         ));
                     }
                     if f.over.is_some() {
@@ -88,48 +119,146 @@ pub(super) fn extract_projection(stmt: &Statement) -> Result<QueryProjection, Re
                             // Reject DISTINCT
                             if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
                                 return Err(RegisterError::UnsupportedSql(
-                                    "COUNT(DISTINCT ...) not supported — only COUNT(*) is"
-                                        .to_string(),
+                                    "COUNT(DISTINCT ...) not supported".to_string(),
                                 ));
                             }
-                            // Must be exactly one arg: the wildcard `*`
-                            if list.args.len() == 1
-                                && matches!(
-                                    &list.args[0],
-                                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                                )
-                            {
+                            if list.args.len() != 1 {
+                                return Err(RegisterError::UnsupportedSql(
+                                    "COUNT requires exactly one argument".to_string(),
+                                ));
+                            }
+                            // COUNT(*) — wildcard arg
+                            if matches!(
+                                &list.args[0],
+                                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                            ) {
                                 return Ok(QueryProjection::Aggregate(AggSpec::CountStar));
                             }
-                            Err(RegisterError::UnsupportedSql(
-                                "Only COUNT(*) is supported, not COUNT(expression)".to_string(),
-                            ))
+                            // COUNT(column) — plain column identifier
+                            let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
+                                RegisterError::UnsupportedSql(
+                                    "COUNT argument must be * or a plain column name, not an expression"
+                                        .to_string(),
+                                )
+                            })?;
+                            let column = catalog
+                                .column_id(table_id, &col_name)
+                                .ok_or(RegisterError::UnknownColumn {
+                                    table_id,
+                                    column: col_name,
+                                })?;
+                            Ok(QueryProjection::Aggregate(AggSpec::CountColumn { column }))
                         }
                         _ => Err(RegisterError::UnsupportedSql(
-                            "Only COUNT(*) is supported".to_string(),
+                            "COUNT requires an argument".to_string(),
                         )),
                     }
                 }
-                Some(name @ ("sum" | "avg" | "min" | "max")) => {
+                Some(func @ ("sum" | "avg")) => {
+                    // SUM(col) and AVG(col) — no FILTER, OVER, or DISTINCT; numeric columns only.
+                    if f.filter.is_some() {
+                        return Err(RegisterError::UnsupportedSql(format!(
+                            "{}(...) FILTER (WHERE ...) not supported",
+                            func.to_uppercase()
+                        )));
+                    }
+                    if f.over.is_some() {
+                        return Err(RegisterError::UnsupportedSql(
+                            "Window functions not supported".to_string(),
+                        ));
+                    }
+
+                    let column = match &f.args {
+                        FunctionArguments::List(list) => {
+                            if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+                                return Err(RegisterError::UnsupportedSql(format!(
+                                    "{}(DISTINCT ...) not supported",
+                                    func.to_uppercase()
+                                )));
+                            }
+                            if list.args.len() != 1 {
+                                return Err(RegisterError::UnsupportedSql(format!(
+                                    "{} requires exactly one argument",
+                                    func.to_uppercase()
+                                )));
+                            }
+                            if matches!(
+                                &list.args[0],
+                                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                            ) {
+                                return Err(RegisterError::UnsupportedSql(format!(
+                                    "{}(*) is not supported — use {}(column_name)",
+                                    func.to_uppercase(),
+                                    func.to_uppercase()
+                                )));
+                            }
+                            let col_name =
+                                extract_column_arg(&list.args[0]).ok_or_else(|| {
+                                    RegisterError::UnsupportedSql(format!(
+                                        "{} argument must be a plain column name, not an expression",
+                                        func.to_uppercase()
+                                    ))
+                                })?;
+                            catalog
+                                .column_id(table_id, &col_name)
+                                .ok_or(RegisterError::UnknownColumn {
+                                    table_id,
+                                    column: col_name,
+                                })?
+                        }
+                        _ => {
+                            return Err(RegisterError::UnsupportedSql(format!(
+                                "{} requires a column argument",
+                                func.to_uppercase()
+                            )));
+                        }
+                    };
+
+                    // Reject non-numeric column types when the catalog provides type info.
+                    if let Some(col_type) = catalog.column_type(table_id, column) {
+                        match col_type {
+                            crate::ColumnType::Bool | crate::ColumnType::String => {
+                                return Err(RegisterError::UnsupportedSql(format!(
+                                    "{} requires a numeric column (Int or Float), \
+                                     but column {} has type {:?}",
+                                    func.to_uppercase(),
+                                    column,
+                                    col_type,
+                                )));
+                            }
+                            crate::ColumnType::Int
+                            | crate::ColumnType::Float
+                            | crate::ColumnType::Unknown => {}
+                        }
+                    }
+
+                    if func == "sum" {
+                        Ok(QueryProjection::Aggregate(AggSpec::Sum { column }))
+                    } else {
+                        Ok(QueryProjection::Aggregate(AggSpec::Avg { column }))
+                    }
+                }
+                Some(name @ ("min" | "max")) => {
                     Err(RegisterError::UnsupportedSql(format!(
-                        "{} aggregate not yet supported — only COUNT(*) is implemented",
+                        "{} aggregate not supported — not delta-composable; \
+                         see src/todo.md for design notes",
                         name.to_uppercase()
                     )))
                 }
                 _ => Err(RegisterError::UnsupportedSql(
-                    "Unsupported projection: only SELECT * or SELECT COUNT(*) are supported"
+                    "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), or AVG(col) are supported"
                         .to_string(),
                 )),
             }
         } else {
             Err(RegisterError::UnsupportedSql(
-                "Unsupported projection: only SELECT * or SELECT COUNT(*) are supported"
+                "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), or AVG(col) are supported"
                     .to_string(),
             ))
         }
     } else {
         Err(RegisterError::UnsupportedSql(
-            "Unsupported projection: only SELECT * or SELECT COUNT(*) are supported".to_string(),
+            "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), or AVG(col) are supported".to_string(),
         ))
     }
 }
