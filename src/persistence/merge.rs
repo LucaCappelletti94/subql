@@ -51,6 +51,13 @@ pub struct MergeManager<I: IdTypes = DefaultIds> {
 }
 
 impl<I: IdTypes> MergeManager<I> {
+    fn recv_task(receiver: &Arc<Mutex<Receiver<MergeTask<I>>>>) -> Option<MergeTask<I>> {
+        let lock = receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lock.recv().ok()
+    }
+
     /// Create new merge manager
     #[must_use]
     pub fn new() -> Self {
@@ -61,24 +68,22 @@ impl<I: IdTypes> MergeManager<I> {
             let receiver = Arc::clone(&shared_receiver);
             thread::spawn(move || {
                 loop {
-                    let task = {
-                        let lock = receiver
-                            .lock()
-                            .expect("merge worker task receiver mutex poisoned");
-                        lock.recv()
-                    };
-
-                    let Ok(task) = task else {
+                    let Some(task) = Self::recv_task(&receiver) else {
                         break;
                     };
 
                     let start = std::time::Instant::now();
-                    let result = merge_shards_impl::<I>(
-                        task.table_id,
-                        &task.shard_bytes,
-                        &*task.catalog,
-                        start,
-                    );
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        merge_shards_impl::<I>(
+                            task.table_id,
+                            &task.shard_bytes,
+                            &*task.catalog,
+                            start,
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err("Merge worker panicked while processing task".to_string())
+                    });
 
                     // Receiver may have been dropped if caller discarded the job.
                     if task.result_sender.send(result).is_err() {
@@ -174,6 +179,15 @@ impl<I: IdTypes> Default for MergeManager<I> {
 }
 
 /// Perform merge operation
+fn unix_ms_from(now: std::time::SystemTime) -> Result<u64, String> {
+    let elapsed = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("System clock is before UNIX epoch: {e}"))?;
+    u64::try_from(elapsed.as_millis())
+        .map_err(|_| format!("UNIX timestamp does not fit into u64 milliseconds: {elapsed:?}"))
+}
+
+/// Perform merge operation
 fn merge_shards_impl<I: IdTypes>(
     table_id: TableId,
     shard_bytes: &[Vec<u8>],
@@ -242,13 +256,7 @@ fn merge_shards_impl<I: IdTypes>(
 
     let output_bindings: Vec<_> = unique_bindings.into_values().collect();
 
-    // SystemTime::now() is always after UNIX_EPOCH on supported platforms;
-    // truncation from u128 to u64 is acceptable (won't overflow until year ~584M).
-    #[allow(clippy::cast_possible_truncation)]
-    let created_at_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is before UNIX epoch")
-        .as_millis() as u64;
+    let created_at_unix_ms = unix_ms_from(std::time::SystemTime::now())?;
 
     // Capture lengths before moving into payload
     let num_output_predicates = output_predicates.len();
@@ -696,6 +704,115 @@ mod tests {
         assert!(
             matches!(result, Err(MergeError::BuildFailed(ref msg)) if msg == "Thread panicked")
         );
+    }
+
+    #[test]
+    fn test_worker_panic_does_not_take_down_pool() {
+        struct PanicCatalog;
+        impl SchemaCatalog for PanicCatalog {
+            fn table_id(&self, _table_name: &str) -> Option<TableId> {
+                Some(1)
+            }
+
+            fn column_id(&self, _table_id: TableId, _column_name: &str) -> Option<u16> {
+                Some(0)
+            }
+
+            fn table_arity(&self, _table_id: TableId) -> Option<usize> {
+                Some(5)
+            }
+
+            fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
+                panic!("intentional catalog panic");
+            }
+        }
+
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
+        let catalog = make_catalog();
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![],
+            },
+            created_at_unix_ms: 1000,
+        };
+        let shard = serialize_shard(1, &payload, &catalog).unwrap();
+
+        for _ in 0..MERGE_WORKER_COUNT {
+            manager
+                .merge_shards_background(1, vec![shard.clone()], Box::new(PanicCatalog))
+                .expect("panic task should be enqueued");
+        }
+
+        // Let panic tasks run.
+        thread::sleep(Duration::from_millis(200));
+
+        let healthy_job = manager
+            .merge_shards_background(1, vec![shard], Box::new(make_catalog()))
+            .expect("worker pool should remain available after task panic");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match manager.try_get_result(healthy_job) {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => panic!("healthy job did not complete before timeout"),
+                Err(e) => panic!("healthy job should not fail after panic recovery: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn recv_task_recovers_from_poisoned_mutex() {
+        let (task_tx, task_rx) = mpsc::channel::<MergeTask<DefaultIds>>();
+        let receiver = Arc::new(Mutex::new(task_rx));
+
+        let poison_target = Arc::clone(&receiver);
+        let _ = thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("poison receiver mutex");
+        })
+        .join();
+
+        assert!(
+            receiver.lock().is_err(),
+            "receiver mutex should be poisoned"
+        );
+
+        let (result_sender, _result_receiver) =
+            mpsc::channel::<Result<MergedShard<DefaultIds>, String>>();
+        task_tx
+            .send(MergeTask {
+                table_id: 1,
+                shard_bytes: Vec::new(),
+                catalog: Box::new(make_catalog()),
+                result_sender,
+            })
+            .unwrap();
+
+        let received = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            MergeManager::<DefaultIds>::recv_task(&receiver)
+        }));
+        assert!(received.is_ok(), "poisoned mutex should not panic");
+        assert!(received.unwrap().is_some(), "task should still be received");
+    }
+
+    #[test]
+    fn unix_ms_from_rejects_pre_epoch_time() {
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(Duration::from_millis(1))
+            .expect("pre-epoch timestamp should be representable");
+        let err = unix_ms_from(before_epoch).expect_err("pre-epoch time should be rejected");
+        assert!(err.contains("before UNIX epoch"));
+    }
+
+    #[test]
+    fn unix_ms_from_accepts_epoch() {
+        let ts = unix_ms_from(std::time::UNIX_EPOCH).expect("epoch should convert");
+        assert_eq!(ts, 0);
     }
 
     #[test]
