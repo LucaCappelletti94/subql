@@ -55,14 +55,9 @@ impl WalParser for DebeziumParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let env: Option<DebeziumEnvelope> = super::parse_json_message_or_tombstone(data)?;
-        let Some(env) = env else {
-            // Debezium Kafka topics may emit tombstone messages ("null") for compaction.
-            return Ok(Vec::new());
-        };
-
-        let event = convert_debezium_envelope(&env, catalog)?;
-        Ok(vec![event])
+        super::parse_single_json_event::<DebeziumEnvelope, _>(data, |env| {
+            convert_debezium_envelope(env, catalog)
+        })
     }
 }
 

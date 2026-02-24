@@ -53,6 +53,22 @@ where
     parse_json_message(data)
 }
 
+/// Parse tombstone-capable JSON and map a non-null message into a single event.
+pub(crate) fn parse_single_json_event<T, F>(
+    data: &[u8],
+    build_event: F,
+) -> Result<Vec<WalEvent>, WalParseError>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce(&T) -> Result<WalEvent, WalParseError>,
+{
+    let message: Option<T> = parse_json_message_or_tombstone(data)?;
+    let Some(message) = message else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![build_event(&message)?])
+}
+
 /// Errors that can occur during WAL message parsing.
 #[derive(Error, Clone, Debug)]
 pub enum WalParseError {
@@ -508,5 +524,25 @@ mod tests {
         let parsed: Option<serde_json::Value> =
             parse_json_message_or_tombstone(br#"{"x":1}"#).expect("object should parse");
         assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn test_parse_single_json_event_tombstone_returns_empty() {
+        let events = parse_single_json_event::<serde_json::Value, _>(b"null", |_| {
+            Ok(truncate_event(1))
+        })
+        .expect("tombstone should be ignored");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_parse_single_json_event_wraps_one_event() {
+        let events = parse_single_json_event::<serde_json::Value, _>(br#"{"x":1}"#, |_| {
+            Ok(truncate_event(7))
+        })
+        .expect("object should parse");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].table_id, 7);
+        assert_eq!(events[0].kind, EventKind::Truncate);
     }
 }

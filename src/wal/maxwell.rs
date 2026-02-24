@@ -56,14 +56,9 @@ impl WalParser for MaxwellParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let msg: Option<MaxwellMessage> = super::parse_json_message_or_tombstone(data)?;
-        let Some(msg) = msg else {
-            // Maxwell topics may emit tombstone messages ("null") for compaction.
-            return Ok(Vec::new());
-        };
-
-        let event = convert_maxwell_message(&msg, catalog)?;
-        Ok(vec![event])
+        super::parse_single_json_event::<MaxwellMessage, _>(data, |msg| {
+            convert_maxwell_message(msg, catalog)
+        })
     }
 }
 

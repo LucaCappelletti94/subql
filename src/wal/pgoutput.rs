@@ -18,7 +18,7 @@ use super::{
     build_pk_from_resolved_strict, delete_event, insert_event, pk_from_catalog_or_empty,
     resolve_table, truncate_event, update_event_with_old_row_completeness, WalParseError, WalParser,
 };
-use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId, WalEvent};
+use crate::{Cell, ColumnId, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 #[cfg(test)]
 use crate::EventKind;
 
@@ -385,26 +385,32 @@ impl PgOutputParser {
     }
 
     /// Parse a TupleData section, returning a `RowImage` and resolved pairs.
-    fn parse_tuple_data(
+    fn parse_tuple_data_with_positions(
         cur: &mut Cursor<'_>,
         rel: &CachedRelation,
+        positions: &[usize],
+        context: &str,
     ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-        let num_columns = Self::parse_column_count(cur.read_i16()?, "TupleData")?;
-        if num_columns > rel.columns.len() || num_columns > rel.column_ids.len() {
+        if positions.len() > rel.columns.len() || positions.len() > rel.column_ids.len() {
             return Err(WalParseError::MalformedPayload(format!(
-                "tuple column count {} exceeds relation column count {}",
-                num_columns,
+                "{context} column count {} exceeds relation column count {}",
+                positions.len(),
                 rel.columns.len()
             )));
         }
 
         let mut cells = vec![Cell::Missing; rel.arity];
-        let mut resolved = Vec::with_capacity(num_columns);
+        let mut resolved = Vec::with_capacity(positions.len());
 
-        for i in 0..num_columns {
-            let cell = Self::parse_tuple_cell(cur, rel.columns[i].type_oid)?;
-
-            let col_id = rel.column_ids[i];
+        for &rel_idx in positions {
+            if rel_idx >= rel.columns.len() || rel_idx >= rel.column_ids.len() {
+                return Err(WalParseError::MalformedPayload(format!(
+                    "{context} column index {rel_idx} is out of bounds for relation column count {}",
+                    rel.columns.len()
+                )));
+            }
+            let cell = Self::parse_tuple_cell(cur, rel.columns[rel_idx].type_oid)?;
+            let col_id = rel.column_ids[rel_idx];
             if (col_id as usize) < rel.arity {
                 cells[col_id as usize] = cell.clone();
             }
@@ -417,6 +423,15 @@ impl PgOutputParser {
             },
             resolved,
         ))
+    }
+
+    fn parse_tuple_data(
+        cur: &mut Cursor<'_>,
+        rel: &CachedRelation,
+    ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
+        let num_columns = Self::parse_column_count(cur.read_i16()?, "TupleData")?;
+        let positions: Vec<usize> = (0..num_columns).collect();
+        Self::parse_tuple_data_with_positions(cur, rel, &positions, "tuple")
     }
 
     fn parse_tuple_cell(cur: &mut Cursor<'_>, type_oid: u32) -> Result<Cell, WalParseError> {
@@ -472,24 +487,24 @@ impl PgOutputParser {
             )));
         };
 
-        let mut cells = vec![Cell::Missing; rel.arity];
-        let mut resolved = Vec::with_capacity(num_columns);
+        Self::parse_tuple_data_with_positions(cur, rel, &mapped_positions, "key tuple")
+    }
 
-        for rel_idx in mapped_positions {
-            let cell = Self::parse_tuple_cell(cur, rel.columns[rel_idx].type_oid)?;
-            let col_id = rel.column_ids[rel_idx];
-            if (col_id as usize) < rel.arity {
-                cells[col_id as usize] = cell.clone();
-            }
-            resolved.push((col_id, cell));
+    fn pk_from_old_resolved(
+        rel: &CachedRelation,
+        old_resolved: &[(ColumnId, Cell)],
+    ) -> Result<PrimaryKey, WalParseError> {
+        if rel.identity_columns.is_empty() {
+            let pk_col_ids: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
+            build_pk_from_resolved_strict(old_resolved, &pk_col_ids, "old tuple fallback key")
+        } else {
+            let pk_col_ids: Vec<ColumnId> = rel
+                .identity_columns
+                .iter()
+                .map(|&i| rel.column_ids[i])
+                .collect();
+            build_pk_from_resolved_strict(old_resolved, &pk_col_ids, "replica identity")
         }
-
-        Ok((
-            RowImage {
-                cells: Arc::from(cells),
-            },
-            resolved,
-        ))
     }
 
     /// Handle Insert message.
@@ -549,19 +564,8 @@ impl PgOutputParser {
         let pk = if old_resolved.is_empty() {
             // No old row — extract PK from new row via catalog
             pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?
-        } else if rel.identity_columns.is_empty() {
-            // No identity columns marked — use old tuple values as fallback key.
-            // Require concrete values to avoid emitting PKs containing Missing.
-            let pk_col_ids: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
-            build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "old tuple fallback key")?
         } else {
-            // Use identity columns from old row
-            let pk_col_ids: Vec<ColumnId> = rel
-                .identity_columns
-                .iter()
-                .map(|&i| rel.column_ids[i])
-                .collect();
-            build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "replica identity")?
+            Self::pk_from_old_resolved(&rel, &old_resolved)?
         };
 
         let old_row_complete = old_row
@@ -601,19 +605,7 @@ impl PgOutputParser {
         };
 
         // PK from identity columns
-        let pk = if rel.identity_columns.is_empty() {
-            // No identity columns — use old tuple values as fallback key.
-            // Require concrete values to avoid emitting PKs containing Missing.
-            let pk_col_ids: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
-            build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "old tuple fallback key")?
-        } else {
-            let pk_col_ids: Vec<ColumnId> = rel
-                .identity_columns
-                .iter()
-                .map(|&i| rel.column_ids[i])
-                .collect();
-            build_pk_from_resolved_strict(&old_resolved, &pk_col_ids, "replica identity")?
-        };
+        let pk = Self::pk_from_old_resolved(&rel, &old_resolved)?;
 
         Ok(delete_event(rel.table_id, pk, old_row))
     }
@@ -1786,6 +1778,48 @@ mod tests {
             .parse_wal_message(&delete_msg, &catalog)
             .expect_err("missing old tuple value should fail for fallback PK");
         assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn update_no_identity_columns_uses_full_old_tuple_as_pk() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        let no_identity_cols: Vec<(&str, u32, u8)> = vec![
+            ("id", 23, 0),
+            ("customer", 25, 0),
+            ("amount", 1700, 0),
+            ("status", 25, 0),
+        ];
+        let rel_msg = build_relation_msg(16384, "public", "orders", &no_identity_cols);
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let update_msg = build_update_msg_with_old(
+            16384,
+            b'O',
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Text("99.95".into()),
+                TupleCol::Text("pending".into()),
+            ],
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Text("alice".into()),
+                TupleCol::Text("120.00".into()),
+                TupleCol::Text("paid".into()),
+            ],
+        );
+
+        let events = parser
+            .parse_wal_message(&update_msg, &catalog)
+            .expect("update should parse");
+
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.pk.columns.len(), 4);
     }
 
     #[test]
