@@ -333,7 +333,22 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         guard.contains(&table_id)
     }
 
-    /// Create new subscription engine
+    /// Create new subscription engine.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{DefaultIds, SimpleCatalog, SubscriptionEngine};
+    ///
+    /// let catalog = Arc::new(SimpleCatalog::new().add_table("orders", 1, 1));
+    ///
+    /// let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    ///
+    /// assert_eq!(engine.subscription_count(), 0);
+    /// ```
     #[must_use]
     pub fn new(catalog: Arc<dyn SchemaCatalog>, dialect: D) -> Self {
         Self {
@@ -382,10 +397,50 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         Ok(engine)
     }
 
-    /// Register a new subscription
+    /// Register a new subscription.
     ///
     /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds user.
     /// If storage is enabled and rotation threshold is exceeded, triggers snapshot.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionSpec};
+    ///
+    /// let catalog = Arc::new(
+    ///     SimpleCatalog::new()
+    ///         .add_table("orders", 1, 3)
+    ///         .add_column(1, "id", 0)
+    ///         .add_column(1, "amount", 1)
+    ///         .add_column(1, "status", 2),
+    /// );
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    ///
+    /// let first = engine.register(SubscriptionSpec {
+    ///     subscription_id: 1,
+    ///     user_id: 10,
+    ///     session_id: None,
+    ///     sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+    ///     updated_at_unix_ms: 1_704_067_200_000,
+    /// })?;
+    ///
+    /// let second = engine.register(SubscriptionSpec {
+    ///     subscription_id: 2,
+    ///     user_id: 20,
+    ///     session_id: None,
+    ///     sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+    ///     updated_at_unix_ms: 1_704_067_200_001,
+    /// })?;
+    ///
+    /// assert!(first.created_new_predicate);
+    /// assert!(!second.created_new_predicate);
+    /// assert_eq!(engine.predicate_count(1), 1);
+    /// assert_eq!(engine.subscription_count(), 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[allow(clippy::needless_pass_by_value)]
     pub fn register(&mut self, spec: SubscriptionSpec<I>) -> Result<RegisterResult, RegisterError> {
         // 1. Parse, compile, and canonicalize in one pass.
@@ -463,7 +518,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         })
     }
 
-    /// Register multiple subscriptions in a single batch
+    /// Register multiple subscriptions in a single batch.
     ///
     /// Significantly more efficient than calling `register()` in a loop:
     /// performs a single COW clone and single snapshot swap per table instead
@@ -472,6 +527,59 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// Returns results in the same order as the input specs.
     /// In required durability mode, pre-commit snapshot failures are rolled back.
     /// Post-commit directory fsync failures are surfaced but not rolled back.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionSpec};
+    ///
+    /// let catalog = Arc::new(
+    ///     SimpleCatalog::new()
+    ///         .add_table("orders", 1, 3)
+    ///         .add_column(1, "id", 0)
+    ///         .add_column(1, "amount", 1)
+    ///         .add_column(1, "status", 2),
+    /// );
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    ///
+    /// let results = engine.register_batch(vec![
+    ///     SubscriptionSpec {
+    ///         subscription_id: 1,
+    ///         user_id: 10,
+    ///         session_id: None,
+    ///         sql: "SELECT * FROM orders WHERE status = 'paid'".to_string(),
+    ///         updated_at_unix_ms: 1_704_067_200_000,
+    ///     },
+    ///     SubscriptionSpec {
+    ///         subscription_id: 2,
+    ///         user_id: 11,
+    ///         session_id: None,
+    ///         sql: "SELECT * FROM orders WHERE status = 'paid'".to_string(),
+    ///         updated_at_unix_ms: 1_704_067_200_001,
+    ///     },
+    ///     SubscriptionSpec {
+    ///         subscription_id: 3,
+    ///         user_id: 12,
+    ///         session_id: None,
+    ///         sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+    ///         updated_at_unix_ms: 1_704_067_200_002,
+    ///     },
+    /// ]);
+    ///
+    /// let results: Vec<_> = results
+    ///     .into_iter()
+    ///     .collect::<Result<Vec<_>, _>>()?;
+    ///
+    /// assert!(results[0].created_new_predicate);
+    /// assert!(!results[1].created_new_predicate);
+    /// assert!(results[2].created_new_predicate);
+    /// assert_eq!(engine.predicate_count(1), 2);
+    /// assert_eq!(engine.subscription_count(), 3);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[allow(clippy::too_many_lines)]
     pub fn register_batch(
         &mut self,
@@ -726,7 +834,51 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         None
     }
 
-    /// Dispatch event to interested users
+    /// Dispatch event to interested users.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine,
+    ///     SubscriptionSpec, WalEvent,
+    /// };
+    ///
+    /// let catalog = Arc::new(
+    ///     SimpleCatalog::new()
+    ///         .add_table("orders", 1, 3)
+    ///         .add_column(1, "id", 0)
+    ///         .add_column(1, "amount", 1)
+    ///         .add_column(1, "status", 2),
+    /// );
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    ///
+    /// engine.register(SubscriptionSpec {
+    ///     subscription_id: 7,
+    ///     user_id: 42,
+    ///     session_id: None,
+    ///     sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+    ///     updated_at_unix_ms: 1_704_067_200_000,
+    /// })?;
+    ///
+    /// let event = WalEvent {
+    ///     kind: EventKind::Insert,
+    ///     table_id: 1,
+    ///     pk: PrimaryKey::empty(),
+    ///     old_row: None,
+    ///     new_row: Some(RowImage {
+    ///         cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("paid".into())]),
+    ///     }),
+    ///     changed_columns: Arc::from([]),
+    /// };
+    ///
+    /// let users: Vec<u64> = engine.users(&event)?.collect();
+    /// assert_eq!(users, vec![42]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn users(&mut self, event: &WalEvent) -> Result<MatchedUsers<'_, I>, DispatchError> {
         // Get table partition
         let partition = self
@@ -777,6 +929,53 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///   re-query the DB and replace the stored value.
     /// - Reset on TRUNCATE: engine returns `Err(TruncateRequiresReset)`;
     ///   caller must re-query and replace.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     AggDelta, Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog,
+    ///     SubscriptionEngine, SubscriptionSpec, WalEvent,
+    /// };
+    ///
+    /// let catalog = Arc::new(
+    ///     SimpleCatalog::new()
+    ///         .add_table("orders", 1, 2)
+    ///         .add_column(1, "id", 0)
+    ///         .add_column(1, "status", 1),
+    /// );
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    ///
+    /// engine.register(SubscriptionSpec {
+    ///     subscription_id: 1,
+    ///     user_id: 99,
+    ///     session_id: None,
+    ///     sql: "SELECT COUNT(*) FROM orders WHERE status = 'paid'".to_string(),
+    ///     updated_at_unix_ms: 1_704_067_200_000,
+    /// })?;
+    ///
+    /// let event = WalEvent {
+    ///     kind: EventKind::Insert,
+    ///     table_id: 1,
+    ///     pk: PrimaryKey::empty(),
+    ///     old_row: None,
+    ///     new_row: Some(RowImage {
+    ///         cells: Arc::from([Cell::Int(1), Cell::String("paid".into())]),
+    ///     }),
+    ///     changed_columns: Arc::from([]),
+    /// };
+    ///
+    /// let deltas = engine.aggregate_deltas(&event)?;
+    /// assert_eq!(deltas, vec![(99, AggDelta::Count(1))]);
+    ///
+    /// // Aggregate subscriptions are handled by `aggregate_deltas()`, not `users()`.
+    /// let users: Vec<u64> = engine.users(&event)?.collect();
+    /// assert!(users.is_empty());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn aggregate_deltas(
         &mut self,
         event: &WalEvent,
