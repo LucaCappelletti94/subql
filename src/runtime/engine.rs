@@ -2,7 +2,9 @@
 
 use super::indexes::IndexableAtom;
 use super::{
-    dispatch::{dispatch_users, dispatch_users_with_row, select_event_row, MatchedUsers, UserDictionary},
+    dispatch::{
+        dispatch_users, dispatch_users_with_row, select_event_row, MatchedUsers, UserDictionary,
+    },
     ids::{PredicateId, UserOrdinal},
     partition::TablePartition,
     predicate::{Binding, Predicate},
@@ -20,8 +22,8 @@ use crate::{
             UserDictData,
         },
     },
-    DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, EventKind, IdTypes, MergeError,
-    MergeJobId, MergeReport, PruneReport, RegisterError, RegisterResult, SchemaCatalog,
+    DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, EventKind, IdTypes,
+    MergeError, MergeJobId, MergeReport, PruneReport, RegisterError, RegisterResult, SchemaCatalog,
     StorageError, SubscriptionDispatch, SubscriptionPruning, SubscriptionRegistration,
     SubscriptionSpec, TableId, WalEvent,
 };
@@ -1008,7 +1010,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let mut user_dict = UserDictionary::<I>::new();
 
         for user_id in &payload.user_dict.ordinal_to_user {
-            user_dict.get_or_create(*user_id);
+            user_dict
+                .try_get_or_create(*user_id)
+                .map_err(|e| RebuildPayloadError::Corrupt(e.to_string()))?;
         }
 
         // Build hash -> predicate map and validate binding references.
@@ -1031,6 +1035,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         // Build bindings grouped by predicate hash; IDs are assigned during add_batch.
         let mut bindings_by_hash: AHashMap<u128, Vec<Binding<I>>> = AHashMap::new();
+        let mut users_with_bindings = AHashSet::new();
         for binding_data in &payload.bindings {
             if !pred_hash_to_data.contains_key(&binding_data.predicate_hash) {
                 return Err(RebuildPayloadError::Corrupt(format!(
@@ -1039,7 +1044,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 )));
             }
 
-            let user_ord = user_dict.get_or_create(binding_data.user_id);
+            let user_ord = user_dict
+                .try_get_or_create(binding_data.user_id)
+                .map_err(|e| RebuildPayloadError::Corrupt(e.to_string()))?;
+            users_with_bindings.insert(binding_data.user_id);
             bindings_by_hash
                 .entry(binding_data.predicate_hash)
                 .or_default()
@@ -1053,8 +1061,15 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 });
         }
 
+        for user_id in &payload.user_dict.ordinal_to_user {
+            if !users_with_bindings.contains(user_id) {
+                let _ = user_dict.remove(*user_id);
+            }
+        }
+
         // Build batch entries from predicates + grouped bindings.
-        let mut chosen_predicates: Vec<&PredicateData> = pred_hash_to_data.values().copied().collect();
+        let mut chosen_predicates: Vec<&PredicateData> =
+            pred_hash_to_data.values().copied().collect();
         chosen_predicates.sort_unstable_by_key(|pred_data| pred_data.hash);
 
         let mut entries: BatchEntries<I> = Vec::new();
@@ -1300,9 +1315,44 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         &mut self,
         job_id: MergeJobId,
     ) -> Result<Option<MergeReport>, MergeError> {
-        let Some(merged) = self.merge_manager.try_get_result(job_id)? else {
+        let Some(mut merged) = self.merge_manager.try_get_result(job_id)? else {
             return Ok(None);
         };
+
+        let had_live_table_state = self.partitions.contains_key(&merged.table_id)
+            || self.user_dictionaries.contains_key(&merged.table_id);
+        if had_live_table_state {
+            let live_subscriptions: AHashSet<I::SubscriptionId> = self
+                .partitions
+                .get(&merged.table_id)
+                .map(|partition| {
+                    let snapshot = partition.load_snapshot();
+                    snapshot.predicates.bindings.keys().copied().collect()
+                })
+                .unwrap_or_default();
+
+            merged
+                .payload
+                .bindings
+                .retain(|binding| live_subscriptions.contains(&binding.subscription_id));
+
+            let merged_subscriptions: AHashSet<I::SubscriptionId> = merged
+                .payload
+                .bindings
+                .iter()
+                .map(|binding| binding.subscription_id)
+                .collect();
+            let missing_count = live_subscriptions
+                .iter()
+                .filter(|sub_id| !merged_subscriptions.contains(sub_id))
+                .count();
+            if missing_count > 0 {
+                return Err(MergeError::BuildFailed(format!(
+                    "merge payload missing live subscriptions for table {}: {} missing live subscriptions",
+                    merged.table_id, missing_count
+                )));
+            }
+        }
 
         self.rebuild_and_replace_table_state(merged.table_id, &merged.payload)
             .map_err(|e| MergeError::BuildFailed(e.to_string()))?;
@@ -2334,10 +2384,7 @@ mod tests {
         };
 
         let result = engine.users(&event);
-        assert!(matches!(
-            result,
-            Err(DispatchError::UnknownTableArity(1))
-        ));
+        assert!(matches!(result, Err(DispatchError::UnknownTableArity(1))));
     }
 
     #[test]
@@ -3037,8 +3084,12 @@ mod tests {
         std::fs::write(temp_dir.path().join("not_a_table_id.shard"), b"junk").unwrap();
 
         let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
-            SubscriptionEngine::with_storage(catalog, PostgreSqlDialect {}, temp_dir.path().to_path_buf())
-                .expect("invalid shard filename should be ignored");
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .expect("invalid shard filename should be ignored");
         assert_eq!(engine.subscription_count(), 0);
     }
 
@@ -3608,7 +3659,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_complete_merge_replaces_table_state() {
+    fn test_try_complete_merge_rejects_payload_missing_live_subscriptions() {
         use tempfile::TempDir;
 
         let catalog = make_catalog();
@@ -3627,6 +3678,7 @@ mod tests {
             .unwrap();
 
         // Build merged shard state: amount < 50 for user 99.
+        // It does not contain the currently-live subscription_id=1.
         let (_table_id, program, normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount < 50",
             &PostgreSqlDialect {},
@@ -3667,6 +3719,87 @@ mod tests {
             .merge_shards_background(1, &[shard_path])
             .expect("merge job should start");
 
+        let mut saw_failure = false;
+        for _ in 0..100 {
+            match engine.try_complete_merge(job_id) {
+                Ok(Some(_)) => {
+                    panic!("merge should not succeed when payload omits live subscriptions");
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(MergeError::BuildFailed(message)) => {
+                    assert!(
+                        message.contains("missing live subscriptions"),
+                        "unexpected merge failure: {message}"
+                    );
+                    saw_failure = true;
+                    break;
+                }
+                Err(other) => {
+                    panic!("unexpected merge error: {other:?}");
+                }
+            }
+        }
+        assert!(
+            saw_failure,
+            "merge job did not report expected safety failure"
+        );
+
+        assert_eq!(engine.subscription_count(), 1);
+        assert!(engine.unregister_subscription(1));
+        assert!(!engine.unregister_subscription(2));
+    }
+
+    #[test]
+    fn test_try_complete_merge_prunes_unbound_users_from_dictionary() {
+        use tempfile::TempDir;
+
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
+
+        let (_table_id, program, normalized) = crate::compiler::parse_compile_and_normalize(
+            "SELECT * FROM orders WHERE amount < 50",
+            &PostgreSqlDialect {},
+            &*catalog,
+        )
+        .unwrap();
+        let hash = canonicalize::hash_sql(&normalized);
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![PredicateData {
+                hash,
+                normalized_sql: normalized,
+                bytecode_instructions: codec::serialize(&program).unwrap(),
+                prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
+                    .unwrap(),
+                dependency_columns: program.dependency_columns.clone(),
+                refcount: 1,
+                updated_at_unix_ms: 2,
+            }],
+            bindings: vec![BindingData {
+                subscription_id: 2,
+                predicate_hash: hash,
+                user_id: 99,
+                session_id: None,
+                updated_at_unix_ms: 2,
+            }],
+            user_dict: UserDictData {
+                // 123 has no binding and must be pruned after merge completion.
+                ordinal_to_user: vec![99, 123],
+            },
+            created_at_unix_ms: 2,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let shard_path = tmp.path().join("table_1_merged.shard");
+        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        std::fs::write(&shard_path, shard_bytes).unwrap();
+
+        let job_id = engine
+            .merge_shards_background(1, &[shard_path])
+            .expect("merge job should start");
+
         let mut report = None;
         for _ in 0..100 {
             report = engine.try_complete_merge(job_id).unwrap();
@@ -3677,8 +3810,99 @@ mod tests {
         }
         assert!(report.is_some(), "merge job did not complete in time");
 
-        assert_eq!(engine.subscription_count(), 1);
-        assert!(!engine.unregister_subscription(1)); // old state replaced
-        assert!(engine.unregister_subscription(2));
+        let event = WalEvent {
+            kind: EventKind::Truncate,
+            table_id: 1,
+            pk: PrimaryKey::empty(),
+            old_row: None,
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let mut users: Vec<_> = engine
+            .users(&event)
+            .expect("truncate should dispatch")
+            .collect();
+        users.sort_unstable();
+        assert_eq!(users, vec![99]);
+    }
+
+    #[test]
+    fn test_try_complete_merge_does_not_resurrect_unregistered_subscription() {
+        use tempfile::TempDir;
+
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
+
+        // Simulate a stale shard that still contains subscription 1.
+        let (_table_id, program, normalized) = crate::compiler::parse_compile_and_normalize(
+            "SELECT * FROM orders WHERE amount > 100",
+            &PostgreSqlDialect {},
+            &*catalog,
+        )
+        .unwrap();
+        let hash = canonicalize::hash_sql(&normalized);
+        let stale_payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![PredicateData {
+                hash,
+                normalized_sql: normalized,
+                bytecode_instructions: codec::serialize(&program).unwrap(),
+                prefilter_plan: codec::serialize(&crate::compiler::PrefilterPlan::default())
+                    .unwrap(),
+                dependency_columns: program.dependency_columns.clone(),
+                refcount: 1,
+                updated_at_unix_ms: 1,
+            }],
+            bindings: vec![BindingData {
+                subscription_id: 1,
+                predicate_hash: hash,
+                user_id: 42,
+                session_id: None,
+                updated_at_unix_ms: 1,
+            }],
+            user_dict: UserDictData {
+                ordinal_to_user: vec![42],
+            },
+            created_at_unix_ms: 1,
+        };
+
+        // Live state explicitly removes subscription 1.
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 1,
+            })
+            .unwrap();
+        assert!(engine.unregister_subscription(1));
+        assert_eq!(engine.subscription_count(), 0);
+
+        let tmp = TempDir::new().unwrap();
+        let shard_path = tmp.path().join("table_1_stale.shard");
+        let shard_bytes = serialize_shard::<DefaultIds>(1, &stale_payload, &*catalog).unwrap();
+        std::fs::write(&shard_path, shard_bytes).unwrap();
+
+        let job_id = engine
+            .merge_shards_background(1, &[shard_path])
+            .expect("merge job should start");
+
+        let mut report = None;
+        for _ in 0..100 {
+            report = engine.try_complete_merge(job_id).unwrap();
+            if report.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(report.is_some(), "merge job did not complete in time");
+
+        assert_eq!(engine.subscription_count(), 0);
+        assert!(
+            !engine.unregister_subscription(1),
+            "stale merge payload must not resurrect deleted subscription"
+        );
     }
 }
