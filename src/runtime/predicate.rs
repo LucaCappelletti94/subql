@@ -66,8 +66,8 @@ impl<I: IdTypes> Copy for Binding<I> {}
 pub struct PredicateStore<I: IdTypes> {
     /// Slab-allocated predicates (stable IDs)
     pub predicates: Slab<Predicate>,
-    /// Hash → PredicateId (for deduplication)
-    pub hash_index: AHashMap<PredicateHash, PredicateId>,
+    /// Hash → candidate PredicateIds (for deduplication with collision checks)
+    pub hash_index: AHashMap<PredicateHash, Vec<PredicateId>>,
     /// SubscriptionId → Binding
     pub bindings: AHashMap<I::SubscriptionId, Binding<I>>,
     /// SessionId → `Vec<SubscriptionId>` (for session cleanup)
@@ -104,7 +104,21 @@ impl<I: IdTypes> PredicateStore<I> {
     /// Find predicate by hash (for deduplication)
     #[must_use]
     pub fn find_by_hash(&self, hash: PredicateHash) -> Option<PredicateId> {
-        self.hash_index.get(&hash).copied()
+        self.hash_index.get(&hash).and_then(|ids| ids.first().copied())
+    }
+
+    /// Find predicate by hash and normalized SQL.
+    #[must_use]
+    pub fn find_by_hash_and_sql(
+        &self,
+        hash: PredicateHash,
+        normalized_sql: &str,
+    ) -> Option<PredicateId> {
+        let ids = self.hash_index.get(&hash)?;
+        ids.iter().copied().find(|id| {
+            self.get_predicate(*id)
+                .is_some_and(|pred| pred.normalized_sql.as_ref() == normalized_sql)
+        })
     }
 
     /// Get predicate by ID
@@ -129,7 +143,7 @@ impl<I: IdTypes> PredicateStore<I> {
         predicate.id = id;
 
         entry.insert(predicate);
-        self.hash_index.insert(hash, id);
+        self.hash_index.entry(hash).or_default().push(id);
 
         id
     }
@@ -168,7 +182,12 @@ impl<I: IdTypes> PredicateStore<I> {
     /// Remove predicate completely
     fn remove_predicate(&mut self, id: PredicateId) {
         if let Some(pred) = self.predicates.try_remove(id.to_slab_index()) {
-            self.hash_index.remove(&pred.hash);
+            if let Some(ids) = self.hash_index.get_mut(&pred.hash) {
+                ids.retain(|existing| *existing != id);
+                if ids.is_empty() {
+                    self.hash_index.remove(&pred.hash);
+                }
+            }
             self.predicate_users.remove(&id);
         }
     }
@@ -501,5 +520,32 @@ mod tests {
             .expect("hash index should contain inserted predicate");
         assert_eq!(by_hash, returned_id);
         assert!(store.get_predicate(by_hash).is_some());
+    }
+
+    #[test]
+    fn test_hash_collision_lookup_uses_normalized_sql() {
+        let mut store = PredicateStore::<DefaultIds>::new();
+
+        let mut pred1 = make_predicate(0, 0x00C0_FFEE, 1);
+        pred1.normalized_sql = "amount > 100".into();
+        let id1 = store.add_predicate(pred1);
+
+        let mut pred2 = make_predicate(1, 0x00C0_FFEE, 1);
+        pred2.normalized_sql = "status = 'paid'".into();
+        let id2 = store.add_predicate(pred2);
+
+        assert_eq!(
+            store.find_by_hash_and_sql(0x00C0_FFEE, "amount > 100"),
+            Some(id1)
+        );
+        assert_eq!(
+            store.find_by_hash_and_sql(0x00C0_FFEE, "status = 'paid'"),
+            Some(id2)
+        );
+        assert_eq!(
+            store.find_by_hash_and_sql(0x00C0_FFEE, "amount > 0"),
+            None,
+            "different SQL under same hash must not be treated as equivalent"
+        );
     }
 }
