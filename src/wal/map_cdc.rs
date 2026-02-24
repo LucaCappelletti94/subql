@@ -4,7 +4,8 @@ use super::pg_type::infer_cell_from_json_strict;
 use super::row_build::build_row_from_map_with;
 use super::{
     build_pk_from_resolved, delete_event, insert_event, pk_from_catalog_or_empty,
-    strict_pk_column_ids_from_names, truncate_event, update_event, WalParseError,
+    strict_pk_column_ids_from_names, truncate_event, update_event_with_old_row_completeness,
+    WalParseError,
 };
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
@@ -98,9 +99,18 @@ pub(super) fn convert_map_cdc_event(
                 .map(|old| build_map_row(old, table_id, catalog, config.old_field_prefix))
                 .transpose()?
                 .map(|(row, _)| row);
+            let old_row_complete = old_row
+                .as_ref()
+                .is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()));
             let pk =
                 build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, catalog)?;
-            Ok(update_event(table_id, pk, old_row, new_row))
+            Ok(update_event_with_old_row_completeness(
+                table_id,
+                pk,
+                old_row,
+                new_row,
+                old_row_complete,
+            ))
         }
         EventKind::Delete => {
             let old_map = old_map.ok_or_else(|| {
@@ -143,8 +153,7 @@ mod tests {
 
     #[test]
     fn parse_event_kind_unknown_token() {
-        let err = parse_event_kind("x", &["i"], &["u"], &["d"], &["t"])
-            .expect_err("should fail");
+        let err = parse_event_kind("x", &["i"], &["u"], &["d"], &["t"]).expect_err("should fail");
         assert!(matches!(err, WalParseError::UnknownEventKind(_)));
     }
 
@@ -194,6 +203,41 @@ mod tests {
         assert_eq!(event.kind, EventKind::Update);
         assert!(event.old_row.is_none());
         assert!(event.new_row.is_some());
+    }
+
+    #[test]
+    fn convert_map_cdc_update_with_partial_old_map_disables_changed_columns() {
+        let catalog = orders_catalog();
+        let new_map = HashMap::from([
+            ("id".to_string(), serde_json::json!(1)),
+            ("amount".to_string(), serde_json::json!(10.5)),
+            ("status".to_string(), serde_json::json!("new")),
+        ]);
+        let old_map = HashMap::from([("amount".to_string(), serde_json::json!(7.0))]);
+
+        let event = convert_map_cdc_event(
+            EventKind::Update,
+            1,
+            Some(&new_map),
+            Some(&old_map),
+            MapCdcConfig {
+                required_new_field: "after",
+                required_old_field: "before",
+                new_field_prefix: "after",
+                old_field_prefix: "before",
+                pk_col_names: None,
+            },
+            &catalog,
+        )
+        .expect("update with partial old row should parse");
+
+        assert_eq!(event.kind, EventKind::Update);
+        assert!(event.old_row.is_some());
+        assert!(event.new_row.is_some());
+        assert!(
+            event.changed_columns.is_empty(),
+            "partial old row must not drive changed_columns filtering"
+        );
     }
 
     #[test]

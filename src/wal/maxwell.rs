@@ -240,12 +240,10 @@ mod tests {
         assert_eq!(old.get(0), Some(&Cell::Missing));
         assert_eq!(old.get(3), Some(&Cell::Missing));
 
-        // changed_columns: m(1) and c(2) differ
+        // Partial old rows must not compute changed_columns (safety against
+        // false-negative candidate pruning in dispatch).
         let changed: Vec<ColumnId> = ev.changed_columns.to_vec();
-        assert!(changed.contains(&1), "m should be changed");
-        assert!(changed.contains(&2), "c should be changed");
-        assert!(!changed.contains(&0), "id should NOT be changed");
-        assert!(!changed.contains(&3), "comment should NOT be changed");
+        assert!(changed.is_empty());
     }
 
     #[test]
