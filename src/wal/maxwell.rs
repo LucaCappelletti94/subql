@@ -254,10 +254,10 @@ mod tests {
         assert_eq!(old.get(0), Some(&Cell::Missing));
         assert_eq!(old.get(3), Some(&Cell::Missing));
 
-        // Partial old rows must not compute changed_columns (safety against
-        // false-negative candidate pruning in dispatch).
+        // Maxwell old row contains only changed columns; changed_columns derives
+        // [m(1), c(2)] from the non-Missing old values.
         let changed: Vec<ColumnId> = ev.changed_columns.to_vec();
-        assert!(changed.is_empty());
+        assert_eq!(changed, vec![1, 2]);
     }
 
     #[test]
