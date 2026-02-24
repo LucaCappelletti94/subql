@@ -30,6 +30,38 @@ pub trait WalParser: Send + Sync {
     ///
     /// Batched formats (e.g. wal2json v1) may return multiple events per
     /// message; per-change formats (e.g. wal2json v2) return exactly one.
+    ///
+    /// # Examples
+    /// ```
+    /// use subql::{Cell, EventKind, SimpleCatalog, Wal2JsonV2Parser, WalParseError, WalParser};
+    ///
+    /// let catalog = SimpleCatalog::new()
+    ///     .add_table("public.orders", 1, 2)
+    ///     .add_table("orders", 1, 2)
+    ///     .add_column(1, "id", 0)
+    ///     .add_column(1, "status", 1);
+    ///
+    /// let parser = Wal2JsonV2Parser;
+    /// let message = r#"{
+    ///   "action": "I",
+    ///   "schema": "public",
+    ///   "table": "orders",
+    ///   "columns": [
+    ///     {"name": "id", "type": "integer", "value": 7},
+    ///     {"name": "status", "type": "text", "value": "paid"}
+    ///   ],
+    ///   "pk": [{"name": "id", "type": "integer"}]
+    /// }"#;
+    ///
+    /// let events = parser.parse_wal_message(message.as_bytes(), &catalog)?;
+    /// assert_eq!(events.len(), 1);
+    /// assert_eq!(events[0].kind, EventKind::Insert);
+    /// assert_eq!(
+    ///     events[0].new_row.as_ref().and_then(|row| row.get(1)),
+    ///     Some(&Cell::String("paid".into()))
+    /// );
+    /// # Ok::<(), WalParseError>(())
+    /// ```
     fn parse_wal_message(
         &self,
         data: &[u8],
