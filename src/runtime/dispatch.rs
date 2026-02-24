@@ -148,6 +148,20 @@ pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchEr
             .ok_or(DispatchError::MissingRequiredRowImage(
                 "DELETE requires old_row",
             )),
+        EventKind::Truncate => Err(DispatchError::MissingRequiredRowImage(
+            "TRUNCATE has no row image",
+        )),
+    }
+}
+
+fn matched_users_for_truncate<I: IdTypes>(user_dict: &UserDictionary<I>) -> MatchedUsers<'_, I> {
+    let mut ordinals = RoaringBitmap::new();
+    for ordinal in user_dict.user_to_ordinal.values() {
+        ordinals.insert(ordinal.get());
+    }
+    MatchedUsers {
+        bitmap_iter: ordinals.into_iter(),
+        dict: user_dict,
     }
 }
 
@@ -166,6 +180,12 @@ pub fn dispatch_users<'a, I: IdTypes>(
     user_dict: &'a UserDictionary<I>,
     vm: &mut Vm,
 ) -> Result<MatchedUsers<'a, I>, DispatchError> {
+    if event.kind == EventKind::Truncate {
+        let _ = partition;
+        let _ = vm;
+        return Ok(matched_users_for_truncate(user_dict));
+    }
+
     // 1. Get row image based on event kind (validates presence)
     let row = select_event_row(event)?;
 
@@ -418,6 +438,33 @@ mod tests {
             dispatch_users(&event, &partition, &user_dict, &mut vm),
             Err(DispatchError::MissingRequiredRowImage(_))
         ));
+    }
+
+    #[test]
+    fn test_dispatch_truncate_requires_no_row_and_returns_all_table_users() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        user_dict.get_or_create(42);
+        user_dict.get_or_create(77);
+        let mut vm = Vm::new();
+
+        let event = WalEvent {
+            kind: EventKind::Truncate,
+            table_id: 1,
+            pk: crate::PrimaryKey::empty(),
+            old_row: None,
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let mut users: Vec<_> = dispatch_users(&event, &partition, &user_dict, &mut vm)
+            .expect("truncate should dispatch without row image")
+            .collect();
+        users.sort_unstable();
+        assert_eq!(users, vec![42, 77]);
     }
 
     #[test]

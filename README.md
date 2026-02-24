@@ -23,6 +23,7 @@ uses hybrid indexes to prune candidates before VM evaluation.
 - Session-bound and durable subscriptions
 - Optional shard persistence with background merge
 - Pluggable WAL parsers (`PgOutput`, `wal2json` v1/v2, Debezium, Maxwell)
+- Table-level `TRUNCATE` CDC event support
 - Multiple SQL dialects through `sqlparser`
 
 ## Quick Start

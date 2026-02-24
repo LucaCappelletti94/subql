@@ -73,6 +73,8 @@ pub enum EventKind {
     Update,
     /// Row deletion
     Delete,
+    /// Table truncate (all rows removed)
+    Truncate,
 }
 
 /// Cell value in a row image

@@ -4,7 +4,7 @@ use super::pg_type::infer_cell_from_json_strict;
 use super::row_build::build_row_from_map_with;
 use super::{
     build_pk_from_resolved, delete_event, insert_event, pk_from_catalog_or_empty,
-    strict_pk_column_ids_from_names, update_event, WalParseError,
+    strict_pk_column_ids_from_names, truncate_event, update_event, WalParseError,
 };
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
@@ -13,6 +13,7 @@ pub(super) fn parse_event_kind(
     insert_tokens: &[&str],
     update_tokens: &[&str],
     delete_tokens: &[&str],
+    truncate_tokens: &[&str],
 ) -> Result<EventKind, WalParseError> {
     if insert_tokens.contains(&token) {
         return Ok(EventKind::Insert);
@@ -22,6 +23,9 @@ pub(super) fn parse_event_kind(
     }
     if delete_tokens.contains(&token) {
         return Ok(EventKind::Delete);
+    }
+    if truncate_tokens.contains(&token) {
+        return Ok(EventKind::Truncate);
     }
     Err(WalParseError::UnknownEventKind(token.to_string()))
 }
@@ -108,6 +112,7 @@ pub(super) fn convert_map_cdc_event(
                 build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, catalog)?;
             Ok(delete_event(table_id, pk, old_row))
         }
+        EventKind::Truncate => Ok(truncate_event(table_id)),
     }
 }
 
@@ -138,7 +143,8 @@ mod tests {
 
     #[test]
     fn parse_event_kind_unknown_token() {
-        let err = parse_event_kind("x", &["i"], &["u"], &["d"]).expect_err("should fail");
+        let err = parse_event_kind("x", &["i"], &["u"], &["d"], &["t"])
+            .expect_err("should fail");
         assert!(matches!(err, WalParseError::UnknownEventKind(_)));
     }
 
