@@ -17,6 +17,9 @@ pub enum VmError {
 
     /// Invalid column index (should never happen if compilation correct)
     InvalidColumnIndex(u16),
+
+    /// Jump offset points past the end of the program
+    BadJump(usize),
 }
 
 /// Stack-based VM for predicate evaluation
@@ -61,7 +64,11 @@ impl Vm {
                     // Peek at TOS without popping
                     let top = self.peek_tri()?;
                     if top == Tri::False {
-                        ip += offset;
+                        let new_ip = ip.saturating_add(*offset);
+                        if new_ip > len {
+                            return Err(VmError::BadJump(new_ip));
+                        }
+                        ip = new_ip;
                         continue;
                     }
                 }
@@ -69,7 +76,11 @@ impl Vm {
                     // Peek at TOS without popping
                     let top = self.peek_tri()?;
                     if top == Tri::True {
-                        ip += offset;
+                        let new_ip = ip.saturating_add(*offset);
+                        if new_ip > len {
+                            return Err(VmError::BadJump(new_ip));
+                        }
+                        ip = new_ip;
                         continue;
                     }
                 }
@@ -146,7 +157,7 @@ impl Vm {
 
             Instruction::IsNull => {
                 let cell = self.pop_cell()?;
-                let result = if cell.is_null() {
+                let result = if cell.is_null() || cell.is_missing() {
                     Tri::True
                 } else {
                     Tri::False
@@ -190,10 +201,27 @@ impl Vm {
                     return Ok(());
                 }
 
-                // Check if cell matches any literal
-                let found = literals.iter().any(|lit| cells_equal(&cell, lit));
-                self.stack
-                    .push(StackValue::Tri(if found { Tri::True } else { Tri::False }));
+                // Check if cell matches any literal; track NULL presence in RHS
+                let mut has_null_rhs = false;
+                let mut found = false;
+                for lit in literals {
+                    if lit.is_null() || lit.is_missing() {
+                        has_null_rhs = true;
+                    } else if cells_equal(&cell, lit) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                let result = if found {
+                    Tri::True
+                } else if has_null_rhs {
+                    // x IN (1, NULL) → UNKNOWN when x doesn't match 1 (SQL standard)
+                    Tri::Unknown
+                } else {
+                    Tri::False
+                };
+                self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::Between => {
@@ -371,6 +399,7 @@ impl Default for Vm {
 // Helper Functions
 // ============================================================================
 
+#[allow(clippy::cast_precision_loss)]
 fn cells_equal(a: &Cell, b: &Cell) -> bool {
     match (a, b) {
         (Cell::Bool(x), Cell::Bool(y)) => x == y,
@@ -378,6 +407,17 @@ fn cells_equal(a: &Cell, b: &Cell) -> bool {
         (Cell::Float(x), Cell::Float(y)) => x
             .partial_cmp(y)
             .is_some_and(|ord| ord == std::cmp::Ordering::Equal),
+        // Mixed numeric comparisons: coerce to float (mirroring compare_ordered_cells)
+        (Cell::Int(x), Cell::Float(y)) => {
+            let xf = *x as f64;
+            xf.partial_cmp(y)
+                .is_some_and(|ord| ord == std::cmp::Ordering::Equal)
+        }
+        (Cell::Float(x), Cell::Int(y)) => {
+            let yf = *y as f64;
+            x.partial_cmp(&yf)
+                .is_some_and(|ord| ord == std::cmp::Ordering::Equal)
+        }
         (Cell::String(x), Cell::String(y)) => x == y,
         // NULL = NULL is Unknown, not True!
         _ => false,
@@ -993,8 +1033,8 @@ mod tests {
 
         let row = make_row(vec![Cell::Int(1)]);
 
-        // Missing column → IsNull returns False (not NULL, but Missing)
-        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+        // Missing column → IsNull returns True (Missing is treated as NULL)
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
     }
 
     #[test]
@@ -2419,5 +2459,173 @@ mod tests {
 
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_jump_if_false_out_of_bounds_returns_bad_jump() {
+        let mut vm = Vm::new();
+        // Program: push False, then JumpIfFalse with offset past end of program
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::Equal,            // Tri::False (1 != 2)
+            Instruction::JumpIfFalse(999), // offset 999 is way past end
+        ]);
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row), Err(VmError::BadJump(1002)));
+    }
+
+    #[test]
+    fn test_jump_if_true_out_of_bounds_returns_bad_jump() {
+        let mut vm = Vm::new();
+        // Program: push True, then JumpIfTrue with offset past end
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::Equal,           // Tri::True
+            Instruction::JumpIfTrue(999), // offset 999 is past end
+        ]);
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row), Err(VmError::BadJump(1002)));
+    }
+
+    #[test]
+    fn test_jump_if_false_no_jump_when_true() {
+        let mut vm = Vm::new();
+        // JumpIfFalse should NOT jump when TOS is True
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal, // Tri::True
+            Instruction::JumpIfFalse(999), // should NOT jump (offset would be OOB)
+                                // Fall through to result True
+        ]);
+        let row = make_row(vec![]);
+        // No jump occurs, program ends with True on stack
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn test_jump_if_true_no_jump_when_false() {
+        let mut vm = Vm::new();
+        // JumpIfTrue should NOT jump when TOS is False
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::Equal,           // Tri::False
+            Instruction::JumpIfTrue(999), // should NOT jump
+        ]);
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_in_null_rhs_unknown() {
+        let mut vm = Vm::new();
+
+        // 42 IN (1, NULL) → UNKNOWN (SQL standard)
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::In(vec![Cell::Int(1), Cell::Null]),
+        ]);
+        let row = make_row(vec![Cell::Int(42)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+
+        // 1 IN (1, NULL) → TRUE (matched before hitting NULL)
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::In(vec![Cell::Int(1), Cell::Null]),
+        ]);
+        let row = make_row(vec![Cell::Int(1)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // 0 IN (1, NULL) → UNKNOWN (no match, but NULL present)
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::In(vec![Cell::Int(1), Cell::Null]),
+        ]);
+        let row = make_row(vec![Cell::Int(0)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
+
+        // 0 IN (1, 2) → FALSE (no NULL, no match)
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::In(vec![Cell::Int(1), Cell::Int(2)]),
+        ]);
+        let row = make_row(vec![Cell::Int(0)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_is_null_missing_consistent_with_is_not_null() {
+        let mut vm = Vm::new();
+
+        // NOT(IsNull(Missing)) must equal IsNotNull(Missing)
+        // i.e. both must have consistent semantics
+        let is_null_program =
+            BytecodeProgram::new(vec![Instruction::LoadColumn(0), Instruction::IsNull]);
+        let is_not_null_program =
+            BytecodeProgram::new(vec![Instruction::LoadColumn(0), Instruction::IsNotNull]);
+        let not_is_null_program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::IsNull,
+            Instruction::Not,
+        ]);
+
+        // Row with Missing column (column 0 missing from row with 0 cells)
+        let row = make_row(vec![]);
+
+        let is_null_result = vm.eval(&is_null_program, &row).unwrap();
+        let is_not_null_result = vm.eval(&is_not_null_program, &row).unwrap();
+        let not_is_null_result = vm.eval(&not_is_null_program, &row).unwrap();
+
+        assert_eq!(is_null_result, Tri::True, "IsNull(Missing) should be True");
+        assert_eq!(
+            is_not_null_result,
+            Tri::False,
+            "IsNotNull(Missing) should be False"
+        );
+        assert_eq!(
+            is_not_null_result, not_is_null_result,
+            "NOT(IsNull(Missing)) must equal IsNotNull(Missing)"
+        );
+    }
+
+    #[test]
+    fn test_int_float_cross_type_equality() {
+        let mut vm = Vm::new();
+
+        // Cell::Int(5) == Cell::Float(5.0) → True
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::Equal,
+        ]);
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // Cell::Float(5.0) == Cell::Int(5) → True (reversed)
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Float(5.0)),
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::Equal,
+        ]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+
+        // Cell::Int(5) == Cell::Float(5.1) → False
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(5)),
+            Instruction::PushLiteral(Cell::Float(5.1)),
+            Instruction::Equal,
+        ]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+
+        // IN list: 5 IN (5.0, 6.0) → True
+        let program = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::In(vec![Cell::Float(5.0), Cell::Float(6.0)]),
+        ]);
+        let row = make_row(vec![Cell::Int(5)]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
     }
 }

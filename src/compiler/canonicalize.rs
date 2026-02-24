@@ -124,9 +124,7 @@ fn check_sql_depth(sql: &str) -> Result<(), RegisterError> {
             }
         }
 
-        if paren_depth > sql_shape::MAX_EXPR_DEPTH
-            || consecutive_ops > sql_shape::MAX_EXPR_DEPTH
-        {
+        if paren_depth > sql_shape::MAX_EXPR_DEPTH || consecutive_ops > sql_shape::MAX_EXPR_DEPTH {
             return Err(RegisterError::UnsupportedSql(
                 "Expression nesting too deep".to_string(),
             ));
@@ -151,6 +149,20 @@ fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
     normalize_expr_inner(expr, 0)
 }
 
+/// Collect all operands of a flattened AND or OR tree.
+/// E.g., `a AND (b AND c)` → [a, b, c]
+fn collect_flat_children<'a>(expr: &'a Expr, target_op: &BinaryOperator) -> Vec<&'a Expr> {
+    match expr {
+        Expr::Nested(inner) => collect_flat_children(inner, target_op),
+        Expr::BinaryOp { left, op, right } if op == target_op => {
+            let mut children = collect_flat_children(left, target_op);
+            children.extend(collect_flat_children(right, target_op));
+            children
+        }
+        _ => vec![expr],
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterError> {
     if depth > sql_shape::MAX_EXPR_DEPTH {
@@ -161,27 +173,44 @@ fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterErr
 
     Ok(match expr {
         Expr::BinaryOp { left, op, right } => {
-            let left_norm = normalize_expr_inner(left, depth + 1)?;
-            let right_norm = normalize_expr_inner(right, depth + 1)?;
-
-            // For commutative operators, sort operands
-            let (left_str, right_str) = if is_commutative(op) {
-                if left_norm <= right_norm {
-                    (left_norm, right_norm)
-                } else {
-                    (right_norm, left_norm)
-                }
+            // A4: For AND/OR, flatten nested chains before sorting so that
+            // "(a AND b) AND c" and "a AND (b AND c)" produce the same string.
+            if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                let mut children = collect_flat_children(left, op);
+                children.extend(collect_flat_children(right, op));
+                let mut child_strs: Vec<String> = children
+                    .iter()
+                    .map(|c| normalize_expr_inner(c, depth + 1))
+                    .collect::<Result<_, _>>()?;
+                child_strs.sort();
+                let op_str = op_to_string(op)?;
+                child_strs
+                    .into_iter()
+                    .reduce(|acc, s| format!("({acc} {op_str} {s})"))
+                    .unwrap_or_default()
             } else {
-                (left_norm, right_norm)
-            };
+                let left_norm = normalize_expr_inner(left, depth + 1)?;
+                let right_norm = normalize_expr_inner(right, depth + 1)?;
 
-            format!("({} {} {})", left_str, op_to_string(op), right_str)
+                // For commutative operators, sort operands
+                let (left_str, right_str) = if is_commutative(op) {
+                    if left_norm <= right_norm {
+                        (left_norm, right_norm)
+                    } else {
+                        (right_norm, left_norm)
+                    }
+                } else {
+                    (left_norm, right_norm)
+                };
+
+                format!("({} {} {})", left_str, op_to_string(op)?, right_str)
+            }
         }
 
         Expr::UnaryOp { op, expr } => {
             format!(
                 "{} {}",
-                unary_op_to_string(op),
+                unary_op_to_string(op)?,
                 normalize_expr_inner(expr, depth + 1)?
             )
         }
@@ -305,28 +334,37 @@ const fn is_commutative(op: &BinaryOperator) -> bool {
 }
 
 /// Convert binary operator to canonical string
-const fn op_to_string(op: &BinaryOperator) -> &'static str {
+fn op_to_string(op: &BinaryOperator) -> Result<&'static str, RegisterError> {
     match op {
-        BinaryOperator::And => "AND",
-        BinaryOperator::Or => "OR",
-        BinaryOperator::Eq => "=",
-        BinaryOperator::NotEq => "!=",
-        BinaryOperator::Lt => "<",
-        BinaryOperator::LtEq => "<=",
-        BinaryOperator::Gt => ">",
-        BinaryOperator::GtEq => ">=",
-        _ => "?",
+        BinaryOperator::And => Ok("AND"),
+        BinaryOperator::Or => Ok("OR"),
+        BinaryOperator::Eq => Ok("="),
+        BinaryOperator::NotEq => Ok("!="),
+        BinaryOperator::Lt => Ok("<"),
+        BinaryOperator::LtEq => Ok("<="),
+        BinaryOperator::Gt => Ok(">"),
+        BinaryOperator::GtEq => Ok(">="),
+        BinaryOperator::Plus => Ok("+"),
+        BinaryOperator::Minus => Ok("-"),
+        BinaryOperator::Multiply => Ok("*"),
+        BinaryOperator::Divide => Ok("/"),
+        BinaryOperator::Modulo => Ok("%"),
+        other => Err(RegisterError::UnsupportedSql(format!(
+            "Unsupported binary operator: {other}"
+        ))),
     }
 }
 
 /// Convert unary operator to canonical string
 #[allow(clippy::trivially_copy_pass_by_ref)]
-const fn unary_op_to_string(op: &sqlparser::ast::UnaryOperator) -> &'static str {
+fn unary_op_to_string(op: &sqlparser::ast::UnaryOperator) -> Result<&'static str, RegisterError> {
     match op {
-        sqlparser::ast::UnaryOperator::Not => "NOT",
-        sqlparser::ast::UnaryOperator::Plus => "+",
-        sqlparser::ast::UnaryOperator::Minus => "-",
-        _ => "?",
+        sqlparser::ast::UnaryOperator::Not => Ok("NOT"),
+        sqlparser::ast::UnaryOperator::Plus => Ok("+"),
+        sqlparser::ast::UnaryOperator::Minus => Ok("-"),
+        other => Err(RegisterError::UnsupportedSql(format!(
+            "Unsupported unary operator: {other}"
+        ))),
     }
 }
 
@@ -805,9 +843,56 @@ mod tests {
         let sql = "SELECT * FROM t WHERE ~a = 1";
         let result = normalize_sql(sql, &dialect);
 
-        // Should succeed — unknown unary op uses "?" fallback
-        assert!(result.is_ok());
-        let normalized = result.unwrap();
-        assert!(normalized.contains("?") || !normalized.is_empty());
+        // Should fail — unknown unary op now returns UnsupportedSql error
+        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
+    }
+
+    #[test]
+    fn test_and_tree_flattening() {
+        let dialect = PostgreSqlDialect {};
+
+        // These must hash identically
+        let sql1 = "SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3";
+        let sql2 = "SELECT * FROM t WHERE (a = 1 AND b = 2) AND c = 3";
+        let sql3 = "SELECT * FROM t WHERE a = 1 AND (b = 2 AND c = 3)";
+
+        let norm1 = normalize_sql(sql1, &dialect).unwrap();
+        let norm2 = normalize_sql(sql2, &dialect).unwrap();
+        let norm3 = normalize_sql(sql3, &dialect).unwrap();
+
+        assert_eq!(norm1, norm2, "Flat AND should equal left-associated AND");
+        assert_eq!(norm1, norm3, "Flat AND should equal right-associated AND");
+    }
+
+    #[test]
+    fn test_or_tree_flattening() {
+        let dialect = PostgreSqlDialect {};
+
+        let sql1 = "SELECT * FROM t WHERE a = 1 OR b = 2 OR c = 3";
+        let sql2 = "SELECT * FROM t WHERE (a = 1 OR b = 2) OR c = 3";
+        let sql3 = "SELECT * FROM t WHERE a = 1 OR (b = 2 OR c = 3)";
+
+        let norm1 = normalize_sql(sql1, &dialect).unwrap();
+        let norm2 = normalize_sql(sql2, &dialect).unwrap();
+        let norm3 = normalize_sql(sql3, &dialect).unwrap();
+
+        assert_eq!(norm1, norm2);
+        assert_eq!(norm1, norm3);
+    }
+
+    #[test]
+    fn test_distinct_operators_produce_different_strings() {
+        let dialect = PostgreSqlDialect {};
+
+        let sql1 = "SELECT * FROM t WHERE a + b > 0";
+        let sql2 = "SELECT * FROM t WHERE a - b > 0";
+
+        let norm1 = normalize_sql(sql1, &dialect).unwrap();
+        let norm2 = normalize_sql(sql2, &dialect).unwrap();
+
+        assert_ne!(
+            norm1, norm2,
+            "'+' and '-' must produce different normalized strings"
+        );
     }
 }

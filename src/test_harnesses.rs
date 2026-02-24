@@ -66,7 +66,7 @@ fn arb_cell(u: &mut Unstructured<'_>) -> arbitrary::Result<Cell> {
 
 /// Generate an [`Instruction`] from fuzzer-controlled bytes.
 fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction> {
-    match u.int_in_range(0u8..=21)? {
+    match u.int_in_range(0u8..=23)? {
         0 => Ok(Instruction::PushLiteral(arb_cell(u)?)),
         1 => Ok(Instruction::LoadColumn(u.int_in_range(0u16..=63)?)),
         2 => Ok(Instruction::Equal),
@@ -94,9 +94,12 @@ fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction> {
             Ok(Instruction::In(list))
         }
         20 => Ok(Instruction::Between),
-        _ => Ok(Instruction::Like {
+        21 => Ok(Instruction::Like {
             case_sensitive: bool::arbitrary(u)?,
         }),
+        // Jump instructions with bounded offsets (0..=31 to stay within any reasonable program)
+        22 => Ok(Instruction::JumpIfFalse(u.int_in_range(0usize..=31)?)),
+        _ => Ok(Instruction::JumpIfTrue(u.int_in_range(0usize..=31)?)),
     }
 }
 
@@ -270,7 +273,7 @@ mod tests {
 
         assert_eq!(
             seen.len(),
-            22,
+            24,
             "expected all Instruction variants, saw {seen:?}"
         );
     }
