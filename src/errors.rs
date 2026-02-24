@@ -5,6 +5,7 @@ use thiserror::Error;
 
 /// Errors during subscription registration
 #[derive(Error, Clone, Debug)]
+#[non_exhaustive]
 pub enum RegisterError {
     /// SQL parsing failed
     #[error("SQL parse error at line {line}, column {column}: {message}")]
@@ -51,6 +52,7 @@ pub enum RegisterError {
 
 /// Errors during event dispatch
 #[derive(Error, Clone, Debug)]
+#[non_exhaustive]
 pub enum DispatchError {
     /// Table not registered in engine
     #[error("Unknown table ID: {0}")]
@@ -79,6 +81,7 @@ pub enum DispatchError {
 
 /// Errors during persistence operations
 #[derive(Error, Clone, Debug)]
+#[non_exhaustive]
 pub enum StorageError {
     /// I/O error during shard read/write
     #[error("I/O error: {0}")]
@@ -115,6 +118,7 @@ pub enum StorageError {
 
 /// Errors during merge operations
 #[derive(Error, Clone, Debug)]
+#[non_exhaustive]
 pub enum MergeError {
     /// Merge job ID not found
     #[error("Unknown merge job: {0}")]

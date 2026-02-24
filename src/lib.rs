@@ -13,8 +13,11 @@ pub use wal::{
 
 // Internal modules
 mod errors;
+mod simple_catalog;
 mod table_resolution;
 mod types;
+
+pub use simple_catalog::SimpleCatalog;
 
 pub mod compiler;
 pub mod config;

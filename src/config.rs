@@ -23,6 +23,7 @@ pub enum ConfigError {
 
 /// Main configuration structure
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Storage directory for shards
     pub storage_path: PathBuf,
@@ -45,6 +46,7 @@ pub struct Config {
 
 /// Merge configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MergeConfig {
     /// Auto-merge when shard count exceeds this
     #[serde(default = "default_merge_threshold")]
@@ -57,6 +59,7 @@ pub struct MergeConfig {
 
 /// Schema catalog configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogConfig {
     /// Database URL for schema introspection
     pub database_url: String,
@@ -85,6 +88,26 @@ fn default_dialect() -> String {
 
 const fn default_durability_mode() -> DurabilityMode {
     DurabilityMode::Required
+}
+
+impl Config {
+    /// Validate configuration values, returning a descriptive error if any
+    /// field is out of range or logically inconsistent.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.rotation_threshold == 0 {
+            return Err("rotation_threshold must be greater than 0".to_string());
+        }
+        if self.merge.shard_threshold == 0 {
+            return Err("merge.shard_threshold must be greater than 0".to_string());
+        }
+        if self.merge.interval_secs == 0 {
+            return Err("merge.interval_secs must be greater than 0".to_string());
+        }
+        if self.catalog.database_url.is_empty() {
+            return Err("catalog.database_url must not be empty".to_string());
+        }
+        Ok(())
+    }
 }
 
 impl Default for MergeConfig {
@@ -162,5 +185,59 @@ mod tests {
         assert_eq!(config.merge.interval_secs, 3600);
         assert_eq!(config.durability_mode, DurabilityMode::Required);
         assert_eq!(config.catalog.dialect, "postgres");
+    }
+
+    #[test]
+    fn test_validate_valid_config() {
+        let config = Config {
+            storage_path: PathBuf::from("/tmp/subql"),
+            rotation_threshold: 1024,
+            merge: MergeConfig {
+                shard_threshold: 5,
+                interval_secs: 3600,
+            },
+            durability_mode: DurabilityMode::Required,
+            catalog: CatalogConfig {
+                database_url: "postgresql://localhost/db".to_string(),
+                dialect: "postgres".to_string(),
+            },
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_zero_rotation_threshold() {
+        let config = Config {
+            storage_path: PathBuf::from("/tmp/subql"),
+            rotation_threshold: 0,
+            merge: MergeConfig {
+                shard_threshold: 5,
+                interval_secs: 3600,
+            },
+            durability_mode: DurabilityMode::Required,
+            catalog: CatalogConfig {
+                database_url: "postgresql://localhost/db".to_string(),
+                dialect: "postgres".to_string(),
+            },
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_empty_database_url() {
+        let config = Config {
+            storage_path: PathBuf::from("/tmp/subql"),
+            rotation_threshold: 1024,
+            merge: MergeConfig {
+                shard_threshold: 5,
+                interval_secs: 3600,
+            },
+            durability_mode: DurabilityMode::Required,
+            catalog: CatalogConfig {
+                database_url: String::new(),
+                dialect: "postgres".to_string(),
+            },
+        };
+        assert!(config.validate().is_err());
     }
 }

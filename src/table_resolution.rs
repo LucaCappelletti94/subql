@@ -1,7 +1,7 @@
 use crate::{SchemaCatalog, TableId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TableResolutionError {
+pub enum TableResolutionError {
     Ambiguous {
         qualified: String,
         unqualified: String,
@@ -14,7 +14,7 @@ pub(crate) enum TableResolutionError {
     },
 }
 
-pub(crate) fn resolve_table_reference(
+pub fn resolve_table_reference(
     qualified: Option<&str>,
     unqualified: &str,
     catalog: &dyn SchemaCatalog,
