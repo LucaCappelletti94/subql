@@ -25,7 +25,7 @@ pub use simple_catalog::SimpleCatalog;
 
 pub mod compiler;
 pub mod config;
-#[doc(hidden)]
+#[cfg(feature = "dhat-heap")]
 pub mod memory_profile_workload;
 pub mod persistence;
 pub mod runtime;

@@ -89,6 +89,7 @@ pub enum EventKind {
 /// - `Missing`: Column not present in this image (UPDATE `old_row` may be incomplete)
 /// - `Null`: SQL NULL value
 /// - Typed value: Bool, Int, Float, String
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Cell {
     /// Column not present in row image
@@ -432,6 +433,7 @@ pub trait DurableShardStore: Send {
 ///
 /// Returned by [`SchemaCatalog::column_type`]. Catalogs that cannot provide
 /// type information return `None` (the default), which disables type checking.
+#[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ColumnType {
     /// 64-bit signed integer
@@ -447,6 +449,7 @@ pub enum ColumnType {
 }
 
 /// Typed signed delta from an aggregate subscription.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AggDelta {
     /// COUNT(*) / COUNT(column) delta — always ±1 per matching (non-NULL) row.

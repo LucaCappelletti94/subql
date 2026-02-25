@@ -5,6 +5,7 @@ use sqlparser::ast::{
 };
 
 /// Projection kind for a subscription SQL statement.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QueryProjection {
     /// `SELECT *` — deliver row events (default, current behaviour).
@@ -14,6 +15,7 @@ pub enum QueryProjection {
 }
 
 /// Aggregate function specification.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AggSpec {
     /// `SELECT COUNT(*)`
