@@ -5,11 +5,9 @@
 [![crates.io](https://img.shields.io/crates/v/subql.svg)](https://crates.io/crates/subql)
 [![docs.rs](https://docs.rs/subql/badge.svg)](https://docs.rs/subql)
 [![MSRV](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)]([LICENSE](https://raw.githubusercontent.com/LucaCappelletti94/subql/refs/heads/main/LICENSE))
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/LucaCappelletti94/subql/refs/heads/main/LICENSE)
 
 SQL subscription dispatch engine for Change Data Capture fanout.
-
-This README is the source for the crate-level documentation in `src/lib.rs`.
 
 `subql` dispatches CDC row events to users based on SQL `WHERE` subscriptions.
 It compiles SQL predicates once, deduplicates equivalent predicates across users, and
@@ -25,61 +23,25 @@ uses hybrid indexes to prune candidates before VM evaluation.
 - Pluggable WAL parsers (`PgOutput`, `wal2json` v1/v2, Debezium, Maxwell)
 - Table-level `TRUNCATE` CDC event support
 - Multiple SQL dialects through `sqlparser`
+- Streaming aggregate subscriptions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`
 
 ## Quick Start
 
 ```rust
-use std::collections::HashMap;
 use std::sync::Arc;
-
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
-    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionSpec, TableId, WalEvent,
+    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog,
+    SubscriptionEngine, SubscriptionSpec, WalEvent,
 };
 
-struct DemoCatalog {
-    tables: HashMap<String, (TableId, usize)>,
-    columns: HashMap<(TableId, String), u16>,
-}
-
-impl DemoCatalog {
-    fn new() -> Self {
-        Self {
-            tables: HashMap::from([(String::from("orders"), (1, 3))]),
-            columns: HashMap::from([
-                ((1, String::from("id")), 0),
-                ((1, String::from("amount")), 1),
-                ((1, String::from("status")), 2),
-            ]),
-        }
-    }
-}
-
-impl SchemaCatalog for DemoCatalog {
-    fn table_id(&self, table_name: &str) -> Option<TableId> {
-        self.tables.get(table_name).map(|(id, _)| *id)
-    }
-
-    fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-        self.columns
-            .get(&(table_id, column_name.to_string()))
-            .copied()
-    }
-
-    fn table_arity(&self, table_id: TableId) -> Option<usize> {
-        self.tables
-            .values()
-            .find(|(id, _)| *id == table_id)
-            .map(|(_, arity)| *arity)
-    }
-
-    fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-        Some(0xABCD_1234_5678_9ABC)
-    }
-}
-
-let catalog = Arc::new(DemoCatalog::new());
+let catalog = Arc::new(
+    SimpleCatalog::new()
+        .add_table("orders", 1, 3)
+        .add_column(1, "id", 0)
+        .add_column(1, "amount", 1)
+        .add_column(1, "status", 2),
+);
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
@@ -109,6 +71,124 @@ let users: Vec<u64> = engine.users(&event)?.collect();
 assert_eq!(users, vec![42]);
 
 # Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+## Streaming Aggregates
+
+`subql` supports streaming aggregate subscriptions alongside row-match subscriptions.
+Instead of `SELECT *`, register a `SELECT COUNT(*)`, `SELECT COUNT(col)`,
+`SELECT SUM(col)`, or `SELECT AVG(col)` query. The engine then emits signed
+**deltas** via `aggregate_deltas()` — the caller maintains the running total.
+
+Aggregate subscribers never appear in `users()` output and vice versa.
+
+```rust
+use std::sync::Arc;
+use sqlparser::dialect::PostgreSqlDialect;
+use subql::{
+    AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, EventKind,
+    PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionSpec, WalEvent,
+};
+
+let catalog = Arc::new(
+    SimpleCatalog::new()
+        .add_table("orders", 1, 3)
+        .add_column(1, "id", 0)
+        .add_column_typed(1, "amount", 1, ColumnType::Int)
+        .add_column(1, "status", 2),
+);
+let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+    SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+// Live count of active orders for user 42.
+engine.register(SubscriptionSpec {
+    subscription_id: 1,
+    user_id: 42,
+    session_id: None,
+    sql: "SELECT COUNT(*) FROM orders WHERE status = 'active'".to_string(),
+    updated_at_unix_ms: 0,
+})?;
+
+// Running total of active order amounts for user 42.
+engine.register(SubscriptionSpec {
+    subscription_id: 2,
+    user_id: 42,
+    session_id: None,
+    sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
+    updated_at_unix_ms: 0,
+})?;
+
+let event = WalEvent {
+    kind: EventKind::Insert,
+    table_id: 1,
+    pk: PrimaryKey {
+        columns: Arc::from([0u16]),
+        values: Arc::from([Cell::Int(1)]),
+    },
+    old_row: None,
+    new_row: Some(RowImage {
+        cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("active".into())]),
+    }),
+    changed_columns: Arc::from([]),
+};
+
+let mut deltas: Vec<(u64, AggDelta)> = engine.aggregate_deltas(&event)?;
+// Sort for deterministic comparison (Count before Sum).
+deltas.sort_by_key(|(_, d)| match d {
+    AggDelta::Count(_) => 0,
+    AggDelta::Sum(_) => 1,
+    AggDelta::Avg { .. } => 2,
+});
+assert_eq!(deltas, vec![
+    (42, AggDelta::Count(1)),
+    (42, AggDelta::Sum(250.0)),
+]);
+
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### Aggregate variants
+
+| SQL | `AggDelta` variant | Notes |
+|-----|--------------------|-------|
+| `SELECT COUNT(*) FROM t WHERE …` | `Count(i64)` | ±1 per matching row |
+| `SELECT COUNT(col) FROM t WHERE …` | `Count(i64)` | skips `NULL` cells |
+| `SELECT SUM(col) FROM t WHERE …` | `Sum(f64)` | skips `NULL`/`NaN`/`Inf` |
+| `SELECT AVG(col) FROM t WHERE …` | `Avg { sum_delta, count_delta }` | caller divides to get the new average |
+
+For `AVG`, the caller accumulates `running_sum` and `running_count` separately,
+then computes the average as `running_sum / running_count` on demand:
+
+```rust,ignore
+let mut running_sum = 0.0_f64;
+let mut running_count = 0_i64;
+
+// On each event:
+if let AggDelta::Avg { sum_delta, count_delta } = delta {
+    running_sum += sum_delta;
+    running_count += count_delta;
+    let avg = running_sum / running_count as f64;
+}
+```
+
+### Type validation
+
+Use `SimpleCatalog::add_column_typed` to register column types. When a column
+type is known, the engine rejects `SUM` or `AVG` over non-numeric columns
+(`Bool`, `String`) at registration time with a `RegisterError::UnsupportedSql`.
+
+```rust,ignore
+let catalog = SimpleCatalog::new()
+    .add_table("products", 1, 3)
+    .add_column_typed(1, "price", 0, ColumnType::Float)
+    .add_column_typed(1, "name",  1, ColumnType::String)  // non-numeric
+    .add_column(1, "id", 2);
+
+// Accepted — price is Float:
+engine.register(/* SELECT SUM(price) FROM products … */)?;
+
+// Rejected at registration — name is String:
+assert!(engine.register(/* SELECT SUM(name) FROM products … */).is_err());
 ```
 
 ## CI
