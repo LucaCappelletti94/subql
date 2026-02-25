@@ -13,7 +13,7 @@ use std::sync::Arc;
 use super::map_cdc::{convert_map_cdc_event, parse_event_kind, MapCdcConfig};
 use super::{resolve_table, WalParseError, WalParser};
 #[cfg(test)]
-use crate::{Cell, ColumnId};
+use crate::Cell;
 use crate::{EventKind, SchemaCatalog, WalEvent};
 
 // ============================================================================
@@ -72,7 +72,16 @@ impl WalParser for MaxwellParser {
         ) {
             return Ok(vec![]);
         }
-        Ok(vec![convert_maxwell_message(&message, catalog)?])
+        match convert_maxwell_message(&message, catalog) {
+            Ok(ev) => Ok(vec![ev]),
+            Err(WalParseError::UnknownEventKind(kind)) => {
+                #[cfg(feature = "observability")]
+                tracing::warn!("Maxwell: skipping unknown event kind '{kind}'");
+                drop(kind);
+                Ok(vec![])
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -254,10 +263,10 @@ mod tests {
         assert_eq!(old.get(0), Some(&Cell::Missing));
         assert_eq!(old.get(3), Some(&Cell::Missing));
 
-        // Maxwell old row contains only changed columns; changed_columns derives
-        // [m(1), c(2)] from the non-Missing old values.
-        let changed: Vec<ColumnId> = ev.changed_columns.to_vec();
-        assert_eq!(changed, vec![1, 2]);
+        // Maxwell old row is sparse (only changed columns, rest are Missing).
+        // With conservative semantics, an incomplete old image produces no
+        // changed_columns — avoiding false negatives from missing old values.
+        assert!(ev.changed_columns.is_empty());
     }
 
     #[test]
@@ -444,19 +453,23 @@ mod tests {
     }
 
     #[test]
-    fn error_unknown_event_kind() {
+    fn unknown_event_kind_is_skipped() {
         let catalog = maxwell_e_catalog();
         let parser = MaxwellParser;
 
+        // "truncate" is not a known Maxwell event type; it must be skipped, not error.
         let json = r#"{
             "database":"test","table":"e","type":"truncate",
             "data":{"id":1}
         }"#;
 
-        let err = parser
+        let events = parser
             .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+            .expect("unknown event kind should be skipped, not error");
+        assert!(
+            events.is_empty(),
+            "unknown event kind should produce no output"
+        );
     }
 
     #[test]

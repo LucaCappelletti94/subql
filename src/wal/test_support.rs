@@ -1,6 +1,38 @@
 use crate::{ColumnId, SchemaCatalog, TableId};
 use std::collections::HashMap;
 
+/// Shared test catalog: schema="public", db="mydb", table="orders",
+/// columns: id=0, amount=1, status=2, comment=3, PK=[id].
+/// Used by parsers that emit a full 4-column orders row (e.g. Debezium).
+pub(super) fn orders_catalog() -> TestCatalog {
+    let mut tables = HashMap::new();
+    tables.insert("orders".to_string(), (1, 4));
+    tables.insert("public.orders".to_string(), (1, 4));
+    tables.insert("mydb.orders".to_string(), (1, 4));
+
+    let mut columns = HashMap::new();
+    columns.insert((1, "id".to_string()), 0);
+    columns.insert((1, "amount".to_string()), 1);
+    columns.insert((1, "status".to_string()), 2);
+    columns.insert((1, "comment".to_string()), 3);
+
+    let mut primary_keys = HashMap::new();
+    primary_keys.insert(1, vec![0]); // id is PK
+
+    TestCatalog {
+        tables,
+        columns,
+        primary_keys,
+    }
+}
+
+/// Same as `orders_catalog()` but without primary key metadata.
+pub(super) fn orders_no_pk_catalog() -> TestCatalog {
+    let mut cat = orders_catalog();
+    cat.primary_keys.clear();
+    cat
+}
+
 pub(super) struct TestCatalog {
     pub(super) tables: HashMap<String, (TableId, usize)>,
     pub(super) columns: HashMap<(TableId, String), ColumnId>,

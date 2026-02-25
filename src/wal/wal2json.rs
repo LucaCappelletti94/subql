@@ -116,7 +116,15 @@ impl WalParser for Wal2JsonV1Parser {
 
         let mut events = Vec::with_capacity(msg.change.len());
         for change in &msg.change {
-            events.push(convert_v1_change(change, catalog)?);
+            match convert_v1_change(change, catalog) {
+                Ok(ev) => events.push(ev),
+                Err(WalParseError::UnknownEventKind(kind)) => {
+                    #[cfg(feature = "observability")]
+                    tracing::warn!("wal2json v1: skipping unknown kind '{kind}'");
+                    drop(kind);
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(events)
     }
@@ -140,8 +148,16 @@ impl WalParser for Wal2JsonV2Parser {
             _ => {}
         }
 
-        let event = convert_v2_message(&msg, catalog)?;
-        Ok(vec![event])
+        match convert_v2_message(&msg, catalog) {
+            Ok(ev) => Ok(vec![ev]),
+            Err(WalParseError::UnknownEventKind(kind)) => {
+                #[cfg(feature = "observability")]
+                tracing::warn!("wal2json v2: skipping unknown action '{kind}'");
+                drop(kind);
+                Ok(vec![])
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -217,10 +233,6 @@ fn build_pk_from_key_arrays(
         "oldkeys",
         |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.oldkeys.{name}")),
     )
-}
-
-fn old_row_is_complete(old_row: Option<&RowImage>) -> bool {
-    old_row.is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -326,7 +338,7 @@ fn convert_v1_change(
         let pk = pk_from_catalog_or_empty(&new_resolved, table_id, catalog)?;
         (None, pk)
     };
-    let old_row_complete = old_row_is_complete(old_row.as_ref());
+    let old_row_complete = super::old_row_is_complete(old_row.as_ref());
     build_event_from_rows(
         kind,
         table_id,
@@ -392,7 +404,7 @@ fn convert_v2_message(
         }
         EventKind::Insert | EventKind::Truncate => (None, Vec::new()),
     };
-    let old_row_complete = old_row_is_complete(old_row.as_ref());
+    let old_row_complete = super::old_row_is_complete(old_row.as_ref());
 
     // Build PK: prefer identity columns, then pk metadata, then catalog.
     // The three-way branching is clearer as if-let chains than map_or_else.
@@ -993,29 +1005,50 @@ mod tests {
     }
 
     #[test]
-    fn v2_unknown_action_returns_error() {
+    fn v2_unknown_action_is_skipped() {
         let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
+        // "X" is not a known v2 action; it must be skipped, not error.
         let json = r#"{"action":"X","schema":"public","table":"orders"}"#;
-        let err = parser
+        let events = parser
             .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("unknown action should fail");
-        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+            .expect("unknown action should be skipped, not error");
+        assert!(events.is_empty(), "unknown action should produce no output");
     }
 
-    // -- B1: v1 unknown kind is error ----------------------------------------
+    // -- B1: v1 unknown kind is skipped -------------------------------------
 
     #[test]
-    fn v1_unknown_kind_is_error() {
+    fn v1_unknown_kind_is_skipped() {
         let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
-        // "schema_change" is not insert/update/delete
+        // "schema_change" is not insert/update/delete; it must be skipped, not error.
         let json = r#"{"change":[{"kind":"schema_change","schema":"public","table":"orders","columnnames":["id"],"columntypes":["integer"],"columnvalues":[1]}]}"#;
-        let err = parser
+        let events = parser
             .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("unknown kind should fail");
-        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+            .expect("unknown kind should be skipped, not error");
+        assert!(events.is_empty(), "unknown kind should produce no output");
+    }
+
+    // -- v1 unknown kind in multi-change transaction is isolated skip --------
+
+    #[test]
+    fn v1_unknown_kind_in_multi_change_skips_only_that_change() {
+        let catalog = orders_catalog();
+        let parser = Wal2JsonV1Parser;
+        // Two changes: the first is unknown (skipped), the second is a valid insert.
+        let json = r#"{
+            "change": [
+                {"kind":"schema_change","schema":"public","table":"orders","columnnames":["id"],"columntypes":["integer"],"columnvalues":[1]},
+                {"kind":"insert","schema":"public","table":"orders","columnnames":["id","customer","amount","status"],"columntypes":["integer","text","numeric","text"],"columnvalues":[42,"alice",99.0,"new"]}
+            ]
+        }"#;
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("mixed changes should not error");
+        assert_eq!(events.len(), 1, "only the valid insert should be emitted");
+        assert_eq!(events[0].kind, EventKind::Insert);
     }
 
     // -- B2: v2 missing table on data action ---------------------------------

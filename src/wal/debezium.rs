@@ -63,7 +63,16 @@ impl WalParser for DebeziumParser {
         if message.op == "m" {
             return Ok(vec![]);
         }
-        Ok(vec![convert_debezium_envelope(&message, catalog)?])
+        match convert_debezium_envelope(&message, catalog) {
+            Ok(ev) => Ok(vec![ev]),
+            Err(WalParseError::UnknownEventKind(kind)) => {
+                #[cfg(feature = "observability")]
+                tracing::warn!("Debezium: skipping unknown op '{kind}'");
+                drop(kind);
+                Ok(vec![])
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -116,41 +125,8 @@ fn convert_debezium_envelope(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TestCatalog;
+    use super::super::test_support::{orders_catalog, orders_no_pk_catalog};
     use super::*;
-    use std::collections::HashMap;
-
-    // -- Test catalog --------------------------------------------------------
-
-    /// Debezium test table: schema="public", table="orders",
-    /// columns: id=0, amount=1, status=2, comment=3, PK=[id].
-    fn orders_catalog() -> TestCatalog {
-        let mut tables = HashMap::new();
-        tables.insert("orders".to_string(), (1, 4));
-        tables.insert("public.orders".to_string(), (1, 4));
-        tables.insert("mydb.orders".to_string(), (1, 4));
-
-        let mut columns = HashMap::new();
-        columns.insert((1, "id".to_string()), 0);
-        columns.insert((1, "amount".to_string()), 1);
-        columns.insert((1, "status".to_string()), 2);
-        columns.insert((1, "comment".to_string()), 3);
-
-        let mut primary_keys = HashMap::new();
-        primary_keys.insert(1, vec![0]); // id is PK
-
-        TestCatalog {
-            tables,
-            columns,
-            primary_keys,
-        }
-    }
-
-    fn orders_no_pk_catalog() -> TestCatalog {
-        let mut cat = orders_catalog();
-        cat.primary_keys.clear();
-        cat
-    }
 
     // -- INSERT tests -------------------------------------------------------
 
@@ -492,10 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn error_unknown_op() {
+    fn unknown_op_is_skipped() {
         let catalog = orders_catalog();
         let parser = DebeziumParser;
 
+        // "x" is not a known Debezium op; it must be skipped, not error.
         let json = r#"{
             "before": null,
             "after": {"id": 1},
@@ -504,10 +481,10 @@ mod tests {
             "ts_ms": 1234567890
         }"#;
 
-        let err = parser
+        let events = parser
             .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+            .expect("unknown op should be skipped, not error");
+        assert!(events.is_empty(), "unknown op should produce no output");
     }
 
     #[test]

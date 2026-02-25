@@ -101,13 +101,16 @@ pub(super) fn convert_map_cdc_event(
                 .map(|(row, _)| row);
             let pk =
                 build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, catalog)?;
-            // Always attempt to derive changed_columns from the old row.
-            // `changed_columns()` skips Missing cells, so sparse old images
-            // (e.g. Maxwell's partial-old format) work correctly: only
-            // non-Missing columns are compared, and if none differ the result
-            // is empty — which falls through to a conservative full re-evaluation.
+            // Derive changed_columns only when the old row is complete (no Missing cells).
+            // Partial old images (e.g. Debezium DEFAULT replica identity) are treated
+            // conservatively: changed_columns is left empty to avoid false negatives.
+            let old_row_complete = super::old_row_is_complete(old_row.as_ref());
             Ok(update_event_with_old_row_completeness(
-                table_id, pk, old_row, new_row, true,
+                table_id,
+                pk,
+                old_row,
+                new_row,
+                old_row_complete,
             ))
         }
         EventKind::Delete => {
@@ -204,16 +207,16 @@ mod tests {
     }
 
     #[test]
-    fn convert_map_cdc_update_with_partial_old_map_computes_changed_columns() {
+    fn convert_map_cdc_update_with_partial_old_map_gives_empty_changed_columns() {
         let catalog = orders_catalog();
         let new_map = HashMap::from([
             ("id".to_string(), serde_json::json!(1)),
             ("amount".to_string(), serde_json::json!(10.5)),
             ("status".to_string(), serde_json::json!("new")),
         ]);
-        // Sparse old row: only `amount` is present (Maxwell-style partial image).
-        // changed_columns should be [1] (amount) because it differs; missing
-        // columns (id, status) are skipped — no false negatives possible.
+        // Sparse old row: only `amount` is present; `id` and `status` are Missing.
+        // Because the old row is incomplete, changed_columns is left empty to
+        // avoid false negatives (conservative semantics).
         let old_map = HashMap::from([("amount".to_string(), serde_json::json!(7.0))]);
 
         let event = convert_map_cdc_event(
@@ -235,11 +238,10 @@ mod tests {
         assert_eq!(event.kind, EventKind::Update);
         assert!(event.old_row.is_some());
         assert!(event.new_row.is_some());
-        // amount (col 1) changed: 7.0 → 10.5
-        assert_eq!(
-            event.changed_columns.as_ref(),
-            &[1u16],
-            "sparse old row must still derive changed_columns for known-changed columns"
+        // Partial old row → conservative: changed_columns is empty.
+        assert!(
+            event.changed_columns.is_empty(),
+            "partial old row must produce empty changed_columns to avoid false negatives"
         );
     }
 

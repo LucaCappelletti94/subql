@@ -338,6 +338,12 @@ pub(crate) fn changed_columns(old: &RowImage, new: &RowImage) -> Vec<ColumnId> {
     changed
 }
 
+/// Returns true when every cell in the old row is non-Missing,
+/// meaning the row image is complete and suitable for changed-column derivation.
+pub(crate) fn old_row_is_complete(old_row: Option<&RowImage>) -> bool {
+    old_row.is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()))
+}
+
 /// Build INSERT event with consistent defaults.
 pub(crate) fn insert_event(table_id: TableId, pk: PrimaryKey, new_row: RowImage) -> WalEvent {
     WalEvent {

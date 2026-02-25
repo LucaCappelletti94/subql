@@ -576,9 +576,7 @@ impl PgOutputParser {
             Self::pk_from_old_resolved(&rel, &old_resolved)?
         };
 
-        let old_row_complete = old_row
-            .as_ref()
-            .is_some_and(|row| row.cells.iter().all(|cell| !cell.is_missing()));
+        let old_row_complete = super::old_row_is_complete(old_row.as_ref());
 
         Ok(update_event_with_old_row_completeness(
             rel.table_id,
@@ -687,9 +685,12 @@ impl WalParser for PgOutputParser {
                 Ok(events)
             }
 
-            other => Err(WalParseError::UnknownEventKind(format!(
-                "pgoutput message type: 0x{other:02X}"
-            ))),
+            other => {
+                #[cfg(feature = "observability")]
+                tracing::warn!("pgoutput: skipping unknown message type 0x{other:02X}");
+                let _ = other;
+                Ok(vec![])
+            }
         }
     }
 }
@@ -1383,18 +1384,22 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // -- Test 9: Unknown message type → error --------------------------------
+    // -- Test 9: Unknown message type → skip ---------------------------------
 
     #[test]
-    fn unknown_message_type_error() {
+    fn unknown_message_type_is_skipped() {
         let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
+        // 0xFF is not a known pgoutput message type; it must be skipped, not error.
         let msg = vec![0xFF, 0, 0, 0, 0];
-        let err = parser
+        let events = parser
             .parse_wal_message(&msg, &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownEventKind(_)));
+            .expect("unknown message type should be skipped, not error");
+        assert!(
+            events.is_empty(),
+            "unknown message type should produce no output"
+        );
     }
 
     // -- Test 10: Insert without preceding Relation → UnknownRelationOid -----
