@@ -990,6 +990,21 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
+        // Mirror the arity guard from users(): validate row image against catalog.
+        if let Ok(row) = select_event_row(event) {
+            let expected = self
+                .catalog
+                .table_arity(event.table_id)
+                .ok_or(DispatchError::UnknownTableArity(event.table_id))?;
+            if row.len() != expected {
+                return Err(DispatchError::InvalidRowArity {
+                    table_id: event.table_id,
+                    expected,
+                    got: row.len(),
+                });
+            }
+        }
+
         super::dispatch::compute_agg_deltas(event, partition, user_dict, &mut self.vm)
     }
 
@@ -4407,6 +4422,52 @@ mod tests {
             .aggregate_deltas(&event)
             .expect_err("TRUNCATE must return error");
         assert!(matches!(err, DispatchError::TruncateRequiresReset(1)));
+    }
+
+    #[test]
+    fn aggregate_deltas_rejects_wrong_row_arity() {
+        use crate::DispatchError;
+
+        let catalog = make_catalog(); // orders: 3 columns (id=0, amount=1, status=2)
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        // INSERT with only 2 columns — arity mismatch (expected 3)
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey::empty(),
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(20)]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let err = engine
+            .aggregate_deltas(&event)
+            .expect_err("wrong arity must return error");
+        assert!(
+            matches!(
+                err,
+                DispatchError::InvalidRowArity {
+                    table_id: 1,
+                    expected: 3,
+                    got: 2
+                }
+            ),
+            "Expected InvalidRowArity {{expected: 3, got: 2}}, got: {err:?}"
+        );
     }
 
     #[test]

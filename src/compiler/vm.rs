@@ -20,6 +20,9 @@ pub enum VmError {
 
     /// Jump offset points past the end of the program
     BadJump(usize),
+
+    /// Bytecode program terminated with more than one value on the stack (compiler bug).
+    MalformedProgram,
 }
 
 /// Stack-based VM for predicate evaluation
@@ -97,8 +100,7 @@ impl Vm {
                 if self.stack.is_empty() {
                     Ok(result)
                 } else {
-                    // Stack not empty - malformed program, treat as Unknown
-                    Ok(Tri::Unknown)
+                    Err(VmError::MalformedProgram)
                 }
             }
             Some(StackValue::Cell(cell)) => {
@@ -1320,9 +1322,9 @@ mod tests {
 
         let row = make_row(vec![]);
 
-        // Stack has 2 values, should return Unknown (line 67)
+        // Stack has 2 values → MalformedProgram error (compiler bug detected)
         let result = vm.eval(&program, &row);
-        assert_eq!(result.unwrap(), Tri::Unknown);
+        assert_eq!(result, Err(VmError::MalformedProgram));
     }
 
     #[test]
@@ -2627,5 +2629,23 @@ mod tests {
         ]);
         let row = make_row(vec![Cell::Int(5)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
+    }
+
+    #[test]
+    fn eval_malformed_program_extra_stack_value_returns_error() {
+        let mut vm = Vm::new();
+        // Program leaves two Tri values on the stack (compiler bug scenario).
+        // Each Equal consumes 2 Cells and pushes 1 Tri, so two Equal ops leave
+        // two Tri values with no instruction to consume the first.
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::PushLiteral(Cell::Int(1)),
+            Instruction::Equal, // Tri::True — left on stack
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::PushLiteral(Cell::Int(2)),
+            Instruction::Equal, // Tri::True — also left on stack; stack has 2 values
+        ]);
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row), Err(VmError::MalformedProgram));
     }
 }
