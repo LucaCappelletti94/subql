@@ -21,6 +21,8 @@ pub struct UserDictionary<I: IdTypes> {
     ordinal_to_user: Vec<Option<I::UserId>>,
     /// UserId → UserOrdinal (for reverse lookup)
     user_to_ordinal: AHashMap<I::UserId, UserOrdinal>,
+    /// Recycled ordinals from removed users, available for reuse
+    free_list: Vec<UserOrdinal>,
 }
 
 impl<I: IdTypes> UserDictionary<I> {
@@ -36,6 +38,7 @@ impl<I: IdTypes> UserDictionary<I> {
         Self {
             ordinal_to_user: Vec::new(),
             user_to_ordinal: AHashMap::new(),
+            free_list: Vec::new(),
         }
     }
 
@@ -45,8 +48,14 @@ impl<I: IdTypes> UserDictionary<I> {
             return Ok(ordinal);
         }
 
-        let ordinal = Self::next_ordinal_for_len(self.ordinal_to_user.len() as u64)?;
-        self.ordinal_to_user.push(Some(user_id));
+        let ordinal = if let Some(recycled) = self.free_list.pop() {
+            self.ordinal_to_user[recycled.get() as usize] = Some(user_id);
+            recycled
+        } else {
+            let ord = Self::next_ordinal_for_len(self.ordinal_to_user.len() as u64)?;
+            self.ordinal_to_user.push(Some(user_id));
+            ord
+        };
         self.user_to_ordinal.insert(user_id, ordinal);
 
         Ok(ordinal)
@@ -79,6 +88,7 @@ impl<I: IdTypes> UserDictionary<I> {
         if let Some(slot) = self.ordinal_to_user.get_mut(ordinal.get() as usize) {
             *slot = None;
         }
+        self.free_list.push(ordinal);
         Some(ordinal)
     }
 

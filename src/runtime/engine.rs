@@ -263,7 +263,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         matches!(err, StorageError::PostCommitDirSync(_))
     }
 
-    const fn log_best_effort_durability(message: &str) {
+    fn log_best_effort_durability(message: &str) {
         #[cfg(feature = "observability")]
         tracing::warn!("{message}");
         #[cfg(not(feature = "observability"))]
@@ -1458,7 +1458,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         )
     }
 
-    const fn log_ignored_shard_filename(path: &Path, reason: &str) {
+    fn log_ignored_shard_filename(path: &Path, reason: &str) {
         #[cfg(feature = "observability")]
         tracing::warn!(
             "Ignoring malformed shard filename '{}': {}",
