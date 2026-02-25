@@ -582,4 +582,33 @@ mod tests {
             .expect("Message op should be skipped, not errored");
         assert!(events.is_empty(), "Message ops should produce no output");
     }
+
+    // -- A3: UPDATE PK change must use pre-update PK -------------------------
+
+    #[test]
+    fn update_pk_change_uses_pre_update_pk() {
+        // When a PK column changes (id: 1 → 2), the emitted PK must be the
+        // pre-update value (1), not the post-update value (2).
+        let catalog = orders_catalog();
+        let parser = DebeziumParser;
+
+        let json = r#"{
+            "before": {"id": 1, "amount": 100.0, "status": "old", "comment": "before"},
+            "after":  {"id": 2, "amount": 200.0, "status": "new", "comment": "after"},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "u",
+            "ts_ms": 1234567890
+        }"#;
+
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("parse should succeed");
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Update);
+        // PK must come from the pre-update (before) row: id = 1
+        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk.columns.as_ref(), &[0u16]);
+    }
 }

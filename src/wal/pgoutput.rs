@@ -391,6 +391,7 @@ impl PgOutputParser {
         rel: &CachedRelation,
         positions: &[usize],
         context: &str,
+        is_new_tuple: bool,
     ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
         if positions.len() > rel.columns.len() || positions.len() > rel.column_ids.len() {
             return Err(WalParseError::MalformedPayload(format!(
@@ -410,7 +411,7 @@ impl PgOutputParser {
                     rel.columns.len()
                 )));
             }
-            let cell = Self::parse_tuple_cell(cur, rel.columns[rel_idx].type_oid)?;
+            let cell = Self::parse_tuple_cell(cur, rel.columns[rel_idx].type_oid, is_new_tuple)?;
             let col_id = rel.column_ids[rel_idx];
             if (col_id as usize) < rel.arity {
                 cells[col_id as usize] = cell.clone();
@@ -429,6 +430,7 @@ impl PgOutputParser {
     fn parse_tuple_data(
         cur: &mut Cursor<'_>,
         rel: &CachedRelation,
+        is_new_tuple: bool,
     ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
         let num_columns = Self::parse_column_count(cur.read_i16()?, "TupleData")?;
         if num_columns != rel.arity {
@@ -439,13 +441,20 @@ impl PgOutputParser {
             });
         }
         let positions: Vec<usize> = (0..num_columns).collect();
-        Self::parse_tuple_data_with_positions(cur, rel, &positions, "tuple")
+        Self::parse_tuple_data_with_positions(cur, rel, &positions, "tuple", is_new_tuple)
     }
 
-    fn parse_tuple_cell(cur: &mut Cursor<'_>, type_oid: u32) -> Result<Cell, WalParseError> {
+    fn parse_tuple_cell(
+        cur: &mut Cursor<'_>,
+        type_oid: u32,
+        is_new_tuple: bool,
+    ) -> Result<Cell, WalParseError> {
         let tag = cur.read_u8()?;
         match tag {
             b'n' => Ok(Cell::Null),
+            b'u' if is_new_tuple => Err(WalParseError::MalformedPayload(
+                "unchanged-TOAST tag 'u' is not valid in a new-image tuple".to_string(),
+            )),
             b'u' => Ok(Cell::Missing),
             b't' => {
                 let len_i32 = cur.read_i32()?;
@@ -495,7 +504,7 @@ impl PgOutputParser {
             )));
         };
 
-        Self::parse_tuple_data_with_positions(cur, rel, &mapped_positions, "key tuple")
+        Self::parse_tuple_data_with_positions(cur, rel, &mapped_positions, "key tuple", false)
     }
 
     fn pk_from_old_resolved(
@@ -528,7 +537,7 @@ impl PgOutputParser {
         let tag = cur.read_u8()?;
         Self::expected_tag(tag, b'N', "INSERT tuple")?;
 
-        let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel)?;
+        let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel, true)?;
         let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?;
 
         Ok(insert_event(rel.table_id, pk, new_row))
@@ -551,7 +560,7 @@ impl PgOutputParser {
             let (row, resolved) = if tag == b'K' {
                 Self::parse_key_tuple_data(cur, &rel)?
             } else {
-                Self::parse_tuple_data(cur, &rel)?
+                Self::parse_tuple_data(cur, &rel, false)?
             };
             // Now consume the 'N' tag for the new tuple
             let n_tag = cur.read_u8()?;
@@ -566,7 +575,7 @@ impl PgOutputParser {
             )));
         };
 
-        let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel)?;
+        let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel, true)?;
 
         // PK: prefer identity columns from old row, then catalog fallback.
         let pk = if old_resolved.is_empty() {
@@ -607,7 +616,7 @@ impl PgOutputParser {
         let (old_row, old_resolved) = if tag == b'K' {
             Self::parse_key_tuple_data(cur, &rel)?
         } else {
-            Self::parse_tuple_data(cur, &rel)?
+            Self::parse_tuple_data(cur, &rel, false)?
         };
 
         // PK from identity columns
@@ -624,7 +633,11 @@ impl PgOutputParser {
         let mut events = Vec::with_capacity(rel_count);
         for _ in 0..rel_count {
             let oid = cur.read_u32()?;
-            let rel = self.get_relation(oid)?;
+            let rel = match self.get_relation(oid) {
+                Ok(rel) => rel,
+                Err(WalParseError::UnknownRelationOid(_)) => continue,
+                Err(e) => return Err(e),
+            };
             events.push(truncate_event(rel.table_id));
         }
 
@@ -1492,10 +1505,12 @@ mod tests {
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("active"))));
     }
 
-    // -- Test 13: Unchanged TOAST ('u' tag) → Cell::Missing ------------------
+    // -- Test 13: Unchanged TOAST ('u' tag) → Cell::Missing in OLD tuple -----
 
     #[test]
-    fn unchanged_toast_tag() {
+    fn unchanged_toast_tag_in_old_key_tuple() {
+        // 'u' (unchanged-TOAST) is only valid in old-image tuples (key tuples or full old rows).
+        // It must produce Cell::Missing there, and be rejected in new-image tuples.
         let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
@@ -1504,21 +1519,22 @@ mod tests {
             .parse_wal_message(&rel_msg, &catalog)
             .expect("relation should parse");
 
-        // Update with 'K' old key, where some columns are unchanged TOAST
+        // Update with 'K' old key (b'u' is valid here) and a clean new tuple (no b'u')
+        // Columns: id(int4), customer(text), amount(numeric), status(text)
         let update_msg = build_update_msg_with_old(
             16384,
             b'K',
             &[
                 TupleCol::Text("1".into()),
-                TupleCol::Unchanged,
-                TupleCol::Unchanged,
-                TupleCol::Unchanged,
+                TupleCol::Unchanged, // valid in old/key tuple (customer)
+                TupleCol::Unchanged, // valid in old/key tuple (amount)
+                TupleCol::Unchanged, // valid in old/key tuple (status)
             ],
             &[
-                TupleCol::Text("1".into()),
-                TupleCol::Unchanged,
-                TupleCol::Text("200.00".into()),
-                TupleCol::Text("shipped".into()),
+                TupleCol::Text("1".into()),       // id
+                TupleCol::Text("alice".into()),   // customer (text OID 25)
+                TupleCol::Text("200.00".into()),  // amount (numeric OID 1700)
+                TupleCol::Text("shipped".into()), // status (text OID 25)
             ],
         );
 
@@ -1528,11 +1544,12 @@ mod tests {
 
         let ev = &events[0];
         let old = ev.old_row.as_ref().expect("should have old_row");
-        assert_eq!(old.get(1), Some(&Cell::Missing)); // unchanged TOAST
+        assert_eq!(old.get(1), Some(&Cell::Missing)); // unchanged TOAST in old is ok
 
         let new = ev.new_row.as_ref().expect("should have new_row");
-        assert_eq!(new.get(1), Some(&Cell::Missing)); // unchanged TOAST in new too
+        assert_eq!(new.get(1), Some(&Cell::String(Arc::from("alice"))));
         assert_eq!(new.get(2), Some(&Cell::Float(200.0)));
+        assert_eq!(new.get(3), Some(&Cell::String(Arc::from("shipped"))));
     }
 
     // -- Test 14: Type conversion for various OIDs ---------------------------
@@ -2128,22 +2145,91 @@ mod tests {
     }
 
     #[test]
-    fn truncate_unknown_oid_errors() {
-        // TRUNCATE referencing an unknown OID should fail
+    fn truncate_unknown_oid_is_skipped() {
+        // TRUNCATE referencing an unknown OID should silently skip that relation
         let parser = PgOutputParser::new();
         let catalog = orders_catalog();
 
         let msg = build_truncate_msg(0, &[9999]);
-        let err = parser
+        let events = parser
             .parse_wal_message(&msg, &catalog)
-            .expect_err("unknown OID should fail");
+            .expect("unknown OID in TRUNCATE should be skipped, not error");
         assert!(
-            matches!(err, WalParseError::UnknownRelationOid(_)),
-            "Expected UnknownRelationOid, got: {err:?}"
+            events.is_empty(),
+            "Expected empty events when all OIDs are unknown"
         );
     }
 
+    #[test]
+    fn truncate_skips_unknown_oid_emits_known_ones() {
+        // A 3-OID TRUNCATE where OID[1] is unknown: events for OID[0] and OID[2] should be emitted.
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+
+        // Register two known relations
+        let rel_a = build_relation_msg(100, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_a, &catalog)
+            .expect("relation A should parse");
+
+        // Build a second catalog entry for a second known table
+        let mut catalog2 = orders_catalog();
+        catalog2.tables.insert("public.items".to_string(), (2, 1));
+        catalog2.tables.insert("items".to_string(), (2, 1));
+        catalog2.columns.insert((2, "sku".to_string()), 0);
+
+        // Register second relation using the extended catalog
+        let rel_b = build_relation_msg(200, "public", "items", &[("sku", 25, 1)]);
+        parser
+            .parse_wal_message(&rel_b, &catalog2)
+            .expect("relation B should parse");
+
+        // OID 100 (known), OID 9999 (unknown), OID 200 (known)
+        let truncate_msg = build_truncate_msg(0, &[100, 9999, 200]);
+        let events = parser
+            .parse_wal_message(&truncate_msg, &catalog2)
+            .expect("truncate with one unknown OID should succeed");
+
+        assert_eq!(events.len(), 2, "Should emit events for both known OIDs");
+        assert!(events.iter().any(|e| e.table_id == 1));
+        assert!(events.iter().any(|e| e.table_id == 2));
+        assert!(events.iter().all(|e| e.kind == EventKind::Truncate));
+    }
+
     // -- B7: UnknownTupleTag error path --------------------------------------
+
+    // -- A2: unchanged-TOAST tag 'u' must be rejected in new-image tuples ----
+
+    #[test]
+    fn insert_with_unchanged_toast_tag_is_rejected() {
+        // Build an INSERT message where a column's tuple-data tag is b'u' (unchanged-TOAST).
+        // This tag is only valid in old-image tuples; it must be rejected in new-image tuples.
+        let parser = PgOutputParser::new();
+        let catalog = orders_catalog();
+
+        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation should parse");
+
+        let insert_msg = build_insert_msg(
+            16384,
+            &[
+                TupleCol::Text("1".into()),
+                TupleCol::Unchanged, // 'u' tag — invalid in a new-image tuple
+                TupleCol::Text("50.0".into()),
+                TupleCol::Text("pending".into()),
+            ],
+        );
+
+        let err = parser
+            .parse_wal_message(&insert_msg, &catalog)
+            .expect_err("unchanged-TOAST tag in INSERT new-tuple should fail");
+        assert!(
+            matches!(err, WalParseError::MalformedPayload(_)),
+            "Expected MalformedPayload, got: {err:?}"
+        );
+    }
 
     #[test]
     fn unknown_tuple_tag_errors() {

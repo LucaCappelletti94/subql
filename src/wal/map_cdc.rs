@@ -95,12 +95,22 @@ pub(super) fn convert_map_cdc_event(
             })?;
             let (new_row, resolved) =
                 build_map_row(new_map, table_id, catalog, config.new_field_prefix)?;
-            let old_row = old_map
+            let (old_row, old_resolved) = old_map
                 .map(|old| build_map_row(old, table_id, catalog, config.old_field_prefix))
                 .transpose()?
-                .map(|(row, _)| row);
+                .map_or((None, Vec::new()), |(row, res)| (Some(row), res));
+            // Use pre-update PK when the old row is complete (all columns present).
+            // A complete old row guarantees PK columns are present, enabling correct
+            // index lookups when a PK column changes (e.g. id: 1 → 2).
+            // Sparse old rows (e.g. Debezium DEFAULT replica identity, Maxwell changed-only)
+            // may not contain PK columns, so we fall back to the new row's resolved values.
+            let pk_resolved = if super::old_row_is_complete(old_row.as_ref()) {
+                &old_resolved
+            } else {
+                &resolved
+            };
             let pk =
-                build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, catalog)?;
+                build_pk_from_optional_names(config.pk_col_names, pk_resolved, table_id, catalog)?;
             // Derive changed_columns only when the old row is complete (no Missing cells).
             // Partial old images (e.g. Debezium DEFAULT replica identity) are treated
             // conservatively: changed_columns is left empty to avoid false negatives.

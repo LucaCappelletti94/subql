@@ -60,7 +60,7 @@ impl WalParser for MaxwellParser {
         let Some(message) = message else {
             return Ok(Vec::new());
         };
-        // Skip DDL/schema events — they contain no row data
+        // Skip DDL/schema events and bootstrap control events — they contain no row data
         if matches!(
             message.event_type.as_str(),
             "ddl"
@@ -69,6 +69,8 @@ impl WalParser for MaxwellParser {
                 | "table-alter"
                 | "database-create"
                 | "database-drop"
+                | "bootstrap-start"
+                | "bootstrap-complete"
         ) {
             return Ok(vec![]);
         }
@@ -90,7 +92,13 @@ impl WalParser for MaxwellParser {
 // ============================================================================
 
 fn parse_maxwell_kind(event_type: &str) -> Result<EventKind, WalParseError> {
-    parse_event_kind(event_type, &["insert"], &["update"], &["delete"], &[])
+    parse_event_kind(
+        event_type,
+        &["insert", "bootstrap-insert"],
+        &["update"],
+        &["delete"],
+        &[],
+    )
 }
 
 fn convert_maxwell_message(
@@ -585,5 +593,70 @@ mod tests {
             events.is_empty(),
             "table-create events should produce no output"
         );
+    }
+
+    // -- A3: UPDATE PK change must use pre-update PK -------------------------
+
+    #[test]
+    fn update_pk_change_uses_pre_update_pk() {
+        // When a PK column changes (id: 1 → 2), the emitted PK must be the
+        // pre-update value (1), not the post-update value (2).
+        let catalog = maxwell_e_catalog();
+        let parser = MaxwellParser;
+
+        let json = r#"{
+            "database":"test","table":"e","type":"update",
+            "data":{"id":2,"m":200.0,"c":"2016-10-22","comment":"after"},
+            "old":{"id":1,"m":100.0,"c":"2016-10-21","comment":"before"}
+        }"#;
+
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("parse should succeed");
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Update);
+        // PK must come from the pre-update (old) row: id = 1
+        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk.columns.as_ref(), &[0u16]);
+    }
+
+    // -- A4: bootstrap-insert events must be treated as normal inserts -------
+
+    #[test]
+    fn bootstrap_insert_is_treated_as_insert() {
+        let catalog = maxwell_e_catalog();
+        let parser = MaxwellParser;
+
+        let json = r#"{
+            "database":"test","table":"e","type":"bootstrap-insert","ts":1477053217,
+            "data":{"id":1,"m":4.2341,"c":"2016-10-21 05:33:37","comment":"hello"}
+        }"#;
+
+        let events = parser
+            .parse_wal_message(json.as_bytes(), &catalog)
+            .expect("bootstrap-insert should parse as insert");
+
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EventKind::Insert);
+        assert_eq!(ev.table_id, 1);
+        assert!(ev.new_row.is_some());
+        assert!(ev.old_row.is_none());
+    }
+
+    #[test]
+    fn bootstrap_start_and_complete_are_skipped() {
+        let catalog = maxwell_e_catalog();
+        let parser = MaxwellParser;
+
+        for event_type in &["bootstrap-start", "bootstrap-complete"] {
+            let json = format!(r#"{{"database":"test","table":"e","type":"{event_type}"}}"#);
+            let events = parser
+                .parse_wal_message(json.as_bytes(), &catalog)
+                .unwrap_or_else(|e| panic!("{event_type} should be skipped, not error: {e:?}"));
+            assert!(events.is_empty(), "{event_type} should produce no output");
+        }
     }
 }
