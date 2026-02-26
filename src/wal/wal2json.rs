@@ -409,40 +409,11 @@ fn convert_v2_message(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TestCatalog;
+    use super::super::test_support::{
+        orders_customer_catalog as orders_catalog,
+        orders_customer_no_pk_catalog as orders_no_pk_catalog,
+    };
     use super::*;
-    use std::collections::HashMap;
-
-    // -- Test catalog --------------------------------------------------------
-
-    fn orders_catalog() -> TestCatalog {
-        let mut tables = HashMap::new();
-        tables.insert("orders".to_string(), (1, 4));
-        tables.insert("public.orders".to_string(), (1, 4));
-
-        let mut columns = HashMap::new();
-        // id=0, customer=1, amount=2, status=3
-        columns.insert((1, "id".to_string()), 0);
-        columns.insert((1, "customer".to_string()), 1);
-        columns.insert((1, "amount".to_string()), 2);
-        columns.insert((1, "status".to_string()), 3);
-
-        let mut primary_keys = HashMap::new();
-        primary_keys.insert(1, vec![0]); // id is PK
-
-        TestCatalog {
-            tables,
-            columns,
-            primary_keys,
-        }
-    }
-
-    /// Same schema as `orders_catalog()` but without primary key metadata.
-    fn orders_no_pk_catalog() -> TestCatalog {
-        let mut cat = orders_catalog();
-        cat.primary_keys.clear();
-        cat
-    }
 
     /// Catalog where table_id resolves but table_arity returns None.
     struct NoArityCatalog;

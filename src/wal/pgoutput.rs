@@ -232,38 +232,36 @@ impl PgOutputParser {
         Self::default()
     }
 
-    fn parse_column_count(count: i16, context: &str) -> Result<usize, WalParseError> {
+    fn parse_bounded_count(
+        count: i64,
+        max_allowed: usize,
+        context: &str,
+        count_kind: &str,
+    ) -> Result<usize, WalParseError> {
         if count < 0 {
             return Err(WalParseError::MalformedPayload(format!(
-                "negative column count in {context}: {count}"
+                "negative {count_kind} count in {context}: {count}"
             )));
         }
         let count = usize::try_from(count).map_err(|_| {
-            WalParseError::MalformedPayload(format!("invalid column count in {context}: {count}"))
+            WalParseError::MalformedPayload(format!(
+                "invalid {count_kind} count in {context}: {count}"
+            ))
         })?;
-        if count > MAX_COLUMNS_PER_MESSAGE {
+        if count > max_allowed {
             return Err(WalParseError::MalformedPayload(format!(
-                "column count too large in {context}: {count}"
+                "{count_kind} count too large in {context}: {count}"
             )));
         }
         Ok(count)
     }
 
+    fn parse_column_count(count: i16, context: &str) -> Result<usize, WalParseError> {
+        Self::parse_bounded_count(i64::from(count), MAX_COLUMNS_PER_MESSAGE, context, "column")
+    }
+
     fn parse_relation_count(count: i32, context: &str) -> Result<usize, WalParseError> {
-        if count < 0 {
-            return Err(WalParseError::MalformedPayload(format!(
-                "negative relation count in {context}: {count}"
-            )));
-        }
-        let count = usize::try_from(count).map_err(|_| {
-            WalParseError::MalformedPayload(format!("invalid relation count in {context}: {count}"))
-        })?;
-        if count > MAX_CACHED_RELATIONS {
-            return Err(WalParseError::MalformedPayload(format!(
-                "relation count too large in {context}: {count}"
-            )));
-        }
-        Ok(count)
+        Self::parse_bounded_count(i64::from(count), MAX_CACHED_RELATIONS, context, "relation")
     }
 
     fn expected_tag(tag: u8, expected: u8, context: &str) -> Result<(), WalParseError> {
@@ -714,38 +712,12 @@ impl WalParser for PgOutputParser {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TestCatalog;
+    use super::super::test_support::{
+        orders_customer_catalog as orders_catalog,
+        orders_customer_no_pk_catalog as orders_no_pk_catalog,
+    };
     use super::*;
-    use std::collections::HashMap;
 
-    // -- Test catalog --------------------------------------------------------
-
-    fn orders_catalog() -> TestCatalog {
-        let mut tables = HashMap::new();
-        tables.insert("orders".to_string(), (1, 4));
-        tables.insert("public.orders".to_string(), (1, 4));
-
-        let mut columns = HashMap::new();
-        columns.insert((1, "id".to_string()), 0);
-        columns.insert((1, "customer".to_string()), 1);
-        columns.insert((1, "amount".to_string()), 2);
-        columns.insert((1, "status".to_string()), 3);
-
-        let mut primary_keys = HashMap::new();
-        primary_keys.insert(1, vec![0]); // id is PK
-
-        TestCatalog {
-            tables,
-            columns,
-            primary_keys,
-        }
-    }
-
-    fn orders_no_pk_catalog() -> TestCatalog {
-        let mut cat = orders_catalog();
-        cat.primary_keys.clear();
-        cat
-    }
     // -- Binary message builders ---------------------------------------------
 
     fn push_cstring(buf: &mut Vec<u8>, s: &str) {
