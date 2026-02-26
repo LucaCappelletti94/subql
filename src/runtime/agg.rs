@@ -1,6 +1,47 @@
-//! Streaming aggregate kernels for COUNT(*), COUNT(col), SUM(col), and AVG(col).
+//! Streaming aggregate utilities for COUNT(*), COUNT(col), SUM(col), and AVG(col).
 
-use crate::{AggDelta, ColumnId, RowImage};
+use crate::{compiler::AggSpec, AggDelta, ColumnId, RowImage};
+
+fn numeric_cell_value(row: &RowImage, column: ColumnId) -> Option<f64> {
+    match row.get(column) {
+        #[allow(clippy::cast_precision_loss)]
+        Some(crate::Cell::Int(v)) => Some(*v as f64),
+        Some(crate::Cell::Float(v)) if v.is_finite() => Some(*v),
+        _ => None, // NULL, Missing, NaN, Inf, non-numeric
+    }
+}
+
+/// Compute the per-row aggregate delta for a matched row image.
+///
+/// Returns `None` when the row contributes no delta under SQL semantics
+/// (for example `COUNT(col)` with `NULL`, `SUM`/`AVG` with non-numeric values).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<AggDelta> {
+    match spec {
+        AggSpec::CountStar => Some(AggDelta::Count(weight)),
+        AggSpec::CountColumn { column } => match row.get(*column) {
+            Some(crate::Cell::Null) | None => None,
+            Some(_) => Some(AggDelta::Count(weight)),
+        },
+        AggSpec::Sum { column } => {
+            let value = numeric_cell_value(row, *column)?;
+            let delta = value * weight as f64;
+            if delta != 0.0 {
+                Some(AggDelta::Sum(delta))
+            } else {
+                None
+            }
+        }
+        AggSpec::Avg { column } => {
+            let value = numeric_cell_value(row, *column)?;
+            Some(AggDelta::Avg {
+                sum_delta: value * weight as f64,
+                count_delta: weight,
+            })
+        }
+    }
+}
 
 /// Trait for streaming aggregate kernels.
 ///
@@ -103,11 +144,8 @@ impl SumKernel {
 impl AggKernel for SumKernel {
     #[allow(clippy::cast_precision_loss)]
     fn apply(&mut self, row: &RowImage, weight: i64) {
-        let v = match row.get(self.column) {
-            Some(crate::Cell::Int(v)) => *v as f64,
-            Some(crate::Cell::Float(v)) if v.is_finite() => *v,
-            // NULL, Missing, Bool, String → SQL NULL semantics (skip)
-            _ => return,
+        let Some(v) = numeric_cell_value(row, self.column) else {
+            return;
         };
         self.delta += v * weight as f64;
     }
@@ -147,11 +185,8 @@ impl AvgKernel {
 impl AggKernel for AvgKernel {
     #[allow(clippy::cast_precision_loss)]
     fn apply(&mut self, row: &RowImage, weight: i64) {
-        let v = match row.get(self.column) {
-            Some(crate::Cell::Int(v)) => *v as f64,
-            Some(crate::Cell::Float(v)) if v.is_finite() => *v,
-            // NULL, Missing, Bool, String → skip (SQL AVG ignores NULLs)
-            _ => return,
+        let Some(v) = numeric_cell_value(row, self.column) else {
+            return;
         };
         self.sum_delta += v * weight as f64;
         self.count_delta += weight;
@@ -181,6 +216,40 @@ mod tests {
         RowImage {
             cells: Arc::from(cells),
         }
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_count_star() {
+        let row = row(vec![Cell::Int(1)]);
+        let delta = agg_delta_for_row(&AggSpec::CountStar, &row, 1);
+        assert_eq!(delta, Some(AggDelta::Count(1)));
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_count_column_null_skips() {
+        let row = row(vec![Cell::Null]);
+        let delta = agg_delta_for_row(&AggSpec::CountColumn { column: 0 }, &row, 1);
+        assert_eq!(delta, None);
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_sum_skips_non_finite() {
+        let row = row(vec![Cell::Float(f64::NAN)]);
+        let delta = agg_delta_for_row(&AggSpec::Sum { column: 0 }, &row, 1);
+        assert_eq!(delta, None);
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_avg_uses_weight() {
+        let row = row(vec![Cell::Int(10)]);
+        let delta = agg_delta_for_row(&AggSpec::Avg { column: 0 }, &row, -1);
+        assert_eq!(
+            delta,
+            Some(AggDelta::Avg {
+                sum_delta: -10.0,
+                count_delta: -1
+            })
+        );
     }
 
     // --- CountKernel tests ---

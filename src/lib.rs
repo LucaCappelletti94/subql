@@ -6,8 +6,8 @@
 pub use compiler::{AggSpec, QueryProjection};
 pub use errors::*;
 pub use runtime::{
-    AggKernel, AvgKernel, CountColumnKernel, CountKernel, MatchedUsers, SubscriptionEngine,
-    SumKernel,
+    agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, MatchedUsers,
+    SubscriptionEngine, SumKernel,
 };
 pub use types::*;
 pub use wal::{

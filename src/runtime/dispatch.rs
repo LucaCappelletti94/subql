@@ -1,12 +1,9 @@
 //! Event dispatch pipeline
 
-use super::{ids::UserOrdinal, partition::TablePartition};
+use super::{agg::agg_delta_for_row, ids::UserOrdinal, partition::TablePartition};
 use crate::{
-    compiler::{
-        sql_shape::{AggSpec, QueryProjection},
-        Tri, Vm,
-    },
-    AggDelta, Cell, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
+    compiler::{sql_shape::QueryProjection, Tri, Vm},
+    AggDelta, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
 };
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
@@ -368,51 +365,23 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
 
                 if result == Tri::True {
                     if let Some(bitmap) = snapshot.predicates.predicate_users.get(&pred_id) {
-                        match spec {
-                            AggSpec::CountStar => {
-                                for ord_u32 in bitmap {
-                                    let ord = UserOrdinal::new(ord_u32);
-                                    *count_weights.entry(ord).or_default() += weight;
-                                }
-                            }
-                            AggSpec::CountColumn { column } => {
-                                // Only count non-NULL, non-Missing values (SQL semantics).
-                                match row.get(*column) {
-                                    Some(Cell::Null) | None => {}
-                                    Some(_) => {
-                                        for ord_u32 in bitmap {
-                                            let ord = UserOrdinal::new(ord_u32);
-                                            *count_weights.entry(ord).or_default() += weight;
-                                        }
+                        if let Some(delta) = agg_delta_for_row(spec, row, weight) {
+                            for ord_u32 in bitmap {
+                                let ord = UserOrdinal::new(ord_u32);
+                                match &delta {
+                                    AggDelta::Count(n) => {
+                                        *count_weights.entry(ord).or_default() += *n;
                                     }
-                                }
-                            }
-                            AggSpec::Sum { column } => {
-                                let v = match row.get(*column) {
-                                    Some(Cell::Int(v)) => (*v as f64) * (weight as f64),
-                                    Some(Cell::Float(v)) if v.is_finite() => v * (weight as f64),
-                                    _ => 0.0,
-                                };
-                                if v != 0.0 {
-                                    for ord_u32 in bitmap {
-                                        let ord = UserOrdinal::new(ord_u32);
-                                        *sum_weights.entry(ord).or_default() += v;
+                                    AggDelta::Sum(v) => {
+                                        *sum_weights.entry(ord).or_default() += *v;
                                     }
-                                }
-                            }
-                            AggSpec::Avg { column } => {
-                                let cell_val = match row.get(*column) {
-                                    Some(Cell::Int(v)) => Some(*v as f64),
-                                    Some(Cell::Float(v)) if v.is_finite() => Some(*v),
-                                    _ => None, // NULL, Missing, NaN, Inf → skip
-                                };
-                                if let Some(v) = cell_val {
-                                    let s_contrib = v * weight as f64;
-                                    for ord_u32 in bitmap {
-                                        let ord = UserOrdinal::new(ord_u32);
+                                    AggDelta::Avg {
+                                        sum_delta,
+                                        count_delta,
+                                    } => {
                                         let entry = avg_accum.entry(ord).or_default();
-                                        entry.0 += s_contrib;
-                                        entry.1 += weight;
+                                        entry.0 += *sum_delta;
+                                        entry.1 += *count_delta;
                                     }
                                 }
                             }
