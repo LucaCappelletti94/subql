@@ -263,6 +263,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         matches!(err, StorageError::PostCommitDirSync(_))
     }
 
+    // Not `const fn`: the observability branch calls tracing::warn! which is not const.
+    #[allow(clippy::missing_const_for_fn)]
     fn log_best_effort_durability(message: &str) {
         #[cfg(feature = "observability")]
         tracing::warn!("{message}");
@@ -1473,6 +1475,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         )
     }
 
+    // Not `const fn`: the observability branch calls tracing::warn! which is not const.
+    #[allow(clippy::missing_const_for_fn)]
     fn log_ignored_shard_filename(path: &Path, reason: &str) {
         #[cfg(feature = "observability")]
         tracing::warn!(
