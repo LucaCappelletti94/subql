@@ -16,9 +16,8 @@ use super::row_build::{
     build_row_from_typed_arrays_with,
 };
 use super::{
-    build_pk_from_resolved, delete_event, insert_event, pk_from_catalog_or_empty, resolve_table,
-    strict_pk_column_ids_from_names, truncate_event, update_event_with_old_row_completeness,
-    WalParseError, WalParser,
+    build_event_from_rows, build_pk_from_resolved, pk_from_catalog_or_empty, resolve_table,
+    strict_pk_column_ids_from_names, truncate_event, WalParseError, WalParser,
 };
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
@@ -116,14 +115,12 @@ impl WalParser for Wal2JsonV1Parser {
 
         let mut events = Vec::with_capacity(msg.change.len());
         for change in &msg.change {
-            match convert_v1_change(change, catalog) {
-                Ok(ev) => events.push(ev),
-                Err(WalParseError::UnknownEventKind(kind)) => {
-                    #[cfg(feature = "observability")]
-                    tracing::warn!("wal2json v1: skipping unknown kind '{kind}'");
-                    drop(kind);
-                }
-                Err(e) => return Err(e),
+            if let Some(event) = super::skip_unknown_event_kind(
+                convert_v1_change(change, catalog),
+                "wal2json v1",
+                "kind",
+            )? {
+                events.push(event);
             }
         }
         Ok(events)
@@ -136,28 +133,17 @@ impl WalParser for Wal2JsonV2Parser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let msg: Option<Wal2JsonV2Message> = super::parse_json_message_or_tombstone(data)?;
-        let Some(msg) = msg else {
-            // wal2json topics may emit tombstone messages ("null") for compaction.
-            return Ok(Vec::new());
-        };
-
-        // Skip non-row transactional metadata messages.
-        match msg.action.as_str() {
-            "B" | "C" | "M" => return Ok(Vec::new()),
-            _ => {}
-        }
-
-        match convert_v2_message(&msg, catalog) {
-            Ok(ev) => Ok(vec![ev]),
-            Err(WalParseError::UnknownEventKind(kind)) => {
-                #[cfg(feature = "observability")]
-                tracing::warn!("wal2json v2: skipping unknown action '{kind}'");
-                drop(kind);
-                Ok(vec![])
+        super::parse_single_json_event::<Wal2JsonV2Message, _>(data, |msg| {
+            // Skip non-row transactional metadata messages.
+            if matches!(msg.action.as_str(), "B" | "C" | "M") {
+                return Ok(None);
             }
-            Err(e) => Err(e),
-        }
+            super::skip_unknown_event_kind(
+                convert_v2_message(msg, catalog),
+                "wal2json v2",
+                "action",
+            )
+        })
     }
 }
 
@@ -233,43 +219,6 @@ fn build_pk_from_key_arrays(
         "oldkeys",
         |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.oldkeys.{name}")),
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_event_from_rows(
-    kind: EventKind,
-    table_id: TableId,
-    pk: PrimaryKey,
-    old_row: Option<RowImage>,
-    new_row: Option<RowImage>,
-    old_row_complete: bool,
-    missing_new_field: &'static str,
-    missing_old_field: &'static str,
-) -> Result<WalEvent, WalParseError> {
-    match kind {
-        EventKind::Insert => {
-            let new_row = new_row
-                .ok_or_else(|| WalParseError::MissingField(missing_new_field.to_string()))?;
-            Ok(insert_event(table_id, pk, new_row))
-        }
-        EventKind::Update => {
-            let new_row = new_row
-                .ok_or_else(|| WalParseError::MissingField(missing_new_field.to_string()))?;
-            Ok(update_event_with_old_row_completeness(
-                table_id,
-                pk,
-                old_row,
-                new_row,
-                old_row_complete,
-            ))
-        }
-        EventKind::Delete => {
-            let old_row = old_row
-                .ok_or_else(|| WalParseError::MissingField(missing_old_field.to_string()))?;
-            Ok(delete_event(table_id, pk, old_row))
-        }
-        EventKind::Truncate => Ok(truncate_event(table_id)),
-    }
 }
 
 // ============================================================================

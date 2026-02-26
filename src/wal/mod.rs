@@ -86,20 +86,36 @@ where
     parse_json_message(data)
 }
 
-#[cfg(test)]
 pub(crate) fn parse_single_json_event<T, F>(
     data: &[u8],
     build_event: F,
 ) -> Result<Vec<WalEvent>, WalParseError>
 where
     T: serde::de::DeserializeOwned,
-    F: FnOnce(&T) -> Result<WalEvent, WalParseError>,
+    F: FnOnce(&T) -> Result<Option<WalEvent>, WalParseError>,
 {
     let message: Option<T> = parse_json_message_or_tombstone(data)?;
     let Some(message) = message else {
         return Ok(Vec::new());
     };
-    Ok(vec![build_event(&message)?])
+    Ok(build_event(&message)?.into_iter().collect())
+}
+
+pub(crate) fn skip_unknown_event_kind(
+    result: Result<WalEvent, WalParseError>,
+    _parser_name: &'static str,
+    _token_name: &'static str,
+) -> Result<Option<WalEvent>, WalParseError> {
+    match result {
+        Ok(event) => Ok(Some(event)),
+        Err(WalParseError::UnknownEventKind(kind)) => {
+            #[cfg(feature = "observability")]
+            tracing::warn!("{_parser_name}: skipping unknown {_token_name} '{kind}'");
+            drop(kind);
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Errors that can occur during WAL message parsing.
@@ -407,6 +423,43 @@ pub(crate) fn truncate_event(table_id: TableId) -> WalEvent {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_event_from_rows(
+    kind: EventKind,
+    table_id: TableId,
+    pk: PrimaryKey,
+    old_row: Option<RowImage>,
+    new_row: Option<RowImage>,
+    old_row_complete: bool,
+    missing_new_field: &str,
+    missing_old_field: &str,
+) -> Result<WalEvent, WalParseError> {
+    match kind {
+        EventKind::Insert => {
+            let new_row = new_row
+                .ok_or_else(|| WalParseError::MissingField(missing_new_field.to_string()))?;
+            Ok(insert_event(table_id, pk, new_row))
+        }
+        EventKind::Update => {
+            let new_row = new_row
+                .ok_or_else(|| WalParseError::MissingField(missing_new_field.to_string()))?;
+            Ok(update_event_with_old_row_completeness(
+                table_id,
+                pk,
+                old_row,
+                new_row,
+                old_row_complete,
+            ))
+        }
+        EventKind::Delete => {
+            let old_row = old_row
+                .ok_or_else(|| WalParseError::MissingField(missing_old_field.to_string()))?;
+            Ok(delete_event(table_id, pk, old_row))
+        }
+        EventKind::Truncate => Ok(truncate_event(table_id)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,16 +606,17 @@ mod tests {
 
     #[test]
     fn test_parse_single_json_event_tombstone_returns_empty() {
-        let events =
-            parse_single_json_event::<serde_json::Value, _>(b"null", |_| Ok(truncate_event(1)))
-                .expect("tombstone should be ignored");
+        let events = parse_single_json_event::<serde_json::Value, _>(b"null", |_| {
+            Ok(Some(truncate_event(1)))
+        })
+        .expect("tombstone should be ignored");
         assert!(events.is_empty());
     }
 
     #[test]
     fn test_parse_single_json_event_wraps_one_event() {
         let events = parse_single_json_event::<serde_json::Value, _>(br#"{"x":1}"#, |_| {
-            Ok(truncate_event(7))
+            Ok(Some(truncate_event(7)))
         })
         .expect("object should parse");
         assert_eq!(events.len(), 1);

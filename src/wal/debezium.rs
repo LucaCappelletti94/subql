@@ -55,24 +55,17 @@ impl WalParser for DebeziumParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let message: Option<DebeziumEnvelope> = super::parse_json_message_or_tombstone(data)?;
-        let Some(message) = message else {
-            return Ok(Vec::new());
-        };
-        // Skip message/heartbeat ops — they contain no row data
-        if message.op == "m" {
-            return Ok(vec![]);
-        }
-        match convert_debezium_envelope(&message, catalog) {
-            Ok(ev) => Ok(vec![ev]),
-            Err(WalParseError::UnknownEventKind(kind)) => {
-                #[cfg(feature = "observability")]
-                tracing::warn!("Debezium: skipping unknown op '{kind}'");
-                drop(kind);
-                Ok(vec![])
+        super::parse_single_json_event::<DebeziumEnvelope, _>(data, |message| {
+            // Skip message/heartbeat ops — they contain no row data.
+            if message.op == "m" {
+                return Ok(None);
             }
-            Err(e) => Err(e),
-        }
+            super::skip_unknown_event_kind(
+                convert_debezium_envelope(message, catalog),
+                "Debezium",
+                "op",
+            )
+        })
     }
 }
 

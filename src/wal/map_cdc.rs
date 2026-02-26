@@ -3,9 +3,8 @@ use std::collections::HashMap;
 use super::pg_type::infer_cell_from_json_strict;
 use super::row_build::build_row_from_map_with;
 use super::{
-    build_pk_from_resolved, delete_event, insert_event, pk_from_catalog_or_empty,
-    strict_pk_column_ids_from_names, truncate_event, update_event_with_old_row_completeness,
-    WalParseError,
+    build_event_from_rows, build_pk_from_resolved, pk_from_catalog_or_empty,
+    strict_pk_column_ids_from_names, WalParseError,
 };
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
@@ -97,7 +96,16 @@ pub(super) fn convert_map_cdc_event(
                 build_map_row(new_map, table_id, catalog, config.new_field_prefix)?;
             let pk =
                 build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, catalog)?;
-            Ok(insert_event(table_id, pk, new_row))
+            build_event_from_rows(
+                kind,
+                table_id,
+                pk,
+                None,
+                Some(new_row),
+                false,
+                config.required_new_field,
+                config.required_old_field,
+            )
         }
         EventKind::Update => {
             let new_map = new_map.ok_or_else(|| {
@@ -128,13 +136,16 @@ pub(super) fn convert_map_cdc_event(
             //   changed_columns() safely skips Missing cells.
             let old_row_complete = super::old_row_is_complete(old_row.as_ref());
             let compute_changed = config.old_is_changed_columns_only || old_row_complete;
-            Ok(update_event_with_old_row_completeness(
+            build_event_from_rows(
+                kind,
                 table_id,
                 pk,
                 old_row,
-                new_row,
+                Some(new_row),
                 compute_changed,
-            ))
+                config.required_new_field,
+                config.required_old_field,
+            )
         }
         EventKind::Delete => {
             let old_map = old_map.ok_or_else(|| {
@@ -144,9 +155,27 @@ pub(super) fn convert_map_cdc_event(
                 build_map_row(old_map, table_id, catalog, config.old_field_prefix)?;
             let pk =
                 build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, catalog)?;
-            Ok(delete_event(table_id, pk, old_row))
+            build_event_from_rows(
+                kind,
+                table_id,
+                pk,
+                Some(old_row),
+                None,
+                false,
+                config.required_new_field,
+                config.required_old_field,
+            )
         }
-        EventKind::Truncate => Ok(truncate_event(table_id)),
+        EventKind::Truncate => build_event_from_rows(
+            kind,
+            table_id,
+            PrimaryKey::empty(),
+            None,
+            None,
+            false,
+            config.required_new_field,
+            config.required_old_field,
+        ),
     }
 }
 

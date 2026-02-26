@@ -56,34 +56,27 @@ impl WalParser for MaxwellParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        let message: Option<MaxwellMessage> = super::parse_json_message_or_tombstone(data)?;
-        let Some(message) = message else {
-            return Ok(Vec::new());
-        };
-        // Skip DDL/schema events and bootstrap control events — they contain no row data
-        if matches!(
-            message.event_type.as_str(),
-            "ddl"
-                | "table-create"
-                | "table-drop"
-                | "table-alter"
-                | "database-create"
-                | "database-drop"
-                | "bootstrap-start"
-                | "bootstrap-complete"
-        ) {
-            return Ok(vec![]);
-        }
-        match convert_maxwell_message(&message, catalog) {
-            Ok(ev) => Ok(vec![ev]),
-            Err(WalParseError::UnknownEventKind(kind)) => {
-                #[cfg(feature = "observability")]
-                tracing::warn!("Maxwell: skipping unknown event kind '{kind}'");
-                drop(kind);
-                Ok(vec![])
+        super::parse_single_json_event::<MaxwellMessage, _>(data, |message| {
+            // Skip DDL/schema events and bootstrap control events — they contain no row data.
+            if matches!(
+                message.event_type.as_str(),
+                "ddl"
+                    | "table-create"
+                    | "table-drop"
+                    | "table-alter"
+                    | "database-create"
+                    | "database-drop"
+                    | "bootstrap-start"
+                    | "bootstrap-complete"
+            ) {
+                return Ok(None);
             }
-            Err(e) => Err(e),
-        }
+            super::skip_unknown_event_kind(
+                convert_maxwell_message(message, catalog),
+                "Maxwell",
+                "event kind",
+            )
+        })
     }
 }
 
