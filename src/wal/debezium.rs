@@ -114,6 +114,10 @@ fn convert_debezium_envelope(
             new_field_prefix: "debezium.after",
             old_field_prefix: "debezium.before",
             pk_col_names: None,
+            // Debezium's `before` reflects replica identity, which may be sparse due to
+            // non-FULL replica identity settings.  We only compute changed_columns when
+            // the old row is complete to avoid false negatives.
+            old_is_changed_columns_only: false,
         },
         catalog,
     )

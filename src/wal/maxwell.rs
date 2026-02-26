@@ -128,6 +128,10 @@ fn convert_maxwell_message(
             new_field_prefix: "maxwell.data",
             old_field_prefix: old_prefix,
             pk_col_names: msg.primary_key_columns.as_deref(),
+            // Maxwell's `old` field contains only the changed columns by design;
+            // Missing means "not changed", so changed_columns() is safe to call
+            // even on a sparse old row.
+            old_is_changed_columns_only: true,
         },
         catalog,
     )
@@ -271,10 +275,11 @@ mod tests {
         assert_eq!(old.get(0), Some(&Cell::Missing));
         assert_eq!(old.get(3), Some(&Cell::Missing));
 
-        // Maxwell old row is sparse (only changed columns, rest are Missing).
-        // With conservative semantics, an incomplete old image produces no
-        // changed_columns — avoiding false negatives from missing old values.
-        assert!(ev.changed_columns.is_empty());
+        // Maxwell's `old` contains only changed columns; Missing means "not changed".
+        // changed_columns() skips Missing cells, so the result is exactly the
+        // columns that differed: m (col 1) and c (col 2).
+        let changed: Vec<u16> = ev.changed_columns.to_vec();
+        assert_eq!(changed, vec![1, 2]);
     }
 
     #[test]

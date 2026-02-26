@@ -68,6 +68,16 @@ pub(super) struct MapCdcConfig<'a> {
     pub new_field_prefix: &'a str,
     pub old_field_prefix: &'a str,
     pub pk_col_names: Option<&'a [String]>,
+    /// When `true`, the old-row map contains **only the changed columns** by
+    /// format contract (e.g. Maxwell's `old` field).  `Cell::Missing` in the
+    /// old row therefore means "column was not changed", and `changed_columns`
+    /// can be derived correctly even from a sparse old row.
+    ///
+    /// When `false` (e.g. Debezium, wal2json), the old row reflects whatever
+    /// the replica identity captured; a sparse row may be missing columns that
+    /// *did* change, so we only compute `changed_columns` when the old row is
+    /// complete (conservative, avoids false negatives).
+    pub old_is_changed_columns_only: bool,
 }
 
 pub(super) fn convert_map_cdc_event(
@@ -111,16 +121,19 @@ pub(super) fn convert_map_cdc_event(
             };
             let pk =
                 build_pk_from_optional_names(config.pk_col_names, pk_resolved, table_id, catalog)?;
-            // Derive changed_columns only when the old row is complete (no Missing cells).
-            // Partial old images (e.g. Debezium DEFAULT replica identity) are treated
-            // conservatively: changed_columns is left empty to avoid false negatives.
+            // Derive changed_columns when either:
+            // - The old row is complete (all columns present), or
+            // - The format guarantees the old row contains only changed columns
+            //   (e.g. Maxwell), in which case Missing means "not changed" and
+            //   changed_columns() safely skips Missing cells.
             let old_row_complete = super::old_row_is_complete(old_row.as_ref());
+            let compute_changed = config.old_is_changed_columns_only || old_row_complete;
             Ok(update_event_with_old_row_completeness(
                 table_id,
                 pk,
                 old_row,
                 new_row,
-                old_row_complete,
+                compute_changed,
             ))
         }
         EventKind::Delete => {
@@ -182,6 +195,7 @@ mod tests {
                 new_field_prefix: "after",
                 old_field_prefix: "before",
                 pk_col_names: None,
+                old_is_changed_columns_only: false,
             },
             &catalog,
         )
@@ -207,6 +221,7 @@ mod tests {
                 new_field_prefix: "after",
                 old_field_prefix: "before",
                 pk_col_names: None,
+                old_is_changed_columns_only: false,
             },
             &catalog,
         )
@@ -240,6 +255,7 @@ mod tests {
                 new_field_prefix: "after",
                 old_field_prefix: "before",
                 pk_col_names: None,
+                old_is_changed_columns_only: false,
             },
             &catalog,
         )
@@ -273,6 +289,7 @@ mod tests {
                 new_field_prefix: "after",
                 old_field_prefix: "before",
                 pk_col_names: None,
+                old_is_changed_columns_only: false,
             },
             &catalog,
         )
