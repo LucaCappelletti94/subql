@@ -26,6 +26,11 @@ required-features = ["dhat-heap"]
 name = "dispatch"
 harness = false
 
+[[bench]]
+name = "memory"
+harness = false
+required-features = ["dhat-heap"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects)
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs.git", rev = "40350e321f918005e07f818fa31d816f4f8b4c8c", features = ["visitor"] }
