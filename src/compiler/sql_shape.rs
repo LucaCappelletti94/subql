@@ -4,6 +4,10 @@ use sqlparser::ast::{
     SelectItem, SetExpr, Statement, TableFactor,
 };
 
+const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
+const UNSUPPORTED_PROJECTION: &str =
+    "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), or AVG(col) are supported";
+
 /// Projection kind for a subscription SQL statement.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -112,7 +116,7 @@ pub(super) fn extract_projection(
                     }
                     if f.over.is_some() {
                         return Err(RegisterError::UnsupportedSql(
-                            "Window functions not supported".to_string(),
+                            WINDOW_FUNCTIONS_NOT_SUPPORTED.to_string(),
                         ));
                     }
 
@@ -143,12 +147,12 @@ pub(super) fn extract_projection(
                                         .to_string(),
                                 )
                             })?;
-                            let column = catalog
-                                .column_id(table_id, &col_name)
-                                .ok_or(RegisterError::UnknownColumn {
+                            let column = catalog.column_id(table_id, &col_name).ok_or(
+                                RegisterError::UnknownColumn {
                                     table_id,
                                     column: col_name,
-                                })?;
+                                },
+                            )?;
                             Ok(QueryProjection::Aggregate(AggSpec::CountColumn { column }))
                         }
                         _ => Err(RegisterError::UnsupportedSql(
@@ -166,7 +170,7 @@ pub(super) fn extract_projection(
                     }
                     if f.over.is_some() {
                         return Err(RegisterError::UnsupportedSql(
-                            "Window functions not supported".to_string(),
+                            WINDOW_FUNCTIONS_NOT_SUPPORTED.to_string(),
                         ));
                     }
 
@@ -194,19 +198,18 @@ pub(super) fn extract_projection(
                                     func.to_uppercase()
                                 )));
                             }
-                            let col_name =
-                                extract_column_arg(&list.args[0]).ok_or_else(|| {
-                                    RegisterError::UnsupportedSql(format!(
-                                        "{} argument must be a plain column name, not an expression",
-                                        func.to_uppercase()
-                                    ))
-                                })?;
-                            catalog
-                                .column_id(table_id, &col_name)
-                                .ok_or(RegisterError::UnknownColumn {
+                            let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
+                                RegisterError::UnsupportedSql(format!(
+                                    "{} argument must be a plain column name, not an expression",
+                                    func.to_uppercase()
+                                ))
+                            })?;
+                            catalog.column_id(table_id, &col_name).ok_or(
+                                RegisterError::UnknownColumn {
                                     table_id,
                                     column: col_name,
-                                })?
+                                },
+                            )?
                         }
                         _ => {
                             return Err(RegisterError::UnsupportedSql(format!(
@@ -240,27 +243,23 @@ pub(super) fn extract_projection(
                         Ok(QueryProjection::Aggregate(AggSpec::Avg { column }))
                     }
                 }
-                Some(name @ ("min" | "max")) => {
-                    Err(RegisterError::UnsupportedSql(format!(
-                        "{} aggregate not supported — not delta-composable; \
+                Some(name @ ("min" | "max")) => Err(RegisterError::UnsupportedSql(format!(
+                    "{} aggregate not supported — not delta-composable; \
                          see src/todo.md for design notes",
-                        name.to_uppercase()
-                    )))
-                }
+                    name.to_uppercase()
+                ))),
                 _ => Err(RegisterError::UnsupportedSql(
-                    "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), or AVG(col) are supported"
-                        .to_string(),
+                    UNSUPPORTED_PROJECTION.to_string(),
                 )),
             }
         } else {
             Err(RegisterError::UnsupportedSql(
-                "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), or AVG(col) are supported"
-                    .to_string(),
+                UNSUPPORTED_PROJECTION.to_string(),
             ))
         }
     } else {
         Err(RegisterError::UnsupportedSql(
-            "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), or AVG(col) are supported".to_string(),
+            UNSUPPORTED_PROJECTION.to_string(),
         ))
     }
 }
