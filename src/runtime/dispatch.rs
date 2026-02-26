@@ -138,26 +138,31 @@ impl<I: IdTypes> Iterator for MatchedUsers<'_, I> {
 }
 
 /// Select the row image used for dispatch based on event kind.
+fn require_new_row<'a>(
+    event: &'a WalEvent,
+    message: &'static str,
+) -> Result<&'a RowImage, DispatchError> {
+    event
+        .new_row
+        .as_ref()
+        .ok_or(DispatchError::MissingRequiredRowImage(message))
+}
+
+fn require_old_row<'a>(
+    event: &'a WalEvent,
+    message: &'static str,
+) -> Result<&'a RowImage, DispatchError> {
+    event
+        .old_row
+        .as_ref()
+        .ok_or(DispatchError::MissingRequiredRowImage(message))
+}
+
 pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchError> {
     match event.kind {
-        EventKind::Insert => event
-            .new_row
-            .as_ref()
-            .ok_or(DispatchError::MissingRequiredRowImage(
-                "INSERT requires new_row",
-            )),
-        EventKind::Update => event
-            .new_row
-            .as_ref()
-            .ok_or(DispatchError::MissingRequiredRowImage(
-                "UPDATE requires new_row",
-            )),
-        EventKind::Delete => event
-            .old_row
-            .as_ref()
-            .ok_or(DispatchError::MissingRequiredRowImage(
-                "DELETE requires old_row",
-            )),
+        EventKind::Insert => require_new_row(event, "INSERT requires new_row"),
+        EventKind::Update => require_new_row(event, "UPDATE requires new_row"),
+        EventKind::Delete => require_old_row(event, "DELETE requires old_row"),
         EventKind::Truncate => Err(DispatchError::MissingRequiredRowImage(
             "TRUNCATE has no row image",
         )),
@@ -261,6 +266,28 @@ pub(crate) fn dispatch_users_with_row<'a, I: IdTypes>(
     })
 }
 
+fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, DispatchError> {
+    match event.kind {
+        EventKind::Insert => Ok(vec![(
+            1,
+            require_new_row(event, "INSERT requires new_row")?,
+        )]),
+        EventKind::Delete => Ok(vec![(
+            -1,
+            require_old_row(event, "DELETE requires old_row")?,
+        )]),
+        EventKind::Update => {
+            let old_row = event
+                .old_row
+                .as_ref()
+                .ok_or(DispatchError::AggregateUpdateRequiresOldRow(event.table_id))?;
+            let new_row = require_new_row(event, "UPDATE requires new_row")?;
+            Ok(vec![(-1, old_row), (1, new_row)])
+        }
+        EventKind::Truncate => Err(DispatchError::TruncateRequiresReset(event.table_id)),
+    }
+}
+
 /// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), …).
 ///
 /// Delta normalization per event kind:
@@ -282,45 +309,7 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
 ) -> Result<Vec<(I::UserId, AggDelta)>, DispatchError> {
     use crate::runtime::ids::PredicateId;
 
-    if event.kind == EventKind::Truncate {
-        return Err(DispatchError::TruncateRequiresReset(event.table_id));
-    }
-
-    // Build (weight, row) pairs based on event kind.
-    let weighted_rows: Vec<(i64, &RowImage)> = match event.kind {
-        EventKind::Insert => {
-            let new_row = event
-                .new_row
-                .as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage(
-                    "INSERT requires new_row",
-                ))?;
-            vec![(1, new_row)]
-        }
-        EventKind::Delete => {
-            let old_row = event
-                .old_row
-                .as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage(
-                    "DELETE requires old_row",
-                ))?;
-            vec![(-1, old_row)]
-        }
-        EventKind::Update => {
-            let old_row = event
-                .old_row
-                .as_ref()
-                .ok_or(DispatchError::AggregateUpdateRequiresOldRow(event.table_id))?;
-            let new_row = event
-                .new_row
-                .as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage(
-                    "UPDATE requires new_row",
-                ))?;
-            vec![(-1, old_row), (1, new_row)]
-        }
-        EventKind::Truncate => unreachable!("handled above"),
-    };
+    let weighted_rows = weighted_rows_for_agg(event)?;
 
     // Separate accumulators for each aggregate kind (avoids mixed-type confusion).
     let mut count_weights: AHashMap<UserOrdinal, i64> = AHashMap::new();

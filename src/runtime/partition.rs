@@ -145,16 +145,20 @@ impl<I: IdTypes> TablePartition<I> {
     }
 
     /// Update snapshot with current mutable predicates (no index rebuild)
-    fn update_snapshot(&self) {
-        let current = self.load_snapshot();
-
+    fn store_snapshot_with_indexes(&self, indexes: HybridIndexes) {
         let new_snapshot = TablePartitionSnapshot {
             table_id: self.table_id,
-            indexes: current.indexes.clone(),
+            indexes,
             predicates: Arc::clone(&self.mutable_predicates),
         };
 
         self.snapshot.store(Arc::new(new_snapshot));
+    }
+
+    /// Update snapshot with current mutable predicates (no index rebuild)
+    fn update_snapshot(&self) {
+        let current = self.load_snapshot();
+        self.store_snapshot_with_indexes(current.indexes.clone());
     }
 
     /// Incrementally update indexes for a single newly added predicate.
@@ -168,14 +172,7 @@ impl<I: IdTypes> TablePartition<I> {
         let current = self.load_snapshot();
         let mut new_indexes = current.indexes.clone();
         new_indexes.add_predicate(pred_id, atoms, deps, is_agg);
-
-        let new_snapshot = TablePartitionSnapshot {
-            table_id: self.table_id,
-            indexes: new_indexes,
-            predicates: Arc::clone(&self.mutable_predicates),
-        };
-
-        self.snapshot.store(Arc::new(new_snapshot));
+        self.store_snapshot_with_indexes(new_indexes);
     }
 
     /// Rebuild indexes from all predicates (used after predicate removal)
@@ -192,13 +189,7 @@ impl<I: IdTypes> TablePartition<I> {
             );
         }
 
-        let new_snapshot = TablePartitionSnapshot {
-            table_id: self.table_id,
-            indexes: new_indexes,
-            predicates: Arc::clone(&self.mutable_predicates),
-        };
-
-        self.snapshot.store(Arc::new(new_snapshot));
+        self.store_snapshot_with_indexes(new_indexes);
     }
 
     /// Select candidate predicates for a row
@@ -306,13 +297,7 @@ impl<I: IdTypes> TablePartition<I> {
         }
 
         // Single atomic snapshot swap
-        let new_snapshot = TablePartitionSnapshot {
-            table_id: self.table_id,
-            indexes: new_indexes,
-            predicates: Arc::clone(&self.mutable_predicates),
-        };
-
-        self.snapshot.store(Arc::new(new_snapshot));
+        self.store_snapshot_with_indexes(new_indexes);
     }
 
     /// Select candidate agg predicates for an event.
