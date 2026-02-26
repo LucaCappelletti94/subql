@@ -10,11 +10,11 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::Arc;
 
-use super::map_cdc::{convert_map_cdc_event, parse_event_kind, MapCdcConfig};
+use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig, MapCdcEnvelope};
 use super::{resolve_table, WalParseError, WalParser};
 #[cfg(test)]
 use crate::Cell;
-use crate::{EventKind, SchemaCatalog, WalEvent};
+use crate::{EventKind, SchemaCatalog, TableId, WalEvent};
 
 // ============================================================================
 // Serde structs
@@ -56,27 +56,7 @@ impl WalParser for MaxwellParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        super::parse_single_json_event::<MaxwellMessage, _>(data, |message| {
-            // Skip DDL/schema events and bootstrap control events — they contain no row data.
-            if matches!(
-                message.event_type.as_str(),
-                "ddl"
-                    | "table-create"
-                    | "table-drop"
-                    | "table-alter"
-                    | "database-create"
-                    | "database-drop"
-                    | "bootstrap-start"
-                    | "bootstrap-complete"
-            ) {
-                return Ok(None);
-            }
-            super::skip_unknown_event_kind(
-                convert_maxwell_message(message, catalog),
-                "Maxwell",
-                "event kind",
-            )
-        })
+        parse_map_cdc_json_message::<MaxwellMessage>(data, catalog)
     }
 }
 
@@ -94,40 +74,66 @@ fn parse_maxwell_kind(event_type: &str) -> Result<EventKind, WalParseError> {
     )
 }
 
-fn convert_maxwell_message(
-    msg: &MaxwellMessage,
-    catalog: &dyn SchemaCatalog,
-) -> Result<WalEvent, WalParseError> {
-    let kind = parse_maxwell_kind(&msg.event_type)?;
-    let table_id = resolve_table(&msg.database, &msg.table, catalog)?;
+impl MapCdcEnvelope for MaxwellMessage {
+    const PARSER_NAME: &'static str = "Maxwell";
+    const TOKEN_NAME: &'static str = "event kind";
 
-    let old_map = match kind {
-        EventKind::Delete => msg.data.as_ref(),
-        _ => msg.old.as_ref(),
-    };
-    let old_prefix = match kind {
-        EventKind::Delete => "maxwell.data",
-        _ => "maxwell.old",
-    };
+    fn event_token(&self) -> &str {
+        &self.event_type
+    }
 
-    convert_map_cdc_event(
-        kind,
-        table_id,
-        msg.data.as_ref(),
-        old_map,
-        &MapCdcConfig {
+    fn parse_kind(token: &str) -> Result<EventKind, WalParseError> {
+        parse_maxwell_kind(token)
+    }
+
+    fn resolve_table_id(&self, catalog: &dyn SchemaCatalog) -> Result<TableId, WalParseError> {
+        resolve_table(&self.database, &self.table, catalog)
+    }
+
+    fn map_config(&self, kind: EventKind) -> MapCdcConfig<'_> {
+        let old_prefix = match kind {
+            EventKind::Delete => "maxwell.data",
+            _ => "maxwell.old",
+        };
+
+        MapCdcConfig {
             required_new_field: "data",
             required_old_field: "data",
             new_field_prefix: "maxwell.data",
             old_field_prefix: old_prefix,
-            pk_col_names: msg.primary_key_columns.as_deref(),
+            pk_col_names: self.primary_key_columns.as_deref(),
             // Maxwell's `old` field contains only the changed columns by design;
             // Missing means "not changed", so changed_columns() is safe to call
             // even on a sparse old row.
             old_is_changed_columns_only: true,
-        },
-        catalog,
-    )
+        }
+    }
+
+    fn new_map(&self, _kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
+        self.data.as_ref()
+    }
+
+    fn old_map(&self, kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
+        match kind {
+            EventKind::Delete => self.data.as_ref(),
+            _ => self.old.as_ref(),
+        }
+    }
+
+    fn skip_message(&self) -> bool {
+        // Skip DDL/schema events and bootstrap control events — they contain no row data.
+        matches!(
+            self.event_type.as_str(),
+            "ddl"
+                | "table-create"
+                | "table-drop"
+                | "table-alter"
+                | "database-create"
+                | "database-drop"
+                | "bootstrap-start"
+                | "bootstrap-complete"
+        )
+    }
 }
 
 // ============================================================================

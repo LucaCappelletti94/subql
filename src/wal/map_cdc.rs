@@ -8,6 +8,63 @@ use super::{
 };
 use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
 
+pub(super) trait MapCdcEnvelope {
+    const PARSER_NAME: &'static str;
+    const TOKEN_NAME: &'static str;
+
+    fn event_token(&self) -> &str;
+
+    fn parse_kind(token: &str) -> Result<EventKind, WalParseError>;
+
+    fn resolve_table_id(&self, catalog: &dyn SchemaCatalog) -> Result<TableId, WalParseError>;
+
+    fn map_config(&self, kind: EventKind) -> MapCdcConfig<'_>;
+
+    fn new_map(&self, kind: EventKind) -> Option<&HashMap<String, serde_json::Value>>;
+
+    fn old_map(&self, kind: EventKind) -> Option<&HashMap<String, serde_json::Value>>;
+
+    fn skip_message(&self) -> bool {
+        false
+    }
+}
+
+pub(super) fn parse_map_cdc_json_message<T>(
+    data: &[u8],
+    catalog: &dyn SchemaCatalog,
+) -> Result<Vec<WalEvent>, WalParseError>
+where
+    T: serde::de::DeserializeOwned + MapCdcEnvelope,
+{
+    super::parse_single_json_event::<T, _>(data, |message| {
+        if message.skip_message() {
+            return Ok(None);
+        }
+        super::skip_unknown_event_kind(
+            convert_map_cdc_envelope(message, catalog),
+            T::PARSER_NAME,
+            T::TOKEN_NAME,
+        )
+    })
+}
+
+pub(super) fn convert_map_cdc_envelope<T: MapCdcEnvelope>(
+    message: &T,
+    catalog: &dyn SchemaCatalog,
+) -> Result<WalEvent, WalParseError> {
+    let kind = T::parse_kind(message.event_token())?;
+    let table_id = message.resolve_table_id(catalog)?;
+    let config = message.map_config(kind);
+    convert_map_cdc_event(
+        kind,
+        table_id,
+        message.new_map(kind),
+        message.old_map(kind),
+        &config,
+        catalog,
+    )
+}
+
 pub(super) fn parse_event_kind(
     token: &str,
     insert_tokens: &[&str],
@@ -122,7 +179,8 @@ pub(super) fn convert_map_cdc_event(
             // index lookups when a PK column changes (e.g. id: 1 → 2).
             // Sparse old rows (e.g. Debezium DEFAULT replica identity, Maxwell changed-only)
             // may not contain PK columns, so we fall back to the new row's resolved values.
-            let pk_resolved = if super::old_row_is_complete(old_row.as_ref()) {
+            let old_row_complete = super::old_row_is_complete(old_row.as_ref());
+            let pk_resolved = if old_row_complete {
                 &old_resolved
             } else {
                 &resolved
@@ -134,7 +192,6 @@ pub(super) fn convert_map_cdc_event(
             // - The format guarantees the old row contains only changed columns
             //   (e.g. Maxwell), in which case Missing means "not changed" and
             //   changed_columns() safely skips Missing cells.
-            let old_row_complete = super::old_row_is_complete(old_row.as_ref());
             let compute_changed = config.old_is_changed_columns_only || old_row_complete;
             build_event_from_rows(
                 kind,

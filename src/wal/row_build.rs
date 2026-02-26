@@ -32,6 +32,49 @@ fn validate_typed_arrays_lengths(
     Ok(())
 }
 
+fn resolve_unique_column_id(
+    table_id: TableId,
+    name: &str,
+    catalog: &dyn SchemaCatalog,
+    seen: &mut HashSet<ColumnId>,
+    duplicate_context: &str,
+) -> Result<ColumnId, WalParseError> {
+    let col_id = catalog
+        .column_id(table_id, name)
+        .ok_or_else(|| WalParseError::UnknownColumn {
+            table_id,
+            column: name.to_string(),
+        })?;
+    if !seen.insert(col_id) {
+        return Err(WalParseError::MalformedPayload(format!(
+            "{duplicate_context} contains duplicate column id {col_id} ('{name}')"
+        )));
+    }
+    Ok(col_id)
+}
+
+fn ensure_column_in_arity(
+    table_id: TableId,
+    col_id: ColumnId,
+    wal_count: usize,
+    catalog_arity: usize,
+) -> Result<(), WalParseError> {
+    if (col_id as usize) >= catalog_arity {
+        return Err(WalParseError::ArityMismatch {
+            table_id,
+            wal_count,
+            catalog_arity,
+        });
+    }
+    Ok(())
+}
+
+fn row_image_from_cells(cells: Vec<Cell>) -> RowImage {
+    RowImage {
+        cells: Arc::from(cells),
+    }
+}
+
 /// Build a row image from a column->value map and return resolved `(ColumnId, Cell)` pairs.
 pub(super) fn build_row_from_map_with<F>(
     map: &HashMap<String, serde_json::Value>,
@@ -49,37 +92,15 @@ where
     let mut seen = HashSet::with_capacity(map.len());
 
     for (name, value) in map {
-        let col_id =
-            catalog
-                .column_id(table_id, name)
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
-                })?;
-        if !seen.insert(col_id) {
-            return Err(WalParseError::MalformedPayload(format!(
-                "map row contains duplicate column id {col_id} ('{name}')"
-            )));
-        }
-        if (col_id as usize) >= arity {
-            return Err(WalParseError::ArityMismatch {
-                table_id,
-                wal_count: map.len(),
-                catalog_arity: arity,
-            });
-        }
+        let col_id = resolve_unique_column_id(table_id, name, catalog, &mut seen, "map row")?;
+        ensure_column_in_arity(table_id, col_id, map.len(), arity)?;
 
         let cell = value_to_cell(value, name)?;
         cells[col_id as usize] = cell.clone();
         resolved.push((col_id, cell));
     }
 
-    Ok((
-        RowImage {
-            cells: Arc::from(cells),
-        },
-        resolved,
-    ))
+    Ok((row_image_from_cells(cells), resolved))
 }
 
 /// Build a row image from parallel typed arrays.
@@ -100,37 +121,15 @@ where
     let mut seen = HashSet::with_capacity(columns.len());
 
     for (name, ty, value) in columns {
-        let col_id =
-            catalog
-                .column_id(table_id, name)
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: (*name).to_string(),
-                })?;
-        if !seen.insert(col_id) {
-            return Err(WalParseError::MalformedPayload(format!(
-                "{context} contains duplicate column id {col_id} ('{name}')"
-            )));
-        }
-        if (col_id as usize) >= arity {
-            return Err(WalParseError::ArityMismatch {
-                table_id,
-                wal_count: columns.len(),
-                catalog_arity: arity,
-            });
-        }
+        let col_id = resolve_unique_column_id(table_id, name, catalog, &mut seen, context)?;
+        ensure_column_in_arity(table_id, col_id, columns.len(), arity)?;
 
         let cell = value_to_cell(value, ty, name)?;
         cells[col_id as usize] = cell.clone();
         resolved.push((col_id, cell));
     }
 
-    Ok((
-        RowImage {
-            cells: Arc::from(cells),
-        },
-        resolved,
-    ))
+    Ok((row_image_from_cells(cells), resolved))
 }
 
 /// Build a row image from parallel typed arrays.
@@ -178,18 +177,7 @@ where
     let mut seen = HashSet::with_capacity(names.len());
 
     for ((name, ty), value) in names.iter().zip(types).zip(values) {
-        let col_id =
-            catalog
-                .column_id(table_id, name)
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
-                })?;
-        if !seen.insert(col_id) {
-            return Err(WalParseError::MalformedPayload(format!(
-                "{context} contains duplicate column id {col_id} ('{name}')"
-            )));
-        }
+        let col_id = resolve_unique_column_id(table_id, name, catalog, &mut seen, context)?;
         pk_cols.push(col_id);
         pk_vals.push(value_to_cell(value, ty, name)?);
     }

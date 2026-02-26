@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::map_cdc::{convert_map_cdc_event, parse_event_kind, MapCdcConfig};
-use super::{resolve_table, truncate_event, WalParseError, WalParser};
+use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig, MapCdcEnvelope};
+use super::{resolve_table, WalParseError, WalParser};
 #[cfg(test)]
 use crate::{Cell, ColumnId};
-use crate::{EventKind, SchemaCatalog, WalEvent};
+use crate::{EventKind, SchemaCatalog, TableId, WalEvent};
 
 // ============================================================================
 // Serde structs
@@ -55,17 +55,7 @@ impl WalParser for DebeziumParser {
         data: &[u8],
         catalog: &dyn SchemaCatalog,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        super::parse_single_json_event::<DebeziumEnvelope, _>(data, |message| {
-            // Skip message/heartbeat ops — they contain no row data.
-            if message.op == "m" {
-                return Ok(None);
-            }
-            super::skip_unknown_event_kind(
-                convert_debezium_envelope(message, catalog),
-                "Debezium",
-                "op",
-            )
-        })
+        parse_map_cdc_json_message::<DebeziumEnvelope>(data, catalog)
     }
 }
 
@@ -77,31 +67,31 @@ fn parse_debezium_op(op: &str) -> Result<EventKind, WalParseError> {
     parse_event_kind(op, &["c", "r"], &["u"], &["d"], &["t"])
 }
 
-fn convert_debezium_envelope(
-    env: &DebeziumEnvelope,
-    catalog: &dyn SchemaCatalog,
-) -> Result<WalEvent, WalParseError> {
-    let kind = parse_debezium_op(&env.op)?;
+impl MapCdcEnvelope for DebeziumEnvelope {
+    const PARSER_NAME: &'static str = "Debezium";
+    const TOKEN_NAME: &'static str = "op";
 
-    // Try schema.table first, then fall back to db.table only when table is unknown.
-    let table_id = match resolve_table(&env.source.schema, &env.source.table, catalog) {
-        Ok(table_id) => table_id,
-        Err(WalParseError::UnknownTable { .. }) => {
-            resolve_table(&env.source.db, &env.source.table, catalog)?
-        }
-        Err(err) => return Err(err),
-    };
-
-    if kind == EventKind::Truncate {
-        return Ok(truncate_event(table_id));
+    fn event_token(&self) -> &str {
+        &self.op
     }
 
-    convert_map_cdc_event(
-        kind,
-        table_id,
-        env.after.as_ref(),
-        env.before.as_ref(),
-        &MapCdcConfig {
+    fn parse_kind(token: &str) -> Result<EventKind, WalParseError> {
+        parse_debezium_op(token)
+    }
+
+    fn resolve_table_id(&self, catalog: &dyn SchemaCatalog) -> Result<TableId, WalParseError> {
+        // Try schema.table first, then fall back to db.table only when table is unknown.
+        match resolve_table(&self.source.schema, &self.source.table, catalog) {
+            Ok(table_id) => Ok(table_id),
+            Err(WalParseError::UnknownTable { .. }) => {
+                resolve_table(&self.source.db, &self.source.table, catalog)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn map_config(&self, _kind: EventKind) -> MapCdcConfig<'_> {
+        MapCdcConfig {
             required_new_field: "after",
             required_old_field: "before",
             new_field_prefix: "debezium.after",
@@ -111,9 +101,21 @@ fn convert_debezium_envelope(
             // non-FULL replica identity settings.  We only compute changed_columns when
             // the old row is complete to avoid false negatives.
             old_is_changed_columns_only: false,
-        },
-        catalog,
-    )
+        }
+    }
+
+    fn new_map(&self, _kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
+        self.after.as_ref()
+    }
+
+    fn old_map(&self, _kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
+        self.before.as_ref()
+    }
+
+    fn skip_message(&self) -> bool {
+        // Skip message/heartbeat ops — they contain no row data.
+        self.op == "m"
+    }
 }
 
 // ============================================================================
