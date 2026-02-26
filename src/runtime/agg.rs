@@ -12,9 +12,12 @@ use crate::{AggDelta, ColumnId, RowImage};
 /// The engine handles only WAL-driven deltas. Callers must:
 /// 1. **Bootstrap** — query the DB for the initial aggregate before subscribing.
 /// 2. **Accumulate** — `running_value += delta` on each `aggregate_deltas` call.
-/// 3. **Reset on policy change** — RLS/ACL changes produce no WAL events;
+/// 3. **Require old UPDATE images** — aggregate UPDATE deltas need both old and
+///    new row images; CDC sources that omit `before`/`old` rows cannot produce
+///    correct UPDATE deltas.
+/// 4. **Reset on policy change** — RLS/ACL changes produce no WAL events;
 ///    re-query the DB and replace the stored value.
-/// 4. **Reset on TRUNCATE** — engine returns `Err(TruncateRequiresReset)`;
+/// 5. **Reset on TRUNCATE** — engine returns `Err(TruncateRequiresReset)`;
 ///    caller must re-query and replace the stored value.
 pub trait AggKernel: Send {
     /// Apply a signed-weight delta for a matched row.
@@ -102,13 +105,7 @@ impl AggKernel for SumKernel {
     fn apply(&mut self, row: &RowImage, weight: i64) {
         let v = match row.get(self.column) {
             Some(crate::Cell::Int(v)) => *v as f64,
-            Some(crate::Cell::Float(v)) => {
-                if v.is_finite() {
-                    *v
-                } else {
-                    return;
-                }
-            }
+            Some(crate::Cell::Float(v)) if v.is_finite() => *v,
             // NULL, Missing, Bool, String → SQL NULL semantics (skip)
             _ => return,
         };
@@ -152,13 +149,7 @@ impl AggKernel for AvgKernel {
     fn apply(&mut self, row: &RowImage, weight: i64) {
         let v = match row.get(self.column) {
             Some(crate::Cell::Int(v)) => *v as f64,
-            Some(crate::Cell::Float(v)) => {
-                if v.is_finite() {
-                    *v
-                } else {
-                    return;
-                }
-            }
+            Some(crate::Cell::Float(v)) if v.is_finite() => *v,
             // NULL, Missing, Bool, String → skip (SQL AVG ignores NULLs)
             _ => return,
         };

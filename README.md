@@ -81,6 +81,9 @@ Instead of `SELECT *`, register a `SELECT COUNT(*)`, `SELECT COUNT(col)`,
 **deltas** via `aggregate_deltas()` — the caller maintains the running total.
 
 Aggregate subscribers never appear in `users()` output and vice versa.
+For `UPDATE` aggregate deltas, CDC events must include both old and new row
+images. If a source omits old images (`before`/`old`), `aggregate_deltas()`
+returns an error for update events.
 
 ```rust
 use std::sync::Arc;
