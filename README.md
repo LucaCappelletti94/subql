@@ -138,6 +138,7 @@ deltas.sort_by_key(|(_, d)| match d {
     AggDelta::Count(_) => 0,
     AggDelta::Sum(_) => 1,
     AggDelta::Avg { .. } => 2,
+    _ => 3,
 });
 assert_eq!(deltas, vec![
     (42, AggDelta::Count(1)),
@@ -159,16 +160,60 @@ assert_eq!(deltas, vec![
 For `AVG`, the caller accumulates `running_sum` and `running_count` separately,
 then computes the average as `running_sum / running_count` on demand:
 
-```rust,ignore
+```rust
+use std::sync::Arc;
+use sqlparser::dialect::PostgreSqlDialect;
+use subql::{
+    AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, EventKind,
+    PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionSpec, WalEvent,
+};
+
+let catalog = Arc::new(
+    SimpleCatalog::new()
+        .add_table("scores", 1, 2)
+        .add_column(1, "id", 0)
+        .add_column_typed(1, "value", 1, ColumnType::Int),
+);
+let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+    SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+engine.register(SubscriptionSpec {
+    subscription_id: 1,
+    user_id: 7,
+    session_id: None,
+    sql: "SELECT AVG(value) FROM scores WHERE id > 0".to_string(),
+    updated_at_unix_ms: 0,
+})?;
+
+let event = WalEvent {
+    kind: EventKind::Insert,
+    table_id: 1,
+    pk: PrimaryKey {
+        columns: Arc::from([0u16]),
+        values: Arc::from([Cell::Int(1)]),
+    },
+    old_row: None,
+    new_row: Some(RowImage {
+        cells: Arc::from([Cell::Int(1), Cell::Int(100)]),
+    }),
+    changed_columns: Arc::from([]),
+};
+
+let deltas = engine.aggregate_deltas(&event)?;
+let (_, delta) = &deltas[0];
+
+// Accumulate running statistics across events:
 let mut running_sum = 0.0_f64;
 let mut running_count = 0_i64;
 
-// On each event:
 if let AggDelta::Avg { sum_delta, count_delta } = delta {
     running_sum += sum_delta;
     running_count += count_delta;
     let avg = running_sum / running_count as f64;
+    assert_eq!(avg, 100.0);
 }
+
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### Type validation
@@ -177,18 +222,42 @@ Use `SimpleCatalog::add_column_typed` to register column types. When a column
 type is known, the engine rejects `SUM` or `AVG` over non-numeric columns
 (`Bool`, `String`) at registration time with a `RegisterError::UnsupportedSql`.
 
-```rust,ignore
-let catalog = SimpleCatalog::new()
-    .add_table("products", 1, 3)
-    .add_column_typed(1, "price", 0, ColumnType::Float)
-    .add_column_typed(1, "name",  1, ColumnType::String)  // non-numeric
-    .add_column(1, "id", 2);
+```rust
+use std::sync::Arc;
+use sqlparser::dialect::PostgreSqlDialect;
+use subql::{ColumnType, DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionSpec};
+
+let catalog = Arc::new(
+    SimpleCatalog::new()
+        .add_table("products", 1, 3)
+        .add_column_typed(1, "price", 0, ColumnType::Float)
+        .add_column_typed(1, "name", 1, ColumnType::String) // non-numeric
+        .add_column(1, "id", 2),
+);
+let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+    SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 // Accepted — price is Float:
-engine.register(/* SELECT SUM(price) FROM products … */)?;
+engine.register(SubscriptionSpec {
+    subscription_id: 1,
+    user_id: 1,
+    session_id: None,
+    sql: "SELECT SUM(price) FROM products WHERE id > 0".to_string(),
+    updated_at_unix_ms: 0,
+})?;
 
 // Rejected at registration — name is String:
-assert!(engine.register(/* SELECT SUM(name) FROM products … */).is_err());
+assert!(engine
+    .register(SubscriptionSpec {
+        subscription_id: 2,
+        user_id: 1,
+        session_id: None,
+        sql: "SELECT SUM(name) FROM products WHERE id > 0".to_string(),
+        updated_at_unix_ms: 0,
+    })
+    .is_err());
+
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## CI
