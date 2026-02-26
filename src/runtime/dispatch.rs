@@ -658,8 +658,8 @@ mod tests {
         use super::super::partition::TablePartition;
         use super::super::predicate::{Binding, Predicate};
         use crate::compiler::sql_shape::QueryProjection;
-        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
         use crate::compiler::Vm;
+        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
         let mut user_dict = UserDictionary::<DefaultIds>::new();
@@ -1155,7 +1155,10 @@ mod tests {
 
         let err = compute_agg_deltas(&event, &partition, &user_dict, &mut vm)
             .expect_err("UPDATE without old_row must be rejected for aggregates");
-        assert!(matches!(err, DispatchError::AggregateUpdateRequiresOldRow(1)));
+        assert!(matches!(
+            err,
+            DispatchError::AggregateUpdateRequiresOldRow(1)
+        ));
     }
 
     // --- SUM aggregate dispatch tests ---

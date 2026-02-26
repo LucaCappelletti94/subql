@@ -25,9 +25,9 @@ use crate::{
         },
     },
     DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, EventKind, IdTypes,
-    MergeError, MergeJobId, MergeReport, PruneReport, RegisterError, RegisterResult, SchemaCatalog,
-    RowImage, StorageError, SubscriptionDispatch, SubscriptionPruning, SubscriptionRegistration,
-    SubscriptionSpec, TableId, WalEvent,
+    MergeError, MergeJobId, MergeReport, PruneReport, RegisterError, RegisterResult, RowImage,
+    SchemaCatalog, StorageError, SubscriptionDispatch, SubscriptionPruning,
+    SubscriptionRegistration, SubscriptionSpec, TableId, WalEvent,
 };
 use ahash::{AHashMap, AHashSet};
 use sqlparser::dialect::Dialect;
@@ -4589,7 +4589,10 @@ mod tests {
         let err = engine
             .aggregate_deltas(&event)
             .expect_err("UPDATE without old_row must be rejected for aggregate deltas");
-        assert!(matches!(err, DispatchError::AggregateUpdateRequiresOldRow(1)));
+        assert!(matches!(
+            err,
+            DispatchError::AggregateUpdateRequiresOldRow(1)
+        ));
     }
 
     #[test]
@@ -4700,7 +4703,10 @@ mod tests {
         };
 
         let users: Vec<_> = engine.users(&event).unwrap().collect();
-        assert!(users.is_empty(), "aggregate-only users must not appear in users()");
+        assert!(
+            users.is_empty(),
+            "aggregate-only users must not appear in users()"
+        );
     }
 
     // --- SUM engine integration tests ---
