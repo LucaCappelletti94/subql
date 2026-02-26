@@ -75,11 +75,10 @@ pub enum EventKind {
     Delete,
     /// Table truncate — all rows in the table are removed.
     ///
-    /// **Fanout semantics**: TRUNCATE does not carry a row image, so predicate
-    /// evaluation is skipped. Every subscriber whose subscription references
-    /// the truncated table is notified unconditionally. This mirrors PostgreSQL
-    /// logical-replication behaviour where TRUNCATE is broadcast to all
-    /// replication slots that include the affected table.
+    /// **Fanout semantics**: TRUNCATE does not carry a row image, so `users()`
+    /// skips predicate VM evaluation and notifies row subscriptions for the
+    /// table. Aggregate subscriptions are handled separately by
+    /// `aggregate_deltas()`, which returns `TruncateRequiresReset`.
     Truncate,
 }
 

@@ -26,7 +26,7 @@ use crate::{
     },
     DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, EventKind, IdTypes,
     MergeError, MergeJobId, MergeReport, PruneReport, RegisterError, RegisterResult, SchemaCatalog,
-    StorageError, SubscriptionDispatch, SubscriptionPruning, SubscriptionRegistration,
+    RowImage, StorageError, SubscriptionDispatch, SubscriptionPruning, SubscriptionRegistration,
     SubscriptionSpec, TableId, WalEvent,
 };
 use ahash::{AHashMap, AHashSet};
@@ -927,6 +927,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// # Caller contract
     /// - Bootstrap: query the DB for the initial aggregate **before** subscribing.
     /// - Accumulate: `running_value += delta` on each call.
+    /// - UPDATE image requirement: aggregate UPDATE deltas require both
+    ///   `old_row` and `new_row`; when CDC omits old images, this API returns
+    ///   `DispatchError::AggregateUpdateRequiresOldRow`.
     /// - Reset on policy change: RLS/ACL changes produce no WAL events;
     ///   re-query the DB and replace the stored value.
     /// - Reset on TRUNCATE: engine returns `Err(TruncateRequiresReset)`;
@@ -992,12 +995,20 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
-        // Mirror the arity guard from users(): validate row image against catalog.
-        if let Ok(row) = select_event_row(event) {
-            let expected = self
-                .catalog
-                .table_arity(event.table_id)
-                .ok_or(DispatchError::UnknownTableArity(event.table_id))?;
+        // Validate all row images consumed by aggregate dispatch.
+        let mut expected_arity = None;
+        let mut validate_row = |row: &RowImage| -> Result<(), DispatchError> {
+            let expected = if let Some(v) = expected_arity {
+                v
+            } else {
+                let v = self
+                    .catalog
+                    .table_arity(event.table_id)
+                    .ok_or(DispatchError::UnknownTableArity(event.table_id))?;
+                expected_arity = Some(v);
+                v
+            };
+
             if row.len() != expected {
                 return Err(DispatchError::InvalidRowArity {
                     table_id: event.table_id,
@@ -1005,6 +1016,30 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                     got: row.len(),
                 });
             }
+
+            Ok(())
+        };
+
+        match event.kind {
+            EventKind::Insert => {
+                if let Some(new_row) = event.new_row.as_ref() {
+                    validate_row(new_row)?;
+                }
+            }
+            EventKind::Delete => {
+                if let Some(old_row) = event.old_row.as_ref() {
+                    validate_row(old_row)?;
+                }
+            }
+            EventKind::Update => {
+                if let Some(old_row) = event.old_row.as_ref() {
+                    validate_row(old_row)?;
+                }
+                if let Some(new_row) = event.new_row.as_ref() {
+                    validate_row(new_row)?;
+                }
+            }
+            EventKind::Truncate => {}
         }
 
         super::dispatch::compute_agg_deltas(event, partition, user_dict, &mut self.vm)
@@ -4475,6 +4510,89 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_deltas_update_rejects_wrong_old_row_arity() {
+        use crate::DispatchError;
+
+        let catalog = make_catalog(); // orders: 3 columns (id=0, amount=1, status=2)
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey::empty(),
+            old_row: Some(RowImage {
+                // Wrong old-row arity (expected 3)
+                cells: Arc::from([Cell::Int(1), Cell::Int(20)]),
+            }),
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("done".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let err = engine
+            .aggregate_deltas(&event)
+            .expect_err("wrong old-row arity must return error");
+        assert!(
+            matches!(
+                err,
+                DispatchError::InvalidRowArity {
+                    table_id: 1,
+                    expected: 3,
+                    got: 2
+                }
+            ),
+            "Expected InvalidRowArity {{expected: 3, got: 2}}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn aggregate_deltas_update_without_old_row_returns_strict_error() {
+        use crate::DispatchError;
+
+        let catalog = make_catalog(); // orders: 3 columns (id=0, amount=1, status=2)
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey::empty(),
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("done".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let err = engine
+            .aggregate_deltas(&event)
+            .expect_err("UPDATE without old_row must be rejected for aggregate deltas");
+        assert!(matches!(err, DispatchError::AggregateUpdateRequiresOldRow(1)));
+    }
+
+    #[test]
     fn test_same_where_different_projection_yields_two_predicates() {
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
@@ -4553,6 +4671,36 @@ mod tests {
             vec![1u64],
             "COUNT subscribers must not appear in users() dispatch"
         );
+    }
+
+    #[test]
+    fn test_users_truncate_skips_aggregate_only_subscriptions() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Aggregate-only subscriber.
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 2,
+                session_id: None,
+                sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Truncate,
+            table_id: 1,
+            pk: PrimaryKey::empty(),
+            old_row: None,
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        assert!(users.is_empty(), "aggregate-only users must not appear in users()");
     }
 
     // --- SUM engine integration tests ---

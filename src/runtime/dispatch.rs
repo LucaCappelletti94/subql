@@ -167,10 +167,19 @@ pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchEr
     }
 }
 
-fn matched_users_for_truncate<I: IdTypes>(user_dict: &UserDictionary<I>) -> MatchedUsers<'_, I> {
+fn matched_users_for_truncate<'a, I: IdTypes>(
+    partition: &TablePartition<I>,
+    user_dict: &'a UserDictionary<I>,
+) -> MatchedUsers<'a, I> {
+    let snapshot = partition.load_snapshot();
     let mut ordinals = RoaringBitmap::new();
-    for ordinal in user_dict.user_to_ordinal.values() {
-        ordinals.insert(ordinal.get());
+    for (pred_id, users) in &snapshot.predicates.predicate_users {
+        let Some(pred) = snapshot.predicates.get_predicate(*pred_id) else {
+            continue;
+        };
+        if matches!(pred.projection, QueryProjection::Rows) {
+            ordinals |= users;
+        }
     }
     MatchedUsers {
         bitmap_iter: ordinals.into_iter(),
@@ -193,11 +202,10 @@ pub fn dispatch_users<'a, I: IdTypes>(
     user_dict: &'a UserDictionary<I>,
     vm: &mut Vm,
 ) -> Result<MatchedUsers<'a, I>, DispatchError> {
-    // TRUNCATE events fan-out to all table subscribers.
+    // TRUNCATE events fan-out only to row subscribers (`SELECT * ...`).
     if event.kind == EventKind::Truncate {
-        let _ = partition;
         let _ = vm;
-        return Ok(matched_users_for_truncate(user_dict));
+        return Ok(matched_users_for_truncate(partition, user_dict));
     }
 
     // 1. Get row image based on event kind (validates presence)
@@ -305,9 +313,7 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
             let old_row = event
                 .old_row
                 .as_ref()
-                .ok_or(DispatchError::MissingRequiredRowImage(
-                    "UPDATE requires old_row",
-                ))?;
+                .ok_or(DispatchError::AggregateUpdateRequiresOldRow(event.table_id))?;
             let new_row = event
                 .new_row
                 .as_ref()
@@ -384,13 +390,7 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
                             AggSpec::Sum { column } => {
                                 let v = match row.get(*column) {
                                     Some(Cell::Int(v)) => (*v as f64) * (weight as f64),
-                                    Some(Cell::Float(v)) => {
-                                        if v.is_finite() {
-                                            v * (weight as f64)
-                                        } else {
-                                            0.0
-                                        }
-                                    }
+                                    Some(Cell::Float(v)) if v.is_finite() => v * (weight as f64),
                                     _ => 0.0,
                                 };
                                 if v != 0.0 {
@@ -653,14 +653,50 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_truncate_requires_no_row_and_returns_all_table_users() {
+    fn test_dispatch_truncate_requires_no_row_and_returns_only_row_subscribers() {
+        use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
+        use super::super::predicate::{Binding, Predicate};
+        use crate::compiler::sql_shape::QueryProjection;
+        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
         use crate::compiler::Vm;
 
-        let partition = TablePartition::<DefaultIds>::new(1);
+        let mut partition = TablePartition::<DefaultIds>::new(1);
         let mut user_dict = UserDictionary::<DefaultIds>::new();
-        user_dict.get_or_create(42);
-        user_dict.get_or_create(77);
+
+        // Row predicate bound to user 42.
+        let row_pred = Predicate {
+            id: super::super::ids::PredicateId::from_slab_index(0),
+            hash: 0xABCD,
+            normalized_sql: "true".into(),
+            bytecode: Arc::new(BytecodeProgram::new(vec![Instruction::PushLiteral(
+                crate::Cell::Bool(true),
+            )])),
+            dependency_columns: Arc::from([]),
+            projection: QueryProjection::Rows,
+            index_atoms: Arc::from([IndexableAtom::Fallback]),
+            prefilter_plan: Arc::new(PrefilterPlan::default()),
+            refcount: 1,
+            updated_at_unix_ms: 1000,
+        };
+        let row_pred_id = row_pred.id;
+        partition.add_predicate(row_pred, vec![IndexableAtom::Fallback]);
+
+        let row_ord = user_dict.get_or_create(42);
+        partition.add_binding(
+            Binding {
+                subscription_id: 100,
+                predicate_id: row_pred_id,
+                user_id: 42,
+                user_ordinal: row_ord,
+                session_id: None,
+                updated_at_unix_ms: 1000,
+            },
+            row_pred_id,
+        );
+
+        // Aggregate predicate bound to user 77 must not leak into users().
+        make_count_pred_and_binding(1, 101, 77, &mut partition, &mut user_dict);
         let mut vm = Vm::new();
 
         let event = WalEvent {
@@ -676,7 +712,7 @@ mod tests {
             .expect("truncate should dispatch without row image")
             .collect();
         users.sort_unstable();
-        assert_eq!(users, vec![42, 77]);
+        assert_eq!(users, vec![42]);
     }
 
     #[test]
@@ -1092,6 +1128,34 @@ mod tests {
             deltas.is_empty(),
             "UPDATE where both old and new match should yield zero net delta (no entry)"
         );
+    }
+
+    #[test]
+    fn test_agg_update_missing_old_row_returns_strict_error() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(make_row(20)),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let err = compute_agg_deltas(&event, &partition, &user_dict, &mut vm)
+            .expect_err("UPDATE without old_row must be rejected for aggregates");
+        assert!(matches!(err, DispatchError::AggregateUpdateRequiresOldRow(1)));
     }
 
     // --- SUM aggregate dispatch tests ---

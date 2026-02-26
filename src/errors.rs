@@ -66,6 +66,15 @@ pub enum DispatchError {
     #[error("Missing required row image: {0}")]
     MissingRequiredRowImage(&'static str),
 
+    /// Aggregate UPDATE requires pre-update row image.
+    ///
+    /// CDC sources that omit `before`/`old` images cannot produce correct
+    /// aggregate deltas for UPDATE events.
+    #[error(
+        "Aggregate UPDATE on table {0} requires old_row image — enable before/old images in CDC source"
+    )]
+    AggregateUpdateRequiresOldRow(TableId),
+
     /// Row arity doesn't match schema
     #[error("Invalid row arity for table {table_id}: expected {expected} columns, got {got}")]
     InvalidRowArity {
@@ -207,6 +216,10 @@ mod tests {
         assert_eq!(
             DispatchError::MissingRequiredRowImage("old_row").to_string(),
             "Missing required row image: old_row"
+        );
+        assert_eq!(
+            DispatchError::AggregateUpdateRequiresOldRow(7).to_string(),
+            "Aggregate UPDATE on table 7 requires old_row image — enable before/old images in CDC source"
         );
         assert_eq!(
             DispatchError::InvalidRowArity {
