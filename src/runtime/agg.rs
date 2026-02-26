@@ -27,10 +27,10 @@ pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<
         AggSpec::Sum { column } => {
             let value = numeric_cell_value(row, *column)?;
             let delta = value * weight as f64;
-            if delta != 0.0 {
-                Some(AggDelta::Sum(delta))
-            } else {
+            if delta == 0.0 {
                 None
+            } else {
+                Some(AggDelta::Sum(delta))
             }
         }
         AggSpec::Avg { column } => {
