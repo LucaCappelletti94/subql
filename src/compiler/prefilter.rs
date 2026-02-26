@@ -3,7 +3,7 @@
 //! This planner is intentionally conservative: it may return false positives,
 //! but it must not return false negatives.
 
-use super::Tri;
+use super::{literals::sql_value_to_cell_lossy, Tri};
 use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
@@ -670,13 +670,7 @@ fn flip_comparison(op: BinaryOperator) -> BinaryOperator {
 }
 
 fn resolve_column(expr: &Expr, table_id: TableId, catalog: &dyn SchemaCatalog) -> Option<ColumnId> {
-    match expr {
-        Expr::Identifier(ident) => catalog.column_id(table_id, &ident.value),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            catalog.column_id(table_id, &parts[1].value)
-        }
-        _ => None,
-    }
+    super::literals::resolve_column_ref(expr, table_id, catalog)
 }
 
 fn literal_cell(expr: &Expr) -> Option<Cell> {
@@ -699,20 +693,7 @@ const fn literal_int_cell(cell: &Cell) -> Option<i64> {
 }
 
 fn literal_cell_from_sql_value(val: &Value) -> Option<Cell> {
-    match val {
-        Value::Null => Some(Cell::Null),
-        Value::Boolean(b) => Some(Cell::Bool(*b)),
-        Value::Number(n, _long) => n
-            .parse::<i64>()
-            .map(Cell::Int)
-            .or_else(|_| n.parse::<f64>().map(Cell::Float))
-            .ok(),
-        Value::SingleQuotedString(s)
-        | Value::DoubleQuotedString(s)
-        | Value::NationalStringLiteral(s)
-        | Value::HexStringLiteral(s) => Some(Cell::String(s.as_str().into())),
-        _ => None,
-    }
+    sql_value_to_cell_lossy(val)
 }
 
 fn planner_value_from_sql_value(val: &Value) -> Option<PlannerValue> {

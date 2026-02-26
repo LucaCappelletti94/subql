@@ -2,6 +2,7 @@
 
 pub mod bytecode;
 pub mod canonicalize;
+mod literals;
 pub mod parser;
 pub mod prefilter;
 pub mod sql_shape;

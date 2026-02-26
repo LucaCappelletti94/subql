@@ -3,8 +3,8 @@
 //! Supports generic SQL dialects via sqlparser crate.
 
 use super::{
-    canonicalize, prefilter::build_prefilter_plan, sql_shape, BytecodeProgram, Instruction,
-    PrefilterPlan,
+    canonicalize, literals::sql_value_to_cell_strict, prefilter::build_prefilter_plan, sql_shape,
+    BytecodeProgram, Instruction, PrefilterPlan,
 };
 use crate::compiler::sql_shape::QueryProjection;
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
@@ -315,7 +315,7 @@ fn compile_expr_recursive(
         // Literals
         // ====================================================================
         Expr::Value(val) => {
-            let cell = value_to_cell(&val.value)?;
+            let cell = sql_value_to_cell_strict(&val.value)?;
             out.push(Instruction::PushLiteral(cell));
         }
 
@@ -334,7 +334,7 @@ fn compile_expr_recursive(
             let mut literals = Vec::with_capacity(list.len());
             for item in list {
                 if let Expr::Value(val) = item {
-                    literals.push(value_to_cell(&val.value)?);
+                    literals.push(sql_value_to_cell_strict(&val.value)?);
                 } else {
                     return Err(RegisterError::UnsupportedSql(
                         "IN with subqueries not supported - SubQL only supports IN with literal lists like IN ('a', 'b', 'c'). \
@@ -483,36 +483,6 @@ fn compile_expr_recursive(
     }
 
     Ok(())
-}
-
-/// Convert sqlparser Value to Cell
-fn value_to_cell(val: &sqlparser::ast::Value) -> Result<Cell, RegisterError> {
-    use sqlparser::ast::Value;
-
-    match val {
-        Value::Null => Ok(Cell::Null),
-        Value::Boolean(b) => Ok(Cell::Bool(*b)),
-        Value::Number(n, _long) => {
-            // Try parsing as i64 first, then f64
-            #[allow(clippy::option_if_let_else)]
-            if let Ok(i) = n.parse::<i64>() {
-                Ok(Cell::Int(i))
-            } else if let Ok(f) = n.parse::<f64>() {
-                Ok(Cell::Float(f))
-            } else {
-                Err(RegisterError::TypeError(format!(
-                    "Cannot parse number: {n}"
-                )))
-            }
-        }
-        Value::SingleQuotedString(s)
-        | Value::DoubleQuotedString(s)
-        | Value::NationalStringLiteral(s)
-        | Value::HexStringLiteral(s) => Ok(Cell::String(s.as_str().into())),
-        _ => Err(RegisterError::UnsupportedSql(format!(
-            "Value type {val:?} not supported"
-        ))),
-    }
 }
 
 #[cfg(test)]
@@ -1582,7 +1552,7 @@ mod tests {
         // Construct a Value::Number with a string that can't parse as i64 or f64
         // This is defensive — sqlparser normally validates numbers — but we test it directly
         let val = Value::Number("not_a_number".to_string(), false);
-        let result = value_to_cell(&val);
+        let result = sql_value_to_cell_strict(&val);
         assert!(matches!(result, Err(RegisterError::TypeError(_))));
     }
 
