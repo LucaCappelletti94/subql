@@ -103,14 +103,14 @@ where
 
 pub(crate) fn skip_unknown_event_kind(
     result: Result<WalEvent, WalParseError>,
-    _parser_name: &'static str,
-    _token_name: &'static str,
+    parser_name: &'static str,
+    token_name: &'static str,
 ) -> Result<Option<WalEvent>, WalParseError> {
     match result {
         Ok(event) => Ok(Some(event)),
         Err(WalParseError::UnknownEventKind(kind)) => {
             #[cfg(feature = "observability")]
-            tracing::warn!("{_parser_name}: skipping unknown {_token_name} '{kind}'");
+            tracing::warn!("{parser_name}: skipping unknown {token_name} '{kind}'");
             drop(kind);
             Ok(None)
         }
