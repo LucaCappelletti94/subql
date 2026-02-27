@@ -209,7 +209,7 @@ fn eval_atom(atom: &PlannerAtom, row: &RowImage) -> Tri {
         PlannerAtom::Null { column_id, is_null } => {
             row.get(*column_id).map_or(Tri::Unknown, |cell| {
                 if *is_null {
-                    if cell.is_null() {
+                    if cell.is_null() || cell.is_missing() {
                         Tri::True
                     } else {
                         Tri::False
@@ -964,7 +964,7 @@ mod tests {
         };
 
         assert!(is_null_plan.may_match(&row_null));
-        assert!(!is_null_plan.may_match(&row_missing));
+        assert!(is_null_plan.may_match(&row_missing)); // Missing is treated as NULL by VM
         assert!(!is_null_plan.may_match(&row_present));
 
         assert!(!is_not_null_plan.may_match(&row_null));
@@ -1125,6 +1125,19 @@ mod tests {
                 &PlannerAtom::Null {
                     column_id: 2,
                     is_null: false
+                },
+                &row
+            ),
+            Tri::True
+        );
+        // Cell::Missing (in-bounds) with is_null: true → Tri::True
+        // (Missing means the column was not included in the CDC image,
+        //  which is semantically equivalent to NULL for IS NULL checks)
+        assert_eq!(
+            eval_atom(
+                &PlannerAtom::Null {
+                    column_id: 1,
+                    is_null: true
                 },
                 &row
             ),

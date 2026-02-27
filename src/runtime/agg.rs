@@ -21,7 +21,7 @@ pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<
     match spec {
         AggSpec::CountStar => Some(AggDelta::Count(weight)),
         AggSpec::CountColumn { column } => match row.get(*column) {
-            Some(crate::Cell::Null) | None => None,
+            Some(crate::Cell::Null | crate::Cell::Missing) | None => None,
             Some(_) => Some(AggDelta::Count(weight)),
         },
         AggSpec::Sum { column } => {
@@ -112,7 +112,7 @@ impl CountColumnKernel {
 impl AggKernel for CountColumnKernel {
     fn apply(&mut self, row: &RowImage, weight: i64) {
         match row.get(self.column) {
-            Some(crate::Cell::Null) | None => {} // SQL NULL semantics: do not count
+            Some(crate::Cell::Null | crate::Cell::Missing) | None => {} // SQL NULL/Missing semantics: do not count
             Some(_) => self.delta += weight,
         }
     }
@@ -233,6 +233,13 @@ mod tests {
     }
 
     #[test]
+    fn test_agg_delta_for_row_count_column_missing_skipped() {
+        let row = row(vec![Cell::Int(1), Cell::Missing]);
+        let delta = agg_delta_for_row(&AggSpec::CountColumn { column: 1 }, &row, 1);
+        assert_eq!(delta, None, "COUNT(col) must skip Cell::Missing");
+    }
+
+    #[test]
     fn test_agg_delta_for_row_sum_skips_non_finite() {
         let row = row(vec![Cell::Float(f64::NAN)]);
         let delta = agg_delta_for_row(&AggSpec::Sum { column: 0 }, &row, 1);
@@ -297,6 +304,17 @@ mod tests {
         let mut k = CountColumnKernel::new(1); // col 1 absent in row
         k.apply(&row(vec![Cell::Int(1)]), 1);
         assert_eq!(k.result(), AggDelta::Count(0));
+    }
+
+    #[test]
+    fn test_count_column_kernel_in_bounds_missing_skipped() {
+        let mut k = CountColumnKernel::new(1);
+        k.apply(&row(vec![Cell::Int(1), Cell::Missing]), 1);
+        assert_eq!(
+            k.result(),
+            AggDelta::Count(0),
+            "in-bounds Cell::Missing must be skipped"
+        );
     }
 
     #[test]

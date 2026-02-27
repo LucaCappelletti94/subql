@@ -3,7 +3,7 @@
 use super::{agg::agg_delta_for_row, ids::UserOrdinal, partition::TablePartition};
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm},
-    AggDelta, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
+    AggDelta, Cell, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
 };
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
@@ -281,6 +281,10 @@ fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, Disp
                 .old_row
                 .as_ref()
                 .ok_or(DispatchError::AggregateUpdateRequiresOldRow(event.table_id))?;
+            // Reject partial old rows — Cell::Missing would produce unsound deltas
+            if old_row.cells.iter().any(Cell::is_missing) {
+                return Err(DispatchError::AggregateUpdateRequiresOldRow(event.table_id));
+            }
             let new_row = require_new_row(event, "UPDATE requires new_row")?;
             Ok(vec![(-1, old_row), (1, new_row)])
         }
@@ -1113,6 +1117,40 @@ mod tests {
 
         let err = compute_agg_deltas(&event, &partition, &user_dict, &mut vm)
             .expect_err("UPDATE without old_row must be rejected for aggregates");
+        assert!(matches!(
+            err,
+            DispatchError::AggregateUpdateRequiresOldRow(1)
+        ));
+    }
+
+    #[test]
+    fn test_agg_update_partial_old_row_returns_error() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+
+        // old_row has Cell::Missing at column 1 — partial image
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: crate::PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([crate::Cell::Int(1)]),
+            },
+            old_row: Some(crate::RowImage {
+                cells: Arc::from([crate::Cell::Int(1), crate::Cell::Missing]),
+            }),
+            new_row: Some(make_row(20)),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let err = compute_agg_deltas(&event, &partition, &user_dict, &mut vm)
+            .expect_err("UPDATE with partial old_row must be rejected for aggregates");
         assert!(matches!(
             err,
             DispatchError::AggregateUpdateRequiresOldRow(1)
