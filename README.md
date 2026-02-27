@@ -9,8 +9,8 @@
 
 SQL subscription dispatch engine for Change Data Capture fanout.
 
-`subql` dispatches CDC row events to users based on SQL `WHERE` subscriptions.
-It compiles SQL predicates once, deduplicates equivalent predicates across users, and
+`subql` dispatches CDC row events to consumers based on SQL `WHERE` subscriptions.
+It compiles SQL predicates once, deduplicates equivalent predicates across consumers, and
 uses hybrid indexes to prune candidates before VM evaluation.
 
 ## Features
@@ -32,7 +32,7 @@ use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog,
-    SubscriptionEngine, SubscriptionSpec, WalEvent,
+    SubscriptionEngine, SubscriptionRequest, SubscriptionScope, WalEvent,
 };
 
 let catalog = Arc::new(
@@ -45,10 +45,10 @@ let catalog = Arc::new(
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-engine.register(SubscriptionSpec {
+engine.register(SubscriptionRequest {
     subscription_id: 1,
-    user_id: 42,
-    session_id: None,
+    consumer_id: 42,
+    scope: SubscriptionScope::Durable,
     sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
     updated_at_unix_ms: 1_704_067_200_000,
 })?;
@@ -67,8 +67,8 @@ let event = WalEvent {
     changed_columns: Arc::from([]),
 };
 
-let users: Vec<u64> = engine.users(&event)?.collect();
-assert_eq!(users, vec![42]);
+let consumers: Vec<u64> = engine.consumers(&event)?.collect();
+assert_eq!(consumers, vec![42]);
 
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -80,7 +80,7 @@ Instead of `SELECT *`, register a `SELECT COUNT(*)`, `SELECT COUNT(col)`,
 `SELECT SUM(col)`, or `SELECT AVG(col)` query. The engine then emits signed
 **deltas** via `aggregate_deltas()` — the caller maintains the running total.
 
-Aggregate subscribers never appear in `users()` output and vice versa.
+Aggregate subscribers never appear in `consumers()` output and vice versa.
 For `UPDATE` aggregate deltas, CDC events must include both old and new row
 images. If a source omits old images (`before`/`old`), `aggregate_deltas()`
 returns an error for update events.
@@ -90,7 +90,8 @@ use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
     AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, EventKind,
-    PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionSpec, WalEvent,
+    PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
+    SubscriptionScope, WalEvent,
 };
 
 let catalog = Arc::new(
@@ -103,20 +104,20 @@ let catalog = Arc::new(
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-// Live count of active orders for user 42.
-engine.register(SubscriptionSpec {
+// Live count of active orders for consumer 42.
+engine.register(SubscriptionRequest {
     subscription_id: 1,
-    user_id: 42,
-    session_id: None,
+    consumer_id: 42,
+    scope: SubscriptionScope::Durable,
     sql: "SELECT COUNT(*) FROM orders WHERE status = 'active'".to_string(),
     updated_at_unix_ms: 0,
 })?;
 
-// Running total of active order amounts for user 42.
-engine.register(SubscriptionSpec {
+// Running total of active order amounts for consumer 42.
+engine.register(SubscriptionRequest {
     subscription_id: 2,
-    user_id: 42,
-    session_id: None,
+    consumer_id: 42,
+    scope: SubscriptionScope::Durable,
     sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
     updated_at_unix_ms: 0,
 })?;
@@ -168,7 +169,8 @@ use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
     AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, EventKind,
-    PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionSpec, WalEvent,
+    PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
+    SubscriptionScope, WalEvent,
 };
 
 let catalog = Arc::new(
@@ -180,10 +182,10 @@ let catalog = Arc::new(
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-engine.register(SubscriptionSpec {
+engine.register(SubscriptionRequest {
     subscription_id: 1,
-    user_id: 7,
-    session_id: None,
+    consumer_id: 7,
+    scope: SubscriptionScope::Durable,
     sql: "SELECT AVG(value) FROM scores WHERE id > 0".to_string(),
     updated_at_unix_ms: 0,
 })?;
@@ -228,7 +230,10 @@ type is known, the engine rejects `SUM` or `AVG` over non-numeric columns
 ```rust
 use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::{ColumnType, DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionSpec};
+use subql::{
+    ColumnType, DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
+    SubscriptionScope,
+};
 
 let catalog = Arc::new(
     SimpleCatalog::new()
@@ -241,20 +246,20 @@ let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 // Accepted — price is Float:
-engine.register(SubscriptionSpec {
+engine.register(SubscriptionRequest {
     subscription_id: 1,
-    user_id: 1,
-    session_id: None,
+    consumer_id: 1,
+    scope: SubscriptionScope::Durable,
     sql: "SELECT SUM(price) FROM products WHERE id > 0".to_string(),
     updated_at_unix_ms: 0,
 })?;
 
 // Rejected at registration — name is String:
 assert!(engine
-    .register(SubscriptionSpec {
+    .register(SubscriptionRequest {
         subscription_id: 2,
-        user_id: 1,
-        session_id: None,
+        consumer_id: 1,
+        scope: SubscriptionScope::Durable,
         sql: "SELECT SUM(name) FROM products WHERE id > 0".to_string(),
         updated_at_unix_ms: 0,
     })
