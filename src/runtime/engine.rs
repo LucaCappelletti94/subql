@@ -450,11 +450,18 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let table_id = compiled.table_id;
         let hash = compiled.hash;
 
-        // 2. Upsert semantics: replace existing subscription ID atomically
+        // 2. Snapshot old partition state for rollback before upsert removal.
+        let old_state = self
+            .subscription_to_table
+            .get(&compiled.spec.subscription_id)
+            .copied()
+            .and_then(|tid| self.partitions.get(&tid).map(|p| (tid, p.save_state())));
+
+        // 3. Upsert semantics: replace existing subscription ID atomically
         // after new SQL has been validated.
         let _ = self.unregister_subscription_internal(compiled.spec.subscription_id);
 
-        // 3. Get/create table partition and user dictionary
+        // 4. Get/create table partition and user dictionary
         let partition = self
             .partitions
             .entry(table_id)
@@ -462,12 +469,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         let user_dict = self.user_dictionaries.entry(table_id).or_default();
 
-        // 4. Get user ordinal
+        // 5. Get user ordinal
         let user_ord = user_dict
             .try_get_or_create(compiled.spec.user_id)
             .map_err(|e| RegisterError::Storage(e.to_string()))?;
 
-        // 5. Check if predicate exists (deduplication)
+        // 6. Check if predicate exists (deduplication)
         let snapshot = partition.load_snapshot();
         let (pred_id, created_new) = snapshot
             .predicates
@@ -487,17 +494,17 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 },
             );
 
-        // 6. Create binding
+        // 7. Create binding
         let binding = Self::make_binding(&compiled.spec, pred_id, user_ord);
 
         // Add binding to partition
         partition.add_binding(binding, pred_id);
 
-        // 7. Index subscription for O(1) unregister/upsert lookups.
+        // 8. Index subscription for O(1) unregister/upsert lookups.
         self.subscription_to_table
             .insert(compiled.spec.subscription_id, table_id);
 
-        // 8. Enforce durability policy for this table.
+        // 9. Enforce durability policy for this table.
         if let DurabilityCheckOutcome::RequiredFailure {
             message,
             post_commit,
@@ -506,7 +513,28 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             // Pre-commit durability failures can be rolled back safely.
             // Post-commit dir-sync failures mean data was already renamed.
             if !post_commit {
+                // Remove new subscription
                 let _ = self.unregister_subscription_internal(compiled.spec.subscription_id);
+                // Restore old partition state if an old subscription existed before the upsert
+                if let Some((old_table_id, (old_predicates, old_snapshot))) = old_state {
+                    if let Some(partition) = self.partitions.get_mut(&old_table_id) {
+                        partition.restore_state(old_predicates, old_snapshot);
+                    }
+                    self.subscription_to_table
+                        .insert(compiled.spec.subscription_id, old_table_id);
+                    // Ensure the old user ordinal is present (unregister may have freed it)
+                    if let Some(old_binding) = self.partitions.get(&old_table_id).and_then(|p| {
+                        p.load_snapshot()
+                            .predicates
+                            .bindings
+                            .get(&compiled.spec.subscription_id)
+                            .copied()
+                    }) {
+                        if let Some(user_dict) = self.user_dictionaries.get_mut(&old_table_id) {
+                            let _ = user_dict.try_get_or_create(old_binding.user_id);
+                        }
+                    }
+                }
             }
             return Err(RegisterError::Storage(message));
         }
@@ -2939,6 +2967,84 @@ mod tests {
         assert!(!engine.unregister_subscription(1000));
         let user_dict = engine.user_dictionaries.get(&1).unwrap();
         assert!(user_dict.get(42).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_upsert_register_rollback_preserves_old_subscription() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::with_storage(
+                catalog,
+                PostgreSqlDialect {},
+                temp_dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        // Register initial subscription: sub_id=1, user=42
+        engine
+            .register(SubscriptionSpec {
+                subscription_id: 1,
+                user_id: 42,
+                session_id: None,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 1,
+            })
+            .unwrap();
+        assert_eq!(engine.subscription_count(), 1);
+
+        // Now force durability failure and attempt upsert with user=99
+        engine.set_rotation_threshold(1);
+        engine.set_durability_mode(DurabilityMode::Required);
+        set_dir_mode(temp_dir.path(), 0o500); // read-only → forces pre-commit failure
+
+        let result = engine.register(SubscriptionSpec {
+            subscription_id: 1,
+            user_id: 99,
+            session_id: None,
+            sql: "SELECT * FROM orders WHERE amount > 200".to_string(),
+            updated_at_unix_ms: 2,
+        });
+
+        set_dir_mode(temp_dir.path(), 0o700);
+
+        // The upsert must fail
+        assert!(matches!(result, Err(RegisterError::Storage(_))));
+
+        // The old subscription must still be present
+        assert_eq!(
+            engine.subscription_count(),
+            1,
+            "old subscription must be restored after upsert rollback"
+        );
+
+        // Dispatch to verify the old subscription still works (user=42, not user=99)
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let matched: Vec<u64> = engine.users(&event).unwrap().collect();
+        assert!(
+            matched.contains(&42),
+            "old user 42 must still receive events after upsert rollback"
+        );
+        assert!(
+            !matched.contains(&99),
+            "new user 99 must not appear after upsert rollback"
+        );
     }
 
     #[test]

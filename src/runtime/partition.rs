@@ -175,6 +175,21 @@ impl<I: IdTypes> TablePartition<I> {
         self.store_snapshot_with_indexes(new_indexes);
     }
 
+    /// Save partition state for rollback (cheap Arc clones).
+    pub(super) fn save_state(&self) -> (Arc<PredicateStore<I>>, Arc<TablePartitionSnapshot<I>>) {
+        (Arc::clone(&self.mutable_predicates), self.load_snapshot())
+    }
+
+    /// Restore partition state from a previous save.
+    pub(super) fn restore_state(
+        &mut self,
+        predicates: Arc<PredicateStore<I>>,
+        snapshot: Arc<TablePartitionSnapshot<I>>,
+    ) {
+        self.mutable_predicates = predicates;
+        self.snapshot.store(snapshot);
+    }
+
     /// Rebuild indexes from all predicates (used after predicate removal)
     fn rebuild_all_indexes(&self) {
         let mut new_indexes = HybridIndexes::new();
