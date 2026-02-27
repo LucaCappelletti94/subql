@@ -53,7 +53,7 @@ fn resolve_unique_column_id(
     Ok(col_id)
 }
 
-fn ensure_column_in_arity(
+const fn ensure_column_in_arity(
     table_id: TableId,
     col_id: ColumnId,
     wal_count: usize,
