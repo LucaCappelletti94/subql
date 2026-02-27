@@ -1,4 +1,4 @@
-//! ID types for runtime predicate and user management
+//! ID types for runtime predicate and consumer management
 
 use std::num::NonZeroU32;
 
@@ -87,15 +87,15 @@ impl TryFrom<usize> for PredicateId {
     }
 }
 
-/// User ordinal within table partition (for bitmap indexing)
+/// Consumer ordinal within table partition (for bitmap indexing)
 ///
 /// Dense, 0-based ordinal assigned within each table partition.
 /// Used as bitmap index in `RoaringBitmap` for fast set operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct UserOrdinal(u32);
+pub struct ConsumerOrdinal(u32);
 
-impl UserOrdinal {
-    /// Create UserOrdinal from u32
+impl ConsumerOrdinal {
+    /// Create ConsumerOrdinal from u32
     #[must_use]
     pub const fn new(ordinal: u32) -> Self {
         Self(ordinal)
@@ -183,8 +183,8 @@ mod tests {
     }
 
     #[test]
-    fn test_user_ordinal() {
-        let ord = UserOrdinal::new(42);
+    fn test_consumer_ordinal() {
+        let ord = ConsumerOrdinal::new(42);
         assert_eq!(ord.get(), 42);
 
         let next = ord.next();
@@ -192,9 +192,9 @@ mod tests {
     }
 
     #[test]
-    fn test_user_ordinal_ordering() {
-        let ord1 = UserOrdinal::new(10);
-        let ord2 = UserOrdinal::new(20);
+    fn test_consumer_ordinal_ordering() {
+        let ord1 = ConsumerOrdinal::new(10);
+        let ord2 = ConsumerOrdinal::new(20);
 
         assert!(ord1 < ord2);
         assert!(ord2 > ord1);

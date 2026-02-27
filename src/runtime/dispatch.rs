@@ -1,6 +1,6 @@
 //! Event dispatch pipeline
 
-use super::{agg::agg_delta_for_row, ids::UserOrdinal, partition::TablePartition};
+use super::{agg::agg_delta_for_row, ids::ConsumerOrdinal, partition::TablePartition};
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm},
     AggDelta, Cell, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
@@ -8,129 +8,135 @@ use crate::{
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
 
-/// User dictionary for ordinal ↔ UserId translation
+/// Consumer dictionary for ordinal ↔ ConsumerId translation
 ///
-/// Maps dense ordinals (0-based, used in bitmaps) to sparse UserIds.
-/// Enables efficient RoaringBitmap operations while supporting arbitrary UserIds.
+/// Maps dense ordinals (0-based, used in bitmaps) to sparse ConsumerIds.
+/// Enables efficient RoaringBitmap operations while supporting arbitrary ConsumerIds.
 #[derive(Clone, Debug)]
-pub struct UserDictionary<I: IdTypes> {
-    /// UserOrdinal → UserId (dense, 0-indexed)
-    ordinal_to_user: Vec<Option<I::UserId>>,
-    /// UserId → UserOrdinal (for reverse lookup)
-    user_to_ordinal: AHashMap<I::UserId, UserOrdinal>,
-    /// Recycled ordinals from removed users, available for reuse
-    free_list: Vec<UserOrdinal>,
+pub struct ConsumerDictionary<I: IdTypes> {
+    /// ConsumerOrdinal → ConsumerId (dense, 0-indexed)
+    ordinal_to_consumer: Vec<Option<I::ConsumerId>>,
+    /// ConsumerId → ConsumerOrdinal (for reverse lookup)
+    consumer_to_ordinal: AHashMap<I::ConsumerId, ConsumerOrdinal>,
+    /// Recycled ordinals from removed consumers, available for reuse
+    free_list: Vec<ConsumerOrdinal>,
 }
 
-impl<I: IdTypes> UserDictionary<I> {
-    fn next_ordinal_for_len(len: u64) -> Result<UserOrdinal, &'static str> {
+impl<I: IdTypes> ConsumerDictionary<I> {
+    fn next_ordinal_for_len(len: u64) -> Result<ConsumerOrdinal, &'static str> {
         let ordinal =
-            u32::try_from(len).map_err(|_| "user ordinal capacity exceeded (u32::MAX)")?;
-        Ok(UserOrdinal::new(ordinal))
+            u32::try_from(len).map_err(|_| "consumer ordinal capacity exceeded (u32::MAX)")?;
+        Ok(ConsumerOrdinal::new(ordinal))
     }
 
     /// Create new empty dictionary
     #[must_use]
     pub fn new() -> Self {
         Self {
-            ordinal_to_user: Vec::new(),
-            user_to_ordinal: AHashMap::new(),
+            ordinal_to_consumer: Vec::new(),
+            consumer_to_ordinal: AHashMap::new(),
             free_list: Vec::new(),
         }
     }
 
-    /// Try to get/create ordinal for user, returning an error when capacity is exceeded.
-    pub fn try_get_or_create(&mut self, user_id: I::UserId) -> Result<UserOrdinal, &'static str> {
-        if let Some(&ordinal) = self.user_to_ordinal.get(&user_id) {
+    /// Try to get/create ordinal for consumer, returning an error when capacity is exceeded.
+    pub fn try_get_or_create(
+        &mut self,
+        consumer_id: I::ConsumerId,
+    ) -> Result<ConsumerOrdinal, &'static str> {
+        if let Some(&ordinal) = self.consumer_to_ordinal.get(&consumer_id) {
             return Ok(ordinal);
         }
 
         let ordinal = if let Some(recycled) = self.free_list.pop() {
-            self.ordinal_to_user[recycled.get() as usize] = Some(user_id);
+            self.ordinal_to_consumer[recycled.get() as usize] = Some(consumer_id);
             recycled
         } else {
-            let ord = Self::next_ordinal_for_len(self.ordinal_to_user.len() as u64)?;
-            self.ordinal_to_user.push(Some(user_id));
+            let ord = Self::next_ordinal_for_len(self.ordinal_to_consumer.len() as u64)?;
+            self.ordinal_to_consumer.push(Some(consumer_id));
             ord
         };
-        self.user_to_ordinal.insert(user_id, ordinal);
+        self.consumer_to_ordinal.insert(consumer_id, ordinal);
 
         Ok(ordinal)
     }
 
-    /// Get or create ordinal for user
-    pub fn get_or_create(&mut self, user_id: I::UserId) -> UserOrdinal {
-        self.try_get_or_create(user_id)
+    /// Get or create ordinal for consumer
+    pub fn get_or_create(&mut self, consumer_id: I::ConsumerId) -> ConsumerOrdinal {
+        self.try_get_or_create(consumer_id)
             .unwrap_or_else(|msg| panic!("{msg}"))
     }
 
-    /// Get ordinal for user (if exists)
+    /// Get ordinal for consumer (if exists)
     #[must_use]
-    pub fn get(&self, user_id: I::UserId) -> Option<UserOrdinal> {
-        self.user_to_ordinal.get(&user_id).copied()
+    pub fn get(&self, consumer_id: I::ConsumerId) -> Option<ConsumerOrdinal> {
+        self.consumer_to_ordinal.get(&consumer_id).copied()
     }
 
-    /// Get user by ordinal
+    /// Get consumer by ordinal
     #[must_use]
-    pub fn get_user(&self, ordinal: UserOrdinal) -> Option<I::UserId> {
-        self.ordinal_to_user
+    pub fn get_consumer(&self, ordinal: ConsumerOrdinal) -> Option<I::ConsumerId> {
+        self.ordinal_to_consumer
             .get(ordinal.get() as usize)
             .copied()
             .flatten()
     }
 
-    /// Remove user (for cleanup)
-    pub fn remove(&mut self, user_id: I::UserId) -> Option<UserOrdinal> {
-        let ordinal = self.user_to_ordinal.remove(&user_id)?;
-        if let Some(slot) = self.ordinal_to_user.get_mut(ordinal.get() as usize) {
+    /// Remove consumer (for cleanup)
+    pub fn remove(&mut self, consumer_id: I::ConsumerId) -> Option<ConsumerOrdinal> {
+        let ordinal = self.consumer_to_ordinal.remove(&consumer_id)?;
+        if let Some(slot) = self.ordinal_to_consumer.get_mut(ordinal.get() as usize) {
             *slot = None;
         }
         self.free_list.push(ordinal);
         Some(ordinal)
     }
 
-    /// Get ordinal_to_user vector for serialization
+    /// Get ordinal_to_consumer vector for serialization
     #[must_use]
-    pub fn ordinal_to_user_vec(&self) -> Vec<I::UserId> {
-        let mut by_ordinal: Vec<(u32, I::UserId)> = self
-            .user_to_ordinal
+    pub fn ordinal_to_consumer_vec(&self) -> Vec<I::ConsumerId> {
+        let mut by_ordinal: Vec<(u32, I::ConsumerId)> = self
+            .consumer_to_ordinal
             .iter()
-            .map(|(&user_id, ordinal)| (ordinal.get(), user_id))
+            .map(|(&consumer_id, ordinal)| (ordinal.get(), consumer_id))
             .collect();
         by_ordinal.sort_unstable_by_key(|(ordinal, _)| *ordinal);
-        by_ordinal.into_iter().map(|(_, user_id)| user_id).collect()
+        by_ordinal
+            .into_iter()
+            .map(|(_, consumer_id)| consumer_id)
+            .collect()
     }
 }
 
-impl<I: IdTypes> Default for UserDictionary<I> {
+impl<I: IdTypes> Default for ConsumerDictionary<I> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Zero-allocation iterator over matched user IDs.
+/// Zero-allocation iterator over matched consumer IDs.
 ///
 /// Owns the `RoaringBitmap` (already heap-allocated during dispatch — moving
-/// it is just a pointer move) and borrows the `UserDictionary` to translate
-/// ordinals into user IDs.
-pub struct MatchedUsers<'a, I: IdTypes> {
+/// it is just a pointer move) and borrows the `ConsumerDictionary` to translate
+/// ordinals into consumer IDs.
+pub struct MatchedConsumers<'a, I: IdTypes> {
     bitmap_iter: roaring::bitmap::IntoIter,
-    dict: &'a UserDictionary<I>,
+    dict: &'a ConsumerDictionary<I>,
 }
 
-impl<I: IdTypes> Iterator for MatchedUsers<'_, I> {
-    type Item = I::UserId;
+impl<I: IdTypes> Iterator for MatchedConsumers<'_, I> {
+    type Item = I::ConsumerId;
 
     fn next(&mut self) -> Option<Self::Item> {
         for ord in self.bitmap_iter.by_ref() {
-            if let Some(user_id) = self
+            if let Some(consumer_id) = self
                 .dict
-                .ordinal_to_user
+                .ordinal_to_consumer
                 .get(ord as usize)
                 .copied()
                 .flatten()
             {
-                return Some(user_id);
+                return Some(consumer_id);
             }
         }
         None
@@ -169,27 +175,27 @@ pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchEr
     }
 }
 
-fn matched_users_for_truncate<'a, I: IdTypes>(
+fn matched_consumers_for_truncate<'a, I: IdTypes>(
     partition: &TablePartition<I>,
-    user_dict: &'a UserDictionary<I>,
-) -> MatchedUsers<'a, I> {
+    consumer_dict: &'a ConsumerDictionary<I>,
+) -> MatchedConsumers<'a, I> {
     let snapshot = partition.load_snapshot();
     let mut ordinals = RoaringBitmap::new();
-    for (pred_id, users) in &snapshot.predicates.predicate_users {
+    for (pred_id, consumers) in &snapshot.predicates.predicate_consumers {
         let Some(pred) = snapshot.predicates.get_predicate(*pred_id) else {
             continue;
         };
         if matches!(pred.projection, QueryProjection::Rows) {
-            ordinals |= users;
+            ordinals |= consumers;
         }
     }
-    MatchedUsers {
+    MatchedConsumers {
         bitmap_iter: ordinals.into_iter(),
-        dict: user_dict,
+        dict: consumer_dict,
     }
 }
 
-/// Dispatch event to interested users
+/// Dispatch event to interested consumers
 ///
 /// Main dispatch algorithm:
 /// 1. Validate event
@@ -197,32 +203,32 @@ fn matched_users_for_truncate<'a, I: IdTypes>(
 /// 3. Get table partition
 /// 4. Select candidate predicates (index lookups)
 /// 5. VM evaluation (filter to Tri::True)
-/// 6. Return zero-alloc iterator over matched users
-pub fn dispatch_users<'a, I: IdTypes>(
+/// 6. Return zero-alloc iterator over matched consumers
+pub fn dispatch_consumers<'a, I: IdTypes>(
     event: &WalEvent,
     partition: &TablePartition<I>,
-    user_dict: &'a UserDictionary<I>,
+    consumer_dict: &'a ConsumerDictionary<I>,
     vm: &mut Vm,
-) -> Result<MatchedUsers<'a, I>, DispatchError> {
+) -> Result<MatchedConsumers<'a, I>, DispatchError> {
     // TRUNCATE events fan-out only to row subscribers (`SELECT * ...`).
     if event.kind == EventKind::Truncate {
         let _ = vm;
-        return Ok(matched_users_for_truncate(partition, user_dict));
+        return Ok(matched_consumers_for_truncate(partition, consumer_dict));
     }
 
     // 1. Get row image based on event kind (validates presence)
     let row = select_event_row(event)?;
 
-    dispatch_users_with_row(event, row, partition, user_dict, vm)
+    dispatch_consumers_with_row(event, row, partition, consumer_dict, vm)
 }
 
-pub(crate) fn dispatch_users_with_row<'a, I: IdTypes>(
+pub(crate) fn dispatch_consumers_with_row<'a, I: IdTypes>(
     event: &WalEvent,
     row: &RowImage,
     partition: &TablePartition<I>,
-    user_dict: &'a UserDictionary<I>,
+    consumer_dict: &'a ConsumerDictionary<I>,
     vm: &mut Vm,
-) -> Result<MatchedUsers<'a, I>, DispatchError> {
+) -> Result<MatchedConsumers<'a, I>, DispatchError> {
     // 2. Select candidates (index lookups + fallback)
     let candidates = partition.select_candidates(row, event.kind, &event.changed_columns);
 
@@ -252,7 +258,7 @@ pub(crate) fn dispatch_users_with_row<'a, I: IdTypes>(
             // Only Tri::True is a match
             if result == Tri::True {
                 // Collect user ordinals for this predicate
-                if let Some(bitmap) = snapshot.predicates.predicate_users.get(&pred_id) {
+                if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
                     matching_ordinals |= bitmap;
                 }
             }
@@ -260,9 +266,9 @@ pub(crate) fn dispatch_users_with_row<'a, I: IdTypes>(
     }
 
     // 4. Return zero-alloc iterator
-    Ok(MatchedUsers {
+    Ok(MatchedConsumers {
         bitmap_iter: matching_ordinals.into_iter(),
-        dict: user_dict,
+        dict: consumer_dict,
     })
 }
 
@@ -308,18 +314,18 @@ fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, Disp
 pub(crate) fn compute_agg_deltas<I: IdTypes>(
     event: &WalEvent,
     partition: &TablePartition<I>,
-    user_dict: &UserDictionary<I>,
+    consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
-) -> Result<Vec<(I::UserId, AggDelta)>, DispatchError> {
+) -> Result<Vec<(I::ConsumerId, AggDelta)>, DispatchError> {
     use crate::runtime::ids::PredicateId;
 
     let weighted_rows = weighted_rows_for_agg(event)?;
 
     // Separate accumulators for each aggregate kind (avoids mixed-type confusion).
-    let mut count_weights: AHashMap<UserOrdinal, i64> = AHashMap::new();
-    let mut sum_weights: AHashMap<UserOrdinal, f64> = AHashMap::new();
+    let mut count_weights: AHashMap<ConsumerOrdinal, i64> = AHashMap::new();
+    let mut sum_weights: AHashMap<ConsumerOrdinal, f64> = AHashMap::new();
     // AVG accumulator: (sum_delta, count_delta)
-    let mut avg_accum: AHashMap<UserOrdinal, (f64, i64)> = AHashMap::new();
+    let mut avg_accum: AHashMap<ConsumerOrdinal, (f64, i64)> = AHashMap::new();
 
     let snapshot = partition.load_snapshot();
 
@@ -357,10 +363,10 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
                     .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
 
                 if result == Tri::True {
-                    if let Some(bitmap) = snapshot.predicates.predicate_users.get(&pred_id) {
+                    if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
                         if let Some(delta) = agg_delta_for_row(spec, row, weight) {
                             for ord_u32 in bitmap {
-                                let ord = UserOrdinal::new(ord_u32);
+                                let ord = ConsumerOrdinal::new(ord_u32);
                                 match &delta {
                                     AggDelta::Count(n) => {
                                         *count_weights.entry(ord).or_default() += *n;
@@ -387,14 +393,14 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
 
     // Translate ordinals to user IDs; filter out zero-net entries.
     // Same user may appear multiple times (once per AggDelta variant).
-    let mut result: Vec<(I::UserId, AggDelta)> = Vec::new();
+    let mut result: Vec<(I::ConsumerId, AggDelta)> = Vec::new();
     for (ord, n) in count_weights.into_iter().filter(|(_, n)| *n != 0) {
-        if let Some(uid) = user_dict.get_user(ord) {
+        if let Some(uid) = consumer_dict.get_consumer(ord) {
             result.push((uid, AggDelta::Count(n)));
         }
     }
     for (ord, v) in sum_weights.into_iter().filter(|(_, v)| *v != 0.0) {
-        if let Some(uid) = user_dict.get_user(ord) {
+        if let Some(uid) = consumer_dict.get_consumer(ord) {
             result.push((uid, AggDelta::Sum(v)));
         }
     }
@@ -402,7 +408,7 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
         .into_iter()
         .filter(|(_, (s, c))| *s != 0.0 || *c != 0)
     {
-        if let Some(uid) = user_dict.get_user(ord) {
+        if let Some(uid) = consumer_dict.get_consumer(ord) {
             result.push((
                 uid,
                 AggDelta::Avg {
@@ -420,12 +426,12 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
 #[allow(clippy::unwrap_used, clippy::needless_collect)]
 mod tests {
     use super::*;
-    use crate::DefaultIds;
+    use crate::{DefaultIds, SubscriptionScope};
     use std::sync::Arc;
 
     #[test]
-    fn test_user_dictionary_get_or_create() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_consumer_dictionary_get_or_create() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
 
         let ord1 = dict.get_or_create(100);
         assert_eq!(ord1.get(), 0);
@@ -433,21 +439,21 @@ mod tests {
         let ord2 = dict.get_or_create(200);
         assert_eq!(ord2.get(), 1);
 
-        // Same user returns same ordinal
+        // Same consumer returns same ordinal
         let ord1_again = dict.get_or_create(100);
         assert_eq!(ord1_again.get(), 0);
     }
 
     #[test]
-    fn test_user_dictionary_next_ordinal_overflow_errors() {
-        let err = UserDictionary::<DefaultIds>::next_ordinal_for_len(u64::from(u32::MAX) + 1)
+    fn test_consumer_dictionary_next_ordinal_overflow_errors() {
+        let err = ConsumerDictionary::<DefaultIds>::next_ordinal_for_len(u64::from(u32::MAX) + 1)
             .expect_err("ordinal allocation beyond u32::MAX should fail");
         assert!(err.contains("ordinal capacity exceeded"));
     }
 
     #[test]
-    fn test_user_dictionary_try_get_or_create_success() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_consumer_dictionary_try_get_or_create_success() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
         let ord = dict
             .try_get_or_create(123)
             .expect("small dictionaries should allocate ordinals");
@@ -455,12 +461,12 @@ mod tests {
     }
 
     #[test]
-    fn test_user_dictionary_get() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_consumer_dictionary_get() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
 
         dict.get_or_create(42);
 
-        assert_eq!(dict.get(42), Some(UserOrdinal::new(0)));
+        assert_eq!(dict.get(42), Some(ConsumerOrdinal::new(0)));
         assert_eq!(dict.get(99), None);
     }
 
@@ -470,7 +476,7 @@ mod tests {
         use crate::compiler::Vm;
 
         let partition = TablePartition::<DefaultIds>::new(1);
-        let user_dict = UserDictionary::<DefaultIds>::new();
+        let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
         let event = WalEvent {
@@ -487,7 +493,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        assert!(dispatch_users(&event, &partition, &user_dict, &mut vm).is_ok());
+        assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
     }
 
     #[test]
@@ -496,7 +502,7 @@ mod tests {
         use crate::compiler::Vm;
 
         let partition = TablePartition::<DefaultIds>::new(1);
-        let user_dict = UserDictionary::<DefaultIds>::new();
+        let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
         let event = WalEvent {
@@ -512,14 +518,14 @@ mod tests {
         };
 
         assert!(matches!(
-            dispatch_users(&event, &partition, &user_dict, &mut vm),
+            dispatch_consumers(&event, &partition, &consumer_dict, &mut vm),
             Err(DispatchError::MissingRequiredRowImage(_))
         ));
     }
 
     #[test]
-    fn test_user_dictionary_remove() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_consumer_dictionary_remove() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
 
         let ord = dict.get_or_create(42);
         assert_eq!(dict.get(42), Some(ord));
@@ -529,30 +535,30 @@ mod tests {
     }
 
     #[test]
-    fn test_user_dictionary_remove_clears_ordinal_lookup() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_consumer_dictionary_remove_clears_ordinal_lookup() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
 
         let ord = dict.get_or_create(42);
-        assert_eq!(dict.get_user(ord), Some(42));
+        assert_eq!(dict.get_consumer(ord), Some(42));
 
         dict.remove(42);
-        assert_eq!(dict.get_user(ord), None);
+        assert_eq!(dict.get_consumer(ord), None);
     }
 
     #[test]
-    fn test_user_dictionary_get_user() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_consumer_dictionary_get_consumer() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
 
         let ord = dict.get_or_create(100);
-        assert_eq!(dict.get_user(ord), Some(100));
+        assert_eq!(dict.get_consumer(ord), Some(100));
 
         // Invalid ordinal
-        assert_eq!(dict.get_user(UserOrdinal::new(999)), None);
+        assert_eq!(dict.get_consumer(ConsumerOrdinal::new(999)), None);
     }
 
     #[test]
-    fn test_user_dictionary_default() {
-        let dict = UserDictionary::<DefaultIds>::default();
+    fn test_consumer_dictionary_default() {
+        let dict = ConsumerDictionary::<DefaultIds>::default();
         assert_eq!(dict.get(42), None);
     }
 
@@ -562,7 +568,7 @@ mod tests {
         use crate::compiler::Vm;
 
         let partition = TablePartition::<DefaultIds>::new(1);
-        let user_dict = UserDictionary::<DefaultIds>::new();
+        let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
         let event = WalEvent {
@@ -580,7 +586,7 @@ mod tests {
         };
 
         assert!(matches!(
-            dispatch_users(&event, &partition, &user_dict, &mut vm),
+            dispatch_consumers(&event, &partition, &consumer_dict, &mut vm),
             Err(DispatchError::MissingRequiredRowImage(_))
         ));
     }
@@ -591,7 +597,7 @@ mod tests {
         use crate::compiler::Vm;
 
         let partition = TablePartition::<DefaultIds>::new(1);
-        let user_dict = UserDictionary::<DefaultIds>::new();
+        let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
         let event = WalEvent {
@@ -609,7 +615,7 @@ mod tests {
         };
 
         assert!(matches!(
-            dispatch_users(&event, &partition, &user_dict, &mut vm),
+            dispatch_consumers(&event, &partition, &consumer_dict, &mut vm),
             Err(DispatchError::MissingRequiredRowImage(_))
         ));
     }
@@ -618,15 +624,15 @@ mod tests {
     fn test_dispatch_truncate_requires_no_row_and_returns_only_row_subscribers() {
         use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
-        use super::super::predicate::{Binding, Predicate};
+        use super::super::predicate::{Predicate, SubscriptionBinding};
         use crate::compiler::sql_shape::QueryProjection;
         use crate::compiler::Vm;
         use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
 
-        // Row predicate bound to user 42.
+        // Row predicate bound to consumer 42.
         let row_pred = Predicate {
             id: super::super::ids::PredicateId::from_slab_index(0),
             hash: 0xABCD,
@@ -644,21 +650,21 @@ mod tests {
         let row_pred_id = row_pred.id;
         partition.add_predicate(row_pred, vec![IndexableAtom::Fallback]);
 
-        let row_ord = user_dict.get_or_create(42);
+        let row_ord = consumer_dict.get_or_create(42);
         partition.add_binding(
-            Binding {
+            SubscriptionBinding {
                 subscription_id: 100,
                 predicate_id: row_pred_id,
-                user_id: 42,
-                user_ordinal: row_ord,
-                session_id: None,
+                consumer_id: 42,
+                consumer_ordinal: row_ord,
+                scope: SubscriptionScope::Durable,
                 updated_at_unix_ms: 1000,
             },
             row_pred_id,
         );
 
-        // Aggregate predicate bound to user 77 must not leak into users().
-        make_count_pred_and_binding(1, 101, 77, &mut partition, &mut user_dict);
+        // Aggregate predicate bound to consumer 77 must not leak into consumers().
+        make_count_pred_and_binding(1, 101, 77, &mut partition, &mut consumer_dict);
         let mut vm = Vm::new();
 
         let event = WalEvent {
@@ -670,65 +676,65 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let mut users: Vec<_> = dispatch_users(&event, &partition, &user_dict, &mut vm)
+        let mut consumers: Vec<_> = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
             .expect("truncate should dispatch without row image")
             .collect();
-        users.sort_unstable();
-        assert_eq!(users, vec![42]);
+        consumers.sort_unstable();
+        assert_eq!(consumers, vec![42]);
     }
 
     #[test]
-    fn test_user_dictionary_ordinal_to_user_vec() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_consumer_dictionary_ordinal_to_consumer_vec() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
         dict.get_or_create(10);
         dict.get_or_create(20);
         dict.get_or_create(30);
 
-        let vec = dict.ordinal_to_user_vec();
+        let vec = dict.ordinal_to_consumer_vec();
         assert_eq!(vec, vec![10, 20, 30]);
     }
 
     #[test]
-    fn test_user_dictionary_ordinal_to_user_vec_excludes_removed_users() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_consumer_dictionary_ordinal_to_consumer_vec_excludes_removed_users() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
         dict.get_or_create(10);
         dict.get_or_create(20);
         dict.get_or_create(30);
 
         dict.remove(20);
 
-        let vec = dict.ordinal_to_user_vec();
+        let vec = dict.ordinal_to_consumer_vec();
         assert_eq!(vec, vec![10, 30]);
     }
 
     #[test]
-    fn test_matched_users_iterator() {
-        let mut dict = UserDictionary::<DefaultIds>::new();
+    fn test_matched_consumers_iterator() {
+        let mut dict = ConsumerDictionary::<DefaultIds>::new();
         dict.get_or_create(10);
         dict.get_or_create(20);
         dict.get_or_create(30);
 
         let mut bitmap = RoaringBitmap::new();
-        bitmap.insert(0); // User 10
-        bitmap.insert(2); // User 30
+        bitmap.insert(0); // Consumer 10
+        bitmap.insert(2); // Consumer 30
 
-        let users: Vec<_> = (MatchedUsers {
+        let consumers: Vec<_> = (MatchedConsumers {
             bitmap_iter: bitmap.into_iter(),
             dict: &dict,
         })
         .collect();
-        assert_eq!(users, vec![10, 30]);
+        assert_eq!(consumers, vec![10, 30]);
     }
 
     #[test]
-    fn test_dispatch_users_update_event_matching() {
+    fn test_dispatch_consumers_update_event_matching() {
         use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
         use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
         let pred = Predicate {
@@ -751,13 +757,13 @@ mod tests {
         let pred_id = pred.id;
         partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
 
-        let ord = user_dict.get_or_create(42);
-        let binding = super::super::predicate::Binding {
+        let ord = consumer_dict.get_or_create(42);
+        let binding = super::super::predicate::SubscriptionBinding {
             subscription_id: 100,
             predicate_id: pred_id,
-            user_id: 42,
-            user_ordinal: ord,
-            session_id: None,
+            consumer_id: 42,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 1000,
         };
         partition.add_binding(binding, pred_id);
@@ -778,24 +784,24 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
+        let result = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm);
         assert!(result.is_ok());
-        let users: Vec<_> = result.unwrap().collect();
+        let consumers: Vec<_> = result.unwrap().collect();
         assert!(
-            users.contains(&42),
-            "User 42 should match age > 18 with age=25"
+            consumers.contains(&42),
+            "Consumer 42 should match age > 18 with age=25"
         );
     }
 
     #[test]
-    fn test_dispatch_users_delete_event_matching() {
+    fn test_dispatch_consumers_delete_event_matching() {
         use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
         use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
         let pred = Predicate {
@@ -818,13 +824,13 @@ mod tests {
         let pred_id = pred.id;
         partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
 
-        let ord = user_dict.get_or_create(99);
-        let binding = super::super::predicate::Binding {
+        let ord = consumer_dict.get_or_create(99);
+        let binding = super::super::predicate::SubscriptionBinding {
             subscription_id: 200,
             predicate_id: pred_id,
-            user_id: 99,
-            user_ordinal: ord,
-            session_id: None,
+            consumer_id: 99,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 1000,
         };
         partition.add_binding(binding, pred_id);
@@ -843,12 +849,12 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
+        let result = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm);
         assert!(result.is_ok());
-        let users: Vec<_> = result.unwrap().collect();
+        let consumers: Vec<_> = result.unwrap().collect();
         assert!(
-            users.contains(&99),
-            "User 99 should match age < 30 with age=25"
+            consumers.contains(&99),
+            "Consumer 99 should match age < 30 with age=25"
         );
     }
 
@@ -857,12 +863,12 @@ mod tests {
     fn make_count_pred_and_binding(
         pred_slab: usize,
         sub_id: u64,
-        user_id: u64,
+        consumer_id: u64,
         partition: &mut super::super::partition::TablePartition<DefaultIds>,
-        user_dict: &mut UserDictionary<DefaultIds>,
+        consumer_dict: &mut ConsumerDictionary<DefaultIds>,
     ) -> super::super::ids::PredicateId {
         use super::super::indexes::IndexableAtom;
-        use super::super::predicate::{Binding, Predicate};
+        use super::super::predicate::{Predicate, SubscriptionBinding};
         use crate::compiler::sql_shape::{AggSpec, QueryProjection};
         use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
 
@@ -886,14 +892,14 @@ mod tests {
         let pred_id = pred.id;
         partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
 
-        let ord = user_dict.get_or_create(user_id);
+        let ord = consumer_dict.get_or_create(consumer_id);
         partition.add_binding(
-            Binding {
+            SubscriptionBinding {
                 subscription_id: sub_id,
                 predicate_id: pred_id,
-                user_id,
-                user_ordinal: ord,
-                session_id: None,
+                consumer_id,
+                consumer_ordinal: ord,
+                scope: SubscriptionScope::Durable,
                 updated_at_unix_ms: 1000,
             },
             pred_id,
@@ -914,10 +920,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Insert,
@@ -931,7 +937,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(
             deltas,
             vec![(42, crate::AggDelta::Count(1))],
@@ -945,10 +951,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Insert,
@@ -962,7 +968,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(
             deltas.is_empty(),
             "INSERT not matching predicate should yield no delta"
@@ -975,10 +981,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Delete,
@@ -992,7 +998,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(
             deltas,
             vec![(42, crate::AggDelta::Count(-1))],
@@ -1006,10 +1012,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1023,7 +1029,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(
             deltas,
             vec![(42, crate::AggDelta::Count(-1))],
@@ -1037,10 +1043,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1054,7 +1060,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(
             deltas,
             vec![(42, crate::AggDelta::Count(1))],
@@ -1068,10 +1074,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1085,7 +1091,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(
             deltas.is_empty(),
             "UPDATE where both old and new match should yield zero net delta (no entry)"
@@ -1098,10 +1104,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1115,7 +1121,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let err = compute_agg_deltas(&event, &partition, &user_dict, &mut vm)
+        let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
             .expect_err("UPDATE without old_row must be rejected for aggregates");
         assert!(matches!(
             err,
@@ -1129,10 +1135,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         // old_row has Cell::Missing at column 1 — partial image
         let event = WalEvent {
@@ -1149,7 +1155,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let err = compute_agg_deltas(&event, &partition, &user_dict, &mut vm)
+        let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
             .expect_err("UPDATE with partial old_row must be rejected for aggregates");
         assert!(matches!(
             err,
@@ -1159,17 +1165,17 @@ mod tests {
 
     // --- SUM aggregate dispatch tests ---
 
-    /// Helper: create a SUM predicate (WHERE amount > 10, SUM on column 1) and bind user.
+    /// Helper: create a SUM predicate (WHERE amount > 10, SUM on column 1) and bind consumer.
     fn make_sum_pred_and_binding(
         pred_slab: usize,
         sub_id: u64,
-        user_id: u64,
+        consumer_id: u64,
         sum_col: u16,
         partition: &mut super::super::partition::TablePartition<DefaultIds>,
-        user_dict: &mut UserDictionary<DefaultIds>,
+        consumer_dict: &mut ConsumerDictionary<DefaultIds>,
     ) -> super::super::ids::PredicateId {
         use super::super::indexes::IndexableAtom;
-        use super::super::predicate::{Binding, Predicate};
+        use super::super::predicate::{Predicate, SubscriptionBinding};
         use crate::compiler::sql_shape::{AggSpec, QueryProjection};
         use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
 
@@ -1193,14 +1199,14 @@ mod tests {
         let pred_id = pred.id;
         partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
 
-        let ord = user_dict.get_or_create(user_id);
+        let ord = consumer_dict.get_or_create(consumer_id);
         partition.add_binding(
-            Binding {
+            SubscriptionBinding {
                 subscription_id: sub_id,
                 predicate_id: pred_id,
-                user_id,
-                user_ordinal: ord,
-                session_id: None,
+                consumer_id,
+                consumer_ordinal: ord,
+                scope: SubscriptionScope::Durable,
                 updated_at_unix_ms: 1000,
             },
             pred_id,
@@ -1221,10 +1227,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Insert,
@@ -1238,7 +1244,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
     }
 
@@ -1248,10 +1254,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Insert,
@@ -1265,7 +1271,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(deltas.is_empty());
     }
 
@@ -1275,10 +1281,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Delete,
@@ -1292,7 +1298,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-20.0))]);
     }
 
@@ -1302,10 +1308,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1319,7 +1325,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(10.0))]);
     }
 
@@ -1329,10 +1335,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1346,7 +1352,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(
             deltas.is_empty(),
             "zero net SUM delta should be filtered out"
@@ -1359,10 +1365,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1376,7 +1382,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-20.0))]);
     }
 
@@ -1386,10 +1392,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Update,
@@ -1403,7 +1409,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
     }
 
@@ -1413,10 +1419,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         // WHERE amount > 10 won't match NULL, so no delta
         let event = WalEvent {
@@ -1431,7 +1437,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(deltas.is_empty());
     }
 
@@ -1441,10 +1447,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         // Row too short — column 1 (amount) is missing
         // WHERE amount > 10 evaluates to Unknown → no match
@@ -1462,7 +1468,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(deltas.is_empty());
     }
 
@@ -1472,10 +1478,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut user_dict);
+        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Insert,
@@ -1490,7 +1496,7 @@ mod tests {
         };
 
         // WHERE amount > 10 won't match 2.5, so no delta
-        let deltas = compute_agg_deltas(&event, &partition, &user_dict, &mut vm).unwrap();
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(deltas.is_empty(), "2.5 ≤ 10, so WHERE does not match");
     }
 
@@ -1500,10 +1506,10 @@ mod tests {
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         let event = WalEvent {
             kind: EventKind::Truncate,
@@ -1514,7 +1520,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let err = compute_agg_deltas(&event, &partition, &user_dict, &mut vm)
+        let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
             .expect_err("TRUNCATE should return TruncateRequiresReset");
         assert!(
             matches!(err, DispatchError::TruncateRequiresReset(1)),
@@ -1523,21 +1529,21 @@ mod tests {
     }
 
     #[test]
-    fn test_agg_users_dispatch_skips_count_predicates() {
+    fn test_agg_consumers_dispatch_skips_count_predicates() {
         use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use crate::compiler::Vm;
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        // Register a COUNT predicate for user 42
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut user_dict);
+        // Register a COUNT predicate for consumer 42
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
-        // Also register a Rows predicate for user 99 (to ensure dispatch still works)
+        // Also register a Rows predicate for consumer 99 (to ensure dispatch still works)
         {
-            use super::super::predicate::{Binding, Predicate};
+            use super::super::predicate::{Predicate, SubscriptionBinding};
             use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
             let pred = Predicate {
                 id: super::super::ids::PredicateId::from_slab_index(1),
@@ -1557,14 +1563,14 @@ mod tests {
             };
             let pred_id = pred.id;
             partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
-            let ord = user_dict.get_or_create(99);
+            let ord = consumer_dict.get_or_create(99);
             partition.add_binding(
-                Binding {
+                SubscriptionBinding {
                     subscription_id: 2,
                     predicate_id: pred_id,
-                    user_id: 99,
-                    user_ordinal: ord,
-                    session_id: None,
+                    consumer_id: 99,
+                    consumer_ordinal: ord,
+                    scope: SubscriptionScope::Durable,
                     updated_at_unix_ms: 1000,
                 },
                 pred_id,
@@ -1583,27 +1589,30 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users: Vec<_> = dispatch_users(&event, &partition, &user_dict, &mut vm)
-            .expect("dispatch_users should succeed")
+        let consumers: Vec<_> = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
+            .expect("dispatch_consumers should succeed")
             .collect();
 
-        // User 99 (Rows predicate) should appear; user 42 (COUNT predicate) must NOT
-        assert!(users.contains(&99), "Rows subscriber should be dispatched");
+        // Consumer 99 (Rows predicate) should appear; consumer 42 (COUNT predicate) must NOT
         assert!(
-            !users.contains(&42),
-            "COUNT subscriber must not appear in users() dispatch"
+            consumers.contains(&99),
+            "Rows subscriber should be dispatched"
+        );
+        assert!(
+            !consumers.contains(&42),
+            "COUNT subscriber must not appear in consumers() dispatch"
         );
     }
 
     #[test]
-    fn test_dispatch_users_no_match() {
+    fn test_dispatch_consumers_no_match() {
         use super::super::indexes::IndexableAtom;
         use super::super::partition::TablePartition;
         use super::super::predicate::Predicate;
         use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
 
         let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut user_dict = UserDictionary::<DefaultIds>::new();
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
         let pred = Predicate {
@@ -1626,13 +1635,13 @@ mod tests {
         let pred_id = pred.id;
         partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
 
-        let ord = user_dict.get_or_create(42);
-        let binding = super::super::predicate::Binding {
+        let ord = consumer_dict.get_or_create(42);
+        let binding = super::super::predicate::SubscriptionBinding {
             subscription_id: 300,
             predicate_id: pred_id,
-            user_id: 42,
-            user_ordinal: ord,
-            session_id: None,
+            consumer_id: 42,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 1000,
         };
         partition.add_binding(binding, pred_id);
@@ -1651,12 +1660,12 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let result = dispatch_users(&event, &partition, &user_dict, &mut vm);
+        let result = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm);
         assert!(result.is_ok());
-        let users: Vec<_> = result.unwrap().collect();
+        let consumers: Vec<_> = result.unwrap().collect();
         assert!(
-            users.is_empty(),
-            "No users should match age > 50 with age=25"
+            consumers.is_empty(),
+            "No consumers should match age > 50 with age=25"
         );
     }
 }

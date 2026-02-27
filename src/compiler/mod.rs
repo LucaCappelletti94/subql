@@ -12,7 +12,8 @@ pub mod vm;
 pub use bytecode::{BytecodeProgram, Instruction};
 pub use canonicalize::{hash_sql, normalize_sql, PredicateHash};
 pub use parser::{
-    parse_and_compile, parse_compile_and_normalize, parse_compile_normalize_and_prefilter,
+    parse_and_compile, parse_and_resolve_hash, parse_compile_and_normalize,
+    parse_compile_normalize_and_prefilter,
 };
 pub use prefilter::{PlannerAtom, PlannerValue, PrefilterPlan};
 pub use sql_shape::{AggSpec, QueryProjection};

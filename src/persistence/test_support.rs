@@ -1,8 +1,8 @@
 use crate::{SchemaCatalog, TableId};
 use std::collections::HashMap;
 
-pub(crate) struct MockCatalog {
-    pub(crate) fingerprints: HashMap<TableId, u64>,
+pub struct MockCatalog {
+    pub fingerprints: HashMap<TableId, u64>,
 }
 
 impl SchemaCatalog for MockCatalog {
@@ -23,7 +23,7 @@ impl SchemaCatalog for MockCatalog {
     }
 }
 
-pub(crate) fn make_catalog() -> MockCatalog {
+pub fn make_catalog() -> MockCatalog {
     let mut fingerprints = HashMap::new();
     fingerprints.insert(1, 0x1234_5678_90AB_CDEF);
     MockCatalog { fingerprints }

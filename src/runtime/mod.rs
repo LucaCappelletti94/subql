@@ -9,5 +9,5 @@ pub mod partition;
 pub mod predicate;
 
 pub use agg::{agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SumKernel};
-pub use dispatch::MatchedUsers;
+pub use dispatch::MatchedConsumers;
 pub use engine::SubscriptionEngine;

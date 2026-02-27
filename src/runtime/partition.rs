@@ -3,7 +3,7 @@
 use super::{
     ids::PredicateId,
     indexes::{HybridIndexes, IndexableAtom, IndexableCell},
-    predicate::{Binding, Predicate, PredicateStore},
+    predicate::{Predicate, PredicateStore, SubscriptionBinding},
 };
 use crate::{
     compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, RowImage, TableId,
@@ -24,7 +24,7 @@ pub struct TablePartitionSnapshot<I: IdTypes> {
 
 pub(super) struct BindingRemoval<I: IdTypes> {
     pub predicate_removed: bool,
-    pub user_id: I::UserId,
+    pub consumer_id: I::ConsumerId,
 }
 
 /// Table partition with atomic swap
@@ -88,7 +88,7 @@ impl<I: IdTypes> TablePartition<I> {
     /// Add binding to an existing predicate
     ///
     /// Increments refcount and updates snapshot.
-    pub fn add_binding(&mut self, binding: Binding<I>, pred_id: PredicateId) {
+    pub fn add_binding(&mut self, binding: SubscriptionBinding<I>, pred_id: PredicateId) {
         let store = Arc::make_mut(&mut self.mutable_predicates);
         store.add_binding(binding);
         store.increment_refcount(pred_id);
@@ -137,7 +137,7 @@ impl<I: IdTypes> TablePartition<I> {
 
             Some(BindingRemoval {
                 predicate_removed: removed,
-                user_id: binding.user_id,
+                consumer_id: binding.consumer_id,
             })
         } else {
             None
@@ -288,7 +288,10 @@ impl<I: IdTypes> TablePartition<I> {
     /// indexes once, and performs a single atomic snapshot swap.
     /// Much more efficient than calling `add_predicate`/`add_binding` in a loop.
     #[allow(clippy::type_complexity)]
-    pub fn add_batch(&mut self, entries: &[(Predicate, Vec<IndexableAtom>, Vec<Binding<I>>)]) {
+    pub fn add_batch(
+        &mut self,
+        entries: &[(Predicate, Vec<IndexableAtom>, Vec<SubscriptionBinding<I>>)],
+    ) {
         if entries.is_empty() {
             return;
         }
@@ -337,12 +340,12 @@ impl<I: IdTypes> TablePartition<I> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ids::UserOrdinal;
+    use super::super::ids::ConsumerOrdinal;
     use super::super::indexes::{IndexableAtom, NullKind};
     use super::*;
     use crate::{
         compiler::{BytecodeProgram, Instruction, PrefilterPlan},
-        Cell, DefaultIds,
+        Cell, DefaultIds, SubscriptionScope,
     };
 
     fn make_predicate(id: usize, hash: u128) -> Predicate {
@@ -456,20 +459,20 @@ mod tests {
         partition.add_predicate(pred, vec![]);
 
         // Add two bindings for the same predicate
-        let binding1 = Binding {
+        let binding1 = SubscriptionBinding {
             subscription_id: 100,
             predicate_id: pred_id,
-            user_id: 1,
-            user_ordinal: UserOrdinal::new(0),
-            session_id: None,
+            consumer_id: 1,
+            consumer_ordinal: ConsumerOrdinal::new(0),
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 0,
         };
-        let binding2 = Binding {
+        let binding2 = SubscriptionBinding {
             subscription_id: 101,
             predicate_id: pred_id,
-            user_id: 2,
-            user_ordinal: UserOrdinal::new(1),
-            session_id: None,
+            consumer_id: 2,
+            consumer_ordinal: ConsumerOrdinal::new(1),
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 0,
         };
 

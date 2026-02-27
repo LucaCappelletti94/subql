@@ -6,7 +6,7 @@
 pub use compiler::{AggSpec, QueryProjection};
 pub use errors::*;
 pub use runtime::{
-    agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, MatchedUsers,
+    agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, MatchedConsumers,
     SubscriptionEngine, SumKernel,
 };
 pub use types::*;

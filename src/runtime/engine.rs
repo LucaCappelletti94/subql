@@ -3,15 +3,16 @@
 use super::indexes::IndexableAtom;
 use super::{
     dispatch::{
-        dispatch_users, dispatch_users_with_row, select_event_row, MatchedUsers, UserDictionary,
+        dispatch_consumers, dispatch_consumers_with_row, select_event_row, ConsumerDictionary,
+        MatchedConsumers,
     },
-    ids::{PredicateId, UserOrdinal},
+    ids::{ConsumerOrdinal, PredicateId},
     partition::TablePartition,
-    predicate::{Binding, Predicate},
+    predicate::{Predicate, SubscriptionBinding},
 };
 use crate::{
     compiler::{
-        canonicalize, parse_compile_normalize_and_prefilter,
+        canonicalize, parse_and_resolve_hash, parse_compile_normalize_and_prefilter,
         sql_shape::{AggSpec, QueryProjection},
         BytecodeProgram, PrefilterPlan, Vm,
     },
@@ -20,14 +21,14 @@ use crate::{
         merge::MergeManager,
         predicate_data::predicate_data_equivalent,
         shard::{
-            deserialize_shard, serialize_shard, BindingData, PredicateData, ShardPayload,
-            UserDictData,
+            deserialize_shard, serialize_shard, BindingData, ConsumerDictData, PredicateData,
+            ShardPayload,
         },
     },
     DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, EventKind, IdTypes,
-    MergeError, MergeJobId, MergeReport, PruneReport, RegisterError, RegisterResult, RowImage,
-    SchemaCatalog, StorageError, SubscriptionDispatch, SubscriptionPruning,
-    SubscriptionRegistration, SubscriptionSpec, TableId, WalEvent,
+    MergeError, MergeJobId, MergeReport, RegisterError, RegisterResult, RowImage, SchemaCatalog,
+    StorageError, SubscriptionDispatch, SubscriptionRegistration, SubscriptionRequest,
+    SubscriptionUnregistration, TableId, UnregisterReport, WalEvent,
 };
 use ahash::{AHashMap, AHashSet};
 use sqlparser::dialect::Dialect;
@@ -37,10 +38,10 @@ use std::io::Write;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-type BatchEntries<I> = Vec<(Predicate, Vec<IndexableAtom>, Vec<Binding<I>>)>;
+type BatchEntries<I> = Vec<(Predicate, Vec<IndexableAtom>, Vec<SubscriptionBinding<I>>)>;
 
 struct CompiledSpec<I: IdTypes> {
-    spec: SubscriptionSpec<I>,
+    spec: SubscriptionRequest<I>,
     table_id: TableId,
     bytecode: BytecodeProgram,
     normalized: String,
@@ -136,8 +137,8 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
     catalog: Arc<dyn SchemaCatalog>,
     /// Table partitions (TableId → TablePartition)
     partitions: AHashMap<TableId, TablePartition<I>>,
-    /// User dictionaries (TableId → UserDictionary)
-    user_dictionaries: AHashMap<TableId, UserDictionary<I>>,
+    /// User dictionaries (TableId → ConsumerDictionary)
+    consumer_dictionaries: AHashMap<TableId, ConsumerDictionary<I>>,
     /// Subscription index for O(1) unregister/upsert lookup.
     subscription_to_table: AHashMap<I::SubscriptionId, TableId>,
     /// VM for bytecode evaluation
@@ -167,27 +168,13 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         atoms
     }
 
-    fn compile_spec(&self, spec: SubscriptionSpec<I>) -> Result<CompiledSpec<I>, RegisterError> {
+    fn compile_spec(&self, spec: SubscriptionRequest<I>) -> Result<CompiledSpec<I>, RegisterError> {
         let (table_id, bytecode, normalized, prefilter_plan, projection) =
             parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog)?;
 
         // Disambiguate hash: same WHERE clause with different projection kind must map to
         // distinct predicates.
-        let hash_input = match &projection {
-            QueryProjection::Rows => normalized.clone(),
-            QueryProjection::Aggregate(AggSpec::CountStar) => {
-                format!("{normalized}\x00COUNT(*)")
-            }
-            QueryProjection::Aggregate(AggSpec::CountColumn { column }) => {
-                format!("{normalized}\x00COUNT({column})")
-            }
-            QueryProjection::Aggregate(AggSpec::Sum { column }) => {
-                format!("{normalized}\x00SUM({column})")
-            }
-            QueryProjection::Aggregate(AggSpec::Avg { column }) => {
-                format!("{normalized}\x00AVG({column})")
-            }
-        };
+        let hash_input = crate::compiler::parser::projection_hash_input(&normalized, &projection);
         let hash = canonicalize::hash_sql(&hash_input);
         #[cfg(test)]
         let hash = injected_compile_hash_override(&normalized).unwrap_or(hash);
@@ -245,16 +232,16 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     }
 
     const fn make_binding(
-        spec: &SubscriptionSpec<I>,
+        spec: &SubscriptionRequest<I>,
         pred_id: PredicateId,
-        user_ord: UserOrdinal,
-    ) -> Binding<I> {
-        Binding {
+        consumer_ord: ConsumerOrdinal,
+    ) -> SubscriptionBinding<I> {
+        SubscriptionBinding {
             subscription_id: spec.subscription_id,
             predicate_id: pred_id,
-            user_id: spec.user_id,
-            user_ordinal: user_ord,
-            session_id: spec.session_id,
+            consumer_id: spec.consumer_id,
+            consumer_ordinal: consumer_ord,
+            scope: spec.scope,
             updated_at_unix_ms: spec.updated_at_unix_ms,
         }
     }
@@ -357,7 +344,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             dialect,
             catalog,
             partitions: AHashMap::new(),
-            user_dictionaries: AHashMap::new(),
+            consumer_dictionaries: AHashMap::new(),
             subscription_to_table: AHashMap::new(),
             vm: Vm::new(),
             storage_path: None,
@@ -380,7 +367,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             dialect,
             catalog: Arc::clone(&catalog),
             partitions: AHashMap::new(),
-            user_dictionaries: AHashMap::new(),
+            consumer_dictionaries: AHashMap::new(),
             subscription_to_table: AHashMap::new(),
             vm: Vm::new(),
             storage_path: Some(storage_path.clone()),
@@ -401,7 +388,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
     /// Register a new subscription.
     ///
-    /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds user.
+    /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds consumer.
     /// If storage is enabled and rotation threshold is exceeded, triggers snapshot.
     ///
     /// # Examples
@@ -409,7 +396,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// use std::sync::Arc;
     ///
     /// use sqlparser::dialect::PostgreSqlDialect;
-    /// use subql::{DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionSpec};
+    /// use subql::{
+    ///     DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionRequest, SubscriptionScope,
+    /// };
     ///
     /// let catalog = Arc::new(
     ///     SimpleCatalog::new()
@@ -421,18 +410,18 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     ///
-    /// let first = engine.register(SubscriptionSpec {
+    /// let first = engine.register(SubscriptionRequest {
     ///     subscription_id: 1,
-    ///     user_id: 10,
-    ///     session_id: None,
+    ///     consumer_id: 10,
+    ///     scope: SubscriptionScope::Durable,
     ///     sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
     ///     updated_at_unix_ms: 1_704_067_200_000,
     /// })?;
     ///
-    /// let second = engine.register(SubscriptionSpec {
+    /// let second = engine.register(SubscriptionRequest {
     ///     subscription_id: 2,
-    ///     user_id: 20,
-    ///     session_id: None,
+    ///     consumer_id: 20,
+    ///     scope: SubscriptionScope::Durable,
     ///     sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
     ///     updated_at_unix_ms: 1_704_067_200_001,
     /// })?;
@@ -444,7 +433,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[allow(clippy::needless_pass_by_value)]
-    pub fn register(&mut self, spec: SubscriptionSpec<I>) -> Result<RegisterResult, RegisterError> {
+    pub fn register(
+        &mut self,
+        spec: SubscriptionRequest<I>,
+    ) -> Result<RegisterResult, RegisterError> {
         // 1. Parse, compile, and canonicalize in one pass.
         let compiled = self.compile_spec(spec)?;
         let table_id = compiled.table_id;
@@ -461,17 +453,17 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         // after new SQL has been validated.
         let _ = self.unregister_subscription_internal(compiled.spec.subscription_id);
 
-        // 4. Get/create table partition and user dictionary
+        // 4. Get/create table partition and consumer dictionary
         let partition = self
             .partitions
             .entry(table_id)
             .or_insert_with(|| TablePartition::new(table_id));
 
-        let user_dict = self.user_dictionaries.entry(table_id).or_default();
+        let consumer_dict = self.consumer_dictionaries.entry(table_id).or_default();
 
-        // 5. Get user ordinal
-        let user_ord = user_dict
-            .try_get_or_create(compiled.spec.user_id)
+        // 5. Get consumer ordinal
+        let consumer_ord = consumer_dict
+            .try_get_or_create(compiled.spec.consumer_id)
             .map_err(|e| RegisterError::Storage(e.to_string()))?;
 
         // 6. Check if predicate exists (deduplication)
@@ -495,7 +487,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             );
 
         // 7. Create binding
-        let binding = Self::make_binding(&compiled.spec, pred_id, user_ord);
+        let binding = Self::make_binding(&compiled.spec, pred_id, consumer_ord);
 
         // Add binding to partition
         partition.add_binding(binding, pred_id);
@@ -522,7 +514,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                     }
                     self.subscription_to_table
                         .insert(compiled.spec.subscription_id, old_table_id);
-                    // Ensure the old user ordinal is present (unregister may have freed it)
+                    // Ensure the old consumer ordinal is present (unregister may have freed it)
                     if let Some(old_binding) = self.partitions.get(&old_table_id).and_then(|p| {
                         p.load_snapshot()
                             .predicates
@@ -530,8 +522,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                             .get(&compiled.spec.subscription_id)
                             .copied()
                     }) {
-                        if let Some(user_dict) = self.user_dictionaries.get_mut(&old_table_id) {
-                            let _ = user_dict.try_get_or_create(old_binding.user_id);
+                        if let Some(consumer_dict) =
+                            self.consumer_dictionaries.get_mut(&old_table_id)
+                        {
+                            let _ = consumer_dict.try_get_or_create(old_binding.consumer_id);
                         }
                     }
                 }
@@ -563,7 +557,9 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// use std::sync::Arc;
     ///
     /// use sqlparser::dialect::PostgreSqlDialect;
-    /// use subql::{DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionSpec};
+    /// use subql::{
+    ///     DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionRequest, SubscriptionScope,
+    /// };
     ///
     /// let catalog = Arc::new(
     ///     SimpleCatalog::new()
@@ -576,24 +572,24 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     ///
     /// let results = engine.register_batch(vec![
-    ///     SubscriptionSpec {
+    ///     SubscriptionRequest {
     ///         subscription_id: 1,
-    ///         user_id: 10,
-    ///         session_id: None,
+    ///         consumer_id: 10,
+    ///         scope: SubscriptionScope::Durable,
     ///         sql: "SELECT * FROM orders WHERE status = 'paid'".to_string(),
     ///         updated_at_unix_ms: 1_704_067_200_000,
     ///     },
-    ///     SubscriptionSpec {
+    ///     SubscriptionRequest {
     ///         subscription_id: 2,
-    ///         user_id: 11,
-    ///         session_id: None,
+    ///         consumer_id: 11,
+    ///         scope: SubscriptionScope::Durable,
     ///         sql: "SELECT * FROM orders WHERE status = 'paid'".to_string(),
     ///         updated_at_unix_ms: 1_704_067_200_001,
     ///     },
-    ///     SubscriptionSpec {
+    ///     SubscriptionRequest {
     ///         subscription_id: 3,
-    ///         user_id: 12,
-    ///         session_id: None,
+    ///         consumer_id: 12,
+    ///         scope: SubscriptionScope::Durable,
     ///         sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
     ///         updated_at_unix_ms: 1_704_067_200_002,
     ///     },
@@ -613,7 +609,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     #[allow(clippy::too_many_lines)]
     pub fn register_batch(
         &mut self,
-        specs: Vec<SubscriptionSpec<I>>,
+        specs: Vec<SubscriptionRequest<I>>,
     ) -> Vec<Result<RegisterResult, RegisterError>> {
         // Preserve correctness for upsert workloads: if the batch includes
         // existing subscription IDs or duplicate IDs within the batch, fall
@@ -667,8 +663,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 .partitions
                 .entry(c.table_id)
                 .or_insert_with(|| TablePartition::new(c.table_id));
-            let user_dict = self.user_dictionaries.entry(c.table_id).or_default();
-            let user_ord = match user_dict.try_get_or_create(c.spec.user_id) {
+            let consumer_dict = self.consumer_dictionaries.entry(c.table_id).or_default();
+            let consumer_ord = match consumer_dict.try_get_or_create(c.spec.consumer_id) {
                 Ok(ord) => ord,
                 Err(e) => {
                     results[i] = Err(RegisterError::Storage(e.to_string()));
@@ -694,7 +690,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             if let Some(pred_id) = existing {
                 // Predicate exists in the live partition — add binding directly
                 // (cannot batch this since it references an existing pred_id)
-                let binding = Self::make_binding(&c.spec, pred_id, user_ord);
+                let binding = Self::make_binding(&c.spec, pred_id, consumer_ord);
                 partition.add_binding(binding, pred_id);
                 self.subscription_to_table
                     .insert(c.spec.subscription_id, c.table_id);
@@ -709,14 +705,14 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                     continue;
                 };
                 let binding =
-                    Self::make_binding(&c.spec, PredicateId::from_slab_index(0), user_ord);
+                    Self::make_binding(&c.spec, PredicateId::from_slab_index(0), consumer_ord);
                 entries[batch_idx].2.push(binding);
                 created_new = false;
             } else {
                 // New predicate — create batch entry
                 let (pred, atoms) = Self::make_predicate_from_compiled(&c);
                 let binding =
-                    Self::make_binding(&c.spec, PredicateId::from_slab_index(0), user_ord);
+                    Self::make_binding(&c.spec, PredicateId::from_slab_index(0), consumer_ord);
 
                 let entries = table_entries.entry(c.table_id).or_default();
                 let batch_idx = entries.len();
@@ -806,19 +802,19 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .is_some()
     }
 
-    fn cleanup_user_if_unreferenced(&mut self, table_id: TableId, user_id: I::UserId) {
+    fn cleanup_consumer_if_unreferenced(&mut self, table_id: TableId, consumer_id: I::ConsumerId) {
         let has_active_bindings = self.partitions.get(&table_id).is_some_and(|partition| {
             let snapshot = partition.load_snapshot();
             snapshot
                 .predicates
                 .bindings
                 .values()
-                .any(|binding| binding.user_id == user_id)
+                .any(|binding| binding.consumer_id == consumer_id)
         });
 
         if !has_active_bindings {
-            if let Some(user_dict) = self.user_dictionaries.get_mut(&table_id) {
-                let _ = user_dict.remove(user_id);
+            if let Some(consumer_dict) = self.consumer_dictionaries.get_mut(&table_id) {
+                let _ = consumer_dict.remove(consumer_id);
             }
         }
     }
@@ -838,7 +834,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 .and_then(|partition| partition.remove_binding_detail(subscription_id));
             if let Some(removal) = removal {
                 self.subscription_to_table.remove(&subscription_id);
-                self.cleanup_user_if_unreferenced(table_id, removal.user_id);
+                self.cleanup_consumer_if_unreferenced(table_id, removal.consumer_id);
                 return Some(removal.predicate_removed);
             }
 
@@ -857,14 +853,14 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         if let Some((table_id, removal)) = removed {
             self.subscription_to_table.remove(&subscription_id);
-            self.cleanup_user_if_unreferenced(table_id, removal.user_id);
+            self.cleanup_consumer_if_unreferenced(table_id, removal.consumer_id);
             return Some(removal.predicate_removed);
         }
 
         None
     }
 
-    /// Dispatch event to interested users.
+    /// Dispatch event to interested consumers.
     ///
     /// # Examples
     /// ```
@@ -873,7 +869,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{
     ///     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine,
-    ///     SubscriptionSpec, WalEvent,
+    ///     SubscriptionRequest, SubscriptionScope, WalEvent,
     /// };
     ///
     /// let catalog = Arc::new(
@@ -886,10 +882,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     ///
-    /// engine.register(SubscriptionSpec {
+    /// engine.register(SubscriptionRequest {
     ///     subscription_id: 7,
-    ///     user_id: 42,
-    ///     session_id: None,
+    ///     consumer_id: 42,
+    ///     scope: SubscriptionScope::Durable,
     ///     sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
     ///     updated_at_unix_ms: 1_704_067_200_000,
     /// })?;
@@ -905,25 +901,28 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///     changed_columns: Arc::from([]),
     /// };
     ///
-    /// let users: Vec<u64> = engine.users(&event)?.collect();
-    /// assert_eq!(users, vec![42]);
+    /// let consumers: Vec<u64> = engine.consumers(&event)?.collect();
+    /// assert_eq!(consumers, vec![42]);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn users(&mut self, event: &WalEvent) -> Result<MatchedUsers<'_, I>, DispatchError> {
+    pub fn consumers(
+        &mut self,
+        event: &WalEvent,
+    ) -> Result<MatchedConsumers<'_, I>, DispatchError> {
         // Get table partition
         let partition = self
             .partitions
             .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
-        // Get user dictionary
-        let user_dict = self
-            .user_dictionaries
+        // Get consumer dictionary
+        let consumer_dict = self
+            .consumer_dictionaries
             .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
         if event.kind == EventKind::Truncate {
-            return dispatch_users(event, partition, user_dict, &mut self.vm);
+            return dispatch_consumers(event, partition, consumer_dict, &mut self.vm);
         }
 
         // Validate selected row image arity against schema catalog.
@@ -943,14 +942,14 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Dispatch
-        dispatch_users_with_row(event, row, partition, user_dict, &mut self.vm)
+        dispatch_consumers_with_row(event, row, partition, consumer_dict, &mut self.vm)
     }
 
     /// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), …).
     ///
-    /// Returns `Vec<(UserId, AggDelta)>` where each entry is the net signed change
-    /// for that user's aggregate predicate. Zero-net entries are omitted.
-    /// The same user may appear multiple times (once per aggregate kind).
+    /// Returns `Vec<(ConsumerId, AggDelta)>`` where each entry is the net signed change
+    /// for that consumer's aggregate predicate. Zero-net entries are omitted.
+    /// The same consumer may appear multiple times (once per aggregate kind).
     ///
     /// # Caller contract
     /// - Bootstrap: query the DB for the initial aggregate **before** subscribing.
@@ -970,7 +969,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{
     ///     AggDelta, Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog,
-    ///     SubscriptionEngine, SubscriptionSpec, WalEvent,
+    ///     SubscriptionEngine, SubscriptionRequest, SubscriptionScope, WalEvent,
     /// };
     ///
     /// let catalog = Arc::new(
@@ -982,10 +981,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     ///
-    /// engine.register(SubscriptionSpec {
+    /// engine.register(SubscriptionRequest {
     ///     subscription_id: 1,
-    ///     user_id: 99,
-    ///     session_id: None,
+    ///     consumer_id: 99,
+    ///     scope: SubscriptionScope::Durable,
     ///     sql: "SELECT COUNT(*) FROM orders WHERE status = 'paid'".to_string(),
     ///     updated_at_unix_ms: 1_704_067_200_000,
     /// })?;
@@ -1004,22 +1003,22 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// let deltas = engine.aggregate_deltas(&event)?;
     /// assert_eq!(deltas, vec![(99, AggDelta::Count(1))]);
     ///
-    /// // Aggregate subscriptions are handled by `aggregate_deltas()`, not `users()`.
-    /// let users: Vec<u64> = engine.users(&event)?.collect();
-    /// assert!(users.is_empty());
+    /// // Aggregate subscriptions are handled by `aggregate_deltas()`, not `consumers()`.
+    /// let consumers: Vec<u64> = engine.consumers(&event)?.collect();
+    /// assert!(consumers.is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn aggregate_deltas(
         &mut self,
         event: &WalEvent,
-    ) -> Result<Vec<(I::UserId, crate::AggDelta)>, DispatchError> {
+    ) -> Result<Vec<(I::ConsumerId, crate::AggDelta)>, DispatchError> {
         let partition = self
             .partitions
             .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
-        let user_dict = self
-            .user_dictionaries
+        let consumer_dict = self
+            .consumer_dictionaries
             .get(&event.table_id)
             .ok_or(DispatchError::UnknownTableId(event.table_id))?;
 
@@ -1070,18 +1069,19 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             EventKind::Truncate => {}
         }
 
-        super::dispatch::compute_agg_deltas(event, partition, user_dict, &mut self.vm)
+        super::dispatch::compute_agg_deltas(event, partition, consumer_dict, &mut self.vm)
     }
 
     /// Unregister all subscriptions for a session
-    pub fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport {
+    pub fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
         let mut removed_bindings = 0;
         let mut removed_predicates = 0;
-        let mut removed_users = 0;
+        let mut removed_consumers = 0;
 
         // Collect subscription IDs to remove
         let mut to_remove = Vec::new();
-        let mut removed_user_candidates: AHashMap<TableId, AHashSet<I::UserId>> = AHashMap::new();
+        let mut removed_consumer_candidates: AHashMap<TableId, AHashSet<I::ConsumerId>> =
+            AHashMap::new();
 
         for (&table_id, partition) in &self.partitions {
             let snapshot = partition.load_snapshot();
@@ -1089,10 +1089,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             if let Some(sub_ids) = snapshot.predicates.get_session_subscriptions(session_id) {
                 removed_bindings += sub_ids.len();
                 to_remove.extend_from_slice(sub_ids);
-                let users = removed_user_candidates.entry(table_id).or_default();
+                let consumers = removed_consumer_candidates.entry(table_id).or_default();
                 for sub_id in sub_ids {
                     if let Some(binding) = snapshot.predicates.bindings.get(sub_id) {
-                        users.insert(binding.user_id);
+                        consumers.insert(binding.consumer_id);
                     }
                 }
             }
@@ -1105,12 +1105,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             }
         }
 
-        for (table_id, users) in removed_user_candidates {
-            let Some(user_dict) = self.user_dictionaries.get_mut(&table_id) else {
+        for (table_id, consumers) in removed_consumer_candidates {
+            let Some(consumer_dict) = self.consumer_dictionaries.get_mut(&table_id) else {
                 continue;
             };
 
-            let active_users: AHashSet<I::UserId> = self
+            let active_consumers: AHashSet<I::ConsumerId> = self
                 .partitions
                 .get(&table_id)
                 .map(|partition| {
@@ -1119,27 +1119,100 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                         .predicates
                         .bindings
                         .values()
-                        .map(|binding| binding.user_id)
+                        .map(|binding| binding.consumer_id)
                         .collect()
                 })
                 .unwrap_or_default();
 
-            for user_id in users {
-                if !active_users.contains(&user_id) {
-                    let was_present = user_dict.get(user_id).is_some();
+            for consumer_id in consumers {
+                if !active_consumers.contains(&consumer_id) {
+                    let was_present = consumer_dict.get(consumer_id).is_some();
                     if was_present {
-                        let _ = user_dict.remove(user_id);
+                        let _ = consumer_dict.remove(consumer_id);
                     }
-                    removed_users += 1;
+                    removed_consumers += 1;
                 }
             }
         }
 
-        PruneReport {
+        UnregisterReport {
             removed_bindings,
             removed_predicates,
-            removed_users,
+            removed_consumers,
         }
+    }
+
+    /// Unregister all subscriptions for a consumer matching a specific SQL query.
+    ///
+    /// Parses the SQL just enough to compute the predicate hash (no bytecode
+    /// compilation), then removes all bindings for `consumer_id` that share that
+    /// hash.
+    pub fn unregister_query(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        sql: &str,
+    ) -> Result<UnregisterReport, RegisterError> {
+        let (table_id, hash) = parse_and_resolve_hash(sql, &self.dialect, &*self.catalog)?;
+
+        let empty = UnregisterReport {
+            removed_bindings: 0,
+            removed_predicates: 0,
+            removed_consumers: 0,
+        };
+
+        let Some(partition) = self.partitions.get(&table_id) else {
+            return Ok(empty);
+        };
+
+        // Find the predicate for this hash.
+        let snapshot = partition.load_snapshot();
+        let Some(pred_id) = snapshot.predicates.find_by_hash(hash) else {
+            return Ok(empty);
+        };
+
+        // Collect subscription IDs belonging to this consumer on this predicate.
+        let to_remove: Vec<I::SubscriptionId> = snapshot
+            .predicates
+            .bindings
+            .values()
+            .filter(|b| b.predicate_id == pred_id && b.consumer_id == consumer_id)
+            .map(|b| b.subscription_id)
+            .collect();
+
+        if to_remove.is_empty() {
+            return Ok(empty);
+        }
+
+        let removed_bindings = to_remove.len();
+        let mut removed_predicates = 0;
+
+        for sub_id in to_remove {
+            if self.unregister_subscription_internal(sub_id) == Some(true) {
+                removed_predicates += 1;
+            }
+        }
+
+        // Check if the consumer still has any bindings in this table; if not, clean up.
+        let removed_consumers = if self.partitions.get(&table_id).is_some_and(|partition| {
+            let snap = partition.load_snapshot();
+            snap.predicates
+                .bindings
+                .values()
+                .any(|b| b.consumer_id == consumer_id)
+        }) {
+            0
+        } else {
+            if let Some(consumer_dict) = self.consumer_dictionaries.get_mut(&table_id) {
+                let _ = consumer_dict.remove(consumer_id);
+            }
+            1
+        };
+
+        Ok(UnregisterReport {
+            removed_bindings,
+            removed_predicates,
+            removed_consumers,
+        })
     }
 
     /// Get number of registered predicates for a table
@@ -1272,7 +1345,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
     /// Snapshot table partition to disk
     ///
-    /// Serializes all predicates, bindings, and user dictionary to a shard file.
+    /// Serializes all predicates, bindings, and consumer dictionary to a shard file.
     pub fn snapshot_table(&self, table_id: TableId) -> Result<(), StorageError> {
         let storage_path = self
             .storage_path
@@ -1284,8 +1357,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             .get(&table_id)
             .ok_or_else(|| StorageError::Corrupt(format!("Unknown table ID: {table_id}")))?;
 
-        let user_dict = self.user_dictionaries.get(&table_id).ok_or_else(|| {
-            StorageError::Corrupt(format!("No user dictionary for table {table_id}"))
+        let consumer_dict = self.consumer_dictionaries.get(&table_id).ok_or_else(|| {
+            StorageError::Corrupt(format!("No consumer dictionary for table {table_id}"))
         })?;
 
         // Load snapshot
@@ -1318,30 +1391,30 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 .map(|p| p.hash)
                 .ok_or_else(|| {
                     StorageError::Corrupt(format!(
-                        "Binding {:?} references missing predicate ID {:?}",
+                        "SubscriptionBinding {:?} references missing predicate ID {:?}",
                         binding.subscription_id, binding.predicate_id
                     ))
                 })?;
             let binding_data = BindingData::<I> {
                 subscription_id: binding.subscription_id,
                 predicate_hash,
-                user_id: binding.user_id,
-                session_id: binding.session_id,
+                consumer_id: binding.consumer_id,
+                scope: binding.scope,
                 updated_at_unix_ms: binding.updated_at_unix_ms,
             };
             binding_data_vec.push(binding_data);
         }
 
-        // Convert user dictionary to serializable format
-        let user_dict_data = UserDictData::<I> {
-            ordinal_to_user: user_dict.ordinal_to_user_vec(),
+        // Convert consumer dictionary to serializable format
+        let consumer_dict_data = ConsumerDictData::<I> {
+            ordinal_to_consumer: consumer_dict.ordinal_to_consumer_vec(),
         };
 
         // Build payload
         let payload: ShardPayload<I> = ShardPayload {
             predicates: predicate_data_vec,
             bindings: binding_data_vec,
-            user_dict: user_dict_data,
+            consumer_dict: consumer_dict_data,
             #[allow(clippy::cast_possible_truncation)]
             created_at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1365,12 +1438,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
     fn rebuild_entries_from_payload(
         payload: &ShardPayload<I>,
-    ) -> Result<(UserDictionary<I>, BatchEntries<I>), RebuildPayloadError> {
-        let mut user_dict = UserDictionary::<I>::new();
+    ) -> Result<(ConsumerDictionary<I>, BatchEntries<I>), RebuildPayloadError> {
+        let mut consumer_dict = ConsumerDictionary::<I>::new();
 
-        for user_id in &payload.user_dict.ordinal_to_user {
-            user_dict
-                .try_get_or_create(*user_id)
+        for consumer_id in &payload.consumer_dict.ordinal_to_consumer {
+            consumer_dict
+                .try_get_or_create(*consumer_id)
                 .map_err(|e| RebuildPayloadError::Corrupt(e.to_string()))?;
         }
 
@@ -1393,36 +1466,36 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Build bindings grouped by predicate hash; IDs are assigned during add_batch.
-        let mut bindings_by_hash: AHashMap<u128, Vec<Binding<I>>> = AHashMap::new();
-        let mut users_with_bindings = AHashSet::new();
+        let mut bindings_by_hash: AHashMap<u128, Vec<SubscriptionBinding<I>>> = AHashMap::new();
+        let mut consumers_with_bindings = AHashSet::new();
         for binding_data in &payload.bindings {
             if !pred_hash_to_data.contains_key(&binding_data.predicate_hash) {
                 return Err(RebuildPayloadError::Corrupt(format!(
-                    "Binding references unknown predicate hash: {:016x}",
+                    "SubscriptionBinding references unknown predicate hash: {:016x}",
                     binding_data.predicate_hash
                 )));
             }
 
-            let user_ord = user_dict
-                .try_get_or_create(binding_data.user_id)
+            let consumer_ord = consumer_dict
+                .try_get_or_create(binding_data.consumer_id)
                 .map_err(|e| RebuildPayloadError::Corrupt(e.to_string()))?;
-            users_with_bindings.insert(binding_data.user_id);
+            consumers_with_bindings.insert(binding_data.consumer_id);
             bindings_by_hash
                 .entry(binding_data.predicate_hash)
                 .or_default()
-                .push(Binding {
+                .push(SubscriptionBinding {
                     subscription_id: binding_data.subscription_id,
                     predicate_id: PredicateId::from_slab_index(0), // add_batch patches this
-                    user_id: binding_data.user_id,
-                    user_ordinal: user_ord,
-                    session_id: binding_data.session_id,
+                    consumer_id: binding_data.consumer_id,
+                    consumer_ordinal: consumer_ord,
+                    scope: binding_data.scope,
                     updated_at_unix_ms: binding_data.updated_at_unix_ms,
                 });
         }
 
-        for user_id in &payload.user_dict.ordinal_to_user {
-            if !users_with_bindings.contains(user_id) {
-                let _ = user_dict.remove(*user_id);
+        for consumer_id in &payload.consumer_dict.ordinal_to_consumer {
+            if !consumers_with_bindings.contains(consumer_id) {
+                let _ = consumer_dict.remove(*consumer_id);
             }
         }
 
@@ -1468,18 +1541,18 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             ));
         }
 
-        Ok((user_dict, entries))
+        Ok((consumer_dict, entries))
     }
 
     fn replace_table_state(
         &mut self,
         table_id: TableId,
         partition: TablePartition<I>,
-        user_dict: UserDictionary<I>,
+        consumer_dict: ConsumerDictionary<I>,
         entries: &BatchEntries<I>,
     ) {
         self.partitions.insert(table_id, partition);
-        self.user_dictionaries.insert(table_id, user_dict);
+        self.consumer_dictionaries.insert(table_id, consumer_dict);
         self.subscription_to_table
             .retain(|_, mapped_table_id| *mapped_table_id != table_id);
         for (_, _, bindings) in entries {
@@ -1495,10 +1568,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         table_id: TableId,
         payload: &ShardPayload<I>,
     ) -> Result<(), RebuildPayloadError> {
-        let (user_dict, entries) = Self::rebuild_entries_from_payload(payload)?;
+        let (consumer_dict, entries) = Self::rebuild_entries_from_payload(payload)?;
         let mut partition = TablePartition::new(table_id);
         partition.add_batch(&entries);
-        self.replace_table_state(table_id, partition, user_dict, &entries);
+        self.replace_table_state(table_id, partition, consumer_dict, &entries);
         Ok(())
     }
 
@@ -1682,7 +1755,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         };
 
         let had_live_table_state = self.partitions.contains_key(&merged.table_id)
-            || self.user_dictionaries.contains_key(&merged.table_id);
+            || self.consumer_dictionaries.contains_key(&merged.table_id);
         if had_live_table_state {
             let live_subscriptions: AHashSet<I::SubscriptionId> = self
                 .partitions
@@ -1732,7 +1805,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionRegistration<I>
     for SubscriptionEngine<D, I>
 {
-    fn register(&mut self, spec: SubscriptionSpec<I>) -> Result<RegisterResult, RegisterError> {
+    fn register(&mut self, spec: SubscriptionRequest<I>) -> Result<RegisterResult, RegisterError> {
         Self::register(self, spec)
     }
 
@@ -1742,19 +1815,29 @@ impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionRegistration<I>
 }
 
 impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionDispatch<I> for SubscriptionEngine<D, I> {
-    type UserIter<'a>
-        = MatchedUsers<'a, I>
+    type ConsumerIter<'a>
+        = MatchedConsumers<'a, I>
     where
         Self: 'a;
 
-    fn users(&mut self, event: &WalEvent) -> Result<Self::UserIter<'_>, DispatchError> {
-        Self::users(self, event)
+    fn consumers(&mut self, event: &WalEvent) -> Result<Self::ConsumerIter<'_>, DispatchError> {
+        Self::consumers(self, event)
     }
 }
 
-impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionPruning<I> for SubscriptionEngine<D, I> {
-    fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport {
+impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionUnregistration<I>
+    for SubscriptionEngine<D, I>
+{
+    fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
         Self::unregister_session(self, session_id)
+    }
+
+    fn unregister_query(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        sql: &str,
+    ) -> Result<UnregisterReport, RegisterError> {
+        Self::unregister_query(self, consumer_id, sql)
     }
 }
 
@@ -1764,7 +1847,7 @@ impl<D: Dialect + Send + Sync, I: IdTypes> crate::AggregateDispatch<I>
     fn aggregate_deltas(
         &mut self,
         event: &WalEvent,
-    ) -> Result<Vec<(I::UserId, crate::AggDelta)>, DispatchError> {
+    ) -> Result<Vec<(I::ConsumerId, crate::AggDelta)>, DispatchError> {
         Self::aggregate_deltas(self, event)
     }
 }
@@ -1803,7 +1886,7 @@ impl<D: Dialect + Send + Sync, I: IdTypes> DurableShardMerge for SubscriptionEng
 mod tests {
     use super::*;
     use crate::testing::MockCatalog;
-    use crate::{Cell, DefaultIds, EventKind, PrimaryKey, RowImage};
+    use crate::{Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SubscriptionScope};
     use sqlparser::dialect::PostgreSqlDialect;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1933,10 +2016,10 @@ mod tests {
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 100,
-            session_id: None,
+            consumer_id: 100,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -1955,19 +2038,19 @@ mod tests {
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        // Register same predicate for two users
-        let spec1 = SubscriptionSpec {
+        // Register same predicate for two consumers
+        let spec1 = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 100,
-            session_id: None,
+            consumer_id: 100,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
 
-        let spec2 = SubscriptionSpec {
+        let spec2 = SubscriptionRequest {
             subscription_id: 2,
-            user_id: 200,
-            session_id: None,
+            consumer_id: 200,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -1988,10 +2071,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription: amount > 100
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -2017,11 +2100,11 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users = engine.users(&event);
+        let consumers = engine.consumers(&event);
         // Note: This will fail because our stub extract_indexable_atoms
         // returns Fallback, and we haven't properly integrated the VM eval
         // This is expected at this stage
-        assert!(users.is_ok());
+        assert!(consumers.is_ok());
     }
 
     #[test]
@@ -2030,10 +2113,10 @@ mod tests {
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -2053,8 +2136,8 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users: Vec<_> = engine.users(&event).unwrap().collect();
-        assert_eq!(users, vec![42]);
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        assert_eq!(consumers, vec![42]);
     }
 
     #[test]
@@ -2064,10 +2147,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 100,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -2081,7 +2164,7 @@ mod tests {
 
         // Verify binding details
         let binding = snapshot.predicates.bindings.get(&100).unwrap();
-        assert_eq!(binding.user_id, 42);
+        assert_eq!(binding.consumer_id, 42);
         assert_eq!(binding.subscription_id, 100);
     }
 
@@ -2092,10 +2175,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 100,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -2114,8 +2197,8 @@ mod tests {
         let snapshot = partition.load_snapshot();
         assert!(!snapshot.predicates.bindings.contains_key(&100));
 
-        let user_dict = engine.user_dictionaries.get(&1).unwrap();
-        assert!(user_dict.get(42).is_none());
+        let consumer_dict = engine.consumer_dictionaries.get(&1).unwrap();
+        assert!(consumer_dict.get(42).is_none());
     }
 
     #[test]
@@ -2126,19 +2209,19 @@ mod tests {
 
         let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1000,
-                user_id: 7,
-                session_id: None,
+                consumer_id: 7,
+                scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 1,
             })
             .unwrap();
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1001,
-                user_id: 7,
-                session_id: None,
+                consumer_id: 7,
+                scope: SubscriptionScope::Durable,
                 sql,
                 updated_at_unix_ms: 2,
             })
@@ -2160,11 +2243,11 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users: Vec<_> = engine.users(&event).unwrap().collect();
-        assert_eq!(users, vec![7]);
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        assert_eq!(consumers, vec![7]);
 
-        let user_dict = engine.user_dictionaries.get(&1).unwrap();
-        assert!(user_dict.get(7).is_some());
+        let consumer_dict = engine.consumer_dictionaries.get(&1).unwrap();
+        assert!(consumer_dict.get(7).is_some());
     }
 
     #[test]
@@ -2175,10 +2258,10 @@ mod tests {
 
         // Sub 1 -> predicate A
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 101,
-                session_id: None,
+                consumer_id: 101,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
             })
@@ -2186,10 +2269,10 @@ mod tests {
 
         // Sub 2 -> predicate B (kept alive while A is removed)
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 202,
-                session_id: None,
+                consumer_id: 202,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 0".to_string(),
                 updated_at_unix_ms: 2,
             })
@@ -2200,10 +2283,10 @@ mod tests {
 
         // Sub 3 -> predicate C should be independently dispatchable.
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 3,
-                user_id: 303,
-                session_id: None,
+                consumer_id: 303,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount = 7".to_string(),
                 updated_at_unix_ms: 3,
             })
@@ -2227,9 +2310,9 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
         assert!(
-            users.contains(&303),
+            consumers.contains(&303),
             "newly registered predicate should dispatch after hole reuse"
         );
     }
@@ -2241,19 +2324,19 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register first predicate
-        let spec1 = SubscriptionSpec {
+        let spec1 = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 100,
-            session_id: None,
+            consumer_id: 100,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount = 100".to_string(),
             updated_at_unix_ms: 0,
         };
 
         // Register second predicate
-        let spec2 = SubscriptionSpec {
+        let spec2 = SubscriptionRequest {
             subscription_id: 2,
-            user_id: 200,
-            session_id: None,
+            consumer_id: 200,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount = 200".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -2293,10 +2376,10 @@ mod tests {
             .unwrap();
 
         // Register subscription
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1000,
         };
@@ -2333,7 +2416,7 @@ mod tests {
 
         // Verify binding details
         let binding = snapshot.predicates.bindings.get(&1).unwrap();
-        assert_eq!(binding.user_id, 42);
+        assert_eq!(binding.consumer_id, 42);
         assert_eq!(binding.subscription_id, 1);
     }
 
@@ -2386,19 +2469,19 @@ mod tests {
             )
             .unwrap();
 
-        // Register same predicate for two users
-        let spec1 = SubscriptionSpec {
+        // Register same predicate for two consumers
+        let spec1 = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 100,
-            session_id: None,
+            consumer_id: 100,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1000,
         };
 
-        let spec2 = SubscriptionSpec {
+        let spec2 = SubscriptionRequest {
             subscription_id: 2,
-            user_id: 200,
-            session_id: None,
+            consumer_id: 200,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1000,
         };
@@ -2426,13 +2509,13 @@ mod tests {
     }
 
     #[test]
-    fn test_user_dictionary_persists() {
+    fn test_consumer_dictionary_persists() {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
 
-        // Create engine and register users
+        // Create engine and register consumers
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::with_storage(
                 catalog.clone(),
@@ -2442,10 +2525,10 @@ mod tests {
             .unwrap();
 
         for i in 0..5 {
-            let spec = SubscriptionSpec {
+            let spec = SubscriptionRequest {
                 subscription_id: i,
-                user_id: 100 + i,
-                session_id: None,
+                consumer_id: 100 + i,
+                scope: SubscriptionScope::Durable,
                 sql: format!("SELECT * FROM orders WHERE amount > {}", i * 10),
                 updated_at_unix_ms: 1000,
             };
@@ -2464,10 +2547,10 @@ mod tests {
             )
             .unwrap();
 
-        // Verify user dictionary
-        let user_dict = engine2.user_dictionaries.get(&1).unwrap();
+        // Verify consumer dictionary
+        let consumer_dict = engine2.consumer_dictionaries.get(&1).unwrap();
         for i in 0..5 {
-            assert!(user_dict.get(100 + i).is_some());
+            assert!(consumer_dict.get(100 + i).is_some());
         }
     }
 
@@ -2506,10 +2589,10 @@ mod tests {
         assert_eq!(engine.predicate_count(999), 0); // Non-existent table
 
         // Register a subscription
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 100,
-            session_id: None,
+            consumer_id: 100,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -2526,18 +2609,18 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscriptions with session
-        let spec1 = SubscriptionSpec {
+        let spec1 = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 100,
-            session_id: Some(999),
+            consumer_id: 100,
+            scope: SubscriptionScope::Session(999),
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
 
-        let spec2 = SubscriptionSpec {
+        let spec2 = SubscriptionRequest {
             subscription_id: 2,
-            user_id: 100,
-            session_id: Some(999),
+            consumer_id: 100,
+            scope: SubscriptionScope::Session(999),
             sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -2568,16 +2651,16 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_users_via_engine() {
+    fn test_dispatch_consumers_via_engine() {
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register a subscription
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -2599,8 +2682,8 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        // Dispatch should succeed (covers the users() method path)
-        let result = engine.users(&event);
+        // Dispatch should succeed (covers the consumers() method path)
+        let result = engine.consumers(&event);
         assert!(result.is_ok());
     }
 
@@ -2652,7 +2735,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let result = engine.users(&event);
+        let result = engine.consumers(&event);
         assert!(matches!(result, Err(DispatchError::UnknownTableId(999))));
     }
 
@@ -2663,10 +2746,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 31,
-                user_id: 31,
-                session_id: None,
+                consumer_id: 31,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 31,
             })
@@ -2687,7 +2770,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let result = engine.users(&event);
+        let result = engine.consumers(&event);
         assert!(matches!(
             result,
             Err(DispatchError::InvalidRowArity {
@@ -2733,10 +2816,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 31_001,
-                user_id: 31_001,
-                session_id: None,
+                consumer_id: 31_001,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 31_001,
             })
@@ -2756,7 +2839,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let result = engine.users(&event);
+        let result = engine.consumers(&event);
         assert!(matches!(result, Err(DispatchError::UnknownTableArity(1))));
     }
 
@@ -2767,10 +2850,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 32,
-                user_id: 32,
-                session_id: None,
+                consumer_id: 32,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 32,
             })
@@ -2793,7 +2876,7 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let result = engine.users(&event);
+        let result = engine.consumers(&event);
         assert!(matches!(
             result,
             Err(DispatchError::InvalidRowArity {
@@ -2811,10 +2894,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 33,
-                user_id: 33,
-                session_id: None,
+                consumer_id: 33,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 33,
             })
@@ -2835,7 +2918,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let result = engine.users(&event);
+        let result = engine.consumers(&event);
         assert!(matches!(
             result,
             Err(DispatchError::InvalidRowArity {
@@ -2853,19 +2936,19 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 34,
-                user_id: 340,
-                session_id: None,
+                consumer_id: 340,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 34,
             })
             .unwrap();
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 35,
-                user_id: 350,
-                session_id: None,
+                consumer_id: 350,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE status = 'pending'".to_string(),
                 updated_at_unix_ms: 35,
             })
@@ -2880,12 +2963,12 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let mut users: Vec<_> = engine
-            .users(&event)
+        let mut consumers: Vec<_> = engine
+            .consumers(&event)
             .expect("truncate should dispatch")
             .collect();
-        users.sort_unstable();
-        assert_eq!(users, vec![340, 350]);
+        consumers.sort_unstable();
+        assert_eq!(consumers, vec![340, 350]);
     }
 
     #[test]
@@ -2907,10 +2990,10 @@ mod tests {
         engine.set_rotation_threshold(0);
 
         // Register subscription (should trigger rotation)
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1000,
         };
@@ -2918,10 +3001,10 @@ mod tests {
         engine.register(spec).unwrap();
 
         // Register another to trigger rotation on already-populated partition
-        let spec2 = SubscriptionSpec {
+        let spec2 = SubscriptionRequest {
             subscription_id: 2,
-            user_id: 43,
-            session_id: None,
+            consumer_id: 43,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
             updated_at_unix_ms: 1000,
         };
@@ -2952,10 +3035,10 @@ mod tests {
         engine.set_durability_mode(DurabilityMode::Required);
         set_dir_mode(temp_dir.path(), 0o500); // read + execute, no write
 
-        let result = engine.register(SubscriptionSpec {
+        let result = engine.register(SubscriptionRequest {
             subscription_id: 1000,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1,
         });
@@ -2965,8 +3048,8 @@ mod tests {
         assert!(matches!(result, Err(RegisterError::Storage(_))));
         assert_eq!(engine.subscription_count(), 0);
         assert!(!engine.unregister_subscription(1000));
-        let user_dict = engine.user_dictionaries.get(&1).unwrap();
-        assert!(user_dict.get(42).is_none());
+        let consumer_dict = engine.consumer_dictionaries.get(&1).unwrap();
+        assert!(consumer_dict.get(42).is_none());
     }
 
     #[cfg(unix)]
@@ -2986,10 +3069,10 @@ mod tests {
 
         // Register initial subscription: sub_id=1, user=42
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
             })
@@ -3001,10 +3084,10 @@ mod tests {
         engine.set_durability_mode(DurabilityMode::Required);
         set_dir_mode(temp_dir.path(), 0o500); // read-only → forces pre-commit failure
 
-        let result = engine.register(SubscriptionSpec {
+        let result = engine.register(SubscriptionRequest {
             subscription_id: 1,
-            user_id: 99,
-            session_id: None,
+            consumer_id: 99,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 200".to_string(),
             updated_at_unix_ms: 2,
         });
@@ -3036,7 +3119,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let matched: Vec<u64> = engine.users(&event).unwrap().collect();
+        let matched: Vec<u64> = engine.consumers(&event).unwrap().collect();
         assert!(
             matched.contains(&42),
             "old user 42 must still receive events after upsert rollback"
@@ -3069,10 +3152,10 @@ mod tests {
         engine.set_durability_mode(DurabilityMode::Required);
         let _inject_failure = ParentDirSyncFailureGuard::for_dir(temp_dir.path());
 
-        let result = engine.register(SubscriptionSpec {
+        let result = engine.register(SubscriptionRequest {
             subscription_id: 1001,
-            user_id: 77,
-            session_id: None,
+            consumer_id: 77,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1,
         });
@@ -3106,17 +3189,17 @@ mod tests {
         set_dir_mode(temp_dir.path(), 0o500);
 
         let results = engine.register_batch(vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2000,
-                user_id: 10,
-                session_id: None,
+                consumer_id: 10,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 1,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2001,
-                user_id: 11,
-                session_id: None,
+                consumer_id: 11,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 20".to_string(),
                 updated_at_unix_ms: 1,
             },
@@ -3130,9 +3213,9 @@ mod tests {
         assert_eq!(engine.subscription_count(), 0);
         assert!(!engine.unregister_subscription(2000));
         assert!(!engine.unregister_subscription(2001));
-        let user_dict = engine.user_dictionaries.get(&1).unwrap();
-        assert!(user_dict.get(10).is_none());
-        assert!(user_dict.get(11).is_none());
+        let consumer_dict = engine.consumer_dictionaries.get(&1).unwrap();
+        assert!(consumer_dict.get(10).is_none());
+        assert!(consumer_dict.get(11).is_none());
     }
 
     #[test]
@@ -3169,17 +3252,17 @@ mod tests {
         let _inject_failure = ParentDirSyncFailureGuard::for_dir(temp_dir.path());
 
         let results = engine.register_batch(vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2100,
-                user_id: 10,
-                session_id: None,
+                consumer_id: 10,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 1,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2101,
-                user_id: 11,
-                session_id: None,
+                consumer_id: 11,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 20".to_string(),
                 updated_at_unix_ms: 1,
             },
@@ -3217,10 +3300,10 @@ mod tests {
         engine.set_durability_mode(DurabilityMode::BestEffort);
         set_dir_mode(temp_dir.path(), 0o500);
 
-        let result = engine.register(SubscriptionSpec {
+        let result = engine.register(SubscriptionRequest {
             subscription_id: 3000,
-            user_id: 12,
-            session_id: None,
+            consumer_id: 12,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 1".to_string(),
             updated_at_unix_ms: 1,
         });
@@ -3240,7 +3323,7 @@ mod tests {
         // Unregister session with no subscriptions
         let report = engine.unregister_session(999);
         assert_eq!(report.removed_bindings, 0);
-        assert_eq!(report.removed_users, 0);
+        assert_eq!(report.removed_consumers, 0);
     }
 
     #[test]
@@ -3250,20 +3333,20 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 10,
-                user_id: 1,
-                session_id: Some(42),
+                consumer_id: 1,
+                scope: SubscriptionScope::Session(42),
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 10,
             })
             .unwrap();
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 11,
-                user_id: 1,
-                session_id: Some(42),
+                consumer_id: 1,
+                scope: SubscriptionScope::Session(42),
                 sql: "SELECT * FROM orders WHERE amount < 10".to_string(),
                 updated_at_unix_ms: 11,
             })
@@ -3275,7 +3358,7 @@ mod tests {
             report.removed_predicates, 2,
             "both predicates should be removed when their last bindings are session-bound"
         );
-        assert_eq!(report.removed_users, 1);
+        assert_eq!(report.removed_consumers, 1);
     }
 
     #[test]
@@ -3286,10 +3369,10 @@ mod tests {
 
         // Session-bound binding
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 20,
-                user_id: 1,
-                session_id: Some(43),
+                consumer_id: 1,
+                scope: SubscriptionScope::Session(43),
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 20,
             })
@@ -3297,10 +3380,10 @@ mod tests {
 
         // Durable binding keeps predicate alive
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 21,
-                user_id: 2,
-                session_id: None,
+                consumer_id: 2,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 21,
             })
@@ -3309,7 +3392,7 @@ mod tests {
         let report = engine.unregister_session(43);
         assert_eq!(report.removed_bindings, 1);
         assert_eq!(report.removed_predicates, 0);
-        assert_eq!(report.removed_users, 1);
+        assert_eq!(report.removed_consumers, 1);
     }
 
     #[test]
@@ -3320,10 +3403,10 @@ mod tests {
 
         // Session-bound binding
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 30,
-                user_id: 1,
-                session_id: Some(44),
+                consumer_id: 1,
+                scope: SubscriptionScope::Session(44),
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 30,
             })
@@ -3331,10 +3414,10 @@ mod tests {
 
         // Durable binding for the same user should keep dictionary entry alive.
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 31,
-                user_id: 1,
-                session_id: None,
+                consumer_id: 1,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 10".to_string(),
                 updated_at_unix_ms: 31,
             })
@@ -3343,13 +3426,13 @@ mod tests {
         let report = engine.unregister_session(44);
         assert_eq!(report.removed_bindings, 1);
         assert_eq!(report.removed_predicates, 1);
-        assert_eq!(report.removed_users, 0);
+        assert_eq!(report.removed_consumers, 0);
     }
 
     #[test]
     fn test_load_shard_with_orphan_binding() {
         use crate::persistence::shard::{
-            serialize_shard, BindingData, PredicateData, ShardPayload, UserDictData,
+            serialize_shard, BindingData, ConsumerDictData, PredicateData, ShardPayload,
         };
         use crate::DefaultIds;
         use tempfile::TempDir;
@@ -3383,21 +3466,21 @@ mod tests {
                 BindingData {
                     subscription_id: 1,
                     predicate_hash: 0xAAAA, // matches predicate above
-                    user_id: 42,
-                    session_id: None,
+                    consumer_id: 42,
+                    scope: SubscriptionScope::Durable,
                     updated_at_unix_ms: 1000,
                 },
                 // Orphan binding — references non-existent predicate hash
                 BindingData {
                     subscription_id: 2,
                     predicate_hash: 0xDEAD, // NO predicate with this hash
-                    user_id: 43,
-                    session_id: None,
+                    consumer_id: 43,
+                    scope: SubscriptionScope::Durable,
                     updated_at_unix_ms: 1000,
                 },
             ],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![42, 43],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![42, 43],
             },
             created_at_unix_ms: 1000,
         };
@@ -3431,7 +3514,7 @@ mod tests {
     #[test]
     fn test_load_shard_rejects_non_equivalent_duplicate_predicate_hashes() {
         use crate::persistence::shard::{
-            serialize_shard, BindingData, PredicateData, ShardPayload, UserDictData,
+            serialize_shard, BindingData, ConsumerDictData, PredicateData, ShardPayload,
         };
         use crate::DefaultIds;
         use tempfile::TempDir;
@@ -3467,12 +3550,12 @@ mod tests {
             bindings: vec![BindingData {
                 subscription_id: 1,
                 predicate_hash: 0xABCD,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 updated_at_unix_ms: 2000,
             }],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![42],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![42],
             },
             created_at_unix_ms: 2000,
         };
@@ -3495,7 +3578,7 @@ mod tests {
 
     #[test]
     fn test_load_shard_rejects_filename_header_table_id_mismatch() {
-        use crate::persistence::shard::{serialize_shard, ShardPayload, UserDictData};
+        use crate::persistence::shard::{serialize_shard, ConsumerDictData, ShardPayload};
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
@@ -3504,8 +3587,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 0,
         };
@@ -3549,7 +3632,7 @@ mod tests {
 
     #[test]
     fn test_load_all_shards_skips_invalid_shard_filename_and_loads_valid_shards() {
-        use crate::persistence::shard::{serialize_shard, ShardPayload, UserDictData};
+        use crate::persistence::shard::{serialize_shard, ConsumerDictData, ShardPayload};
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
@@ -3558,8 +3641,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 0,
         };
@@ -3583,7 +3666,7 @@ mod tests {
 
     #[test]
     fn test_load_all_shards_rejects_duplicate_table_ids() {
-        use crate::persistence::shard::{serialize_shard, ShardPayload, UserDictData};
+        use crate::persistence::shard::{serialize_shard, ConsumerDictData, ShardPayload};
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
@@ -3592,8 +3675,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 0,
         };
@@ -3626,17 +3709,17 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let specs = vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 100,
-                session_id: None,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 200,
-                session_id: None,
+                consumer_id: 200,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
                 updated_at_unix_ms: 0,
             },
@@ -3653,10 +3736,10 @@ mod tests {
 
     #[test]
     fn test_register_batch_single_matches_register() {
-        let single_spec = SubscriptionSpec {
+        let single_spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 100,
-            session_id: None,
+            consumer_id: 100,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -3666,10 +3749,10 @@ mod tests {
         let single_result = single_engine.register(single_spec).unwrap();
         assert_eq!(single_engine.subscription_count(), 1);
 
-        let batch_spec = SubscriptionSpec {
+        let batch_spec = SubscriptionRequest {
             subscription_id: 1,
-            user_id: 100,
-            session_id: None,
+            consumer_id: 100,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -3700,8 +3783,8 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let single_users: Vec<_> = single_engine.users(&event).unwrap().collect();
-        let batch_users: Vec<_> = batch_engine.users(&event).unwrap().collect();
+        let single_users: Vec<_> = single_engine.consumers(&event).unwrap().collect();
+        let batch_users: Vec<_> = batch_engine.consumers(&event).unwrap().collect();
         assert_eq!(single_users, batch_users);
     }
 
@@ -3711,19 +3794,19 @@ mod tests {
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        // Two users with the same predicate in a single batch
+        // Two consumers with the same predicate in a single batch
         let specs = vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 100,
-                session_id: None,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 200,
-                session_id: None,
+                consumer_id: 200,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
             },
@@ -3765,17 +3848,17 @@ mod tests {
         ]);
 
         let specs = vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 99,
-                session_id: None,
+                consumer_id: 99,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
                 updated_at_unix_ms: 0,
             },
@@ -3807,9 +3890,9 @@ mod tests {
             }),
             changed_columns: Arc::from([]),
         };
-        let high_users: Vec<_> = engine.users(&high_amount_event).unwrap().collect();
-        assert!(high_users.contains(&42));
-        assert!(!high_users.contains(&99));
+        let high_consumers: Vec<_> = engine.consumers(&high_amount_event).unwrap().collect();
+        assert!(high_consumers.contains(&42));
+        assert!(!high_consumers.contains(&99));
 
         let low_amount_event = WalEvent {
             kind: EventKind::Insert,
@@ -3824,9 +3907,9 @@ mod tests {
             }),
             changed_columns: Arc::from([]),
         };
-        let low_users: Vec<_> = engine.users(&low_amount_event).unwrap().collect();
-        assert!(!low_users.contains(&42));
-        assert!(low_users.contains(&99));
+        let low_consumers: Vec<_> = engine.consumers(&low_amount_event).unwrap().collect();
+        assert!(!low_consumers.contains(&42));
+        assert!(low_consumers.contains(&99));
     }
 
     #[test]
@@ -3836,24 +3919,24 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let specs = vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 100,
-                session_id: None,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 200,
-                session_id: None,
+                consumer_id: 200,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM nonexistent WHERE id = 1".to_string(), // bad table
                 updated_at_unix_ms: 0,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 3,
-                user_id: 300,
-                session_id: None,
+                consumer_id: 300,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount = 42".to_string(),
                 updated_at_unix_ms: 0,
             },
@@ -3890,10 +3973,10 @@ mod tests {
         let _guard = BatchPhase3PartitionDropGuard::for_table(1);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.register_batch(vec![SubscriptionSpec {
+            engine.register_batch(vec![SubscriptionRequest {
                 subscription_id: 7,
-                user_id: 700,
-                session_id: None,
+                consumer_id: 700,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             }])
@@ -3919,17 +4002,17 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let specs = vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 99,
-                session_id: None,
+                consumer_id: 99,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
                 updated_at_unix_ms: 0,
             },
@@ -3952,9 +4035,9 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users: Vec<_> = engine.users(&event).unwrap().collect();
-        assert!(users.contains(&42));
-        assert!(!users.contains(&99));
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        assert!(consumers.contains(&42));
+        assert!(!consumers.contains(&99));
     }
 
     #[test]
@@ -3964,17 +4047,17 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let specs = vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 1, // same ID, replaces previous
-                user_id: 99,
-                session_id: None,
+                consumer_id: 99,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
                 updated_at_unix_ms: 2,
             },
@@ -3999,9 +4082,9 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users: Vec<_> = engine.users(&event).unwrap().collect();
-        assert!(users.contains(&99));
-        assert!(!users.contains(&42));
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        assert!(consumers.contains(&99));
+        assert!(!consumers.contains(&42));
     }
 
     #[test]
@@ -4012,10 +4095,10 @@ mod tests {
 
         // Register one subscription individually
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 100,
-                session_id: None,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4023,17 +4106,17 @@ mod tests {
 
         // Batch register with same predicate + a new one
         let specs = vec![
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 200,
-                session_id: None,
+                consumer_id: 200,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(), // dedup with existing
                 updated_at_unix_ms: 0,
             },
-            SubscriptionSpec {
+            SubscriptionRequest {
                 subscription_id: 3,
-                user_id: 300,
-                session_id: None,
+                consumer_id: 300,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(), // new
                 updated_at_unix_ms: 0,
             },
@@ -4054,10 +4137,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: Some(10),
+                consumer_id: 42,
+                scope: SubscriptionScope::Session(10),
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
             })
@@ -4065,10 +4148,10 @@ mod tests {
 
         // Same subscription_id is replaced with a new predicate and user.
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 99,
-                session_id: Some(20),
+                consumer_id: 99,
+                scope: SubscriptionScope::Session(20),
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
                 updated_at_unix_ms: 2,
             })
@@ -4090,9 +4173,9 @@ mod tests {
             }),
             changed_columns: Arc::from([]),
         };
-        let users_high: Vec<_> = engine.users(&event_high).unwrap().collect();
-        assert!(!users_high.contains(&42));
-        assert!(!users_high.contains(&99));
+        let consumers_high: Vec<_> = engine.consumers(&event_high).unwrap().collect();
+        assert!(!consumers_high.contains(&42));
+        assert!(!consumers_high.contains(&99));
 
         let event_low = WalEvent {
             kind: EventKind::Insert,
@@ -4107,9 +4190,9 @@ mod tests {
             }),
             changed_columns: Arc::from([]),
         };
-        let users_low: Vec<_> = engine.users(&event_low).unwrap().collect();
-        assert!(users_low.contains(&99));
-        assert!(!users_low.contains(&42));
+        let consumers_low: Vec<_> = engine.consumers(&event_low).unwrap().collect();
+        assert!(consumers_low.contains(&99));
+        assert!(!consumers_low.contains(&42));
     }
 
     #[test]
@@ -4122,10 +4205,10 @@ mod tests {
 
         // Existing live state: amount > 100 for user 42.
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
             })
@@ -4155,12 +4238,12 @@ mod tests {
             bindings: vec![BindingData {
                 subscription_id: 2,
                 predicate_hash: hash,
-                user_id: 99,
-                session_id: None,
+                consumer_id: 99,
+                scope: SubscriptionScope::Durable,
                 updated_at_unix_ms: 2,
             }],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![99],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![99],
             },
             created_at_unix_ms: 2,
         };
@@ -4236,13 +4319,13 @@ mod tests {
             bindings: vec![BindingData {
                 subscription_id: 2,
                 predicate_hash: hash,
-                user_id: 99,
-                session_id: None,
+                consumer_id: 99,
+                scope: SubscriptionScope::Durable,
                 updated_at_unix_ms: 2,
             }],
-            user_dict: UserDictData {
+            consumer_dict: ConsumerDictData {
                 // 123 has no binding and must be pruned after merge completion.
-                ordinal_to_user: vec![99, 123],
+                ordinal_to_consumer: vec![99, 123],
             },
             created_at_unix_ms: 2,
         };
@@ -4275,12 +4358,12 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let mut users: Vec<_> = engine
-            .users(&event)
+        let mut consumers: Vec<_> = engine
+            .consumers(&event)
             .expect("truncate should dispatch")
             .collect();
-        users.sort_unstable();
-        assert_eq!(users, vec![99]);
+        consumers.sort_unstable();
+        assert_eq!(consumers, vec![99]);
     }
 
     #[test]
@@ -4314,22 +4397,22 @@ mod tests {
             bindings: vec![BindingData {
                 subscription_id: 1,
                 predicate_hash: hash,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 updated_at_unix_ms: 1,
             }],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![42],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![42],
             },
             created_at_unix_ms: 1,
         };
 
         // Live state explicitly removes subscription 1.
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
             })
@@ -4364,7 +4447,7 @@ mod tests {
     }
 
     // =========================================================================
-    // C1 — TRUNCATE must exclude unregistered users (no ghost recipients)
+    // C1 — TRUNCATE must exclude unregistered consumers (no ghost recipients)
     // =========================================================================
 
     #[test]
@@ -4374,10 +4457,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register user 42 on table 1 (orders)
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: 100,
-            user_id: 42,
-            session_id: None,
+            consumer_id: 42,
+            scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
             updated_at_unix_ms: 0,
         };
@@ -4399,10 +4482,10 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users: Vec<u64> = engine.users(&event).unwrap().collect();
+        let consumers: Vec<u64> = engine.consumers(&event).unwrap().collect();
         assert!(
-            users.is_empty(),
-            "TRUNCATE must not fan out to unregistered user 42; got: {users:?}"
+            consumers.is_empty(),
+            "TRUNCATE must not fan out to unregistered consumer 42; got: {consumers:?}"
         );
     }
 
@@ -4502,10 +4585,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4523,10 +4606,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4546,10 +4629,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4578,10 +4661,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4624,10 +4707,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4672,10 +4755,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4709,20 +4792,20 @@ mod tests {
 
         // Same WHERE clause, but different projections
         let r1 = engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 1,
-                session_id: None,
+                consumer_id: 1,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
             .unwrap();
 
         let r2 = engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 2,
-                session_id: None,
+                consumer_id: 2,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4748,37 +4831,37 @@ mod tests {
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-        // User 1: SELECT * subscription
+        // Consumer 1: SELECT * subscription
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 1,
-                session_id: None,
+                consumer_id: 1,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
             .unwrap();
 
-        // User 2: SELECT COUNT(*) subscription
+        // Consumer 2: SELECT COUNT(*) subscription
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 2,
-                session_id: None,
+                consumer_id: 2,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
             .unwrap();
 
         let event = make_wal_event(EventKind::Insert, None, Some(20));
-        let mut users: Vec<_> = engine.users(&event).unwrap().collect();
-        users.sort_unstable();
+        let mut consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        consumers.sort_unstable();
 
         // Only user 1 (Rows) should appear; user 2 (COUNT) must not
         assert_eq!(
-            users,
+            consumers,
             vec![1u64],
-            "COUNT subscribers must not appear in users() dispatch"
+            "COUNT subscribers must not appear in consumers() dispatch"
         );
     }
 
@@ -4790,10 +4873,10 @@ mod tests {
 
         // Aggregate-only subscriber.
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 2,
-                session_id: None,
+                consumer_id: 2,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4808,10 +4891,10 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
         assert!(
-            users.is_empty(),
-            "aggregate-only users must not appear in users()"
+            consumers.is_empty(),
+            "aggregate-only consumers must not appear in consumers()"
         );
     }
 
@@ -4824,10 +4907,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4858,10 +4941,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4892,10 +4975,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -4928,10 +5011,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 // WHERE amount > 0 with NULL amount → WHERE doesn't match → no delta
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 0,
@@ -4963,20 +5046,20 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let r_count = engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 1,
-                session_id: None,
+                consumer_id: 1,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
             .unwrap();
 
         let r_sum = engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 2,
-                session_id: None,
+                consumer_id: 2,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -5001,20 +5084,20 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let r1 = engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 1,
-                session_id: None,
+                consumer_id: 1,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 0,
             })
             .unwrap();
 
         let r2 = engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 2,
-                user_id: 2,
-                session_id: None,
+                consumer_id: 2,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(id) FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -5036,21 +5119,21 @@ mod tests {
 
         // SUM subscriber
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
             })
             .unwrap();
 
         let event = make_wal_event(EventKind::Insert, None, Some(20));
-        let users: Vec<_> = engine.users(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
 
         assert!(
-            !users.contains(&42),
-            "SUM subscriber must not appear in users() dispatch"
+            !consumers.contains(&42),
+            "SUM subscriber must not appear in consumers() dispatch"
         );
     }
 
@@ -5063,10 +5146,10 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: 1,
-                user_id: 42,
-                session_id: None,
+                consumer_id: 42,
+                scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -5096,5 +5179,234 @@ mod tests {
             vec![(42, crate::AggDelta::Sum(10.0))],
             "UPDATE changing only SUM column must still emit delta"
         );
+    }
+
+    // ========================================================================
+    // unregister_query tests
+    // ========================================================================
+
+    #[test]
+    fn test_unregister_query_basic() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 1,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        assert_eq!(engine.subscription_count(), 1);
+        assert_eq!(engine.predicate_count(1), 1);
+
+        let report = engine
+            .unregister_query(100, "SELECT * FROM orders WHERE amount > 100")
+            .unwrap();
+
+        assert_eq!(report.removed_bindings, 1);
+        assert_eq!(report.removed_predicates, 1);
+        assert_eq!(report.removed_consumers, 1);
+        assert_eq!(engine.subscription_count(), 0);
+        assert_eq!(engine.predicate_count(1), 0);
+    }
+
+    #[test]
+    fn test_unregister_query_user_scoping() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
+
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 1,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
+                sql: sql.clone(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 2,
+                consumer_id: 200,
+                scope: SubscriptionScope::Durable,
+                sql: sql.clone(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        assert_eq!(engine.subscription_count(), 2);
+
+        // Remove only user 100's subscription
+        let report = engine.unregister_query(100, &sql).unwrap();
+
+        assert_eq!(report.removed_bindings, 1);
+        assert_eq!(
+            report.removed_predicates, 0,
+            "predicate still has refcount from user 200"
+        );
+        assert_eq!(report.removed_consumers, 1);
+        assert_eq!(engine.subscription_count(), 1);
+        assert_eq!(engine.predicate_count(1), 1);
+    }
+
+    #[test]
+    fn test_unregister_query_no_match() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 1,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
+                sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        // Unregister a different query
+        let report = engine
+            .unregister_query(100, "SELECT * FROM orders WHERE amount > 200")
+            .unwrap();
+
+        assert_eq!(report.removed_bindings, 0);
+        assert_eq!(report.removed_predicates, 0);
+        assert_eq!(report.removed_consumers, 0);
+        assert_eq!(engine.subscription_count(), 1);
+    }
+
+    #[test]
+    fn test_unregister_query_normalization_equivalence() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Register with one ordering of AND clauses
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 1,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
+                sql: "SELECT * FROM orders WHERE amount > 100 AND status = 'paid'".to_string(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        // Unregister with reversed AND clause order — should still match
+        let report = engine
+            .unregister_query(
+                100,
+                "SELECT * FROM orders WHERE status = 'paid' AND amount > 100",
+            )
+            .unwrap();
+
+        assert_eq!(report.removed_bindings, 1);
+        assert_eq!(report.removed_predicates, 1);
+        assert_eq!(engine.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_unregister_query_projection_specificity() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let where_clause = "WHERE amount > 100";
+
+        // Register SELECT * (row subscription)
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 1,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
+                sql: format!("SELECT * FROM orders {where_clause}"),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        // Register SELECT COUNT(*) (aggregate subscription)
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 2,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
+                sql: format!("SELECT COUNT(*) FROM orders {where_clause}"),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        assert_eq!(engine.subscription_count(), 2);
+        assert_eq!(engine.predicate_count(1), 2);
+
+        // Unregister only the row subscription
+        let report = engine
+            .unregister_query(100, &format!("SELECT * FROM orders {where_clause}"))
+            .unwrap();
+
+        assert_eq!(report.removed_bindings, 1);
+        assert_eq!(report.removed_predicates, 1);
+        // Consumer still has the COUNT(*) subscription, so not removed from dict
+        assert_eq!(report.removed_consumers, 0);
+        assert_eq!(engine.subscription_count(), 1);
+        assert_eq!(engine.predicate_count(1), 1);
+    }
+
+    #[test]
+    fn test_unregister_query_multiple_subscriptions_same_user() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
+
+        // Same user registers same query twice with different subscription IDs
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 1,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
+                sql: sql.clone(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        engine
+            .register(SubscriptionRequest {
+                subscription_id: 2,
+                consumer_id: 100,
+                scope: SubscriptionScope::Durable,
+                sql: sql.clone(),
+                updated_at_unix_ms: 0,
+            })
+            .unwrap();
+
+        assert_eq!(engine.subscription_count(), 2);
+
+        let report = engine.unregister_query(100, &sql).unwrap();
+
+        assert_eq!(report.removed_bindings, 2);
+        assert_eq!(report.removed_predicates, 1);
+        assert_eq!(report.removed_consumers, 1);
+        assert_eq!(engine.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_unregister_query_invalid_sql() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        let result = engine.unregister_query(100, "NOT VALID SQL AT ALL");
+        assert!(result.is_err());
     }
 }

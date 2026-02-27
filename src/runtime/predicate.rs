@@ -1,10 +1,10 @@
 //! Predicate storage with deduplication and refcounting
 
-use super::ids::{PredicateHash, PredicateId, UserOrdinal};
+use super::ids::{ConsumerOrdinal, PredicateHash, PredicateId};
 use super::indexes::IndexableAtom;
 use crate::{
     compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
-    ColumnId, IdTypes,
+    ColumnId, IdTypes, SubscriptionScope,
 };
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
@@ -36,30 +36,30 @@ pub struct Predicate {
     pub updated_at_unix_ms: u64,
 }
 
-/// Subscription binding (user → predicate → subscription)
+/// Subscription binding (consumer → predicate → subscription)
 #[derive(Debug)]
-pub struct Binding<I: IdTypes> {
+pub struct SubscriptionBinding<I: IdTypes> {
     /// Subscription identifier
     pub subscription_id: I::SubscriptionId,
     /// Predicate this subscription uses
     pub predicate_id: PredicateId,
-    /// User who owns this subscription
-    pub user_id: I::UserId,
-    /// Dense user ordinal for bitmap indexing
-    pub user_ordinal: UserOrdinal,
-    /// Session ID if session-bound, None if durable
-    pub session_id: Option<I::SessionId>,
+    /// Consumer who owns this subscription
+    pub consumer_id: I::ConsumerId,
+    /// Dense consumer ordinal for bitmap indexing
+    pub consumer_ordinal: ConsumerOrdinal,
+    /// Lifetime scope: durable or session-bound
+    pub scope: SubscriptionScope<I>,
     /// Timestamp for conflict resolution
     pub updated_at_unix_ms: u64,
 }
 
-impl<I: IdTypes> Clone for Binding<I> {
+impl<I: IdTypes> Clone for SubscriptionBinding<I> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<I: IdTypes> Copy for Binding<I> {}
+impl<I: IdTypes> Copy for SubscriptionBinding<I> {}
 
 /// Predicate storage with deduplication
 ///
@@ -70,12 +70,12 @@ pub struct PredicateStore<I: IdTypes> {
     pub predicates: Slab<Predicate>,
     /// Hash → candidate PredicateIds (for deduplication with collision checks)
     pub hash_index: AHashMap<PredicateHash, Vec<PredicateId>>,
-    /// SubscriptionId → Binding
-    pub bindings: AHashMap<I::SubscriptionId, Binding<I>>,
+    /// SubscriptionId → SubscriptionBinding
+    pub bindings: AHashMap<I::SubscriptionId, SubscriptionBinding<I>>,
     /// SessionId → `Vec<SubscriptionId>` (for session cleanup)
-    pub session_index: AHashMap<I::SessionId, Vec<I::SubscriptionId>>,
-    /// PredicateId → `RoaringBitmap<UserOrdinal>` (users interested in this predicate)
-    pub predicate_users: AHashMap<PredicateId, RoaringBitmap>,
+    pub scope_index: AHashMap<I::SessionId, Vec<I::SubscriptionId>>,
+    /// PredicateId → `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate)
+    pub predicate_consumers: AHashMap<PredicateId, RoaringBitmap>,
 }
 
 impl<I: IdTypes> Clone for PredicateStore<I> {
@@ -84,8 +84,8 @@ impl<I: IdTypes> Clone for PredicateStore<I> {
             predicates: self.predicates.clone(),
             hash_index: self.hash_index.clone(),
             bindings: self.bindings.clone(),
-            session_index: self.session_index.clone(),
-            predicate_users: self.predicate_users.clone(),
+            scope_index: self.scope_index.clone(),
+            predicate_consumers: self.predicate_consumers.clone(),
         }
     }
 }
@@ -98,8 +98,8 @@ impl<I: IdTypes> PredicateStore<I> {
             predicates: Slab::new(),
             hash_index: AHashMap::new(),
             bindings: AHashMap::new(),
-            session_index: AHashMap::new(),
-            predicate_users: AHashMap::new(),
+            scope_index: AHashMap::new(),
+            predicate_consumers: AHashMap::new(),
         }
     }
 
@@ -192,12 +192,12 @@ impl<I: IdTypes> PredicateStore<I> {
                     self.hash_index.remove(&pred.hash);
                 }
             }
-            self.predicate_users.remove(&id);
+            self.predicate_consumers.remove(&id);
         }
     }
 
     /// Add subscription binding
-    pub fn add_binding(&mut self, binding: Binding<I>) {
+    pub fn add_binding(&mut self, binding: SubscriptionBinding<I>) {
         let sub_id = binding.subscription_id;
 
         // Overwrite-safe upsert: remove previous secondary index entries when
@@ -212,7 +212,7 @@ impl<I: IdTypes> PredicateStore<I> {
     /// Remove subscription binding
     ///
     /// Returns the removed binding if it existed.
-    pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> Option<Binding<I>> {
+    pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> Option<SubscriptionBinding<I>> {
         let binding = self.bindings.remove(&sub_id)?;
 
         self.remove_binding_indexes(binding);
@@ -226,49 +226,48 @@ impl<I: IdTypes> PredicateStore<I> {
         &self,
         session_id: I::SessionId,
     ) -> Option<&[I::SubscriptionId]> {
-        self.session_index
+        self.scope_index
             .get(&session_id)
             .map(std::vec::Vec::as_slice)
     }
 
-    fn add_binding_indexes(&mut self, binding: Binding<I>) {
+    fn add_binding_indexes(&mut self, binding: SubscriptionBinding<I>) {
         let sub_id = binding.subscription_id;
         let pred_id = binding.predicate_id;
-        let user_ord = binding.user_ordinal;
-        let session_id = binding.session_id;
+        let consumer_ord = binding.consumer_ordinal;
 
-        if let Some(sid) = session_id {
-            self.session_index.entry(sid).or_default().push(sub_id);
+        if let SubscriptionScope::Session(sid) = binding.scope {
+            self.scope_index.entry(sid).or_default().push(sub_id);
         }
 
-        self.predicate_users
+        self.predicate_consumers
             .entry(pred_id)
             .or_default()
-            .insert(user_ord.get());
+            .insert(consumer_ord.get());
     }
 
-    fn remove_binding_indexes(&mut self, binding: Binding<I>) {
+    fn remove_binding_indexes(&mut self, binding: SubscriptionBinding<I>) {
         let sub_id = binding.subscription_id;
 
-        let has_other_same_user_binding = self.bindings.values().any(|existing| {
+        let has_other_same_consumer_binding = self.bindings.values().any(|existing| {
             existing.predicate_id == binding.predicate_id
-                && existing.user_ordinal == binding.user_ordinal
+                && existing.consumer_ordinal == binding.consumer_ordinal
         });
 
-        if !has_other_same_user_binding {
-            if let Some(bitmap) = self.predicate_users.get_mut(&binding.predicate_id) {
-                bitmap.remove(binding.user_ordinal.get());
+        if !has_other_same_consumer_binding {
+            if let Some(bitmap) = self.predicate_consumers.get_mut(&binding.predicate_id) {
+                bitmap.remove(binding.consumer_ordinal.get());
                 if bitmap.is_empty() {
-                    self.predicate_users.remove(&binding.predicate_id);
+                    self.predicate_consumers.remove(&binding.predicate_id);
                 }
             }
         }
 
-        if let Some(session_id) = binding.session_id {
-            if let Some(subs) = self.session_index.get_mut(&session_id) {
+        if let SubscriptionScope::Session(session_id) = binding.scope {
+            if let Some(subs) = self.scope_index.get_mut(&session_id) {
                 subs.retain(|&id| id != sub_id);
                 if subs.is_empty() {
-                    self.session_index.remove(&session_id);
+                    self.scope_index.remove(&session_id);
                 }
             }
         }
@@ -347,12 +346,12 @@ mod tests {
     fn test_binding_lifecycle() {
         let mut store = PredicateStore::<DefaultIds>::new();
 
-        let binding = Binding {
+        let binding = SubscriptionBinding {
             subscription_id: 100,
             predicate_id: PredicateId::from_slab_index(0),
-            user_id: 42,
-            user_ordinal: UserOrdinal::new(0),
-            session_id: Some(1000),
+            consumer_id: 42,
+            consumer_ordinal: ConsumerOrdinal::new(0),
+            scope: SubscriptionScope::Session(1000),
             updated_at_unix_ms: 0,
         };
 
@@ -367,33 +366,33 @@ mod tests {
     }
 
     #[test]
-    fn test_predicate_users_bitmap() {
+    fn test_predicate_consumers_bitmap() {
         let mut store = PredicateStore::<DefaultIds>::new();
 
         let pred_id = PredicateId::from_slab_index(0);
 
-        let binding1 = Binding {
+        let binding1 = SubscriptionBinding {
             subscription_id: 100,
             predicate_id: pred_id,
-            user_id: 1,
-            user_ordinal: UserOrdinal::new(0),
-            session_id: None,
+            consumer_id: 1,
+            consumer_ordinal: ConsumerOrdinal::new(0),
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 0,
         };
 
-        let binding2 = Binding {
+        let binding2 = SubscriptionBinding {
             subscription_id: 101,
             predicate_id: pred_id,
-            user_id: 2,
-            user_ordinal: UserOrdinal::new(1),
-            session_id: None,
+            consumer_id: 2,
+            consumer_ordinal: ConsumerOrdinal::new(1),
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 0,
         };
 
         store.add_binding(binding1);
         store.add_binding(binding2);
 
-        let bitmap = store.predicate_users.get(&pred_id).unwrap();
+        let bitmap = store.predicate_consumers.get(&pred_id).unwrap();
         assert!(bitmap.contains(0));
         assert!(bitmap.contains(1));
         assert_eq!(bitmap.len(), 2);
@@ -408,29 +407,29 @@ mod tests {
         let pred1_id = store.add_predicate(pred1);
         let pred2_id = store.add_predicate(pred2);
 
-        store.add_binding(Binding {
+        store.add_binding(SubscriptionBinding {
             subscription_id: 100,
             predicate_id: pred1_id,
-            user_id: 10,
-            user_ordinal: UserOrdinal::new(0),
-            session_id: Some(500),
+            consumer_id: 10,
+            consumer_ordinal: ConsumerOrdinal::new(0),
+            scope: SubscriptionScope::Session(500),
             updated_at_unix_ms: 1,
         });
-        store.add_binding(Binding {
+        store.add_binding(SubscriptionBinding {
             subscription_id: 100, // overwrite same subscription id
             predicate_id: pred2_id,
-            user_id: 20,
-            user_ordinal: UserOrdinal::new(1),
-            session_id: Some(600),
+            consumer_id: 20,
+            consumer_ordinal: ConsumerOrdinal::new(1),
+            scope: SubscriptionScope::Session(600),
             updated_at_unix_ms: 2,
         });
 
         assert!(!store
-            .predicate_users
+            .predicate_consumers
             .get(&pred1_id)
             .is_some_and(|bitmap| bitmap.contains(0)));
         assert!(store
-            .predicate_users
+            .predicate_consumers
             .get(&pred2_id)
             .is_some_and(|bitmap| bitmap.contains(1)));
         assert!(store.get_session_subscriptions(500).is_none());
@@ -438,39 +437,39 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_binding_keeps_bitmap_when_same_user_has_another_binding() {
+    fn test_remove_binding_keeps_bitmap_when_same_consumer_has_another_binding() {
         let mut store = PredicateStore::<DefaultIds>::new();
 
         let pred = make_predicate(0, 0x3333, 0);
         let pred_id = store.add_predicate(pred);
 
-        store.add_binding(Binding {
+        store.add_binding(SubscriptionBinding {
             subscription_id: 201,
             predicate_id: pred_id,
-            user_id: 42,
-            user_ordinal: UserOrdinal::new(0),
-            session_id: None,
+            consumer_id: 42,
+            consumer_ordinal: ConsumerOrdinal::new(0),
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 1,
         });
-        store.add_binding(Binding {
+        store.add_binding(SubscriptionBinding {
             subscription_id: 202,
             predicate_id: pred_id,
-            user_id: 42,
-            user_ordinal: UserOrdinal::new(0),
-            session_id: None,
+            consumer_id: 42,
+            consumer_ordinal: ConsumerOrdinal::new(0),
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 2,
         });
 
         let _ = store.remove_binding(201);
         let bitmap = store
-            .predicate_users
+            .predicate_consumers
             .get(&pred_id)
             .expect("bitmap should remain while one binding still exists");
         assert!(bitmap.contains(0));
 
         let _ = store.remove_binding(202);
         assert!(
-            !store.predicate_users.contains_key(&pred_id),
+            !store.predicate_consumers.contains_key(&pred_id),
             "bitmap should be removed after last binding is removed"
         );
     }

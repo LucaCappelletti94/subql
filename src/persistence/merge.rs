@@ -1,7 +1,7 @@
 //! Background merge operations with atomic swap
 
 use super::predicate_data::predicate_data_equivalent;
-use super::shard::{deserialize_shard, BindingData, PredicateData, ShardPayload, UserDictData};
+use super::shard::{deserialize_shard, BindingData, ConsumerDictData, PredicateData, ShardPayload};
 use crate::{DefaultIds, IdTypes, MergeError, MergeJobId, MergeReport, SchemaCatalog, TableId};
 use ahash::AHashMap;
 use std::sync::{
@@ -197,7 +197,7 @@ fn merge_shards_impl<I: IdTypes>(
 ) -> Result<MergedShard<I>, String> {
     let mut all_predicates = Vec::new();
     let mut all_bindings = Vec::new();
-    let mut user_ordinals: Vec<I::UserId> = Vec::new();
+    let mut consumer_ordinals: Vec<I::ConsumerId> = Vec::new();
 
     // 1. Load all shards
     for bytes in shard_bytes {
@@ -213,12 +213,12 @@ fn merge_shards_impl<I: IdTypes>(
 
         all_predicates.extend(payload.predicates);
         all_bindings.extend(payload.bindings);
-        user_ordinals.extend(payload.user_dict.ordinal_to_user);
+        consumer_ordinals.extend(payload.consumer_dict.ordinal_to_consumer);
     }
 
-    // Deduplicate users via sort + dedup (O(n log n) instead of O(n^2))
-    user_ordinals.sort_unstable();
-    user_ordinals.dedup();
+    // Deduplicate consumers via sort + dedup (O(n log n) instead of O(n^2))
+    consumer_ordinals.sort_unstable();
+    consumer_ordinals.dedup();
 
     let input_predicates = all_predicates.len();
     let input_bindings = all_bindings.len();
@@ -281,8 +281,8 @@ fn merge_shards_impl<I: IdTypes>(
     let payload: ShardPayload<I> = ShardPayload {
         predicates: output_predicates,
         bindings: output_bindings,
-        user_dict: UserDictData {
-            ordinal_to_user: user_ordinals,
+        consumer_dict: ConsumerDictData {
+            ordinal_to_consumer: consumer_ordinals,
         },
         created_at_unix_ms,
     };
@@ -330,9 +330,10 @@ impl From<MergeStats> for MergeReport {
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::super::codec;
-    use super::super::shard::{serialize_shard, PredicateData, UserDictData};
+    use super::super::shard::{serialize_shard, ConsumerDictData, PredicateData};
     use super::super::test_support::{make_catalog, MockCatalog};
     use super::*;
+    use crate::SubscriptionScope;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
@@ -355,8 +356,8 @@ mod tests {
         let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred.clone()],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -364,8 +365,8 @@ mod tests {
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 2000,
         };
@@ -394,8 +395,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![10, 20],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![10, 20],
             },
             created_at_unix_ms: 1000,
         };
@@ -450,8 +451,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -484,8 +485,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -533,8 +534,8 @@ mod tests {
         let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_old],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -542,8 +543,8 @@ mod tests {
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_new],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 2000,
         };
@@ -592,8 +593,8 @@ mod tests {
         let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_a],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -601,8 +602,8 @@ mod tests {
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_b],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 2000,
         };
@@ -641,24 +642,24 @@ mod tests {
         let binding_old: BindingData<DefaultIds> = BindingData {
             subscription_id: 100,
             predicate_hash: 0x1234,
-            user_id: 42,
-            session_id: Some(1000),
+            consumer_id: 42,
+            scope: SubscriptionScope::Session(1000),
             updated_at_unix_ms: 1000, // Older
         };
 
         let binding_new: BindingData<DefaultIds> = BindingData {
             subscription_id: 100, // Same sub_id
             predicate_hash: 0x1234,
-            user_id: 42,
-            session_id: Some(2000),   // Different session
-            updated_at_unix_ms: 2000, // Newer
+            consumer_id: 42,
+            scope: SubscriptionScope::Session(2000), // Different session
+            updated_at_unix_ms: 2000,                // Newer
         };
 
         let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![binding_old],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -666,8 +667,8 @@ mod tests {
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![binding_new],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 2000,
         };
@@ -684,7 +685,10 @@ mod tests {
         // Should keep the newer one
         assert_eq!(merged.payload.bindings.len(), 1);
         assert_eq!(merged.payload.bindings[0].updated_at_unix_ms, 2000);
-        assert_eq!(merged.payload.bindings[0].session_id, Some(2000));
+        assert_eq!(
+            merged.payload.bindings[0].scope,
+            crate::SubscriptionScope::Session(2000)
+        );
     }
 
     #[test]
@@ -731,8 +735,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -790,8 +794,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -897,8 +901,8 @@ mod tests {
             payload: ShardPayload {
                 predicates: vec![],
                 bindings: vec![],
-                user_dict: UserDictData {
-                    ordinal_to_user: vec![],
+                consumer_dict: ConsumerDictData {
+                    ordinal_to_consumer: vec![],
                 },
                 created_at_unix_ms: 1000,
             },
@@ -944,8 +948,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -1008,31 +1012,31 @@ mod tests {
         let binding_a = BindingData::<DefaultIds> {
             subscription_id: 42,
             predicate_hash: 0xAAAA,
-            user_id: 1,
-            session_id: None,
+            consumer_id: 1,
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 5000,
         };
         let binding_b = BindingData::<DefaultIds> {
             subscription_id: 42,
             predicate_hash: 0xBBBB, // different hash
-            user_id: 1,
-            session_id: None,
+            consumer_id: 1,
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 5000, // same timestamp
         };
 
         let payload1: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred.clone()],
             bindings: vec![binding_a],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![1],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![1],
             },
             created_at_unix_ms: 1000,
         };
         let payload2: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred],
             bindings: vec![binding_b],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![1],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![1],
             },
             created_at_unix_ms: 2000,
         };
@@ -1095,23 +1099,23 @@ mod tests {
         let binding_1 = BindingData::<DefaultIds> {
             subscription_id: 10,
             predicate_hash: 0x2000,
-            user_id: 1,
-            session_id: None,
+            consumer_id: 1,
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 1000,
         };
         let binding_2 = BindingData::<DefaultIds> {
             subscription_id: 5, // lower subscription_id
             predicate_hash: 0x1000,
-            user_id: 2,
-            session_id: None,
+            consumer_id: 2,
+            scope: SubscriptionScope::Durable,
             updated_at_unix_ms: 1000,
         };
 
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![pred_a, pred_b],
             bindings: vec![binding_1, binding_2],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![1, 2],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![1, 2],
             },
             created_at_unix_ms: 1000,
         };

@@ -149,8 +149,8 @@ pub struct ShardPayload<I: IdTypes> {
     pub predicates: Vec<PredicateData>,
     /// Bindings in this shard
     pub bindings: Vec<BindingData<I>>,
-    /// User dictionary
-    pub user_dict: UserDictData<I>,
+    /// Consumer dictionary
+    pub consumer_dict: ConsumerDictData<I>,
     /// Shard creation timestamp (milliseconds since Unix epoch)
     pub created_at_unix_ms: u64,
 }
@@ -160,7 +160,7 @@ impl<I: IdTypes> Clone for ShardPayload<I> {
         Self {
             predicates: self.predicates.clone(),
             bindings: self.bindings.clone(),
-            user_dict: self.user_dict.clone(),
+            consumer_dict: self.consumer_dict.clone(),
             created_at_unix_ms: self.created_at_unix_ms,
         }
     }
@@ -185,8 +185,8 @@ pub struct PredicateData {
 pub struct BindingData<I: IdTypes> {
     pub subscription_id: I::SubscriptionId,
     pub predicate_hash: u128, // Link to predicate
-    pub user_id: I::UserId,
-    pub session_id: Option<I::SessionId>,
+    pub consumer_id: I::ConsumerId,
+    pub scope: crate::SubscriptionScope<I>,
     pub updated_at_unix_ms: u64,
 }
 
@@ -198,17 +198,17 @@ impl<I: IdTypes> Clone for BindingData<I> {
 
 impl<I: IdTypes> Copy for BindingData<I> {}
 
-/// Serializable user dictionary
+/// Serializable consumer dictionary
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct UserDictData<I: IdTypes> {
-    pub ordinal_to_user: Vec<I::UserId>,
+pub struct ConsumerDictData<I: IdTypes> {
+    pub ordinal_to_consumer: Vec<I::ConsumerId>,
 }
 
-impl<I: IdTypes> Clone for UserDictData<I> {
+impl<I: IdTypes> Clone for ConsumerDictData<I> {
     fn clone(&self) -> Self {
         Self {
-            ordinal_to_user: self.ordinal_to_user.clone(),
+            ordinal_to_consumer: self.ordinal_to_consumer.clone(),
         }
     }
 }
@@ -315,8 +315,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![10, 20, 30],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![10, 20, 30],
             },
             created_at_unix_ms: 1234567890,
         };
@@ -326,7 +326,10 @@ mod tests {
 
         assert_eq!(header.table_id, 1);
         assert_eq!(header.schema_fingerprint, 0x1234_5678_90AB_CDEF);
-        assert_eq!(decoded_payload.user_dict.ordinal_to_user, vec![10, 20, 30]);
+        assert_eq!(
+            decoded_payload.consumer_dict.ordinal_to_consumer,
+            vec![10, 20, 30]
+        );
     }
 
     #[test]
@@ -371,8 +374,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -387,8 +390,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![1, 2, 3],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![1, 2, 3],
             },
             created_at_unix_ms: 1,
         };
@@ -412,8 +415,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![7, 8],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![7, 8],
             },
             created_at_unix_ms: 2,
         };
@@ -437,8 +440,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![42],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![42],
             },
             created_at_unix_ms: 3,
         };
@@ -467,8 +470,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };
@@ -494,8 +497,8 @@ mod tests {
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
-            user_dict: UserDictData {
-                ordinal_to_user: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
             },
             created_at_unix_ms: 1000,
         };

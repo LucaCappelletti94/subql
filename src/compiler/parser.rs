@@ -4,9 +4,9 @@
 
 use super::{
     canonicalize, literals::sql_value_to_cell_strict, prefilter::build_prefilter_plan, sql_shape,
-    BytecodeProgram, Instruction, PrefilterPlan,
+    BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
-use crate::compiler::sql_shape::QueryProjection;
+use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{Cell, RegisterError, SchemaCatalog, TableId};
 use sqlparser::ast::{Expr, ObjectName, Statement};
@@ -170,6 +170,67 @@ fn extract_table_and_where(
 ) -> Result<(SqlTableName, Option<Expr>), RegisterError> {
     let (table_name, where_clause) = sql_shape::extract_single_table_and_where(stmt)?;
     Ok((SqlTableName::from_object_name(&table_name)?, where_clause))
+}
+
+/// Build the projection-disambiguated hash input from a normalized WHERE clause
+/// and a projection kind.
+///
+/// Same WHERE clause with different projection (e.g. `SELECT *` vs `SELECT COUNT(*)`)
+/// must hash to distinct predicates.
+pub(crate) fn projection_hash_input(normalized: &str, projection: &QueryProjection) -> String {
+    match projection {
+        QueryProjection::Rows => normalized.to_owned(),
+        QueryProjection::Aggregate(AggSpec::CountStar) => {
+            format!("{normalized}\x00COUNT(*)")
+        }
+        QueryProjection::Aggregate(AggSpec::CountColumn { column }) => {
+            format!("{normalized}\x00COUNT({column})")
+        }
+        QueryProjection::Aggregate(AggSpec::Sum { column }) => {
+            format!("{normalized}\x00SUM({column})")
+        }
+        QueryProjection::Aggregate(AggSpec::Avg { column }) => {
+            format!("{normalized}\x00AVG({column})")
+        }
+    }
+}
+
+/// Lightweight parse path that extracts `(TableId, PredicateHash)` from SQL
+/// without compiling bytecode or building a prefilter plan.
+///
+/// Used by `unregister_query` to find matching predicates by hash.
+pub fn parse_and_resolve_hash<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+    catalog: &dyn SchemaCatalog,
+) -> Result<(TableId, PredicateHash), RegisterError> {
+    if sql.len() > sql_shape::MAX_SQL_LEN {
+        return Err(RegisterError::UnsupportedSql(
+            "SQL input too long".to_string(),
+        ));
+    }
+
+    let statements = Parser::parse_sql(dialect, sql).map_err(|e| RegisterError::ParseError {
+        line: 1,
+        column: 0,
+        message: e.to_string(),
+    })?;
+
+    if statements.len() != 1 {
+        return Err(RegisterError::UnsupportedSql(
+            "Expected exactly one SELECT statement".to_string(),
+        ));
+    }
+
+    let stmt = &statements[0];
+    let (table_name, where_clause) = extract_table_and_where(stmt)?;
+    let table_id = resolve_table_id(&table_name, catalog)?;
+    let projection = sql_shape::extract_projection(stmt, table_id, catalog)?;
+    let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
+    let hash_input = projection_hash_input(&normalized, &projection);
+    let hash = canonicalize::hash_sql(&hash_input);
+
+    Ok((table_id, hash))
 }
 
 /// Compile SQL expression to bytecode

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 /// Marker trait for ID types used in the subscription engine.
 ///
-/// Any type satisfying these bounds can be used as a user, session, or
+/// Any type satisfying these bounds can be used as a consumer, session, or
 /// subscription identifier.
 pub trait Id:
     Copy + Ord + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static
@@ -27,8 +27,8 @@ impl<T: Copy + Ord + Hash + Debug + Send + Sync + Serialize + DeserializeOwned +
 /// No default type parameters — `SubscriptionEngine<D, I>` always requires
 /// both, forcing an explicit choice and preventing hidden bugs.
 pub trait IdTypes: 'static {
-    /// User identifier (globally unique)
-    type UserId: Id;
+    /// Consumer identifier (globally unique)
+    type ConsumerId: Id;
     /// Session identifier (per-connection)
     type SessionId: Id;
     /// Subscription identifier (globally unique, assigned by caller)
@@ -39,9 +39,58 @@ pub trait IdTypes: 'static {
 pub struct DefaultIds;
 
 impl IdTypes for DefaultIds {
-    type UserId = u64;
+    type ConsumerId = u64;
     type SessionId = u64;
     type SubscriptionId = u64;
+}
+
+/// Lifetime scope of a subscription.
+///
+/// Wire-compatible with `Option<SessionId>` under postcard's positional
+/// encoding: `Durable` = variant 0 = `None`, `Session(id)` = variant 1 =
+/// `Some(id)`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub enum SubscriptionScope<I: IdTypes> {
+    /// Persists until explicitly unregistered.
+    Durable,
+    /// Bound to a session; auto-removed when the session ends.
+    Session(I::SessionId),
+}
+
+// Manual impls avoid derived bounds that would require `I: Copy/Clone/Debug/…`.
+// Only `I::SessionId` (already `Copy + Debug + Hash + …` via `Id`) is needed.
+impl<I: IdTypes> Copy for SubscriptionScope<I> {}
+impl<I: IdTypes> Clone for SubscriptionScope<I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<I: IdTypes> std::fmt::Debug for SubscriptionScope<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Durable => write!(f, "Durable"),
+            Self::Session(id) => f.debug_tuple("Session").field(id).finish(),
+        }
+    }
+}
+impl<I: IdTypes> PartialEq for SubscriptionScope<I> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Durable, Self::Durable) => true,
+            (Self::Session(a), Self::Session(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl<I: IdTypes> Eq for SubscriptionScope<I> {}
+impl<I: IdTypes> std::hash::Hash for SubscriptionScope<I> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        if let Self::Session(id) = self {
+            id.hash(state);
+        }
+    }
 }
 
 // ============================================================================
@@ -75,7 +124,7 @@ pub enum EventKind {
     Delete,
     /// Table truncate — all rows in the table are removed.
     ///
-    /// **Fanout semantics**: TRUNCATE does not carry a row image, so `users()`
+    /// **Fanout semantics**: TRUNCATE does not carry a row image, so `consumers()`
     /// skips predicate VM evaluation and notifies row subscriptions for the
     /// table. Aggregate subscriptions are handled separately by
     /// `aggregate_deltas()`, which returns `TruncateRequiresReset`.
@@ -126,7 +175,7 @@ impl Cell {
 }
 
 #[cfg(test)]
-#[allow(clippy::approx_constant)]
+#[allow(clippy::approx_constant, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -193,6 +242,21 @@ mod tests {
         assert_ne!(EventKind::Insert, EventKind::Update);
         assert_ne!(EventKind::Update, EventKind::Delete);
         assert_eq!(EventKind::Insert, EventKind::Insert);
+    }
+
+    #[test]
+    fn subscription_scope_wire_compatible_with_option() {
+        let none_bytes = crate::persistence::codec::serialize(&Option::<u64>::None).unwrap();
+        let durable_bytes =
+            crate::persistence::codec::serialize(&SubscriptionScope::<DefaultIds>::Durable)
+                .unwrap();
+        assert_eq!(none_bytes, durable_bytes);
+
+        let some_bytes = crate::persistence::codec::serialize(&Some(42u64)).unwrap();
+        let session_bytes =
+            crate::persistence::codec::serialize(&SubscriptionScope::<DefaultIds>::Session(42))
+                .unwrap();
+        assert_eq!(some_bytes, session_bytes);
     }
 }
 
@@ -272,15 +336,15 @@ pub struct WalEvent {
 // Subscription Types
 // ============================================================================
 
-/// Subscription specification provided by user
+/// Subscription request provided by caller
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubscriptionSpec<I: IdTypes> {
+pub struct SubscriptionRequest<I: IdTypes> {
     /// Unique subscription ID (assigned by caller)
     pub subscription_id: I::SubscriptionId,
-    /// User who owns this subscription
-    pub user_id: I::UserId,
-    /// Session ID if session-bound, None if durable
-    pub session_id: Option<I::SessionId>,
+    /// Consumer who owns this subscription
+    pub consumer_id: I::ConsumerId,
+    /// Lifetime scope: durable or session-bound
+    pub scope: SubscriptionScope<I>,
     /// SQL SELECT statement with WHERE clause
     pub sql: String,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
@@ -314,13 +378,13 @@ pub enum DurabilityMode {
 
 /// Report from pruning session subscriptions
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PruneReport {
+pub struct UnregisterReport {
     /// Number of subscription bindings removed
     pub removed_bindings: usize,
     /// Number of predicates removed (refcount reached 0)
     pub removed_predicates: usize,
-    /// Number of user dictionary entries removed
-    pub removed_users: usize,
+    /// Number of consumer dictionary entries removed
+    pub removed_consumers: usize,
 }
 
 /// Report from background merge operation
@@ -386,11 +450,11 @@ pub trait SchemaCatalog: Send + Sync {
 pub trait SubscriptionRegistration<I: IdTypes>: Send {
     /// Register a new subscription
     ///
-    /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds user.
+    /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds consumer.
     /// Returns error if SQL is unparseable or unsupported.
     fn register(
         &mut self,
-        spec: SubscriptionSpec<I>,
+        spec: SubscriptionRequest<I>,
     ) -> Result<RegisterResult, crate::RegisterError>;
 
     /// Unregister a subscription by ID
@@ -402,24 +466,43 @@ pub trait SubscriptionRegistration<I: IdTypes>: Send {
 
 /// Event dispatch operations
 pub trait SubscriptionDispatch<I: IdTypes>: Send {
-    /// Iterator over matched user IDs
-    type UserIter<'a>: Iterator<Item = I::UserId>
+    /// Iterator over matched consumer IDs
+    type ConsumerIter<'a>: Iterator<Item = I::ConsumerId>
     where
         Self: 'a;
 
-    /// Get interested users for a WAL event
+    /// Get interested consumers for a WAL event
     ///
-    /// Returns a zero-alloc iterator of matched user IDs.
-    fn users(&mut self, event: &WalEvent) -> Result<Self::UserIter<'_>, crate::DispatchError>;
+    /// Returns a zero-alloc iterator of matched consumer IDs.
+    fn consumers(
+        &mut self,
+        event: &WalEvent,
+    ) -> Result<Self::ConsumerIter<'_>, crate::DispatchError>;
 }
 
 /// Session lifecycle operations
-pub trait SubscriptionPruning<I: IdTypes>: Send {
+pub trait SubscriptionUnregistration<I: IdTypes>: Send {
     /// Unregister all subscriptions for a session
     ///
     /// Removes all session-bound subscriptions, decrements refcounts, prunes predicates.
-    /// Durable subscriptions (session_id = None) are NOT affected.
-    fn unregister_session(&mut self, session_id: I::SessionId) -> PruneReport;
+    /// Durable subscriptions (`SubscriptionScope::Durable`) are NOT affected.
+    fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport;
+
+    /// Unregister all subscriptions for a consumer matching a specific SQL query.
+    ///
+    /// Parses the SQL just enough to compute the predicate hash (no bytecode
+    /// compilation), then removes all bindings for `consumer_id` that share that
+    /// hash. Returns a [`UnregisterReport`] with the counts of removed bindings,
+    /// predicates, and consumer-dictionary entries.
+    fn unregister_query(
+        &mut self,
+        _consumer_id: I::ConsumerId,
+        _sql: &str,
+    ) -> Result<UnregisterReport, crate::RegisterError> {
+        Err(crate::RegisterError::UnsupportedSql(
+            "unregister_query not supported".to_string(),
+        ))
+    }
 }
 
 /// Durable shard storage operations
@@ -470,8 +553,8 @@ pub enum AggDelta {
 ///
 /// Separate from [`SubscriptionDispatch`] because:
 /// - UPDATE events require evaluating **both** the old row and the new row.
-/// - Returns signed deltas, not user bitmaps.
-/// - Aggregate predicates are **never** included in `users()` results.
+/// - Returns signed deltas, not consumer bitmaps.
+/// - Aggregate predicates are **never** included in `consumers()` results.
 ///
 /// # Caller contract
 ///
@@ -485,13 +568,13 @@ pub enum AggDelta {
 pub trait AggregateDispatch<I: IdTypes>: Send {
     /// Compute typed signed deltas for all matching aggregate subscriptions.
     ///
-    /// Returns `Vec<(UserId, AggDelta)>` where each entry is the signed change
-    /// for that user's subscription. Zero-net entries are omitted.
-    /// The same user may appear multiple times (once per aggregate kind).
+    /// Returns `Vec<(ConsumerId, AggDelta)>` where each entry is the signed change
+    /// for that consumer's subscription. Zero-net entries are omitted.
+    /// The same consumer may appear multiple times (once per aggregate kind).
     fn aggregate_deltas(
         &mut self,
         event: &WalEvent,
-    ) -> Result<Vec<(I::UserId, AggDelta)>, crate::DispatchError>;
+    ) -> Result<Vec<(I::ConsumerId, AggDelta)>, crate::DispatchError>;
 }
 
 /// Background merge operations
