@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use subql::{
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionSpec, TableId, WalEvent,
+    SubscriptionRequest, SubscriptionScope, TableId, WalEvent,
 };
 
 const STATUS_BUCKETS: [&str; 7] = [
@@ -217,10 +217,10 @@ fn build_scaling_engine(
 
     for i in 0..predicate_count {
         let i_u64 = u64::try_from(i).unwrap_or(0);
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: i_u64,
-            user_id: i_u64 % 5_000,
-            session_id: None,
+            consumer_id: i_u64 % 5_000,
+            scope: SubscriptionScope::Durable,
             sql: scaling_tree_sql(realistic_workload_seed(i_u64)),
             updated_at_unix_ms: 0,
         };
@@ -486,8 +486,8 @@ fn dispatch_scaling_benchmark(c: &mut Criterion) {
                 b.iter(|| {
                     let event = &events[next_event_idx];
                     next_event_idx = (next_event_idx + 1) % events.len();
-                    let matched_users = engine.users(black_box(event)).unwrap().count();
-                    black_box(matched_users);
+                    let matched_consumers = engine.consumers(black_box(event)).unwrap().count();
+                    black_box(matched_consumers);
                 });
             },
         );
@@ -520,8 +520,9 @@ fn dispatch_kind_scaling_benchmark(c: &mut Criterion) {
                 b.iter(|| {
                     let event = &update_events[next_update_event_idx];
                     next_update_event_idx = (next_update_event_idx + 1) % update_events.len();
-                    let matched_users = update_engine.users(black_box(event)).unwrap().count();
-                    black_box(matched_users);
+                    let matched_consumers =
+                        update_engine.consumers(black_box(event)).unwrap().count();
+                    black_box(matched_consumers);
                 });
             },
         );
@@ -541,8 +542,9 @@ fn dispatch_kind_scaling_benchmark(c: &mut Criterion) {
                 b.iter(|| {
                     let event = &delete_events[next_delete_event_idx];
                     next_delete_event_idx = (next_delete_event_idx + 1) % delete_events.len();
-                    let matched_users = delete_engine.users(black_box(event)).unwrap().count();
-                    black_box(matched_users);
+                    let matched_consumers =
+                        delete_engine.consumers(black_box(event)).unwrap().count();
+                    black_box(matched_consumers);
                 });
             },
         );
@@ -565,10 +567,10 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         // Register 1000 equality-dominant trees.
         for i in 0_u64..1_000 {
-            let spec = SubscriptionSpec {
+            let spec = SubscriptionRequest {
                 subscription_id: i,
-                user_id: i,
-                session_id: None,
+                consumer_id: i,
+                scope: SubscriptionScope::Durable,
                 sql: equality_tree_sql(i),
                 updated_at_unix_ms: 0,
             };
@@ -585,8 +587,8 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let event = &equality_events[equality_event_idx];
             equality_event_idx = (equality_event_idx + 1) % equality_events.len();
-            let matched_users = equality_engine.users(black_box(event)).unwrap().count();
-            black_box(matched_users);
+            let matched_consumers = equality_engine.consumers(black_box(event)).unwrap().count();
+            black_box(matched_consumers);
         });
     });
 
@@ -596,10 +598,10 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         // Register 1000 range-heavy trees.
         for i in 0_u64..1_000 {
-            let spec = SubscriptionSpec {
+            let spec = SubscriptionRequest {
                 subscription_id: i,
-                user_id: i,
-                session_id: None,
+                consumer_id: i,
+                scope: SubscriptionScope::Durable,
                 sql: range_tree_sql(i ^ 0xABCD_0000),
                 updated_at_unix_ms: 0,
             };
@@ -616,8 +618,8 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let event = &range_events[range_event_idx];
             range_event_idx = (range_event_idx + 1) % range_events.len();
-            let matched_users = range_engine.users(black_box(event)).unwrap().count();
-            black_box(matched_users);
+            let matched_consumers = range_engine.consumers(black_box(event)).unwrap().count();
+            black_box(matched_consumers);
         });
     });
 
@@ -627,10 +629,10 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         // Register 1000 fallback-heavy trees.
         for i in 0_u64..1_000 {
-            let spec = SubscriptionSpec {
+            let spec = SubscriptionRequest {
                 subscription_id: i,
-                user_id: i,
-                session_id: None,
+                consumer_id: i,
+                scope: SubscriptionScope::Durable,
                 sql: fallback_tree_sql(i ^ 0xFFFF_0000),
                 updated_at_unix_ms: 0,
             };
@@ -647,8 +649,8 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let event = &complex_events[complex_event_idx];
             complex_event_idx = (complex_event_idx + 1) % complex_events.len();
-            let matched_users = complex_engine.users(black_box(event)).unwrap().count();
-            black_box(matched_users);
+            let matched_consumers = complex_engine.consumers(black_box(event)).unwrap().count();
+            black_box(matched_consumers);
         });
     });
 
@@ -676,10 +678,10 @@ fn registration_benchmark(c: &mut Criterion) {
                 (engine, seed)
             },
             |(mut engine, seed)| {
-                let spec = SubscriptionSpec {
+                let spec = SubscriptionRequest {
                     subscription_id: 1,
-                    user_id: 42,
-                    session_id: None,
+                    consumer_id: 42,
+                    scope: SubscriptionScope::Durable,
                     sql: realistic_tree_sql(seed),
                     updated_at_unix_ms: 0,
                 };
@@ -704,10 +706,10 @@ fn registration_benchmark(c: &mut Criterion) {
                 next_seed = next_seed.wrapping_add(1);
                 let shared_sql = realistic_tree_sql(seed);
                 engine
-                    .register(SubscriptionSpec {
+                    .register(SubscriptionRequest {
                         subscription_id: 1,
-                        user_id: 42,
-                        session_id: None,
+                        consumer_id: 42,
+                        scope: SubscriptionScope::Durable,
                         sql: shared_sql.clone(),
                         updated_at_unix_ms: 0,
                     })
@@ -716,10 +718,10 @@ fn registration_benchmark(c: &mut Criterion) {
                 (engine, shared_sql)
             },
             |(mut engine, shared_sql)| {
-                let spec = SubscriptionSpec {
+                let spec = SubscriptionRequest {
                     subscription_id: 2,
-                    user_id: 99,
-                    session_id: None,
+                    consumer_id: 99,
+                    scope: SubscriptionScope::Durable,
                     sql: shared_sql,
                     updated_at_unix_ms: 0,
                 };
@@ -747,10 +749,10 @@ fn deduplication_benchmark(c: &mut Criterion) {
         // Register same realistic tree for 1000 users.
         let shared_sql = mixed_tree_sql(13_579);
         for i in 0_u64..1_000 {
-            let spec = SubscriptionSpec {
+            let spec = SubscriptionRequest {
                 subscription_id: i,
-                user_id: i,
-                session_id: None,
+                consumer_id: i,
+                scope: SubscriptionScope::Durable,
                 sql: shared_sql.clone(),
                 updated_at_unix_ms: 0,
             };
@@ -767,8 +769,11 @@ fn deduplication_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let event = &high_dedup_events[high_dedup_event_idx];
             high_dedup_event_idx = (high_dedup_event_idx + 1) % high_dedup_events.len();
-            let matched_users = high_dedup_engine.users(black_box(event)).unwrap().count();
-            black_box(matched_users);
+            let matched_consumers = high_dedup_engine
+                .consumers(black_box(event))
+                .unwrap()
+                .count();
+            black_box(matched_consumers);
         });
     });
 
@@ -778,10 +783,10 @@ fn deduplication_benchmark(c: &mut Criterion) {
 
         // Register unique realistic tree per user.
         for i in 0_u64..1_000 {
-            let spec = SubscriptionSpec {
+            let spec = SubscriptionRequest {
                 subscription_id: i,
-                user_id: i,
-                session_id: None,
+                consumer_id: i,
+                scope: SubscriptionScope::Durable,
                 sql: realistic_tree_sql(mix_seed(i ^ 0xD1E5_EED0)),
                 updated_at_unix_ms: 0,
             };
@@ -798,8 +803,11 @@ fn deduplication_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let event = &low_dedup_events[low_dedup_event_idx];
             low_dedup_event_idx = (low_dedup_event_idx + 1) % low_dedup_events.len();
-            let matched_users = low_dedup_engine.users(black_box(event)).unwrap().count();
-            black_box(matched_users);
+            let matched_consumers = low_dedup_engine
+                .consumers(black_box(event))
+                .unwrap()
+                .count();
+            black_box(matched_consumers);
         });
     });
 

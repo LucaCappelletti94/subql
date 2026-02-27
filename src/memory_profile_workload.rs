@@ -6,7 +6,7 @@
 
 use crate::{
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionSpec, TableId, WalEvent,
+    SubscriptionRequest, SubscriptionScope, TableId, WalEvent,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::HashMap;
@@ -258,10 +258,10 @@ pub fn run_memory_profile(show_progress: bool) {
     }
 
     for i in 0_u64..100_000 {
-        let spec = SubscriptionSpec {
+        let spec = SubscriptionRequest {
             subscription_id: i,
-            user_id: i % 10_000,
-            session_id: None,
+            consumer_id: i % 10_000,
+            scope: SubscriptionScope::Durable,
             sql: realistic_tree_sql(realistic_workload_seed(i)),
             updated_at_unix_ms: 0,
         };
@@ -283,7 +283,7 @@ pub fn run_memory_profile(show_progress: bool) {
     for i in 0_u64..1_000 {
         let event_idx_u64 = i % event_corpus_len_u64;
         let event_idx = usize::try_from(event_idx_u64).unwrap_or(0);
-        let user_count = engine.users(&event_corpus[event_idx]).unwrap().count();
+        let user_count = engine.consumers(&event_corpus[event_idx]).unwrap().count();
 
         if show_progress && (i + 1) % 100 == 0 {
             println!(

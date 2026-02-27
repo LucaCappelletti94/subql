@@ -2,7 +2,7 @@
 //! Property-based tests for dispatch correctness
 //!
 //! Verifies the fundamental invariant: for any subscriptions and events,
-//! `engine.users()` returns exactly the set of users whose SQL WHERE clause
+//! `engine.consumers()` returns exactly the set of consumers whose SQL WHERE clause
 //! matches the dispatched row.
 
 use proptest::prelude::*;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use subql::{
     compiler::{parse_compile_normalize_and_prefilter, Vm},
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionSpec, TableId, WalEvent,
+    SubscriptionRequest, SubscriptionScope, TableId, WalEvent,
 };
 
 // ============================================================================
@@ -198,7 +198,7 @@ fn row_strategy() -> impl Strategy<Value = (Cell, Cell, Cell)> {
 // ============================================================================
 
 proptest! {
-    /// The core invariant: dispatch returns exactly the users whose predicates match.
+    /// The core invariant: dispatch returns exactly the consumers whose predicates match.
     #[test]
     fn dispatch_matches_ground_truth(
         predicates in proptest::collection::vec(predicate_strategy(), 1..20),
@@ -209,22 +209,22 @@ proptest! {
         let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, dialect);
 
-        // Register each predicate as a subscription for a unique user
-        let mut user_predicates: HashMap<u64, TestPredicate> = HashMap::new();
+        // Register each predicate as a subscription for a unique consumer
+        let mut consumer_predicates: HashMap<u64, TestPredicate> = HashMap::new();
 
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
-            let user_id = (i as u64) + 1;
-            let spec = SubscriptionSpec {
-                subscription_id: user_id,
-                user_id,
-                session_id: None,
+            let consumer_id = (i as u64) + 1;
+            let spec = SubscriptionRequest {
+                subscription_id: consumer_id,
+                consumer_id,
+                scope: SubscriptionScope::Durable,
                 sql,
                 updated_at_unix_ms: 0,
             };
 
             if engine.register(spec).is_ok() {
-                user_predicates.insert(user_id, pred.clone());
+                consumer_predicates.insert(consumer_id, pred.clone());
             }
         }
 
@@ -244,13 +244,13 @@ proptest! {
                 changed_columns: Arc::from([]),
             };
 
-            let matched: HashSet<u64> = engine.users(&event).unwrap().collect();
+            let matched: HashSet<u64> = engine.consumers(&event).unwrap().collect();
 
             // Ground truth: evaluate each predicate in Rust
             let mut expected: HashSet<u64> = HashSet::new();
-            for (&user_id, pred) in &user_predicates {
+            for (&consumer_id, pred) in &consumer_predicates {
                 if pred.eval(id_cell, amount_cell, status_cell) == Some(true) {
-                    expected.insert(user_id);
+                    expected.insert(consumer_id);
                 }
             }
 
@@ -268,8 +268,8 @@ proptest! {
     }
 
     /// Update events with changed_columns behave correctly:
-    /// - Users whose predicates depend ONLY on unchanged columns are NOT notified.
-    /// - Users whose predicates depend on at least one changed column are evaluated
+    /// - Consumers whose predicates depend ONLY on unchanged columns are NOT notified.
+    /// - Consumers whose predicates depend on at least one changed column are evaluated
     ///   against the new row (matching if the new row satisfies the predicate).
     #[test]
     fn update_with_changed_columns_matches_ground_truth(
@@ -281,19 +281,19 @@ proptest! {
         let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, dialect);
 
-        let mut user_predicates: HashMap<u64, TestPredicate> = HashMap::new();
+        let mut consumer_predicates: HashMap<u64, TestPredicate> = HashMap::new();
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
-            let user_id = (i as u64) + 1;
-            let spec = SubscriptionSpec {
-                subscription_id: user_id,
-                user_id,
-                session_id: None,
+            let consumer_id = (i as u64) + 1;
+            let spec = SubscriptionRequest {
+                subscription_id: consumer_id,
+                consumer_id,
+                scope: SubscriptionScope::Durable,
                 sql,
                 updated_at_unix_ms: 0,
             };
             if engine.register(spec).is_ok() {
-                user_predicates.insert(user_id, pred.clone());
+                consumer_predicates.insert(consumer_id, pred.clone());
             }
         }
 
@@ -317,18 +317,18 @@ proptest! {
                 changed_columns: Arc::from([1u16]),
             };
 
-            let matched: HashSet<u64> = engine.users(&event).unwrap().collect();
+            let matched: HashSet<u64> = engine.consumers(&event).unwrap().collect();
 
-            // Ground truth: users with predicates depending on `amount` (col 1)
+            // Ground truth: consumers with predicates depending on `amount` (col 1)
             // are candidates; the engine evaluates against the new row.
             // StatusEq predicates (col 2 only) should never appear in matched
             // because col 2 is not in changed_columns.
-            for (&user_id, pred) in &user_predicates {
+            for (&consumer_id, pred) in &consumer_predicates {
                 if let TestPredicate::StatusEq(_) = pred {
                     prop_assert!(
-                        !matched.contains(&user_id),
-                        "StatusEq predicate should not fire when only amount changed: user {}",
-                        user_id
+                        !matched.contains(&consumer_id),
+                        "StatusEq predicate should not fire when only amount changed: consumer {}",
+                        consumer_id
                     );
                 }
             }
@@ -346,19 +346,19 @@ proptest! {
         let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, dialect);
 
-        let mut user_predicates: HashMap<u64, TestPredicate> = HashMap::new();
+        let mut consumer_predicates: HashMap<u64, TestPredicate> = HashMap::new();
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
-            let user_id = (i as u64) + 1;
-            let spec = SubscriptionSpec {
-                subscription_id: user_id,
-                user_id,
-                session_id: None,
+            let consumer_id = (i as u64) + 1;
+            let spec = SubscriptionRequest {
+                subscription_id: consumer_id,
+                consumer_id,
+                scope: SubscriptionScope::Durable,
                 sql,
                 updated_at_unix_ms: 0,
             };
             if engine.register(spec).is_ok() {
-                user_predicates.insert(user_id, pred.clone());
+                consumer_predicates.insert(consumer_id, pred.clone());
             }
         }
 
@@ -377,13 +377,13 @@ proptest! {
                 changed_columns: Arc::from([]),
             };
 
-            let matched: HashSet<u64> = engine.users(&event).unwrap().collect();
+            let matched: HashSet<u64> = engine.consumers(&event).unwrap().collect();
 
             // Ground truth: evaluate against the old row (same cells)
             let mut expected: HashSet<u64> = HashSet::new();
-            for (&user_id, pred) in &user_predicates {
+            for (&consumer_id, pred) in &consumer_predicates {
                 if pred.eval(id_cell, amount_cell, status_cell) == Some(true) {
-                    expected.insert(user_id);
+                    expected.insert(consumer_id);
                 }
             }
 
@@ -462,19 +462,19 @@ proptest! {
         let mut specs = Vec::new();
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
-            let user_id = (i as u64) + 1;
+            let consumer_id = (i as u64) + 1;
 
-            let _ = engine1.register(SubscriptionSpec {
-                subscription_id: user_id,
-                user_id,
-                session_id: None,
+            let _ = engine1.register(SubscriptionRequest {
+                subscription_id: consumer_id,
+                consumer_id,
+                scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 0,
             });
-            specs.push(SubscriptionSpec {
-                subscription_id: user_id,
-                user_id,
-                session_id: None,
+            specs.push(SubscriptionRequest {
+                subscription_id: consumer_id,
+                consumer_id,
+                scope: SubscriptionScope::Durable,
                 sql,
                 updated_at_unix_ms: 0,
             });
@@ -498,13 +498,13 @@ proptest! {
                 changed_columns: Arc::from([]),
             };
 
-            let result1: HashSet<u64> = match engine1.users(&event) {
-                Ok(users) => users.collect(),
+            let result1: HashSet<u64> = match engine1.consumers(&event) {
+                Ok(consumers) => consumers.collect(),
                 Err(_) => HashSet::new(),
             };
 
-            let result2: HashSet<u64> = match engine2.users(&event) {
-                Ok(users) => users.collect(),
+            let result2: HashSet<u64> = match engine2.consumers(&event) {
+                Ok(consumers) => consumers.collect(),
                 Err(_) => HashSet::new(),
             };
 

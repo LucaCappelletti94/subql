@@ -20,8 +20,8 @@ use testcontainers::runners::SyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use subql::{
-    ColumnId, DefaultIds, MaxwellParser, SchemaCatalog, SubscriptionEngine, SubscriptionSpec,
-    TableId, Wal2JsonV2Parser, WalParser,
+    ColumnId, DefaultIds, MaxwellParser, SchemaCatalog, SubscriptionEngine, SubscriptionRequest,
+    SubscriptionScope, TableId, Wal2JsonV2Parser, WalParser,
 };
 
 // ============================================================================
@@ -442,12 +442,12 @@ fn setup_engine(
         (4, 4, "SELECT * FROM readings WHERE sensor_id = 1"),
     ];
 
-    for (sub_id, user_id, sql) in &subscriptions {
+    for (sub_id, consumer_id, sql) in &subscriptions {
         engine
-            .register(SubscriptionSpec {
+            .register(SubscriptionRequest {
                 subscription_id: *sub_id,
-                user_id: *user_id,
-                session_id: None,
+                consumer_id: *consumer_id,
+                scope: SubscriptionScope::Durable,
                 sql: (*sql).to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -458,7 +458,7 @@ fn setup_engine(
 }
 
 // ============================================================================
-// Dispatch and collect matched users
+// Dispatch and collect matched consumers
 // ============================================================================
 
 fn dispatch_events(
@@ -475,11 +475,11 @@ fn dispatch_events(
             .unwrap_or_else(|e| panic!("Failed to parse message {i}: {e}"));
 
         for event in &events {
-            let users: BTreeSet<u64> = engine
-                .users(event)
+            let consumers: BTreeSet<u64> = engine
+                .consumers(event)
                 .unwrap_or_else(|e| panic!("Dispatch failed for event {i}: {e}"))
                 .collect();
-            results.push(users);
+            results.push(consumers);
         }
     }
 
@@ -564,11 +564,11 @@ fn cross_db_cdc_parity() {
     let pg_results = dispatch_events(&mut pg_engine, &Wal2JsonV2Parser, &pg_messages, &*catalog);
     let mx_results = dispatch_events(&mut mx_engine, &MaxwellParser, &mx_messages, &*catalog);
 
-    // Expected matched user IDs per event.
+    // Expected matched consumer IDs per event.
     //
     // UPDATE optimization: only predicates depending on changed columns are
     // re-evaluated, so the UPDATE below (only temperature changed) only
-    // matches user 1 (temperature > 30), not user 2 (location) or user 4
+    // matches consumer 1 (temperature > 30), not consumer 2 (location) or consumer 4
     // (sensor_id) even though the row still matches their predicates.
     let expected: Vec<BTreeSet<u64>> = vec![
         BTreeSet::from([1, 2, 4]), // INSERT (1, 35, 45, 'warehouse-A'): temp>30, loc match, sensor match
