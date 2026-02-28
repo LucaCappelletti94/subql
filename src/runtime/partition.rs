@@ -6,7 +6,8 @@ use super::{
     predicate::{Predicate, PredicateStore, SubscriptionBinding},
 };
 use crate::{
-    compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, RowImage, TableId,
+    compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, RowImage, SubscriptionId,
+    TableId,
 };
 use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
@@ -101,7 +102,7 @@ impl<I: IdTypes> TablePartition<I> {
     ///
     /// If refcount reaches 0, predicate is removed and indexes are rebuilt.
     /// Returns true if predicate was removed.
-    pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> bool {
+    pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> bool {
         self.remove_binding_detail(sub_id)
             .is_some_and(|removal| removal.predicate_removed)
     }
@@ -112,7 +113,7 @@ impl<I: IdTypes> TablePartition<I> {
     /// - `None` if no binding existed
     /// - `Some(false)` if binding removed but predicate kept
     /// - `Some(true)` if binding removed and predicate deleted
-    pub fn remove_binding_status(&mut self, sub_id: I::SubscriptionId) -> Option<bool> {
+    pub fn remove_binding_status(&mut self, sub_id: SubscriptionId) -> Option<bool> {
         self.remove_binding_detail(sub_id)
             .map(|removal| removal.predicate_removed)
     }
@@ -120,7 +121,7 @@ impl<I: IdTypes> TablePartition<I> {
     #[allow(clippy::option_if_let_else)]
     pub(super) fn remove_binding_detail(
         &mut self,
-        sub_id: I::SubscriptionId,
+        sub_id: SubscriptionId,
     ) -> Option<BindingRemoval<I>> {
         let store = Arc::make_mut(&mut self.mutable_predicates);
         if let Some(binding) = store.remove_binding(sub_id) {
@@ -173,21 +174,6 @@ impl<I: IdTypes> TablePartition<I> {
         let mut new_indexes = current.indexes.clone();
         new_indexes.add_predicate(pred_id, atoms, deps, is_agg);
         self.store_snapshot_with_indexes(new_indexes);
-    }
-
-    /// Save partition state for rollback (cheap Arc clones).
-    pub(super) fn save_state(&self) -> (Arc<PredicateStore<I>>, Arc<TablePartitionSnapshot<I>>) {
-        (Arc::clone(&self.mutable_predicates), self.load_snapshot())
-    }
-
-    /// Restore partition state from a previous save.
-    pub(super) fn restore_state(
-        &mut self,
-        predicates: Arc<PredicateStore<I>>,
-        snapshot: Arc<TablePartitionSnapshot<I>>,
-    ) {
-        self.mutable_predicates = predicates;
-        self.snapshot.store(snapshot);
     }
 
     /// Rebuild indexes from all predicates (used after predicate removal)

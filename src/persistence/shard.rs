@@ -186,7 +186,7 @@ pub struct PredicateData {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct BindingData<I: IdTypes> {
-    pub subscription_id: I::SubscriptionId,
+    pub subscription_id: crate::SubscriptionId,
     pub predicate_hash: u128, // Link to predicate
     pub consumer_id: I::ConsumerId,
     pub scope: crate::SubscriptionScope<I>,

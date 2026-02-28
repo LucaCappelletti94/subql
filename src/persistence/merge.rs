@@ -2,7 +2,10 @@
 
 use super::predicate_data::dedup_predicates_by_hash;
 use super::shard::{deserialize_shard, BindingData, ConsumerDictData, PredicateData, ShardPayload};
-use crate::{DefaultIds, IdTypes, MergeError, MergeJobId, MergeReport, SchemaCatalog, TableId};
+use crate::{
+    DefaultIds, IdTypes, MergeError, MergeJobId, MergeReport, SchemaCatalog, SubscriptionId,
+    TableId,
+};
 use ahash::AHashMap;
 use std::sync::{
     mpsc::{self, Receiver, Sender, TryRecvError},
@@ -233,7 +236,7 @@ fn merge_shards_impl<I: IdTypes>(
     // 4. Filter bindings (remove duplicates, keep most recent by timestamp;
     //    break ties deterministically by predicate_hash so output is stable
     //    regardless of shard input order).
-    let mut unique_bindings: AHashMap<I::SubscriptionId, BindingData<I>> = AHashMap::new();
+    let mut unique_bindings: AHashMap<SubscriptionId, BindingData<I>> = AHashMap::new();
 
     for binding in all_bindings {
         unique_bindings

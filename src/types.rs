@@ -22,26 +22,25 @@ pub trait Id:
 /// Blanket implementation: every type meeting the bounds is automatically an `Id`.
 impl<T: Copy + Ord + Hash + Debug + Send + Sync + Serialize + DeserializeOwned + 'static> Id for T {}
 
-/// Associated types that pin the three consumer-facing ID representations.
+/// Engine-assigned subscription identifier (always `u64`).
+pub type SubscriptionId = u64;
+
+/// Associated types that pin the consumer-facing ID representations.
 ///
-/// No default type parameters — `SubscriptionEngine<D, I>` always requires
-/// both, forcing an explicit choice and preventing hidden bugs.
+/// `SubscriptionId` is always `u64` and auto-assigned by the engine.
 pub trait IdTypes: 'static {
     /// Consumer identifier (globally unique)
     type ConsumerId: Id;
     /// Session identifier (per-connection)
     type SessionId: Id;
-    /// Subscription identifier (globally unique, assigned by caller)
-    type SubscriptionId: Id;
 }
 
-/// Default ID configuration using `u64` for all three identifiers.
+/// Default ID configuration using `u64` for consumer and session identifiers.
 pub struct DefaultIds;
 
 impl IdTypes for DefaultIds {
     type ConsumerId = u64;
     type SessionId = u64;
-    type SubscriptionId = u64;
 }
 
 /// Lifetime scope of a subscription.
@@ -339,21 +338,47 @@ pub struct WalEvent {
 /// Subscription request provided by caller
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionRequest<I: IdTypes> {
-    /// Unique subscription ID (assigned by caller)
-    pub subscription_id: I::SubscriptionId,
     /// Consumer who owns this subscription
-    pub consumer_id: I::ConsumerId,
+    pub(crate) consumer_id: I::ConsumerId,
     /// Lifetime scope: durable or session-bound
-    pub scope: SubscriptionScope<I>,
+    pub(crate) scope: SubscriptionScope<I>,
     /// SQL SELECT statement with WHERE clause
-    pub sql: String,
+    pub(crate) sql: String,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
-    pub updated_at_unix_ms: u64,
+    pub(crate) updated_at_unix_ms: u64,
+}
+
+impl<I: IdTypes> SubscriptionRequest<I> {
+    /// Create a new subscription request with default scope (`Durable`) and timestamp (`0`).
+    pub fn new(consumer_id: I::ConsumerId, sql: impl Into<String>) -> Self {
+        Self {
+            consumer_id,
+            scope: SubscriptionScope::Durable,
+            sql: sql.into(),
+            updated_at_unix_ms: 0,
+        }
+    }
+
+    /// Set the subscription scope (default: `SubscriptionScope::Durable`).
+    #[must_use]
+    pub const fn scope(mut self, scope: SubscriptionScope<I>) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// Set the conflict-resolution timestamp in milliseconds since Unix epoch (default: `0`).
+    #[must_use]
+    pub const fn updated_at_unix_ms(mut self, ts: u64) -> Self {
+        self.updated_at_unix_ms = ts;
+        self
+    }
 }
 
 /// Result of successful subscription registration
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisterResult {
+    /// Engine-assigned subscription identifier
+    pub subscription_id: SubscriptionId,
     /// Table this subscription applies to
     pub table_id: TableId,
     /// Normalized/canonicalized SQL
@@ -461,7 +486,7 @@ pub trait SubscriptionRegistration<I: IdTypes>: Send {
     ///
     /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
     /// Returns true if subscription existed and was removed.
-    fn unregister_subscription(&mut self, subscription_id: I::SubscriptionId) -> bool;
+    fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool;
 }
 
 /// Event dispatch operations

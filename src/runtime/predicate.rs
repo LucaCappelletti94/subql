@@ -4,7 +4,7 @@ use super::ids::{ConsumerOrdinal, PredicateHash, PredicateId};
 use super::indexes::IndexableAtom;
 use crate::{
     compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
-    ColumnId, IdTypes, SubscriptionScope,
+    ColumnId, IdTypes, SubscriptionId, SubscriptionScope,
 };
 use ahash::{AHashMap, AHashSet};
 use roaring::RoaringBitmap;
@@ -39,8 +39,8 @@ pub struct Predicate {
 /// Subscription binding (consumer → predicate → subscription)
 #[derive(Debug)]
 pub struct SubscriptionBinding<I: IdTypes> {
-    /// Subscription identifier
-    pub subscription_id: I::SubscriptionId,
+    /// Engine-assigned subscription identifier
+    pub subscription_id: SubscriptionId,
     /// Predicate this subscription uses
     pub predicate_id: PredicateId,
     /// Consumer who owns this subscription
@@ -71,9 +71,9 @@ pub struct PredicateStore<I: IdTypes> {
     /// Hash → candidate PredicateIds (for deduplication with collision checks)
     pub hash_index: AHashMap<PredicateHash, Vec<PredicateId>>,
     /// SubscriptionId → SubscriptionBinding
-    pub bindings: AHashMap<I::SubscriptionId, SubscriptionBinding<I>>,
+    pub bindings: AHashMap<SubscriptionId, SubscriptionBinding<I>>,
     /// SessionId → `Vec<SubscriptionId>` (for session cleanup)
-    pub scope_index: AHashMap<I::SessionId, Vec<I::SubscriptionId>>,
+    pub scope_index: AHashMap<I::SessionId, Vec<SubscriptionId>>,
     /// PredicateId → `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate)
     pub predicate_consumers: AHashMap<PredicateId, RoaringBitmap>,
 }
@@ -212,7 +212,7 @@ impl<I: IdTypes> PredicateStore<I> {
     /// Remove subscription binding
     ///
     /// Returns the removed binding if it existed.
-    pub fn remove_binding(&mut self, sub_id: I::SubscriptionId) -> Option<SubscriptionBinding<I>> {
+    pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> Option<SubscriptionBinding<I>> {
         let binding = self.bindings.remove(&sub_id)?;
 
         self.remove_binding_indexes(binding);
@@ -222,10 +222,7 @@ impl<I: IdTypes> PredicateStore<I> {
 
     /// Get all subscription IDs for a session
     #[must_use]
-    pub fn get_session_subscriptions(
-        &self,
-        session_id: I::SessionId,
-    ) -> Option<&[I::SubscriptionId]> {
+    pub fn get_session_subscriptions(&self, session_id: I::SessionId) -> Option<&[SubscriptionId]> {
         self.scope_index
             .get(&session_id)
             .map(std::vec::Vec::as_slice)
