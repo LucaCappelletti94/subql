@@ -1,6 +1,9 @@
 //! VM interpreter for bytecode evaluation
 
-use super::{BytecodeProgram, Instruction, Tri};
+use super::{
+    cell_cmp::{cells_equal, compare_ordered_cells},
+    BytecodeProgram, Instruction, Tri,
+};
 use crate::{Cell, RowImage};
 
 /// VM evaluation error
@@ -401,74 +404,7 @@ impl Default for Vm {
 // Helper Functions
 // ============================================================================
 
-#[allow(clippy::cast_precision_loss)]
-fn cells_equal(a: &Cell, b: &Cell) -> bool {
-    match (a, b) {
-        (Cell::Bool(x), Cell::Bool(y)) => x == y,
-        (Cell::Int(x), Cell::Int(y)) => x == y,
-        (Cell::Float(x), Cell::Float(y)) => x
-            .partial_cmp(y)
-            .is_some_and(|ord| ord == std::cmp::Ordering::Equal),
-        // Mixed numeric comparisons: coerce to float (mirroring compare_ordered_cells)
-        (Cell::Int(x), Cell::Float(y)) => {
-            let xf = *x as f64;
-            xf.partial_cmp(y)
-                .is_some_and(|ord| ord == std::cmp::Ordering::Equal)
-        }
-        (Cell::Float(x), Cell::Int(y)) => {
-            let yf = *y as f64;
-            x.partial_cmp(&yf)
-                .is_some_and(|ord| ord == std::cmp::Ordering::Equal)
-        }
-        (Cell::String(x), Cell::String(y)) => x == y,
-        // NULL = NULL is Unknown, not True!
-        _ => false,
-    }
-}
-
-#[allow(clippy::many_single_char_names, clippy::cast_precision_loss)]
-fn compare_ordered_cells<F>(lhs: &Cell, rhs: &Cell, predicate: F) -> Tri
-where
-    F: FnOnce(std::cmp::Ordering) -> bool,
-{
-    // NULL or Missing → Unknown
-    if lhs.is_null() || lhs.is_missing() || rhs.is_null() || rhs.is_missing() {
-        return Tri::Unknown;
-    }
-
-    let ord = match (lhs, rhs) {
-        (Cell::Int(x), Cell::Int(y)) => x.cmp(y),
-        (Cell::Float(x), Cell::Float(y)) => {
-            if x.is_nan() || y.is_nan() {
-                return Tri::Unknown;
-            }
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        // Mixed Int/Float comparisons - coerce to Float
-        (Cell::Int(x), Cell::Float(y)) => {
-            let x_float = *x as f64;
-            if y.is_nan() {
-                return Tri::Unknown;
-            }
-            x_float.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Cell::Float(x), Cell::Int(y)) => {
-            let y_float = *y as f64;
-            if x.is_nan() {
-                return Tri::Unknown;
-            }
-            x.partial_cmp(&y_float).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Cell::String(x), Cell::String(y)) => x.cmp(y),
-        _ => return Tri::Unknown, // Type mismatch
-    };
-
-    if predicate(ord) {
-        Tri::True
-    } else {
-        Tri::False
-    }
-}
+// cells_equal and compare_ordered_cells are in super::cell_cmp
 
 const fn predicate_tri_from_cell(cell: &Cell) -> Option<Tri> {
     match cell {

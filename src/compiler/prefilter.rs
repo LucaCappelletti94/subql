@@ -7,7 +7,6 @@ use super::{literals::sql_value_to_cell_lossy, Tri};
 use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -50,6 +49,19 @@ pub enum PlannerValue {
     Int(i64),
     Float(u64), // f64::to_bits()
     String(Arc<str>),
+}
+
+impl PlannerValue {
+    /// Convert to a runtime [`Cell`] for unified comparison.
+    #[must_use]
+    pub fn to_cell(&self) -> Cell {
+        match self {
+            Self::Bool(b) => Cell::Bool(*b),
+            Self::Int(i) => Cell::Int(*i),
+            Self::Float(bits) => Cell::Float(f64::from_bits(*bits)),
+            Self::String(s) => Cell::String(Arc::clone(s)),
+        }
+    }
 }
 
 /// Indexable planner atom.
@@ -227,19 +239,14 @@ fn eval_atom(atom: &PlannerAtom, row: &RowImage) -> Tri {
 }
 
 fn eval_equality(cell: &Cell, value: &PlannerValue) -> Tri {
-    match (cell, value) {
-        (Cell::Bool(lhs), PlannerValue::Bool(rhs)) => Tri::from_option(Some(lhs == rhs)),
-        (Cell::Int(lhs), PlannerValue::Int(rhs)) => Tri::from_option(Some(lhs == rhs)),
-        (Cell::Float(lhs), PlannerValue::Float(rhs_bits)) => {
-            let rhs = f64::from_bits(*rhs_bits);
-            match lhs.partial_cmp(&rhs) {
-                Some(Ordering::Equal) => Tri::True,
-                Some(Ordering::Less | Ordering::Greater) => Tri::False,
-                None => Tri::Unknown,
-            }
-        }
-        (Cell::String(lhs), PlannerValue::String(rhs)) => Tri::from_option(Some(lhs == rhs)),
-        _ => Tri::Unknown,
+    if cell.is_null() || cell.is_missing() {
+        return Tri::Unknown;
+    }
+    let rhs = value.to_cell();
+    if super::cell_cmp::cells_equal(cell, &rhs) {
+        Tri::True
+    } else {
+        Tri::False
     }
 }
 
@@ -1169,15 +1176,41 @@ mod tests {
             eval_equality(&Cell::String("x".into()), &PlannerValue::String("x".into())),
             Tri::True
         );
+        // Int(1) vs Bool(true): cross-type mismatch → False (matching VM behavior).
         assert_eq!(
             eval_equality(&Cell::Int(1), &PlannerValue::Bool(true)),
-            Tri::Unknown
+            Tri::False
         );
 
         assert_eq!(eval_range(&Cell::Int(5), Some(0), Some(10)), Tri::True);
         assert_eq!(eval_range(&Cell::Float(5.5), Some(0), Some(5)), Tri::False);
         assert_eq!(
             eval_range(&Cell::Bool(true), Some(0), Some(1)),
+            Tri::Unknown
+        );
+    }
+
+    #[test]
+    fn test_eval_equality_cross_type_int_float() {
+        // Before the fix, Float(5.0) vs Int(5) returned Unknown, causing
+        // false-negative subscription skips.  Now it correctly returns True,
+        // matching the VM's cells_equal semantics.
+        assert_eq!(
+            eval_equality(&Cell::Float(5.0), &PlannerValue::Int(5)),
+            Tri::True
+        );
+        assert_eq!(
+            eval_equality(&Cell::Int(5), &PlannerValue::Float(5.0_f64.to_bits())),
+            Tri::True
+        );
+        // Non-equal cross-type → False
+        assert_eq!(
+            eval_equality(&Cell::Float(5.1), &PlannerValue::Int(5)),
+            Tri::False
+        );
+        // NULL cell → Unknown
+        assert_eq!(
+            eval_equality(&Cell::Null, &PlannerValue::Int(5)),
             Tri::Unknown
         );
     }

@@ -2,6 +2,7 @@
 
 pub mod bytecode;
 pub mod canonicalize;
+pub(crate) mod cell_cmp;
 mod literals;
 pub mod parser;
 pub mod prefilter;
