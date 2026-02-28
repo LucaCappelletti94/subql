@@ -52,22 +52,10 @@ pub(super) fn sql_value_to_cell_strict(val: &Value) -> Result<Cell, RegisterErro
 /// Parse SQL literal value to runtime cell for planner analysis.
 ///
 /// Returns `None` for unsupported values and unparseable numerics.
+/// Delegates to [`sql_value_to_cell_strict`], discarding the error variant.
 #[must_use]
 pub(super) fn sql_value_to_cell_lossy(val: &Value) -> Option<Cell> {
-    match val {
-        Value::Null => Some(Cell::Null),
-        Value::Boolean(b) => Some(Cell::Bool(*b)),
-        Value::Number(n, _long) => n
-            .parse::<i64>()
-            .map(Cell::Int)
-            .or_else(|_| n.parse::<f64>().map(Cell::Float))
-            .ok(),
-        Value::SingleQuotedString(s)
-        | Value::DoubleQuotedString(s)
-        | Value::NationalStringLiteral(s)
-        | Value::HexStringLiteral(s) => Some(Cell::String(s.as_str().into())),
-        _ => None,
-    }
+    sql_value_to_cell_strict(val).ok()
 }
 
 #[cfg(test)]

@@ -264,6 +264,40 @@ pub(super) fn extract_projection(
     }
 }
 
+/// Parse and validate a single SQL statement from text.
+///
+/// Encapsulates the common sequence: length check → parse → single-statement assertion.
+pub(super) fn parse_single_statement(
+    sql: &str,
+    dialect: &dyn sqlparser::dialect::Dialect,
+) -> Result<sqlparser::ast::Statement, crate::RegisterError> {
+    if sql.len() > MAX_SQL_LEN {
+        return Err(crate::RegisterError::UnsupportedSql(
+            "SQL input too long".to_string(),
+        ));
+    }
+
+    let statements = sqlparser::parser::Parser::parse_sql(dialect, sql).map_err(|e| {
+        crate::RegisterError::ParseError {
+            line: 1,
+            column: 0,
+            message: e.to_string(),
+        }
+    })?;
+
+    if statements.len() != 1 {
+        return Err(crate::RegisterError::UnsupportedSql(
+            "Expected exactly one SELECT statement".to_string(),
+        ));
+    }
+
+    // SAFETY: we just checked len == 1
+    Ok(statements
+        .into_iter()
+        .next()
+        .expect("len == 1 checked above"))
+}
+
 /// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
 pub(super) const MAX_EXPR_DEPTH: usize = 128;
 

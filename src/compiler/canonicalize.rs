@@ -5,7 +5,6 @@ use crate::RegisterError;
 use seahash::SeaHasher;
 use sqlparser::ast::{BinaryOperator, Expr, Statement};
 use sqlparser::dialect::Dialect;
-use sqlparser::parser::Parser;
 use std::hash::{Hash, Hasher};
 
 /// Predicate hash (128-bit, deterministic)
@@ -34,30 +33,13 @@ pub type PredicateHash = u128;
 /// assert_eq!(norm1, norm2); // Same predicate
 /// ```
 pub fn normalize_sql(sql: &str, dialect: &dyn Dialect) -> Result<String, RegisterError> {
-    if sql.len() > sql_shape::MAX_SQL_LEN {
-        return Err(RegisterError::UnsupportedSql(
-            "SQL input too long".to_string(),
-        ));
-    }
-
     // Reject SQL that would cause stack overflow in the parser
     check_sql_depth(sql)?;
 
-    // Parse SQL
-    let statements = Parser::parse_sql(dialect, sql).map_err(|e| RegisterError::ParseError {
-        line: 1,
-        column: 0,
-        message: e.to_string(),
-    })?;
-
-    if statements.len() != 1 {
-        return Err(RegisterError::UnsupportedSql(
-            "Expected exactly one SELECT statement".to_string(),
-        ));
-    }
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
 
     // Extract WHERE clause
-    let where_expr = extract_where(&statements[0])?;
+    let where_expr = extract_where(&stmt)?;
 
     normalize_where_clause(where_expr.as_ref())
 }

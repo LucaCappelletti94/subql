@@ -3,15 +3,16 @@
 //! Supports generic SQL dialects via sqlparser crate.
 
 use super::{
-    canonicalize, literals::sql_value_to_cell_strict, prefilter::build_prefilter_plan, sql_shape,
-    BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
+    canonicalize,
+    literals::{resolve_column_ref, sql_value_to_cell_strict},
+    prefilter::build_prefilter_plan,
+    sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{Cell, RegisterError, SchemaCatalog, TableId};
 use sqlparser::ast::{Expr, ObjectName, Statement};
 use sqlparser::dialect::Dialect;
-use sqlparser::parser::Parser;
 
 struct SqlTableName {
     unqualified: String,
@@ -93,36 +94,17 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     ),
     RegisterError,
 > {
-    if sql.len() > sql_shape::MAX_SQL_LEN {
-        return Err(RegisterError::UnsupportedSql(
-            "SQL input too long".to_string(),
-        ));
-    }
-
-    // Parse SQL
-    let statements = Parser::parse_sql(dialect, sql).map_err(|e| RegisterError::ParseError {
-        line: 1, // sqlparser doesn't provide line numbers easily
-        column: 0,
-        message: e.to_string(),
-    })?;
-
-    if statements.len() != 1 {
-        return Err(RegisterError::UnsupportedSql(
-            "Expected exactly one SELECT statement".to_string(),
-        ));
-    }
-
-    let stmt = &statements[0];
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
 
     // Extract SELECT ... FROM table WHERE predicate
-    let (table_name, where_clause) = extract_table_and_where(stmt)?;
+    let (table_name, where_clause) = extract_table_and_where(&stmt)?;
 
     // Resolve table ID
     let table_id = resolve_table_id(&table_name, catalog)?;
 
     // Extract projection (SELECT * vs SELECT COUNT(*) vs SELECT SUM(col))
     // Must come after table resolution so SUM can resolve column names.
-    let projection = sql_shape::extract_projection(stmt, table_id, catalog)?;
+    let projection = sql_shape::extract_projection(&stmt, table_id, catalog)?;
 
     // Compile WHERE clause to bytecode
     let program = if let Some(expr) = where_clause.as_ref() {
@@ -204,28 +186,10 @@ pub fn parse_and_resolve_hash<D: Dialect>(
     dialect: &D,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(TableId, PredicateHash), RegisterError> {
-    if sql.len() > sql_shape::MAX_SQL_LEN {
-        return Err(RegisterError::UnsupportedSql(
-            "SQL input too long".to_string(),
-        ));
-    }
-
-    let statements = Parser::parse_sql(dialect, sql).map_err(|e| RegisterError::ParseError {
-        line: 1,
-        column: 0,
-        message: e.to_string(),
-    })?;
-
-    if statements.len() != 1 {
-        return Err(RegisterError::UnsupportedSql(
-            "Expected exactly one SELECT statement".to_string(),
-        ));
-    }
-
-    let stmt = &statements[0];
-    let (table_name, where_clause) = extract_table_and_where(stmt)?;
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+    let (table_name, where_clause) = extract_table_and_where(&stmt)?;
     let table_id = resolve_table_id(&table_name, catalog)?;
-    let projection = sql_shape::extract_projection(stmt, table_id, catalog)?;
+    let projection = sql_shape::extract_projection(&stmt, table_id, catalog)?;
     let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
     let hash_input = projection_hash_input(&normalized, &projection);
     let hash = canonicalize::hash_sql(&hash_input);
@@ -345,31 +309,25 @@ fn compile_expr_recursive(
         // ====================================================================
         // Identifiers (column references)
         // ====================================================================
-        Expr::Identifier(ident) => {
-            let col_id = catalog.column_id(table_id, &ident.value).ok_or_else(|| {
+        Expr::CompoundIdentifier(parts) if parts.len() != 2 => {
+            return Err(RegisterError::UnsupportedSql(format!(
+                "Complex identifier {parts:?} not supported"
+            )));
+        }
+
+        ref col_expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
+            let col_id = resolve_column_ref(col_expr, table_id, catalog).ok_or_else(|| {
+                let col_name = match col_expr {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    Expr::CompoundIdentifier(parts) => parts[1].value.clone(),
+                    _ => unreachable!(),
+                };
                 RegisterError::UnknownColumn {
                     table_id,
-                    column: ident.value.clone(),
+                    column: col_name,
                 }
             })?;
             out.push(Instruction::LoadColumn(col_id));
-        }
-
-        Expr::CompoundIdentifier(parts) => {
-            // Handle table.column format
-            if parts.len() == 2 {
-                let col_id = catalog
-                    .column_id(table_id, &parts[1].value)
-                    .ok_or_else(|| RegisterError::UnknownColumn {
-                        table_id,
-                        column: parts[1].value.clone(),
-                    })?;
-                out.push(Instruction::LoadColumn(col_id));
-            } else {
-                return Err(RegisterError::UnsupportedSql(format!(
-                    "Complex identifier {parts:?} not supported"
-                )));
-            }
         }
 
         // ====================================================================
