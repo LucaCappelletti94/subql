@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 const SHARD_VERSION: u16 = 6; // v6: AggSpec::CountColumn, AggSpec::Avg added
 
 /// Hard cap for decompressed shard payload size (defense in depth).
+///
+/// Intentionally separate from [`super::codec::MAX_DECODE_UNCOMPRESSED`] — each
+/// layer enforces its own limit independently.
 const MAX_SHARD_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// Magic bytes for shard identification
@@ -303,23 +306,27 @@ pub fn deserialize_shard<I: IdTypes>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::unreadable_literal)]
 mod tests {
-    use super::super::test_support::{make_catalog, MockCatalog};
+    use super::super::test_support::{
+        empty_shard_payload, make_catalog, shard_payload_with_consumers, MockCatalog,
+    };
     use super::*;
     use crate::DefaultIds;
     use std::collections::HashMap;
 
+    /// Serialize a shard, decode+mutate its header, and re-encode the tampered
+    /// bytes.  The payload bytes are kept unchanged.
+    fn tamper_shard_header(bytes: &[u8], mutate: impl FnOnce(&mut ShardHeader)) -> Vec<u8> {
+        let mut hdr = decode_header(bytes).unwrap();
+        mutate(&mut hdr);
+        let mut tampered = encode_header(&hdr).to_vec();
+        tampered.extend_from_slice(&bytes[SHARD_HEADER_SIZE..]);
+        tampered
+    }
+
     #[test]
     fn test_shard_roundtrip() {
         let catalog = make_catalog();
-
-        let payload: ShardPayload<DefaultIds> = ShardPayload {
-            predicates: vec![],
-            bindings: vec![],
-            consumer_dict: ConsumerDictData {
-                ordinal_to_consumer: vec![10, 20, 30],
-            },
-            created_at_unix_ms: 1234567890,
-        };
+        let payload = shard_payload_with_consumers(vec![10, 20, 30], 1234567890);
 
         let bytes = serialize_shard(1, &payload, &catalog).unwrap();
         let (header, decoded_payload) = deserialize_shard::<DefaultIds>(&bytes, &catalog).unwrap();
@@ -366,19 +373,10 @@ mod tests {
 
     #[test]
     fn test_serialize_missing_fingerprint() {
-        // Catalog that returns None for schema fingerprint
         let catalog = MockCatalog {
-            fingerprints: HashMap::new(), // Empty - no fingerprints
+            fingerprints: HashMap::new(),
         };
-
-        let payload: ShardPayload<DefaultIds> = ShardPayload {
-            predicates: vec![],
-            bindings: vec![],
-            consumer_dict: ConsumerDictData {
-                ordinal_to_consumer: vec![],
-            },
-            created_at_unix_ms: 1000,
-        };
+        let payload = empty_shard_payload(1000);
 
         let result = serialize_shard(1, &payload, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
@@ -387,23 +385,12 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_compressed_size_mismatch() {
         let catalog = make_catalog();
-        let payload: ShardPayload<DefaultIds> = ShardPayload {
-            predicates: vec![],
-            bindings: vec![],
-            consumer_dict: ConsumerDictData {
-                ordinal_to_consumer: vec![1, 2, 3],
-            },
-            created_at_unix_ms: 1,
-        };
+        let payload = shard_payload_with_consumers(vec![1, 2, 3], 1);
 
         let bytes = serialize_shard(1, &payload, &catalog).unwrap();
-        let header = decode_header(&bytes).unwrap();
-        let header_size = SHARD_HEADER_SIZE;
-
-        let mut tampered_header = header;
-        tampered_header.compressed_size = tampered_header.compressed_size.saturating_add(1);
-        let mut tampered = encode_header(&tampered_header).to_vec();
-        tampered.extend_from_slice(&bytes[header_size..]);
+        let tampered = tamper_shard_header(&bytes, |hdr| {
+            hdr.compressed_size = hdr.compressed_size.saturating_add(1);
+        });
 
         let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
@@ -412,23 +399,12 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_uncompressed_size_mismatch() {
         let catalog = make_catalog();
-        let payload: ShardPayload<DefaultIds> = ShardPayload {
-            predicates: vec![],
-            bindings: vec![],
-            consumer_dict: ConsumerDictData {
-                ordinal_to_consumer: vec![7, 8],
-            },
-            created_at_unix_ms: 2,
-        };
+        let payload = shard_payload_with_consumers(vec![7, 8], 2);
 
         let bytes = serialize_shard(1, &payload, &catalog).unwrap();
-        let header = decode_header(&bytes).unwrap();
-        let header_size = SHARD_HEADER_SIZE;
-
-        let mut tampered_header = header;
-        tampered_header.uncompressed_size = tampered_header.uncompressed_size.saturating_add(1);
-        let mut tampered = encode_header(&tampered_header).to_vec();
-        tampered.extend_from_slice(&bytes[header_size..]);
+        let tampered = tamper_shard_header(&bytes, |hdr| {
+            hdr.uncompressed_size = hdr.uncompressed_size.saturating_add(1);
+        });
 
         let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
@@ -437,23 +413,12 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_oversized_uncompressed_header() {
         let catalog = make_catalog();
-        let payload: ShardPayload<DefaultIds> = ShardPayload {
-            predicates: vec![],
-            bindings: vec![],
-            consumer_dict: ConsumerDictData {
-                ordinal_to_consumer: vec![42],
-            },
-            created_at_unix_ms: 3,
-        };
+        let payload = shard_payload_with_consumers(vec![42], 3);
 
         let bytes = serialize_shard(1, &payload, &catalog).unwrap();
-        let header = decode_header(&bytes).unwrap();
-        let header_size = SHARD_HEADER_SIZE;
-
-        let mut tampered_header = header;
-        tampered_header.uncompressed_size = u64::MAX;
-        let mut tampered = encode_header(&tampered_header).to_vec();
-        tampered.extend_from_slice(&bytes[header_size..]);
+        let tampered = tamper_shard_header(&bytes, |hdr| {
+            hdr.uncompressed_size = u64::MAX;
+        });
 
         let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
@@ -465,21 +430,12 @@ mod tests {
 
     #[test]
     fn test_fingerprint_bypass_blocked_when_catalog_returns_none() {
-        // Build a shard with a non-zero fingerprint using a catalog that knows the table.
-        let catalog_with_fingerprint = make_catalog(); // returns Some(0x1234_5678_90AB_CDEF) for table 1
-        let payload: ShardPayload<DefaultIds> = ShardPayload {
-            predicates: vec![],
-            bindings: vec![],
-            consumer_dict: ConsumerDictData {
-                ordinal_to_consumer: vec![],
-            },
-            created_at_unix_ms: 1000,
-        };
+        let catalog_with_fingerprint = make_catalog();
+        let payload = empty_shard_payload(1000);
         let bytes = serialize_shard(1, &payload, &catalog_with_fingerprint).unwrap();
 
-        // Now try to deserialize with a catalog that returns None for the same table.
         let catalog_without_fingerprint = MockCatalog {
-            fingerprints: HashMap::new(), // returns None for all tables
+            fingerprints: HashMap::new(),
         };
 
         let result = deserialize_shard::<DefaultIds>(&bytes, &catalog_without_fingerprint);
@@ -491,32 +447,19 @@ mod tests {
 
     #[test]
     fn test_fingerprint_zero_shard_accepted_when_catalog_returns_none() {
-        // A shard with fingerprint=0 should still be accepted if catalog returns None.
-        // This covers the case where fingerprinting was not enabled.
         let catalog_with_fingerprint = make_catalog();
-        let payload: ShardPayload<DefaultIds> = ShardPayload {
-            predicates: vec![],
-            bindings: vec![],
-            consumer_dict: ConsumerDictData {
-                ordinal_to_consumer: vec![],
-            },
-            created_at_unix_ms: 1000,
-        };
+        let payload = empty_shard_payload(1000);
 
-        // Build a shard header with fingerprint=0 manually
         let bytes = serialize_shard(1, &payload, &catalog_with_fingerprint).unwrap();
-        let header_size = SHARD_HEADER_SIZE;
-        let mut hdr = decode_header(&bytes).unwrap();
-        hdr.schema_fingerprint = 0;
-        let mut modified = encode_header(&hdr).to_vec();
-        modified.extend_from_slice(&bytes[header_size..]);
+        let tampered = tamper_shard_header(&bytes, |hdr| {
+            hdr.schema_fingerprint = 0;
+        });
 
         let catalog_without_fingerprint = MockCatalog {
             fingerprints: HashMap::new(),
         };
 
-        // Fingerprint=0 with catalog returning None should succeed (no fingerprint set)
-        let result = deserialize_shard::<DefaultIds>(&modified, &catalog_without_fingerprint);
+        let result = deserialize_shard::<DefaultIds>(&tampered, &catalog_without_fingerprint);
         assert!(
             result.is_ok(),
             "Zero fingerprint with None catalog should succeed"
