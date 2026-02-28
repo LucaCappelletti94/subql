@@ -78,6 +78,33 @@ pub fn parse_compile_and_normalize<D: Dialect>(
     Ok((table_id, program, normalized))
 }
 
+/// Shared front-half of query parsing: parse → extract table + WHERE → resolve
+/// table_id → extract projection → normalize.
+struct ParsedQuery {
+    table_id: TableId,
+    where_clause: Option<Expr>,
+    projection: QueryProjection,
+    normalized: String,
+}
+
+fn parse_query_front_half<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+    catalog: &dyn SchemaCatalog,
+) -> Result<ParsedQuery, RegisterError> {
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+    let (table_name, where_clause) = extract_table_and_where(&stmt)?;
+    let table_id = resolve_table_id(&table_name, catalog)?;
+    let projection = sql_shape::extract_projection(&stmt, table_id, catalog)?;
+    let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
+    Ok(ParsedQuery {
+        table_id,
+        where_clause,
+        projection,
+        normalized,
+    })
+}
+
 /// Parse SQL once and produce compiled bytecode, canonical normalized form,
 /// OR/NOT-aware prefilter plan, and projection kind.
 pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
@@ -94,31 +121,26 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     ),
     RegisterError,
 > {
-    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
-
-    // Extract SELECT ... FROM table WHERE predicate
-    let (table_name, where_clause) = extract_table_and_where(&stmt)?;
-
-    // Resolve table ID
-    let table_id = resolve_table_id(&table_name, catalog)?;
-
-    // Extract projection (SELECT * vs SELECT COUNT(*) vs SELECT SUM(col))
-    // Must come after table resolution so SUM can resolve column names.
-    let projection = sql_shape::extract_projection(&stmt, table_id, catalog)?;
+    let pq = parse_query_front_half(sql, dialect, catalog)?;
 
     // Compile WHERE clause to bytecode
-    let program = if let Some(expr) = where_clause.as_ref() {
-        compile_expression(expr, table_id, catalog)?
+    let program = if let Some(expr) = pq.where_clause.as_ref() {
+        compile_expression(expr, pq.table_id, catalog)?
     } else {
         // No WHERE clause = always match
         // Push True onto stack
         BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(true))])
     };
 
-    let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
-    let prefilter_plan = build_prefilter_plan(where_clause.as_ref(), table_id, catalog);
+    let prefilter_plan = build_prefilter_plan(pq.where_clause.as_ref(), pq.table_id, catalog);
 
-    Ok((table_id, program, normalized, prefilter_plan, projection))
+    Ok((
+        pq.table_id,
+        program,
+        pq.normalized,
+        prefilter_plan,
+        pq.projection,
+    ))
 }
 
 fn resolve_table_id(
@@ -186,15 +208,11 @@ pub fn parse_and_resolve_hash<D: Dialect>(
     dialect: &D,
     catalog: &dyn SchemaCatalog,
 ) -> Result<(TableId, PredicateHash), RegisterError> {
-    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
-    let (table_name, where_clause) = extract_table_and_where(&stmt)?;
-    let table_id = resolve_table_id(&table_name, catalog)?;
-    let projection = sql_shape::extract_projection(&stmt, table_id, catalog)?;
-    let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
-    let hash_input = projection_hash_input(&normalized, &projection);
+    let pq = parse_query_front_half(sql, dialect, catalog)?;
+    let hash_input = projection_hash_input(&pq.normalized, &pq.projection);
     let hash = canonicalize::hash_sql(&hash_input);
 
-    Ok((table_id, hash))
+    Ok((pq.table_id, hash))
 }
 
 /// Compile SQL expression to bytecode
@@ -1937,6 +1955,32 @@ mod tests {
         assert!(
             result.is_ok(),
             "SUM on Int column should be accepted, got: {result:?}"
+        );
+    }
+
+    /// Both the compile path and the canonicalize path use `sql_shape::MAX_EXPR_DEPTH`
+    /// to bound recursion. Verify they reject the same depth.
+    #[test]
+    fn both_paths_reject_same_excessive_depth() {
+        let dialect = PostgreSqlDialect {};
+        let catalog = make_catalog();
+
+        // Build deeply nested parenthesized expression that exceeds MAX_EXPR_DEPTH
+        let depth = sql_shape::MAX_EXPR_DEPTH + 2;
+        let open = "(".repeat(depth);
+        let close = ")".repeat(depth);
+        let sql = format!("SELECT * FROM users WHERE {open}age > 18{close}");
+
+        let compile_result = parse_compile_normalize_and_prefilter(&sql, &dialect, &catalog);
+        let hash_result = parse_and_resolve_hash(&sql, &dialect, &catalog);
+
+        assert!(
+            compile_result.is_err(),
+            "compile path must reject depth > MAX_EXPR_DEPTH"
+        );
+        assert!(
+            hash_result.is_err(),
+            "hash path must reject depth > MAX_EXPR_DEPTH"
         );
     }
 }
