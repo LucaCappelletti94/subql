@@ -238,7 +238,11 @@ proptest! {
                 changed_columns: Arc::from([]),
             };
 
-            let matched: HashSet<u64> = engine.consumers(&event).unwrap().collect();
+            let notifs = engine.consumers(&event).unwrap();
+            // INSERT events: all matched consumers should be in `inserted`.
+            let matched: HashSet<u64> = notifs.inserted.into_iter().collect();
+            prop_assert!(notifs.deleted.is_empty() && notifs.updated.is_empty(),
+                "INSERT should produce no deleted/updated");
 
             // Ground truth: evaluate each predicate in Rust
             let mut expected: HashSet<u64> = HashSet::new();
@@ -305,16 +309,17 @@ proptest! {
                 changed_columns: Arc::from([1u16]),
             };
 
-            let matched: HashSet<u64> = engine.consumers(&event).unwrap().collect();
+            let notifs = engine.consumers(&event).unwrap();
+            let all_notified: HashSet<u64> = notifs.into_iter().collect();
 
             // Ground truth: consumers with predicates depending on `amount` (col 1)
-            // are candidates; the engine evaluates against the new row.
-            // StatusEq predicates (col 2 only) should never appear in matched
+            // are candidates; the engine evaluates both old and new rows.
+            // StatusEq predicates (col 2 only) should never appear in any bucket
             // because col 2 is not in changed_columns.
             for (&consumer_id, pred) in &consumer_predicates {
                 if let TestPredicate::StatusEq(_) = pred {
                     prop_assert!(
-                        !matched.contains(&consumer_id),
+                        !all_notified.contains(&consumer_id),
                         "StatusEq predicate should not fire when only amount changed: consumer {}",
                         consumer_id
                     );
@@ -359,7 +364,11 @@ proptest! {
                 changed_columns: Arc::from([]),
             };
 
-            let matched: HashSet<u64> = engine.consumers(&event).unwrap().collect();
+            let notifs = engine.consumers(&event).unwrap();
+            // DELETE events: all matched consumers should be in `deleted`.
+            let matched: HashSet<u64> = notifs.deleted.into_iter().collect();
+            prop_assert!(notifs.inserted.is_empty() && notifs.updated.is_empty(),
+                "DELETE should produce no inserted/updated");
 
             // Ground truth: evaluate against the old row (same cells)
             let mut expected: HashSet<u64> = HashSet::new();
@@ -469,12 +478,12 @@ proptest! {
             };
 
             let result1: HashSet<u64> = match engine1.consumers(&event) {
-                Ok(consumers) => consumers.collect(),
+                Ok(notifs) => notifs.into_iter().collect(),
                 Err(_) => HashSet::new(),
             };
 
             let result2: HashSet<u64> = match engine2.consumers(&event) {
-                Ok(consumers) => consumers.collect(),
+                Ok(notifs) => notifs.into_iter().collect(),
                 Err(_) => HashSet::new(),
             };
 

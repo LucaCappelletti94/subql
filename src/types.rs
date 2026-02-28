@@ -491,18 +491,14 @@ pub trait SubscriptionRegistration<I: IdTypes>: Send {
 
 /// Event dispatch operations
 pub trait SubscriptionDispatch<I: IdTypes>: Send {
-    /// Iterator over matched consumer IDs
-    type ConsumerIter<'a>: Iterator<Item = I::ConsumerId>
-    where
-        Self: 'a;
-
-    /// Get interested consumers for a WAL event
+    /// Get interested consumers for a WAL event.
     ///
-    /// Returns a zero-alloc iterator of matched consumer IDs.
+    /// Returns view-relative notifications: each consumer sees INSERT/DELETE/UPDATE
+    /// relative to their own result set.
     fn consumers(
         &mut self,
         event: &WalEvent,
-    ) -> Result<Self::ConsumerIter<'_>, crate::DispatchError>;
+    ) -> Result<ConsumerNotifications<I>, crate::DispatchError>;
 }
 
 /// Session lifecycle operations
@@ -572,6 +568,78 @@ pub enum AggDelta {
     /// avg            = running_sum / running_count  (when running_count > 0)
     /// ```
     Avg { sum_delta: f64, count_delta: i64 },
+}
+
+/// Per-consumer notification classification from `consumers()`.
+///
+/// Each consumer sees events **relative to their own result set** (view-relative
+/// deltas), not the base-table operation.  A single base-table UPDATE may
+/// produce `Inserted` for one consumer, `Deleted` for another, and `Updated`
+/// for a third.
+pub struct ConsumerNotifications<I: IdTypes> {
+    /// Consumers for whom a row appeared in their result set.
+    /// (Base INSERT, or base UPDATE where new row matches but old didn't.)
+    pub inserted: Vec<I::ConsumerId>,
+    /// Consumers for whom a row disappeared from their result set.
+    /// (Base DELETE, or base UPDATE where old row matched but new doesn't.)
+    pub deleted: Vec<I::ConsumerId>,
+    /// Consumers for whom a row changed but remained in their result set.
+    /// (Base UPDATE where both old and new rows match.)
+    pub updated: Vec<I::ConsumerId>,
+}
+
+impl<I: IdTypes> ConsumerNotifications<I> {
+    /// Create empty notifications.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            inserted: Vec::new(),
+            deleted: Vec::new(),
+            updated: Vec::new(),
+        }
+    }
+}
+
+impl<I: IdTypes> std::fmt::Debug for ConsumerNotifications<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumerNotifications")
+            .field("inserted", &self.inserted)
+            .field("deleted", &self.deleted)
+            .field("updated", &self.updated)
+            .finish()
+    }
+}
+
+/// Iterator over `inserted ∪ updated` consumers — those who should see the
+/// current row state.
+pub struct ConsumerNotificationsIter<I: IdTypes> {
+    inserted: std::vec::IntoIter<I::ConsumerId>,
+    updated: std::vec::IntoIter<I::ConsumerId>,
+}
+
+impl<I: IdTypes> Iterator for ConsumerNotificationsIter<I> {
+    type Item = I::ConsumerId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inserted.next().or_else(|| self.updated.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.inserted.len() + self.updated.len();
+        (remaining, Some(remaining))
+    }
+}
+
+impl<I: IdTypes> IntoIterator for ConsumerNotifications<I> {
+    type Item = I::ConsumerId;
+    type IntoIter = ConsumerNotificationsIter<I>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ConsumerNotificationsIter {
+            inserted: self.inserted.into_iter(),
+            updated: self.updated.into_iter(),
+        }
+    }
 }
 
 /// Aggregate dispatch — delivers typed signed deltas for aggregate subscriptions.

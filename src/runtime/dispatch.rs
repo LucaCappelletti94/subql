@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm},
-    AggDelta, Cell, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
+    AggDelta, Cell, ConsumerNotifications, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
 };
 use ahash::AHashMap;
 use roaring::RoaringBitmap;
@@ -180,10 +180,10 @@ pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchEr
     }
 }
 
-fn matched_consumers_for_truncate<'a, I: IdTypes>(
+fn notifications_for_truncate<I: IdTypes>(
     partition: &TablePartition<I>,
-    consumer_dict: &'a ConsumerDictionary<I>,
-) -> MatchedConsumers<'a, I> {
+    consumer_dict: &ConsumerDictionary<I>,
+) -> ConsumerNotifications<I> {
     let snapshot = partition.load_snapshot();
     let mut ordinals = RoaringBitmap::new();
     for (pred_id, consumers) in &snapshot.predicates.predicate_consumers {
@@ -194,44 +194,199 @@ fn matched_consumers_for_truncate<'a, I: IdTypes>(
             ordinals |= consumers;
         }
     }
-    MatchedConsumers {
-        bitmap_iter: ordinals.into_iter(),
-        dict: consumer_dict,
+    let deleted = resolve_ordinals(ordinals, consumer_dict);
+    ConsumerNotifications {
+        inserted: Vec::new(),
+        deleted,
+        updated: Vec::new(),
     }
 }
 
-/// Dispatch event to interested consumers
+/// Resolve a `RoaringBitmap` of consumer ordinals into a `Vec` of consumer IDs.
+fn resolve_ordinals<I: IdTypes>(
+    bitmap: RoaringBitmap,
+    dict: &ConsumerDictionary<I>,
+) -> Vec<I::ConsumerId> {
+    #[allow(clippy::cast_possible_truncation)]
+    let mut result = Vec::with_capacity(bitmap.len() as usize);
+    for ord in bitmap {
+        if let Some(consumer_id) = dict
+            .ordinal_to_consumer
+            .get(ord as usize)
+            .copied()
+            .flatten()
+        {
+            result.push(consumer_id);
+        }
+    }
+    result
+}
+
+/// Dispatch event to interested consumers, returning view-relative notifications.
 ///
 /// Main dispatch algorithm:
 /// 1. Validate event
-/// 2. Select row image based on event kind
-/// 3. Get table partition
-/// 4. Select candidate predicates (index lookups)
-/// 5. VM evaluation (filter to Tri::True)
-/// 6. Return zero-alloc iterator over matched consumers
-pub fn dispatch_consumers<'a, I: IdTypes>(
+/// 2. Route by event kind:
+///    - INSERT: single-eval against new_row → all matches to `inserted`
+///    - DELETE: single-eval against old_row → all matches to `deleted`
+///    - UPDATE: dual-eval (old_row + new_row) → three-way split
+///    - TRUNCATE: all row subscribers → `deleted`
+/// 3. Return `ConsumerNotifications`
+pub fn dispatch_consumers<I: IdTypes>(
     event: &WalEvent,
     partition: &TablePartition<I>,
-    consumer_dict: &'a ConsumerDictionary<I>,
+    consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
-) -> Result<MatchedConsumers<'a, I>, DispatchError> {
-    // TRUNCATE events fan-out only to row subscribers (`SELECT * ...`).
-    if event.kind == EventKind::Truncate {
-        let _ = vm;
-        return Ok(matched_consumers_for_truncate(partition, consumer_dict));
+) -> Result<ConsumerNotifications<I>, DispatchError> {
+    match event.kind {
+        EventKind::Truncate => {
+            let _ = vm;
+            Ok(notifications_for_truncate(partition, consumer_dict))
+        }
+        EventKind::Insert => {
+            let row = require_new_row(event, "INSERT requires new_row")?;
+            let bitmap = dispatch_single_eval_bitmap(event, row, partition, vm)?;
+            Ok(ConsumerNotifications {
+                inserted: resolve_ordinals(bitmap, consumer_dict),
+                deleted: Vec::new(),
+                updated: Vec::new(),
+            })
+        }
+        EventKind::Delete => {
+            let row = require_old_row(event, "DELETE requires old_row")?;
+            let bitmap = dispatch_single_eval_bitmap(event, row, partition, vm)?;
+            Ok(ConsumerNotifications {
+                inserted: Vec::new(),
+                deleted: resolve_ordinals(bitmap, consumer_dict),
+                updated: Vec::new(),
+            })
+        }
+        EventKind::Update => dispatch_update(event, partition, consumer_dict, vm),
+    }
+}
+
+/// Dual-eval dispatch for UPDATE events: evaluates both old and new rows to
+/// produce view-relative `inserted` / `deleted` / `updated` sets.
+fn dispatch_update<I: IdTypes>(
+    event: &WalEvent,
+    partition: &TablePartition<I>,
+    consumer_dict: &ConsumerDictionary<I>,
+    vm: &mut Vm,
+) -> Result<ConsumerNotifications<I>, DispatchError> {
+    // Hard error if old_row is absent.
+    let old_row = event
+        .old_row
+        .as_ref()
+        .ok_or(DispatchError::UpdateRequiresOldRow(event.table_id))?;
+
+    // Hard error if old_row contains Cell::Missing (partial old image).
+    if old_row.cells.iter().any(Cell::is_missing) {
+        return Err(DispatchError::UpdateRequiresOldRow(event.table_id));
     }
 
-    // 1. Get row image based on event kind (validates presence)
-    let row = select_event_row(event)?;
+    let new_row = require_new_row(event, "UPDATE requires new_row")?;
 
-    dispatch_consumers_with_row(event, row, partition, consumer_dict, vm)
+    // Use the UPDATE candidate set (dependency-aware).
+    let candidates =
+        partition.select_candidates(new_row, EventKind::Update, &event.changed_columns);
+    let snapshot = partition.load_snapshot();
+
+    let mut inserted_ordinals = RoaringBitmap::new();
+    let mut deleted_ordinals = RoaringBitmap::new();
+    let mut updated_ordinals = RoaringBitmap::new();
+
+    for pred_id_u32 in &candidates {
+        let Some(pred_id) = super::ids::PredicateId::try_from_u32(pred_id_u32) else {
+            continue;
+        };
+
+        let Some(pred) = snapshot.predicates.get_predicate(pred_id) else {
+            continue;
+        };
+
+        // Only row subscriptions participate in consumers().
+        if !matches!(pred.projection, QueryProjection::Rows) {
+            continue;
+        }
+
+        // Evaluate new_row.
+        let new_match = {
+            if pred.prefilter_plan.requires_prefilter_eval
+                && !pred.prefilter_plan.may_match(new_row)
+            {
+                false
+            } else {
+                let result = vm
+                    .eval(&pred.bytecode, new_row)
+                    .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
+                result == Tri::True
+            }
+        };
+
+        // Evaluate old_row.
+        let old_match = {
+            if pred.prefilter_plan.requires_prefilter_eval
+                && !pred.prefilter_plan.may_match(old_row)
+            {
+                false
+            } else {
+                let result = vm
+                    .eval(&pred.bytecode, old_row)
+                    .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
+                result == Tri::True
+            }
+        };
+
+        if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
+            match (new_match, old_match) {
+                (true, false) => inserted_ordinals |= bitmap,
+                (false, true) => deleted_ordinals |= bitmap,
+                (true, true) => updated_ordinals |= bitmap,
+                (false, false) => {}
+            }
+        }
+    }
+
+    Ok(ConsumerNotifications {
+        inserted: resolve_ordinals(inserted_ordinals, consumer_dict),
+        deleted: resolve_ordinals(deleted_ordinals, consumer_dict),
+        updated: resolve_ordinals(updated_ordinals, consumer_dict),
+    })
+}
+
+/// Single-eval dispatch: evaluate one row, return the matching ordinals bitmap.
+/// Used for INSERT (new_row) and DELETE (old_row).
+fn dispatch_single_eval_bitmap<I: IdTypes>(
+    event: &WalEvent,
+    row: &RowImage,
+    partition: &TablePartition<I>,
+    vm: &mut Vm,
+) -> Result<RoaringBitmap, DispatchError> {
+    let candidates = partition.select_candidates(row, event.kind, &event.changed_columns);
+    let snapshot = partition.load_snapshot();
+    let mut matching_ordinals = RoaringBitmap::new();
+
+    for_each_matching_predicate(
+        &candidates,
+        &snapshot.predicates,
+        row,
+        vm,
+        |pred, consumers| {
+            if matches!(pred.projection, QueryProjection::Rows) {
+                matching_ordinals |= consumers;
+            }
+            Ok(())
+        },
+    )?;
+
+    Ok(matching_ordinals)
 }
 
 /// Iterate over candidate predicates, evaluate each against a row, and invoke
 /// the callback for every match.
 ///
-/// This is the inner hot-loop shared by both `dispatch_consumers_with_row`
-/// (row subscriptions) and `compute_agg_deltas` (aggregate subscriptions).
+/// This is the inner hot-loop shared by both row dispatch
+/// and `compute_agg_deltas` (aggregate subscriptions).
 fn for_each_matching_predicate<I, F>(
     candidates: &RoaringBitmap,
     store: &PredicateStore<I>,
@@ -269,35 +424,6 @@ where
         }
     }
     Ok(())
-}
-
-pub(crate) fn dispatch_consumers_with_row<'a, I: IdTypes>(
-    event: &WalEvent,
-    row: &RowImage,
-    partition: &TablePartition<I>,
-    consumer_dict: &'a ConsumerDictionary<I>,
-    vm: &mut Vm,
-) -> Result<MatchedConsumers<'a, I>, DispatchError> {
-    let candidates = partition.select_candidates(row, event.kind, &event.changed_columns);
-    let snapshot = partition.load_snapshot();
-    let mut matching_ordinals = RoaringBitmap::new();
-
-    for_each_matching_predicate(
-        &candidates,
-        &snapshot.predicates,
-        row,
-        vm,
-        |_pred, consumers| {
-            matching_ordinals |= consumers;
-            Ok(())
-        },
-    )?;
-
-    // Return zero-alloc iterator
-    Ok(MatchedConsumers {
-        bitmap_iter: matching_ordinals.into_iter(),
-        dict: consumer_dict,
-    })
 }
 
 fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, DispatchError> {
@@ -687,11 +813,13 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let mut consumers: Vec<_> = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
-            .expect("truncate should dispatch without row image")
-            .collect();
-        consumers.sort_unstable();
-        assert_eq!(consumers, vec![42]);
+        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
+            .expect("truncate should dispatch without row image");
+        assert!(notifs.inserted.is_empty());
+        assert!(notifs.updated.is_empty());
+        let mut deleted = notifs.deleted;
+        deleted.sort_unstable();
+        assert_eq!(deleted, vec![42]);
     }
 
     #[test]
@@ -795,13 +923,14 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let result = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm);
-        assert!(result.is_ok());
-        let consumers: Vec<_> = result.unwrap().collect();
+        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
+        // old_row age=17 (no match), new_row age=25 (match) → consumer enters (inserted)
         assert!(
-            consumers.contains(&42),
-            "Consumer 42 should match age > 18 with age=25"
+            notifs.inserted.contains(&42),
+            "Consumer 42 should be inserted (age > 18 with new age=25, old age=17)"
         );
+        assert!(notifs.deleted.is_empty());
+        assert!(notifs.updated.is_empty());
     }
 
     #[test]
@@ -860,13 +989,13 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let result = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm);
-        assert!(result.is_ok());
-        let consumers: Vec<_> = result.unwrap().collect();
+        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(
-            consumers.contains(&99),
-            "Consumer 99 should match age < 30 with age=25"
+            notifs.deleted.contains(&99),
+            "Consumer 99 should see deletion (age < 30 with age=25)"
         );
+        assert!(notifs.inserted.is_empty());
+        assert!(notifs.updated.is_empty());
     }
 
     // --- Aggregate dispatch tests ---
@@ -1600,17 +1729,17 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let consumers: Vec<_> = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
-            .expect("dispatch_consumers should succeed")
-            .collect();
+        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
+            .expect("dispatch_consumers should succeed");
 
-        // Consumer 99 (Rows predicate) should appear; consumer 42 (COUNT predicate) must NOT
+        // Consumer 99 (Rows predicate) should appear as inserted; consumer 42 (COUNT) must NOT
         assert!(
-            consumers.contains(&99),
+            notifs.inserted.contains(&99),
             "Rows subscriber should be dispatched"
         );
+        let all: Vec<_> = notifs.into_iter().collect();
         assert!(
-            !consumers.contains(&42),
+            !all.contains(&42),
             "COUNT subscriber must not appear in consumers() dispatch"
         );
     }
@@ -1671,11 +1800,10 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let result = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm);
-        assert!(result.is_ok());
-        let consumers: Vec<_> = result.unwrap().collect();
+        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
+        let all: Vec<_> = notifs.into_iter().collect();
         assert!(
-            consumers.is_empty(),
+            all.is_empty(),
             "No consumers should match age > 50 with age=25"
         );
     }

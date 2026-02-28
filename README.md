@@ -64,8 +64,8 @@ let event = WalEvent {
     changed_columns: Arc::from([]),
 };
 
-let consumers: Vec<u64> = engine.consumers(&event)?.collect();
-assert_eq!(consumers, vec![42]);
+let notifs = engine.consumers(&event)?;
+assert_eq!(notifs.inserted, vec![42]);
 
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

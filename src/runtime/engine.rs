@@ -2,10 +2,7 @@
 
 use super::indexes::IndexableAtom;
 use super::{
-    dispatch::{
-        dispatch_consumers, dispatch_consumers_with_row, select_event_row, ConsumerDictionary,
-        MatchedConsumers,
-    },
+    dispatch::{dispatch_consumers, select_event_row, ConsumerDictionary},
     ids::{ConsumerOrdinal, PredicateId},
     partition::TablePartition,
     predicate::{Predicate, SubscriptionBinding},
@@ -922,14 +919,16 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///     changed_columns: Arc::from([]),
     /// };
     ///
-    /// let consumers: Vec<u64> = engine.consumers(&event)?.collect();
-    /// assert_eq!(consumers, vec![42]);
+    /// let notifs = engine.consumers(&event)?;
+    /// assert_eq!(notifs.inserted, vec![42]);
+    /// assert!(notifs.deleted.is_empty());
+    /// assert!(notifs.updated.is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn consumers(
         &mut self,
         event: &WalEvent,
-    ) -> Result<MatchedConsumers<'_, I>, DispatchError> {
+    ) -> Result<crate::ConsumerNotifications<I>, DispatchError> {
         let (partition, consumer_dict) = table_context(
             &self.partitions,
             &self.consumer_dictionaries,
@@ -940,12 +939,22 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             return dispatch_consumers(event, partition, consumer_dict, &mut self.vm);
         }
 
-        // Validate selected row image arity against schema catalog.
-        let row = select_event_row(event)?;
-        self.validate_row_arity(event.table_id, row)?;
+        // Validate row image arity against schema catalog.
+        // For UPDATE events, validate both old_row and new_row.
+        if let Some(ref old_row) = event.old_row {
+            self.validate_row_arity(event.table_id, old_row)?;
+        }
+        if event.kind != EventKind::Delete {
+            if let Some(ref new_row) = event.new_row {
+                self.validate_row_arity(event.table_id, new_row)?;
+            }
+        }
+        if event.kind == EventKind::Delete {
+            let row = select_event_row(event)?;
+            self.validate_row_arity(event.table_id, row)?;
+        }
 
-        // Dispatch
-        dispatch_consumers_with_row(event, row, partition, consumer_dict, &mut self.vm)
+        dispatch_consumers(event, partition, consumer_dict, &mut self.vm)
     }
 
     /// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), …).
@@ -1004,8 +1013,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// assert_eq!(deltas, vec![(99, AggDelta::Count(1))]);
     ///
     /// // Aggregate subscriptions are handled by `aggregate_deltas()`, not `consumers()`.
-    /// let consumers: Vec<u64> = engine.consumers(&event)?.collect();
-    /// assert!(consumers.is_empty());
+    /// let notifs = engine.consumers(&event)?;
+    /// assert!(notifs.inserted.is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn aggregate_deltas(
@@ -1779,12 +1788,10 @@ impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionRegistration<I>
 }
 
 impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionDispatch<I> for SubscriptionEngine<D, I> {
-    type ConsumerIter<'a>
-        = MatchedConsumers<'a, I>
-    where
-        Self: 'a;
-
-    fn consumers(&mut self, event: &WalEvent) -> Result<Self::ConsumerIter<'_>, DispatchError> {
+    fn consumers(
+        &mut self,
+        event: &WalEvent,
+    ) -> Result<crate::ConsumerNotifications<I>, DispatchError> {
         Self::consumers(self, event)
     }
 }
@@ -2095,7 +2102,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert_eq!(consumers, vec![42]);
     }
 
@@ -2201,7 +2208,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert_eq!(consumers, vec![7]);
 
         let consumer_dict = engine.consumer_dictionaries.get(&1).unwrap();
@@ -2265,7 +2272,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert!(
             consumers.contains(&303),
             "newly registered predicate should dispatch after hole reuse"
@@ -2902,12 +2909,10 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let mut consumers: Vec<_> = engine
-            .consumers(&event)
-            .expect("truncate should dispatch")
-            .collect();
-        consumers.sort_unstable();
-        assert_eq!(consumers, vec![340, 350]);
+        let notifs = engine.consumers(&event).expect("truncate should dispatch");
+        let mut deleted = notifs.deleted;
+        deleted.sort_unstable();
+        assert_eq!(deleted, vec![340, 350]);
     }
 
     #[test]
@@ -3053,7 +3058,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let matched: Vec<u64> = engine.consumers(&event).unwrap().collect();
+        let matched: Vec<u64> = engine.consumers(&event).unwrap().into_iter().collect();
         assert!(
             matched.contains(&42),
             "old user 42 must still receive events after upsert rollback"
@@ -3711,8 +3716,16 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let single_users: Vec<_> = single_engine.consumers(&event).unwrap().collect();
-        let batch_users: Vec<_> = batch_engine.consumers(&event).unwrap().collect();
+        let single_users: Vec<_> = single_engine
+            .consumers(&event)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let batch_users: Vec<_> = batch_engine
+            .consumers(&event)
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(single_users, batch_users);
     }
 
@@ -3814,7 +3827,11 @@ mod tests {
             }),
             changed_columns: Arc::from([]),
         };
-        let high_consumers: Vec<_> = engine.consumers(&high_amount_event).unwrap().collect();
+        let high_consumers: Vec<_> = engine
+            .consumers(&high_amount_event)
+            .unwrap()
+            .into_iter()
+            .collect();
         assert!(high_consumers.contains(&42));
         assert!(!high_consumers.contains(&99));
 
@@ -3831,7 +3848,11 @@ mod tests {
             }),
             changed_columns: Arc::from([]),
         };
-        let low_consumers: Vec<_> = engine.consumers(&low_amount_event).unwrap().collect();
+        let low_consumers: Vec<_> = engine
+            .consumers(&low_amount_event)
+            .unwrap()
+            .into_iter()
+            .collect();
         assert!(!low_consumers.contains(&42));
         assert!(low_consumers.contains(&99));
     }
@@ -3953,7 +3974,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert!(consumers.contains(&42));
         assert!(!consumers.contains(&99));
     }
@@ -4005,7 +4026,7 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert!(consumers.contains(&42));
     }
 
@@ -4094,7 +4115,7 @@ mod tests {
             }),
             changed_columns: Arc::from([]),
         };
-        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert_eq!(consumers, vec![42]);
     }
 
@@ -4260,12 +4281,10 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let mut consumers: Vec<_> = engine
-            .consumers(&event)
-            .expect("truncate should dispatch")
-            .collect();
-        consumers.sort_unstable();
-        assert_eq!(consumers, vec![99]);
+        let notifs = engine.consumers(&event).expect("truncate should dispatch");
+        let mut deleted = notifs.deleted;
+        deleted.sort_unstable();
+        assert_eq!(deleted, vec![99]);
     }
 
     #[test]
@@ -4382,10 +4401,11 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let consumers: Vec<u64> = engine.consumers(&event).unwrap().collect();
+        let notifs = engine.consumers(&event).unwrap();
         assert!(
-            consumers.is_empty(),
-            "TRUNCATE must not fan out to unregistered consumer 42; got: {consumers:?}"
+            notifs.deleted.is_empty(),
+            "TRUNCATE must not fan out to unregistered consumer 42; got: {:?}",
+            notifs.deleted,
         );
     }
 
@@ -4744,7 +4764,7 @@ mod tests {
             .unwrap();
 
         let event = make_wal_event(EventKind::Insert, None, Some(20));
-        let mut consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let mut consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         consumers.sort_unstable();
 
         // Only user 1 (Rows) should appear; user 2 (COUNT) must not
@@ -4780,9 +4800,9 @@ mod tests {
             changed_columns: Arc::from([]),
         };
 
-        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let notifs = engine.consumers(&event).unwrap();
         assert!(
-            consumers.is_empty(),
+            notifs.deleted.is_empty(),
             "aggregate-only consumers must not appear in consumers()"
         );
     }
@@ -5009,7 +5029,7 @@ mod tests {
             .unwrap();
 
         let event = make_wal_event(EventKind::Insert, None, Some(20));
-        let consumers: Vec<_> = engine.consumers(&event).unwrap().collect();
+        let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
 
         assert!(
             !consumers.contains(&42),
@@ -5278,5 +5298,332 @@ mod tests {
 
         let result = engine.unregister_query(100, "NOT VALID SQL AT ALL");
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // View-relative delta tests for UPDATE events
+    // =========================================================================
+
+    /// Cross-subscription transition: row moves from sub A (x=3) to sub B (x=4).
+    #[test]
+    fn test_update_cross_subscription_transition() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Sub A: amount = 3
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount = 3",
+            ))
+            .unwrap();
+        // Sub B: amount = 4
+        engine
+            .register(SubscriptionRequest::new(
+                2,
+                "SELECT * FROM orders WHERE amount = 4",
+            ))
+            .unwrap();
+
+        // UPDATE: amount 3 → 4
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(3), Cell::String("ok".into())]),
+            }),
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let notifs = engine.consumers(&event).unwrap();
+        // Sub B enters (new matches, old doesn't) → inserted
+        assert_eq!(notifs.inserted, vec![2]);
+        // Sub A leaves (old matches, new doesn't) → deleted
+        assert_eq!(notifs.deleted, vec![1]);
+        // No one stayed → updated is empty
+        assert!(notifs.updated.is_empty());
+    }
+
+    /// Same-subscription update: row changes but stays in the result set.
+    #[test]
+    fn test_update_same_subscription_stays() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount > 0",
+            ))
+            .unwrap();
+
+        // UPDATE: amount 3 → 4, both match `amount > 0`
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(3), Cell::String("ok".into())]),
+            }),
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let notifs = engine.consumers(&event).unwrap();
+        assert!(notifs.inserted.is_empty());
+        assert!(notifs.deleted.is_empty());
+        assert_eq!(notifs.updated, vec![1]);
+    }
+
+    /// Leave-all: row leaves the only matching subscription.
+    #[test]
+    fn test_update_leaves_all_subscriptions() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount = 3",
+            ))
+            .unwrap();
+
+        // UPDATE: amount 3 → 4, leaves the subscription
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(3), Cell::String("ok".into())]),
+            }),
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let notifs = engine.consumers(&event).unwrap();
+        assert!(notifs.inserted.is_empty());
+        assert_eq!(notifs.deleted, vec![1]);
+        assert!(notifs.updated.is_empty());
+    }
+
+    /// Enter-from-nothing: row enters a subscription it didn't match before.
+    #[test]
+    fn test_update_enters_subscription() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount = 4",
+            ))
+            .unwrap();
+
+        // UPDATE: amount 3 → 4, enters the subscription
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(3), Cell::String("ok".into())]),
+            }),
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let notifs = engine.consumers(&event).unwrap();
+        assert_eq!(notifs.inserted, vec![1]);
+        assert!(notifs.deleted.is_empty());
+        assert!(notifs.updated.is_empty());
+    }
+
+    /// INSERT event produces only `inserted`, no `deleted` or `updated`.
+    #[test]
+    fn test_insert_produces_only_inserted() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount > 0",
+            ))
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Insert,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([]),
+        };
+
+        let notifs = engine.consumers(&event).unwrap();
+        assert_eq!(notifs.inserted, vec![1]);
+        assert!(notifs.deleted.is_empty());
+        assert!(notifs.updated.is_empty());
+    }
+
+    /// DELETE event produces only `deleted`, no `inserted` or `updated`.
+    #[test]
+    fn test_delete_produces_only_deleted() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount > 0",
+            ))
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Delete,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
+            }),
+            new_row: None,
+            changed_columns: Arc::from([]),
+        };
+
+        let notifs = engine.consumers(&event).unwrap();
+        assert!(notifs.inserted.is_empty());
+        assert_eq!(notifs.deleted, vec![1]);
+        assert!(notifs.updated.is_empty());
+    }
+
+    /// Missing old_row for UPDATE → UpdateRequiresOldRow error.
+    #[test]
+    fn test_update_missing_old_row_errors() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount > 0",
+            ))
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: None,
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let result = engine.consumers(&event);
+        assert!(matches!(
+            result,
+            Err(DispatchError::UpdateRequiresOldRow(1))
+        ));
+    }
+
+    /// Partial old_row (Cell::Missing) for UPDATE → UpdateRequiresOldRow error.
+    #[test]
+    fn test_update_partial_old_row_errors() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount > 0",
+            ))
+            .unwrap();
+
+        let event = WalEvent {
+            kind: EventKind::Update,
+            table_id: 1,
+            pk: PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            old_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Missing, Cell::String("ok".into())]),
+            }),
+            new_row: Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
+            }),
+            changed_columns: Arc::from([1u16]),
+        };
+
+        let result = engine.consumers(&event);
+        assert!(matches!(
+            result,
+            Err(DispatchError::UpdateRequiresOldRow(1))
+        ));
+    }
+
+    /// into_iter() yields inserted ∪ updated.
+    #[test]
+    fn test_consumer_notifications_into_iter() {
+        let notifs = crate::ConsumerNotifications::<DefaultIds> {
+            inserted: vec![1, 2],
+            deleted: vec![3],
+            updated: vec![4, 5],
+        };
+        let all: Vec<u64> = notifs.into_iter().collect();
+        assert_eq!(all, vec![1, 2, 4, 5]);
+    }
+
+    /// into_iter() size_hint is correct.
+    #[test]
+    fn test_consumer_notifications_size_hint() {
+        let notifs = crate::ConsumerNotifications::<DefaultIds> {
+            inserted: vec![1, 2],
+            deleted: vec![3],
+            updated: vec![4],
+        };
+        let iter = notifs.into_iter();
+        assert_eq!(iter.size_hint(), (3, Some(3)));
     }
 }

@@ -11,3 +11,5 @@ pub mod predicate;
 pub use agg::{agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SumKernel};
 pub use dispatch::MatchedConsumers;
 pub use engine::SubscriptionEngine;
+
+// ConsumerNotifications is re-exported from types.rs via `pub use types::*` in lib.rs.

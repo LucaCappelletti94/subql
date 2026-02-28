@@ -6,8 +6,8 @@
 pub use compiler::{AggSpec, QueryProjection};
 pub use errors::*;
 pub use runtime::{
-    agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, MatchedConsumers,
-    SubscriptionEngine, SumKernel,
+    agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SubscriptionEngine,
+    SumKernel,
 };
 pub use types::*;
 pub use wal::{
@@ -36,6 +36,14 @@ pub mod test_harnesses;
 
 // Version and metadata
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// SQL to check REPLICA IDENTITY setting for a table.
+///
+/// Returns `'f'` for FULL. Callers should run this at setup and reject
+/// tables where the result is not `'f'`, since view-relative UPDATE dispatch
+/// requires a complete old row image.
+pub const REPLICA_IDENTITY_CHECK_SQL: &str =
+    "SELECT relreplident FROM pg_class WHERE oid = $1::regclass";
 
 #[cfg(test)]
 pub(crate) mod testing {

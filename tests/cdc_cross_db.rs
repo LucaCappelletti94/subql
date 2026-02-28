@@ -472,6 +472,7 @@ fn dispatch_events(
             let consumers: BTreeSet<u64> = engine
                 .consumers(event)
                 .unwrap_or_else(|e| panic!("Dispatch failed for event {i}: {e}"))
+                .into_iter()
                 .collect();
             results.push(consumers);
         }

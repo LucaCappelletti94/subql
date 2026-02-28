@@ -75,6 +75,15 @@ pub enum DispatchError {
     )]
     AggregateUpdateRequiresOldRow(TableId),
 
+    /// UPDATE event requires a complete old_row for view-relative delta dispatch.
+    ///
+    /// Returned when `old_row` is `None` or contains `Cell::Missing`.
+    /// Callers must ensure REPLICA IDENTITY FULL is set on the source table.
+    #[error(
+        "UPDATE on table {0} requires complete old_row — set REPLICA IDENTITY FULL on source table"
+    )]
+    UpdateRequiresOldRow(TableId),
+
     /// Row arity doesn't match schema
     #[error("Invalid row arity for table {table_id}: expected {expected} columns, got {got}")]
     InvalidRowArity {
@@ -220,6 +229,10 @@ mod tests {
         assert_eq!(
             DispatchError::AggregateUpdateRequiresOldRow(7).to_string(),
             "Aggregate UPDATE on table 7 requires old_row image — enable before/old images in CDC source"
+        );
+        assert_eq!(
+            DispatchError::UpdateRequiresOldRow(5).to_string(),
+            "UPDATE on table 5 requires complete old_row — set REPLICA IDENTITY FULL on source table"
         );
         assert_eq!(
             DispatchError::InvalidRowArity {
