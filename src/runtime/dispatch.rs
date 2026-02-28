@@ -1,6 +1,11 @@
 //! Event dispatch pipeline
 
-use super::{agg::agg_delta_for_row, ids::ConsumerOrdinal, partition::TablePartition};
+use super::{
+    agg::agg_delta_for_row,
+    ids::ConsumerOrdinal,
+    partition::TablePartition,
+    predicate::{Predicate, PredicateStore},
+};
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm},
     AggDelta, Cell, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
@@ -222,6 +227,50 @@ pub fn dispatch_consumers<'a, I: IdTypes>(
     dispatch_consumers_with_row(event, row, partition, consumer_dict, vm)
 }
 
+/// Iterate over candidate predicates, evaluate each against a row, and invoke
+/// the callback for every match.
+///
+/// This is the inner hot-loop shared by both `dispatch_consumers_with_row`
+/// (row subscriptions) and `compute_agg_deltas` (aggregate subscriptions).
+fn for_each_matching_predicate<I, F>(
+    candidates: &RoaringBitmap,
+    store: &PredicateStore<I>,
+    row: &RowImage,
+    vm: &mut Vm,
+    mut on_match: F,
+) -> Result<(), DispatchError>
+where
+    I: IdTypes,
+    F: FnMut(&Predicate, &RoaringBitmap) -> Result<(), DispatchError>,
+{
+    for pred_id_u32 in candidates {
+        let Some(pred_id) = super::ids::PredicateId::try_from_u32(pred_id_u32) else {
+            continue;
+        };
+
+        let Some(pred) = store.get_predicate(pred_id) else {
+            continue;
+        };
+
+        // Prefilter: skip VM when the plan can statically rule out the row.
+        if pred.prefilter_plan.requires_prefilter_eval && !pred.prefilter_plan.may_match(row) {
+            continue;
+        }
+
+        // VM evaluation
+        let result = vm
+            .eval(&pred.bytecode, row)
+            .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
+
+        if result == Tri::True {
+            if let Some(bitmap) = store.predicate_consumers.get(&pred_id) {
+                on_match(pred, bitmap)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn dispatch_consumers_with_row<'a, I: IdTypes>(
     event: &WalEvent,
     row: &RowImage,
@@ -229,43 +278,22 @@ pub(crate) fn dispatch_consumers_with_row<'a, I: IdTypes>(
     consumer_dict: &'a ConsumerDictionary<I>,
     vm: &mut Vm,
 ) -> Result<MatchedConsumers<'a, I>, DispatchError> {
-    // 2. Select candidates (index lookups + fallback)
     let candidates = partition.select_candidates(row, event.kind, &event.changed_columns);
-
-    // 3. VM evaluation (filter to Tri::True)
     let snapshot = partition.load_snapshot();
     let mut matching_ordinals = RoaringBitmap::new();
 
-    for pred_id_u32 in &candidates {
-        let Some(pred_id) = super::ids::PredicateId::try_from_u32(pred_id_u32) else {
-            // Candidate IDs are engine-generated and expected to be non-zero.
-            // Ignore invalid values defensively instead of panicking.
-            continue;
-        };
+    for_each_matching_predicate(
+        &candidates,
+        &snapshot.predicates,
+        row,
+        vm,
+        |_pred, consumers| {
+            matching_ordinals |= consumers;
+            Ok(())
+        },
+    )?;
 
-        if let Some(pred) = snapshot.predicates.get_predicate(pred_id) {
-            // Hybrid path: for scan-required predicates, run cheap prefilter
-            // first and skip VM if predicate cannot possibly be true.
-            if pred.prefilter_plan.requires_prefilter_eval && !pred.prefilter_plan.may_match(row) {
-                continue;
-            }
-
-            // Evaluate predicate against row
-            let result = vm
-                .eval(&pred.bytecode, row)
-                .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
-
-            // Only Tri::True is a match
-            if result == Tri::True {
-                // Collect user ordinals for this predicate
-                if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
-                    matching_ordinals |= bitmap;
-                }
-            }
-        }
-    }
-
-    // 4. Return zero-alloc iterator
+    // Return zero-alloc iterator
     Ok(MatchedConsumers {
         bitmap_iter: matching_ordinals.into_iter(),
         dict: consumer_dict,
@@ -317,8 +345,6 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
 ) -> Result<Vec<(I::ConsumerId, AggDelta)>, DispatchError> {
-    use crate::runtime::ids::PredicateId;
-
     let weighted_rows = weighted_rows_for_agg(event)?;
 
     // Separate accumulators for each aggregate kind (avoids mixed-type confusion).
@@ -339,56 +365,41 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
     let candidates = partition.select_agg_candidates(event.kind, changed_cols);
 
     for (weight, row) in weighted_rows {
-        for pred_id_u32 in &candidates {
-            let Some(pred_id) = PredicateId::try_from_u32(pred_id_u32) else {
-                continue;
-            };
-
-            if let Some(pred) = snapshot.predicates.get_predicate(pred_id) {
-                // Only process aggregate predicates.
+        for_each_matching_predicate(
+            &candidates,
+            &snapshot.predicates,
+            row,
+            vm,
+            |pred, consumers| {
                 let QueryProjection::Aggregate(ref spec) = pred.projection else {
-                    continue;
+                    return Ok(());
                 };
 
-                // Prefilter check
-                if pred.prefilter_plan.requires_prefilter_eval
-                    && !pred.prefilter_plan.may_match(row)
-                {
-                    continue;
-                }
-
-                // VM evaluation
-                let result = vm
-                    .eval(&pred.bytecode, row)
-                    .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
-
-                if result == Tri::True {
-                    if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
-                        if let Some(delta) = agg_delta_for_row(spec, row, weight) {
-                            for ord_u32 in bitmap {
-                                let ord = ConsumerOrdinal::new(ord_u32);
-                                match &delta {
-                                    AggDelta::Count(n) => {
-                                        *count_weights.entry(ord).or_default() += *n;
-                                    }
-                                    AggDelta::Sum(v) => {
-                                        *sum_weights.entry(ord).or_default() += *v;
-                                    }
-                                    AggDelta::Avg {
-                                        sum_delta,
-                                        count_delta,
-                                    } => {
-                                        let entry = avg_accum.entry(ord).or_default();
-                                        entry.0 += *sum_delta;
-                                        entry.1 += *count_delta;
-                                    }
-                                }
+                if let Some(delta) = agg_delta_for_row(spec, row, weight) {
+                    for ord_u32 in consumers {
+                        let ord = ConsumerOrdinal::new(ord_u32);
+                        match &delta {
+                            AggDelta::Count(n) => {
+                                *count_weights.entry(ord).or_default() += *n;
+                            }
+                            AggDelta::Sum(v) => {
+                                *sum_weights.entry(ord).or_default() += *v;
+                            }
+                            AggDelta::Avg {
+                                sum_delta,
+                                count_delta,
+                            } => {
+                                let entry = avg_accum.entry(ord).or_default();
+                                entry.0 += *sum_delta;
+                                entry.1 += *count_delta;
                             }
                         }
                     }
                 }
-            }
-        }
+
+                Ok(())
+            },
+        )?;
     }
 
     // Translate ordinals to user IDs; filter out zero-net entries.

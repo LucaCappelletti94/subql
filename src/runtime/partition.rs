@@ -228,13 +228,11 @@ impl<I: IdTypes> TablePartition<I> {
         // re-evaluation. Returning the full dependency set is always safe because
         // the VM will evaluate every candidate.
         if kind == EventKind::Update && !changed_cols.is_empty() {
-            let mut update_candidates = snapshot.indexes.dependency_free.clone();
-            for &col in changed_cols {
-                if let Some(deps) = snapshot.indexes.dependency.get(&col) {
-                    update_candidates |= deps;
-                }
-            }
-            return update_candidates;
+            return HybridIndexes::select_update_deps(
+                &snapshot.indexes.dependency_free,
+                &snapshot.indexes.dependency,
+                changed_cols,
+            );
         }
 
         let mut candidates = RoaringBitmap::new();

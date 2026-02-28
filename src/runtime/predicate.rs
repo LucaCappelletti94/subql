@@ -6,7 +6,7 @@ use crate::{
     compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
     ColumnId, IdTypes, SubscriptionScope,
 };
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use roaring::RoaringBitmap;
 use slab::Slab;
 use std::sync::Arc;
@@ -229,6 +229,18 @@ impl<I: IdTypes> PredicateStore<I> {
         self.scope_index
             .get(&session_id)
             .map(std::vec::Vec::as_slice)
+    }
+
+    /// Returns `true` if any active binding references the given consumer.
+    #[must_use]
+    pub fn is_consumer_referenced(&self, consumer_id: I::ConsumerId) -> bool {
+        self.bindings.values().any(|b| b.consumer_id == consumer_id)
+    }
+
+    /// Collect the set of distinct consumer IDs across all active bindings.
+    #[must_use]
+    pub fn active_consumer_ids(&self) -> AHashSet<I::ConsumerId> {
+        self.bindings.values().map(|b| b.consumer_id).collect()
     }
 
     fn add_binding_indexes(&mut self, binding: SubscriptionBinding<I>) {
@@ -551,5 +563,59 @@ mod tests {
             None,
             "different SQL under same hash must not be treated as equivalent"
         );
+    }
+
+    #[test]
+    fn test_is_consumer_referenced() {
+        let mut store = PredicateStore::<DefaultIds>::new();
+
+        let pred = make_predicate(0, 0xAABB, 1);
+        let pred_id = store.add_predicate(pred);
+
+        assert!(!store.is_consumer_referenced(42));
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 1,
+            predicate_id: pred_id,
+            consumer_id: 42,
+            consumer_ordinal: ConsumerOrdinal::new(0),
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+
+        assert!(store.is_consumer_referenced(42));
+        assert!(!store.is_consumer_referenced(99));
+    }
+
+    #[test]
+    fn test_active_consumer_ids() {
+        let mut store = PredicateStore::<DefaultIds>::new();
+
+        let pred = make_predicate(0, 0xCCDD, 1);
+        let pred_id = store.add_predicate(pred);
+
+        assert!(store.active_consumer_ids().is_empty());
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 1,
+            predicate_id: pred_id,
+            consumer_id: 10,
+            consumer_ordinal: ConsumerOrdinal::new(0),
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 2,
+            predicate_id: pred_id,
+            consumer_id: 20,
+            consumer_ordinal: ConsumerOrdinal::new(1),
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+
+        let ids = store.active_consumer_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&20));
     }
 }

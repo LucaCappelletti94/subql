@@ -177,6 +177,45 @@ impl HybridIndexes {
     ///
     /// When `is_agg` is `true`, the predicate is routed into the parallel agg
     /// bitmaps and does **not** appear in row-dispatch bitmaps.
+    /// Populate a dependency-free bitmap and per-column dependency map for a
+    /// single predicate. Shared by both the agg and non-agg paths of
+    /// [`add_predicate`](Self::add_predicate).
+    fn populate_dependency(
+        free: &mut RoaringBitmap,
+        dep_map: &mut AHashMap<ColumnId, RoaringBitmap>,
+        pred_id_u32: u32,
+        deps: &[ColumnId],
+    ) {
+        if deps.is_empty() {
+            free.insert(pred_id_u32);
+        } else {
+            for &col_id in deps {
+                dep_map.entry(col_id).or_default().insert(pred_id_u32);
+            }
+        }
+    }
+
+    /// Return the set of predicate IDs that depend on at least one of the
+    /// `changed_cols`, plus those that are dependency-free (unconditional).
+    ///
+    /// Used by both the non-agg UPDATE path in
+    /// [`TablePartition::select_candidates`](super::partition::TablePartition::select_candidates)
+    /// and [`select_agg_candidates`](Self::select_agg_candidates).
+    #[must_use]
+    pub fn select_update_deps(
+        free: &RoaringBitmap,
+        dep_map: &AHashMap<ColumnId, RoaringBitmap>,
+        changed_cols: &[ColumnId],
+    ) -> RoaringBitmap {
+        let mut candidates = free.clone();
+        for &col in changed_cols {
+            if let Some(deps) = dep_map.get(&col) {
+                candidates |= deps;
+            }
+        }
+        candidates
+    }
+
     pub fn add_predicate(
         &mut self,
         pred_id: PredicateId,
@@ -188,16 +227,12 @@ impl HybridIndexes {
 
         if is_agg {
             // Aggregate predicates live in the parallel agg bitmaps.
-            if deps.is_empty() {
-                self.agg_dependency_free.insert(pred_id_u32);
-            } else {
-                for &col_id in deps {
-                    self.agg_dependency
-                        .entry(col_id)
-                        .or_default()
-                        .insert(pred_id_u32);
-                }
-            }
+            Self::populate_dependency(
+                &mut self.agg_dependency_free,
+                &mut self.agg_dependency,
+                pred_id_u32,
+                deps,
+            );
             // All agg predicates go in agg_fallback so INSERT/DELETE picks them up.
             self.agg_fallback.insert(pred_id_u32);
             return;
@@ -206,16 +241,12 @@ impl HybridIndexes {
         // Track dependencies (dependency-free predicates must always be
         // evaluated for UPDATE events because they do not depend on changed
         // column sets).
-        if deps.is_empty() {
-            self.dependency_free.insert(pred_id_u32);
-        } else {
-            for &col_id in deps {
-                self.dependency
-                    .entry(col_id)
-                    .or_default()
-                    .insert(pred_id_u32);
-            }
-        }
+        Self::populate_dependency(
+            &mut self.dependency_free,
+            &mut self.dependency,
+            pred_id_u32,
+            deps,
+        );
 
         // If no atoms were provided by the planner, this predicate has no
         // trigger path and no unconditional scan requirement.
@@ -282,13 +313,11 @@ impl HybridIndexes {
         changed_cols: &[ColumnId],
     ) -> RoaringBitmap {
         if kind == crate::EventKind::Update && !changed_cols.is_empty() {
-            let mut candidates = self.agg_dependency_free.clone();
-            for &col in changed_cols {
-                if let Some(deps) = self.agg_dependency.get(&col) {
-                    candidates |= deps;
-                }
-            }
-            return candidates;
+            return Self::select_update_deps(
+                &self.agg_dependency_free,
+                &self.agg_dependency,
+                changed_cols,
+            );
         }
         self.agg_fallback.clone()
     }
@@ -1323,5 +1352,31 @@ mod tests {
         assert!(entries[1].lower.is_none());
         // Last should have Some lower bound
         assert_eq!(entries[2].lower, Some(50));
+    }
+
+    #[test]
+    fn test_select_update_deps() {
+        let mut free = RoaringBitmap::new();
+        free.insert(0); // pred 0 is dependency-free
+
+        let mut dep_map = AHashMap::new();
+        let mut col1_deps = RoaringBitmap::new();
+        col1_deps.insert(1); // pred 1 depends on col 1
+        dep_map.insert(1_u16, col1_deps);
+
+        // No changed columns — only free
+        let result = HybridIndexes::select_update_deps(&free, &dep_map, &[]);
+        assert!(result.contains(0));
+        assert!(!result.contains(1));
+
+        // Changed col 1 — free + col1 deps
+        let result = HybridIndexes::select_update_deps(&free, &dep_map, &[1]);
+        assert!(result.contains(0));
+        assert!(result.contains(1));
+
+        // Changed col 99 — only free (no deps for col 99)
+        let result = HybridIndexes::select_update_deps(&free, &dep_map, &[99]);
+        assert!(result.contains(0));
+        assert!(!result.contains(1));
     }
 }

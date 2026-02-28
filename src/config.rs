@@ -70,8 +70,15 @@ pub struct CatalogConfig {
 }
 
 // Default values
+
+/// Default shard rotation threshold (10 MB).
+///
+/// Also used by [`crate::runtime::engine`] for the default `rotation_threshold`
+/// on [`SubscriptionEngine`](crate::runtime::engine::SubscriptionEngine) builder paths.
+pub const DEFAULT_ROTATION_THRESHOLD: usize = 10 * 1024 * 1024;
+
 const fn default_rotation_threshold() -> usize {
-    10 * 1024 * 1024 // 10 MB
+    DEFAULT_ROTATION_THRESHOLD
 }
 
 const fn default_merge_threshold() -> usize {

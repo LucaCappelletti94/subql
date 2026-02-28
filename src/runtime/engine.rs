@@ -153,6 +153,22 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
     durability_mode: DurabilityMode,
 }
 
+/// Look up the partition and consumer dictionary for a table, or return
+/// `DispatchError::UnknownTableId` if either is missing.
+fn table_context<'a, I: IdTypes>(
+    partitions: &'a AHashMap<TableId, TablePartition<I>>,
+    consumer_dicts: &'a AHashMap<TableId, ConsumerDictionary<I>>,
+    table_id: TableId,
+) -> Result<(&'a TablePartition<I>, &'a ConsumerDictionary<I>), DispatchError> {
+    let partition = partitions
+        .get(&table_id)
+        .ok_or(DispatchError::UnknownTableId(table_id))?;
+    let consumer_dict = consumer_dicts
+        .get(&table_id)
+        .ok_or(DispatchError::UnknownTableId(table_id))?;
+    Ok((partition, consumer_dict))
+}
+
 impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     fn index_atoms_from_plan(plan: &PrefilterPlan) -> Vec<IndexableAtom> {
         let mut atoms: Vec<IndexableAtom> = plan
@@ -348,7 +364,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             subscription_to_table: AHashMap::new(),
             vm: Vm::new(),
             storage_path: None,
-            rotation_threshold: 10 * 1024 * 1024, // 10 MB default
+            rotation_threshold: crate::config::DEFAULT_ROTATION_THRESHOLD,
             merge_manager: MergeManager::new(),
             durability_mode: DurabilityMode::Required,
         }
@@ -371,7 +387,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             subscription_to_table: AHashMap::new(),
             vm: Vm::new(),
             storage_path: Some(storage_path.clone()),
-            rotation_threshold: 10 * 1024 * 1024, // 10 MB default
+            rotation_threshold: crate::config::DEFAULT_ROTATION_THRESHOLD,
             merge_manager: MergeManager::new(),
             durability_mode: DurabilityMode::Required,
         };
@@ -805,11 +821,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     fn cleanup_consumer_if_unreferenced(&mut self, table_id: TableId, consumer_id: I::ConsumerId) {
         let has_active_bindings = self.partitions.get(&table_id).is_some_and(|partition| {
             let snapshot = partition.load_snapshot();
-            snapshot
-                .predicates
-                .bindings
-                .values()
-                .any(|binding| binding.consumer_id == consumer_id)
+            snapshot.predicates.is_consumer_referenced(consumer_id)
         });
 
         if !has_active_bindings {
@@ -909,17 +921,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         &mut self,
         event: &WalEvent,
     ) -> Result<MatchedConsumers<'_, I>, DispatchError> {
-        // Get table partition
-        let partition = self
-            .partitions
-            .get(&event.table_id)
-            .ok_or(DispatchError::UnknownTableId(event.table_id))?;
-
-        // Get consumer dictionary
-        let consumer_dict = self
-            .consumer_dictionaries
-            .get(&event.table_id)
-            .ok_or(DispatchError::UnknownTableId(event.table_id))?;
+        let (partition, consumer_dict) = table_context(
+            &self.partitions,
+            &self.consumer_dictionaries,
+            event.table_id,
+        )?;
 
         if event.kind == EventKind::Truncate {
             return dispatch_consumers(event, partition, consumer_dict, &mut self.vm);
@@ -1012,15 +1018,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         &mut self,
         event: &WalEvent,
     ) -> Result<Vec<(I::ConsumerId, crate::AggDelta)>, DispatchError> {
-        let partition = self
-            .partitions
-            .get(&event.table_id)
-            .ok_or(DispatchError::UnknownTableId(event.table_id))?;
-
-        let consumer_dict = self
-            .consumer_dictionaries
-            .get(&event.table_id)
-            .ok_or(DispatchError::UnknownTableId(event.table_id))?;
+        let (partition, consumer_dict) = table_context(
+            &self.partitions,
+            &self.consumer_dictionaries,
+            event.table_id,
+        )?;
 
         // Validate all row images consumed by aggregate dispatch.
         let mut expected_arity = None;
@@ -1047,26 +1049,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             Ok(())
         };
 
-        match event.kind {
-            EventKind::Insert => {
-                if let Some(new_row) = event.new_row.as_ref() {
-                    validate_row(new_row)?;
-                }
-            }
-            EventKind::Delete => {
-                if let Some(old_row) = event.old_row.as_ref() {
-                    validate_row(old_row)?;
-                }
-            }
-            EventKind::Update => {
-                if let Some(old_row) = event.old_row.as_ref() {
-                    validate_row(old_row)?;
-                }
-                if let Some(new_row) = event.new_row.as_ref() {
-                    validate_row(new_row)?;
-                }
-            }
-            EventKind::Truncate => {}
+        if let Some(ref old_row) = event.old_row {
+            validate_row(old_row)?;
+        }
+        if let Some(ref new_row) = event.new_row {
+            validate_row(new_row)?;
         }
 
         super::dispatch::compute_agg_deltas(event, partition, consumer_dict, &mut self.vm)
@@ -1115,12 +1102,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
                 .get(&table_id)
                 .map(|partition| {
                     let snapshot = partition.load_snapshot();
-                    snapshot
-                        .predicates
-                        .bindings
-                        .values()
-                        .map(|binding| binding.consumer_id)
-                        .collect()
+                    snapshot.predicates.active_consumer_ids()
                 })
                 .unwrap_or_default();
 
@@ -1195,10 +1177,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         // Check if the consumer still has any bindings in this table; if not, clean up.
         let removed_consumers = if self.partitions.get(&table_id).is_some_and(|partition| {
             let snap = partition.load_snapshot();
-            snap.predicates
-                .bindings
-                .values()
-                .any(|b| b.consumer_id == consumer_id)
+            snap.predicates.is_consumer_referenced(consumer_id)
         }) {
             0
         } else {
