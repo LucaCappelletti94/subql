@@ -465,4 +465,12 @@ mod tests {
             "Zero fingerprint with None catalog should succeed"
         );
     }
+
+    #[test]
+    fn decompression_caps_are_consistent() {
+        assert!(
+            MAX_SHARD_UNCOMPRESSED_SIZE <= super::codec::MAX_DECODE_UNCOMPRESSED as u64,
+            "Shard cap must not exceed codec cap"
+        );
+    }
 }

@@ -19,7 +19,7 @@ use crate::{
     persistence::{
         codec,
         merge::MergeManager,
-        predicate_data::predicate_data_equivalent,
+        predicate_data::dedup_predicates_by_hash,
         shard::{
             deserialize_shard, serialize_shard, BindingData, ConsumerDictData, PredicateData,
             ShardPayload,
@@ -379,18 +379,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         dialect: D,
         storage_path: PathBuf,
     ) -> Result<Self, StorageError> {
-        let mut engine = Self {
-            dialect,
-            catalog: Arc::clone(&catalog),
-            partitions: AHashMap::new(),
-            consumer_dictionaries: AHashMap::new(),
-            subscription_to_table: AHashMap::new(),
-            vm: Vm::new(),
-            storage_path: Some(storage_path.clone()),
-            rotation_threshold: crate::config::DEFAULT_ROTATION_THRESHOLD,
-            merge_manager: MergeManager::new(),
-            durability_mode: DurabilityMode::Required,
-        };
+        let mut engine = Self::new(catalog, dialect);
+        engine.storage_path = Some(storage_path.clone());
 
         // Create storage directory if it doesn't exist
         std::fs::create_dir_all(&storage_path)
@@ -933,19 +923,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
         // Validate selected row image arity against schema catalog.
         let row = select_event_row(event)?;
-        let expected = self
-            .catalog
-            .table_arity(event.table_id)
-            .ok_or(DispatchError::UnknownTableArity(event.table_id))?;
-
-        let got = row.len();
-        if got != expected {
-            return Err(DispatchError::InvalidRowArity {
-                table_id: event.table_id,
-                expected,
-                got,
-            });
-        }
+        self.validate_row_arity(event.table_id, row)?;
 
         // Dispatch
         dispatch_consumers_with_row(event, row, partition, consumer_dict, &mut self.vm)
@@ -1025,35 +1003,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         )?;
 
         // Validate all row images consumed by aggregate dispatch.
-        let mut expected_arity = None;
-        let mut validate_row = |row: &RowImage| -> Result<(), DispatchError> {
-            let expected = if let Some(v) = expected_arity {
-                v
-            } else {
-                let v = self
-                    .catalog
-                    .table_arity(event.table_id)
-                    .ok_or(DispatchError::UnknownTableArity(event.table_id))?;
-                expected_arity = Some(v);
-                v
-            };
-
-            if row.len() != expected {
-                return Err(DispatchError::InvalidRowArity {
-                    table_id: event.table_id,
-                    expected,
-                    got: row.len(),
-                });
-            }
-
-            Ok(())
-        };
-
         if let Some(ref old_row) = event.old_row {
-            validate_row(old_row)?;
+            self.validate_row_arity(event.table_id, old_row)?;
         }
         if let Some(ref new_row) = event.new_row {
-            validate_row(new_row)?;
+            self.validate_row_arity(event.table_id, new_row)?;
         }
 
         super::dispatch::compute_agg_deltas(event, partition, consumer_dict, &mut self.vm)
@@ -1192,6 +1146,23 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             removed_predicates,
             removed_consumers,
         })
+    }
+
+    /// Validate that a row image has the expected arity for its table.
+    fn validate_row_arity(&self, table_id: TableId, row: &RowImage) -> Result<(), DispatchError> {
+        let expected = self
+            .catalog
+            .table_arity(table_id)
+            .ok_or(DispatchError::UnknownTableArity(table_id))?;
+        let got = row.len();
+        if got != expected {
+            return Err(DispatchError::InvalidRowArity {
+                table_id,
+                expected,
+                got,
+            });
+        }
+        Ok(())
     }
 
     /// Get number of registered predicates for a table
@@ -1427,22 +1398,10 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Build hash -> predicate map and validate binding references.
-        let mut pred_hash_to_data: AHashMap<u128, &PredicateData> = AHashMap::new();
-        for pred_data in &payload.predicates {
-            if let Some(existing) = pred_hash_to_data.get(&pred_data.hash) {
-                if !predicate_data_equivalent(existing, pred_data) {
-                    return Err(RebuildPayloadError::Corrupt(format!(
-                        "predicate hash collision for hash {:016x} with non-equivalent payload",
-                        pred_data.hash
-                    )));
-                }
-                if pred_data.updated_at_unix_ms > existing.updated_at_unix_ms {
-                    pred_hash_to_data.insert(pred_data.hash, pred_data);
-                }
-            } else {
-                pred_hash_to_data.insert(pred_data.hash, pred_data);
-            }
-        }
+        let pred_hash_to_data = dedup_predicates_by_hash(
+            payload.predicates.iter().cloned(),
+            RebuildPayloadError::Corrupt,
+        )?;
 
         // Build bindings grouped by predicate hash; IDs are assigned during add_batch.
         let mut bindings_by_hash: AHashMap<u128, Vec<SubscriptionBinding<I>>> = AHashMap::new();
@@ -1479,8 +1438,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         }
 
         // Build batch entries from predicates + grouped bindings.
-        let mut chosen_predicates: Vec<&PredicateData> =
-            pred_hash_to_data.values().copied().collect();
+        let mut chosen_predicates: Vec<PredicateData> = pred_hash_to_data.into_values().collect();
         chosen_predicates.sort_unstable_by_key(|pred_data| pred_data.hash);
 
         let mut entries: BatchEntries<I> = Vec::new();
@@ -1502,12 +1460,12 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             let pred = Predicate {
                 id: PredicateId::from_slab_index(0),
                 hash: pred_data.hash,
-                normalized_sql: pred_data.normalized_sql.clone().into(),
+                normalized_sql: pred_data.normalized_sql.into(),
                 bytecode: Arc::new(bytecode.clone()),
                 dependency_columns: Arc::from(pred_data.dependency_columns.as_slice()),
                 index_atoms: Arc::from(atoms.as_slice()),
                 prefilter_plan: Arc::new(prefilter_plan),
-                projection: pred_data.projection.clone(),
+                projection: pred_data.projection,
                 refcount: 0, // incremented via bindings in add_batch
                 updated_at_unix_ms: pred_data.updated_at_unix_ms,
             };

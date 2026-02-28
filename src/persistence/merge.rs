@@ -1,6 +1,6 @@
 //! Background merge operations with atomic swap
 
-use super::predicate_data::predicate_data_equivalent;
+use super::predicate_data::dedup_predicates_by_hash;
 use super::shard::{deserialize_shard, BindingData, ConsumerDictData, PredicateData, ShardPayload};
 use crate::{DefaultIds, IdTypes, MergeError, MergeJobId, MergeReport, SchemaCatalog, TableId};
 use ahash::AHashMap;
@@ -224,25 +224,7 @@ fn merge_shards_impl<I: IdTypes>(
     let input_bindings = all_bindings.len();
 
     // 2. Deduplicate predicates by hash (keep most recent)
-    let mut unique_predicates: AHashMap<u128, PredicateData> = AHashMap::new();
-
-    for pred in all_predicates {
-        if let Some(existing) = unique_predicates.get_mut(&pred.hash) {
-            if !predicate_data_equivalent(existing, &pred) {
-                return Err(format!(
-                    "predicate hash collision for hash {:016x} with non-equivalent payload",
-                    pred.hash
-                ));
-            }
-
-            // Keep most recent
-            if pred.updated_at_unix_ms > existing.updated_at_unix_ms {
-                *existing = pred;
-            }
-        } else {
-            unique_predicates.insert(pred.hash, pred);
-        }
-    }
+    let unique_predicates = dedup_predicates_by_hash(all_predicates, |msg| msg)?;
 
     // 3. Collect final predicates, sorted by hash for deterministic output.
     let mut output_predicates: Vec<PredicateData> = unique_predicates.into_values().collect();

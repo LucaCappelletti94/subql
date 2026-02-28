@@ -93,7 +93,7 @@ pub(crate) fn decompress_with_limit(
 ///
 /// Intentionally separate from [`super::shard::MAX_SHARD_UNCOMPRESSED_SIZE`] — each
 /// layer enforces its own limit independently.
-const MAX_DECODE_UNCOMPRESSED: usize = 256 * 1024 * 1024; // 256 MiB
+pub(super) const MAX_DECODE_UNCOMPRESSED: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// Decompress and deserialize data
 ///
