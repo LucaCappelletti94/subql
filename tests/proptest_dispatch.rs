@@ -11,7 +11,7 @@ use std::sync::Arc;
 use subql::{
     compiler::{parse_compile_normalize_and_prefilter, Vm},
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionRequest, SubscriptionScope, TableId, WalEvent,
+    SubscriptionRequest, TableId, WalEvent,
 };
 
 // ============================================================================
@@ -215,13 +215,7 @@ proptest! {
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
             let consumer_id = (i as u64) + 1;
-            let spec = SubscriptionRequest {
-                subscription_id: consumer_id,
-                consumer_id,
-                scope: SubscriptionScope::Durable,
-                sql,
-                updated_at_unix_ms: 0,
-            };
+            let spec = SubscriptionRequest::new(consumer_id, sql);
 
             if engine.register(spec).is_ok() {
                 consumer_predicates.insert(consumer_id, pred.clone());
@@ -285,13 +279,7 @@ proptest! {
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
             let consumer_id = (i as u64) + 1;
-            let spec = SubscriptionRequest {
-                subscription_id: consumer_id,
-                consumer_id,
-                scope: SubscriptionScope::Durable,
-                sql,
-                updated_at_unix_ms: 0,
-            };
+            let spec = SubscriptionRequest::new(consumer_id, sql);
             if engine.register(spec).is_ok() {
                 consumer_predicates.insert(consumer_id, pred.clone());
             }
@@ -350,13 +338,7 @@ proptest! {
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
             let consumer_id = (i as u64) + 1;
-            let spec = SubscriptionRequest {
-                subscription_id: consumer_id,
-                consumer_id,
-                scope: SubscriptionScope::Durable,
-                sql,
-                updated_at_unix_ms: 0,
-            };
+            let spec = SubscriptionRequest::new(consumer_id, sql);
             if engine.register(spec).is_ok() {
                 consumer_predicates.insert(consumer_id, pred.clone());
             }
@@ -464,20 +446,8 @@ proptest! {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
             let consumer_id = (i as u64) + 1;
 
-            let _ = engine1.register(SubscriptionRequest {
-                subscription_id: consumer_id,
-                consumer_id,
-                scope: SubscriptionScope::Durable,
-                sql: sql.clone(),
-                updated_at_unix_ms: 0,
-            });
-            specs.push(SubscriptionRequest {
-                subscription_id: consumer_id,
-                consumer_id,
-                scope: SubscriptionScope::Durable,
-                sql,
-                updated_at_unix_ms: 0,
-            });
+            let _ = engine1.register(SubscriptionRequest::new(consumer_id, sql.clone()));
+            specs.push(SubscriptionRequest::new(consumer_id, sql));
         }
 
         engine2.register_batch(specs);

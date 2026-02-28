@@ -21,7 +21,7 @@ use testcontainers::{GenericImage, ImageExt};
 
 use subql::{
     ColumnId, DefaultIds, MaxwellParser, SchemaCatalog, SubscriptionEngine, SubscriptionRequest,
-    SubscriptionScope, TableId, Wal2JsonV2Parser, WalParser,
+    TableId, Wal2JsonV2Parser, WalParser,
 };
 
 // ============================================================================
@@ -444,13 +444,7 @@ fn setup_engine(
 
     for (sub_id, consumer_id, sql) in &subscriptions {
         engine
-            .register(SubscriptionRequest {
-                subscription_id: *sub_id,
-                consumer_id: *consumer_id,
-                scope: SubscriptionScope::Durable,
-                sql: (*sql).to_string(),
-                updated_at_unix_ms: 0,
-            })
+            .register(SubscriptionRequest::new(*consumer_id, *sql))
             .unwrap_or_else(|e| panic!("Failed to register subscription {sub_id}: {e}"));
     }
 

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog,
-    SubscriptionEngine, SubscriptionRequest, SubscriptionScope, WalEvent,
+    SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
 let catalog = Arc::new(
@@ -45,13 +45,10 @@ let catalog = Arc::new(
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-engine.register(SubscriptionRequest {
-    subscription_id: 1,
-    consumer_id: 42,
-    scope: SubscriptionScope::Durable,
-    sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
-    updated_at_unix_ms: 1_704_067_200_000,
-})?;
+engine.register(
+    SubscriptionRequest::new(42, "SELECT * FROM orders WHERE amount > 100")
+        .updated_at_unix_ms(1_704_067_200_000),
+)?;
 
 let event = WalEvent {
     kind: EventKind::Insert,
@@ -91,7 +88,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
     AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, EventKind,
     PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
-    SubscriptionScope, WalEvent,
+    WalEvent,
 };
 
 let catalog = Arc::new(
@@ -105,22 +102,14 @@ let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 // Live count of active orders for consumer 42.
-engine.register(SubscriptionRequest {
-    subscription_id: 1,
-    consumer_id: 42,
-    scope: SubscriptionScope::Durable,
-    sql: "SELECT COUNT(*) FROM orders WHERE status = 'active'".to_string(),
-    updated_at_unix_ms: 0,
-})?;
+engine.register(SubscriptionRequest::new(
+    42, "SELECT COUNT(*) FROM orders WHERE status = 'active'",
+))?;
 
 // Running total of active order amounts for consumer 42.
-engine.register(SubscriptionRequest {
-    subscription_id: 2,
-    consumer_id: 42,
-    scope: SubscriptionScope::Durable,
-    sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
-    updated_at_unix_ms: 0,
-})?;
+engine.register(SubscriptionRequest::new(
+    42, "SELECT SUM(amount) FROM orders WHERE status = 'active'",
+))?;
 
 let event = WalEvent {
     kind: EventKind::Insert,
@@ -170,7 +159,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
     AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, EventKind,
     PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
-    SubscriptionScope, WalEvent,
+    WalEvent,
 };
 
 let catalog = Arc::new(
@@ -182,13 +171,9 @@ let catalog = Arc::new(
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-engine.register(SubscriptionRequest {
-    subscription_id: 1,
-    consumer_id: 7,
-    scope: SubscriptionScope::Durable,
-    sql: "SELECT AVG(value) FROM scores WHERE id > 0".to_string(),
-    updated_at_unix_ms: 0,
-})?;
+engine.register(SubscriptionRequest::new(
+    7, "SELECT AVG(value) FROM scores WHERE id > 0",
+))?;
 
 let event = WalEvent {
     kind: EventKind::Insert,
@@ -232,7 +217,6 @@ use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
     ColumnType, DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
-    SubscriptionScope,
 };
 
 let catalog = Arc::new(
@@ -246,23 +230,15 @@ let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 // Accepted — price is Float:
-engine.register(SubscriptionRequest {
-    subscription_id: 1,
-    consumer_id: 1,
-    scope: SubscriptionScope::Durable,
-    sql: "SELECT SUM(price) FROM products WHERE id > 0".to_string(),
-    updated_at_unix_ms: 0,
-})?;
+engine.register(SubscriptionRequest::new(
+    1, "SELECT SUM(price) FROM products WHERE id > 0",
+))?;
 
 // Rejected at registration — name is String:
 assert!(engine
-    .register(SubscriptionRequest {
-        subscription_id: 2,
-        consumer_id: 1,
-        scope: SubscriptionScope::Durable,
-        sql: "SELECT SUM(name) FROM products WHERE id > 0".to_string(),
-        updated_at_unix_ms: 0,
-    })
+    .register(SubscriptionRequest::new(
+        1, "SELECT SUM(name) FROM products WHERE id > 0",
+    ))
     .is_err());
 
 # Ok::<(), Box<dyn std::error::Error>>(())

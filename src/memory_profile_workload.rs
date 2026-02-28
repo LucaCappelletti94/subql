@@ -6,7 +6,7 @@
 
 use crate::{
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionRequest, SubscriptionScope, TableId, WalEvent,
+    SubscriptionRequest, TableId, WalEvent,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::HashMap;
@@ -258,13 +258,8 @@ pub fn run_memory_profile(show_progress: bool) {
     }
 
     for i in 0_u64..100_000 {
-        let spec = SubscriptionRequest {
-            subscription_id: i,
-            consumer_id: i % 10_000,
-            scope: SubscriptionScope::Durable,
-            sql: realistic_tree_sql(realistic_workload_seed(i)),
-            updated_at_unix_ms: 0,
-        };
+        let spec =
+            SubscriptionRequest::new(i % 10_000, realistic_tree_sql(realistic_workload_seed(i)));
         engine.register(spec).unwrap();
 
         if show_progress && (i + 1) % 10_000 == 0 {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use subql::{
     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionRequest, SubscriptionScope, TableId, WalEvent,
+    SubscriptionRequest, TableId, WalEvent,
 };
 
 const STATUS_BUCKETS: [&str; 7] = [
@@ -217,13 +217,10 @@ fn build_scaling_engine(
 
     for i in 0..predicate_count {
         let i_u64 = u64::try_from(i).unwrap_or(0);
-        let spec = SubscriptionRequest {
-            subscription_id: i_u64,
-            consumer_id: i_u64 % 5_000,
-            scope: SubscriptionScope::Durable,
-            sql: scaling_tree_sql(realistic_workload_seed(i_u64)),
-            updated_at_unix_ms: 0,
-        };
+        let spec = SubscriptionRequest::new(
+            i_u64 % 5_000,
+            scaling_tree_sql(realistic_workload_seed(i_u64)),
+        );
         engine.register(spec).unwrap();
     }
 
@@ -567,14 +564,9 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         // Register 1000 equality-dominant trees.
         for i in 0_u64..1_000 {
-            let spec = SubscriptionRequest {
-                subscription_id: i,
-                consumer_id: i,
-                scope: SubscriptionScope::Durable,
-                sql: equality_tree_sql(i),
-                updated_at_unix_ms: 0,
-            };
-            engine.register(spec).unwrap();
+            engine
+                .register(SubscriptionRequest::new(i, equality_tree_sql(i)))
+                .unwrap();
         }
 
         engine
@@ -598,14 +590,9 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         // Register 1000 range-heavy trees.
         for i in 0_u64..1_000 {
-            let spec = SubscriptionRequest {
-                subscription_id: i,
-                consumer_id: i,
-                scope: SubscriptionScope::Durable,
-                sql: range_tree_sql(i ^ 0xABCD_0000),
-                updated_at_unix_ms: 0,
-            };
-            engine.register(spec).unwrap();
+            engine
+                .register(SubscriptionRequest::new(i, range_tree_sql(i ^ 0xABCD_0000)))
+                .unwrap();
         }
 
         engine
@@ -629,14 +616,12 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
 
         // Register 1000 fallback-heavy trees.
         for i in 0_u64..1_000 {
-            let spec = SubscriptionRequest {
-                subscription_id: i,
-                consumer_id: i,
-                scope: SubscriptionScope::Durable,
-                sql: fallback_tree_sql(i ^ 0xFFFF_0000),
-                updated_at_unix_ms: 0,
-            };
-            engine.register(spec).unwrap();
+            engine
+                .register(SubscriptionRequest::new(
+                    i,
+                    fallback_tree_sql(i ^ 0xFFFF_0000),
+                ))
+                .unwrap();
         }
 
         engine
@@ -678,13 +663,7 @@ fn registration_benchmark(c: &mut Criterion) {
                 (engine, seed)
             },
             |(mut engine, seed)| {
-                let spec = SubscriptionRequest {
-                    subscription_id: 1,
-                    consumer_id: 42,
-                    scope: SubscriptionScope::Durable,
-                    sql: realistic_tree_sql(seed),
-                    updated_at_unix_ms: 0,
-                };
+                let spec = SubscriptionRequest::new(42, realistic_tree_sql(seed));
                 black_box(engine.register(spec).unwrap());
             },
             criterion::BatchSize::SmallInput,
@@ -706,25 +685,13 @@ fn registration_benchmark(c: &mut Criterion) {
                 next_seed = next_seed.wrapping_add(1);
                 let shared_sql = realistic_tree_sql(seed);
                 engine
-                    .register(SubscriptionRequest {
-                        subscription_id: 1,
-                        consumer_id: 42,
-                        scope: SubscriptionScope::Durable,
-                        sql: shared_sql.clone(),
-                        updated_at_unix_ms: 0,
-                    })
+                    .register(SubscriptionRequest::new(42, shared_sql.clone()))
                     .unwrap();
 
                 (engine, shared_sql)
             },
             |(mut engine, shared_sql)| {
-                let spec = SubscriptionRequest {
-                    subscription_id: 2,
-                    consumer_id: 99,
-                    scope: SubscriptionScope::Durable,
-                    sql: shared_sql,
-                    updated_at_unix_ms: 0,
-                };
+                let spec = SubscriptionRequest::new(99, shared_sql);
                 black_box(engine.register(spec).unwrap());
             },
             criterion::BatchSize::SmallInput,
@@ -749,14 +716,9 @@ fn deduplication_benchmark(c: &mut Criterion) {
         // Register same realistic tree for 1000 users.
         let shared_sql = mixed_tree_sql(13_579);
         for i in 0_u64..1_000 {
-            let spec = SubscriptionRequest {
-                subscription_id: i,
-                consumer_id: i,
-                scope: SubscriptionScope::Durable,
-                sql: shared_sql.clone(),
-                updated_at_unix_ms: 0,
-            };
-            engine.register(spec).unwrap();
+            engine
+                .register(SubscriptionRequest::new(i, shared_sql.clone()))
+                .unwrap();
         }
 
         engine
@@ -783,14 +745,12 @@ fn deduplication_benchmark(c: &mut Criterion) {
 
         // Register unique realistic tree per user.
         for i in 0_u64..1_000 {
-            let spec = SubscriptionRequest {
-                subscription_id: i,
-                consumer_id: i,
-                scope: SubscriptionScope::Durable,
-                sql: realistic_tree_sql(mix_seed(i ^ 0xD1E5_EED0)),
-                updated_at_unix_ms: 0,
-            };
-            engine.register(spec).unwrap();
+            engine
+                .register(SubscriptionRequest::new(
+                    i,
+                    realistic_tree_sql(mix_seed(i ^ 0xD1E5_EED0)),
+                ))
+                .unwrap();
         }
 
         engine
