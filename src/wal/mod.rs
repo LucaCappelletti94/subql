@@ -111,7 +111,8 @@ pub(crate) fn skip_unknown_event_kind(
         Err(WalParseError::UnknownEventKind(kind)) => {
             #[cfg(feature = "observability")]
             tracing::warn!("{parser_name}: skipping unknown {token_name} '{kind}'");
-            drop(kind);
+            #[cfg(not(feature = "observability"))]
+            let _ = (&parser_name, &token_name, &kind);
             Ok(None)
         }
         Err(err) => Err(err),
