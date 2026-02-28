@@ -5531,9 +5531,10 @@ mod tests {
         assert!(notifs.updated.is_empty());
     }
 
-    /// Missing old_row for UPDATE → UpdateRequiresOldRow error.
+    /// Missing old_row for UPDATE → graceful degradation (single-eval fallback).
+    /// All matching consumers go to `updated` since we can't distinguish.
     #[test]
-    fn test_update_missing_old_row_errors() {
+    fn test_update_missing_old_row_falls_back() {
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
@@ -5559,16 +5560,16 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let result = engine.consumers(&event);
-        assert!(matches!(
-            result,
-            Err(DispatchError::UpdateRequiresOldRow(1))
-        ));
+        let notifs = engine.consumers(&event).unwrap();
+        // Fallback: all matches go to `updated`
+        assert!(notifs.inserted.is_empty());
+        assert!(notifs.deleted.is_empty());
+        assert_eq!(notifs.updated, vec![1]);
     }
 
-    /// Partial old_row (Cell::Missing) for UPDATE → UpdateRequiresOldRow error.
+    /// Partial old_row (Cell::Missing) for UPDATE → graceful degradation.
     #[test]
-    fn test_update_partial_old_row_errors() {
+    fn test_update_partial_old_row_falls_back() {
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
@@ -5596,11 +5597,11 @@ mod tests {
             changed_columns: Arc::from([1u16]),
         };
 
-        let result = engine.consumers(&event);
-        assert!(matches!(
-            result,
-            Err(DispatchError::UpdateRequiresOldRow(1))
-        ));
+        let notifs = engine.consumers(&event).unwrap();
+        // Fallback: all matches go to `updated`
+        assert!(notifs.inserted.is_empty());
+        assert!(notifs.deleted.is_empty());
+        assert_eq!(notifs.updated, vec![1]);
     }
 
     /// into_iter() yields inserted ∪ updated.

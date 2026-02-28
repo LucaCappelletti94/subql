@@ -75,10 +75,11 @@ pub enum DispatchError {
     )]
     AggregateUpdateRequiresOldRow(TableId),
 
-    /// UPDATE event requires a complete old_row for view-relative delta dispatch.
+    /// UPDATE event requires a complete old_row for exact view-relative delta dispatch.
     ///
-    /// Returned when `old_row` is `None` or contains `Cell::Missing`.
-    /// Callers must ensure REPLICA IDENTITY FULL is set on the source table.
+    /// Not returned by `consumers()` (which gracefully degrades to single-eval),
+    /// but available for callers who require exact three-way splits and want to
+    /// enforce REPLICA IDENTITY FULL at the application layer.
     #[error(
         "UPDATE on table {0} requires complete old_row — set REPLICA IDENTITY FULL on source table"
     )]

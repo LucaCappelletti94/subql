@@ -265,26 +265,46 @@ pub fn dispatch_consumers<I: IdTypes>(
     }
 }
 
+/// Returns `true` when `old_row` is present and complete (no `Cell::Missing`),
+/// meaning dual-eval is possible for view-relative UPDATE dispatch.
+fn old_row_is_complete(event: &WalEvent) -> bool {
+    event
+        .old_row
+        .as_ref()
+        .is_some_and(|row| !row.cells.iter().any(Cell::is_missing))
+}
+
 /// Dual-eval dispatch for UPDATE events: evaluates both old and new rows to
 /// produce view-relative `inserted` / `deleted` / `updated` sets.
+///
+/// When a complete `old_row` is available (REPLICA IDENTITY FULL), the three-way
+/// split is exact. When `old_row` is absent or partial, falls back to single-eval
+/// on `new_row` — all matches go to `updated` (conservative: we cannot prove they
+/// are new entries).
 fn dispatch_update<I: IdTypes>(
     event: &WalEvent,
     partition: &TablePartition<I>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
 ) -> Result<ConsumerNotifications<I>, DispatchError> {
-    // Hard error if old_row is absent.
+    let new_row = require_new_row(event, "UPDATE requires new_row")?;
+
+    // When old_row is missing or partial, fall back to single-eval on new_row.
+    // All matches go to `updated` (we can't distinguish entered vs stayed).
+    if !old_row_is_complete(event) {
+        let bitmap = dispatch_single_eval_bitmap(event, new_row, partition, vm)?;
+        return Ok(ConsumerNotifications {
+            inserted: Vec::new(),
+            deleted: Vec::new(),
+            updated: resolve_ordinals(bitmap, consumer_dict),
+        });
+    }
+
+    // Safety: old_row_is_complete guarantees old_row is Some with no Cell::Missing.
     let old_row = event
         .old_row
         .as_ref()
-        .ok_or(DispatchError::UpdateRequiresOldRow(event.table_id))?;
-
-    // Hard error if old_row contains Cell::Missing (partial old image).
-    if old_row.cells.iter().any(Cell::is_missing) {
-        return Err(DispatchError::UpdateRequiresOldRow(event.table_id));
-    }
-
-    let new_row = require_new_row(event, "UPDATE requires new_row")?;
+        .expect("checked by old_row_is_complete");
 
     // Use the UPDATE candidate set (dependency-aware).
     let candidates =
