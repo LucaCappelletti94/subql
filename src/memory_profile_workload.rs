@@ -278,7 +278,11 @@ pub fn run_memory_profile(show_progress: bool) {
     for i in 0_u64..1_000 {
         let event_idx_u64 = i % event_corpus_len_u64;
         let event_idx = usize::try_from(event_idx_u64).unwrap_or(0);
-        let user_count = engine.consumers(&event_corpus[event_idx]).unwrap().count();
+        let user_count = engine
+            .consumers(&event_corpus[event_idx])
+            .unwrap()
+            .into_iter()
+            .count();
 
         if show_progress && (i + 1) % 100 == 0 {
             println!(

@@ -483,7 +483,11 @@ fn dispatch_scaling_benchmark(c: &mut Criterion) {
                 b.iter(|| {
                     let event = &events[next_event_idx];
                     next_event_idx = (next_event_idx + 1) % events.len();
-                    let matched_consumers = engine.consumers(black_box(event)).unwrap().count();
+                    let matched_consumers = engine
+                        .consumers(black_box(event))
+                        .unwrap()
+                        .into_iter()
+                        .count();
                     black_box(matched_consumers);
                 });
             },
@@ -517,8 +521,11 @@ fn dispatch_kind_scaling_benchmark(c: &mut Criterion) {
                 b.iter(|| {
                     let event = &update_events[next_update_event_idx];
                     next_update_event_idx = (next_update_event_idx + 1) % update_events.len();
-                    let matched_consumers =
-                        update_engine.consumers(black_box(event)).unwrap().count();
+                    let matched_consumers = update_engine
+                        .consumers(black_box(event))
+                        .unwrap()
+                        .into_iter()
+                        .count();
                     black_box(matched_consumers);
                 });
             },
@@ -539,8 +546,11 @@ fn dispatch_kind_scaling_benchmark(c: &mut Criterion) {
                 b.iter(|| {
                     let event = &delete_events[next_delete_event_idx];
                     next_delete_event_idx = (next_delete_event_idx + 1) % delete_events.len();
-                    let matched_consumers =
-                        delete_engine.consumers(black_box(event)).unwrap().count();
+                    let matched_consumers = delete_engine
+                        .consumers(black_box(event))
+                        .unwrap()
+                        .into_iter()
+                        .count();
                     black_box(matched_consumers);
                 });
             },
@@ -579,7 +589,11 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let event = &equality_events[equality_event_idx];
             equality_event_idx = (equality_event_idx + 1) % equality_events.len();
-            let matched_consumers = equality_engine.consumers(black_box(event)).unwrap().count();
+            let matched_consumers = equality_engine
+                .consumers(black_box(event))
+                .unwrap()
+                .into_iter()
+                .count();
             black_box(matched_consumers);
         });
     });
@@ -605,7 +619,11 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let event = &range_events[range_event_idx];
             range_event_idx = (range_event_idx + 1) % range_events.len();
-            let matched_consumers = range_engine.consumers(black_box(event)).unwrap().count();
+            let matched_consumers = range_engine
+                .consumers(black_box(event))
+                .unwrap()
+                .into_iter()
+                .count();
             black_box(matched_consumers);
         });
     });
@@ -634,7 +652,11 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let event = &complex_events[complex_event_idx];
             complex_event_idx = (complex_event_idx + 1) % complex_events.len();
-            let matched_consumers = complex_engine.consumers(black_box(event)).unwrap().count();
+            let matched_consumers = complex_engine
+                .consumers(black_box(event))
+                .unwrap()
+                .into_iter()
+                .count();
             black_box(matched_consumers);
         });
     });
@@ -734,6 +756,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
             let matched_consumers = high_dedup_engine
                 .consumers(black_box(event))
                 .unwrap()
+                .into_iter()
                 .count();
             black_box(matched_consumers);
         });
@@ -766,6 +789,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
             let matched_consumers = low_dedup_engine
                 .consumers(black_box(event))
                 .unwrap()
+                .into_iter()
                 .count();
             black_box(matched_consumers);
         });
