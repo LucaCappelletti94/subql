@@ -1,6 +1,7 @@
 //! Core type definitions for subql
 
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::path::PathBuf;
@@ -244,6 +245,80 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_builder_success() {
+        let event = WalEvent::builder(7)
+            .insert()
+            .pk_cell(0, Cell::Int(1))
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::String("ok".into())]),
+            })
+            .build()
+            .expect("insert builder should succeed");
+
+        assert_eq!(event.kind(), EventKind::Insert);
+        assert_eq!(event.table_id(), 7);
+        assert_eq!(event.pk().columns(), &[0]);
+        assert_eq!(event.pk().values(), &[Cell::Int(1)]);
+        assert!(event.old_row().is_none());
+        assert!(event.new_row().is_some());
+    }
+
+    #[test]
+    fn test_insert_builder_missing_new_row() {
+        let err = WalEvent::builder(1)
+            .insert()
+            .pk_cell(0, Cell::Int(1))
+            .build()
+            .expect_err("insert without new_row must fail");
+        assert_eq!(err, WalEventBuildError::MissingNewRow);
+    }
+
+    #[test]
+    fn test_delete_builder_missing_old_row() {
+        let err = WalEvent::builder(1)
+            .delete()
+            .pk_cell(0, Cell::Int(1))
+            .build()
+            .expect_err("delete without old_row must fail");
+        assert_eq!(err, WalEventBuildError::MissingOldRow);
+    }
+
+    #[test]
+    fn test_update_builder_changed_columns_and_old_row() {
+        let event = WalEvent::builder(1)
+            .update()
+            .pk_cell(0, Cell::Int(1))
+            .old_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(10)]),
+            })
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(20)]),
+            })
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("update builder should succeed");
+
+        assert_eq!(event.kind(), EventKind::Update);
+        assert_eq!(event.changed_columns(), &[1]);
+        assert!(event.old_row().is_some());
+        assert!(event.new_row().is_some());
+    }
+
+    #[test]
+    fn test_builder_rejects_duplicate_pk_column() {
+        let err = WalEvent::builder(1)
+            .insert()
+            .pk_cell(0, Cell::Int(1))
+            .pk_cell(0, Cell::Int(2))
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1)]),
+            })
+            .build()
+            .expect_err("duplicate PK columns must fail");
+        assert_eq!(err, WalEventBuildError::DuplicatePkColumn(0));
+    }
+
+    #[test]
     fn subscription_scope_wire_compatible_with_option() {
         let none_bytes = crate::persistence::codec::serialize(&Option::<u64>::None).unwrap();
         let durable_bytes =
@@ -292,12 +367,56 @@ impl RowImage {
 #[derive(Clone, Debug)]
 pub struct PrimaryKey {
     /// Column IDs comprising the primary key
-    pub columns: Arc<[ColumnId]>,
+    pub(crate) columns: Arc<[ColumnId]>,
     /// Values of the primary key columns
-    pub values: Arc<[Cell]>,
+    pub(crate) values: Arc<[Cell]>,
+}
+
+/// Error returned when constructing an invalid [`PrimaryKey`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimaryKeyError {
+    columns_len: usize,
+    values_len: usize,
+}
+
+impl std::fmt::Display for PrimaryKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "primary key columns/values length mismatch: columns={}, values={}",
+            self.columns_len, self.values_len
+        )
+    }
+}
+
+impl std::error::Error for PrimaryKeyError {}
+
+impl PrimaryKeyError {
+    /// Number of column IDs in the invalid input.
+    #[must_use]
+    pub const fn columns_len(&self) -> usize {
+        self.columns_len
+    }
+
+    /// Number of values in the invalid input.
+    #[must_use]
+    pub const fn values_len(&self) -> usize {
+        self.values_len
+    }
 }
 
 impl PrimaryKey {
+    /// Create a validated primary key.
+    pub fn new(columns: Arc<[ColumnId]>, values: Arc<[Cell]>) -> Result<Self, PrimaryKeyError> {
+        if columns.len() != values.len() {
+            return Err(PrimaryKeyError {
+                columns_len: columns.len(),
+                values_len: values.len(),
+            });
+        }
+        Ok(Self { columns, values })
+    }
+
     /// Empty primary key (used when PK metadata is unavailable).
     #[must_use]
     pub fn empty() -> Self {
@@ -312,23 +431,467 @@ impl PrimaryKey {
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty() && self.values.is_empty()
     }
+
+    /// Number of key columns.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Primary-key column IDs.
+    #[must_use]
+    pub fn columns(&self) -> &[ColumnId] {
+        &self.columns
+    }
+
+    /// Primary-key values.
+    #[must_use]
+    pub fn values(&self) -> &[Cell] {
+        &self.values
+    }
 }
 
 /// WAL event from PostgreSQL CDC
 #[derive(Clone, Debug)]
-pub struct WalEvent {
-    /// Event type
-    pub kind: EventKind,
-    /// Table this event belongs to
-    pub table_id: TableId,
-    /// Primary key of affected row
-    pub pk: PrimaryKey,
-    /// Old row image (for UPDATE/DELETE)
-    pub old_row: Option<RowImage>,
-    /// New row image (for INSERT/UPDATE)
-    pub new_row: Option<RowImage>,
-    /// Columns that changed (for UPDATE optimization)
-    pub changed_columns: Arc<[ColumnId]>,
+pub enum WalEvent {
+    /// Row insertion.
+    Insert {
+        /// Table this event belongs to.
+        table_id: TableId,
+        /// Primary key of affected row.
+        pk: PrimaryKey,
+        /// New row image.
+        new_row: RowImage,
+    },
+    /// Row update.
+    Update {
+        /// Table this event belongs to.
+        table_id: TableId,
+        /// Primary key of affected row.
+        pk: PrimaryKey,
+        /// Old row image (may be missing from source CDC).
+        old_row: Option<RowImage>,
+        /// New row image.
+        new_row: RowImage,
+        /// Columns that changed (for UPDATE optimization).
+        changed_columns: Arc<[ColumnId]>,
+    },
+    /// Row deletion.
+    Delete {
+        /// Table this event belongs to.
+        table_id: TableId,
+        /// Primary key of affected row.
+        pk: PrimaryKey,
+        /// Old row image.
+        old_row: RowImage,
+    },
+    /// Table truncate.
+    Truncate {
+        /// Table this event belongs to.
+        table_id: TableId,
+    },
+}
+
+/// Errors returned by `WalEvent` fluent builders.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WalEventBuildError {
+    /// INSERT/UPDATE requires `new_row`.
+    MissingNewRow,
+    /// DELETE requires `old_row`.
+    MissingOldRow,
+    /// PK columns and values had different lengths.
+    MismatchedPkLengths {
+        /// Number of PK columns.
+        columns_len: usize,
+        /// Number of PK values.
+        values_len: usize,
+    },
+    /// Duplicate PK column ID was provided.
+    DuplicatePkColumn(ColumnId),
+    /// A field was configured for an incompatible event kind.
+    FieldNotAllowedForKind(&'static str),
+}
+
+impl std::fmt::Display for WalEventBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingNewRow => write!(f, "missing required field: new_row"),
+            Self::MissingOldRow => write!(f, "missing required field: old_row"),
+            Self::MismatchedPkLengths {
+                columns_len,
+                values_len,
+            } => {
+                write!(
+                    f,
+                    "primary key columns/values length mismatch: columns={}, values={}",
+                    columns_len, values_len
+                )
+            }
+            Self::DuplicatePkColumn(col) => write!(f, "duplicate primary key column: {col}"),
+            Self::FieldNotAllowedForKind(field) => {
+                write!(f, "field '{field}' is not allowed for this event kind")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WalEventBuildError {}
+
+/// Start of fluent `WalEvent` construction.
+#[derive(Clone, Debug)]
+pub struct WalEventBuilderStart {
+    table_id: TableId,
+}
+
+/// Fluent builder for [`WalEvent::Insert`].
+#[derive(Clone, Debug)]
+pub struct InsertEventBuilder {
+    table_id: TableId,
+    pk_columns: Vec<ColumnId>,
+    pk_values: Vec<Cell>,
+    new_row: Option<RowImage>,
+}
+
+/// Fluent builder for [`WalEvent::Update`].
+#[derive(Clone, Debug)]
+pub struct UpdateEventBuilder {
+    table_id: TableId,
+    pk_columns: Vec<ColumnId>,
+    pk_values: Vec<Cell>,
+    old_row: Option<RowImage>,
+    new_row: Option<RowImage>,
+    changed_columns: Arc<[ColumnId]>,
+}
+
+/// Fluent builder for [`WalEvent::Delete`].
+#[derive(Clone, Debug)]
+pub struct DeleteEventBuilder {
+    table_id: TableId,
+    pk_columns: Vec<ColumnId>,
+    pk_values: Vec<Cell>,
+    old_row: Option<RowImage>,
+}
+
+/// Fluent builder for [`WalEvent::Truncate`].
+#[derive(Clone, Debug)]
+pub struct TruncateEventBuilder {
+    table_id: TableId,
+}
+
+fn build_primary_key(
+    columns: Vec<ColumnId>,
+    values: Vec<Cell>,
+) -> Result<PrimaryKey, WalEventBuildError> {
+    if columns.len() != values.len() {
+        return Err(WalEventBuildError::MismatchedPkLengths {
+            columns_len: columns.len(),
+            values_len: values.len(),
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for col in &columns {
+        if !seen.insert(*col) {
+            return Err(WalEventBuildError::DuplicatePkColumn(*col));
+        }
+    }
+    PrimaryKey::new(Arc::from(columns), Arc::from(values)).map_err(|e| {
+        WalEventBuildError::MismatchedPkLengths {
+            columns_len: e.columns_len(),
+            values_len: e.values_len(),
+        }
+    })
+}
+
+fn apply_pk(columns: &mut Vec<ColumnId>, values: &mut Vec<Cell>, pk: PrimaryKey) {
+    columns.clear();
+    values.clear();
+    for (&col, value) in pk.columns().iter().zip(pk.values().iter()) {
+        columns.push(col);
+        values.push(value.clone());
+    }
+}
+
+impl WalEventBuilderStart {
+    /// Start building an INSERT event.
+    #[must_use]
+    pub fn insert(self) -> InsertEventBuilder {
+        InsertEventBuilder {
+            table_id: self.table_id,
+            pk_columns: Vec::new(),
+            pk_values: Vec::new(),
+            new_row: None,
+        }
+    }
+
+    /// Start building an UPDATE event.
+    #[must_use]
+    pub fn update(self) -> UpdateEventBuilder {
+        UpdateEventBuilder {
+            table_id: self.table_id,
+            pk_columns: Vec::new(),
+            pk_values: Vec::new(),
+            old_row: None,
+            new_row: None,
+            changed_columns: Arc::from([]),
+        }
+    }
+
+    /// Start building a DELETE event.
+    #[must_use]
+    pub fn delete(self) -> DeleteEventBuilder {
+        DeleteEventBuilder {
+            table_id: self.table_id,
+            pk_columns: Vec::new(),
+            pk_values: Vec::new(),
+            old_row: None,
+        }
+    }
+
+    /// Start building a TRUNCATE event.
+    #[must_use]
+    pub fn truncate(self) -> TruncateEventBuilder {
+        TruncateEventBuilder {
+            table_id: self.table_id,
+        }
+    }
+}
+
+impl InsertEventBuilder {
+    /// Set primary key from a prebuilt value.
+    #[must_use]
+    pub fn pk(mut self, pk: PrimaryKey) -> Self {
+        apply_pk(&mut self.pk_columns, &mut self.pk_values, pk);
+        self
+    }
+
+    /// Append one PK `(column, value)` pair.
+    #[must_use]
+    pub fn pk_cell(mut self, column: ColumnId, value: Cell) -> Self {
+        self.pk_columns.push(column);
+        self.pk_values.push(value);
+        self
+    }
+
+    /// Append multiple PK `(column, value)` pairs.
+    #[must_use]
+    pub fn pk_cells(mut self, pairs: impl IntoIterator<Item = (ColumnId, Cell)>) -> Self {
+        for (column, value) in pairs {
+            self.pk_columns.push(column);
+            self.pk_values.push(value);
+        }
+        self
+    }
+
+    /// Set full new-row image.
+    #[must_use]
+    pub fn new_row(mut self, row: RowImage) -> Self {
+        self.new_row = Some(row);
+        self
+    }
+
+    /// Build the insert event.
+    pub fn build(self) -> Result<WalEvent, WalEventBuildError> {
+        let new_row = self.new_row.ok_or(WalEventBuildError::MissingNewRow)?;
+        let pk = build_primary_key(self.pk_columns, self.pk_values)?;
+        Ok(WalEvent::Insert {
+            table_id: self.table_id,
+            pk,
+            new_row,
+        })
+    }
+}
+
+impl UpdateEventBuilder {
+    /// Set primary key from a prebuilt value.
+    #[must_use]
+    pub fn pk(mut self, pk: PrimaryKey) -> Self {
+        apply_pk(&mut self.pk_columns, &mut self.pk_values, pk);
+        self
+    }
+
+    /// Append one PK `(column, value)` pair.
+    #[must_use]
+    pub fn pk_cell(mut self, column: ColumnId, value: Cell) -> Self {
+        self.pk_columns.push(column);
+        self.pk_values.push(value);
+        self
+    }
+
+    /// Append multiple PK `(column, value)` pairs.
+    #[must_use]
+    pub fn pk_cells(mut self, pairs: impl IntoIterator<Item = (ColumnId, Cell)>) -> Self {
+        for (column, value) in pairs {
+            self.pk_columns.push(column);
+            self.pk_values.push(value);
+        }
+        self
+    }
+
+    /// Set old row image.
+    #[must_use]
+    pub fn old_row(mut self, old_row: RowImage) -> Self {
+        self.old_row = Some(old_row);
+        self
+    }
+
+    /// Set old row image directly (including `None`).
+    #[must_use]
+    pub fn maybe_old_row(mut self, old_row: Option<RowImage>) -> Self {
+        self.old_row = old_row;
+        self
+    }
+
+    /// Set full new-row image.
+    #[must_use]
+    pub fn new_row(mut self, row: RowImage) -> Self {
+        self.new_row = Some(row);
+        self
+    }
+
+    /// Set changed columns.
+    #[must_use]
+    pub fn changed_columns(mut self, changed_columns: Arc<[ColumnId]>) -> Self {
+        self.changed_columns = changed_columns;
+        self
+    }
+
+    /// Build the update event.
+    pub fn build(self) -> Result<WalEvent, WalEventBuildError> {
+        let new_row = self.new_row.ok_or(WalEventBuildError::MissingNewRow)?;
+        let pk = build_primary_key(self.pk_columns, self.pk_values)?;
+        Ok(WalEvent::Update {
+            table_id: self.table_id,
+            pk,
+            old_row: self.old_row,
+            new_row,
+            changed_columns: self.changed_columns,
+        })
+    }
+}
+
+impl DeleteEventBuilder {
+    /// Set primary key from a prebuilt value.
+    #[must_use]
+    pub fn pk(mut self, pk: PrimaryKey) -> Self {
+        apply_pk(&mut self.pk_columns, &mut self.pk_values, pk);
+        self
+    }
+
+    /// Append one PK `(column, value)` pair.
+    #[must_use]
+    pub fn pk_cell(mut self, column: ColumnId, value: Cell) -> Self {
+        self.pk_columns.push(column);
+        self.pk_values.push(value);
+        self
+    }
+
+    /// Append multiple PK `(column, value)` pairs.
+    #[must_use]
+    pub fn pk_cells(mut self, pairs: impl IntoIterator<Item = (ColumnId, Cell)>) -> Self {
+        for (column, value) in pairs {
+            self.pk_columns.push(column);
+            self.pk_values.push(value);
+        }
+        self
+    }
+
+    /// Set full old-row image.
+    #[must_use]
+    pub fn old_row(mut self, row: RowImage) -> Self {
+        self.old_row = Some(row);
+        self
+    }
+
+    /// Build the delete event.
+    pub fn build(self) -> Result<WalEvent, WalEventBuildError> {
+        let old_row = self.old_row.ok_or(WalEventBuildError::MissingOldRow)?;
+        let pk = build_primary_key(self.pk_columns, self.pk_values)?;
+        Ok(WalEvent::Delete {
+            table_id: self.table_id,
+            pk,
+            old_row,
+        })
+    }
+}
+
+impl TruncateEventBuilder {
+    /// Build the truncate event.
+    pub fn build(self) -> Result<WalEvent, WalEventBuildError> {
+        Ok(WalEvent::Truncate {
+            table_id: self.table_id,
+        })
+    }
+}
+
+impl WalEvent {
+    /// Start fluent construction for a WAL event.
+    #[must_use]
+    pub fn builder(table_id: TableId) -> WalEventBuilderStart {
+        WalEventBuilderStart { table_id }
+    }
+
+    /// Event kind.
+    #[must_use]
+    pub const fn kind(&self) -> EventKind {
+        match self {
+            Self::Insert { .. } => EventKind::Insert,
+            Self::Update { .. } => EventKind::Update,
+            Self::Delete { .. } => EventKind::Delete,
+            Self::Truncate { .. } => EventKind::Truncate,
+        }
+    }
+
+    /// Table ID associated with this event.
+    #[must_use]
+    pub const fn table_id(&self) -> TableId {
+        match self {
+            Self::Insert { table_id, .. }
+            | Self::Update { table_id, .. }
+            | Self::Delete { table_id, .. }
+            | Self::Truncate { table_id } => *table_id,
+        }
+    }
+
+    /// Primary key for row-level events. Truncate returns an empty key.
+    #[must_use]
+    pub fn pk(&self) -> &PrimaryKey {
+        static EMPTY_PK: std::sync::LazyLock<PrimaryKey> =
+            std::sync::LazyLock::new(PrimaryKey::empty);
+        match self {
+            Self::Insert { pk, .. } | Self::Update { pk, .. } | Self::Delete { pk, .. } => pk,
+            Self::Truncate { .. } => &EMPTY_PK,
+        }
+    }
+
+    /// Old row image if present.
+    #[must_use]
+    pub fn old_row(&self) -> Option<&RowImage> {
+        match self {
+            Self::Update { old_row, .. } => old_row.as_ref(),
+            Self::Delete { old_row, .. } => Some(old_row),
+            Self::Insert { .. } | Self::Truncate { .. } => None,
+        }
+    }
+
+    /// New row image if present.
+    #[must_use]
+    pub fn new_row(&self) -> Option<&RowImage> {
+        match self {
+            Self::Insert { new_row, .. } | Self::Update { new_row, .. } => Some(new_row),
+            Self::Delete { .. } | Self::Truncate { .. } => None,
+        }
+    }
+
+    /// Columns changed by the update.
+    #[must_use]
+    pub fn changed_columns(&self) -> &[ColumnId] {
+        match self {
+            Self::Update {
+                changed_columns, ..
+            } => changed_columns,
+            Self::Insert { .. } | Self::Delete { .. } | Self::Truncate { .. } => &[],
+        }
+    }
 }
 
 // ============================================================================
@@ -579,13 +1142,13 @@ pub enum AggDelta {
 pub struct ConsumerNotifications<I: IdTypes> {
     /// Consumers for whom a row appeared in their result set.
     /// (Base INSERT, or base UPDATE where new row matches but old didn't.)
-    pub inserted: Vec<I::ConsumerId>,
+    pub(crate) inserted: Vec<I::ConsumerId>,
     /// Consumers for whom a row disappeared from their result set.
     /// (Base DELETE, or base UPDATE where old row matched but new doesn't.)
-    pub deleted: Vec<I::ConsumerId>,
+    pub(crate) deleted: Vec<I::ConsumerId>,
     /// Consumers for whom a row changed but remained in their result set.
     /// (Base UPDATE where both old and new rows match.)
-    pub updated: Vec<I::ConsumerId>,
+    pub(crate) updated: Vec<I::ConsumerId>,
 }
 
 impl<I: IdTypes> ConsumerNotifications<I> {
@@ -597,6 +1160,44 @@ impl<I: IdTypes> ConsumerNotifications<I> {
             deleted: Vec::new(),
             updated: Vec::new(),
         }
+    }
+
+    /// Construct notifications from explicit buckets.
+    #[must_use]
+    pub(crate) fn from_parts(
+        inserted: Vec<I::ConsumerId>,
+        deleted: Vec<I::ConsumerId>,
+        updated: Vec<I::ConsumerId>,
+    ) -> Self {
+        Self {
+            inserted,
+            deleted,
+            updated,
+        }
+    }
+
+    /// Consumers notified as inserted.
+    #[must_use]
+    pub fn inserted(&self) -> &[I::ConsumerId] {
+        &self.inserted
+    }
+
+    /// Consumers notified as deleted.
+    #[must_use]
+    pub fn deleted(&self) -> &[I::ConsumerId] {
+        &self.deleted
+    }
+
+    /// Consumers notified as updated.
+    #[must_use]
+    pub fn updated(&self) -> &[I::ConsumerId] {
+        &self.updated
+    }
+
+    /// Decompose into `(inserted, deleted, updated)`.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<I::ConsumerId>, Vec<I::ConsumerId>, Vec<I::ConsumerId>) {
+        (self.inserted, self.deleted, self.updated)
     }
 }
 
