@@ -148,22 +148,22 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Insert);
-        assert_eq!(ev.table_id, 1);
+        assert_eq!(ev.kind(), EventKind::Insert);
+        assert_eq!(ev.table_id(), 1);
 
-        let new = ev.new_row.as_ref().expect("INSERT should have new_row");
+        let new = ev.new_row().expect("INSERT should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::Float(99.95)));
         assert_eq!(new.get(2), Some(&Cell::String(Arc::from("new"))));
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("rush"))));
 
-        assert!(ev.old_row.is_none());
+        assert!(ev.old_row().is_none());
 
         // PK from catalog
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
 
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -185,9 +185,9 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Insert);
-        assert!(ev.new_row.is_some());
-        assert!(ev.old_row.is_none());
+        assert_eq!(ev.kind(), EventKind::Insert);
+        assert!(ev.new_row().is_some());
+        assert!(ev.old_row().is_none());
     }
 
     // -- UPDATE tests -------------------------------------------------------
@@ -211,18 +211,18 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
 
-        let new = ev.new_row.as_ref().expect("UPDATE should have new_row");
+        let new = ev.new_row().expect("UPDATE should have new_row");
         assert_eq!(new.get(1), Some(&Cell::Float(149.99)));
         assert_eq!(new.get(2), Some(&Cell::String(Arc::from("shipped"))));
 
-        let old = ev.old_row.as_ref().expect("UPDATE should have old_row");
+        let old = ev.old_row().expect("UPDATE should have old_row");
         assert_eq!(old.get(1), Some(&Cell::Float(99.95)));
         assert_eq!(old.get(2), Some(&Cell::String(Arc::from("new"))));
 
         // changed_columns: amount(1) and status(2) differ
-        let changed: Vec<ColumnId> = ev.changed_columns.to_vec();
+        let changed: Vec<ColumnId> = ev.changed_columns().to_vec();
         assert!(changed.contains(&1), "amount should be changed");
         assert!(changed.contains(&2), "status should be changed");
         assert!(!changed.contains(&0), "id should NOT be changed");
@@ -247,10 +247,10 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
-        assert!(ev.new_row.is_some());
-        assert!(ev.old_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert_eq!(ev.kind(), EventKind::Update);
+        assert!(ev.new_row().is_some());
+        assert!(ev.old_row().is_none());
+        assert!(ev.changed_columns().is_empty());
     }
 
     // -- DELETE tests -------------------------------------------------------
@@ -274,17 +274,17 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Delete);
-        assert!(ev.new_row.is_none());
+        assert_eq!(ev.kind(), EventKind::Delete);
+        assert!(ev.new_row().is_none());
 
-        let old = ev.old_row.as_ref().expect("DELETE should have old_row");
+        let old = ev.old_row().expect("DELETE should have old_row");
         assert_eq!(old.get(0), Some(&Cell::Int(1)));
 
         // PK from catalog
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
 
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -306,12 +306,12 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Truncate);
-        assert_eq!(ev.table_id, 1);
-        assert!(ev.pk.is_empty());
-        assert!(ev.old_row.is_none());
-        assert!(ev.new_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert_eq!(ev.kind(), EventKind::Truncate);
+        assert_eq!(ev.table_id(), 1);
+        assert!(ev.pk().is_empty());
+        assert!(ev.old_row().is_none());
+        assert!(ev.new_row().is_none());
+        assert!(ev.changed_columns().is_empty());
     }
 
     // -- Edge cases ----------------------------------------------------------
@@ -333,7 +333,7 @@ mod tests {
             .parse_wal_message(json.as_bytes(), &catalog)
             .expect("parse should succeed");
 
-        let new = events[0].new_row.as_ref().expect("should have new_row");
+        let new = events[0].new_row().expect("should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::Null));
         assert_eq!(new.get(2), Some(&Cell::Null));
@@ -359,8 +359,8 @@ mod tests {
 
         let ev = &events[0];
         // No PK source → empty PK
-        assert!(ev.pk.columns.is_empty());
-        assert!(ev.pk.values.is_empty());
+        assert!(ev.pk().columns.is_empty());
+        assert!(ev.pk().values.is_empty());
     }
 
     // -- Error paths ---------------------------------------------------------
@@ -605,9 +605,9 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
         // PK must come from the pre-update (before) row: id = 1
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
-        assert_eq!(ev.pk.columns.as_ref(), &[0u16]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0u16]);
     }
 }

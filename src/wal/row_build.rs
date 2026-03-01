@@ -182,10 +182,10 @@ where
         pk_vals.push(value_to_cell(value, ty, name)?);
     }
 
-    Ok(crate::PrimaryKey {
-        columns: Arc::from(pk_cols),
-        values: Arc::from(pk_vals),
-    })
+    Ok(
+        crate::PrimaryKey::new(Arc::from(pk_cols), Arc::from(pk_vals))
+            .expect("pk columns and values are built in lockstep"),
+    )
 }
 
 #[cfg(test)]

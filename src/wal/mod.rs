@@ -55,9 +55,9 @@ pub trait WalParser: Send + Sync {
     ///
     /// let events = parser.parse_wal_message(message.as_bytes(), &catalog)?;
     /// assert_eq!(events.len(), 1);
-    /// assert_eq!(events[0].kind, EventKind::Insert);
+    /// assert_eq!(events[0].kind(), EventKind::Insert);
     /// assert_eq!(
-    ///     events[0].new_row.as_ref().and_then(|row| row.get(1)),
+    ///     events[0].new_row().as_ref().and_then(|row| row.get(1)),
     ///     Some(&Cell::String("paid".into()))
     /// );
     /// # Ok::<(), WalParseError>(())
@@ -243,10 +243,8 @@ pub(crate) fn build_pk_from_resolved(
         }
     }
 
-    PrimaryKey {
-        columns: std::sync::Arc::from(columns),
-        values: std::sync::Arc::from(values),
-    }
+    PrimaryKey::new(std::sync::Arc::from(columns), std::sync::Arc::from(values))
+        .expect("pk columns and values are built in lockstep")
 }
 
 /// Build a [`PrimaryKey`] from resolved column/value pairs, requiring every
@@ -280,10 +278,10 @@ pub(crate) fn build_pk_from_resolved_strict(
         values.push(cell.clone());
     }
 
-    Ok(PrimaryKey {
-        columns: std::sync::Arc::from(columns),
-        values: std::sync::Arc::from(values),
-    })
+    Ok(
+        PrimaryKey::new(std::sync::Arc::from(columns), std::sync::Arc::from(values))
+            .expect("strict PK construction pushes columns and values in lockstep"),
+    )
 }
 
 /// Resolve PK metadata names to column IDs and require each resolved PK column
@@ -362,15 +360,17 @@ pub(crate) fn old_row_is_complete(old_row: Option<&RowImage>) -> bool {
 }
 
 /// Build INSERT event with consistent defaults.
-pub(crate) fn insert_event(table_id: TableId, pk: PrimaryKey, new_row: RowImage) -> WalEvent {
-    WalEvent {
-        kind: EventKind::Insert,
-        table_id,
-        pk,
-        old_row: None,
-        new_row: Some(new_row),
-        changed_columns: std::sync::Arc::from([]),
-    }
+pub(crate) fn insert_event(
+    table_id: TableId,
+    pk: PrimaryKey,
+    new_row: RowImage,
+) -> Result<WalEvent, WalParseError> {
+    WalEvent::builder(table_id)
+        .insert()
+        .pk(pk)
+        .new_row(new_row)
+        .build()
+        .map_err(|e| WalParseError::MalformedPayload(format!("invalid insert event: {e}")))
 }
 
 /// Build UPDATE event while allowing parsers to disable changed-column
@@ -390,38 +390,36 @@ pub(crate) fn update_event_with_old_row_completeness(
         Vec::new()
     };
 
-    WalEvent {
-        kind: EventKind::Update,
-        table_id,
-        pk,
-        old_row,
-        new_row: Some(new_row),
-        changed_columns: std::sync::Arc::from(changed),
-    }
+    WalEvent::builder(table_id)
+        .update()
+        .pk(pk)
+        .new_row(new_row)
+        .maybe_old_row(old_row)
+        .changed_columns(std::sync::Arc::from(changed))
+        .build()
+        .expect("update_event_with_old_row_completeness should build valid update events")
 }
 
 /// Build DELETE event with consistent defaults.
-pub(crate) fn delete_event(table_id: TableId, pk: PrimaryKey, old_row: RowImage) -> WalEvent {
-    WalEvent {
-        kind: EventKind::Delete,
-        table_id,
-        pk,
-        old_row: Some(old_row),
-        new_row: None,
-        changed_columns: std::sync::Arc::from([]),
-    }
+pub(crate) fn delete_event(
+    table_id: TableId,
+    pk: PrimaryKey,
+    old_row: RowImage,
+) -> Result<WalEvent, WalParseError> {
+    WalEvent::builder(table_id)
+        .delete()
+        .pk(pk)
+        .old_row(old_row)
+        .build()
+        .map_err(|e| WalParseError::MalformedPayload(format!("invalid delete event: {e}")))
 }
 
 /// Build TRUNCATE event with consistent defaults.
-pub(crate) fn truncate_event(table_id: TableId) -> WalEvent {
-    WalEvent {
-        kind: EventKind::Truncate,
-        table_id,
-        pk: PrimaryKey::empty(),
-        old_row: None,
-        new_row: None,
-        changed_columns: std::sync::Arc::from([]),
-    }
+pub(crate) fn truncate_event(table_id: TableId) -> Result<WalEvent, WalParseError> {
+    WalEvent::builder(table_id)
+        .truncate()
+        .build()
+        .map_err(|e| WalParseError::MalformedPayload(format!("invalid truncate event: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -439,7 +437,7 @@ pub(crate) fn build_event_from_rows(
         EventKind::Insert => {
             let new_row = new_row
                 .ok_or_else(|| WalParseError::MissingField(missing_new_field.to_string()))?;
-            Ok(insert_event(table_id, pk, new_row))
+            insert_event(table_id, pk, new_row)
         }
         EventKind::Update => {
             let new_row = new_row
@@ -455,9 +453,9 @@ pub(crate) fn build_event_from_rows(
         EventKind::Delete => {
             let old_row = old_row
                 .ok_or_else(|| WalParseError::MissingField(missing_old_field.to_string()))?;
-            Ok(delete_event(table_id, pk, old_row))
+            delete_event(table_id, pk, old_row)
         }
-        EventKind::Truncate => Ok(truncate_event(table_id)),
+        EventKind::Truncate => truncate_event(table_id),
     }
 }
 
@@ -608,7 +606,9 @@ mod tests {
     #[test]
     fn test_parse_single_json_event_tombstone_returns_empty() {
         let events = parse_single_json_event::<serde_json::Value, _>(b"null", |_| {
-            Ok(Some(truncate_event(1)))
+            Ok(Some(
+                truncate_event(1).expect("truncate_event helper should build valid event"),
+            ))
         })
         .expect("tombstone should be ignored");
         assert!(events.is_empty());
@@ -617,11 +617,13 @@ mod tests {
     #[test]
     fn test_parse_single_json_event_wraps_one_event() {
         let events = parse_single_json_event::<serde_json::Value, _>(br#"{"x":1}"#, |_| {
-            Ok(Some(truncate_event(7)))
+            Ok(Some(
+                truncate_event(7).expect("truncate_event helper should build valid event"),
+            ))
         })
         .expect("object should parse");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].table_id, 7);
-        assert_eq!(events[0].kind, EventKind::Truncate);
+        assert_eq!(events[0].table_id(), 7);
+        assert_eq!(events[0].kind(), EventKind::Truncate);
     }
 }

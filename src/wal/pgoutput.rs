@@ -538,7 +538,7 @@ impl PgOutputParser {
         let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel, true)?;
         let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?;
 
-        Ok(insert_event(rel.table_id, pk, new_row))
+        Ok(insert_event(rel.table_id, pk, new_row)?)
     }
 
     /// Handle Update message.
@@ -620,7 +620,7 @@ impl PgOutputParser {
         // PK from identity columns
         let pk = Self::pk_from_old_resolved(&rel, &old_resolved)?;
 
-        Ok(delete_event(rel.table_id, pk, old_row))
+        Ok(delete_event(rel.table_id, pk, old_row)?)
     }
 
     /// Handle Truncate message.
@@ -636,7 +636,7 @@ impl PgOutputParser {
                 Err(WalParseError::UnknownRelationOid(_)) => continue,
                 Err(e) => return Err(e),
             };
-            events.push(truncate_event(rel.table_id));
+            events.push(truncate_event(rel.table_id)?);
         }
 
         Ok(events)
@@ -880,22 +880,22 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Insert);
-        assert_eq!(ev.table_id, 1);
+        assert_eq!(ev.kind(), EventKind::Insert);
+        assert_eq!(ev.table_id(), 1);
 
-        let new = ev.new_row.as_ref().expect("INSERT should have new_row");
+        let new = ev.new_row().expect("INSERT should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::String(Arc::from("alice"))));
         assert_eq!(new.get(2), Some(&Cell::Float(99.95)));
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("pending"))));
 
-        assert!(ev.old_row.is_none());
+        assert!(ev.old_row().is_none());
 
         // PK from catalog
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
 
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -1013,14 +1013,14 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
 
-        assert!(ev.new_row.is_some());
-        assert!(ev.old_row.is_some());
+        assert!(ev.new_row().is_some());
+        assert!(ev.old_row().is_some());
 
         // PK from identity column (id, flags=1)
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
     }
 
     #[test]
@@ -1053,10 +1053,10 @@ mod tests {
         assert_eq!(events.len(), 1);
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
-        assert!(ev.old_row.is_some());
+        assert_eq!(ev.kind(), EventKind::Update);
+        assert!(ev.old_row().is_some());
         assert!(
-            ev.changed_columns.is_empty(),
+            ev.changed_columns().is_empty(),
             "partial key tuple must disable changed-columns pruning"
         );
     }
@@ -1096,9 +1096,9 @@ mod tests {
             .expect("sparse key tuple should map onto identity columns");
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
-        assert_eq!(ev.pk.columns.as_ref(), &[1]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::String(Arc::from("alice"))]);
+        assert_eq!(ev.kind(), EventKind::Update);
+        assert_eq!(ev.pk().columns.as_ref(), &[1]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::String(Arc::from("alice"))]);
     }
 
     // -- Test 3: Update with 'O' full old row (FULL replica identity) --------
@@ -1142,18 +1142,18 @@ mod tests {
             .expect("update should parse");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
 
-        let old = ev.old_row.as_ref().expect("should have old_row");
+        let old = ev.old_row().expect("should have old_row");
         assert_eq!(old.get(0), Some(&Cell::Int(1)));
         assert_eq!(old.get(2), Some(&Cell::Float(99.95)));
 
-        let new = ev.new_row.as_ref().expect("should have new_row");
+        let new = ev.new_row().expect("should have new_row");
         assert_eq!(new.get(2), Some(&Cell::Float(149.95)));
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("shipped"))));
 
         // PK from identity columns (all marked)
-        assert_eq!(ev.pk.columns.as_ref(), &[0, 1, 2, 3]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0, 1, 2, 3]);
     }
 
     // -- Test 4: Update without old tuple ------------------------------------
@@ -1183,13 +1183,13 @@ mod tests {
             .expect("update should parse");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
-        assert!(ev.old_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert_eq!(ev.kind(), EventKind::Update);
+        assert!(ev.old_row().is_none());
+        assert!(ev.changed_columns().is_empty());
 
         // PK from catalog (no old row)
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
     }
 
     // -- Test 5: Delete with 'K' key ----------------------------------------
@@ -1221,15 +1221,15 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Delete);
-        assert!(ev.new_row.is_none());
-        assert!(ev.old_row.is_some());
+        assert_eq!(ev.kind(), EventKind::Delete);
+        assert!(ev.new_row().is_none());
+        assert!(ev.old_row().is_some());
 
         // PK from identity column
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(42)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(42)]);
 
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -1256,9 +1256,9 @@ mod tests {
             .expect("sparse key tuple should map onto identity columns");
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Delete);
-        assert_eq!(ev.pk.columns.as_ref(), &[1]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::String(Arc::from("bob"))]);
+        assert_eq!(ev.kind(), EventKind::Delete);
+        assert_eq!(ev.pk().columns.as_ref(), &[1]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::String(Arc::from("bob"))]);
     }
 
     // -- Test 6: Delete with 'O' full old row --------------------------------
@@ -1289,15 +1289,15 @@ mod tests {
             .expect("delete should parse");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Delete);
+        assert_eq!(ev.kind(), EventKind::Delete);
 
-        let old = ev.old_row.as_ref().expect("should have old_row");
+        let old = ev.old_row().expect("should have old_row");
         assert_eq!(old.get(0), Some(&Cell::Int(42)));
         assert_eq!(old.get(1), Some(&Cell::String(Arc::from("bob"))));
 
         // PK from identity column (id)
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(42)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(42)]);
     }
 
     // -- Test 7: Metadata messages return empty vec --------------------------
@@ -1348,12 +1348,12 @@ mod tests {
             .expect("truncate should parse");
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Truncate);
-        assert_eq!(ev.table_id, 1);
-        assert!(ev.pk.is_empty());
-        assert!(ev.old_row.is_none());
-        assert!(ev.new_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert_eq!(ev.kind(), EventKind::Truncate);
+        assert_eq!(ev.table_id(), 1);
+        assert!(ev.pk().is_empty());
+        assert!(ev.old_row().is_none());
+        assert!(ev.new_row().is_none());
+        assert!(ev.changed_columns().is_empty());
     }
 
     // -- Test 8: Empty input returns empty vec --------------------------------
@@ -1470,7 +1470,7 @@ mod tests {
             .parse_wal_message(&insert_msg, &catalog)
             .expect("insert should parse");
 
-        let new = events[0].new_row.as_ref().expect("should have new_row");
+        let new = events[0].new_row().expect("should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::Null));
         assert_eq!(new.get(2), Some(&Cell::Null));
@@ -1515,10 +1515,10 @@ mod tests {
             .expect("update should parse");
 
         let ev = &events[0];
-        let old = ev.old_row.as_ref().expect("should have old_row");
+        let old = ev.old_row().expect("should have old_row");
         assert_eq!(old.get(1), Some(&Cell::Missing)); // unchanged TOAST in old is ok
 
-        let new = ev.new_row.as_ref().expect("should have new_row");
+        let new = ev.new_row().expect("should have new_row");
         assert_eq!(new.get(1), Some(&Cell::String(Arc::from("alice"))));
         assert_eq!(new.get(2), Some(&Cell::Float(200.0)));
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("shipped"))));
@@ -1557,7 +1557,7 @@ mod tests {
             .parse_wal_message(&insert_msg, &catalog)
             .expect("insert should parse");
 
-        let new = events[0].new_row.as_ref().expect("should have new_row");
+        let new = events[0].new_row().expect("should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(42)));
         assert_eq!(new.get(1), Some(&Cell::String(Arc::from("bob"))));
         assert_eq!(new.get(2), Some(&Cell::Float(3.15)));
@@ -1637,7 +1637,7 @@ mod tests {
             .expect("update should parse");
 
         let ev = &events[0];
-        let changed: Vec<ColumnId> = ev.changed_columns.to_vec();
+        let changed: Vec<ColumnId> = ev.changed_columns().to_vec();
         assert!(changed.contains(&2), "amount should be changed");
         assert!(changed.contains(&3), "status should be changed");
         assert!(!changed.contains(&0), "id should NOT be changed");
@@ -1692,8 +1692,8 @@ mod tests {
             .expect("insert should parse");
 
         let ev = &events[0];
-        assert!(ev.pk.columns.is_empty());
-        assert!(ev.pk.values.is_empty());
+        assert!(ev.pk().columns.is_empty());
+        assert!(ev.pk().values.is_empty());
     }
 
     // -- Test: Truncated relation message ------------------------------------
@@ -1747,7 +1747,7 @@ mod tests {
 
         let ev = &events[0];
         // All columns used as PK since no identity columns
-        assert_eq!(ev.pk.columns.len(), 4);
+        assert_eq!(ev.pk().columns.len(), 4);
     }
 
     #[test]
@@ -1821,8 +1821,8 @@ mod tests {
             .expect("update should parse");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
-        assert_eq!(ev.pk.columns.len(), 4);
+        assert_eq!(ev.kind(), EventKind::Update);
+        assert_eq!(ev.pk().columns.len(), 4);
     }
 
     #[test]
@@ -2163,9 +2163,9 @@ mod tests {
             .expect("truncate with one unknown OID should succeed");
 
         assert_eq!(events.len(), 2, "Should emit events for both known OIDs");
-        assert!(events.iter().any(|e| e.table_id == 1));
-        assert!(events.iter().any(|e| e.table_id == 2));
-        assert!(events.iter().all(|e| e.kind == EventKind::Truncate));
+        assert!(events.iter().any(|e| e.table_id() == 1));
+        assert!(events.iter().any(|e| e.table_id() == 2));
+        assert!(events.iter().all(|e| e.kind() == EventKind::Truncate));
     }
 
     // -- B7: UnknownTupleTag error path --------------------------------------

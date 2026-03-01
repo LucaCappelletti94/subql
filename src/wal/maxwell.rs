@@ -195,10 +195,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Insert);
-        assert_eq!(ev.table_id, 1);
+        assert_eq!(ev.kind(), EventKind::Insert);
+        assert_eq!(ev.table_id(), 1);
 
-        let new = ev.new_row.as_ref().expect("INSERT should have new_row");
+        let new = ev.new_row().expect("INSERT should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::Float(4.2341)));
         assert_eq!(
@@ -207,13 +207,13 @@ mod tests {
         );
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("hello"))));
 
-        assert!(ev.old_row.is_none());
+        assert!(ev.old_row().is_none());
 
         // PK from catalog
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
 
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -233,9 +233,9 @@ mod tests {
 
         let ev = &events[0];
         // PK from message — both id and c
-        assert_eq!(ev.pk.columns.len(), 2);
-        assert!(ev.pk.columns.contains(&0)); // id
-        assert!(ev.pk.columns.contains(&2)); // c
+        assert_eq!(ev.pk().columns.len(), 2);
+        assert!(ev.pk().columns.contains(&0)); // id
+        assert!(ev.pk().columns.contains(&2)); // c
     }
 
     // -- UPDATE tests -------------------------------------------------------
@@ -257,14 +257,14 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
 
         // New row present
-        let new = ev.new_row.as_ref().expect("UPDATE should have new_row");
+        let new = ev.new_row().expect("UPDATE should have new_row");
         assert_eq!(new.get(1), Some(&Cell::Float(5.444)));
 
         // Old row (sparse — only changed columns)
-        let old = ev.old_row.as_ref().expect("UPDATE should have old_row");
+        let old = ev.old_row().expect("UPDATE should have old_row");
         assert_eq!(old.get(1), Some(&Cell::Float(4.2341)));
         assert_eq!(
             old.get(2),
@@ -277,7 +277,7 @@ mod tests {
         // Maxwell's `old` contains only changed columns; Missing means "not changed".
         // changed_columns() skips Missing cells, so the result is exactly the
         // columns that differed: m (col 1) and c (col 2).
-        let changed: Vec<u16> = ev.changed_columns.to_vec();
+        let changed: Vec<u16> = ev.changed_columns().to_vec();
         assert_eq!(changed, vec![1, 2]);
     }
 
@@ -296,10 +296,10 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
-        assert!(ev.new_row.is_some());
-        assert!(ev.old_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert_eq!(ev.kind(), EventKind::Update);
+        assert!(ev.new_row().is_some());
+        assert!(ev.old_row().is_none());
+        assert!(ev.changed_columns().is_empty());
     }
 
     // -- DELETE tests -------------------------------------------------------
@@ -320,17 +320,17 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Delete);
-        assert!(ev.new_row.is_none());
+        assert_eq!(ev.kind(), EventKind::Delete);
+        assert!(ev.new_row().is_none());
 
-        let old = ev.old_row.as_ref().expect("DELETE should have old_row");
+        let old = ev.old_row().expect("DELETE should have old_row");
         assert_eq!(old.get(0), Some(&Cell::Int(1)));
 
         // PK from catalog
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
 
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -349,8 +349,8 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
     }
 
     // -- Edge cases ----------------------------------------------------------
@@ -369,7 +369,7 @@ mod tests {
             .parse_wal_message(json.as_bytes(), &catalog)
             .expect("parse should succeed");
 
-        let new = events[0].new_row.as_ref().expect("should have new_row");
+        let new = events[0].new_row().expect("should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::Null));
         assert_eq!(new.get(2), Some(&Cell::Null));
@@ -392,8 +392,8 @@ mod tests {
 
         let ev = &events[0];
         // No PK source → empty PK
-        assert!(ev.pk.columns.is_empty());
-        assert!(ev.pk.values.is_empty());
+        assert!(ev.pk().columns.is_empty());
+        assert!(ev.pk().values.is_empty());
     }
 
     // -- Error paths ---------------------------------------------------------
@@ -620,10 +620,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
         // PK must come from the pre-update (old) row: id = 1
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
-        assert_eq!(ev.pk.columns.as_ref(), &[0u16]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0u16]);
     }
 
     // -- A4: bootstrap-insert events must be treated as normal inserts -------
@@ -644,10 +644,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Insert);
-        assert_eq!(ev.table_id, 1);
-        assert!(ev.new_row.is_some());
-        assert!(ev.old_row.is_none());
+        assert_eq!(ev.kind(), EventKind::Insert);
+        assert_eq!(ev.table_id(), 1);
+        assert!(ev.new_row().is_some());
+        assert!(ev.old_row().is_none());
     }
 
     #[test]

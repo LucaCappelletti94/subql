@@ -312,9 +312,9 @@ mod tests {
             &catalog,
         )
         .expect("update should parse");
-        assert_eq!(event.kind, EventKind::Update);
-        assert!(event.old_row.is_none());
-        assert!(event.new_row.is_some());
+        assert_eq!(event.kind(), EventKind::Update);
+        assert!(event.old_row().is_none());
+        assert!(event.new_row().is_some());
     }
 
     #[test]
@@ -347,12 +347,12 @@ mod tests {
         )
         .expect("update with partial old row should parse");
 
-        assert_eq!(event.kind, EventKind::Update);
-        assert!(event.old_row.is_some());
-        assert!(event.new_row.is_some());
+        assert_eq!(event.kind(), EventKind::Update);
+        assert!(event.old_row().is_some());
+        assert!(event.new_row().is_some());
         // Partial old row → conservative: changed_columns is empty.
         assert!(
-            event.changed_columns.is_empty(),
+            event.changed_columns().is_empty(),
             "partial old row must produce empty changed_columns to avoid false negatives"
         );
     }

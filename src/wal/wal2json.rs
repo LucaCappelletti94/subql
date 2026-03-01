@@ -233,7 +233,7 @@ fn convert_v1_change(
     let table_id = resolve_table(&change.schema, &change.table, catalog)?;
 
     if kind == EventKind::Truncate {
-        return Ok(truncate_event(table_id));
+        return Ok(truncate_event(table_id)?);
     }
 
     if matches!(kind, EventKind::Insert | EventKind::Update)
@@ -376,10 +376,8 @@ fn convert_v2_message(
             // No pk metadata — use all identity columns as PK
             let cols: Vec<ColumnId> = identity_resolved.iter().map(|(c, _)| *c).collect();
             let vals: Vec<Cell> = identity_resolved.iter().map(|(_, v)| v.clone()).collect();
-            PrimaryKey {
-                columns: Arc::from(cols),
-                values: Arc::from(vals),
-            }
+            PrimaryKey::new(Arc::from(cols), Arc::from(vals))
+                .expect("identity columns and values are built in lockstep")
         }
     } else if let Some(ref pk_cols) = msg.pk {
         // INSERT — extract PK from new row using pk metadata
@@ -465,25 +463,25 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Insert);
-        assert_eq!(ev.table_id, 1);
+        assert_eq!(ev.kind(), EventKind::Insert);
+        assert_eq!(ev.table_id(), 1);
 
         // New row present
-        let new = ev.new_row.as_ref().expect("INSERT should have new_row");
+        let new = ev.new_row().expect("INSERT should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::String(Arc::from("alice"))));
         assert_eq!(new.get(2), Some(&Cell::Float(99.95)));
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("pending"))));
 
         // No old row
-        assert!(ev.old_row.is_none());
+        assert!(ev.old_row().is_none());
 
         // PK extracted from new row via catalog
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
 
         // No changed columns for INSERT
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.changed_columns().is_empty());
     }
 
     // -- v1 UPDATE -----------------------------------------------------------
@@ -516,21 +514,21 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
 
         // New row
-        let new = ev.new_row.as_ref().expect("UPDATE should have new_row");
+        let new = ev.new_row().expect("UPDATE should have new_row");
         assert_eq!(new.get(2), Some(&Cell::Float(149.95)));
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("shipped"))));
 
         // Old row (sparse — only key columns)
-        let old = ev.old_row.as_ref().expect("UPDATE should have old_row");
+        let old = ev.old_row().expect("UPDATE should have old_row");
         assert_eq!(old.get(0), Some(&Cell::Int(1)));
         assert_eq!(old.get(1), Some(&Cell::Missing)); // not in oldkeys
 
         // PK from oldkeys
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
     }
 
     // -- v1 DELETE -----------------------------------------------------------
@@ -560,14 +558,14 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Delete);
-        assert!(ev.new_row.is_none());
-        assert!(ev.old_row.is_some());
+        assert_eq!(ev.kind(), EventKind::Delete);
+        assert!(ev.new_row().is_none());
+        assert!(ev.old_row().is_some());
 
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(42)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(42)]);
 
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.changed_columns().is_empty());
     }
 
     // -- v1 multi-change transaction -----------------------------------------
@@ -619,9 +617,9 @@ mod tests {
             .expect("parse should succeed");
 
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].kind, EventKind::Insert);
-        assert_eq!(events[1].kind, EventKind::Update);
-        assert_eq!(events[2].kind, EventKind::Delete);
+        assert_eq!(events[0].kind(), EventKind::Insert);
+        assert_eq!(events[1].kind(), EventKind::Update);
+        assert_eq!(events[2].kind(), EventKind::Delete);
     }
 
     // -- v2 INSERT -----------------------------------------------------------
@@ -652,18 +650,18 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Insert);
-        assert_eq!(ev.table_id, 1);
+        assert_eq!(ev.kind(), EventKind::Insert);
+        assert_eq!(ev.table_id(), 1);
 
-        let new = ev.new_row.as_ref().expect("INSERT should have new_row");
+        let new = ev.new_row().expect("INSERT should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::String(Arc::from("alice"))));
 
-        assert!(ev.old_row.is_none());
+        assert!(ev.old_row().is_none());
 
         // PK from pk metadata + new row
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
     }
 
     #[test]
@@ -721,14 +719,14 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
 
-        assert!(ev.new_row.is_some());
-        assert!(ev.old_row.is_some());
+        assert!(ev.new_row().is_some());
+        assert!(ev.old_row().is_some());
 
         // PK from identity
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
     }
 
     // -- v2 DELETE -----------------------------------------------------------
@@ -756,12 +754,12 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Delete);
-        assert!(ev.new_row.is_none());
-        assert!(ev.old_row.is_some());
+        assert_eq!(ev.kind(), EventKind::Delete);
+        assert!(ev.new_row().is_none());
+        assert!(ev.old_row().is_some());
 
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(42)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(42)]);
     }
 
     // -- Error paths ---------------------------------------------------------
@@ -854,12 +852,12 @@ mod tests {
             .expect("truncate should parse");
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Truncate);
-        assert_eq!(ev.table_id, 1);
-        assert!(ev.pk.is_empty());
-        assert!(ev.old_row.is_none());
-        assert!(ev.new_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert_eq!(ev.kind(), EventKind::Truncate);
+        assert_eq!(ev.table_id(), 1);
+        assert!(ev.pk().is_empty());
+        assert!(ev.old_row().is_none());
+        assert!(ev.new_row().is_none());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -896,12 +894,12 @@ mod tests {
             .expect("truncate action should parse");
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Truncate);
-        assert_eq!(ev.table_id, 1);
-        assert!(ev.pk.is_empty());
-        assert!(ev.old_row.is_none());
-        assert!(ev.new_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert_eq!(ev.kind(), EventKind::Truncate);
+        assert_eq!(ev.table_id(), 1);
+        assert!(ev.pk().is_empty());
+        assert!(ev.old_row().is_none());
+        assert!(ev.new_row().is_none());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -968,7 +966,7 @@ mod tests {
             .parse_wal_message(json.as_bytes(), &catalog)
             .expect("mixed changes should not error");
         assert_eq!(events.len(), 1, "only the valid insert should be emitted");
-        assert_eq!(events[0].kind, EventKind::Insert);
+        assert_eq!(events[0].kind(), EventKind::Insert);
     }
 
     // -- B2: v2 missing table on data action ---------------------------------
@@ -1041,10 +1039,10 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
 
         // amount (col 2) and status (col 3) changed
-        let changed: Vec<ColumnId> = ev.changed_columns.to_vec();
+        let changed: Vec<ColumnId> = ev.changed_columns().to_vec();
         assert!(changed.contains(&2), "amount should be changed");
         assert!(changed.contains(&3), "status should be changed");
         assert!(!changed.contains(&0), "id should NOT be changed");
@@ -1074,10 +1072,10 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
         // No oldkeys → no old_row → changed_columns is empty
-        assert!(ev.old_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.old_row().is_none());
+        assert!(ev.changed_columns().is_empty());
     }
 
     #[test]
@@ -1108,10 +1106,10 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
-        assert!(ev.old_row.is_some());
+        assert_eq!(ev.kind(), EventKind::Update);
+        assert!(ev.old_row().is_some());
         assert!(
-            ev.changed_columns.is_empty(),
+            ev.changed_columns().is_empty(),
             "partial oldkeys must disable changed-columns pruning"
         );
     }
@@ -1140,8 +1138,8 @@ mod tests {
 
         let ev = &events[0];
         // No oldkeys and no catalog PK → empty PK
-        assert!(ev.pk.columns.is_empty());
-        assert!(ev.pk.values.is_empty());
+        assert!(ev.pk().columns.is_empty());
+        assert!(ev.pk().values.is_empty());
     }
 
     // -- v2 UPDATE with identity but no pk metadata --------------------------
@@ -1171,10 +1169,10 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
         // PK from all identity columns (no pk metadata to filter)
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
     }
 
     // -- v2 INSERT without pk metadata AND without catalog PK ----------------
@@ -1202,8 +1200,8 @@ mod tests {
 
         let ev = &events[0];
         // No pk metadata and no catalog PK → empty PK
-        assert!(ev.pk.columns.is_empty());
-        assert!(ev.pk.values.is_empty());
+        assert!(ev.pk().columns.is_empty());
+        assert!(ev.pk().values.is_empty());
     }
 
     // -- v2 UPDATE without identity (changed_columns branch: None old_row) ---
@@ -1233,10 +1231,10 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        assert_eq!(ev.kind, EventKind::Update);
+        assert_eq!(ev.kind(), EventKind::Update);
         // No identity → no old_row → changed_columns empty
-        assert!(ev.old_row.is_none());
-        assert!(ev.changed_columns.is_empty());
+        assert!(ev.old_row().is_none());
+        assert!(ev.changed_columns().is_empty());
     }
 
     // -- v2 unknown column error ---------------------------------------------
@@ -1284,7 +1282,7 @@ mod tests {
             .parse_wal_message(json.as_bytes(), &catalog)
             .expect("parse should succeed");
 
-        let new = events[0].new_row.as_ref().expect("should have new_row");
+        let new = events[0].new_row().expect("should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
         assert_eq!(new.get(1), Some(&Cell::Null));
         assert_eq!(new.get(2), Some(&Cell::Null));
@@ -1316,8 +1314,8 @@ mod tests {
 
         let ev = &events[0];
         // PK should come from catalog.primary_key_columns()
-        assert_eq!(ev.pk.columns.as_ref(), &[0]);
-        assert_eq!(ev.pk.values.as_ref(), &[Cell::Int(7)]);
+        assert_eq!(ev.pk().columns.as_ref(), &[0]);
+        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(7)]);
     }
 
     // -- Error: table_arity returns None (v1) --------------------------------
@@ -1632,10 +1630,10 @@ mod tests {
             .parse_wal_message(v1_json.as_bytes(), &catalog)
             .expect("v1 update should parse");
         assert_eq!(v1_events.len(), 1);
-        assert_eq!(v1_events[0].kind, EventKind::Update);
-        assert!(v1_events[0].old_row.is_some());
+        assert_eq!(v1_events[0].kind(), EventKind::Update);
+        assert!(v1_events[0].old_row().is_some());
         assert!(
-            v1_events[0].changed_columns.is_empty(),
+            v1_events[0].changed_columns().is_empty(),
             "v1 partial old row must not compute changed_columns"
         );
 
@@ -1660,10 +1658,10 @@ mod tests {
             .parse_wal_message(v2_json.as_bytes(), &catalog)
             .expect("v2 update should parse");
         assert_eq!(v2_events.len(), 1);
-        assert_eq!(v2_events[0].kind, EventKind::Update);
-        assert!(v2_events[0].old_row.is_some());
+        assert_eq!(v2_events[0].kind(), EventKind::Update);
+        assert!(v2_events[0].old_row().is_some());
         assert!(
-            v2_events[0].changed_columns.is_empty(),
+            v2_events[0].changed_columns().is_empty(),
             "v2 partial old row must not compute changed_columns"
         );
     }
