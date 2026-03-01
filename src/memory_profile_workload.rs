@@ -218,15 +218,10 @@ fn make_test_event(seed: u64) -> WalEvent {
     let created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
     let status = status_for(seed ^ 0xBECF);
 
-    WalEvent {
-        kind: EventKind::Insert,
-        table_id: 1,
-        pk: PrimaryKey {
-            columns: Arc::from([0u16]),
-            values: Arc::from([Cell::Int(id)]),
-        },
-        old_row: None,
-        new_row: Some(RowImage {
+    WalEvent::builder(1)
+        .insert()
+        .pk_cell(0, Cell::Int(id))
+        .new_row(RowImage {
             cells: Arc::from([
                 Cell::Int(id),
                 Cell::Int(user_id),
@@ -239,9 +234,9 @@ fn make_test_event(seed: u64) -> WalEvent {
                 Cell::Int(shipping),
                 Cell::Int(created_at),
             ]),
-        }),
-        changed_columns: Arc::from([]),
-    }
+        })
+        .build()
+        .expect("insert event builder should be valid")
 }
 
 pub fn run_memory_profile(show_progress: bool) {
@@ -323,18 +318,18 @@ mod tests {
     fn make_test_event_is_deterministic_for_seed() {
         let event_a = make_test_event(1234);
         let event_b = make_test_event(1234);
-        assert_eq!(event_a.kind, EventKind::Insert);
-        assert_eq!(event_a.table_id, 1);
-        assert_eq!(event_a.pk.columns.as_ref(), event_b.pk.columns.as_ref());
-        assert_eq!(event_a.pk.values.as_ref(), event_b.pk.values.as_ref());
+        assert_eq!(event_a.kind(), EventKind::Insert);
+        assert_eq!(event_a.table_id(), 1);
+        assert_eq!(event_a.pk().columns.as_ref(), event_b.pk().columns.as_ref());
+        assert_eq!(event_a.pk().values.as_ref(), event_b.pk().values.as_ref());
         assert_eq!(
             event_a
-                .new_row
+                .new_row()
                 .as_ref()
                 .expect("event should have new row")
                 .cells,
             event_b
-                .new_row
+                .new_row()
                 .as_ref()
                 .expect("event should have new row")
                 .cells

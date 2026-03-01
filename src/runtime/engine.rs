@@ -889,8 +889,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{
-    ///     Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine,
-    ///     SubscriptionRequest, WalEvent,
+    ///     Cell, DefaultIds, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
+    ///     WalEvent,
     /// };
     ///
     /// let catalog = Arc::new(
@@ -908,21 +908,17 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///         .updated_at_unix_ms(1_704_067_200_000),
     /// )?;
     ///
-    /// let event = WalEvent {
-    ///     kind: EventKind::Insert,
-    ///     table_id: 1,
-    ///     pk: PrimaryKey::empty(),
-    ///     old_row: None,
-    ///     new_row: Some(RowImage {
+    /// let event = WalEvent::builder(1)
+    ///     .insert()
+    ///     .new_row(RowImage {
     ///         cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("paid".into())]),
-    ///     }),
-    ///     changed_columns: Arc::from([]),
-    /// };
+    ///     })
+    ///     .build()?;
     ///
     /// let notifs = engine.consumers(&event)?;
-    /// assert_eq!(notifs.inserted, vec![42]);
-    /// assert!(notifs.deleted.is_empty());
-    /// assert!(notifs.updated.is_empty());
+    /// assert_eq!(notifs.inserted(), vec![42]);
+    /// assert!(notifs.deleted().is_empty());
+    /// assert!(notifs.updated().is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn consumers(
@@ -932,26 +928,26 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let (partition, consumer_dict) = table_context(
             &self.partitions,
             &self.consumer_dictionaries,
-            event.table_id,
+            event.table_id(),
         )?;
 
-        if event.kind == EventKind::Truncate {
+        if event.kind() == EventKind::Truncate {
             return dispatch_consumers(event, partition, consumer_dict, &mut self.vm);
         }
 
         // Validate row image arity against schema catalog.
         // For UPDATE events, validate both old_row and new_row.
-        if let Some(ref old_row) = event.old_row {
-            self.validate_row_arity(event.table_id, old_row)?;
+        if let Some(old_row) = event.old_row() {
+            self.validate_row_arity(event.table_id(), old_row)?;
         }
-        if event.kind != EventKind::Delete {
-            if let Some(ref new_row) = event.new_row {
-                self.validate_row_arity(event.table_id, new_row)?;
+        if event.kind() != EventKind::Delete {
+            if let Some(new_row) = event.new_row() {
+                self.validate_row_arity(event.table_id(), new_row)?;
             }
         }
-        if event.kind == EventKind::Delete {
+        if event.kind() == EventKind::Delete {
             let row = select_event_row(event)?;
-            self.validate_row_arity(event.table_id, row)?;
+            self.validate_row_arity(event.table_id(), row)?;
         }
 
         dispatch_consumers(event, partition, consumer_dict, &mut self.vm)
@@ -980,8 +976,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{
-    ///     AggDelta, Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog,
-    ///     SubscriptionEngine, SubscriptionRequest, WalEvent,
+    ///     AggDelta, Cell, DefaultIds, RowImage, SimpleCatalog, SubscriptionEngine,
+    ///     SubscriptionRequest, WalEvent,
     /// };
     ///
     /// let catalog = Arc::new(
@@ -998,23 +994,19 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///         .updated_at_unix_ms(1_704_067_200_000),
     /// )?;
     ///
-    /// let event = WalEvent {
-    ///     kind: EventKind::Insert,
-    ///     table_id: 1,
-    ///     pk: PrimaryKey::empty(),
-    ///     old_row: None,
-    ///     new_row: Some(RowImage {
+    /// let event = WalEvent::builder(1)
+    ///     .insert()
+    ///     .new_row(RowImage {
     ///         cells: Arc::from([Cell::Int(1), Cell::String("paid".into())]),
-    ///     }),
-    ///     changed_columns: Arc::from([]),
-    /// };
+    ///     })
+    ///     .build()?;
     ///
     /// let deltas = engine.aggregate_deltas(&event)?;
     /// assert_eq!(deltas, vec![(99, AggDelta::Count(1))]);
     ///
     /// // Aggregate subscriptions are handled by `aggregate_deltas()`, not `consumers()`.
     /// let notifs = engine.consumers(&event)?;
-    /// assert!(notifs.inserted.is_empty());
+    /// assert!(notifs.inserted().is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn aggregate_deltas(
@@ -1024,15 +1016,15 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let (partition, consumer_dict) = table_context(
             &self.partitions,
             &self.consumer_dictionaries,
-            event.table_id,
+            event.table_id(),
         )?;
 
         // Validate all row images consumed by aggregate dispatch.
-        if let Some(ref old_row) = event.old_row {
-            self.validate_row_arity(event.table_id, old_row)?;
+        if let Some(old_row) = event.old_row() {
+            self.validate_row_arity(event.table_id(), old_row)?;
         }
-        if let Some(ref new_row) = event.new_row {
-            self.validate_row_arity(event.table_id, new_row)?;
+        if let Some(new_row) = event.new_row() {
+            self.validate_row_arity(event.table_id(), new_row)?;
         }
 
         super::dispatch::compute_agg_deltas(event, partition, consumer_dict, &mut self.vm)
@@ -1874,6 +1866,24 @@ mod tests {
         Arc::new(MockCatalog { tables, columns })
     }
 
+    fn build_insert_event(table_id: TableId, pk: PrimaryKey, new_row: RowImage) -> WalEvent {
+        WalEvent::builder(table_id)
+            .insert()
+            .pk(pk)
+            .new_row(new_row)
+            .build()
+            .expect("insert event builder should be valid")
+    }
+
+    fn build_delete_event(table_id: TableId, pk: PrimaryKey, old_row: RowImage) -> WalEvent {
+        WalEvent::builder(table_id)
+            .delete()
+            .pk(pk)
+            .old_row(old_row)
+            .build()
+            .expect("delete event builder should be valid")
+    }
+
     #[cfg(unix)]
     fn set_dir_mode(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
@@ -2049,23 +2059,20 @@ mod tests {
         engine.register(spec).unwrap();
 
         // Dispatch event with amount = 200 (should match)
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([
                     Cell::Int(1),                   // id
                     Cell::Int(200),                 // amount
                     Cell::String("pending".into()), // status
                 ]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let consumers = engine.consumers(&event);
         // Note: This will fail because our stub extract_indexable_atoms
@@ -2088,19 +2095,16 @@ mod tests {
         };
         engine.register(spec).unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("pending".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert_eq!(consumers, vec![42]);
@@ -2194,19 +2198,16 @@ mod tests {
 
         assert!(engine.unregister_subscription(r1.subscription_id));
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("paid".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert_eq!(consumers, vec![7]);
@@ -2254,23 +2255,20 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(7)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([
                     Cell::Int(7), // id
                     Cell::Int(7), // amount
                     Cell::String("ok".into()),
                 ]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert!(
@@ -2620,19 +2618,16 @@ mod tests {
         engine.register(spec).unwrap();
 
         // Dispatch an event
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("active".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         // Dispatch should succeed (covers the consumers() method path)
         let result = engine.consumers(&event);
@@ -2673,19 +2668,16 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Dispatch to unknown table
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 999,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            999,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1)]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let result = engine.consumers(&event);
         assert!(matches!(result, Err(DispatchError::UnknownTableId(999))));
@@ -2706,20 +2698,17 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 // orders table arity in test catalog is 3
                 cells: Arc::from([Cell::Int(1), Cell::Int(5)]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let result = engine.consumers(&event);
         assert!(matches!(
@@ -2775,19 +2764,16 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(5), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let result = engine.consumers(&event);
         assert!(matches!(result, Err(DispatchError::UnknownTableArity(1))));
@@ -2808,22 +2794,22 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(2), Cell::String("old".into())]),
-            }),
-            new_row: Some(RowImage {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
                 // Invalid arity for UPDATE selected row image (new_row)
                 cells: Arc::from([Cell::Int(1), Cell::Int(5)]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            })
+            .pk(PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            })
+            .maybe_old_row(Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(2), Cell::String("old".into())]),
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let result = engine.consumers(&event);
         assert!(matches!(
@@ -2851,20 +2837,17 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Delete,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_delete_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: Some(RowImage {
+            RowImage {
                 // Invalid arity for DELETE selected row image (old_row)
                 cells: Arc::from([Cell::Int(1), Cell::Int(5)]),
-            }),
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let result = engine.consumers(&event);
         assert!(matches!(
@@ -2900,17 +2883,13 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Truncate,
-            table_id: 1,
-            pk: PrimaryKey::empty(),
-            old_row: None,
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .truncate()
+            .build()
+            .expect("truncate event builder should be valid");
 
         let notifs = engine.consumers(&event).expect("truncate should dispatch");
-        let mut deleted = notifs.deleted;
+        let mut deleted = notifs.deleted().to_vec();
         deleted.sort_unstable();
         assert_eq!(deleted, vec![340, 350]);
     }
@@ -3044,19 +3023,16 @@ mod tests {
         );
 
         // Dispatch to verify the old subscription still works (user=42, not user=99)
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let matched: Vec<u64> = engine.consumers(&event).unwrap().into_iter().collect();
         assert!(
@@ -3698,23 +3674,20 @@ mod tests {
 
         assert_eq!(single_result, batch_result);
 
-        let event = WalEvent {
-            kind: crate::EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
+        let event = build_insert_event(
+            1,
+            crate::PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([crate::Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(crate::RowImage {
+            crate::RowImage {
                 cells: Arc::from([
                     crate::Cell::Int(1),
                     crate::Cell::Float(150.0),
                     crate::Cell::String("open".into()),
                 ]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let single_users: Vec<_> = single_engine
             .consumers(&event)
@@ -3814,19 +3787,16 @@ mod tests {
         );
         assert_eq!(engine.predicate_count(1), 2);
 
-        let high_amount_event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let high_amount_event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
         let high_consumers: Vec<_> = engine
             .consumers(&high_amount_event)
             .unwrap()
@@ -3835,19 +3805,16 @@ mod tests {
         assert!(high_consumers.contains(&42));
         assert!(!high_consumers.contains(&99));
 
-        let low_amount_event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let low_amount_event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(2)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(2), Cell::Int(25), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
         let low_consumers: Vec<_> = engine
             .consumers(&low_amount_event)
             .unwrap()
@@ -3960,19 +3927,16 @@ mod tests {
         engine.register_batch(specs);
 
         // Dispatch event with amount = 200 (should match user 42 but not 99)
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert!(consumers.contains(&42));
@@ -4012,19 +3976,16 @@ mod tests {
         );
         assert_eq!(engine.subscription_count(), 1);
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert!(consumers.contains(&42));
@@ -4102,19 +4063,16 @@ mod tests {
         assert_eq!(engine.predicate_count(1), 1);
 
         // The single subscription still dispatches correctly.
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(200), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
         let consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         assert_eq!(consumers, vec![42]);
     }
@@ -4272,17 +4230,13 @@ mod tests {
         }
         assert!(report.is_some(), "merge job did not complete in time");
 
-        let event = WalEvent {
-            kind: EventKind::Truncate,
-            table_id: 1,
-            pk: PrimaryKey::empty(),
-            old_row: None,
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .truncate()
+            .build()
+            .expect("truncate event builder should be valid");
 
         let notifs = engine.consumers(&event).expect("truncate should dispatch");
-        let mut deleted = notifs.deleted;
+        let mut deleted = notifs.deleted().to_vec();
         deleted.sort_unstable();
         assert_eq!(deleted, vec![99]);
     }
@@ -4389,23 +4343,16 @@ mod tests {
         engine.unregister_subscription(result.subscription_id);
 
         // Dispatch TRUNCATE on table 1
-        let event = WalEvent {
-            table_id: 1,
-            kind: EventKind::Truncate,
-            new_row: None,
-            old_row: None,
-            pk: PrimaryKey {
-                columns: Arc::from([]),
-                values: Arc::from([]),
-            },
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .truncate()
+            .build()
+            .expect("truncate event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
         assert!(
-            notifs.deleted.is_empty(),
+            notifs.deleted().is_empty(),
             "TRUNCATE must not fan out to unregistered consumer 42; got: {:?}",
-            notifs.deleted,
+            notifs.deleted(),
         );
     }
 
@@ -4481,20 +4428,33 @@ mod tests {
         old_amount: Option<i64>,
         new_amount: Option<i64>,
     ) -> WalEvent {
-        WalEvent {
-            kind,
-            table_id: 1,
-            pk: PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: old_amount.map(|v| RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(v), Cell::String("done".into())]),
-            }),
-            new_row: new_amount.map(|v| RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(v), Cell::String("done".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
+        let pk = PrimaryKey::new(Arc::from([0u16]), Arc::from([Cell::Int(1)]))
+            .expect("single PK column/value must be valid");
+        let old_row = old_amount.map(|v| RowImage {
+            cells: Arc::from([Cell::Int(1), Cell::Int(v), Cell::String("done".into())]),
+        });
+        let new_row = new_amount.map(|v| RowImage {
+            cells: Arc::from([Cell::Int(1), Cell::Int(v), Cell::String("done".into())]),
+        });
+        match kind {
+            EventKind::Insert => {
+                build_insert_event(1, pk, new_row.expect("insert fixture requires new row"))
+            }
+            EventKind::Update => WalEvent::builder(1)
+                .update()
+                .new_row(new_row.expect("update fixture requires new row"))
+                .pk(pk)
+                .maybe_old_row(old_row)
+                .changed_columns(Arc::from([1u16]))
+                .build()
+                .expect("update fixture should build a valid event"),
+            EventKind::Delete => {
+                build_delete_event(1, pk, old_row.expect("delete fixture requires old row"))
+            }
+            EventKind::Truncate => WalEvent::builder(1)
+                .truncate()
+                .build()
+                .expect("truncate event builder should be valid"),
         }
     }
 
@@ -4555,14 +4515,10 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Truncate,
-            table_id: 1,
-            pk: PrimaryKey::empty(),
-            old_row: None,
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .truncate()
+            .build()
+            .expect("truncate event builder should be valid");
         let err = engine
             .aggregate_deltas(&event)
             .expect_err("TRUNCATE must return error");
@@ -4587,16 +4543,13 @@ mod tests {
             .unwrap();
 
         // INSERT with only 2 columns — arity mismatch (expected 3)
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey::empty(),
-            old_row: None,
-            new_row: Some(RowImage {
+        let event = build_insert_event(
+            1,
+            PrimaryKey::empty(),
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(20)]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let err = engine
             .aggregate_deltas(&event)
@@ -4631,19 +4584,19 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey::empty(),
-            old_row: Some(RowImage {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("done".into())]),
+            })
+            .pk(PrimaryKey::empty())
+            .maybe_old_row(Some(RowImage {
                 // Wrong old-row arity (expected 3)
                 cells: Arc::from([Cell::Int(1), Cell::Int(20)]),
-            }),
-            new_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("done".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let err = engine
             .aggregate_deltas(&event)
@@ -4678,16 +4631,16 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey::empty(),
-            old_row: None,
-            new_row: Some(RowImage {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("done".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            })
+            .pk(PrimaryKey::empty())
+            .maybe_old_row(None)
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let err = engine
             .aggregate_deltas(&event)
@@ -4791,18 +4744,14 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Truncate,
-            table_id: 1,
-            pk: PrimaryKey::empty(),
-            old_row: None,
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .truncate()
+            .build()
+            .expect("truncate event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
         assert!(
-            notifs.deleted.is_empty(),
+            notifs.deleted().is_empty(),
             "aggregate-only consumers must not appear in consumers()"
         );
     }
@@ -4824,19 +4773,16 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(50), Cell::String("active".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let deltas = engine.aggregate_deltas(&event).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(50.0))]);
@@ -4857,19 +4803,16 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Delete,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_delete_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(50), Cell::String("active".into())]),
-            }),
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let deltas = engine.aggregate_deltas(&event).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-50.0))]);
@@ -4890,21 +4833,21 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("active".into())]),
+            })
+            .pk(PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: Some(RowImage {
+            })
+            .maybe_old_row(Some(RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(20), Cell::String("active".into())]),
-            }),
-            new_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("active".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = engine.aggregate_deltas(&event).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(10.0))]);
@@ -4926,19 +4869,16 @@ mod tests {
             })
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Null, Cell::String("active".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let deltas = engine.aggregate_deltas(&event).unwrap();
         assert!(deltas.is_empty(), "NULL amount should produce no delta");
@@ -5056,21 +4996,21 @@ mod tests {
 
         // UPDATE: status unchanged (still 'active'), only amount changes 20 → 30
         // changed_columns = [1] (amount column)
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(20), Cell::String("active".into())]),
-            }),
-            new_row: Some(RowImage {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(30), Cell::String("active".into())]),
-            }),
-            changed_columns: Arc::from([1u16]), // only amount changed
-        };
+            })
+            .pk(
+                PrimaryKey::new(Arc::from([0u16]), Arc::from([Cell::Int(1)]))
+                    .expect("single PK column/value must be valid"),
+            )
+            .maybe_old_row(Some(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(20), Cell::String("active".into())]),
+            }))
+            .changed_columns(Arc::from([1u16])) // only amount changed
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = engine.aggregate_deltas(&event).unwrap();
         assert_eq!(
@@ -5327,29 +5267,29 @@ mod tests {
             .unwrap();
 
         // UPDATE: amount 3 → 4
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
+            })
+            .pk(PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: Some(RowImage {
+            })
+            .maybe_old_row(Some(RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(3), Cell::String("ok".into())]),
-            }),
-            new_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
         // Sub B enters (new matches, old doesn't) → inserted
-        assert_eq!(notifs.inserted, vec![2]);
+        assert_eq!(notifs.inserted(), vec![2]);
         // Sub A leaves (old matches, new doesn't) → deleted
-        assert_eq!(notifs.deleted, vec![1]);
+        assert_eq!(notifs.deleted(), vec![1]);
         // No one stayed → updated is empty
-        assert!(notifs.updated.is_empty());
+        assert!(notifs.updated().is_empty());
     }
 
     /// Same-subscription update: row changes but stays in the result set.
@@ -5367,26 +5307,26 @@ mod tests {
             .unwrap();
 
         // UPDATE: amount 3 → 4, both match `amount > 0`
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
+            })
+            .pk(PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: Some(RowImage {
+            })
+            .maybe_old_row(Some(RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(3), Cell::String("ok".into())]),
-            }),
-            new_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
-        assert!(notifs.inserted.is_empty());
-        assert!(notifs.deleted.is_empty());
-        assert_eq!(notifs.updated, vec![1]);
+        assert!(notifs.inserted().is_empty());
+        assert!(notifs.deleted().is_empty());
+        assert_eq!(notifs.updated(), vec![1]);
     }
 
     /// Leave-all: row leaves the only matching subscription.
@@ -5404,26 +5344,26 @@ mod tests {
             .unwrap();
 
         // UPDATE: amount 3 → 4, leaves the subscription
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
+            })
+            .pk(PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: Some(RowImage {
+            })
+            .maybe_old_row(Some(RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(3), Cell::String("ok".into())]),
-            }),
-            new_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
-        assert!(notifs.inserted.is_empty());
-        assert_eq!(notifs.deleted, vec![1]);
-        assert!(notifs.updated.is_empty());
+        assert!(notifs.inserted().is_empty());
+        assert_eq!(notifs.deleted(), vec![1]);
+        assert!(notifs.updated().is_empty());
     }
 
     /// Enter-from-nothing: row enters a subscription it didn't match before.
@@ -5441,26 +5381,26 @@ mod tests {
             .unwrap();
 
         // UPDATE: amount 3 → 4, enters the subscription
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
+            })
+            .pk(PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: Some(RowImage {
+            })
+            .maybe_old_row(Some(RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(3), Cell::String("ok".into())]),
-            }),
-            new_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(4), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
-        assert_eq!(notifs.inserted, vec![1]);
-        assert!(notifs.deleted.is_empty());
-        assert!(notifs.updated.is_empty());
+        assert_eq!(notifs.inserted(), vec![1]);
+        assert!(notifs.deleted().is_empty());
+        assert!(notifs.updated().is_empty());
     }
 
     /// INSERT event produces only `inserted`, no `deleted` or `updated`.
@@ -5477,24 +5417,21 @@ mod tests {
             ))
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_insert_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: None,
-            new_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let notifs = engine.consumers(&event).unwrap();
-        assert_eq!(notifs.inserted, vec![1]);
-        assert!(notifs.deleted.is_empty());
-        assert!(notifs.updated.is_empty());
+        assert_eq!(notifs.inserted(), vec![1]);
+        assert!(notifs.deleted().is_empty());
+        assert!(notifs.updated().is_empty());
     }
 
     /// DELETE event produces only `deleted`, no `inserted` or `updated`.
@@ -5511,24 +5448,21 @@ mod tests {
             ))
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Delete,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = build_delete_event(
+            1,
+            PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
             },
-            old_row: Some(RowImage {
+            RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
-            }),
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+            },
+        );
 
         let notifs = engine.consumers(&event).unwrap();
-        assert!(notifs.inserted.is_empty());
-        assert_eq!(notifs.deleted, vec![1]);
-        assert!(notifs.updated.is_empty());
+        assert!(notifs.inserted().is_empty());
+        assert_eq!(notifs.deleted(), vec![1]);
+        assert!(notifs.updated().is_empty());
     }
 
     /// Missing old_row for UPDATE → graceful degradation (single-eval fallback).
@@ -5546,25 +5480,25 @@ mod tests {
             ))
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
+            })
+            .pk(PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            })
+            .maybe_old_row(None)
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
         // Fallback: all matches go to `updated`
-        assert!(notifs.inserted.is_empty());
-        assert!(notifs.deleted.is_empty());
-        assert_eq!(notifs.updated, vec![1]);
+        assert!(notifs.inserted().is_empty());
+        assert!(notifs.deleted().is_empty());
+        assert_eq!(notifs.updated(), vec![1]);
     }
 
     /// Partial old_row (Cell::Missing) for UPDATE → graceful degradation.
@@ -5581,27 +5515,27 @@ mod tests {
             ))
             .unwrap();
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: PrimaryKey {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
+            })
+            .pk(PrimaryKey {
                 columns: Arc::from([0u16]),
                 values: Arc::from([Cell::Int(1)]),
-            },
-            old_row: Some(RowImage {
+            })
+            .maybe_old_row(Some(RowImage {
                 cells: Arc::from([Cell::Int(1), Cell::Missing, Cell::String("ok".into())]),
-            }),
-            new_row: Some(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(10), Cell::String("ok".into())]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
         // Fallback: all matches go to `updated`
-        assert!(notifs.inserted.is_empty());
-        assert!(notifs.deleted.is_empty());
-        assert_eq!(notifs.updated, vec![1]);
+        assert!(notifs.inserted().is_empty());
+        assert!(notifs.deleted().is_empty());
+        assert_eq!(notifs.updated(), vec![1]);
     }
 
     /// into_iter() yields inserted ∪ updated.

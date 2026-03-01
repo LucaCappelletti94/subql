@@ -154,8 +154,7 @@ fn require_new_row<'a>(
     message: &'static str,
 ) -> Result<&'a RowImage, DispatchError> {
     event
-        .new_row
-        .as_ref()
+        .new_row()
         .ok_or(DispatchError::MissingRequiredRowImage(message))
 }
 
@@ -164,13 +163,12 @@ fn require_old_row<'a>(
     message: &'static str,
 ) -> Result<&'a RowImage, DispatchError> {
     event
-        .old_row
-        .as_ref()
+        .old_row()
         .ok_or(DispatchError::MissingRequiredRowImage(message))
 }
 
 pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchError> {
-    match event.kind {
+    match event.kind() {
         EventKind::Insert => require_new_row(event, "INSERT requires new_row"),
         EventKind::Update => require_new_row(event, "UPDATE requires new_row"),
         EventKind::Delete => require_old_row(event, "DELETE requires old_row"),
@@ -195,11 +193,7 @@ fn notifications_for_truncate<I: IdTypes>(
         }
     }
     let deleted = resolve_ordinals(ordinals, consumer_dict);
-    ConsumerNotifications {
-        inserted: Vec::new(),
-        deleted,
-        updated: Vec::new(),
-    }
+    ConsumerNotifications::from_parts(Vec::new(), deleted, Vec::new())
 }
 
 /// Resolve a `RoaringBitmap` of consumer ordinals into a `Vec` of consumer IDs.
@@ -238,7 +232,7 @@ pub fn dispatch_consumers<I: IdTypes>(
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
 ) -> Result<ConsumerNotifications<I>, DispatchError> {
-    match event.kind {
+    match event.kind() {
         EventKind::Truncate => {
             let _ = vm;
             Ok(notifications_for_truncate(partition, consumer_dict))
@@ -246,20 +240,20 @@ pub fn dispatch_consumers<I: IdTypes>(
         EventKind::Insert => {
             let row = require_new_row(event, "INSERT requires new_row")?;
             let bitmap = dispatch_single_eval_bitmap(event, row, partition, vm)?;
-            Ok(ConsumerNotifications {
-                inserted: resolve_ordinals(bitmap, consumer_dict),
-                deleted: Vec::new(),
-                updated: Vec::new(),
-            })
+            Ok(ConsumerNotifications::from_parts(
+                resolve_ordinals(bitmap, consumer_dict),
+                Vec::new(),
+                Vec::new(),
+            ))
         }
         EventKind::Delete => {
             let row = require_old_row(event, "DELETE requires old_row")?;
             let bitmap = dispatch_single_eval_bitmap(event, row, partition, vm)?;
-            Ok(ConsumerNotifications {
-                inserted: Vec::new(),
-                deleted: resolve_ordinals(bitmap, consumer_dict),
-                updated: Vec::new(),
-            })
+            Ok(ConsumerNotifications::from_parts(
+                Vec::new(),
+                resolve_ordinals(bitmap, consumer_dict),
+                Vec::new(),
+            ))
         }
         EventKind::Update => dispatch_update(event, partition, consumer_dict, vm),
     }
@@ -269,8 +263,7 @@ pub fn dispatch_consumers<I: IdTypes>(
 /// meaning dual-eval is possible for view-relative UPDATE dispatch.
 fn old_row_is_complete(event: &WalEvent) -> bool {
     event
-        .old_row
-        .as_ref()
+        .old_row()
         .is_some_and(|row| !row.cells.iter().any(Cell::is_missing))
 }
 
@@ -293,22 +286,19 @@ fn dispatch_update<I: IdTypes>(
     // All matches go to `updated` (we can't distinguish entered vs stayed).
     if !old_row_is_complete(event) {
         let bitmap = dispatch_single_eval_bitmap(event, new_row, partition, vm)?;
-        return Ok(ConsumerNotifications {
-            inserted: Vec::new(),
-            deleted: Vec::new(),
-            updated: resolve_ordinals(bitmap, consumer_dict),
-        });
+        return Ok(ConsumerNotifications::from_parts(
+            Vec::new(),
+            Vec::new(),
+            resolve_ordinals(bitmap, consumer_dict),
+        ));
     }
 
     // Safety: old_row_is_complete guarantees old_row is Some with no Cell::Missing.
-    let old_row = event
-        .old_row
-        .as_ref()
-        .expect("checked by old_row_is_complete");
+    let old_row = event.old_row().expect("checked by old_row_is_complete");
 
     // Use the UPDATE candidate set (dependency-aware).
     let candidates =
-        partition.select_candidates(new_row, EventKind::Update, &event.changed_columns);
+        partition.select_candidates(new_row, EventKind::Update, event.changed_columns());
     let snapshot = partition.load_snapshot();
 
     let mut inserted_ordinals = RoaringBitmap::new();
@@ -367,11 +357,11 @@ fn dispatch_update<I: IdTypes>(
         }
     }
 
-    Ok(ConsumerNotifications {
-        inserted: resolve_ordinals(inserted_ordinals, consumer_dict),
-        deleted: resolve_ordinals(deleted_ordinals, consumer_dict),
-        updated: resolve_ordinals(updated_ordinals, consumer_dict),
-    })
+    Ok(ConsumerNotifications::from_parts(
+        resolve_ordinals(inserted_ordinals, consumer_dict),
+        resolve_ordinals(deleted_ordinals, consumer_dict),
+        resolve_ordinals(updated_ordinals, consumer_dict),
+    ))
 }
 
 /// Single-eval dispatch: evaluate one row, return the matching ordinals bitmap.
@@ -382,7 +372,7 @@ fn dispatch_single_eval_bitmap<I: IdTypes>(
     partition: &TablePartition<I>,
     vm: &mut Vm,
 ) -> Result<RoaringBitmap, DispatchError> {
-    let candidates = partition.select_candidates(row, event.kind, &event.changed_columns);
+    let candidates = partition.select_candidates(row, event.kind(), event.changed_columns());
     let snapshot = partition.load_snapshot();
     let mut matching_ordinals = RoaringBitmap::new();
 
@@ -447,7 +437,7 @@ where
 }
 
 fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, DispatchError> {
-    match event.kind {
+    match event.kind() {
         EventKind::Insert => Ok(vec![(
             1,
             require_new_row(event, "INSERT requires new_row")?,
@@ -458,17 +448,20 @@ fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, Disp
         )]),
         EventKind::Update => {
             let old_row = event
-                .old_row
-                .as_ref()
-                .ok_or(DispatchError::AggregateUpdateRequiresOldRow(event.table_id))?;
+                .old_row()
+                .ok_or(DispatchError::AggregateUpdateRequiresOldRow(
+                    event.table_id(),
+                ))?;
             // Reject partial old rows — Cell::Missing would produce unsound deltas
             if old_row.cells.iter().any(Cell::is_missing) {
-                return Err(DispatchError::AggregateUpdateRequiresOldRow(event.table_id));
+                return Err(DispatchError::AggregateUpdateRequiresOldRow(
+                    event.table_id(),
+                ));
             }
             let new_row = require_new_row(event, "UPDATE requires new_row")?;
             Ok(vec![(-1, old_row), (1, new_row)])
         }
-        EventKind::Truncate => Err(DispatchError::TruncateRequiresReset(event.table_id)),
+        EventKind::Truncate => Err(DispatchError::TruncateRequiresReset(event.table_id())),
     }
 }
 
@@ -503,12 +496,12 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
 
     // For UPDATE, use dependency-aware candidate selection; for INSERT/DELETE
     // pass empty changed_cols to get all agg candidates.
-    let changed_cols = if event.kind == EventKind::Update {
-        &event.changed_columns[..]
+    let changed_cols = if event.kind() == EventKind::Update {
+        event.changed_columns()
     } else {
         &[]
     };
-    let candidates = partition.select_agg_candidates(event.kind, changed_cols);
+    let candidates = partition.select_agg_candidates(event.kind(), changed_cols);
 
     for (weight, row) in weighted_rows {
         for_each_matching_predicate(
@@ -636,25 +629,20 @@ mod tests {
         let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(crate::RowImage {
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk_cell(0, crate::Cell::Int(1))
+            .new_row(crate::RowImage {
                 cells: Arc::from([crate::Cell::Int(100)]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            })
+            .build()
+            .expect("event builder should be valid");
 
         assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
     }
 
     #[test]
-    fn test_dispatch_insert_missing_new_row() {
+    fn test_insert_event_is_valid_by_construction() {
         use super::super::partition::TablePartition;
         use crate::compiler::Vm;
 
@@ -662,22 +650,16 @@ mod tests {
         let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk_cell(0, crate::Cell::Int(1))
+            .new_row(crate::RowImage {
+                cells: Arc::from([crate::Cell::Int(100)]),
+            })
+            .build()
+            .expect("event builder should be valid");
 
-        assert!(matches!(
-            dispatch_consumers(&event, &partition, &consumer_dict, &mut vm),
-            Err(DispatchError::MissingRequiredRowImage(_))
-        ));
+        assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
     }
 
     #[test]
@@ -720,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_update_missing_new_row() {
+    fn test_update_event_requires_no_missing_row_checks() {
         use super::super::partition::TablePartition;
         use crate::compiler::Vm;
 
@@ -728,28 +710,24 @@ mod tests {
         let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(crate::RowImage {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(crate::RowImage {
                 cells: Arc::from([crate::Cell::Int(100)]),
-            }),
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+            })
+            .pk_cell(0, crate::Cell::Int(1))
+            .old_row(crate::RowImage {
+                cells: Arc::from([crate::Cell::Int(99)]),
+            })
+            .changed_columns(Arc::from([0u16]))
+            .build()
+            .expect("event builder should be valid");
 
-        assert!(matches!(
-            dispatch_consumers(&event, &partition, &consumer_dict, &mut vm),
-            Err(DispatchError::MissingRequiredRowImage(_))
-        ));
+        assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
     }
 
     #[test]
-    fn test_dispatch_delete_missing_old_row() {
+    fn test_delete_event_is_valid_by_construction() {
         use super::super::partition::TablePartition;
         use crate::compiler::Vm;
 
@@ -757,24 +735,16 @@ mod tests {
         let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
         let mut vm = Vm::new();
 
-        let event = WalEvent {
-            kind: EventKind::Delete,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(crate::RowImage {
+        let event = WalEvent::builder(1)
+            .delete()
+            .pk_cell(0, crate::Cell::Int(1))
+            .old_row(crate::RowImage {
                 cells: Arc::from([crate::Cell::Int(100)]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            })
+            .build()
+            .expect("event builder should be valid");
 
-        assert!(matches!(
-            dispatch_consumers(&event, &partition, &consumer_dict, &mut vm),
-            Err(DispatchError::MissingRequiredRowImage(_))
-        ));
+        assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
     }
 
     #[test]
@@ -824,20 +794,16 @@ mod tests {
         make_count_pred_and_binding(1, 101, 77, &mut partition, &mut consumer_dict);
         let mut vm = Vm::new();
 
-        let event = WalEvent {
-            kind: EventKind::Truncate,
-            table_id: 1,
-            pk: crate::PrimaryKey::empty(),
-            old_row: None,
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .truncate()
+            .build()
+            .expect("truncate event builder should be valid");
 
         let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
             .expect("truncate should dispatch without row image");
-        assert!(notifs.inserted.is_empty());
-        assert!(notifs.updated.is_empty());
-        let mut deleted = notifs.deleted;
+        assert!(notifs.inserted().is_empty());
+        assert!(notifs.updated().is_empty());
+        let mut deleted = notifs.deleted().to_vec();
         deleted.sort_unstable();
         assert_eq!(deleted, vec![42]);
     }
@@ -927,30 +893,27 @@ mod tests {
         };
         partition.add_binding(binding, pred_id);
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(17)]),
-            }),
-            new_row: Some(crate::RowImage {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(crate::RowImage {
                 cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(25)]),
-            }),
-            changed_columns: Arc::from([1u16]),
-        };
+            })
+            .pk_cell(0, crate::Cell::Int(1))
+            .maybe_old_row(Some(crate::RowImage {
+                cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(17)]),
+            }))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
         // old_row age=17 (no match), new_row age=25 (match) → consumer enters (inserted)
         assert!(
-            notifs.inserted.contains(&42),
+            notifs.inserted().contains(&42),
             "Consumer 42 should be inserted (age > 18 with new age=25, old age=17)"
         );
-        assert!(notifs.deleted.is_empty());
-        assert!(notifs.updated.is_empty());
+        assert!(notifs.deleted().is_empty());
+        assert!(notifs.updated().is_empty());
     }
 
     #[test]
@@ -995,27 +958,22 @@ mod tests {
         };
         partition.add_binding(binding, pred_id);
 
-        let event = WalEvent {
-            kind: EventKind::Delete,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(crate::RowImage {
+        let event = WalEvent::builder(1)
+            .delete()
+            .pk_cell(0, crate::Cell::Int(1))
+            .old_row(crate::RowImage {
                 cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(25)]),
-            }),
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+            })
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(
-            notifs.deleted.contains(&99),
+            notifs.deleted().contains(&99),
             "Consumer 99 should see deletion (age < 30 with age=25)"
         );
-        assert!(notifs.inserted.is_empty());
-        assert!(notifs.updated.is_empty());
+        assert!(notifs.inserted().is_empty());
+        assert!(notifs.updated().is_empty());
     }
 
     // --- Aggregate dispatch tests ---
@@ -1074,6 +1032,12 @@ mod tests {
         }
     }
 
+    /// Helper: primary key on id column.
+    fn make_pk(id: i64) -> crate::PrimaryKey {
+        crate::PrimaryKey::new(Arc::from([0u16]), Arc::from([crate::Cell::Int(id)]))
+            .expect("single PK column/value is valid")
+    }
+
     #[test]
     fn test_agg_insert_matching_gives_plus_one() {
         use super::super::partition::TablePartition;
@@ -1085,17 +1049,12 @@ mod tests {
 
         make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(make_row(20)), // 20 > 10 → matches
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(make_row(20))
+            .build()
+            .expect("event builder should be valid"); // 20 > 10 → matches
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(
@@ -1116,17 +1075,12 @@ mod tests {
 
         make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(make_row(5)), // 5 ≤ 10 → no match
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(make_row(5))
+            .build()
+            .expect("event builder should be valid"); // 5 ≤ 10 → no match
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(
@@ -1146,17 +1100,12 @@ mod tests {
 
         make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Delete,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_row(20)), // was matching
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .delete()
+            .pk(make_pk(1))
+            .old_row(make_row(20))
+            .build()
+            .expect("event builder should be valid"); // was matching
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(
@@ -1177,109 +1126,12 @@ mod tests {
 
         make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_row(20)), // was matching (20 > 10)
-            new_row: Some(make_row(5)),  // no longer matches (5 ≤ 10)
-            changed_columns: Arc::from([1u16]),
-        };
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(
-            deltas,
-            vec![(42, crate::AggDelta::Count(-1))],
-            "UPDATE leaving predicate should yield delta -1"
-        );
-    }
-
-    #[test]
-    fn test_agg_update_old_does_not_match_new_does_gives_plus_one() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_row(5)),  // was not matching
-            new_row: Some(make_row(20)), // now matches
-            changed_columns: Arc::from([1u16]),
-        };
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(
-            deltas,
-            vec![(42, crate::AggDelta::Count(1))],
-            "UPDATE entering predicate should yield delta +1"
-        );
-    }
-
-    #[test]
-    fn test_agg_update_both_match_gives_zero_net_no_entry() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_row(15)), // matches (15 > 10)
-            new_row: Some(make_row(20)), // also matches (20 > 10)
-            changed_columns: Arc::from([1u16]),
-        };
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(
-            deltas.is_empty(),
-            "UPDATE where both old and new match should yield zero net delta (no entry)"
-        );
-    }
-
-    #[test]
-    fn test_agg_update_missing_old_row_returns_strict_error() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(make_row(20)),
-            changed_columns: Arc::from([1u16]),
-        };
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_row(20))
+            .pk(make_pk(1))
+            .build()
+            .expect("event builder should be valid");
 
         let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
             .expect_err("UPDATE without old_row must be rejected for aggregates");
@@ -1301,19 +1153,98 @@ mod tests {
         make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
         // old_row has Cell::Missing at column 1 — partial image
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(crate::RowImage {
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_row(20))
+            .pk(make_pk(1))
+            .old_row(crate::RowImage {
                 cells: Arc::from([crate::Cell::Int(1), crate::Cell::Missing]),
-            }),
-            new_row: Some(make_row(20)),
-            changed_columns: Arc::from([1u16]),
-        };
+            })
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
+
+        let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
+            .expect_err("UPDATE with partial old_row must be rejected for aggregates");
+        assert!(matches!(
+            err,
+            DispatchError::AggregateUpdateRequiresOldRow(1)
+        ));
+    }
+
+    #[test]
+    fn test_agg_update_old_does_not_match_new_does_gives_plus_one() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
+
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_row(20))
+            .pk(make_pk(1))
+            .maybe_old_row(Some(make_row(5))) // was not matching
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
+
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
+        assert_eq!(
+            deltas,
+            vec![(42, crate::AggDelta::Count(1))],
+            "UPDATE entering predicate should yield delta +1"
+        );
+    }
+
+    #[test]
+    fn test_agg_update_both_match_gives_zero_net_no_entry() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
+
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_row(20))
+            .pk(make_pk(1))
+            .maybe_old_row(Some(make_row(15))) // matches (15 > 10)
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
+
+        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
+        assert!(
+            deltas.is_empty(),
+            "UPDATE where both old and new match should yield zero net delta (no entry)"
+        );
+    }
+
+    #[test]
+    fn test_agg_update_missing_old_row_returns_strict_error() {
+        use super::super::partition::TablePartition;
+        use crate::compiler::Vm;
+
+        let mut partition = TablePartition::<DefaultIds>::new(1);
+        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
+        let mut vm = Vm::new();
+
+        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
+
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_row(20))
+            .pk(make_pk(1))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
             .expect_err("UPDATE with partial old_row must be rejected for aggregates");
@@ -1392,17 +1323,12 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(make_sum_row(crate::Cell::Int(20))), // 20 > 10 → matches
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(make_sum_row(crate::Cell::Int(20)))
+            .build()
+            .expect("event builder should be valid"); // 20 > 10 → matches
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
@@ -1419,17 +1345,12 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(make_sum_row(crate::Cell::Int(5))), // 5 ≤ 10 → no match
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(make_sum_row(crate::Cell::Int(5)))
+            .build()
+            .expect("event builder should be valid"); // 5 ≤ 10 → no match
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(deltas.is_empty());
@@ -1446,17 +1367,12 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Delete,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_sum_row(crate::Cell::Int(20))),
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .delete()
+            .pk(make_pk(1))
+            .old_row(make_sum_row(crate::Cell::Int(20)))
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-20.0))]);
@@ -1473,17 +1389,14 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_sum_row(crate::Cell::Int(15))), // matches, contributes -15
-            new_row: Some(make_sum_row(crate::Cell::Int(25))), // matches, contributes +25
-            changed_columns: Arc::from([1u16]),
-        };
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_sum_row(crate::Cell::Int(25)))
+            .pk(make_pk(1))
+            .maybe_old_row(Some(make_sum_row(crate::Cell::Int(15)))) // matches, contributes -15
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(10.0))]);
@@ -1500,17 +1413,14 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_sum_row(crate::Cell::Int(20))),
-            new_row: Some(make_sum_row(crate::Cell::Int(20))),
-            changed_columns: Arc::from([1u16]),
-        };
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_sum_row(crate::Cell::Int(20)))
+            .pk(make_pk(1))
+            .maybe_old_row(Some(make_sum_row(crate::Cell::Int(20))))
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(
@@ -1530,17 +1440,14 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_sum_row(crate::Cell::Int(20))), // matches → -20
-            new_row: Some(make_sum_row(crate::Cell::Int(5))),  // no match → 0
-            changed_columns: Arc::from([1u16]),
-        };
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_sum_row(crate::Cell::Int(5)))
+            .pk(make_pk(1))
+            .maybe_old_row(Some(make_sum_row(crate::Cell::Int(20)))) // matches -> -20
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-20.0))]);
@@ -1557,17 +1464,14 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Update,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: Some(make_sum_row(crate::Cell::Int(5))), // no match
-            new_row: Some(make_sum_row(crate::Cell::Int(20))), // matches → +20
-            changed_columns: Arc::from([1u16]),
-        };
+        let event = WalEvent::builder(1)
+            .update()
+            .new_row(make_sum_row(crate::Cell::Int(20)))
+            .pk(make_pk(1))
+            .maybe_old_row(Some(make_sum_row(crate::Cell::Int(5)))) // no match
+            .changed_columns(Arc::from([1u16]))
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
@@ -1585,17 +1489,12 @@ mod tests {
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
         // WHERE amount > 10 won't match NULL, so no delta
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(make_sum_row(crate::Cell::Null)),
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(make_sum_row(crate::Cell::Null))
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(deltas.is_empty());
@@ -1614,19 +1513,14 @@ mod tests {
 
         // Row too short — column 1 (amount) is missing
         // WHERE amount > 10 evaluates to Unknown → no match
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(crate::RowImage {
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(crate::RowImage {
                 cells: Arc::from([crate::Cell::Int(1)]), // only col 0, col 1 missing
-            }),
-            changed_columns: Arc::from([]),
-        };
+            })
+            .build()
+            .expect("event builder should be valid");
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(deltas.is_empty());
@@ -1643,17 +1537,12 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(make_sum_row(crate::Cell::Float(2.5))),
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(make_sum_row(crate::Cell::Float(2.5)))
+            .build()
+            .expect("event builder should be valid");
 
         // WHERE amount > 10 won't match 2.5, so no delta
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
@@ -1671,14 +1560,10 @@ mod tests {
 
         make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
-        let event = WalEvent {
-            kind: EventKind::Truncate,
-            table_id: 1,
-            pk: crate::PrimaryKey::empty(),
-            old_row: None,
-            new_row: None,
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .truncate()
+            .build()
+            .expect("truncate event builder should be valid");
 
         let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
             .expect_err("TRUNCATE should return TruncateRequiresReset");
@@ -1737,24 +1622,19 @@ mod tests {
             );
         }
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(make_row(20)), // matches both predicates
-            changed_columns: Arc::from([]),
-        };
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(make_row(20))
+            .build()
+            .expect("event builder should be valid"); // matches both predicates
 
         let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
             .expect("dispatch_consumers should succeed");
 
         // Consumer 99 (Rows predicate) should appear as inserted; consumer 42 (COUNT) must NOT
         assert!(
-            notifs.inserted.contains(&99),
+            notifs.inserted().contains(&99),
             "Rows subscriber should be dispatched"
         );
         let all: Vec<_> = notifs.into_iter().collect();
@@ -1806,19 +1686,14 @@ mod tests {
         };
         partition.add_binding(binding, pred_id);
 
-        let event = WalEvent {
-            kind: EventKind::Insert,
-            table_id: 1,
-            pk: crate::PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([crate::Cell::Int(1)]),
-            },
-            old_row: None,
-            new_row: Some(crate::RowImage {
+        let event = WalEvent::builder(1)
+            .insert()
+            .pk(make_pk(1))
+            .new_row(crate::RowImage {
                 cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(25)]),
-            }),
-            changed_columns: Arc::from([]),
-        };
+            })
+            .build()
+            .expect("event builder should be valid");
 
         let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
         let all: Vec<_> = notifs.into_iter().collect();

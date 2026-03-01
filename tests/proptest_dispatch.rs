@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::option_if_let_else)]
+#![allow(clippy::unwrap_used, clippy::option_if_let_else, unused_imports)]
 //! Property-based tests for dispatch correctness
 //!
 //! Verifies the fundamental invariant: for any subscriptions and events,
@@ -224,24 +224,19 @@ proptest! {
 
         // Dispatch each row and verify
         for (id_cell, amount_cell, status_cell) in &rows {
-            let event = WalEvent {
-                kind: EventKind::Insert,
-                table_id: 1,
-                pk: PrimaryKey {
-                    columns: Arc::from([0u16]),
-                    values: Arc::from([id_cell.clone()]),
-                },
-                old_row: None,
-                new_row: Some(RowImage {
+            let event = WalEvent::builder(1)
+                .insert()
+                .pk_cell(0, id_cell.clone())
+                .new_row(RowImage {
                     cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
-                }),
-                changed_columns: Arc::from([]),
-            };
+                })
+                .build()
+                .expect("insert event builder should be valid");
 
             let notifs = engine.consumers(&event).unwrap();
             // INSERT events: all matched consumers should be in `inserted`.
-            let matched: HashSet<u64> = notifs.inserted.into_iter().collect();
-            prop_assert!(notifs.deleted.is_empty() && notifs.updated.is_empty(),
+            let matched: HashSet<u64> = notifs.inserted().iter().copied().collect();
+            prop_assert!(notifs.deleted().is_empty() && notifs.updated().is_empty(),
                 "INSERT should produce no deleted/updated");
 
             // Ground truth: evaluate each predicate in Rust
@@ -292,22 +287,19 @@ proptest! {
         // Update events where only `amount` (col 1) changed.
         // Predicates on `amount` or `id` may fire; predicates only on `status` won't.
         for (id_cell, amount_cell, status_cell) in &rows {
-            let event = WalEvent {
-                kind: EventKind::Update,
-                table_id: 1,
-                pk: PrimaryKey {
-                    columns: Arc::from([0u16]),
-                    values: Arc::from([id_cell.clone()]),
-                },
-                old_row: Some(RowImage {
-                    cells: Arc::from([id_cell.clone(), Cell::Int(0), status_cell.clone()]),
-                }),
-                new_row: Some(RowImage {
+            let event = subql::WalEvent::builder(1)
+                .update()
+                .new_row(RowImage {
                     cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
-                }),
+                })
+                .pk_cell(0, id_cell.clone())
+                .maybe_old_row(Some(RowImage {
+                    cells: Arc::from([id_cell.clone(), Cell::Int(0), status_cell.clone()]),
+                }))
                 // Only `amount` (col 1) changed.
-                changed_columns: Arc::from([1u16]),
-            };
+                .changed_columns(Arc::from([1u16]))
+                .build()
+                .expect("update event builder should be valid");
 
             let notifs = engine.consumers(&event).unwrap();
             let all_notified: HashSet<u64> = notifs.into_iter().collect();
@@ -350,24 +342,19 @@ proptest! {
         }
 
         for (id_cell, amount_cell, status_cell) in &rows {
-            let event = WalEvent {
-                kind: EventKind::Delete,
-                table_id: 1,
-                pk: PrimaryKey {
-                    columns: Arc::from([0u16]),
-                    values: Arc::from([id_cell.clone()]),
-                },
-                old_row: Some(RowImage {
+            let event = WalEvent::builder(1)
+                .delete()
+                .pk_cell(0, id_cell.clone())
+                .old_row(RowImage {
                     cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
-                }),
-                new_row: None,
-                changed_columns: Arc::from([]),
-            };
+                })
+                .build()
+                .expect("delete event builder should be valid");
 
             let notifs = engine.consumers(&event).unwrap();
             // DELETE events: all matched consumers should be in `deleted`.
-            let matched: HashSet<u64> = notifs.deleted.into_iter().collect();
-            prop_assert!(notifs.inserted.is_empty() && notifs.updated.is_empty(),
+            let matched: HashSet<u64> = notifs.deleted().iter().copied().collect();
+            prop_assert!(notifs.inserted().is_empty() && notifs.updated().is_empty(),
                 "DELETE should produce no inserted/updated");
 
             // Ground truth: evaluate against the old row (same cells)
@@ -463,19 +450,14 @@ proptest! {
 
         // Dispatch same events to both engines, verify identical results
         for (id_cell, amount_cell, status_cell) in &rows {
-            let event = WalEvent {
-                kind: EventKind::Insert,
-                table_id: 1,
-                pk: PrimaryKey {
-                    columns: Arc::from([0u16]),
-                    values: Arc::from([id_cell.clone()]),
-                },
-                old_row: None,
-                new_row: Some(RowImage {
+            let event = WalEvent::builder(1)
+                .insert()
+                .pk_cell(0, id_cell.clone())
+                .new_row(RowImage {
                     cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
-                }),
-                changed_columns: Arc::from([]),
-            };
+                })
+                .build()
+                .expect("insert event builder should be valid");
 
             let result1: HashSet<u64> = match engine1.consumers(&event) {
                 Ok(notifs) => notifs.into_iter().collect(),

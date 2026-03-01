@@ -9,8 +9,8 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 use subql::{
-    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionRequest, TableId, WalEvent,
+    Cell, DefaultIds, RowImage, SchemaCatalog, SubscriptionEngine, SubscriptionRequest, TableId,
+    WalEvent,
 };
 
 const STATUS_BUCKETS: [&str; 7] = [
@@ -296,15 +296,10 @@ fn make_test_event(seed: u64) -> WalEvent {
     let created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
     let status = status_for(seed ^ 0xBECF);
 
-    WalEvent {
-        kind: EventKind::Insert,
-        table_id: 1,
-        pk: PrimaryKey {
-            columns: Arc::from([0u16]),
-            values: Arc::from([Cell::Int(id)]),
-        },
-        old_row: None,
-        new_row: Some(RowImage {
+    WalEvent::builder(1)
+        .insert()
+        .pk_cell(0, Cell::Int(id))
+        .new_row(RowImage {
             cells: Arc::from([
                 Cell::Int(id),
                 Cell::Int(user_id),
@@ -317,9 +312,9 @@ fn make_test_event(seed: u64) -> WalEvent {
                 Cell::Int(shipping),
                 Cell::Int(created_at),
             ]),
-        }),
-        changed_columns: Arc::from([]),
-    }
+        })
+        .build()
+        .expect("insert event builder should be valid")
 }
 
 fn make_test_update_event(seed: u64) -> WalEvent {
@@ -372,28 +367,9 @@ fn make_test_update_event(seed: u64) -> WalEvent {
         }
     };
 
-    WalEvent {
-        kind: EventKind::Update,
-        table_id: 1,
-        pk: PrimaryKey {
-            columns: Arc::from([0u16]),
-            values: Arc::from([Cell::Int(id)]),
-        },
-        old_row: Some(RowImage {
-            cells: Arc::from([
-                Cell::Int(id),
-                Cell::Int(user_id),
-                Cell::Int(old_amount),
-                Cell::String(old_status.into()),
-                Cell::Int(old_priority),
-                Cell::Int(old_quantity),
-                old_discount,
-                Cell::Int(old_tax),
-                Cell::Int(old_shipping),
-                Cell::Int(old_created_at),
-            ]),
-        }),
-        new_row: Some(RowImage {
+    WalEvent::builder(1)
+        .update()
+        .new_row(RowImage {
             cells: Arc::from([
                 Cell::Int(id),
                 Cell::Int(user_id),
@@ -406,9 +382,25 @@ fn make_test_update_event(seed: u64) -> WalEvent {
                 Cell::Int(new_shipping),
                 Cell::Int(old_created_at),
             ]),
-        }),
-        changed_columns,
-    }
+        })
+        .pk_cell(0, Cell::Int(id))
+        .maybe_old_row(Some(RowImage {
+            cells: Arc::from([
+                Cell::Int(id),
+                Cell::Int(user_id),
+                Cell::Int(old_amount),
+                Cell::String(old_status.into()),
+                Cell::Int(old_priority),
+                Cell::Int(old_quantity),
+                old_discount,
+                Cell::Int(old_tax),
+                Cell::Int(old_shipping),
+                Cell::Int(old_created_at),
+            ]),
+        }))
+        .changed_columns(changed_columns)
+        .build()
+        .expect("update event builder should be valid")
 }
 
 fn make_test_delete_event(seed: u64) -> WalEvent {
@@ -427,14 +419,10 @@ fn make_test_delete_event(seed: u64) -> WalEvent {
     let created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
     let status = status_for(seed ^ 0xBECF);
 
-    WalEvent {
-        kind: EventKind::Delete,
-        table_id: 1,
-        pk: PrimaryKey {
-            columns: Arc::from([0u16]),
-            values: Arc::from([Cell::Int(id)]),
-        },
-        old_row: Some(RowImage {
+    WalEvent::builder(1)
+        .delete()
+        .pk_cell(0, Cell::Int(id))
+        .old_row(RowImage {
             cells: Arc::from([
                 Cell::Int(id),
                 Cell::Int(user_id),
@@ -447,10 +435,9 @@ fn make_test_delete_event(seed: u64) -> WalEvent {
                 Cell::Int(shipping),
                 Cell::Int(created_at),
             ]),
-        }),
-        new_row: None,
-        changed_columns: Arc::from([]),
-    }
+        })
+        .build()
+        .expect("delete event builder should be valid")
 }
 
 fn event_corpus(size: usize, salt: u64, make_event: fn(u64) -> WalEvent) -> Vec<WalEvent> {

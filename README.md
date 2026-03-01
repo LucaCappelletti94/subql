@@ -50,22 +50,16 @@ engine.register(
         .updated_at_unix_ms(1_704_067_200_000),
 )?;
 
-let event = WalEvent {
-    kind: EventKind::Insert,
-    table_id: 1,
-    pk: PrimaryKey {
-        columns: Arc::from([0u16]),
-        values: Arc::from([Cell::Int(1)]),
-    },
-    old_row: None,
-    new_row: Some(RowImage {
+let event = WalEvent::builder(1)
+    .insert()
+    .pk_cell(0, Cell::Int(1))
+    .new_row(RowImage {
         cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("paid".into())]),
-    }),
-    changed_columns: Arc::from([]),
-};
+    })
+    .build()?;
 
 let notifs = engine.consumers(&event)?;
-assert_eq!(notifs.inserted, vec![42]);
+assert_eq!(notifs.inserted(), vec![42]);
 
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -86,9 +80,8 @@ returns an error for update events.
 use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
-    AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, EventKind,
-    PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
-    WalEvent,
+    AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, PrimaryKey, RowImage,
+    SimpleCatalog, SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
 let catalog = Arc::new(
@@ -111,19 +104,13 @@ engine.register(SubscriptionRequest::new(
     42, "SELECT SUM(amount) FROM orders WHERE status = 'active'",
 ))?;
 
-let event = WalEvent {
-    kind: EventKind::Insert,
-    table_id: 1,
-    pk: PrimaryKey {
-        columns: Arc::from([0u16]),
-        values: Arc::from([Cell::Int(1)]),
-    },
-    old_row: None,
-    new_row: Some(RowImage {
+let event = WalEvent::builder(1)
+    .insert()
+    .pk_cell(0, Cell::Int(1))
+    .new_row(RowImage {
         cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("active".into())]),
-    }),
-    changed_columns: Arc::from([]),
-};
+    })
+    .build()?;
 
 let mut deltas: Vec<(u64, AggDelta)> = engine.aggregate_deltas(&event)?;
 // Sort for deterministic comparison (Count before Sum).
@@ -157,9 +144,8 @@ then computes the average as `running_sum / running_count` on demand:
 use std::sync::Arc;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
-    AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, EventKind,
-    PrimaryKey, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
-    WalEvent,
+    AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, PrimaryKey, RowImage,
+    SimpleCatalog, SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
 let catalog = Arc::new(
@@ -175,19 +161,13 @@ engine.register(SubscriptionRequest::new(
     7, "SELECT AVG(value) FROM scores WHERE id > 0",
 ))?;
 
-let event = WalEvent {
-    kind: EventKind::Insert,
-    table_id: 1,
-    pk: PrimaryKey {
-        columns: Arc::from([0u16]),
-        values: Arc::from([Cell::Int(1)]),
-    },
-    old_row: None,
-    new_row: Some(RowImage {
+let event = WalEvent::builder(1)
+    .insert()
+    .pk_cell(0, Cell::Int(1))
+    .new_row(RowImage {
         cells: Arc::from([Cell::Int(1), Cell::Int(100)]),
-    }),
-    changed_columns: Arc::from([]),
-};
+    })
+    .build()?;
 
 let deltas = engine.aggregate_deltas(&event)?;
 let (_, delta) = &deltas[0];
