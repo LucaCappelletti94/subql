@@ -233,7 +233,7 @@ fn convert_v1_change(
     let table_id = resolve_table(&change.schema, &change.table, catalog)?;
 
     if kind == EventKind::Truncate {
-        return Ok(truncate_event(table_id)?);
+        return truncate_event(table_id);
     }
 
     if matches!(kind, EventKind::Insert | EventKind::Update)

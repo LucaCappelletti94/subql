@@ -5,8 +5,8 @@
 #![allow(clippy::print_stdout, clippy::unnecessary_cast)]
 
 use crate::{
-    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionRequest, TableId, WalEvent,
+    Cell, DefaultIds, RowImage, SchemaCatalog, SubscriptionEngine, SubscriptionRequest, TableId,
+    WalEvent,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::HashMap;
@@ -305,6 +305,7 @@ pub fn run_memory_profile(show_progress: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EventKind;
 
     #[test]
     fn realistic_tree_sql_is_deterministic_for_seed() {

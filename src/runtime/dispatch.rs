@@ -449,9 +449,7 @@ fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, Disp
         EventKind::Update => {
             let old_row = event
                 .old_row()
-                .ok_or(DispatchError::AggregateUpdateRequiresOldRow(
-                    event.table_id(),
-                ))?;
+                .ok_or_else(|| DispatchError::AggregateUpdateRequiresOldRow(event.table_id()))?;
             // Reject partial old rows — Cell::Missing would produce unsound deltas
             if old_row.cells.iter().any(Cell::is_missing) {
                 return Err(DispatchError::AggregateUpdateRequiresOldRow(

@@ -523,8 +523,7 @@ impl std::fmt::Display for WalEventBuildError {
             } => {
                 write!(
                     f,
-                    "primary key columns/values length mismatch: columns={}, values={}",
-                    columns_len, values_len
+                    "primary key columns/values length mismatch: columns={columns_len}, values={values_len}"
                 )
             }
             Self::DuplicatePkColumn(col) => write!(f, "duplicate primary key column: {col}"),
@@ -602,6 +601,7 @@ fn build_primary_key(
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn apply_pk(columns: &mut Vec<ColumnId>, values: &mut Vec<Cell>, pk: PrimaryKey) {
     columns.clear();
     values.clear();
@@ -614,7 +614,7 @@ fn apply_pk(columns: &mut Vec<ColumnId>, values: &mut Vec<Cell>, pk: PrimaryKey)
 impl WalEventBuilderStart {
     /// Start building an INSERT event.
     #[must_use]
-    pub fn insert(self) -> InsertEventBuilder {
+    pub const fn insert(self) -> InsertEventBuilder {
         InsertEventBuilder {
             table_id: self.table_id,
             pk_columns: Vec::new(),
@@ -638,7 +638,7 @@ impl WalEventBuilderStart {
 
     /// Start building a DELETE event.
     #[must_use]
-    pub fn delete(self) -> DeleteEventBuilder {
+    pub const fn delete(self) -> DeleteEventBuilder {
         DeleteEventBuilder {
             table_id: self.table_id,
             pk_columns: Vec::new(),
@@ -649,7 +649,7 @@ impl WalEventBuilderStart {
 
     /// Start building a TRUNCATE event.
     #[must_use]
-    pub fn truncate(self) -> TruncateEventBuilder {
+    pub const fn truncate(self) -> TruncateEventBuilder {
         TruncateEventBuilder {
             table_id: self.table_id,
         }
@@ -816,7 +816,7 @@ impl DeleteEventBuilder {
 
 impl TruncateEventBuilder {
     /// Build the truncate event.
-    pub fn build(self) -> Result<WalEvent, WalEventBuildError> {
+    pub const fn build(self) -> Result<WalEvent, WalEventBuildError> {
         Ok(WalEvent::Truncate {
             table_id: self.table_id,
         })
@@ -826,7 +826,7 @@ impl TruncateEventBuilder {
 impl WalEvent {
     /// Start fluent construction for a WAL event.
     #[must_use]
-    pub fn builder(table_id: TableId) -> WalEventBuilderStart {
+    pub const fn builder(table_id: TableId) -> WalEventBuilderStart {
         WalEventBuilderStart { table_id }
     }
 
@@ -865,7 +865,7 @@ impl WalEvent {
 
     /// Old row image if present.
     #[must_use]
-    pub fn old_row(&self) -> Option<&RowImage> {
+    pub const fn old_row(&self) -> Option<&RowImage> {
         match self {
             Self::Update { old_row, .. } => old_row.as_ref(),
             Self::Delete { old_row, .. } => Some(old_row),
@@ -875,7 +875,7 @@ impl WalEvent {
 
     /// New row image if present.
     #[must_use]
-    pub fn new_row(&self) -> Option<&RowImage> {
+    pub const fn new_row(&self) -> Option<&RowImage> {
         match self {
             Self::Insert { new_row, .. } | Self::Update { new_row, .. } => Some(new_row),
             Self::Delete { .. } | Self::Truncate { .. } => None,
@@ -1164,7 +1164,7 @@ impl<I: IdTypes> ConsumerNotifications<I> {
 
     /// Construct notifications from explicit buckets.
     #[must_use]
-    pub(crate) fn from_parts(
+    pub(crate) const fn from_parts(
         inserted: Vec<I::ConsumerId>,
         deleted: Vec<I::ConsumerId>,
         updated: Vec<I::ConsumerId>,
@@ -1196,6 +1196,7 @@ impl<I: IdTypes> ConsumerNotifications<I> {
 
     /// Decompose into `(inserted, deleted, updated)`.
     #[must_use]
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(self) -> (Vec<I::ConsumerId>, Vec<I::ConsumerId>, Vec<I::ConsumerId>) {
         (self.inserted, self.deleted, self.updated)
     }

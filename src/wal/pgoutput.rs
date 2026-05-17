@@ -538,7 +538,7 @@ impl PgOutputParser {
         let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel, true)?;
         let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?;
 
-        Ok(insert_event(rel.table_id, pk, new_row)?)
+        insert_event(rel.table_id, pk, new_row)
     }
 
     /// Handle Update message.
@@ -620,7 +620,7 @@ impl PgOutputParser {
         // PK from identity columns
         let pk = Self::pk_from_old_resolved(&rel, &old_resolved)?;
 
-        Ok(delete_event(rel.table_id, pk, old_row)?)
+        delete_event(rel.table_id, pk, old_row)
     }
 
     /// Handle Truncate message.

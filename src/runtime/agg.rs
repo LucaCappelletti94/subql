@@ -147,7 +147,7 @@ impl AggKernel for SumKernel {
         let Some(v) = numeric_cell_value(row, self.column) else {
             return;
         };
-        self.delta += v * weight as f64;
+        self.delta = v.mul_add(weight as f64, self.delta);
     }
 
     fn result(&self) -> AggDelta {
@@ -188,7 +188,7 @@ impl AggKernel for AvgKernel {
         let Some(v) = numeric_cell_value(row, self.column) else {
             return;
         };
-        self.sum_delta += v * weight as f64;
+        self.sum_delta = v.mul_add(weight as f64, self.sum_delta);
         self.count_delta += weight;
     }
 
