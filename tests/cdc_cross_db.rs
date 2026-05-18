@@ -52,14 +52,16 @@ struct NewReading {
 
 /// Schema catalog for the `readings` table across both PG and MySQL.
 ///
-/// Declares the table in both `public` and `testdb` schemas so wal2json
-/// (`public.readings`) and Maxwell (`testdb.readings`) both resolve. A bare
-/// `CREATE TABLE readings ...` is included for the no-schema fallback path.
+/// One bare `readings` declaration serves all three callers:
+/// - subscription registration (`SELECT * FROM readings WHERE ...`),
+/// - wal2json (sends `schema="public"`, resolved as `public.readings`
+///   which Postgres aliases to bare `readings`),
+/// - Maxwell (sends `schema="testdb"`, no `testdb.readings` exists so
+///   `resolve_table_reference` falls back to the unqualified lookup
+///   that hits the bare table).
 fn iot_catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location TEXT);\n\
-         CREATE TABLE public.readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location TEXT);\n\
-         CREATE TABLE testdb.readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location TEXT);",
+        "CREATE TABLE readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location TEXT);",
     )
     .expect("iot fixture DDL parses")
 }
@@ -420,10 +422,19 @@ fn dispatch_events(
             .unwrap_or_else(|e| panic!("Failed to parse message {i}: {e}"));
 
         for event in &events {
-            let consumers: BTreeSet<u64> = engine
+            let notifs = engine
                 .consumers(event)
-                .unwrap_or_else(|e| panic!("Dispatch failed for event {i}: {e}"))
-                .into_iter()
+                .unwrap_or_else(|e| panic!("Dispatch failed for event {i}: {e}"));
+            // Collect every bucket — the view-relative consumers API splits
+            // matches across inserted/deleted/updated; a DELETE's matches
+            // live in `deleted`, which `into_iter()` (which yields only
+            // inserted ∪ updated) would silently drop.
+            let consumers: BTreeSet<u64> = notifs
+                .inserted()
+                .iter()
+                .chain(notifs.deleted())
+                .chain(notifs.updated())
+                .copied()
                 .collect();
             results.push(consumers);
         }

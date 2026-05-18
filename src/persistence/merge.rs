@@ -395,10 +395,21 @@ mod tests {
             .merge_shards_background(1, vec![shard], catalog)
             .unwrap();
 
-        // Wait a bit for merge to complete
-        thread::sleep(std::time::Duration::from_millis(100));
-
-        let result = manager.try_get_result(job_id).unwrap();
+        // Poll for completion. A fixed sleep is unreliable under
+        // instrumented runs (e.g. tarpaulin), where worker threads can be
+        // dramatically slower than wall-clock.
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        let result = loop {
+            if let Some(merged) = manager.try_get_result(job_id).unwrap() {
+                break Some(merged);
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "merge did not complete within {timeout:?}"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(result.is_some());
     }
 
@@ -708,10 +719,21 @@ mod tests {
             .merge_shards_background(1, vec![invalid_shard], catalog)
             .unwrap();
 
-        // Wait for merge to fail
-        thread::sleep(std::time::Duration::from_millis(100));
-
-        let result = manager.try_get_result(job_id);
+        // Poll for the failure outcome instead of a fixed sleep so the test
+        // is stable under instrumented runs (tarpaulin slows workers down).
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        let result = loop {
+            let r = manager.try_get_result(job_id);
+            if !matches!(r, Ok(None)) {
+                break r;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "merge did not fail within {timeout:?}"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(matches!(result, Err(MergeError::BuildFailed(_))));
     }
 
