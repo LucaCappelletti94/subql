@@ -32,8 +32,12 @@ harness = false
 required-features = ["dhat-heap"]
 
 [dependencies]
-# SQL parsing (supports multiple dialects)
-sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs.git", rev = "40350e321f918005e07f818fa31d816f4f8b4c8c", features = ["visitor"] }
+# SQL parsing (supports multiple dialects) — aligned with sql-traits' sqlparser
+# source so both crates resolve to the same sqlparser instance.
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main", features = ["visitor"] }
+
+# Generic SQL schema traits + canonical SchemaFingerprint (FINGERPRINT_SPEC).
+sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main" }
 
 # Compressed bitmaps for predicate/user sets
 roaring = "0.11.3"
