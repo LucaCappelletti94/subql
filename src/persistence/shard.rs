@@ -74,6 +74,13 @@ pub struct ShardFingerprintEnvelope {
 
 impl ShardFingerprintEnvelope {
     /// Project a live [`SchemaFingerprint`] into the on-disk envelope.
+    ///
+    /// **Wire-format invariant**: the `algorithm_id` byte is a stable on-disk
+    /// identifier. Any new [`AlgorithmId`] variant added upstream MUST be
+    /// assigned a fresh constant here (and SHOULD bump [`SHARD_VERSION`] so
+    /// pre-existing shards can be distinguished). Reassigning an existing
+    /// `u8` value would silently produce shards that validate but were
+    /// computed under a different hash.
     #[must_use]
     pub fn from_schema(fp: &SchemaFingerprint) -> Self {
         let algorithm_id = match fp.algorithm_id() {
@@ -366,15 +373,18 @@ pub fn deserialize_shard<I: IdTypes, DB: DatabaseLike>(
 ) -> Result<(ShardHeader, ShardPayload<I>), StorageError> {
     let header = decode_header(bytes)?;
 
-    // Validate header
-    header.validate(database)?;
-
+    // Size sanity check first — a tampered header claiming `u64::MAX` would
+    // otherwise burn a SHA-256 catalog recomputation in `validate` before
+    // being rejected here.
     if header.uncompressed_size > MAX_SHARD_UNCOMPRESSED_SIZE {
         return Err(StorageError::Corrupt(format!(
             "Uncompressed payload too large: {} > {}",
             header.uncompressed_size, MAX_SHARD_UNCOMPRESSED_SIZE
         )));
     }
+
+    // Validate header
+    header.validate(database)?;
 
     // Extract payload bytes (skip fixed-size header).
     let payload_bytes = bytes

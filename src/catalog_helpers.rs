@@ -28,10 +28,17 @@ use crate::types::{ColumnId, ColumnType, TableId};
 /// Accepts either a bare name (`orders`) or a schema-qualified name
 /// (`public.orders`). Schema qualification is detected by the presence
 /// of a single `.` separator outside of quotes; both halves are passed
-/// to [`DatabaseLike::table`] unchanged.
+/// to [`DatabaseLike::table`] unchanged. Note: the quote-detection is a
+/// simple `.contains('"')` heuristic and does not handle escaped quotes
+/// inside quoted identifiers (e.g. `"a""b".c`); callers parsing such
+/// identifiers must pre-resolve them.
 ///
-/// Returns `None` when the table is not found or when the database's
-/// index for the table exceeds `u32::MAX`.
+/// Returns `None` when the table is not found **or** when the database's
+/// index for the table exceeds `u32::MAX` — the two cases are
+/// indistinguishable to callers. The latter is effectively unreachable
+/// with any realistic catalog (it implies > 4 billion declared tables),
+/// but consumers writing against untrusted introspection sources should
+/// be aware of the silent collapse.
 #[must_use]
 pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<TableId> {
     // Heuristic split on the first unquoted '.' for schema-qualified names.
@@ -56,7 +63,12 @@ pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<Tab
 ///
 /// Identifier matching uses sql-traits' PostgreSQL semantics
 /// (quoted/unquoted aware). Returns `None` when the table is unknown,
-/// the column is not present, or the column's ordinal exceeds `u16::MAX`.
+/// the column is not present, or the column's ordinal exceeds `u16::MAX`
+/// (≥ 65536 columns in a single table — unreachable in any sane schema).
+///
+/// **Complexity**: O(n) per call where `n = table.number_of_columns()`.
+/// Callers that need repeated lookups should cache results — this helper
+/// performs a linear scan over the table's columns on every invocation.
 #[must_use]
 pub fn column_id<DB: DatabaseLike>(
     database: &DB,
@@ -84,12 +96,18 @@ pub fn table_arity<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option
 
 /// Compute the spec-compliant [`SchemaFingerprint`] for the table.
 ///
+/// Returns:
+/// - `Ok(Some(fp))` when the table is known and its canonical model is
+///   well-formed.
+/// - `Ok(None)` when the table id is unknown to the database.
+/// - `Err(FingerprintError)` when the table is known but its column model
+///   is malformed (non-contiguous ordinals, duplicate or out-of-range
+///   primary-key ordinals).
+///
 /// # Errors
 ///
-/// Returns [`FingerprintError`] when the table's column model is malformed
-/// (non-contiguous ordinals, duplicate or out-of-range primary-key
-/// ordinals). Returns `Ok(None)` is not possible: this function returns
-/// `None` only when the table id itself is unknown.
+/// See above — propagates the validation errors from
+/// [`compute_persistence_v1`](sql_traits::structs::canonical_bytes_v1).
 pub fn schema_fingerprint<DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
