@@ -21,7 +21,8 @@ use super::{
 };
 #[cfg(test)]
 use crate::EventKind;
-use crate::{Cell, ColumnId, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use crate::{catalog_helpers, Cell, ColumnId, PrimaryKey, RowImage, TableId, WalEvent};
+use sql_traits::prelude::DatabaseLike;
 
 /// Defensive bound to prevent pathological allocations from malformed input.
 const MAX_COLUMNS_PER_MESSAGE: usize = 10_000;
@@ -285,10 +286,10 @@ impl PgOutputParser {
     }
 
     /// Handle Relation message: parse schema and cache for later DML lookups.
-    fn handle_relation(
+    fn handle_relation<DB: DatabaseLike>(
         &self,
         cur: &mut Cursor<'_>,
-        catalog: &dyn SchemaCatalog,
+        database: &DB,
     ) -> Result<(), WalParseError> {
         let oid = cur.read_u32()?;
         let namespace = cur.read_cstring()?.to_string();
@@ -309,23 +310,24 @@ impl PgOutputParser {
             });
         }
 
-        let table_id = resolve_table(&namespace, &name, catalog)?;
-        let arity = catalog
-            .table_arity(table_id)
-            .ok_or_else(|| WalParseError::UnknownTable {
+        let table_id = resolve_table(&namespace, &name, database)?;
+        let arity = catalog_helpers::table_arity(database, table_id).ok_or_else(|| {
+            WalParseError::UnknownTable {
                 schema: namespace.clone(),
                 table: name.clone(),
-            })?;
+            }
+        })?;
 
         let mut column_ids = Vec::with_capacity(columns.len());
         let mut seen_column_ids = HashSet::with_capacity(columns.len());
         for col in &columns {
-            let col_id = catalog.column_id(table_id, &col.name).ok_or_else(|| {
-                WalParseError::UnknownColumn {
-                    table_id,
-                    column: col.name.clone(),
-                }
-            })?;
+            let col_id =
+                catalog_helpers::column_id(database, table_id, &col.name).ok_or_else(|| {
+                    WalParseError::UnknownColumn {
+                        table_id,
+                        column: col.name.clone(),
+                    }
+                })?;
             if !seen_column_ids.insert(col_id) {
                 return Err(WalParseError::MalformedPayload(format!(
                     "relation '{}' column '{}' resolves to duplicate column id {} for table {}",
@@ -523,10 +525,10 @@ impl PgOutputParser {
     }
 
     /// Handle Insert message.
-    fn handle_insert(
+    fn handle_insert<DB: DatabaseLike>(
         &self,
         cur: &mut Cursor<'_>,
-        catalog: &dyn SchemaCatalog,
+        database: &DB,
     ) -> Result<WalEvent, WalParseError> {
         let oid = cur.read_u32()?;
         let rel = self.get_relation(oid)?;
@@ -536,16 +538,16 @@ impl PgOutputParser {
         Self::expected_tag(tag, b'N', "INSERT tuple")?;
 
         let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel, true)?;
-        let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?;
+        let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, database)?;
 
         insert_event(rel.table_id, pk, new_row)
     }
 
     /// Handle Update message.
-    fn handle_update(
+    fn handle_update<DB: DatabaseLike>(
         &self,
         cur: &mut Cursor<'_>,
-        catalog: &dyn SchemaCatalog,
+        database: &DB,
     ) -> Result<WalEvent, WalParseError> {
         let oid = cur.read_u32()?;
         let rel = self.get_relation(oid)?;
@@ -575,10 +577,10 @@ impl PgOutputParser {
 
         let (new_row, new_resolved) = Self::parse_tuple_data(cur, &rel, true)?;
 
-        // PK: prefer identity columns from old row, then catalog fallback.
+        // PK: prefer identity columns from old row, then database fallback.
         let pk = if old_resolved.is_empty() {
-            // No old row — extract PK from new row via catalog
-            pk_from_catalog_or_empty(&new_resolved, rel.table_id, catalog)?
+            // No old row — extract PK from new row via database
+            pk_from_catalog_or_empty(&new_resolved, rel.table_id, database)?
         } else {
             Self::pk_from_old_resolved(&rel, &old_resolved)?
         };
@@ -595,10 +597,10 @@ impl PgOutputParser {
     }
 
     /// Handle Delete message.
-    fn handle_delete(
+    fn handle_delete<DB: DatabaseLike>(
         &self,
         cur: &mut Cursor<'_>,
-        _catalog: &dyn SchemaCatalog,
+        _database: &DB,
     ) -> Result<WalEvent, WalParseError> {
         let oid = cur.read_u32()?;
         let rel = self.get_relation(oid)?;
@@ -643,11 +645,11 @@ impl PgOutputParser {
     }
 }
 
-impl WalParser for PgOutputParser {
+impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
     fn parse_wal_message(
         &self,
         data: &[u8],
-        catalog: &dyn SchemaCatalog,
+        database: &DB,
     ) -> Result<Vec<WalEvent>, WalParseError> {
         if data.is_empty() {
             return Ok(vec![]);
@@ -663,28 +665,28 @@ impl WalParser for PgOutputParser {
 
             // Relation message — cache, no events
             b'R' => {
-                self.handle_relation(&mut cur, catalog)?;
+                self.handle_relation(&mut cur, database)?;
                 Self::ensure_fully_consumed(&cur, "Relation message")?;
                 Ok(vec![])
             }
 
             // Insert
             b'I' => {
-                let event = self.handle_insert(&mut cur, catalog)?;
+                let event = self.handle_insert(&mut cur, database)?;
                 Self::ensure_fully_consumed(&cur, "Insert message")?;
                 Ok(vec![event])
             }
 
             // Update
             b'U' => {
-                let event = self.handle_update(&mut cur, catalog)?;
+                let event = self.handle_update(&mut cur, database)?;
                 Self::ensure_fully_consumed(&cur, "Update message")?;
                 Ok(vec![event])
             }
 
             // Delete
             b'D' => {
-                let event = self.handle_delete(&mut cur, catalog)?;
+                let event = self.handle_delete(&mut cur, database)?;
                 Self::ensure_fully_consumed(&cur, "Delete message")?;
                 Ok(vec![event])
             }
@@ -898,33 +900,11 @@ mod tests {
         assert!(ev.changed_columns().is_empty());
     }
 
-    #[test]
-    fn relation_with_out_of_range_catalog_column_id_errors() {
-        let mut catalog = orders_catalog();
-        // Force one relation column to resolve outside table arity.
-        catalog.columns.insert((1, "status".to_string()), 99);
-        let parser = PgOutputParser::new();
-
-        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
-        let err = parser
-            .parse_wal_message(&rel_msg, &catalog)
-            .expect_err("out-of-range resolved column ID should fail");
-        assert!(matches!(err, WalParseError::MalformedPayload(_)));
-    }
-
-    #[test]
-    fn relation_with_duplicate_catalog_column_id_errors() {
-        let mut catalog = orders_catalog();
-        // Force two relation columns to resolve to the same catalog column id.
-        catalog.columns.insert((1, "customer".to_string()), 0);
-        let parser = PgOutputParser::new();
-
-        let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
-        let err = parser
-            .parse_wal_message(&rel_msg, &catalog)
-            .expect_err("duplicate resolved column ID should fail");
-        assert!(matches!(err, WalParseError::MalformedPayload(_)));
-    }
+    // Removed `relation_with_out_of_range_catalog_column_id_errors` and
+    // `relation_with_duplicate_catalog_column_id_errors`: both injected
+    // out-of-range or duplicate column ordinals into a `MockCatalog`.
+    // ParserDB always assigns unique, in-range ordinals to columns, so the
+    // failure modes are unreachable through the public API.
 
     #[test]
     fn relation_cache_is_bounded_and_evicts_oldest() {
@@ -1648,8 +1628,8 @@ mod tests {
 
     #[test]
     fn trait_object_compiles() {
-        let parser: &dyn WalParser = &PgOutputParser::new();
         let catalog = orders_catalog();
+        let parser: &dyn WalParser<sql_traits::structs::ParserDB> = &PgOutputParser::new();
 
         // Should compile and work as a trait object
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());
@@ -2134,37 +2114,38 @@ mod tests {
 
     #[test]
     fn truncate_skips_unknown_oid_emits_known_ones() {
-        // A 3-OID TRUNCATE where OID[1] is unknown: events for OID[0] and OID[2] should be emitted.
-        let catalog = orders_catalog();
+        // A 3-OID TRUNCATE where OID[1] is unknown: events for OID[0] and
+        // OID[2] should be emitted. Catalog contains both `orders` and
+        // `items` tables so two distinct relations can register.
+        let catalog = sql_traits::structs::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer INT, amount INT, status TEXT);\n\
+             CREATE TABLE items (sku INT PRIMARY KEY);",
+        )
+        .expect("orders+items DDL parses");
+        let orders_id = crate::catalog_helpers::table_id(&catalog, "orders").expect("orders id");
+        let items_id = crate::catalog_helpers::table_id(&catalog, "items").expect("items id");
+
         let parser = PgOutputParser::new();
 
-        // Register two known relations
         let rel_a = build_relation_msg(100, "public", "orders", &orders_columns());
         parser
             .parse_wal_message(&rel_a, &catalog)
             .expect("relation A should parse");
 
-        // Build a second catalog entry for a second known table
-        let mut catalog2 = orders_catalog();
-        catalog2.tables.insert("public.items".to_string(), (2, 1));
-        catalog2.tables.insert("items".to_string(), (2, 1));
-        catalog2.columns.insert((2, "sku".to_string()), 0);
-
-        // Register second relation using the extended catalog
         let rel_b = build_relation_msg(200, "public", "items", &[("sku", 25, 1)]);
         parser
-            .parse_wal_message(&rel_b, &catalog2)
+            .parse_wal_message(&rel_b, &catalog)
             .expect("relation B should parse");
 
         // OID 100 (known), OID 9999 (unknown), OID 200 (known)
         let truncate_msg = build_truncate_msg(0, &[100, 9999, 200]);
         let events = parser
-            .parse_wal_message(&truncate_msg, &catalog2)
+            .parse_wal_message(&truncate_msg, &catalog)
             .expect("truncate with one unknown OID should succeed");
 
         assert_eq!(events.len(), 2, "Should emit events for both known OIDs");
-        assert!(events.iter().any(|e| e.table_id() == 1));
-        assert!(events.iter().any(|e| e.table_id() == 2));
+        assert!(events.iter().any(|e| e.table_id() == orders_id));
+        assert!(events.iter().any(|e| e.table_id() == items_id));
         assert!(events.iter().all(|e| e.kind() == EventKind::Truncate));
     }
 

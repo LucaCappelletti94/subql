@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use arbitrary::{Arbitrary, Unstructured};
+use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 
 use crate::compiler::bytecode::{BytecodeProgram, Instruction};
@@ -16,34 +17,26 @@ use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
-use crate::types::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
+use crate::types::{Cell, RowImage};
 use crate::DefaultIds;
 
-/// Maximally permissive schema catalog for fuzzing.
+/// Build a permissive fuzz schema as a [`ParserDB`].
 ///
-/// Accepts any table/column name so the fuzzer can exercise deep code paths
-/// without being rejected at schema resolution.
-pub struct FuzzCatalog;
-
-impl SchemaCatalog for FuzzCatalog {
-    fn table_id(&self, _table_name: &str) -> Option<TableId> {
-        Some(1)
-    }
-
-    fn column_id(&self, _table_id: TableId, column_name: &str) -> Option<ColumnId> {
-        let hash = column_name.bytes().fold(0u16, |acc, b| {
-            acc.wrapping_mul(31).wrapping_add(u16::from(b))
-        });
-        Some(hash % 64)
-    }
-
-    fn table_arity(&self, _table_id: TableId) -> Option<usize> {
-        Some(64)
-    }
-
-    fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-        Some(0xF022_F022_F022_F022)
-    }
+/// Declares an `orders` table with a wide selection of column names that
+/// are commonly produced by the SQL fuzzer (`amount`, `status`, `id`, plus
+/// a generous bank of generic `c0`-`c15` columns). The fuzzer may still
+/// feed SQL that references columns/tables not in this fixture — those
+/// inputs simply fail SQL resolution, which is fine for crash testing.
+#[must_use]
+pub fn fuzz_catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE orders (\
+             id INT PRIMARY KEY, amount INT, status TEXT, \
+             c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, \
+             c8 INT, c9 INT, c10 INT, c11 INT, c12 INT, c13 INT, c14 INT, c15 INT\
+         );",
+    )
+    .expect("fuzz fixture DDL parses")
 }
 
 /// Generate a [`Cell`] from fuzzer-controlled bytes.
@@ -109,7 +102,7 @@ fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction> {
 
 /// Parse SQL with both PostgreSQL and Generic dialects.
 pub fn harness_parse_sql(data: &[u8]) {
-    let catalog = FuzzCatalog;
+    let catalog = fuzz_catalog();
     let pg = PostgreSqlDialect {};
     let generic = GenericDialect {};
     let sql = String::from_utf8_lossy(data);
@@ -157,8 +150,8 @@ pub fn harness_vm_eval(data: &[u8]) {
 
 /// Feed raw bytes to shard deserialization.
 pub fn harness_deserialize_shard(data: &[u8]) {
-    let catalog = FuzzCatalog;
-    let _ = deserialize_shard::<DefaultIds>(data, &catalog);
+    let catalog = fuzz_catalog();
+    let _ = deserialize_shard::<DefaultIds, _>(data, &catalog);
 }
 
 /// Normalize and hash SQL, asserting determinism.
@@ -230,18 +223,25 @@ mod tests {
     }
 
     #[test]
-    fn test_fuzz_catalog_accepts_any_table_and_column() {
-        let catalog = FuzzCatalog;
+    fn test_fuzz_catalog_resolves_orders_fixture() {
+        use sql_traits::prelude::DatabaseLike;
 
-        assert_eq!(catalog.table_id("any_table"), Some(1));
-        assert_eq!(catalog.table_arity(1), Some(64));
-        assert_eq!(catalog.schema_fingerprint(1), Some(0xF022_F022_F022_F022));
+        let catalog = fuzz_catalog();
+        let tid = crate::catalog_helpers::table_id(&catalog, "orders")
+            .expect("orders must be resolvable in fuzz fixture");
+        assert!(catalog.number_of_tables() > 0);
+        let arity = crate::catalog_helpers::table_arity(&catalog, tid)
+            .expect("orders arity should be known");
+        assert!(
+            arity >= 3,
+            "fuzz orders should have at least id/amount/status"
+        );
 
-        let col_a = catalog.column_id(1, "alpha").unwrap();
-        let col_b = catalog.column_id(1, "beta").unwrap();
-        assert!(col_a < 64);
-        assert!(col_b < 64);
-        assert_ne!(col_a, col_b);
+        let id_col = crate::catalog_helpers::column_id(&catalog, tid, "id");
+        let amount_col = crate::catalog_helpers::column_id(&catalog, tid, "amount");
+        assert!(id_col.is_some());
+        assert!(amount_col.is_some());
+        assert_ne!(id_col, amount_col);
     }
 
     #[test]

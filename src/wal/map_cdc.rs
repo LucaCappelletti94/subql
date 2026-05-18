@@ -6,7 +6,8 @@ use super::{
     build_event_from_rows, build_pk_from_resolved, pk_from_catalog_or_empty,
     strict_pk_column_ids_from_names, WalParseError,
 };
-use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
+use sql_traits::prelude::DatabaseLike;
 
 pub(super) trait MapCdcEnvelope {
     const PARSER_NAME: &'static str;
@@ -16,7 +17,7 @@ pub(super) trait MapCdcEnvelope {
 
     fn parse_kind(token: &str) -> Result<EventKind, WalParseError>;
 
-    fn resolve_table_id(&self, catalog: &dyn SchemaCatalog) -> Result<TableId, WalParseError>;
+    fn resolve_table_id<DB: DatabaseLike>(&self, database: &DB) -> Result<TableId, WalParseError>;
 
     fn map_config(&self, kind: EventKind) -> MapCdcConfig<'_>;
 
@@ -29,9 +30,9 @@ pub(super) trait MapCdcEnvelope {
     }
 }
 
-pub(super) fn parse_map_cdc_json_message<T>(
+pub(super) fn parse_map_cdc_json_message<T, DB: DatabaseLike>(
     data: &[u8],
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<Vec<WalEvent>, WalParseError>
 where
     T: serde::de::DeserializeOwned + MapCdcEnvelope,
@@ -41,19 +42,19 @@ where
             return Ok(None);
         }
         super::skip_unknown_event_kind(
-            convert_map_cdc_envelope(message, catalog),
+            convert_map_cdc_envelope(message, database),
             T::PARSER_NAME,
             T::TOKEN_NAME,
         )
     })
 }
 
-pub(super) fn convert_map_cdc_envelope<T: MapCdcEnvelope>(
+pub(super) fn convert_map_cdc_envelope<T: MapCdcEnvelope, DB: DatabaseLike>(
     message: &T,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<WalEvent, WalParseError> {
     let kind = T::parse_kind(message.event_token())?;
-    let table_id = message.resolve_table_id(catalog)?;
+    let table_id = message.resolve_table_id(database)?;
     let config = message.map_config(kind);
     convert_map_cdc_event(
         kind,
@@ -61,7 +62,7 @@ pub(super) fn convert_map_cdc_envelope<T: MapCdcEnvelope>(
         message.new_map(kind),
         message.old_map(kind),
         &config,
-        catalog,
+        database,
     )
 }
 
@@ -87,35 +88,35 @@ pub(super) fn parse_event_kind(
     Err(WalParseError::UnknownEventKind(token.to_string()))
 }
 
-pub(super) fn build_map_row(
+pub(super) fn build_map_row<DB: DatabaseLike>(
     map: &HashMap<String, serde_json::Value>,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     field_prefix: &str,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    build_row_from_map_with(map, table_id, catalog, |value, column| {
+    build_row_from_map_with(map, table_id, database, |value, column| {
         infer_cell_from_json_strict(value, &format!("{field_prefix}.{column}"))
     })
 }
 
-pub(super) fn build_pk_from_optional_names(
+pub(super) fn build_pk_from_optional_names<DB: DatabaseLike>(
     pk_col_names: Option<&[String]>,
     resolved: &[(ColumnId, Cell)],
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<PrimaryKey, WalParseError> {
     if let Some(names) = pk_col_names {
         let pk_col_ids = strict_pk_column_ids_from_names(
             table_id,
             names,
             resolved,
-            catalog,
+            database,
             "primary_key_columns",
         )?;
         return Ok(build_pk_from_resolved(resolved, &pk_col_ids));
     }
 
-    pk_from_catalog_or_empty(resolved, table_id, catalog)
+    pk_from_catalog_or_empty(resolved, table_id, database)
 }
 
 pub(super) struct MapCdcConfig<'a> {
@@ -136,13 +137,13 @@ pub(super) struct MapCdcConfig<'a> {
     pub old_is_changed_columns_only: bool,
 }
 
-pub(super) fn convert_map_cdc_event(
+pub(super) fn convert_map_cdc_event<DB: DatabaseLike>(
     kind: EventKind,
     table_id: TableId,
     new_map: Option<&HashMap<String, serde_json::Value>>,
     old_map: Option<&HashMap<String, serde_json::Value>>,
     config: &MapCdcConfig<'_>,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<WalEvent, WalParseError> {
     match kind {
         EventKind::Insert => {
@@ -150,9 +151,9 @@ pub(super) fn convert_map_cdc_event(
                 WalParseError::MissingField(config.required_new_field.to_string())
             })?;
             let (new_row, resolved) =
-                build_map_row(new_map, table_id, catalog, config.new_field_prefix)?;
+                build_map_row(new_map, table_id, database, config.new_field_prefix)?;
             let pk =
-                build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, catalog)?;
+                build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, database)?;
             build_event_from_rows(
                 kind,
                 table_id,
@@ -169,9 +170,9 @@ pub(super) fn convert_map_cdc_event(
                 WalParseError::MissingField(config.required_new_field.to_string())
             })?;
             let (new_row, resolved) =
-                build_map_row(new_map, table_id, catalog, config.new_field_prefix)?;
+                build_map_row(new_map, table_id, database, config.new_field_prefix)?;
             let (old_row, old_resolved) = old_map
-                .map(|old| build_map_row(old, table_id, catalog, config.old_field_prefix))
+                .map(|old| build_map_row(old, table_id, database, config.old_field_prefix))
                 .transpose()?
                 .map_or((None, Vec::new()), |(row, res)| (Some(row), res));
             // Use pre-update PK when the old row is complete (all columns present).
@@ -186,7 +187,7 @@ pub(super) fn convert_map_cdc_event(
                 &resolved
             };
             let pk =
-                build_pk_from_optional_names(config.pk_col_names, pk_resolved, table_id, catalog)?;
+                build_pk_from_optional_names(config.pk_col_names, pk_resolved, table_id, database)?;
             // Derive changed_columns when either:
             // - The old row is complete (all columns present), or
             // - The format guarantees the old row contains only changed columns
@@ -209,9 +210,9 @@ pub(super) fn convert_map_cdc_event(
                 WalParseError::MissingField(config.required_old_field.to_string())
             })?;
             let (old_row, resolved) =
-                build_map_row(old_map, table_id, catalog, config.old_field_prefix)?;
+                build_map_row(old_map, table_id, database, config.old_field_prefix)?;
             let pk =
-                build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, catalog)?;
+                build_pk_from_optional_names(config.pk_col_names, &resolved, table_id, database)?;
             build_event_from_rows(
                 kind,
                 table_id,
@@ -238,27 +239,16 @@ pub(super) fn convert_map_cdc_event(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TestCatalog;
     use super::*;
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
     use std::collections::HashMap;
 
-    fn orders_catalog() -> TestCatalog {
-        let mut tables = HashMap::new();
-        tables.insert("orders".to_string(), (1, 3));
-
-        let mut columns = HashMap::new();
-        columns.insert((1, "id".to_string()), 0);
-        columns.insert((1, "amount".to_string()), 1);
-        columns.insert((1, "status".to_string()), 2);
-
-        let mut primary_keys = HashMap::new();
-        primary_keys.insert(1, vec![0]);
-
-        TestCatalog {
-            tables,
-            columns,
-            primary_keys,
-        }
+    fn orders_catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (id INT PRIMARY KEY, amount DOUBLE PRECISION, status TEXT);",
+        )
+        .expect("orders DDL parses")
     }
 
     #[test]
@@ -270,9 +260,10 @@ mod tests {
     #[test]
     fn convert_map_cdc_insert_missing_required_field() {
         let catalog = orders_catalog();
+        let tid = crate::catalog_helpers::table_id(&catalog, "orders").expect("orders id");
         let err = convert_map_cdc_event(
             EventKind::Insert,
-            1,
+            tid,
             None,
             None,
             &MapCdcConfig {
@@ -292,13 +283,14 @@ mod tests {
     #[test]
     fn convert_map_cdc_update_without_old_map_is_allowed() {
         let catalog = orders_catalog();
+        let tid = crate::catalog_helpers::table_id(&catalog, "orders").expect("orders id");
         let new_map = HashMap::from([
             ("id".to_string(), serde_json::json!(1)),
             ("amount".to_string(), serde_json::json!(10.5)),
         ]);
         let event = convert_map_cdc_event(
             EventKind::Update,
-            1,
+            tid,
             Some(&new_map),
             None,
             &MapCdcConfig {
@@ -320,6 +312,7 @@ mod tests {
     #[test]
     fn convert_map_cdc_update_with_partial_old_map_gives_empty_changed_columns() {
         let catalog = orders_catalog();
+        let tid = crate::catalog_helpers::table_id(&catalog, "orders").expect("orders id");
         let new_map = HashMap::from([
             ("id".to_string(), serde_json::json!(1)),
             ("amount".to_string(), serde_json::json!(10.5)),
@@ -332,7 +325,7 @@ mod tests {
 
         let event = convert_map_cdc_event(
             EventKind::Update,
-            1,
+            tid,
             Some(&new_map),
             Some(&old_map),
             &MapCdcConfig {
@@ -360,13 +353,14 @@ mod tests {
     #[test]
     fn convert_map_cdc_insert_missing_catalog_pk_column_errors() {
         let catalog = orders_catalog();
+        let tid = crate::catalog_helpers::table_id(&catalog, "orders").expect("orders id");
         let new_map = HashMap::from([
             ("amount".to_string(), serde_json::json!(10.5)),
             ("status".to_string(), serde_json::json!("new")),
         ]);
         let err = convert_map_cdc_event(
             EventKind::Insert,
-            1,
+            tid,
             Some(&new_map),
             None,
             &MapCdcConfig {
@@ -386,10 +380,11 @@ mod tests {
     #[test]
     fn build_pk_from_optional_names_unknown_column_errors() {
         let catalog = orders_catalog();
+        let tid = crate::catalog_helpers::table_id(&catalog, "orders").expect("orders id");
         let resolved = vec![(0_u16, Cell::Int(1))];
         let names = vec!["id".to_string(), "missing".to_string()];
 
-        let err = build_pk_from_optional_names(Some(&names), &resolved, 1, &catalog)
+        let err = build_pk_from_optional_names(Some(&names), &resolved, tid, &catalog)
             .expect_err("unknown PK metadata column should fail");
         assert!(matches!(err, WalParseError::UnknownColumn { .. }));
     }
@@ -397,10 +392,11 @@ mod tests {
     #[test]
     fn build_pk_from_optional_names_missing_value_errors() {
         let catalog = orders_catalog();
+        let tid = crate::catalog_helpers::table_id(&catalog, "orders").expect("orders id");
         let resolved = vec![(1_u16, Cell::Float(10.5))];
         let names = vec!["id".to_string()];
 
-        let err = build_pk_from_optional_names(Some(&names), &resolved, 1, &catalog)
+        let err = build_pk_from_optional_names(Some(&names), &resolved, tid, &catalog)
             .expect_err("missing PK value should fail");
         assert!(matches!(err, WalParseError::MalformedPayload(_)));
     }

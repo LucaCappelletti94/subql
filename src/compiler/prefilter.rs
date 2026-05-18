@@ -4,8 +4,9 @@
 //! but it must not return false negatives.
 
 use super::{literals::sql_value_to_cell_lossy, Tri};
-use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
+use crate::{Cell, ColumnId, RowImage, TableId};
 use serde::{Deserialize, Serialize};
+use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -380,14 +381,14 @@ fn merge_expr(
 
 /// Build prefilter plan from WHERE clause expression.
 #[must_use]
-pub fn build_prefilter_plan(
+pub fn build_prefilter_plan<DB: DatabaseLike>(
     where_clause: Option<&Expr>,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> PrefilterPlan {
     let analysis = where_clause.map_or_else(
         || Analysis::constant(true),
-        |expr| analyze_expr(expr, table_id, catalog, false),
+        |expr| analyze_expr(expr, table_id, database, false),
     );
 
     let scan_required = analysis.true_possible && !analysis.hit_guaranteed_if_true;
@@ -401,10 +402,10 @@ pub fn build_prefilter_plan(
     }
 }
 
-fn analyze_expr(
+fn analyze_expr<DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     negated: bool,
 ) -> Analysis {
     match expr {
@@ -415,29 +416,29 @@ fn analyze_expr(
                 let child_negated = negated;
                 let effective_or = matches!(op, BinaryOperator::Or) ^ negated;
 
-                let lhs = analyze_expr(left, table_id, catalog, child_negated);
-                let rhs = analyze_expr(right, table_id, catalog, child_negated);
+                let lhs = analyze_expr(left, table_id, database, child_negated);
+                let rhs = analyze_expr(right, table_id, database, child_negated);
                 if effective_or {
                     Analysis::or(lhs, rhs)
                 } else {
                     Analysis::and(lhs, rhs)
                 }
             }
-            _ => analyze_comparison(left, op.clone(), right, table_id, catalog, negated),
+            _ => analyze_comparison(left, op.clone(), right, table_id, database, negated),
         },
 
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => analyze_expr(expr, table_id, catalog, !negated),
+        } => analyze_expr(expr, table_id, database, !negated),
 
-        Expr::Nested(expr) => analyze_expr(expr, table_id, catalog, negated),
+        Expr::Nested(expr) => analyze_expr(expr, table_id, database, negated),
 
         Expr::InList {
             expr,
             list,
             negated: list_negated,
-        } => analyze_in_list(expr, list, *list_negated ^ negated, table_id, catalog),
+        } => analyze_in_list(expr, list, *list_negated ^ negated, table_id, database),
 
         Expr::Between {
             expr,
@@ -450,11 +451,11 @@ fn analyze_expr(
             high,
             *between_negated ^ negated,
             table_id,
-            catalog,
+            database,
         ),
 
-        Expr::IsNull(expr) => analyze_null_check(expr, true ^ negated, table_id, catalog),
-        Expr::IsNotNull(expr) => analyze_null_check(expr, false ^ negated, table_id, catalog),
+        Expr::IsNull(expr) => analyze_null_check(expr, true ^ negated, table_id, database),
+        Expr::IsNotNull(expr) => analyze_null_check(expr, false ^ negated, table_id, database),
 
         Expr::Value(val) => match &val.value {
             Value::Boolean(b) => Analysis::constant(*b ^ negated),
@@ -465,29 +466,29 @@ fn analyze_expr(
     }
 }
 
-fn analyze_null_check(
+fn analyze_null_check<DB: DatabaseLike>(
     expr: &Expr,
     is_null: bool,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Analysis {
-    resolve_column(expr, table_id, catalog).map_or_else(Analysis::unknown, |column_id| {
+    resolve_column(expr, table_id, database).map_or_else(Analysis::unknown, |column_id| {
         Analysis::indexed_atom(PlannerAtom::Null { column_id, is_null })
     })
 }
 
-fn analyze_in_list(
+fn analyze_in_list<DB: DatabaseLike>(
     expr: &Expr,
     list: &[Expr],
     negated: bool,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Analysis {
     if negated {
         return Analysis::unknown();
     }
 
-    let Some(column_id) = resolve_column(expr, table_id, catalog) else {
+    let Some(column_id) = resolve_column(expr, table_id, database) else {
         return Analysis::unknown();
     };
 
@@ -539,15 +540,15 @@ fn analyze_in_list(
     }
 }
 
-fn analyze_between(
+fn analyze_between<DB: DatabaseLike>(
     expr: &Expr,
     low: &Expr,
     high: &Expr,
     negated: bool,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Analysis {
-    let Some(column_id) = resolve_column(expr, table_id, catalog) else {
+    let Some(column_id) = resolve_column(expr, table_id, database) else {
         return Analysis::unknown();
     };
 
@@ -579,23 +580,25 @@ fn analyze_between(
     Analysis::or(below, above)
 }
 
-fn analyze_comparison(
+fn analyze_comparison<DB: DatabaseLike>(
     left: &Expr,
     op: BinaryOperator,
     right: &Expr,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     negated: bool,
 ) -> Analysis {
     let mut normalized_op = op.clone();
 
-    let comparison = if let (Some(column_id), Some(lit)) =
-        (resolve_column(left, table_id, catalog), literal_cell(right))
-    {
+    let comparison = if let (Some(column_id), Some(lit)) = (
+        resolve_column(left, table_id, database),
+        literal_cell(right),
+    ) {
         Some((column_id, lit))
-    } else if let (Some(lit), Some(column_id)) =
-        (literal_cell(left), resolve_column(right, table_id, catalog))
-    {
+    } else if let (Some(lit), Some(column_id)) = (
+        literal_cell(left),
+        resolve_column(right, table_id, database),
+    ) {
         normalized_op = flip_comparison(op);
         Some((column_id, lit))
     } else {
@@ -676,8 +679,12 @@ fn flip_comparison(op: BinaryOperator) -> BinaryOperator {
     }
 }
 
-fn resolve_column(expr: &Expr, table_id: TableId, catalog: &dyn SchemaCatalog) -> Option<ColumnId> {
-    super::literals::resolve_column_ref(expr, table_id, catalog)
+fn resolve_column<DB: DatabaseLike>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+) -> Option<ColumnId> {
+    super::literals::resolve_column_ref(expr, table_id, database)
 }
 
 fn literal_cell(expr: &Expr) -> Option<Cell> {
@@ -723,27 +730,33 @@ fn planner_value_from_cell(cell: &Cell) -> Option<PlannerValue> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::catalog_helpers;
     use crate::compiler::parse_compile_normalize_and_prefilter;
-    use crate::testing::MockCatalog;
+    use sql_traits::structs::ParserDB;
     use sqlparser::{
         ast::{Expr, SetExpr, Statement},
         dialect::PostgreSqlDialect,
         parser::Parser,
     };
-    use std::collections::HashMap;
 
-    fn make_catalog() -> MockCatalog {
-        let mut tables = HashMap::new();
-        tables.insert("orders".to_string(), (1, 8));
+    fn make_catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (\
+                 id INT PRIMARY KEY, \
+                 amount INT, \
+                 status TEXT, \
+                 priority INT, \
+                 created_at TIMESTAMP, \
+                 customer INT, \
+                 sku TEXT, \
+                 region TEXT\
+             );",
+        )
+        .expect("prefilter fixture DDL parses")
+    }
 
-        let mut columns = HashMap::new();
-        columns.insert((1, "id".to_string()), 0);
-        columns.insert((1, "amount".to_string()), 1);
-        columns.insert((1, "status".to_string()), 2);
-        columns.insert((1, "priority".to_string()), 3);
-        columns.insert((1, "created_at".to_string()), 4);
-
-        MockCatalog { tables, columns }
+    fn orders_tid(catalog: &ParserDB) -> crate::TableId {
+        catalog_helpers::table_id(catalog, "orders").expect("orders id")
     }
 
     fn parse_where_expr(sql: &str) -> Expr {
@@ -807,7 +820,7 @@ mod tests {
             },
             _ => panic!("unexpected non-query statement"),
         };
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(plan.scan_required);
         assert_eq!(plan.trigger_atoms.len(), 1);
@@ -851,7 +864,7 @@ mod tests {
     fn test_not_in_requires_scan_and_no_atoms() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE amount NOT IN (10, 20)");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(plan.scan_required);
         assert!(plan.requires_prefilter_eval);
@@ -863,7 +876,7 @@ mod tests {
     fn test_not_not_equal_becomes_equality_atom() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE NOT (amount <> 10)");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(!plan.scan_required);
         assert_eq!(plan.trigger_atoms.len(), 1);
@@ -880,7 +893,7 @@ mod tests {
     fn test_operand_flipped_comparison_builds_expected_range() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE 10 < amount");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(!plan.scan_required);
         assert_eq!(plan.trigger_atoms.len(), 1);
@@ -898,7 +911,7 @@ mod tests {
     fn test_not_greater_than_becomes_lte_range() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE NOT (amount > 10)");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(!plan.scan_required);
         assert_eq!(plan.trigger_atoms.len(), 1);
@@ -916,7 +929,7 @@ mod tests {
     fn test_column_to_column_comparison_is_unknown() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE amount > priority");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(plan.scan_required);
         assert_eq!(plan.trigger_atoms.len(), 0);
@@ -927,7 +940,7 @@ mod tests {
     fn test_compound_identifier_two_parts_is_indexed() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE orders.amount = 10");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(!plan.scan_required);
         assert_eq!(plan.trigger_atoms.len(), 1);
@@ -944,7 +957,7 @@ mod tests {
     fn test_compound_identifier_three_parts_is_not_indexed() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE public.orders.amount = 10");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(plan.scan_required);
         assert_eq!(plan.trigger_atoms.len(), 0);
@@ -957,8 +970,10 @@ mod tests {
         let is_null_expr = parse_where_expr("SELECT * FROM orders WHERE amount IS NULL");
         let is_not_null_expr = parse_where_expr("SELECT * FROM orders WHERE amount IS NOT NULL");
 
-        let is_null_plan = build_prefilter_plan(Some(&is_null_expr), 1, &catalog);
-        let is_not_null_plan = build_prefilter_plan(Some(&is_not_null_expr), 1, &catalog);
+        let is_null_plan =
+            build_prefilter_plan(Some(&is_null_expr), orders_tid(&catalog), &catalog);
+        let is_not_null_plan =
+            build_prefilter_plan(Some(&is_not_null_expr), orders_tid(&catalog), &catalog);
 
         let row_null = RowImage {
             cells: Arc::from([Cell::Int(1), Cell::Null]),
@@ -985,8 +1000,8 @@ mod tests {
         let expr_true = parse_where_expr("SELECT * FROM orders WHERE TRUE");
         let expr_false = parse_where_expr("SELECT * FROM orders WHERE FALSE");
 
-        let true_plan = build_prefilter_plan(Some(&expr_true), 1, &catalog);
-        let false_plan = build_prefilter_plan(Some(&expr_false), 1, &catalog);
+        let true_plan = build_prefilter_plan(Some(&expr_true), orders_tid(&catalog), &catalog);
+        let false_plan = build_prefilter_plan(Some(&expr_false), orders_tid(&catalog), &catalog);
         let row = RowImage {
             cells: Arc::from([Cell::Int(1), Cell::Int(2)]),
         };
@@ -1008,8 +1023,8 @@ mod tests {
         let or_expr =
             parse_where_expr("SELECT * FROM orders WHERE amount = 1 OR priority = 2 OR id = 3");
 
-        let and_plan = build_prefilter_plan(Some(&and_expr), 1, &catalog);
-        let or_plan = build_prefilter_plan(Some(&or_expr), 1, &catalog);
+        let and_plan = build_prefilter_plan(Some(&and_expr), orders_tid(&catalog), &catalog);
+        let or_plan = build_prefilter_plan(Some(&or_expr), orders_tid(&catalog), &catalog);
 
         assert!(matches!(and_plan.expr, PrefilterExpr::And(ref parts) if parts.len() == 3));
         assert!(matches!(or_plan.expr, PrefilterExpr::Or(ref parts) if parts.len() == 3));
@@ -1350,14 +1365,14 @@ mod tests {
             panic!("expected IN list expression");
         }
 
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
         assert!(!plan.scan_required);
         assert!(!plan.may_match(&RowImage {
             cells: Arc::from([Cell::Int(1)])
         }));
 
         let unknown_col = parse_where_expr("SELECT * FROM orders WHERE nope IN (1)");
-        let unknown_plan = build_prefilter_plan(Some(&unknown_col), 1, &catalog);
+        let unknown_plan = build_prefilter_plan(Some(&unknown_col), orders_tid(&catalog), &catalog);
         assert!(unknown_plan.scan_required);
         assert!(matches!(unknown_plan.expr, PrefilterExpr::Unknown));
     }
@@ -1366,7 +1381,7 @@ mod tests {
     fn test_between_non_numeric_bounds_is_unknown() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE amount BETWEEN 'a' AND 10");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(plan.scan_required);
         assert!(matches!(plan.expr, PrefilterExpr::Unknown));
@@ -1376,7 +1391,7 @@ mod tests {
     fn test_boolean_negation_path_in_analyze_expr() {
         let catalog = make_catalog();
         let expr = parse_where_expr("SELECT * FROM orders WHERE NOT TRUE");
-        let plan = build_prefilter_plan(Some(&expr), 1, &catalog);
+        let plan = build_prefilter_plan(Some(&expr), orders_tid(&catalog), &catalog);
 
         assert!(!plan.scan_required);
         assert!(!plan.may_match(&RowImage {

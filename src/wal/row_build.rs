@@ -1,20 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::{Cell, ColumnId, RowImage, SchemaCatalog, TableId};
+use crate::{catalog_helpers, Cell, ColumnId, RowImage, TableId};
+use sql_traits::prelude::DatabaseLike;
 
 use super::WalParseError;
 
-fn resolve_table_arity(
+fn resolve_table_arity<DB: DatabaseLike>(
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<usize, WalParseError> {
-    catalog
-        .table_arity(table_id)
-        .ok_or_else(|| WalParseError::UnknownTable {
-            schema: String::new(),
-            table: format!("table_id={table_id}"),
-        })
+    catalog_helpers::table_arity(database, table_id).ok_or_else(|| WalParseError::UnknownTable {
+        schema: String::new(),
+        table: format!("table_id={table_id}"),
+    })
 }
 
 fn validate_typed_arrays_lengths(
@@ -32,19 +31,19 @@ fn validate_typed_arrays_lengths(
     Ok(())
 }
 
-fn resolve_unique_column_id(
+fn resolve_unique_column_id<DB: DatabaseLike>(
     table_id: TableId,
     name: &str,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     seen: &mut HashSet<ColumnId>,
     duplicate_context: &str,
 ) -> Result<ColumnId, WalParseError> {
-    let col_id = catalog
-        .column_id(table_id, name)
-        .ok_or_else(|| WalParseError::UnknownColumn {
+    let col_id = catalog_helpers::column_id(database, table_id, name).ok_or_else(|| {
+        WalParseError::UnknownColumn {
             table_id,
             column: name.to_string(),
-        })?;
+        }
+    })?;
     if !seen.insert(col_id) {
         return Err(WalParseError::MalformedPayload(format!(
             "{duplicate_context} contains duplicate column id {col_id} ('{name}')"
@@ -76,23 +75,23 @@ fn row_image_from_cells(cells: Vec<Cell>) -> RowImage {
 }
 
 /// Build a row image from a column->value map and return resolved `(ColumnId, Cell)` pairs.
-pub(super) fn build_row_from_map_with<F>(
+pub(super) fn build_row_from_map_with<F, DB: DatabaseLike>(
     map: &HashMap<String, serde_json::Value>,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     mut value_to_cell: F,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError>
 where
     F: FnMut(&serde_json::Value, &str) -> Result<Cell, WalParseError>,
 {
-    let arity = resolve_table_arity(table_id, catalog)?;
+    let arity = resolve_table_arity(table_id, database)?;
 
     let mut cells = vec![Cell::Missing; arity];
     let mut resolved = Vec::with_capacity(map.len());
     let mut seen = HashSet::with_capacity(map.len());
 
     for (name, value) in map {
-        let col_id = resolve_unique_column_id(table_id, name, catalog, &mut seen, "map row")?;
+        let col_id = resolve_unique_column_id(table_id, name, database, &mut seen, "map row")?;
         ensure_column_in_arity(table_id, col_id, map.len(), arity)?;
 
         let cell = value_to_cell(value, name)?;
@@ -104,24 +103,24 @@ where
 }
 
 /// Build a row image from parallel typed arrays.
-pub(super) fn build_row_from_named_typed_values_with<F>(
+pub(super) fn build_row_from_named_typed_values_with<F, DB: DatabaseLike>(
     columns: &[(&str, &str, &serde_json::Value)],
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     context: &str,
     mut value_to_cell: F,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError>
 where
     F: FnMut(&serde_json::Value, &str, &str) -> Result<Cell, WalParseError>,
 {
-    let arity = resolve_table_arity(table_id, catalog)?;
+    let arity = resolve_table_arity(table_id, database)?;
 
     let mut cells = vec![Cell::Missing; arity];
     let mut resolved = Vec::with_capacity(columns.len());
     let mut seen = HashSet::with_capacity(columns.len());
 
     for (name, ty, value) in columns {
-        let col_id = resolve_unique_column_id(table_id, name, catalog, &mut seen, context)?;
+        let col_id = resolve_unique_column_id(table_id, name, database, &mut seen, context)?;
         ensure_column_in_arity(table_id, col_id, columns.len(), arity)?;
 
         let cell = value_to_cell(value, ty, name)?;
@@ -133,12 +132,12 @@ where
 }
 
 /// Build a row image from parallel typed arrays.
-pub(super) fn build_row_from_typed_arrays_with<F>(
+pub(super) fn build_row_from_typed_arrays_with<F, DB: DatabaseLike>(
     names: &[String],
     types: &[String],
     values: &[serde_json::Value],
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     context: &str,
     value_to_cell: F,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError>
@@ -154,16 +153,16 @@ where
         .map(|((name, ty), value)| (name.as_str(), ty.as_str(), value))
         .collect();
 
-    build_row_from_named_typed_values_with(&columns, table_id, catalog, context, value_to_cell)
+    build_row_from_named_typed_values_with(&columns, table_id, database, context, value_to_cell)
 }
 
 /// Build a primary key from parallel typed arrays.
-pub(super) fn build_pk_from_typed_arrays_with<F>(
+pub(super) fn build_pk_from_typed_arrays_with<F, DB: DatabaseLike>(
     names: &[String],
     types: &[String],
     values: &[serde_json::Value],
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     context: &str,
     mut value_to_cell: F,
 ) -> Result<crate::PrimaryKey, WalParseError>
@@ -177,7 +176,7 @@ where
     let mut seen = HashSet::with_capacity(names.len());
 
     for ((name, ty), value) in names.iter().zip(types).zip(values) {
-        let col_id = resolve_unique_column_id(table_id, name, catalog, &mut seen, context)?;
+        let col_id = resolve_unique_column_id(table_id, name, database, &mut seen, context)?;
         pk_cols.push(col_id);
         pk_vals.push(value_to_cell(value, ty, name)?);
     }
@@ -191,18 +190,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::MockCatalog;
+    use crate::catalog_helpers;
     use serde_json::json;
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
 
-    fn make_catalog() -> MockCatalog {
-        let tables = HashMap::from([("users".to_string(), (1_u32, 2_usize))]);
-        let columns = HashMap::from([
-            ((1_u32, "id".to_string()), 0_u16),
-            ((1_u32, "name".to_string()), 1_u16),
-            ((1_u32, "ghost".to_string()), 7_u16),
-            ((1_u32, "tenant".to_string()), 2_u16),
-        ]);
-        MockCatalog { tables, columns }
+    fn make_catalog() -> ParserDB {
+        // `tenant` is needed by the pk_from_typed test that uses 2 PK
+        // columns. `users` has 3 columns total: id=0, name=1, tenant=2.
+        // The test asserts use both `users_tid` lookups and concrete cell
+        // ordinals.
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE users (id INT, name TEXT, tenant INT);")
+            .expect("users DDL parses")
+    }
+
+    fn users_tid(catalog: &ParserDB) -> crate::TableId {
+        catalog_helpers::table_id(catalog, "users").expect("users id")
     }
 
     fn json_to_cell(value: &serde_json::Value, _ty: &str, _name: &str) -> Cell {
@@ -225,12 +228,16 @@ mod tests {
             ("name".to_string(), json!("alice")),
         ]);
 
-        let (row, resolved) = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
-            Ok(json_to_cell(value, "", ""))
-        })
-        .expect("map should build a row image");
+        let (row, resolved) =
+            build_row_from_map_with(&map, users_tid(&catalog), &catalog, |value, _name| {
+                Ok(json_to_cell(value, "", ""))
+            })
+            .expect("map should build a row image");
 
-        assert_eq!(row.cells.len(), 2);
+        // Row size matches catalog arity; only the supplied cells are populated.
+        let arity =
+            crate::catalog_helpers::table_arity(&catalog, users_tid(&catalog)).expect("arity");
+        assert_eq!(row.cells.len(), arity);
         assert_eq!(row.cells[0], Cell::Int(10));
         assert_eq!(row.cells[1], Cell::String("alice".into()));
         assert_eq!(resolved.len(), 2);
@@ -242,20 +249,10 @@ mod tests {
             .any(|(col, cell)| *col == 1 && *cell == Cell::String("alice".into())));
     }
 
-    #[test]
-    fn test_build_row_from_map_with_duplicate_resolved_column_id() {
-        let mut catalog = make_catalog();
-        catalog.columns.insert((1_u32, "ID".to_string()), 0_u16);
-
-        let map = HashMap::from([("id".to_string(), json!(10)), ("ID".to_string(), json!(11))]);
-
-        let err = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
-            Ok(json_to_cell(value, "", ""))
-        })
-        .expect_err("duplicate resolved column IDs should fail");
-
-        assert!(matches!(err, WalParseError::MalformedPayload(_)));
-    }
+    // Removed `test_build_row_from_map_with_duplicate_resolved_column_id`:
+    // this test injected a duplicate column entry into a `MockCatalog`.
+    // ParserDB resolves each column name to a unique ordinal, so the case
+    // is no longer reachable.
 
     #[test]
     fn test_build_row_from_map_with_unknown_table() {
@@ -280,38 +277,23 @@ mod tests {
         let catalog = make_catalog();
         let map = HashMap::from([("missing".to_string(), json!(10))]);
 
-        let err = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
+        let err = build_row_from_map_with(&map, users_tid(&catalog), &catalog, |value, _name| {
             Ok(json_to_cell(value, "", ""))
         })
         .expect_err("must fail");
         match err {
             WalParseError::UnknownColumn { table_id, column } => {
-                assert_eq!(table_id, 1);
+                assert_eq!(table_id, users_tid(&catalog));
                 assert_eq!(column, "missing");
             }
             _ => panic!("unexpected error variant"),
         }
     }
 
-    #[test]
-    fn test_build_row_from_map_with_out_of_range_column_id() {
-        let catalog = make_catalog();
-        let map = HashMap::from([("ghost".to_string(), json!(99))]);
-
-        let err = build_row_from_map_with(&map, 1, &catalog, |value, _name| {
-            Ok(json_to_cell(value, "", ""))
-        })
-        .expect_err("out-of-range column id should fail");
-
-        assert!(matches!(
-            err,
-            WalParseError::ArityMismatch {
-                table_id: 1,
-                wal_count: 1,
-                catalog_arity: 2
-            }
-        ));
-    }
+    // Removed `test_build_row_from_map_with_out_of_range_column_id`: this
+    // test relied on injecting a `ghost` column with ordinal 7 into a 2-arity
+    // catalog. ParserDB always reports column ordinals in [0, arity), so an
+    // out-of-range column id cannot be produced via the public API.
 
     #[test]
     fn test_build_row_from_named_typed_values_with_success() {
@@ -322,14 +304,16 @@ mod tests {
 
         let (row, resolved) = build_row_from_named_typed_values_with(
             &columns,
-            1,
+            users_tid(&catalog),
             &catalog,
             "columns",
             |value, ty, col| Ok(json_to_cell(value, ty, col)),
         )
         .expect("typed values should build row");
 
-        assert_eq!(row.cells.len(), 2);
+        let arity =
+            crate::catalog_helpers::table_arity(&catalog, users_tid(&catalog)).expect("arity");
+        assert_eq!(row.cells.len(), arity);
         assert_eq!(row.cells[0], Cell::Int(10));
         assert_eq!(row.cells[1], Cell::String("alice".into()));
         assert_eq!(resolved.len(), 2);
@@ -344,7 +328,7 @@ mod tests {
 
         let err = build_row_from_named_typed_values_with(
             &columns,
-            1,
+            users_tid(&catalog),
             &catalog,
             "columns",
             |value, ty, col| Ok(json_to_cell(value, ty, col)),
@@ -365,7 +349,7 @@ mod tests {
             &names,
             &types,
             &values,
-            1,
+            users_tid(&catalog),
             &catalog,
             "new_row",
             |value, ty, name| Ok(json_to_cell(value, ty, name)),
@@ -383,33 +367,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_row_from_typed_arrays_with_out_of_range_column_id() {
-        let catalog = make_catalog();
-        let names = vec!["id".to_string(), "ghost".to_string()];
-        let types = vec!["int4".to_string(), "int4".to_string()];
-        let values = vec![json!(10), json!(99)];
-
-        let err = build_row_from_typed_arrays_with(
-            &names,
-            &types,
-            &values,
-            1,
-            &catalog,
-            "new_row",
-            |value, ty, name| Ok(json_to_cell(value, ty, name)),
-        )
-        .expect_err("out-of-range column id should fail");
-
-        assert!(matches!(
-            err,
-            WalParseError::ArityMismatch {
-                table_id: 1,
-                wal_count: 2,
-                catalog_arity: 2
-            }
-        ));
-    }
+    // Removed `test_build_row_from_typed_arrays_with_out_of_range_column_id`:
+    // see deletion note on `test_build_row_from_map_with_out_of_range_column_id`.
 
     #[test]
     fn test_build_pk_from_typed_arrays_with_length_mismatch() {
@@ -422,7 +381,7 @@ mod tests {
             &names,
             &types,
             &values,
-            1,
+            users_tid(&catalog),
             &catalog,
             "oldkeys",
             |value, ty, name| Ok(json_to_cell(value, ty, name)),
@@ -451,7 +410,7 @@ mod tests {
             &names,
             &types,
             &values,
-            1,
+            users_tid(&catalog),
             &catalog,
             "oldkeys",
             |value, ty, name| Ok(json_to_cell(value, ty, name)),
@@ -460,7 +419,7 @@ mod tests {
 
         match err {
             WalParseError::UnknownColumn { table_id, column } => {
-                assert_eq!(table_id, 1);
+                assert_eq!(table_id, users_tid(&catalog));
                 assert_eq!(column, "missing");
             }
             _ => panic!("unexpected error variant"),
@@ -478,7 +437,7 @@ mod tests {
             &names,
             &types,
             &values,
-            1,
+            users_tid(&catalog),
             &catalog,
             "oldkeys",
             |value, ty, name| Ok(json_to_cell(value, ty, name)),
@@ -500,7 +459,7 @@ mod tests {
             &names,
             &types,
             &values,
-            1,
+            users_tid(&catalog),
             &catalog,
             "new_row",
             |value, ty, name| Ok(json_to_cell(value, ty, name)),
@@ -521,7 +480,7 @@ mod tests {
             &names,
             &types,
             &values,
-            1,
+            users_tid(&catalog),
             &catalog,
             "oldkeys",
             |value, ty, name| Ok(json_to_cell(value, ty, name)),

@@ -1,4 +1,5 @@
-use crate::{Cell, ColumnId, RegisterError, SchemaCatalog, TableId};
+use crate::{catalog_helpers, Cell, ColumnId, RegisterError, TableId};
+use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{Expr, Value};
 
 /// Resolve simple column references used by parser/prefilter.
@@ -7,15 +8,15 @@ use sqlparser::ast::{Expr, Value};
 /// - `col`
 /// - `table.col` (table qualifier ignored after SQL-shape validation)
 #[must_use]
-pub(super) fn resolve_column_ref(
+pub(super) fn resolve_column_ref<DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Option<ColumnId> {
     match expr {
-        Expr::Identifier(ident) => catalog.column_id(table_id, &ident.value),
+        Expr::Identifier(ident) => catalog_helpers::column_id(database, table_id, &ident.value),
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            catalog.column_id(table_id, &parts[1].value)
+            catalog_helpers::column_id(database, table_id, &parts[1].value)
         }
         _ => None,
     }

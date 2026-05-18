@@ -29,20 +29,20 @@ uses hybrid indexes to prune candidates before VM evaluation.
 
 ```rust
 use std::sync::Arc;
+use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
-    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SimpleCatalog,
+    catalog_helpers, Cell, DefaultIds, EventKind, PrimaryKey, RowImage,
     SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
 let catalog = Arc::new(
-    SimpleCatalog::new()
-        .add_table("orders", 1, 3)
-        .add_column(1, "id", 0)
-        .add_column(1, "amount", 1)
-        .add_column(1, "status", 2),
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    )?,
 );
-let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+let orders_id = catalog_helpers::table_id(&*catalog, "orders").unwrap();
+let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 engine.register(
@@ -50,7 +50,7 @@ engine.register(
         .updated_at_unix_ms(1_704_067_200_000),
 )?;
 
-let event = WalEvent::builder(1)
+let event = WalEvent::builder(orders_id)
     .insert()
     .pk_cell(0, Cell::Int(1))
     .new_row(RowImage {
@@ -78,20 +78,20 @@ returns an error for update events.
 
 ```rust
 use std::sync::Arc;
+use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
-    AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, PrimaryKey, RowImage,
-    SimpleCatalog, SubscriptionEngine, SubscriptionRequest, WalEvent,
+    catalog_helpers, AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds,
+    PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
 let catalog = Arc::new(
-    SimpleCatalog::new()
-        .add_table("orders", 1, 3)
-        .add_column(1, "id", 0)
-        .add_column_typed(1, "amount", 1, ColumnType::Int)
-        .add_column(1, "status", 2),
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    )?,
 );
-let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+let orders_id = catalog_helpers::table_id(&*catalog, "orders").unwrap();
+let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 // Live count of active orders for consumer 42.
@@ -104,7 +104,7 @@ engine.register(SubscriptionRequest::new(
     42, "SELECT SUM(amount) FROM orders WHERE status = 'active'",
 ))?;
 
-let event = WalEvent::builder(1)
+let event = WalEvent::builder(orders_id)
     .insert()
     .pk_cell(0, Cell::Int(1))
     .new_row(RowImage {
@@ -142,26 +142,27 @@ then computes the average as `running_sum / running_count` on demand:
 
 ```rust
 use std::sync::Arc;
+use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
-    AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds, PrimaryKey, RowImage,
-    SimpleCatalog, SubscriptionEngine, SubscriptionRequest, WalEvent,
+    catalog_helpers, AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds,
+    PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
 let catalog = Arc::new(
-    SimpleCatalog::new()
-        .add_table("scores", 1, 2)
-        .add_column(1, "id", 0)
-        .add_column_typed(1, "value", 1, ColumnType::Int),
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE scores (id INT PRIMARY KEY, value INT);",
+    )?,
 );
-let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+let scores_id = catalog_helpers::table_id(&*catalog, "scores").unwrap();
+let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 engine.register(SubscriptionRequest::new(
     7, "SELECT AVG(value) FROM scores WHERE id > 0",
 ))?;
 
-let event = WalEvent::builder(1)
+let event = WalEvent::builder(scores_id)
     .insert()
     .pk_cell(0, Cell::Int(1))
     .new_row(RowImage {
@@ -188,25 +189,23 @@ if let AggDelta::Avg { sum_delta, count_delta } = delta {
 
 ### Type validation
 
-Use `SimpleCatalog::add_column_typed` to register column types. When a column
-type is known, the engine rejects `SUM` or `AVG` over non-numeric columns
-(`Bool`, `String`) at registration time with a `RegisterError::UnsupportedSql`.
+Column types come from the SQL DDL parsed into `ParserDB`. When a column's
+type can be determined (e.g. `INT`, `REAL`, `TEXT`), the engine rejects
+`SUM` or `AVG` over non-numeric columns (`Bool`, `String`) at registration
+time with a `RegisterError::UnsupportedSql`.
 
 ```rust
 use std::sync::Arc;
+use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::{
-    ColumnType, DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
-};
+use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 let catalog = Arc::new(
-    SimpleCatalog::new()
-        .add_table("products", 1, 3)
-        .add_column_typed(1, "price", 0, ColumnType::Float)
-        .add_column_typed(1, "name", 1, ColumnType::String) // non-numeric
-        .add_column(1, "id", 2),
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE products (price REAL, name TEXT, id INT PRIMARY KEY);",
+    )?,
 );
-let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 // Accepted — price is Float:

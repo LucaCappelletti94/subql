@@ -19,7 +19,8 @@ use super::{
     build_event_from_rows, build_pk_from_resolved, pk_from_catalog_or_empty, resolve_table,
     strict_pk_column_ids_from_names, truncate_event, WalParseError, WalParser,
 };
-use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
+use sql_traits::prelude::DatabaseLike;
 
 // ============================================================================
 // Serde structs — v1
@@ -101,11 +102,11 @@ pub struct Wal2JsonV1Parser;
 /// wal2json **v2** parser (per-change: one message per row change).
 pub struct Wal2JsonV2Parser;
 
-impl WalParser for Wal2JsonV1Parser {
+impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV1Parser {
     fn parse_wal_message(
         &self,
         data: &[u8],
-        catalog: &dyn SchemaCatalog,
+        database: &DB,
     ) -> Result<Vec<WalEvent>, WalParseError> {
         let msg: Option<Wal2JsonV1Message> = super::parse_json_message_or_tombstone(data)?;
         let Some(msg) = msg else {
@@ -116,7 +117,7 @@ impl WalParser for Wal2JsonV1Parser {
         let mut events = Vec::with_capacity(msg.change.len());
         for change in &msg.change {
             if let Some(event) = super::skip_unknown_event_kind(
-                convert_v1_change(change, catalog),
+                convert_v1_change(change, database),
                 "wal2json v1",
                 "kind",
             )? {
@@ -127,11 +128,11 @@ impl WalParser for Wal2JsonV1Parser {
     }
 }
 
-impl WalParser for Wal2JsonV2Parser {
+impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV2Parser {
     fn parse_wal_message(
         &self,
         data: &[u8],
-        catalog: &dyn SchemaCatalog,
+        database: &DB,
     ) -> Result<Vec<WalEvent>, WalParseError> {
         super::parse_single_json_event::<Wal2JsonV2Message, _>(data, |msg| {
             // Skip non-row transactional metadata messages.
@@ -139,7 +140,7 @@ impl WalParser for Wal2JsonV2Parser {
                 return Ok(None);
             }
             super::skip_unknown_event_kind(
-                convert_v2_message(msg, catalog),
+                convert_v2_message(msg, database),
                 "wal2json v2",
                 "action",
             )
@@ -165,29 +166,29 @@ fn parse_v2_kind(action: &str) -> Result<EventKind, WalParseError> {
 ///
 /// Returns `(row_image, Vec<(ColumnId, Cell)>)` — the vec is used for PK
 /// extraction.
-fn build_row_from_arrays(
+fn build_row_from_arrays<DB: DatabaseLike>(
     names: &[String],
     types: &[String],
     values: &[serde_json::Value],
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
     build_row_from_typed_arrays_with(
         names,
         types,
         values,
         table_id,
-        catalog,
+        database,
         "column",
         |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.column.{name}")),
     )
 }
 
 /// Build a [`RowImage`] from v2 column structs.
-fn build_row_from_v2_columns(
+fn build_row_from_v2_columns<DB: DatabaseLike>(
     columns: &[Wal2JsonV2Column],
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
     let typed_columns: Vec<(&str, &str, &serde_json::Value)> = columns
         .iter()
@@ -196,26 +197,26 @@ fn build_row_from_v2_columns(
     build_row_from_named_typed_values_with(
         &typed_columns,
         table_id,
-        catalog,
+        database,
         "v2 columns",
         |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.column.{name}")),
     )
 }
 
-/// Build a [`PrimaryKey`] from the old-keys section (names resolved through catalog).
-fn build_pk_from_key_arrays(
+/// Build a [`PrimaryKey`] from the old-keys section (names resolved through database).
+fn build_pk_from_key_arrays<DB: DatabaseLike>(
     names: &[String],
     types: &[String],
     values: &[serde_json::Value],
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<PrimaryKey, WalParseError> {
     build_pk_from_typed_arrays_with(
         names,
         types,
         values,
         table_id,
-        catalog,
+        database,
         "oldkeys",
         |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.oldkeys.{name}")),
     )
@@ -225,12 +226,12 @@ fn build_pk_from_key_arrays(
 // v1 conversion
 // ============================================================================
 
-fn convert_v1_change(
+fn convert_v1_change<DB: DatabaseLike>(
     change: &Wal2JsonV1Change,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<WalEvent, WalParseError> {
     let kind = parse_v1_kind(&change.kind)?;
-    let table_id = resolve_table(&change.schema, &change.table, catalog)?;
+    let table_id = resolve_table(&change.schema, &change.table, database)?;
 
     if kind == EventKind::Truncate {
         return truncate_event(table_id);
@@ -256,7 +257,7 @@ fn convert_v1_change(
             &change.columntypes,
             &change.columnvalues,
             table_id,
-            catalog,
+            database,
         )?;
         (Some(row), resolved)
     } else {
@@ -270,7 +271,7 @@ fn convert_v1_change(
             &oldkeys.keytypes,
             &oldkeys.keyvalues,
             table_id,
-            catalog,
+            database,
         )?;
 
         let pk = build_pk_from_key_arrays(
@@ -278,13 +279,13 @@ fn convert_v1_change(
             &oldkeys.keytypes,
             &oldkeys.keyvalues,
             table_id,
-            catalog,
+            database,
         )?;
 
         (Some(row), pk)
     } else {
-        // INSERT without oldkeys — extract PK from new row using catalog metadata
-        let pk = pk_from_catalog_or_empty(&new_resolved, table_id, catalog)?;
+        // INSERT without oldkeys — extract PK from new row using database metadata
+        let pk = pk_from_catalog_or_empty(&new_resolved, table_id, database)?;
         (None, pk)
     };
     let old_row_complete = super::old_row_is_complete(old_row.as_ref());
@@ -304,9 +305,9 @@ fn convert_v1_change(
 // v2 conversion
 // ============================================================================
 
-fn convert_v2_message(
+fn convert_v2_message<DB: DatabaseLike>(
     msg: &Wal2JsonV2Message,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<WalEvent, WalParseError> {
     let kind = parse_v2_kind(&msg.action)?;
 
@@ -314,7 +315,7 @@ fn convert_v2_message(
     let table = msg.table.as_deref().ok_or_else(|| {
         WalParseError::JsonError("data message (I/U/D) missing 'table' field".to_string())
     })?;
-    let table_id = resolve_table(schema, table, catalog)?;
+    let table_id = resolve_table(schema, table, database)?;
 
     let (new_row, new_resolved) = match kind {
         EventKind::Insert | EventKind::Update => {
@@ -323,7 +324,7 @@ fn convert_v2_message(
                 .as_ref()
                 .filter(|columns| !columns.is_empty())
                 .ok_or_else(|| WalParseError::MissingField("columns".to_string()))?;
-            let (row, resolved) = build_row_from_v2_columns(columns, table_id, catalog)?;
+            let (row, resolved) = build_row_from_v2_columns(columns, table_id, database)?;
             (Some(row), resolved)
         }
         EventKind::Delete | EventKind::Truncate => (None, Vec::new()),
@@ -336,7 +337,7 @@ fn convert_v2_message(
                 .as_ref()
                 .filter(|identity| !identity.is_empty())
                 .ok_or_else(|| WalParseError::MissingField("identity".to_string()))?;
-            let (row, resolved) = build_row_from_v2_columns(identity, table_id, catalog)?;
+            let (row, resolved) = build_row_from_v2_columns(identity, table_id, database)?;
             (Some(row), resolved)
         }
         EventKind::Update => {
@@ -345,7 +346,7 @@ fn convert_v2_message(
                 .as_ref()
                 .filter(|identity| !identity.is_empty())
             {
-                let (row, resolved) = build_row_from_v2_columns(identity, table_id, catalog)?;
+                let (row, resolved) = build_row_from_v2_columns(identity, table_id, database)?;
                 (Some(row), resolved)
             } else {
                 (None, Vec::new())
@@ -355,7 +356,7 @@ fn convert_v2_message(
     };
     let old_row_complete = super::old_row_is_complete(old_row.as_ref());
 
-    // Build PK: prefer identity columns, then pk metadata, then catalog.
+    // Build PK: prefer identity columns, then pk metadata, then database.
     // The three-way branching is clearer as if-let chains than map_or_else.
     #[allow(clippy::option_if_let_else)]
     let pk = if kind == EventKind::Truncate {
@@ -368,7 +369,7 @@ fn convert_v2_message(
                 table_id,
                 &pk_names,
                 &identity_resolved,
-                catalog,
+                database,
                 "pk",
             )?;
             build_pk_from_resolved(&identity_resolved, &pk_col_ids)
@@ -383,10 +384,10 @@ fn convert_v2_message(
         // INSERT — extract PK from new row using pk metadata
         let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
         let pk_col_ids =
-            strict_pk_column_ids_from_names(table_id, &pk_names, &new_resolved, catalog, "pk")?;
+            strict_pk_column_ids_from_names(table_id, &pk_names, &new_resolved, database, "pk")?;
         build_pk_from_resolved(&new_resolved, &pk_col_ids)
     } else {
-        pk_from_catalog_or_empty(&new_resolved, table_id, catalog)?
+        pk_from_catalog_or_empty(&new_resolved, table_id, database)?
     };
 
     build_event_from_rows(
@@ -413,30 +414,10 @@ mod tests {
     };
     use super::*;
 
-    /// Catalog where table_id resolves but table_arity returns None.
-    struct NoArityCatalog;
-
-    impl SchemaCatalog for NoArityCatalog {
-        fn table_id(&self, table_name: &str) -> Option<TableId> {
-            if table_name == "orders" || table_name == "public.orders" {
-                Some(1)
-            } else {
-                None
-            }
-        }
-
-        fn column_id(&self, _table_id: TableId, _column_name: &str) -> Option<ColumnId> {
-            None
-        }
-
-        fn table_arity(&self, _table_id: TableId) -> Option<usize> {
-            None
-        }
-
-        fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-            Some(0)
-        }
-    }
+    // NOTE: Tests `error_no_arity_v1`/`v2` were removed in the migration from
+    // the `SchemaCatalog` trait to `DatabaseLike`. With `DatabaseLike` a
+    // resolved table always exposes its column count, so the "arity missing"
+    // failure mode is no longer reachable.
 
     // -- v1 INSERT -----------------------------------------------------------
 
@@ -992,8 +973,8 @@ mod tests {
 
     #[test]
     fn trait_object_compiles() {
-        let parser: &dyn WalParser = &Wal2JsonV1Parser;
         let catalog = orders_catalog();
+        let parser: &dyn WalParser<sql_traits::structs::ParserDB> = &Wal2JsonV1Parser;
 
         let json = r#"{
             "change": [{
@@ -1316,52 +1297,6 @@ mod tests {
         // PK should come from catalog.primary_key_columns()
         assert_eq!(ev.pk().columns.as_ref(), &[0]);
         assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(7)]);
-    }
-
-    // -- Error: table_arity returns None (v1) --------------------------------
-
-    #[test]
-    fn error_no_arity_v1() {
-        let catalog = NoArityCatalog;
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "insert",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id"],
-                "columntypes": ["integer"],
-                "columnvalues": [1]
-            }]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownTable { .. }));
-    }
-
-    // -- Error: table_arity returns None (v2) --------------------------------
-
-    #[test]
-    fn error_no_arity_v2() {
-        let catalog = NoArityCatalog;
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 1}
-            ]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownTable { .. }));
     }
 
     // -- Error: unknown column in oldkeys ------------------------------------

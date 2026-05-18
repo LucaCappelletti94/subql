@@ -3,15 +3,12 @@
 #![allow(clippy::cast_sign_loss)]
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
+use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
-use subql::{
-    Cell, DefaultIds, RowImage, SchemaCatalog, SubscriptionEngine, SubscriptionRequest, TableId,
-    WalEvent,
-};
+use subql::{Cell, DefaultIds, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent};
 
 const STATUS_BUCKETS: [&str; 7] = [
     "pending",
@@ -211,9 +208,10 @@ const fn realistic_workload_seed(subscription_ix: u64) -> u64 {
 
 fn build_scaling_engine(
     predicate_count: usize,
-) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds> {
-    let catalog = Arc::new(BenchCatalog::new());
-    let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
+    let catalog = Arc::new(bench_catalog());
+    let mut engine =
+        SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
     for i in 0..predicate_count {
         let i_u64 = u64::try_from(i).unwrap_or(0);
@@ -227,57 +225,18 @@ fn build_scaling_engine(
     engine
 }
 
-// Mock catalog for benchmarking
-struct BenchCatalog {
-    tables: HashMap<String, (TableId, usize)>,
-    columns: HashMap<(TableId, String), u16>,
-}
-
-impl BenchCatalog {
-    fn new() -> Self {
-        let mut catalog = Self {
-            tables: HashMap::new(),
-            columns: HashMap::new(),
-        };
-
-        // Add "orders" table with many columns
-        catalog.tables.insert("orders".to_string(), (1, 10));
-        catalog.columns.insert((1, "id".to_string()), 0);
-        catalog.columns.insert((1, "user_id".to_string()), 1);
-        catalog.columns.insert((1, "amount".to_string()), 2);
-        catalog.columns.insert((1, "status".to_string()), 3);
-        catalog.columns.insert((1, "priority".to_string()), 4);
-        catalog.columns.insert((1, "quantity".to_string()), 5);
-        catalog.columns.insert((1, "discount".to_string()), 6);
-        catalog.columns.insert((1, "tax".to_string()), 7);
-        catalog.columns.insert((1, "shipping".to_string()), 8);
-        catalog.columns.insert((1, "created_at".to_string()), 9);
-
-        catalog
-    }
-}
-
-impl SchemaCatalog for BenchCatalog {
-    fn table_id(&self, table_name: &str) -> Option<TableId> {
-        self.tables.get(table_name).map(|(id, _)| *id)
-    }
-
-    fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-        self.columns
-            .get(&(table_id, column_name.to_string()))
-            .copied()
-    }
-
-    fn table_arity(&self, table_id: TableId) -> Option<usize> {
-        self.tables
-            .values()
-            .find(|(id, _)| *id == table_id)
-            .map(|(_, arity)| *arity)
-    }
-
-    fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-        Some(0x1234567890ABCDEF)
-    }
+/// Bench fixture catalog. A placeholder table is declared so the `orders`
+/// table id is stable at 1 (matching `WalEvent::builder(1)` in events).
+fn bench_catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE _bench_pad (id INT);\n\
+         CREATE TABLE orders (\
+             id INT PRIMARY KEY, user_id INT, amount INT, status TEXT, \
+             priority INT, quantity INT, discount INT, tax INT, shipping INT, \
+             created_at INT\
+         );",
+    )
+    .expect("bench DDL parses")
 }
 
 fn make_test_event(seed: u64) -> WalEvent {
@@ -556,8 +515,9 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     let mut equality_engine = {
-        let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+        let catalog = Arc::new(bench_catalog());
+        let mut engine =
+            SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
         // Register 1000 equality-dominant trees.
         for i in 0_u64..1_000 {
@@ -586,8 +546,9 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     });
 
     let mut range_engine = {
-        let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+        let catalog = Arc::new(bench_catalog());
+        let mut engine =
+            SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
         // Register 1000 range-heavy trees.
         for i in 0_u64..1_000 {
@@ -616,8 +577,9 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     });
 
     let mut complex_engine = {
-        let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+        let catalog = Arc::new(bench_catalog());
+        let mut engine =
+            SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
         // Register 1000 fallback-heavy trees.
         for i in 0_u64..1_000 {
@@ -664,9 +626,11 @@ fn registration_benchmark(c: &mut Criterion) {
         let mut next_seed = 1_u64;
         b.iter_batched(
             || {
-                let catalog = Arc::new(BenchCatalog::new());
-                let engine =
-                    SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+                let catalog = Arc::new(bench_catalog());
+                let engine = SubscriptionEngine::<_, DefaultIds, ParserDB>::new(
+                    catalog,
+                    PostgreSqlDialect {},
+                );
                 let seed = next_seed;
                 next_seed = next_seed.wrapping_add(1);
                 (engine, seed)
@@ -684,9 +648,11 @@ fn registration_benchmark(c: &mut Criterion) {
         let mut next_seed = 1_u64;
         b.iter_batched(
             || {
-                let catalog = Arc::new(BenchCatalog::new());
-                let mut engine =
-                    SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+                let catalog = Arc::new(bench_catalog());
+                let mut engine = SubscriptionEngine::<_, DefaultIds, ParserDB>::new(
+                    catalog,
+                    PostgreSqlDialect {},
+                );
 
                 // Pre-register one predicate so the measured operation always
                 // takes the dedup/reuse path against a stable engine state.
@@ -719,8 +685,9 @@ fn deduplication_benchmark(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     let mut high_dedup_engine = {
-        let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+        let catalog = Arc::new(bench_catalog());
+        let mut engine =
+            SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
         // Register same realistic tree for 1000 users.
         let shared_sql = mixed_tree_sql(13_579);
@@ -750,8 +717,9 @@ fn deduplication_benchmark(c: &mut Criterion) {
     });
 
     let mut low_dedup_engine = {
-        let catalog = Arc::new(BenchCatalog::new());
-        let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+        let catalog = Arc::new(bench_catalog());
+        let mut engine =
+            SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
         // Register unique realistic tree per user.
         for i in 0_u64..1_000 {

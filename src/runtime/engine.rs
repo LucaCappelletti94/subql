@@ -8,6 +8,7 @@ use super::{
     predicate::{Predicate, SubscriptionBinding},
 };
 use crate::{
+    catalog_helpers,
     compiler::{
         canonicalize, parse_and_resolve_hash, parse_compile_normalize_and_prefilter,
         sql_shape::{AggSpec, QueryProjection},
@@ -23,12 +24,12 @@ use crate::{
         },
     },
     DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, EventKind, IdTypes,
-    MergeError, MergeJobId, MergeReport, RegisterError, RegisterResult, RowImage, SchemaCatalog,
-    StorageError, SubscriptionDispatch, SubscriptionId, SubscriptionRegistration,
-    SubscriptionRequest, SubscriptionScope, SubscriptionUnregistration, TableId, UnregisterReport,
-    WalEvent,
+    MergeError, MergeJobId, MergeReport, RegisterError, RegisterResult, RowImage, StorageError,
+    SubscriptionDispatch, SubscriptionId, SubscriptionRegistration, SubscriptionRequest,
+    SubscriptionScope, SubscriptionUnregistration, TableId, UnregisterReport, WalEvent,
 };
 use ahash::{AHashMap, AHashSet};
+use sql_traits::prelude::DatabaseLike;
 use sqlparser::dialect::Dialect;
 #[cfg(test)]
 use std::collections::HashSet;
@@ -55,9 +56,6 @@ enum DurabilityCheckOutcome {
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Wrapper to pass `Arc<dyn SchemaCatalog>` as `Box<dyn SchemaCatalog + Send>`.
-struct CatalogRef(Arc<dyn SchemaCatalog>);
 
 #[derive(Debug)]
 enum RebuildPayloadError {
@@ -109,30 +107,15 @@ impl std::fmt::Display for RebuildPayloadError {
     }
 }
 
-impl SchemaCatalog for CatalogRef {
-    fn table_id(&self, table_name: &str) -> Option<TableId> {
-        self.0.table_id(table_name)
-    }
-    fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-        self.0.column_id(table_id, column_name)
-    }
-    fn table_arity(&self, table_id: TableId) -> Option<usize> {
-        self.0.table_arity(table_id)
-    }
-    fn schema_fingerprint(&self, table_id: TableId) -> Option<u64> {
-        self.0.schema_fingerprint(table_id)
-    }
-}
-
 /// Main subscription engine
 ///
 /// Manages subscriptions across all tables with hybrid indexing and
 /// predicate deduplication.
-pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
+pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     /// SQL dialect for parsing
     dialect: D,
-    /// Schema catalog for table/column resolution
-    catalog: Arc<dyn SchemaCatalog>,
+    /// Schema database for table/column resolution
+    database: Arc<DB>,
     /// Table partitions (TableId → TablePartition)
     partitions: AHashMap<TableId, TablePartition<I>>,
     /// User dictionaries (TableId → ConsumerDictionary)
@@ -150,7 +133,7 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes> {
     /// Shard rotation threshold (bytes)
     rotation_threshold: usize,
     /// Background merge compaction manager
-    merge_manager: MergeManager<I>,
+    merge_manager: MergeManager<I, DB>,
     /// Persistence strictness policy for registration.
     durability_mode: DurabilityMode,
 }
@@ -171,7 +154,7 @@ fn table_context<'a, I: IdTypes>(
     Ok((partition, consumer_dict))
 }
 
-impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
+impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I, DB> {
     fn index_atoms_from_plan(plan: &PrefilterPlan) -> Vec<IndexableAtom> {
         let mut atoms: Vec<IndexableAtom> = plan
             .trigger_atoms
@@ -188,7 +171,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
     fn compile_spec(&self, spec: SubscriptionRequest<I>) -> Result<CompiledSpec<I>, RegisterError> {
         let (table_id, bytecode, normalized, prefilter_plan, projection) =
-            parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.catalog)?;
+            parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.database)?;
 
         // Disambiguate hash: same WHERE clause with different projection kind must map to
         // distinct predicates.
@@ -347,21 +330,25 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// ```
     /// use std::sync::Arc;
     ///
+    /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
-    /// use subql::{DefaultIds, SimpleCatalog, SubscriptionEngine};
+    /// use subql::{DefaultIds, SubscriptionEngine};
     ///
-    /// let catalog = Arc::new(SimpleCatalog::new().add_table("orders", 1, 1));
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE orders (id INT);")
+    ///         .expect("DDL parses"),
+    /// );
     ///
-    /// let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
-    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    /// let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// assert_eq!(engine.subscription_count(), 0);
     /// ```
     #[must_use]
-    pub fn new(catalog: Arc<dyn SchemaCatalog>, dialect: D) -> Self {
+    pub fn new(database: Arc<DB>, dialect: D) -> Self {
         Self {
             dialect,
-            catalog,
+            database,
             partitions: AHashMap::new(),
             consumer_dictionaries: AHashMap::new(),
             subscription_to_table: AHashMap::new(),
@@ -380,11 +367,11 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// Loads existing shards from storage directory on startup.
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_storage(
-        catalog: Arc<dyn SchemaCatalog>,
+        database: Arc<DB>,
         dialect: D,
         storage_path: PathBuf,
     ) -> Result<Self, StorageError> {
-        let mut engine = Self::new(catalog, dialect);
+        let mut engine = Self::new(database, dialect);
         engine.storage_path = Some(storage_path.clone());
 
         // Create storage directory if it doesn't exist
@@ -406,20 +393,20 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// ```
     /// use std::sync::Arc;
     ///
+    /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{
-    ///     DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
+    ///     catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
-    /// let catalog = Arc::new(
-    ///     SimpleCatalog::new()
-    ///         .add_table("orders", 1, 3)
-    ///         .add_column(1, "id", 0)
-    ///         .add_column(1, "amount", 1)
-    ///         .add_column(1, "status", 2),
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    ///     )?,
     /// );
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
-    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// let first = engine.register(
     ///     SubscriptionRequest::new(10, "SELECT * FROM orders WHERE amount > 100")
@@ -433,7 +420,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     ///
     /// assert!(first.created_new_predicate);
     /// assert!(!second.created_new_predicate);
-    /// assert_eq!(engine.predicate_count(1), 1);
+    /// assert_eq!(engine.predicate_count(orders_id), 1);
     /// assert_eq!(engine.subscription_count(), 2);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -537,20 +524,20 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// ```
     /// use std::sync::Arc;
     ///
+    /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{
-    ///     DefaultIds, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
+    ///     catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
-    /// let catalog = Arc::new(
-    ///     SimpleCatalog::new()
-    ///         .add_table("orders", 1, 3)
-    ///         .add_column(1, "id", 0)
-    ///         .add_column(1, "amount", 1)
-    ///         .add_column(1, "status", 2),
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    ///     )?,
     /// );
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
-    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// let results = engine.register_batch(vec![
     ///     SubscriptionRequest::new(10, "SELECT * FROM orders WHERE status = 'paid'")
@@ -568,7 +555,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// assert!(results[0].created_new_predicate);
     /// assert!(!results[1].created_new_predicate);
     /// assert!(results[2].created_new_predicate);
-    /// assert_eq!(engine.predicate_count(1), 2);
+    /// assert_eq!(engine.predicate_count(orders_id), 2);
     /// assert_eq!(engine.subscription_count(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -887,28 +874,28 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// ```
     /// use std::sync::Arc;
     ///
+    /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{
-    ///     Cell, DefaultIds, RowImage, SimpleCatalog, SubscriptionEngine, SubscriptionRequest,
-    ///     WalEvent,
+    ///     catalog_helpers, Cell, DefaultIds, RowImage, SubscriptionEngine,
+    ///     SubscriptionRequest, WalEvent,
     /// };
     ///
-    /// let catalog = Arc::new(
-    ///     SimpleCatalog::new()
-    ///         .add_table("orders", 1, 3)
-    ///         .add_column(1, "id", 0)
-    ///         .add_column(1, "amount", 1)
-    ///         .add_column(1, "status", 2),
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    ///     )?,
     /// );
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
-    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// engine.register(
     ///     SubscriptionRequest::new(42, "SELECT * FROM orders WHERE amount > 100")
     ///         .updated_at_unix_ms(1_704_067_200_000),
     /// )?;
     ///
-    /// let event = WalEvent::builder(1)
+    /// let event = WalEvent::builder(orders_id)
     ///     .insert()
     ///     .new_row(RowImage {
     ///         cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("paid".into())]),
@@ -935,7 +922,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
             return dispatch_consumers(event, partition, consumer_dict, &mut self.vm);
         }
 
-        // Validate row image arity against schema catalog.
+        // Validate row image arity against schema database.
         // For UPDATE events, validate both old_row and new_row.
         if let Some(old_row) = event.old_row() {
             self.validate_row_arity(event.table_id(), old_row)?;
@@ -974,27 +961,28 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     /// ```
     /// use std::sync::Arc;
     ///
+    /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{
-    ///     AggDelta, Cell, DefaultIds, RowImage, SimpleCatalog, SubscriptionEngine,
+    ///     catalog_helpers, AggDelta, Cell, DefaultIds, RowImage, SubscriptionEngine,
     ///     SubscriptionRequest, WalEvent,
     /// };
     ///
-    /// let catalog = Arc::new(
-    ///     SimpleCatalog::new()
-    ///         .add_table("orders", 1, 2)
-    ///         .add_column(1, "id", 0)
-    ///         .add_column(1, "status", 1),
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
+    ///     )?,
     /// );
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
-    ///     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// engine.register(
     ///     SubscriptionRequest::new(99, "SELECT COUNT(*) FROM orders WHERE status = 'paid'")
     ///         .updated_at_unix_ms(1_704_067_200_000),
     /// )?;
     ///
-    /// let event = WalEvent::builder(1)
+    /// let event = WalEvent::builder(orders_id)
     ///     .insert()
     ///     .new_row(RowImage {
     ///         cells: Arc::from([Cell::Int(1), Cell::String("paid".into())]),
@@ -1105,7 +1093,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         consumer_id: I::ConsumerId,
         sql: &str,
     ) -> Result<UnregisterReport, RegisterError> {
-        let (table_id, hash) = parse_and_resolve_hash(sql, &self.dialect, &*self.catalog)?;
+        let (table_id, hash) = parse_and_resolve_hash(sql, &self.dialect, &*self.database)?;
 
         let empty = UnregisterReport {
             removed_bindings: 0,
@@ -1167,9 +1155,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
 
     /// Validate that a row image has the expected arity for its table.
     fn validate_row_arity(&self, table_id: TableId, row: &RowImage) -> Result<(), DispatchError> {
-        let expected = self
-            .catalog
-            .table_arity(table_id)
+        let expected = catalog_helpers::table_arity(&*self.database, table_id)
             .ok_or(DispatchError::UnknownTableArity(table_id))?;
         let got = row.len();
         if got != expected {
@@ -1390,7 +1376,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         };
 
         // Serialize shard
-        let bytes = serialize_shard::<I>(table_id, &payload, &*self.catalog)?;
+        let bytes = serialize_shard::<I, DB>(table_id, &payload, &*self.database)?;
 
         // Write to disk atomically (temp file + fsync + rename + parent-dir fsync).
         let shard_path = storage_path.join(format!("table_{table_id}.shard"));
@@ -1545,7 +1531,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         let bytes = std::fs::read(path)
             .map_err(|e| StorageError::Io(format!("Failed to read shard: {e}")))?;
 
-        let (header, payload) = deserialize_shard::<I>(&bytes, &*self.catalog)?;
+        let (header, payload) = deserialize_shard::<I, DB>(&bytes, &*self.database)?;
         if header.table_id != table_id {
             return Err(StorageError::Corrupt(format!(
                 "Shard table ID mismatch: filename table_id {table_id}, header table_id {}",
@@ -1703,7 +1689,7 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
         self.merge_manager.merge_shards_background(
             table_id,
             shard_bytes,
-            Box::new(CatalogRef(Arc::clone(&self.catalog))),
+            Arc::clone(&self.database),
         )
     }
 
@@ -1767,8 +1753,8 @@ impl<D: Dialect, I: IdTypes> SubscriptionEngine<D, I> {
     }
 }
 
-impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionRegistration<I>
-    for SubscriptionEngine<D, I>
+impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionRegistration<I>
+    for SubscriptionEngine<D, I, DB>
 {
     fn register(&mut self, spec: SubscriptionRequest<I>) -> Result<RegisterResult, RegisterError> {
         Self::register(self, spec)
@@ -1779,7 +1765,9 @@ impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionRegistration<I>
     }
 }
 
-impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionDispatch<I> for SubscriptionEngine<D, I> {
+impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionDispatch<I>
+    for SubscriptionEngine<D, I, DB>
+{
     fn consumers(
         &mut self,
         event: &WalEvent,
@@ -1788,8 +1776,8 @@ impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionDispatch<I> for Subscript
     }
 }
 
-impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionUnregistration<I>
-    for SubscriptionEngine<D, I>
+impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionUnregistration<I>
+    for SubscriptionEngine<D, I, DB>
 {
     fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
         Self::unregister_session(self, session_id)
@@ -1804,8 +1792,8 @@ impl<D: Dialect + Send + Sync, I: IdTypes> SubscriptionUnregistration<I>
     }
 }
 
-impl<D: Dialect + Send + Sync, I: IdTypes> crate::AggregateDispatch<I>
-    for SubscriptionEngine<D, I>
+impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> crate::AggregateDispatch<I>
+    for SubscriptionEngine<D, I, DB>
 {
     fn aggregate_deltas(
         &mut self,
@@ -1815,13 +1803,17 @@ impl<D: Dialect + Send + Sync, I: IdTypes> crate::AggregateDispatch<I>
     }
 }
 
-impl<D: Dialect + Send + Sync, I: IdTypes> DurableShardStore for SubscriptionEngine<D, I> {
+impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> DurableShardStore
+    for SubscriptionEngine<D, I, DB>
+{
     fn snapshot_table(&self, table_id: TableId) -> Result<(), StorageError> {
         Self::snapshot_table(self, table_id)
     }
 }
 
-impl<D: Dialect + Send + Sync, I: IdTypes> DurableShardMerge for SubscriptionEngine<D, I> {
+impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> DurableShardMerge
+    for SubscriptionEngine<D, I, DB>
+{
     fn merge_shards_background(
         &mut self,
         table_id: TableId,
@@ -1848,22 +1840,34 @@ impl<D: Dialect + Send + Sync, I: IdTypes> DurableShardMerge for SubscriptionEng
 )]
 mod tests {
     use super::*;
-    use crate::testing::MockCatalog;
+    use crate::catalog_helpers;
     use crate::{Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SubscriptionScope};
+    use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
-    fn make_catalog() -> Arc<MockCatalog> {
-        let mut tables = HashMap::new();
-        tables.insert("orders".to_string(), (1, 3));
+    /// Fixture catalog for engine tests: one table `orders` with three columns
+    /// (`id` PK, `amount` INT, `status` TEXT). Padding tables ensure
+    /// `orders` is assigned table id `1` and a second known table is at
+    /// id `2`, matching tests that serialize shards with header
+    /// `table_id = 2` to exercise filename/header mismatch paths.
+    fn make_catalog() -> Arc<ParserDB> {
+        Arc::new(
+            ParserDB::parse::<PostgreSqlDialect>(
+                "CREATE TABLE _engine_pad (id INT);\n\
+                 CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);\n\
+                 CREATE TABLE z_other (id INT PRIMARY KEY);",
+            )
+            .expect("orders fixture DDL parses"),
+        )
+    }
 
-        let mut columns = HashMap::new();
-        columns.insert((1, "id".to_string()), 0);
-        columns.insert((1, "amount".to_string()), 1);
-        columns.insert((1, "status".to_string()), 2);
-
-        Arc::new(MockCatalog { tables, columns })
+    /// Helper: orders table_id for the standard fixture. With the padded
+    /// `make_catalog()` this is `1`; using the helper instead of a literal
+    /// keeps tests resilient if the padding strategy changes.
+    #[allow(dead_code)]
+    fn orders_tid(catalog: &ParserDB) -> TableId {
+        catalog_helpers::table_id(catalog, "orders").expect("orders id")
     }
 
     fn build_insert_event(table_id: TableId, pk: PrimaryKey, new_row: RowImage) -> WalEvent {
@@ -1985,7 +1989,7 @@ mod tests {
     #[test]
     fn test_engine_creation() {
         let catalog = make_catalog();
-        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         assert_eq!(engine.subscription_count(), 0);
@@ -1994,7 +1998,7 @@ mod tests {
     #[test]
     fn test_register_subscription() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let spec = SubscriptionRequest {
@@ -2015,7 +2019,7 @@ mod tests {
     #[test]
     fn test_predicate_deduplication() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register same predicate for two consumers
@@ -2045,7 +2049,7 @@ mod tests {
     #[test]
     fn test_dispatch_simple() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription: amount > 100
@@ -2084,7 +2088,7 @@ mod tests {
     #[test]
     fn test_dispatch_no_where_matches_all_rows() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let spec = SubscriptionRequest {
@@ -2113,7 +2117,7 @@ mod tests {
     #[test]
     fn test_bindings_persist() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription
@@ -2141,7 +2145,7 @@ mod tests {
     #[test]
     fn test_unregister_removes_binding() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscription
@@ -2174,7 +2178,7 @@ mod tests {
     #[test]
     fn test_unregister_one_of_duplicate_user_bindings_keeps_dispatch_match() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
@@ -2219,7 +2223,7 @@ mod tests {
     #[test]
     fn test_register_after_unsubscribe_does_not_break_hash_lookup_or_dispatch() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Sub 1 -> predicate A
@@ -2280,7 +2284,7 @@ mod tests {
     #[test]
     fn test_multiple_predicates_indexed() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register first predicate
@@ -2325,7 +2329,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with storage
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog.clone(),
                 PostgreSqlDialect {},
@@ -2357,7 +2361,7 @@ mod tests {
         assert!(temp_shards.is_empty());
 
         // Create new engine, load from disk
-        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -2390,7 +2394,7 @@ mod tests {
             .join(format!("table_1.shard.tmp.{pid}.{seed}.0"));
         std::fs::write(&colliding_tmp, b"collision").unwrap();
 
-        SubscriptionEngine::<PostgreSqlDialect, DefaultIds>::durable_atomic_replace(
+        SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::durable_atomic_replace(
             temp_dir.path(),
             &shard_path,
             "table_1",
@@ -2418,7 +2422,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with storage
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog.clone(),
                 PostgreSqlDialect {},
@@ -2448,7 +2452,7 @@ mod tests {
         engine.snapshot_table(1).unwrap();
 
         // Load in new engine
-        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -2471,7 +2475,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine and register consumers
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog.clone(),
                 PostgreSqlDialect {},
@@ -2493,7 +2497,7 @@ mod tests {
         engine.snapshot_table(1).unwrap();
 
         // Load in new engine
-        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let engine2: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -2516,7 +2520,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with empty storage directory
-        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -2535,7 +2539,7 @@ mod tests {
     #[test]
     fn test_predicate_count() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // No predicates initially
@@ -2558,7 +2562,7 @@ mod tests {
     #[test]
     fn test_unregister_session() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register subscriptions with session
@@ -2589,7 +2593,7 @@ mod tests {
     #[test]
     fn test_rotation_threshold() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Default threshold
@@ -2604,7 +2608,7 @@ mod tests {
     #[test]
     fn test_dispatch_consumers_via_engine() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register a subscription
@@ -2639,7 +2643,7 @@ mod tests {
         let catalog = make_catalog();
 
         // Create engine with non-existent storage path
-        let engine: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+        let engine: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -2653,7 +2657,7 @@ mod tests {
     #[test]
     fn test_unregister_nonexistent_subscription() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Unregister subscription that doesn't exist
@@ -2664,7 +2668,7 @@ mod tests {
     #[test]
     fn test_dispatch_unknown_table() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Dispatch to unknown table
@@ -2686,7 +2690,7 @@ mod tests {
     #[test]
     fn test_dispatch_insert_invalid_row_arity() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -2721,68 +2725,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_dispatch_insert_missing_catalog_arity_returns_error() {
-        struct MissingArityCatalog;
-
-        impl SchemaCatalog for MissingArityCatalog {
-            fn table_id(&self, table_name: &str) -> Option<TableId> {
-                (table_name == "orders").then_some(1)
-            }
-
-            fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-                if table_id != 1 {
-                    return None;
-                }
-                match column_name {
-                    "id" => Some(0),
-                    "amount" => Some(1),
-                    "status" => Some(2),
-                    _ => None,
-                }
-            }
-
-            fn table_arity(&self, _table_id: TableId) -> Option<usize> {
-                None
-            }
-
-            fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-                Some(0xABCD_1234_5678_9ABC)
-            }
-        }
-
-        let catalog: Arc<dyn SchemaCatalog> = Arc::new(MissingArityCatalog);
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
-            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
-
-        engine
-            .register(SubscriptionRequest {
-                consumer_id: 31_001,
-                scope: SubscriptionScope::Durable,
-                sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
-                updated_at_unix_ms: 31_001,
-            })
-            .unwrap();
-
-        let event = build_insert_event(
-            1,
-            PrimaryKey {
-                columns: Arc::from([0u16]),
-                values: Arc::from([Cell::Int(1)]),
-            },
-            RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(5), Cell::String("ok".into())]),
-            },
-        );
-
-        let result = engine.consumers(&event);
-        assert!(matches!(result, Err(DispatchError::UnknownTableArity(1))));
-    }
+    // Removed `test_dispatch_insert_missing_catalog_arity_returns_error`:
+    // this test relied on a `MissingArityCatalog` whose `table_arity` returned
+    // None. With `DatabaseLike` a resolved table always exposes its column
+    // count, so `DispatchError::UnknownTableArity` is unreachable.
 
     #[test]
     fn test_dispatch_update_invalid_row_arity() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -2825,7 +2776,7 @@ mod tests {
     #[test]
     fn test_dispatch_delete_invalid_row_arity() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -2863,7 +2814,7 @@ mod tests {
     #[test]
     fn test_dispatch_truncate_does_not_require_row_images_or_arity() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -2901,7 +2852,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
 
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog.clone(),
                 PostgreSqlDialect {},
@@ -2944,7 +2895,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -2979,7 +2930,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3055,7 +3006,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3095,7 +3046,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3139,7 +3090,7 @@ mod tests {
     fn test_post_commit_detection_is_not_message_prefix_based() {
         let forged = StorageError::Io("post_commit_dirsync: forged".to_string());
         assert!(
-            !SubscriptionEngine::<PostgreSqlDialect, DefaultIds>::is_post_commit_dirsync_error(
+            !SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::is_post_commit_dirsync_error(
                 &forged
             ),
             "raw Io messages should not be treated as post-commit durability failures"
@@ -3156,7 +3107,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3208,7 +3159,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3236,7 +3187,7 @@ mod tests {
     #[test]
     fn test_unregister_session_empty() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Unregister session with no subscriptions
@@ -3248,7 +3199,7 @@ mod tests {
     #[test]
     fn test_unregister_session_reports_removed_predicates_when_last_binding_removed() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -3281,7 +3232,7 @@ mod tests {
     #[test]
     fn test_unregister_session_does_not_count_predicate_removed_when_other_bindings_remain() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Session-bound binding
@@ -3313,7 +3264,7 @@ mod tests {
     #[test]
     fn test_unregister_session_keeps_user_when_other_binding_for_same_user_remains() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Session-bound binding
@@ -3399,14 +3350,14 @@ mod tests {
         };
 
         // Serialize shard with catalog fingerprint
-        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
 
         // Write corrupt shard to disk
         let shard_path = temp_dir.path().join("table_1.shard");
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         // Try to load — should fail with Corrupt error about unknown predicate hash
-        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3473,10 +3424,10 @@ mod tests {
             created_at_unix_ms: 2000,
         };
 
-        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
         std::fs::write(temp_dir.path().join("table_1.shard"), shard_bytes).unwrap();
 
-        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3507,11 +3458,11 @@ mod tests {
         };
 
         // Header table_id = 2, filename implies table_id = 1.
-        let shard_bytes = serialize_shard::<DefaultIds>(2, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(2, &payload, &*catalog).unwrap();
         let shard_path = temp_dir.path().join("table_1.shard");
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
-        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3533,7 +3484,7 @@ mod tests {
 
         std::fs::write(temp_dir.path().join("not_a_table_id.shard"), b"junk").unwrap();
 
-        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3559,12 +3510,12 @@ mod tests {
             },
             created_at_unix_ms: 0,
         };
-        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
 
         std::fs::write(temp_dir.path().join("table_1.shard"), &shard_bytes).unwrap();
         std::fs::write(temp_dir.path().join("not_a_table_id.shard"), b"junk").unwrap();
 
-        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3593,12 +3544,12 @@ mod tests {
             },
             created_at_unix_ms: 0,
         };
-        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
 
         std::fs::write(temp_dir.path().join("table_1.shard"), &shard_bytes).unwrap();
         std::fs::write(temp_dir.path().join("table_001.shard"), &shard_bytes).unwrap();
 
-        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -3618,7 +3569,7 @@ mod tests {
     #[test]
     fn test_register_batch_basic() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let specs = vec![
@@ -3654,7 +3605,7 @@ mod tests {
             updated_at_unix_ms: 0,
         };
 
-        let mut single_engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut single_engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
         let single_result = single_engine.register(single_spec).unwrap();
         assert_eq!(single_engine.subscription_count(), 1);
@@ -3665,7 +3616,7 @@ mod tests {
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
         };
-        let mut batch_engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut batch_engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
         let mut batch_results = batch_engine.register_batch(vec![batch_spec]);
         assert_eq!(batch_results.len(), 1);
@@ -3705,7 +3656,7 @@ mod tests {
     #[test]
     fn test_register_batch_deduplication_within_batch() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Two consumers with the same predicate in a single batch
@@ -3738,7 +3689,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
 
         let (_, _, gt_sql_normalized) = crate::compiler::parse_compile_and_normalize(
@@ -3827,7 +3778,7 @@ mod tests {
     #[test]
     fn test_register_batch_partial_failure() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let specs = vec![
@@ -3863,7 +3814,7 @@ mod tests {
     #[test]
     fn test_register_batch_empty() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let results = engine.register_batch(vec![]);
@@ -3874,7 +3825,7 @@ mod tests {
     #[test]
     fn test_register_batch_phase3_missing_partition_returns_error_not_panic() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
         let _test_lock = injection_test_lock()
             .lock()
@@ -3906,7 +3857,7 @@ mod tests {
     #[test]
     fn test_register_batch_dispatch_works() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let specs = vec![
@@ -3946,7 +3897,7 @@ mod tests {
     #[test]
     fn test_register_batch_duplicate_subscription_id_last_wins() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
@@ -3994,7 +3945,7 @@ mod tests {
     #[test]
     fn test_register_batch_dedup_with_existing() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register one subscription individually
@@ -4034,7 +3985,7 @@ mod tests {
     #[test]
     fn test_register_upsert_replaces_existing_subscription_id() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
@@ -4082,7 +4033,7 @@ mod tests {
         use tempfile::TempDir;
 
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
 
         // Existing live state: amount > 100 for user 42.
@@ -4131,7 +4082,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let shard_path = tmp.path().join("table_1_merged.shard");
-        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         let job_id = engine
@@ -4175,7 +4126,7 @@ mod tests {
         use tempfile::TempDir;
 
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
 
         let (_table_id, program, normalized) = crate::compiler::parse_compile_and_normalize(
@@ -4213,7 +4164,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let shard_path = tmp.path().join("table_1_merged.shard");
-        let shard_bytes = serialize_shard::<DefaultIds>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         let job_id = engine
@@ -4246,7 +4197,7 @@ mod tests {
         use tempfile::TempDir;
 
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
 
         // Simulate a stale shard that still contains subscription 1.
@@ -4296,7 +4247,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let shard_path = tmp.path().join("table_1_stale.shard");
-        let shard_bytes = serialize_shard::<DefaultIds>(1, &stale_payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &stale_payload, &*catalog).unwrap();
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         let job_id = engine
@@ -4327,7 +4278,7 @@ mod tests {
     #[test]
     fn test_truncate_excludes_unregistered_users() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register user 42 on table 1 (orders)
@@ -4372,7 +4323,7 @@ mod tests {
         std::fs::write(&shard_path, b"").unwrap();
 
         // Engine startup must not panic; it should either skip or return error gracefully.
-        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -4407,7 +4358,7 @@ mod tests {
         let shard_path = temp_dir.path().join("table_1.shard");
         std::fs::write(&shard_path, b"\xDE\xAD\xBE\xEF\x00\x01").unwrap();
 
-        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds>, _> =
+        let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
                 PostgreSqlDialect {},
@@ -4461,7 +4412,7 @@ mod tests {
     #[test]
     fn test_count_star_insert_delta() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4481,7 +4432,7 @@ mod tests {
     #[test]
     fn test_count_star_delete_delta() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4503,7 +4454,7 @@ mod tests {
         use crate::DispatchError;
 
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4530,7 +4481,7 @@ mod tests {
         use crate::DispatchError;
 
         let catalog = make_catalog(); // orders: 3 columns (id=0, amount=1, status=2)
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4572,7 +4523,7 @@ mod tests {
         use crate::DispatchError;
 
         let catalog = make_catalog(); // orders: 3 columns (id=0, amount=1, status=2)
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4619,7 +4570,7 @@ mod tests {
         use crate::DispatchError;
 
         let catalog = make_catalog(); // orders: 3 columns (id=0, amount=1, status=2)
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4654,7 +4605,7 @@ mod tests {
     #[test]
     fn test_same_where_different_projection_yields_two_predicates() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Same WHERE clause, but different projections
@@ -4693,7 +4644,7 @@ mod tests {
     #[test]
     fn test_users_dispatch_skips_count_subscriptions() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Consumer 1: SELECT * subscription
@@ -4731,7 +4682,7 @@ mod tests {
     #[test]
     fn test_users_truncate_skips_aggregate_only_subscriptions() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Aggregate-only subscriber.
@@ -4761,7 +4712,7 @@ mod tests {
     #[test]
     fn test_sum_column_insert_delta() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4791,7 +4742,7 @@ mod tests {
     #[test]
     fn test_sum_column_delete_delta() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4821,7 +4772,7 @@ mod tests {
     #[test]
     fn test_sum_column_update_delta() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4856,7 +4807,7 @@ mod tests {
     #[test]
     fn test_sum_null_amount_no_delta() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -4887,7 +4838,7 @@ mod tests {
     #[test]
     fn test_sum_and_count_same_where_different_hashes() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let r_count = engine
@@ -4923,7 +4874,7 @@ mod tests {
     #[test]
     fn test_two_sum_columns_different_hashes() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let r1 = engine
@@ -4955,7 +4906,7 @@ mod tests {
     #[test]
     fn test_sum_not_returned_by_users() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // SUM subscriber
@@ -4982,7 +4933,7 @@ mod tests {
         // SUM(amount) WHERE status = 'active'
         // UPDATE changes only amount (not status) → delta must still be emitted
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5027,7 +4978,7 @@ mod tests {
     #[test]
     fn test_unregister_query_basic() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5056,7 +5007,7 @@ mod tests {
     #[test]
     fn test_unregister_query_user_scoping() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
@@ -5097,7 +5048,7 @@ mod tests {
     #[test]
     fn test_unregister_query_no_match() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5123,7 +5074,7 @@ mod tests {
     #[test]
     fn test_unregister_query_normalization_equivalence() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Register with one ordering of AND clauses
@@ -5152,7 +5103,7 @@ mod tests {
     #[test]
     fn test_unregister_query_projection_specificity() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let where_clause = "WHERE amount > 100";
@@ -5196,7 +5147,7 @@ mod tests {
     #[test]
     fn test_unregister_query_multiple_subscriptions_same_user() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let sql = "SELECT * FROM orders WHERE amount > 100".to_string();
@@ -5233,7 +5184,7 @@ mod tests {
     #[test]
     fn test_unregister_query_invalid_sql() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let result = engine.unregister_query(100, "NOT VALID SQL AT ALL");
@@ -5248,7 +5199,7 @@ mod tests {
     #[test]
     fn test_update_cross_subscription_transition() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         // Sub A: amount = 3
@@ -5296,7 +5247,7 @@ mod tests {
     #[test]
     fn test_update_same_subscription_stays() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5333,7 +5284,7 @@ mod tests {
     #[test]
     fn test_update_leaves_all_subscriptions() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5370,7 +5321,7 @@ mod tests {
     #[test]
     fn test_update_enters_subscription() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5407,7 +5358,7 @@ mod tests {
     #[test]
     fn test_insert_produces_only_inserted() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5438,7 +5389,7 @@ mod tests {
     #[test]
     fn test_delete_produces_only_deleted() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5470,7 +5421,7 @@ mod tests {
     #[test]
     fn test_update_missing_old_row_falls_back() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine
@@ -5505,7 +5456,7 @@ mod tests {
     #[test]
     fn test_update_partial_old_row_falls_back() {
         let catalog = make_catalog();
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         engine

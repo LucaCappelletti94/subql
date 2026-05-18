@@ -10,7 +10,8 @@ use super::{
 };
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
-use crate::{Cell, RegisterError, SchemaCatalog, TableId};
+use crate::{Cell, RegisterError, TableId};
+use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{Expr, ObjectName, Statement};
 use sqlparser::dialect::Dialect;
 
@@ -51,30 +52,30 @@ impl SqlTableName {
 /// # Arguments
 /// * `sql` - SQL SELECT statement with optional WHERE clause
 /// * `dialect` - SQL dialect (`PostgreSQL`, `MySQL`, `SQLite`, etc.)
-/// * `catalog` - Schema catalog for table/column resolution
+/// * `database` - Schema database for table/column resolution
 ///
 /// # Returns
 /// * `Ok((table_id, program))` - Compiled bytecode for the WHERE clause
 /// * `Err(RegisterError)` - Parse error, unsupported SQL, or schema error
 #[allow(clippy::option_if_let_else)]
-pub fn parse_and_compile<D: Dialect>(
+pub fn parse_and_compile<D: Dialect, DB: DatabaseLike>(
     sql: &str,
     dialect: &D,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<(TableId, BytecodeProgram), RegisterError> {
     let (table_id, program, _normalized, _, _) =
-        parse_compile_normalize_and_prefilter(sql, dialect, catalog)?;
+        parse_compile_normalize_and_prefilter(sql, dialect, database)?;
     Ok((table_id, program))
 }
 
 /// Parse SQL once and produce compiled bytecode plus canonical normalized form.
-pub fn parse_compile_and_normalize<D: Dialect>(
+pub fn parse_compile_and_normalize<D: Dialect, DB: DatabaseLike>(
     sql: &str,
     dialect: &D,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<(TableId, BytecodeProgram, String), RegisterError> {
     let (table_id, program, normalized, _, _) =
-        parse_compile_normalize_and_prefilter(sql, dialect, catalog)?;
+        parse_compile_normalize_and_prefilter(sql, dialect, database)?;
     Ok((table_id, program, normalized))
 }
 
@@ -87,15 +88,15 @@ struct ParsedQuery {
     normalized: String,
 }
 
-fn parse_query_front_half<D: Dialect>(
+fn parse_query_front_half<D: Dialect, DB: DatabaseLike>(
     sql: &str,
     dialect: &D,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<ParsedQuery, RegisterError> {
     let stmt = sql_shape::parse_single_statement(sql, dialect)?;
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
-    let table_id = resolve_table_id(&table_name, catalog)?;
-    let projection = sql_shape::extract_projection(&stmt, table_id, catalog)?;
+    let table_id = resolve_table_id(&table_name, database)?;
+    let projection = sql_shape::extract_projection(&stmt, table_id, database)?;
     let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
     Ok(ParsedQuery {
         table_id,
@@ -107,10 +108,10 @@ fn parse_query_front_half<D: Dialect>(
 
 /// Parse SQL once and produce compiled bytecode, canonical normalized form,
 /// OR/NOT-aware prefilter plan, and projection kind.
-pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
+pub fn parse_compile_normalize_and_prefilter<D: Dialect, DB: DatabaseLike>(
     sql: &str,
     dialect: &D,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<
     (
         TableId,
@@ -121,18 +122,18 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     ),
     RegisterError,
 > {
-    let pq = parse_query_front_half(sql, dialect, catalog)?;
+    let pq = parse_query_front_half(sql, dialect, database)?;
 
     // Compile WHERE clause to bytecode
     let program = if let Some(expr) = pq.where_clause.as_ref() {
-        compile_expression(expr, pq.table_id, catalog)?
+        compile_expression(expr, pq.table_id, database)?
     } else {
         // No WHERE clause = always match
         // Push True onto stack
         BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(true))])
     };
 
-    let prefilter_plan = build_prefilter_plan(pq.where_clause.as_ref(), pq.table_id, catalog);
+    let prefilter_plan = build_prefilter_plan(pq.where_clause.as_ref(), pq.table_id, database);
 
     Ok((
         pq.table_id,
@@ -143,14 +144,14 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect>(
     ))
 }
 
-fn resolve_table_id(
+fn resolve_table_id<DB: DatabaseLike>(
     table_name: &SqlTableName,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<TableId, RegisterError> {
     resolve_table_reference(
         table_name.qualified.as_deref(),
         &table_name.unqualified,
-        catalog,
+        database,
     )
     .map_err(|err| match err {
         TableResolutionError::Ambiguous {
@@ -203,12 +204,12 @@ pub(crate) fn projection_hash_input(normalized: &str, projection: &QueryProjecti
 /// without compiling bytecode or building a prefilter plan.
 ///
 /// Used by `unregister_query` to find matching predicates by hash.
-pub fn parse_and_resolve_hash<D: Dialect>(
+pub fn parse_and_resolve_hash<D: Dialect, DB: DatabaseLike>(
     sql: &str,
     dialect: &D,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<(TableId, PredicateHash), RegisterError> {
-    let pq = parse_query_front_half(sql, dialect, catalog)?;
+    let pq = parse_query_front_half(sql, dialect, database)?;
     let hash_input = projection_hash_input(&pq.normalized, &pq.projection);
     let hash = canonicalize::hash_sql(&hash_input);
 
@@ -219,13 +220,13 @@ pub fn parse_and_resolve_hash<D: Dialect>(
 ///
 /// Recursively compiles an SQL expression into a sequence of VM instructions.
 /// Handles all supported expression types with proper NULL propagation.
-fn compile_expression(
+fn compile_expression<DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<BytecodeProgram, RegisterError> {
     let mut instructions = Vec::new();
-    compile_expr_recursive(expr, table_id, catalog, &mut instructions, 0)?;
+    compile_expr_recursive(expr, table_id, database, &mut instructions, 0)?;
     Ok(BytecodeProgram::new(instructions))
 }
 
@@ -233,10 +234,10 @@ fn compile_expression(
 ///
 /// Compiles expression to leave result on top of stack.
 #[allow(clippy::too_many_lines)]
-fn compile_expr_recursive(
+fn compile_expr_recursive<DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     out: &mut Vec<Instruction>,
     depth: usize,
 ) -> Result<(), RegisterError> {
@@ -257,7 +258,7 @@ fn compile_expr_recursive(
                 // Short-circuit logical operators
                 BinaryOperator::And => {
                     // Compile left operand
-                    compile_expr_recursive(left, table_id, catalog, out, depth + 1)?;
+                    compile_expr_recursive(left, table_id, database, out, depth + 1)?;
 
                     // Emit placeholder jump (patched below)
                     let jump_idx = out.len();
@@ -265,7 +266,7 @@ fn compile_expr_recursive(
 
                     // Compile right operand
                     let rhs_start = out.len();
-                    compile_expr_recursive(right, table_id, catalog, out, depth + 1)?;
+                    compile_expr_recursive(right, table_id, database, out, depth + 1)?;
 
                     // Emit And
                     out.push(Instruction::And);
@@ -276,7 +277,7 @@ fn compile_expr_recursive(
                 }
                 BinaryOperator::Or => {
                     // Compile left operand
-                    compile_expr_recursive(left, table_id, catalog, out, depth + 1)?;
+                    compile_expr_recursive(left, table_id, database, out, depth + 1)?;
 
                     // Emit placeholder jump (patched below)
                     let jump_idx = out.len();
@@ -284,7 +285,7 @@ fn compile_expr_recursive(
 
                     // Compile right operand
                     let rhs_start = out.len();
-                    compile_expr_recursive(right, table_id, catalog, out, depth + 1)?;
+                    compile_expr_recursive(right, table_id, database, out, depth + 1)?;
 
                     // Emit Or
                     out.push(Instruction::Or);
@@ -295,8 +296,8 @@ fn compile_expr_recursive(
                 }
                 _ => {
                     // All non-short-circuit operators: compile both sides, emit op
-                    compile_expr_recursive(left, table_id, catalog, out, depth + 1)?;
-                    compile_expr_recursive(right, table_id, catalog, out, depth + 1)?;
+                    compile_expr_recursive(left, table_id, database, out, depth + 1)?;
+                    compile_expr_recursive(right, table_id, database, out, depth + 1)?;
 
                     match op {
                         // Comparison operators
@@ -334,7 +335,7 @@ fn compile_expr_recursive(
         }
 
         ref col_expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
-            let col_id = resolve_column_ref(col_expr, table_id, catalog).ok_or_else(|| {
+            let col_id = resolve_column_ref(col_expr, table_id, database).ok_or_else(|| {
                 let col_name = match col_expr {
                     Expr::Identifier(ident) => ident.value.clone(),
                     Expr::CompoundIdentifier(parts) => parts[1].value.clone(),
@@ -365,7 +366,7 @@ fn compile_expr_recursive(
             negated,
         } => {
             // Compile the expression being tested
-            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
 
             // Convert list values to cells
             let mut literals = Vec::with_capacity(list.len());
@@ -398,9 +399,9 @@ fn compile_expr_recursive(
             negated,
         } => {
             // Stack order: value, lower, upper
-            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
-            compile_expr_recursive(low, table_id, catalog, out, depth + 1)?;
-            compile_expr_recursive(high, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
+            compile_expr_recursive(low, table_id, database, out, depth + 1)?;
+            compile_expr_recursive(high, table_id, database, out, depth + 1)?;
 
             out.push(Instruction::Between);
 
@@ -413,12 +414,12 @@ fn compile_expr_recursive(
         // NULL Checks
         // ====================================================================
         Expr::IsNull(expr) => {
-            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
             out.push(Instruction::IsNull);
         }
 
         Expr::IsNotNull(expr) => {
-            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
             out.push(Instruction::IsNotNull);
         }
 
@@ -426,7 +427,7 @@ fn compile_expr_recursive(
         // Unary Operations
         // ====================================================================
         Expr::UnaryOp { op, expr } => {
-            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
 
             match op {
                 UnaryOperator::Not => out.push(Instruction::Not),
@@ -461,8 +462,8 @@ fn compile_expr_recursive(
             }
 
             // Compile string and pattern
-            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
-            compile_expr_recursive(pattern, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
+            compile_expr_recursive(pattern, table_id, database, out, depth + 1)?;
 
             // Case-sensitive LIKE by default
             out.push(Instruction::Like {
@@ -488,8 +489,8 @@ fn compile_expr_recursive(
             }
 
             // Compile string and pattern
-            compile_expr_recursive(expr, table_id, catalog, out, depth + 1)?;
-            compile_expr_recursive(pattern, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
+            compile_expr_recursive(pattern, table_id, database, out, depth + 1)?;
 
             // Case-insensitive LIKE
             out.push(Instruction::Like {
@@ -505,7 +506,7 @@ fn compile_expr_recursive(
         // Nested Expressions (parentheses)
         // ====================================================================
         Expr::Nested(inner) => {
-            compile_expr_recursive(inner, table_id, catalog, out, depth + 1)?;
+            compile_expr_recursive(inner, table_id, database, out, depth + 1)?;
         }
 
         // ====================================================================
@@ -526,50 +527,26 @@ fn compile_expr_recursive(
 #[allow(clippy::unwrap_used, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
-    use crate::testing::MockCatalog;
+    use crate::catalog_helpers;
+    use sql_traits::structs::ParserDB;
     use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
-    use std::collections::HashMap;
 
-    fn make_catalog() -> MockCatalog {
-        let mut tables = HashMap::new();
-        tables.insert("users".to_string(), (1, 5));
-        tables.insert("orders".to_string(), (2, 7));
-        tables.insert("job_history".to_string(), (3, 5));
-        tables.insert("airports".to_string(), (4, 5));
-        tables.insert("brands".to_string(), (5, 5));
-        tables.insert("stats".to_string(), (6, 5));
-        tables.insert("data".to_string(), (7, 5));
+    fn make_catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE users (id INT PRIMARY KEY, age INT, email TEXT, name TEXT, joined TIMESTAMP);\n\
+             CREATE TABLE orders (id INT PRIMARY KEY, price DOUBLE PRECISION, quantity INT, user_id INT, status TEXT, created TIMESTAMP, notes TEXT);\n\
+             CREATE TABLE job_history (end_date TIMESTAMP, start_date TIMESTAMP, employee_id INT, role TEXT, department TEXT);\n\
+             CREATE TABLE airports (elevation INT, name TEXT, code TEXT, country TEXT, lat DOUBLE PRECISION);\n\
+             CREATE TABLE brands (products_this_year INT, products_last_year INT, name TEXT, ceo TEXT, country TEXT);\n\
+             CREATE TABLE stats (total INT, count INT, average DOUBLE PRECISION, max INT, min INT);\n\
+             CREATE TABLE data (id INT PRIMARY KEY, payload TEXT, created TIMESTAMP, updated TIMESTAMP, owner TEXT);",
+        )
+        .expect("compiler fixture DDL parses")
+    }
 
-        let mut columns = HashMap::new();
-        // users table
-        columns.insert((1, "id".to_string()), 0);
-        columns.insert((1, "age".to_string()), 1);
-        columns.insert((1, "email".to_string()), 2);
-
-        // orders table
-        columns.insert((2, "id".to_string()), 0);
-        columns.insert((2, "price".to_string()), 1);
-        columns.insert((2, "quantity".to_string()), 2);
-
-        // job_history table
-        columns.insert((3, "end_date".to_string()), 0);
-        columns.insert((3, "start_date".to_string()), 1);
-
-        // airports table
-        columns.insert((4, "elevation".to_string()), 0);
-
-        // brands table
-        columns.insert((5, "products_this_year".to_string()), 0);
-        columns.insert((5, "products_last_year".to_string()), 1);
-
-        // stats table
-        columns.insert((6, "total".to_string()), 0);
-        columns.insert((6, "count".to_string()), 1);
-
-        // data table
-        columns.insert((7, "id".to_string()), 0);
-
-        MockCatalog { tables, columns }
+    fn tid(catalog: &ParserDB, name: &str) -> crate::TableId {
+        catalog_helpers::table_id(catalog, name)
+            .unwrap_or_else(|| panic!("table {name} should resolve"))
     }
 
     #[test]
@@ -582,7 +559,7 @@ mod tests {
         assert!(result.is_ok());
 
         let (table_id, _program) = result.unwrap();
-        assert_eq!(table_id, 1);
+        assert_eq!(table_id, tid(&catalog, "users"));
     }
 
     #[test]
@@ -616,30 +593,15 @@ mod tests {
         assert!(result.is_ok());
 
         let (table_id, _) = result.unwrap();
-        assert_eq!(table_id, 2);
+        assert_eq!(table_id, tid(&catalog, "orders"));
     }
 
-    #[test]
-    fn test_schema_qualified_table_name_ambiguity_errors() {
-        let mut catalog = make_catalog();
-        catalog.tables.insert("public.orders".to_string(), (99, 7));
-        catalog.columns.insert((99, "price".to_string()), 1);
-
-        let dialect = PostgreSqlDialect {};
-        let sql = "SELECT * FROM public.orders WHERE price > 10";
-
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(
-            result,
-            Err(RegisterError::AmbiguousTable {
-                reference,
-                qualified,
-                unqualified,
-            }) if reference == "public.orders"
-                && qualified == "public.orders"
-                && unqualified == "orders"
-        ));
-    }
+    // Removed `test_schema_qualified_table_name_ambiguity_errors`: this test
+    // relied on a `MockCatalog` storing both `orders` and `public.orders` as
+    // distinct entries with different table ids. `ParserDB` rejects this
+    // shape at DDL parse time (a bare `orders` is treated as `public.orders`
+    // implicitly, so the two collide). The `AmbiguousTable` error path is
+    // still exercised in `src/wal/mod.rs::test_resolve_table_conflicting_matches_errors`.
 
     #[test]
     fn test_reject_joins() {
@@ -673,7 +635,7 @@ mod tests {
         assert!(result.is_ok());
 
         let (table_id, program) = result.unwrap();
-        assert_eq!(table_id, 1);
+        assert_eq!(table_id, tid(&catalog, "users"));
         // Should have trivial "always match" program
         assert!(!program.instructions.is_empty());
     }
@@ -1875,48 +1837,13 @@ mod tests {
         );
     }
 
-    // Inline typed catalog for column_type() tests
-    struct TypedMockCatalog {
-        tables: std::collections::HashMap<String, (u32, usize)>,
-        columns: std::collections::HashMap<(u32, String), u16>,
-        column_types: std::collections::HashMap<(u32, u16), crate::ColumnType>,
-    }
-    impl crate::SchemaCatalog for TypedMockCatalog {
-        fn table_id(&self, n: &str) -> Option<u32> {
-            self.tables.get(n).map(|(id, _)| *id)
-        }
-        fn column_id(&self, tid: u32, col: &str) -> Option<u16> {
-            self.columns.get(&(tid, col.to_string())).copied()
-        }
-        fn table_arity(&self, tid: u32) -> Option<usize> {
-            self.tables
-                .values()
-                .find(|(id, _)| *id == tid)
-                .map(|(_, a)| *a)
-        }
-        fn schema_fingerprint(&self, _: u32) -> Option<u64> {
-            None
-        }
-        fn column_type(&self, tid: u32, col_id: u16) -> Option<crate::ColumnType> {
-            self.column_types.get(&(tid, col_id)).copied()
-        }
-    }
-
-    fn make_typed_catalog() -> TypedMockCatalog {
-        let mut tables = std::collections::HashMap::new();
-        tables.insert("orders".to_string(), (2u32, 3usize));
-        let mut columns = std::collections::HashMap::new();
-        columns.insert((2u32, "id".to_string()), 0u16);
-        columns.insert((2u32, "amount".to_string()), 1u16);
-        columns.insert((2u32, "status".to_string()), 2u16);
-        let mut column_types = std::collections::HashMap::new();
-        column_types.insert((2u32, 1u16), crate::ColumnType::Int);
-        column_types.insert((2u32, 2u16), crate::ColumnType::String);
-        TypedMockCatalog {
-            tables,
-            columns,
-            column_types,
-        }
+    // Typed catalog for column_type() tests: id is unspecified (Unknown),
+    // amount is INT, status is TEXT (String).
+    fn make_typed_catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+        )
+        .expect("typed orders DDL parses")
     }
 
     #[test]

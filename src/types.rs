@@ -37,6 +37,7 @@ pub trait IdTypes: 'static {
 }
 
 /// Default ID configuration using `u64` for consumer and session identifiers.
+#[derive(Debug)]
 pub struct DefaultIds;
 
 impl IdTypes for DefaultIds {
@@ -994,46 +995,6 @@ pub struct MergeReport {
 // Trait Definitions
 // ============================================================================
 
-/// Schema catalog providing table/column metadata
-///
-/// This trait abstracts the schema information needed to compile and validate
-/// SQL subscriptions. Implementations might query PostgreSQL system catalogs,
-/// maintain an in-memory schema cache, or use a schema registry.
-pub trait SchemaCatalog: Send + Sync {
-    /// Resolve table name to TableId
-    fn table_id(&self, table_name: &str) -> Option<TableId>;
-
-    /// Resolve column name to ColumnId within a table
-    fn column_id(&self, table_id: TableId, column_name: &str) -> Option<ColumnId>;
-
-    /// Get number of columns in table (for row validation)
-    fn table_arity(&self, table_id: TableId) -> Option<usize>;
-
-    /// Get schema fingerprint for compatibility checking
-    ///
-    /// Fingerprint changes when table schema changes (add/remove/rename columns).
-    /// Used to detect shard incompatibility on load.
-    fn schema_fingerprint(&self, table_id: TableId) -> Option<u64>;
-
-    /// Get primary key column IDs for a table
-    ///
-    /// Used by WAL parsers (e.g. wal2json INSERT events) to extract PK values
-    /// from the new row when `oldkeys` is absent.
-    fn primary_key_columns(&self, _table_id: TableId) -> Option<&[ColumnId]> {
-        None
-    }
-
-    /// Get the value type of a column (optional, for aggregate validation).
-    ///
-    /// When this returns `Some(ColumnType::Bool | ColumnType::String)`, the
-    /// engine rejects `SUM(col)` and `AVG(col)` subscriptions at registration
-    /// with `RegisterError::UnsupportedSql`. Catalogs that cannot provide type
-    /// information should return `None` (the default), which disables the check.
-    fn column_type(&self, _table_id: TableId, _column_id: ColumnId) -> Option<ColumnType> {
-        None
-    }
-}
-
 /// Subscription registration operations
 pub trait SubscriptionRegistration<I: IdTypes>: Send {
     /// Register a new subscription
@@ -1097,8 +1058,9 @@ pub trait DurableShardStore: Send {
 
 /// Column value type for aggregate validation at registration time.
 ///
-/// Returned by [`SchemaCatalog::column_type`]. Catalogs that cannot provide
-/// type information return `None` (the default), which disables type checking.
+/// Returned by [`crate::catalog_helpers::column_type`] when the live database
+/// exposes type information for the column; SUM/AVG over `Bool`/`String`
+/// columns is rejected at registration time, while `Unknown` is permissive.
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ColumnType {

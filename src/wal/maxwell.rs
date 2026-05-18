@@ -14,7 +14,8 @@ use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig,
 use super::{resolve_table, WalParseError, WalParser};
 #[cfg(test)]
 use crate::Cell;
-use crate::{EventKind, SchemaCatalog, TableId, WalEvent};
+use crate::{EventKind, TableId, WalEvent};
+use sql_traits::prelude::DatabaseLike;
 
 // ============================================================================
 // Serde structs
@@ -50,13 +51,13 @@ struct MaxwellMessage {
 /// Maxwell's Daemon CDC parser (per-change: one JSON message per row change).
 pub struct MaxwellParser;
 
-impl WalParser for MaxwellParser {
+impl<DB: DatabaseLike> WalParser<DB> for MaxwellParser {
     fn parse_wal_message(
         &self,
         data: &[u8],
-        catalog: &dyn SchemaCatalog,
+        database: &DB,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        parse_map_cdc_json_message::<MaxwellMessage>(data, catalog)
+        parse_map_cdc_json_message::<MaxwellMessage, DB>(data, database)
     }
 }
 
@@ -86,8 +87,8 @@ impl MapCdcEnvelope for MaxwellMessage {
         parse_maxwell_kind(token)
     }
 
-    fn resolve_table_id(&self, catalog: &dyn SchemaCatalog) -> Result<TableId, WalParseError> {
-        resolve_table(&self.database, &self.table, catalog)
+    fn resolve_table_id<DB: DatabaseLike>(&self, database: &DB) -> Result<TableId, WalParseError> {
+        resolve_table(&self.database, &self.table, database)
     }
 
     fn map_config(&self, kind: EventKind) -> MapCdcConfig<'_> {
@@ -142,39 +143,32 @@ impl MapCdcEnvelope for MaxwellMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TestCatalog;
     use super::*;
-    use std::collections::HashMap;
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
 
     // -- Test catalog --------------------------------------------------------
 
-    /// Maxwell test table: database="test", table="e",
-    /// columns: id=0, m=1, c=2, comment=3, PK=[id].
-    fn maxwell_e_catalog() -> TestCatalog {
-        let mut tables = HashMap::new();
-        tables.insert("e".to_string(), (1, 4));
-        tables.insert("test.e".to_string(), (1, 4));
-
-        let mut columns = HashMap::new();
-        columns.insert((1, "id".to_string()), 0);
-        columns.insert((1, "m".to_string()), 1);
-        columns.insert((1, "c".to_string()), 2);
-        columns.insert((1, "comment".to_string()), 3);
-
-        let mut primary_keys = HashMap::new();
-        primary_keys.insert(1, vec![0]); // id is PK
-
-        TestCatalog {
-            tables,
-            columns,
-            primary_keys,
-        }
+    /// Maxwell test table: table="e", columns: id=0, m=1, c=2, comment=3, PK=[id].
+    /// A leading `_maxwell_pad` table keeps `e`'s table id stable at 1.
+    fn maxwell_e_catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE _maxwell_pad (id INT);\n\
+             CREATE TABLE e (id INT PRIMARY KEY, m DOUBLE PRECISION, c TEXT, comment TEXT);",
+        )
+        .expect("maxwell e DDL parses")
     }
 
-    fn maxwell_e_no_pk_catalog() -> TestCatalog {
-        let mut cat = maxwell_e_catalog();
-        cat.primary_keys.clear();
-        cat
+    fn maxwell_e_no_pk_catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE _maxwell_pad (id INT);\n\
+             CREATE TABLE e (id INT, m DOUBLE PRECISION, c TEXT, comment TEXT);",
+        )
+        .expect("maxwell e (no-PK) DDL parses")
+    }
+
+    fn maxwell_e_table_id() -> crate::TableId {
+        crate::catalog_helpers::table_id(&maxwell_e_catalog(), "e").expect("e table id")
     }
 
     // -- INSERT tests -------------------------------------------------------
@@ -196,7 +190,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.table_id(), 1);
+        assert_eq!(ev.table_id(), maxwell_e_table_id());
 
         let new = ev.new_row().expect("INSERT should have new_row");
         assert_eq!(new.get(0), Some(&Cell::Int(1)));
@@ -553,8 +547,8 @@ mod tests {
 
     #[test]
     fn trait_object_compiles() {
-        let parser: &dyn WalParser = &MaxwellParser;
         let catalog = maxwell_e_catalog();
+        let parser: &dyn WalParser<ParserDB> = &MaxwellParser;
 
         let json = r#"{
             "database":"test","table":"e","type":"insert",
@@ -645,7 +639,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.table_id(), 1);
+        assert_eq!(ev.table_id(), maxwell_e_table_id());
         assert!(ev.new_row().is_some());
         assert!(ev.old_row().is_none());
     }

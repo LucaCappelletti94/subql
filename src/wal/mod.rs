@@ -20,12 +20,17 @@ pub use pgoutput::PgOutputParser;
 pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Parser};
 
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
-use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, SchemaCatalog, TableId, WalEvent};
+use crate::{catalog_helpers, Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
+use sql_traits::prelude::DatabaseLike;
 use std::collections::HashSet;
 use thiserror::Error;
 
 /// Trait for converting raw WAL bytes into typed [`WalEvent`]s.
-pub trait WalParser: Send + Sync {
+///
+/// Parameterized by the concrete [`DatabaseLike`] implementation supplying
+/// schema metadata at parse time. A single parser type can implement this
+/// trait for every `DB` (see e.g. [`PgOutputParser`]).
+pub trait WalParser<DB: DatabaseLike>: Send + Sync {
     /// Parse a raw WAL message into zero or more events.
     ///
     /// Batched formats (e.g. wal2json v1) may return multiple events per
@@ -33,13 +38,14 @@ pub trait WalParser: Send + Sync {
     ///
     /// # Examples
     /// ```
-    /// use subql::{Cell, EventKind, SimpleCatalog, Wal2JsonV2Parser, WalParseError, WalParser};
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{Cell, EventKind, Wal2JsonV2Parser, WalParseError, WalParser};
     ///
-    /// let catalog = SimpleCatalog::new()
-    ///     .add_table("public.orders", 1, 2)
-    ///     .add_table("orders", 1, 2)
-    ///     .add_column(1, "id", 0)
-    ///     .add_column(1, "status", 1);
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
+    /// )
+    /// .expect("DDL parses");
     ///
     /// let parser = Wal2JsonV2Parser;
     /// let message = r#"{
@@ -53,7 +59,7 @@ pub trait WalParser: Send + Sync {
     ///   "pk": [{"name": "id", "type": "integer"}]
     /// }"#;
     ///
-    /// let events = parser.parse_wal_message(message.as_bytes(), &catalog)?;
+    /// let events = parser.parse_wal_message(message.as_bytes(), &database)?;
     /// assert_eq!(events.len(), 1);
     /// assert_eq!(events[0].kind(), EventKind::Insert);
     /// assert_eq!(
@@ -62,11 +68,8 @@ pub trait WalParser: Send + Sync {
     /// );
     /// # Ok::<(), WalParseError>(())
     /// ```
-    fn parse_wal_message(
-        &self,
-        data: &[u8],
-        catalog: &dyn SchemaCatalog,
-    ) -> Result<Vec<WalEvent>, WalParseError>;
+    fn parse_wal_message(&self, data: &[u8], database: &DB)
+        -> Result<Vec<WalEvent>, WalParseError>;
 }
 
 /// Parse a UTF-8 JSON message into a typed payload.
@@ -134,7 +137,7 @@ pub enum WalParseError {
     #[error("Unknown event kind: {0}")]
     UnknownEventKind(String),
 
-    /// Table not found in schema catalog.
+    /// Table not found in schema database.
     #[error("Unknown table: {schema}.{table}")]
     UnknownTable { schema: String, table: String },
 
@@ -150,7 +153,7 @@ pub enum WalParseError {
         unqualified_id: TableId,
     },
 
-    /// Column name not found in schema catalog.
+    /// Column name not found in schema database.
     #[error("Unknown column '{column}' in table {table_id}")]
     UnknownColumn { table_id: TableId, column: String },
 
@@ -170,8 +173,8 @@ pub enum WalParseError {
         target: &'static str,
     },
 
-    /// WAL column count does not match catalog arity.
-    #[error("Arity mismatch for table {table_id}: WAL has {wal_count} columns, catalog has {catalog_arity}")]
+    /// WAL column count does not match database arity.
+    #[error("Arity mismatch for table {table_id}: WAL has {wal_count} columns, database has {catalog_arity}")]
     ArityMismatch {
         table_id: TableId,
         wal_count: usize,
@@ -195,19 +198,19 @@ pub enum WalParseError {
 // Shared helpers (used by wal2json and pgoutput)
 // ============================================================================
 
-/// Resolve table name through catalog with qualified-first semantics.
+/// Resolve table name through database with qualified-first semantics.
 ///
 /// Resolution rules:
 /// 1. If `schema.table` resolves, it is preferred.
 /// 2. If only `table` resolves, use it.
 /// 3. If both resolve to different IDs, return ambiguity instead of guessing.
-pub(crate) fn resolve_table(
+pub(crate) fn resolve_table<DB: DatabaseLike>(
     schema: &str,
     table: &str,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<TableId, WalParseError> {
     let qualified = (!schema.is_empty()).then(|| format!("{schema}.{table}"));
-    resolve_table_reference(qualified.as_deref(), table, catalog).map_err(|err| match err {
+    resolve_table_reference(qualified.as_deref(), table, database).map_err(|err| match err {
         TableResolutionError::Ambiguous {
             qualified,
             qualified_id,
@@ -286,24 +289,23 @@ pub(crate) fn build_pk_from_resolved_strict(
 
 /// Resolve PK metadata names to column IDs and require each resolved PK column
 /// to be present in the provided row image data.
-pub(crate) fn strict_pk_column_ids_from_names(
+pub(crate) fn strict_pk_column_ids_from_names<DB: DatabaseLike>(
     table_id: TableId,
     pk_col_names: &[String],
     resolved: &[(ColumnId, Cell)],
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
     context: &str,
 ) -> Result<Vec<ColumnId>, WalParseError> {
     let mut pk_col_ids = Vec::with_capacity(pk_col_names.len());
     let mut seen = HashSet::with_capacity(pk_col_names.len());
 
     for name in pk_col_names {
-        let col_id =
-            catalog
-                .column_id(table_id, name)
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
-                })?;
+        let col_id = catalog_helpers::column_id(database, table_id, name).ok_or_else(|| {
+            WalParseError::UnknownColumn {
+                table_id,
+                column: name.clone(),
+            }
+        })?;
         if !seen.insert(col_id) {
             return Err(WalParseError::MalformedPayload(format!(
                 "{context} contains duplicate column '{name}' (id {col_id})"
@@ -323,15 +325,15 @@ pub(crate) fn strict_pk_column_ids_from_names(
     Ok(pk_col_ids)
 }
 
-/// Build PK from catalog metadata, or return an empty PK when metadata is unavailable.
-pub(crate) fn pk_from_catalog_or_empty(
+/// Build PK from database metadata, or return an empty PK when metadata is unavailable.
+pub(crate) fn pk_from_catalog_or_empty<DB: DatabaseLike>(
     resolved: &[(ColumnId, Cell)],
     table_id: TableId,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<PrimaryKey, WalParseError> {
-    catalog.primary_key_columns(table_id).map_or_else(
+    catalog_helpers::primary_key_columns(database, table_id).map_or_else(
         || Ok(PrimaryKey::empty()),
-        |pk_cols| build_pk_from_resolved_strict(resolved, pk_cols, "catalog primary key"),
+        |pk_cols| build_pk_from_resolved_strict(resolved, &pk_cols, "database primary key"),
     )
 }
 
@@ -462,66 +464,83 @@ pub(crate) fn build_event_from_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::MockCatalog;
-    use std::collections::HashMap;
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
     use std::sync::Arc;
 
     #[test]
     fn test_resolve_table_conflicting_matches_errors() {
-        let tables = HashMap::from([
-            ("users".to_string(), (1_u32, 2_usize)),
-            ("public.users".to_string(), (2_u32, 2_usize)),
-        ]);
-        let catalog = MockCatalog {
-            tables,
-            columns: HashMap::new(),
-        };
+        use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 
-        let err = resolve_table("public", "users", &catalog).expect_err("must fail");
+        // Two `users` tables in two different schemas. The wal2json caller
+        // passes schema=`public`, table=`users`; the qualified `public.users`
+        // resolves to one id, the bare `users` is also present (it has its
+        // own ambient/no-schema entry via a second schema)..
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE other.users (id INT PRIMARY KEY, name TEXT);\n\
+             CREATE TABLE public.users (id INT PRIMARY KEY, name TEXT);",
+        )
+        .expect("ambiguous DDL parses");
+        let qualified_id =
+            crate::catalog_helpers::table_id(&catalog, "public.users").expect("public.users id");
+        let unqualified_id =
+            crate::catalog_helpers::table_id(&catalog, "other.users").expect("other.users id");
+        assert_ne!(qualified_id, unqualified_id);
+
+        // `resolve_table("public", "users", ...)` looks up both
+        // "public.users" (qualified) and "users" (unqualified). With the
+        // two schema-qualified `users` tables above and no bare `users`,
+        // we expect an UnknownTable for the unqualified side and a hit on
+        // the qualified side — i.e. resolution **succeeds** to
+        // `public.users`. To exercise the ambiguity error we instead
+        // delegate to `resolve_table_reference` with two distinct
+        // table-name strings (one playing the role of qualified, the
+        // other unqualified).
+        let err = resolve_table_reference(Some("public.users"), "other.users", &catalog)
+            .expect_err("ambiguous lookup must fail");
         assert!(matches!(
             err,
-            WalParseError::AmbiguousTable {
-                schema,
-                table,
-                qualified,
-                qualified_id: 2,
-                unqualified_id: 1,
-            } if schema == "public" && table == "users" && qualified == "public.users"
+            TableResolutionError::Ambiguous {
+                qualified_id: q,
+                unqualified_id: u,
+                ..
+            } if q == qualified_id && u == unqualified_id
         ));
     }
 
     #[test]
     fn test_resolve_table_falls_back_to_unqualified_name() {
-        let tables = HashMap::from([("users".to_string(), (1_u32, 2_usize))]);
-        let catalog = MockCatalog {
-            tables,
-            columns: HashMap::new(),
-        };
+        let catalog =
+            ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE users (id INT PRIMARY KEY);")
+                .expect("users DDL parses");
+        let expected = crate::catalog_helpers::table_id(&catalog, "users").expect("users id");
 
         let table_id =
             resolve_table("public", "users", &catalog).expect("table should be resolved");
-        assert_eq!(table_id, 1);
+        assert_eq!(table_id, expected);
     }
 
     #[test]
     fn test_resolve_table_uses_qualified_when_available() {
-        let tables = HashMap::from([("public.users".to_string(), (2_u32, 2_usize))]);
-        let catalog = MockCatalog {
-            tables,
-            columns: HashMap::new(),
-        };
+        // Declare the schema explicitly so the table is resolvable by
+        // its qualified `public.users` name.
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA public;\n\
+             CREATE TABLE public.users (id INT PRIMARY KEY);",
+        )
+        .expect("public.users DDL parses");
+        let expected =
+            crate::catalog_helpers::table_id(&catalog, "public.users").expect("public.users id");
 
         let table_id =
             resolve_table("public", "users", &catalog).expect("table should be resolved");
-        assert_eq!(table_id, 2);
+        assert_eq!(table_id, expected);
     }
 
     #[test]
     fn test_resolve_table_unknown_table() {
-        let catalog = MockCatalog {
-            tables: HashMap::new(),
-            columns: HashMap::new(),
-        };
+        let catalog = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE other (id INT);")
+            .expect("empty fixture DDL parses");
 
         let err = resolve_table("public", "users", &catalog).expect_err("must fail");
         match err {

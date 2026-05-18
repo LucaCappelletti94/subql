@@ -4,12 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::unreadable_literal)]
 #![allow(clippy::print_stdout, clippy::unnecessary_cast)]
 
-use crate::{
-    Cell, DefaultIds, RowImage, SchemaCatalog, SubscriptionEngine, SubscriptionRequest, TableId,
-    WalEvent,
-};
+use crate::{Cell, DefaultIds, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent};
+use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 const STATUS_BUCKETS: [&str; 7] = [
@@ -150,56 +147,19 @@ const fn realistic_workload_seed(subscription_ix: u64) -> u64 {
     }
 }
 
-// Mock catalog
-struct BenchCatalog {
-    tables: HashMap<String, (TableId, usize)>,
-    columns: HashMap<(TableId, String), u16>,
-}
-
-impl BenchCatalog {
-    fn new() -> Self {
-        let mut catalog = Self {
-            tables: HashMap::new(),
-            columns: HashMap::new(),
-        };
-
-        catalog.tables.insert("orders".to_string(), (1, 10));
-        catalog.columns.insert((1, "id".to_string()), 0);
-        catalog.columns.insert((1, "user_id".to_string()), 1);
-        catalog.columns.insert((1, "amount".to_string()), 2);
-        catalog.columns.insert((1, "status".to_string()), 3);
-        catalog.columns.insert((1, "priority".to_string()), 4);
-        catalog.columns.insert((1, "quantity".to_string()), 5);
-        catalog.columns.insert((1, "discount".to_string()), 6);
-        catalog.columns.insert((1, "tax".to_string()), 7);
-        catalog.columns.insert((1, "shipping".to_string()), 8);
-        catalog.columns.insert((1, "created_at".to_string()), 9);
-
-        catalog
-    }
-}
-
-impl SchemaCatalog for BenchCatalog {
-    fn table_id(&self, table_name: &str) -> Option<TableId> {
-        self.tables.get(table_name).map(|(id, _)| *id)
-    }
-
-    fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-        self.columns
-            .get(&(table_id, column_name.to_string()))
-            .copied()
-    }
-
-    fn table_arity(&self, table_id: TableId) -> Option<usize> {
-        self.tables
-            .values()
-            .find(|(id, _)| *id == table_id)
-            .map(|(_, arity)| *arity)
-    }
-
-    fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-        Some(0x1234567890ABCDEF)
-    }
+/// Build the bench fixture catalog as a [`ParserDB`]. A placeholder table
+/// before `orders` keeps the orders table id stable at 1 (matching the
+/// hardcoded `WalEvent::builder(1)` in `make_test_event`).
+fn bench_catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE _bench_pad (id INT);\n\
+         CREATE TABLE orders (\
+             id INT PRIMARY KEY, user_id INT, amount INT, status TEXT, \
+             priority INT, quantity INT, discount INT, tax INT, shipping INT, \
+             created_at INT\
+         );",
+    )
+    .expect("bench fixture DDL parses")
 }
 
 fn make_test_event(seed: u64) -> WalEvent {
@@ -244,8 +204,9 @@ pub fn run_memory_profile(show_progress: bool) {
     println!("======================");
     println!();
 
-    let catalog = Arc::new(BenchCatalog::new());
-    let mut engine = SubscriptionEngine::<_, DefaultIds>::new(catalog, PostgreSqlDialect {});
+    let catalog = Arc::new(bench_catalog());
+    let mut engine =
+        SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
     println!("Registering 100,000 predicates with realistic tree shapes...");
     if !show_progress {

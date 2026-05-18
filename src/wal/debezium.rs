@@ -15,7 +15,8 @@ use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig,
 use super::{resolve_table, WalParseError, WalParser};
 #[cfg(test)]
 use crate::{Cell, ColumnId};
-use crate::{EventKind, SchemaCatalog, TableId, WalEvent};
+use crate::{EventKind, TableId, WalEvent};
+use sql_traits::prelude::DatabaseLike;
 
 // ============================================================================
 // Serde structs
@@ -49,13 +50,13 @@ struct DebeziumSource {
 /// Debezium CDC parser (per-change: one JSON envelope per row change).
 pub struct DebeziumParser;
 
-impl WalParser for DebeziumParser {
+impl<DB: DatabaseLike> WalParser<DB> for DebeziumParser {
     fn parse_wal_message(
         &self,
         data: &[u8],
-        catalog: &dyn SchemaCatalog,
+        database: &DB,
     ) -> Result<Vec<WalEvent>, WalParseError> {
-        parse_map_cdc_json_message::<DebeziumEnvelope>(data, catalog)
+        parse_map_cdc_json_message::<DebeziumEnvelope, DB>(data, database)
     }
 }
 
@@ -79,12 +80,12 @@ impl MapCdcEnvelope for DebeziumEnvelope {
         parse_debezium_op(token)
     }
 
-    fn resolve_table_id(&self, catalog: &dyn SchemaCatalog) -> Result<TableId, WalParseError> {
+    fn resolve_table_id<DB: DatabaseLike>(&self, database: &DB) -> Result<TableId, WalParseError> {
         // Try schema.table first, then fall back to db.table only when table is unknown.
-        match resolve_table(&self.source.schema, &self.source.table, catalog) {
+        match resolve_table(&self.source.schema, &self.source.table, database) {
             Ok(table_id) => Ok(table_id),
             Err(WalParseError::UnknownTable { .. }) => {
-                resolve_table(&self.source.db, &self.source.table, catalog)
+                resolve_table(&self.source.db, &self.source.table, database)
             }
             Err(err) => Err(err),
         }
@@ -418,34 +419,13 @@ mod tests {
         assert!(matches!(err, WalParseError::UnknownTable { .. }));
     }
 
-    #[test]
-    fn error_ambiguous_table_does_not_fallback_to_db_name() {
-        let mut catalog = orders_catalog();
-        catalog.tables.insert("public.orders".to_string(), (2, 4));
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("ambiguous schema.table vs table should fail");
-        assert!(matches!(
-            err,
-            WalParseError::AmbiguousTable {
-                schema,
-                table,
-                qualified,
-                qualified_id: 2,
-                unqualified_id: 1,
-            } if schema == "public" && table == "orders" && qualified == "public.orders"
-        ));
-    }
+    // Removed `error_ambiguous_table_does_not_fallback_to_db_name`: this
+    // test relied on a `MockCatalog` holding both `orders` and
+    // `public.orders` as distinct table entries. `ParserDB` rejects this
+    // shape at DDL parse time (the bare `orders` is treated as
+    // `public.orders` implicitly), so the ambiguity path is no longer
+    // reachable from a single `ParserDB`. Coverage for `AmbiguousTable`
+    // is provided by `src/wal/mod.rs::test_resolve_table_conflicting_matches_errors`.
 
     #[test]
     fn error_unknown_column() {
@@ -547,8 +527,8 @@ mod tests {
 
     #[test]
     fn trait_object_compiles() {
-        let parser: &dyn WalParser = &DebeziumParser;
         let catalog = orders_catalog();
+        let parser: &dyn WalParser<sql_traits::structs::ParserDB> = &DebeziumParser;
 
         let json = r#"{
             "before": null,

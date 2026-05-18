@@ -1,6 +1,6 @@
 //! Error types for subql
 
-use crate::{MergeJobId, TableId};
+use crate::{persistence::shard::ShardFingerprintEnvelope, MergeJobId, TableId};
 use thiserror::Error;
 
 /// Errors during subscription registration
@@ -41,9 +41,9 @@ pub enum RegisterError {
     #[error("Type error: {0}")]
     TypeError(String),
 
-    /// Schema catalog error
-    #[error("Schema catalog error: {0}")]
-    SchemaCatalog(String),
+    /// Generic schema-resolution error reported by the underlying database.
+    #[error("Schema error: {0}")]
+    Schema(String),
 
     /// Storage/persistence error during registration
     #[error("Storage error during registration: {0}")]
@@ -133,12 +133,16 @@ pub enum StorageError {
     #[error("Version mismatch: expected {expected}, got {got}")]
     VersionMismatch { expected: u16, got: u16 },
 
-    /// Schema fingerprint doesn't match
-    #[error("Schema mismatch for table {table_id}: expected fingerprint {expected:016x}, got {got:016x}")]
+    /// Schema fingerprint envelope or digest does not match the live catalog.
+    ///
+    /// The [`ShardFingerprintEnvelope`] `Display` impl renders the envelope as
+    /// `<algorithm>:v<canonicalization_version>:p<profile_id>:<hex digest>`
+    /// so mismatches surface at any envelope field, not only the digest.
+    #[error("Schema mismatch for table {table_id}: expected {expected}, got {got}")]
     SchemaMismatch {
         table_id: TableId,
-        expected: u64,
-        got: u64,
+        expected: ShardFingerprintEnvelope,
+        got: ShardFingerprintEnvelope,
     },
 }
 
@@ -204,8 +208,8 @@ mod tests {
             "Type error: cannot compare int and text"
         );
         assert_eq!(
-            RegisterError::SchemaCatalog("catalog unavailable".to_string()).to_string(),
-            "Schema catalog error: catalog unavailable"
+            RegisterError::Schema("catalog unavailable".to_string()).to_string(),
+            "Schema error: catalog unavailable"
         );
         assert_eq!(
             RegisterError::Storage("disk full".to_string()).to_string(),
@@ -280,15 +284,34 @@ mod tests {
             .to_string(),
             "Version mismatch: expected 2, got 1"
         );
-        assert_eq!(
-            StorageError::SchemaMismatch {
-                table_id: 7,
-                expected: 0xAA,
-                got: 0xBB
-            }
-            .to_string(),
-            "Schema mismatch for table 7: expected fingerprint 00000000000000aa, got 00000000000000bb"
+        let mut expected_digest = [0u8; 16];
+        expected_digest[15] = 0xAA;
+        let mut got_digest = [0u8; 16];
+        got_digest[15] = 0xBB;
+        let expected = crate::persistence::shard::ShardFingerprintEnvelope {
+            algorithm_id: 1,
+            canonicalization_version: 1,
+            profile_id: 1,
+            digest128: expected_digest,
+        };
+        let got = crate::persistence::shard::ShardFingerprintEnvelope {
+            algorithm_id: 1,
+            canonicalization_version: 1,
+            profile_id: 1,
+            digest128: got_digest,
+        };
+        let rendered = StorageError::SchemaMismatch {
+            table_id: 7,
+            expected,
+            got,
+        }
+        .to_string();
+        assert!(
+            rendered.starts_with("Schema mismatch for table 7: expected sha2-256:v1:p1:"),
+            "rendering: {rendered}"
         );
+        assert!(rendered.contains("000000aa"));
+        assert!(rendered.contains("000000bb"));
     }
 
     #[test]

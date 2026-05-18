@@ -6,53 +6,31 @@
 //! matches the dispatched row.
 
 use proptest::prelude::*;
+use sql_traits::structs::ParserDB;
+use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use subql::{
+    catalog_helpers,
     compiler::{parse_compile_normalize_and_prefilter, Vm},
-    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SchemaCatalog, SubscriptionEngine,
-    SubscriptionRequest, TableId, WalEvent,
+    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest,
+    TableId, WalEvent,
 };
 
 // ============================================================================
 // Test Schema
 // ============================================================================
 
-/// Fixed 3-column schema: id (int), amount (int), status (string)
-struct PropTestCatalog;
-
-impl SchemaCatalog for PropTestCatalog {
-    fn table_id(&self, table_name: &str) -> Option<TableId> {
-        if table_name == "items" {
-            Some(1)
-        } else {
-            None
-        }
-    }
-
-    fn column_id(&self, table_id: TableId, column_name: &str) -> Option<u16> {
-        if table_id != 1 {
-            return None;
-        }
-        match column_name {
-            "id" => Some(0),
-            "amount" => Some(1),
-            "status" => Some(2),
-            _ => None,
-        }
-    }
-
-    fn table_arity(&self, table_id: TableId) -> Option<usize> {
-        if table_id == 1 {
-            Some(3)
-        } else {
-            None
-        }
-    }
-
-    fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-        Some(0xDEAD_BEEF)
-    }
+/// Build the proptest fixture: a single 3-column `items` table. A
+/// placeholder table is included before it (alphabetically) so the
+/// `items` table id is stable at 1 — matching the hardcoded
+/// `WalEvent::builder(1)` calls in this file.
+fn proptest_catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE _items_pad (id INT);\n\
+         CREATE TABLE items (id INT PRIMARY KEY, amount INT, status TEXT);",
+    )
+    .expect("proptest items fixture parses")
 }
 
 // ============================================================================
@@ -204,9 +182,9 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..20),
         rows in proptest::collection::vec(row_strategy(), 1..10),
     ) {
-        let catalog = Arc::new(PropTestCatalog);
+        let catalog = Arc::new(proptest_catalog());
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
 
         // Register each predicate as a subscription for a unique consumer
@@ -269,9 +247,9 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..15),
         rows in proptest::collection::vec(row_strategy(), 1..8),
     ) {
-        let catalog = Arc::new(PropTestCatalog);
+        let catalog = Arc::new(proptest_catalog());
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
 
         let mut consumer_predicates: HashMap<u64, TestPredicate> = HashMap::new();
@@ -326,9 +304,9 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..15),
         rows in proptest::collection::vec(row_strategy(), 1..8),
     ) {
-        let catalog = Arc::new(PropTestCatalog);
+        let catalog = Arc::new(proptest_catalog());
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
+        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
 
         let mut consumer_predicates: HashMap<u64, TestPredicate> = HashMap::new();
@@ -385,7 +363,7 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..20),
         rows in proptest::collection::vec(row_strategy(), 1..10),
     ) {
-        let catalog = PropTestCatalog;
+        let catalog = proptest_catalog();
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
 
         for pred in &predicates {
@@ -426,15 +404,15 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..15),
         rows in proptest::collection::vec(row_strategy(), 1..5),
     ) {
-        let catalog: Arc<dyn subql::SchemaCatalog> = Arc::new(PropTestCatalog);
+        let catalog = Arc::new(proptest_catalog());
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
 
         // Engine 1: individual register
-        let mut engine1: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
+        let mut engine1: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(Arc::clone(&catalog), sqlparser::dialect::PostgreSqlDialect {});
 
         // Engine 2: batch register
-        let mut engine2: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds> =
+        let mut engine2: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
 
         let mut specs = Vec::new();

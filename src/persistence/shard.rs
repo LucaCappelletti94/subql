@@ -1,11 +1,38 @@
 //! Shard format with header and validation
+//!
+//! # v7 header (49 bytes, fixed size)
+//!
+//! ```text
+//!  0..5    magic                    "SUBQL"
+//!  5..7    version (LE u16)          7
+//!  7       padding                   0
+//!  8..12   table_id (LE u32)
+//! 12       algorithm_id              1 = sha2-256
+//! 13..15   canonicalization_version (BE u16)
+//! 15..17   profile_id               (BE u16)
+//! 17..33   fingerprint128           (first 16 bytes of fp256)
+//! 33..41   uncompressed_size (LE u64)
+//! 41..49   compressed_size   (LE u64)
+//! ```
+//!
+//! v7 replaces v6's bare 8-byte `u64` fingerprint with the full
+//! `SchemaFingerprint` envelope (algorithm + canonicalization version +
+//! profile + 128-bit digest), as required by FINGERPRINT_SPEC §10–§12.
+//! Older v6 shards refuse to load — this is a clean break, no compat path.
 
 use super::codec;
-use crate::{compiler::sql_shape::QueryProjection, IdTypes, SchemaCatalog, StorageError, TableId};
+use crate::{
+    catalog_helpers, compiler::sql_shape::QueryProjection, IdTypes, StorageError, TableId,
+};
 use serde::{Deserialize, Serialize};
+use sql_traits::{
+    prelude::DatabaseLike,
+    structs::{AlgorithmId, SchemaFingerprint},
+};
 
-/// Shard format version
-const SHARD_VERSION: u16 = 6; // v6: AggSpec::CountColumn, AggSpec::Avg added
+/// Shard format version. v7: full fingerprint envelope replaces the legacy
+/// `u64` field (FINGERPRINT_SPEC §11 / audit §3.3).
+const SHARD_VERSION: u16 = 7;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 ///
@@ -16,8 +43,72 @@ const MAX_SHARD_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 /// Magic bytes for shard identification
 const MAGIC: &[u8; 5] = b"SUBQL";
 
-/// Shard header (36 bytes, fixed size)
-const SHARD_HEADER_SIZE: usize = 36;
+/// Shard header (49 bytes, fixed size — see module docs for layout).
+const SHARD_HEADER_SIZE: usize = 49;
+
+/// Numeric algorithm identifier for `AlgorithmId::Sha2_256` in the v7 header.
+///
+/// `SchemaFingerprint` exposes the algorithm as an enum; for the wire format we
+/// project it to a single byte. New algorithms added to
+/// [`sql_traits::structs::fingerprint::AlgorithmId`] must be assigned a stable
+/// byte here, with shard-version bumps for any reassignment.
+const ALGORITHM_ID_SHA2_256: u8 = 1;
+
+/// The persisted projection of a [`SchemaFingerprint`] inside a shard header.
+///
+/// The on-disk header stores the envelope (algorithm + canonicalization
+/// version + profile + 128-bit digest) directly so we can compare each field
+/// without reconstructing a full [`SchemaFingerprint`] from bytes (the
+/// constructor for which is crate-private in `sql-traits`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardFingerprintEnvelope {
+    /// Numeric algorithm identifier (1 = sha2-256).
+    pub algorithm_id: u8,
+    /// Canonicalization-rules version (BE on the wire).
+    pub canonicalization_version: u16,
+    /// Persistence profile identifier (BE on the wire).
+    pub profile_id: u16,
+    /// First 128 bits of the digest (fingerprint128 per spec §11).
+    pub digest128: [u8; 16],
+}
+
+impl ShardFingerprintEnvelope {
+    /// Project a live [`SchemaFingerprint`] into the on-disk envelope.
+    #[must_use]
+    pub fn from_schema(fp: &SchemaFingerprint) -> Self {
+        let algorithm_id = match fp.algorithm_id() {
+            AlgorithmId::Sha2_256 => ALGORITHM_ID_SHA2_256,
+            // Any future variant gets a sentinel that does not match any
+            // currently emitted shard, surfacing as a version/algorithm
+            // mismatch on load rather than a silent acceptance.
+            _ => 0,
+        };
+        Self {
+            algorithm_id,
+            canonicalization_version: fp.canonicalization_version(),
+            profile_id: fp.profile_id(),
+            digest128: fp.fingerprint128(),
+        }
+    }
+}
+
+impl std::fmt::Display for ShardFingerprintEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let algo = match self.algorithm_id {
+            ALGORITHM_ID_SHA2_256 => "sha2-256",
+            _ => "unknown",
+        };
+        write!(
+            f,
+            "{}:v{}:p{}:",
+            algo, self.canonicalization_version, self.profile_id
+        )?;
+        for byte in &self.digest128 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Shard header metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,8 +121,8 @@ pub struct ShardHeader {
     pub padding: u8,
     /// Table ID this shard belongs to
     pub table_id: TableId,
-    /// Schema fingerprint (for compatibility checking)
-    pub schema_fingerprint: u64,
+    /// Full schema fingerprint envelope.
+    pub fingerprint: ShardFingerprintEnvelope,
     /// Uncompressed payload size
     pub uncompressed_size: u64,
     /// Compressed payload size
@@ -43,7 +134,7 @@ impl ShardHeader {
     #[must_use]
     pub const fn new(
         table_id: TableId,
-        schema_fingerprint: u64,
+        fingerprint: ShardFingerprintEnvelope,
         uncompressed_size: u64,
         compressed_size: u64,
     ) -> Self {
@@ -52,14 +143,19 @@ impl ShardHeader {
             version: SHARD_VERSION,
             padding: 0,
             table_id,
-            schema_fingerprint,
+            fingerprint,
             uncompressed_size,
             compressed_size,
         }
     }
 
-    /// Validate header
-    pub fn validate(&self, catalog: &dyn SchemaCatalog) -> Result<(), StorageError> {
+    /// Validate header against the live catalog.
+    ///
+    /// Rejects malformed magic, version mismatch, and any difference in the
+    /// fingerprint envelope (algorithm, canonicalization version, profile, or
+    /// digest). There is no zero-fingerprint bypass — every live catalog must
+    /// produce a fingerprint or the shard is rejected.
+    pub fn validate<DB: DatabaseLike>(&self, database: &DB) -> Result<(), StorageError> {
         // Check magic
         if &self.magic != MAGIC {
             return Err(StorageError::Corrupt(format!(
@@ -76,28 +172,24 @@ impl ShardHeader {
             });
         }
 
-        // Check schema fingerprint.
-        // If the shard has a recorded fingerprint but the catalog returns None
-        // (unknown table), reject the shard to prevent silent bypass.
-        match catalog.schema_fingerprint(self.table_id) {
-            Some(expected_fp) => {
-                if expected_fp != self.schema_fingerprint {
-                    return Err(StorageError::SchemaMismatch {
-                        table_id: self.table_id,
-                        expected: expected_fp,
-                        got: self.schema_fingerprint,
-                    });
-                }
-            }
-            None => {
-                if self.schema_fingerprint != 0 {
-                    return Err(StorageError::SchemaMismatch {
-                        table_id: self.table_id,
-                        expected: 0,
-                        got: self.schema_fingerprint,
-                    });
-                }
-            }
+        // Compute the live fingerprint via the sql-traits catalog. The catalog
+        // *must* know about this table — there is no graceful fallback path.
+        let live = catalog_helpers::schema_fingerprint(database, self.table_id)
+            .map_err(|e| StorageError::Corrupt(format!("fingerprint computation failed: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "shard references unknown table {} (no fingerprint available)",
+                    self.table_id,
+                ))
+            })?;
+        let expected = ShardFingerprintEnvelope::from_schema(&live);
+
+        if expected != self.fingerprint {
+            return Err(StorageError::SchemaMismatch {
+                table_id: self.table_id,
+                expected,
+                got: self.fingerprint,
+            });
         }
 
         Ok(())
@@ -110,9 +202,13 @@ fn encode_header(header: &ShardHeader) -> [u8; SHARD_HEADER_SIZE] {
     bytes[5..7].copy_from_slice(&header.version.to_le_bytes());
     bytes[7] = header.padding;
     bytes[8..12].copy_from_slice(&header.table_id.to_le_bytes());
-    bytes[12..20].copy_from_slice(&header.schema_fingerprint.to_le_bytes());
-    bytes[20..28].copy_from_slice(&header.uncompressed_size.to_le_bytes());
-    bytes[28..36].copy_from_slice(&header.compressed_size.to_le_bytes());
+    // Fingerprint envelope (FINGERPRINT_SPEC §10.1: BE for the two u16 fields).
+    bytes[12] = header.fingerprint.algorithm_id;
+    bytes[13..15].copy_from_slice(&header.fingerprint.canonicalization_version.to_be_bytes());
+    bytes[15..17].copy_from_slice(&header.fingerprint.profile_id.to_be_bytes());
+    bytes[17..33].copy_from_slice(&header.fingerprint.digest128);
+    bytes[33..41].copy_from_slice(&header.uncompressed_size.to_le_bytes());
+    bytes[41..49].copy_from_slice(&header.compressed_size.to_le_bytes());
     bytes
 }
 
@@ -127,19 +223,25 @@ fn decode_header(bytes: &[u8]) -> Result<ShardHeader, StorageError> {
     let mut magic = [0_u8; 5];
     magic.copy_from_slice(&bytes[0..5]);
 
+    let mut digest128 = [0_u8; 16];
+    digest128.copy_from_slice(&bytes[17..33]);
+
     Ok(ShardHeader {
         magic,
         version: u16::from_le_bytes([bytes[5], bytes[6]]),
         padding: bytes[7],
         table_id: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-        schema_fingerprint: u64::from_le_bytes([
-            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
-        ]),
+        fingerprint: ShardFingerprintEnvelope {
+            algorithm_id: bytes[12],
+            canonicalization_version: u16::from_be_bytes([bytes[13], bytes[14]]),
+            profile_id: u16::from_be_bytes([bytes[15], bytes[16]]),
+            digest128,
+        },
         uncompressed_size: u64::from_le_bytes([
-            bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26], bytes[27],
+            bytes[33], bytes[34], bytes[35], bytes[36], bytes[37], bytes[38], bytes[39], bytes[40],
         ]),
         compressed_size: u64::from_le_bytes([
-            bytes[28], bytes[29], bytes[30], bytes[31], bytes[32], bytes[33], bytes[34], bytes[35],
+            bytes[41], bytes[42], bytes[43], bytes[44], bytes[45], bytes[46], bytes[47], bytes[48],
         ]),
     })
 }
@@ -219,25 +321,28 @@ impl<I: IdTypes> Clone for ConsumerDictData<I> {
 /// Serialize shard to bytes
 ///
 /// Returns full shard (header + compressed payload).
-pub fn serialize_shard<I: IdTypes>(
+pub fn serialize_shard<I: IdTypes, DB: DatabaseLike>(
     table_id: TableId,
     payload: &ShardPayload<I>,
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<Vec<u8>, StorageError> {
     let uncompressed = codec::serialize(payload)?;
 
     // Compress payload (reuse the already serialized buffer)
     let compressed = codec::encode_serialized(&uncompressed)?;
 
-    // Get schema fingerprint
-    let schema_fingerprint = catalog.schema_fingerprint(table_id).ok_or_else(|| {
-        StorageError::Corrupt(format!("No schema fingerprint for table {table_id}"))
-    })?;
+    // Compute the full fingerprint envelope from the live catalog.
+    let live = catalog_helpers::schema_fingerprint(database, table_id)
+        .map_err(|e| StorageError::Corrupt(format!("fingerprint computation failed: {e}")))?
+        .ok_or_else(|| {
+            StorageError::Corrupt(format!("No schema fingerprint for table {table_id}"))
+        })?;
+    let fingerprint = ShardFingerprintEnvelope::from_schema(&live);
 
     // Create header
     let header = ShardHeader::new(
         table_id,
-        schema_fingerprint,
+        fingerprint,
         uncompressed.len() as u64,
         compressed.len() as u64,
     );
@@ -255,14 +360,14 @@ pub fn serialize_shard<I: IdTypes>(
 /// Deserialize shard from bytes
 ///
 /// Returns (header, payload).
-pub fn deserialize_shard<I: IdTypes>(
+pub fn deserialize_shard<I: IdTypes, DB: DatabaseLike>(
     bytes: &[u8],
-    catalog: &dyn SchemaCatalog,
+    database: &DB,
 ) -> Result<(ShardHeader, ShardPayload<I>), StorageError> {
     let header = decode_header(bytes)?;
 
     // Validate header
-    header.validate(catalog)?;
+    header.validate(database)?;
 
     if header.uncompressed_size > MAX_SHARD_UNCOMPRESSED_SIZE {
         return Err(StorageError::Corrupt(format!(
@@ -307,14 +412,18 @@ pub fn deserialize_shard<I: IdTypes>(
 #[allow(clippy::unwrap_used, clippy::unreadable_literal)]
 mod tests {
     use super::super::test_support::{
-        empty_shard_payload, make_catalog, shard_payload_with_consumers, MockCatalog,
+        empty_shard_payload, make_catalog, make_divergent_catalog, shard_payload_with_consumers,
     };
     use super::*;
-    use crate::DefaultIds;
-    use std::collections::HashMap;
+    use crate::{catalog_helpers, DefaultIds};
+
+    /// Resolve the single test-fixture table id from a [`ParserDB`].
+    fn fixture_table_id(db: &sql_traits::structs::ParserDB) -> TableId {
+        catalog_helpers::table_id(db, "orders").expect("fixture table 'orders' exists")
+    }
 
     /// Serialize a shard, decode+mutate its header, and re-encode the tampered
-    /// bytes.  The payload bytes are kept unchanged.
+    /// bytes. The payload bytes are kept unchanged.
     fn tamper_shard_header(bytes: &[u8], mutate: impl FnOnce(&mut ShardHeader)) -> Vec<u8> {
         let mut hdr = decode_header(bytes).unwrap();
         mutate(&mut hdr);
@@ -326,13 +435,21 @@ mod tests {
     #[test]
     fn test_shard_roundtrip() {
         let catalog = make_catalog();
-        let payload = shard_payload_with_consumers(vec![10, 20, 30], 1234567890);
+        let tid = fixture_table_id(&catalog);
+        let payload = shard_payload_with_consumers(vec![10, 20, 30], 1_234_567_890);
 
-        let bytes = serialize_shard(1, &payload, &catalog).unwrap();
-        let (header, decoded_payload) = deserialize_shard::<DefaultIds>(&bytes, &catalog).unwrap();
+        let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
+        let (header, decoded_payload) =
+            deserialize_shard::<DefaultIds, _>(&bytes, &catalog).unwrap();
 
-        assert_eq!(header.table_id, 1);
-        assert_eq!(header.schema_fingerprint, 0x1234_5678_90AB_CDEF);
+        assert_eq!(header.table_id, tid);
+        let expected = catalog_helpers::schema_fingerprint(&catalog, tid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            header.fingerprint,
+            ShardFingerprintEnvelope::from_schema(&expected)
+        );
         assert_eq!(
             decoded_payload.consumer_dict.ordinal_to_consumer,
             vec![10, 20, 30]
@@ -342,8 +459,13 @@ mod tests {
     #[test]
     fn test_invalid_magic() {
         let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
+        let live = catalog_helpers::schema_fingerprint(&catalog, tid)
+            .unwrap()
+            .unwrap();
 
-        let mut header = ShardHeader::new(1, 0x1234, 100, 80);
+        let mut header =
+            ShardHeader::new(tid, ShardFingerprintEnvelope::from_schema(&live), 100, 80);
         header.magic = *b"WRONG";
 
         let result = header.validate(&catalog);
@@ -353,117 +475,195 @@ mod tests {
     #[test]
     fn test_version_mismatch() {
         let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
+        let live = catalog_helpers::schema_fingerprint(&catalog, tid)
+            .unwrap()
+            .unwrap();
 
-        let mut header = ShardHeader::new(1, 0x1234_5678_90AB_CDEF, 100, 80);
+        let mut header =
+            ShardHeader::new(tid, ShardFingerprintEnvelope::from_schema(&live), 100, 80);
         header.version = 999;
 
         let result = header.validate(&catalog);
         assert!(matches!(result, Err(StorageError::VersionMismatch { .. })));
     }
 
+    /// MIG-001: header with a different `canonicalization_version` than the
+    /// live catalog must be rejected even when the digest happens to match.
+    /// MIG-002: same for `profile_id`. We exercise both bits here against a
+    /// well-formed digest.
     #[test]
-    fn test_schema_mismatch() {
+    fn test_schema_mismatch_digest() {
         let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
+        let live = catalog_helpers::schema_fingerprint(&catalog, tid)
+            .unwrap()
+            .unwrap();
 
-        let header = ShardHeader::new(1, 0xDEADBEEF, 100, 80);
+        let mut env = ShardFingerprintEnvelope::from_schema(&live);
+        // Flip a single bit of the digest — envelope metadata stays intact.
+        env.digest128[0] ^= 0x01;
+        let header = ShardHeader::new(tid, env, 100, 80);
 
         let result = header.validate(&catalog);
         assert!(matches!(result, Err(StorageError::SchemaMismatch { .. })));
     }
 
     #[test]
-    fn test_serialize_missing_fingerprint() {
-        let catalog = MockCatalog {
-            fingerprints: HashMap::new(),
-        };
-        let payload = empty_shard_payload(1000);
-
-        let result = serialize_shard(1, &payload, &catalog);
-        assert!(matches!(result, Err(StorageError::Corrupt(_))));
-    }
-
-    #[test]
     fn test_deserialize_rejects_compressed_size_mismatch() {
         let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
         let payload = shard_payload_with_consumers(vec![1, 2, 3], 1);
 
-        let bytes = serialize_shard(1, &payload, &catalog).unwrap();
+        let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
         let tampered = tamper_shard_header(&bytes, |hdr| {
             hdr.compressed_size = hdr.compressed_size.saturating_add(1);
         });
 
-        let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
+        let result = deserialize_shard::<DefaultIds, _>(&tampered, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
     }
 
     #[test]
     fn test_deserialize_rejects_uncompressed_size_mismatch() {
         let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
         let payload = shard_payload_with_consumers(vec![7, 8], 2);
 
-        let bytes = serialize_shard(1, &payload, &catalog).unwrap();
+        let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
         let tampered = tamper_shard_header(&bytes, |hdr| {
             hdr.uncompressed_size = hdr.uncompressed_size.saturating_add(1);
         });
 
-        let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
+        let result = deserialize_shard::<DefaultIds, _>(&tampered, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
     }
 
     #[test]
     fn test_deserialize_rejects_oversized_uncompressed_header() {
         let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
         let payload = shard_payload_with_consumers(vec![42], 3);
 
-        let bytes = serialize_shard(1, &payload, &catalog).unwrap();
+        let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
         let tampered = tamper_shard_header(&bytes, |hdr| {
             hdr.uncompressed_size = u64::MAX;
         });
 
-        let result = deserialize_shard::<DefaultIds>(&tampered, &catalog);
+        let result = deserialize_shard::<DefaultIds, _>(&tampered, &catalog);
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
     }
 
-    // =========================================================================
-    // D5 — Schema fingerprint bypass must be blocked
-    // =========================================================================
-
+    /// Shard references a table the live catalog doesn't know about. With v7
+    /// there is no zero-fingerprint bypass — every catalog must produce a
+    /// fingerprint for any table referenced by a shard.
     #[test]
-    fn test_fingerprint_bypass_blocked_when_catalog_returns_none() {
-        let catalog_with_fingerprint = make_catalog();
+    fn test_unknown_table_is_corrupt() {
+        let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
         let payload = empty_shard_payload(1000);
-        let bytes = serialize_shard(1, &payload, &catalog_with_fingerprint).unwrap();
+        let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
 
-        let catalog_without_fingerprint = MockCatalog {
-            fingerprints: HashMap::new(),
-        };
+        // Use a catalog that doesn't know about the table id we wrote into the
+        // shard. ParserDB::parse with a different table layout yields a
+        // different id space; pick an obviously out-of-range table_id.
+        let tampered = tamper_shard_header(&bytes, |hdr| {
+            hdr.table_id = u32::MAX;
+        });
 
-        let result = deserialize_shard::<DefaultIds>(&bytes, &catalog_without_fingerprint);
+        let result = deserialize_shard::<DefaultIds, _>(&tampered, &catalog);
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
+    }
+
+    // ============================================================================
+    // Step 3 verification tests (audit §3.3 / FINGERPRINT_SPEC §10–§12)
+    // ============================================================================
+
+    /// Every envelope field roundtrips through the on-wire header.
+    #[test]
+    fn test_v7_envelope_roundtrip() {
+        let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
+        let payload = shard_payload_with_consumers(vec![1, 2, 3], 42);
+
+        let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
+        let (header, _) = deserialize_shard::<DefaultIds, _>(&bytes, &catalog).unwrap();
+
+        assert_eq!(header.version, 7);
+        assert_eq!(header.fingerprint.algorithm_id, ALGORITHM_ID_SHA2_256);
+        assert_eq!(header.fingerprint.canonicalization_version, 1);
+        assert_eq!(header.fingerprint.profile_id, 1);
+
+        let live = catalog_helpers::schema_fingerprint(&catalog, tid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.fingerprint.digest128, live.fingerprint128());
+    }
+
+    /// Loading a shard whose header carries v6 must fail with
+    /// `VersionMismatch` — no legacy decode path is supported.
+    #[test]
+    fn test_v6_rejected() {
+        let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
+        let payload = empty_shard_payload(1);
+        let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
+
+        let tampered = tamper_shard_header(&bytes, |hdr| {
+            hdr.version = 6;
+        });
+
+        let result = deserialize_shard::<DefaultIds, _>(&tampered, &catalog);
         assert!(
-            matches!(result, Err(StorageError::SchemaMismatch { .. })),
-            "Must reject shard with fingerprint when catalog returns None"
+            matches!(
+                &result,
+                Err(StorageError::VersionMismatch {
+                    expected: 7,
+                    got: 6
+                })
+            ),
+            "expected VersionMismatch{{expected: 7, got: 6}}, got {result:?}"
         );
     }
 
+    /// Writing a shard under one schema and loading it under a different
+    /// schema for the same table id must fail with `SchemaMismatch` — the
+    /// digest differs even though all envelope metadata matches.
     #[test]
-    fn test_fingerprint_zero_shard_accepted_when_catalog_returns_none() {
-        let catalog_with_fingerprint = make_catalog();
-        let payload = empty_shard_payload(1000);
+    fn test_envelope_mismatch_rejected() {
+        let writer = make_catalog();
+        let loader = make_divergent_catalog();
+        let tid = fixture_table_id(&writer);
+        assert_eq!(
+            tid,
+            fixture_table_id(&loader),
+            "both fixtures must agree on the table id used by serialize_shard"
+        );
 
-        let bytes = serialize_shard(1, &payload, &catalog_with_fingerprint).unwrap();
+        let payload = empty_shard_payload(1);
+        let bytes = serialize_shard(tid, &payload, &writer).unwrap();
+
+        let result = deserialize_shard::<DefaultIds, _>(&bytes, &loader);
+        assert!(matches!(result, Err(StorageError::SchemaMismatch { .. })));
+    }
+
+    /// A header carrying an unknown algorithm_id (e.g. a future hash that the
+    /// live catalog isn't emitting) must be rejected. The digest may be
+    /// otherwise valid; the envelope metadata mismatch alone is fatal.
+    #[test]
+    fn test_algorithm_id_mismatch_rejected() {
+        let catalog = make_catalog();
+        let tid = fixture_table_id(&catalog);
+        let payload = empty_shard_payload(1);
+        let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
+
         let tampered = tamper_shard_header(&bytes, |hdr| {
-            hdr.schema_fingerprint = 0;
+            // Pretend the digest was produced by some hash other than sha2-256.
+            hdr.fingerprint.algorithm_id = ALGORITHM_ID_SHA2_256.wrapping_add(99);
         });
 
-        let catalog_without_fingerprint = MockCatalog {
-            fingerprints: HashMap::new(),
-        };
-
-        let result = deserialize_shard::<DefaultIds>(&tampered, &catalog_without_fingerprint);
-        assert!(
-            result.is_ok(),
-            "Zero fingerprint with None catalog should succeed"
-        );
+        let result = deserialize_shard::<DefaultIds, _>(&tampered, &catalog);
+        assert!(matches!(result, Err(StorageError::SchemaMismatch { .. })));
     }
 
     #[test]

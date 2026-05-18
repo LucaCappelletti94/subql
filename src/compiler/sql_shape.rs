@@ -1,4 +1,5 @@
-use crate::RegisterError;
+use crate::{catalog_helpers, RegisterError};
+use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{
     DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
     SelectItem, SetExpr, Statement, TableFactor,
@@ -59,12 +60,13 @@ fn extract_column_arg(arg: &FunctionArg) -> Option<String> {
 /// Returns `Err(UnsupportedSql)` for any other projection.
 /// Returns `Err(UnknownColumn)` when the aggregate column does not exist in the catalog.
 /// Returns `Err(UnsupportedSql)` when `SUM`/`AVG` is used on a non-numeric column type
-/// (only when the catalog implements [`crate::SchemaCatalog::column_type`]).
+/// (only when the catalog exposes type information via
+/// [`catalog_helpers::column_type`]).
 #[allow(clippy::too_many_lines)]
-pub(super) fn extract_projection(
+pub(super) fn extract_projection<DB: DatabaseLike>(
     stmt: &Statement,
     table_id: crate::TableId,
-    catalog: &dyn crate::SchemaCatalog,
+    database: &DB,
 ) -> Result<QueryProjection, RegisterError> {
     let select = match stmt {
         Statement::Query(query) => match query.body.as_ref() {
@@ -147,12 +149,11 @@ pub(super) fn extract_projection(
                                         .to_string(),
                                 )
                             })?;
-                            let column = catalog.column_id(table_id, &col_name).ok_or(
-                                RegisterError::UnknownColumn {
+                            let column = catalog_helpers::column_id(database, table_id, &col_name)
+                                .ok_or(RegisterError::UnknownColumn {
                                     table_id,
                                     column: col_name,
-                                },
-                            )?;
+                                })?;
                             Ok(QueryProjection::Aggregate(AggSpec::CountColumn { column }))
                         }
                         _ => Err(RegisterError::UnsupportedSql(
@@ -204,7 +205,7 @@ pub(super) fn extract_projection(
                                     func.to_uppercase()
                                 ))
                             })?;
-                            catalog.column_id(table_id, &col_name).ok_or(
+                            catalog_helpers::column_id(database, table_id, &col_name).ok_or(
                                 RegisterError::UnknownColumn {
                                     table_id,
                                     column: col_name,
@@ -220,7 +221,8 @@ pub(super) fn extract_projection(
                     };
 
                     // Reject non-numeric column types when the catalog provides type info.
-                    if let Some(col_type) = catalog.column_type(table_id, column) {
+                    if let Some(col_type) = catalog_helpers::column_type(database, table_id, column)
+                    {
                         match col_type {
                             crate::ColumnType::Bool | crate::ColumnType::String => {
                                 return Err(RegisterError::UnsupportedSql(format!(

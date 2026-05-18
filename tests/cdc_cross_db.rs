@@ -9,7 +9,7 @@
 //! cargo test --test cdc_cross_db -- --ignored --nocapture
 //! ```
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,9 +19,9 @@ use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
+use sql_traits::structs::ParserDB;
 use subql::{
-    ColumnId, DefaultIds, MaxwellParser, SchemaCatalog, SubscriptionEngine, SubscriptionRequest,
-    TableId, Wal2JsonV2Parser, WalParser,
+    DefaultIds, MaxwellParser, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Parser, WalParser,
 };
 
 // ============================================================================
@@ -52,65 +52,16 @@ struct NewReading {
 
 /// Schema catalog for the `readings` table across both PG and MySQL.
 ///
-/// Resolves all name forms to the same `TableId(1)`:
-/// - `"readings"` (bare name — tried first by `resolve_table`)
-/// - `"public.readings"` (PG wal2json qualified form)
-/// - `"testdb.readings"` (Maxwell `database.table` qualified form)
-struct IoTCatalog {
-    tables: HashMap<String, (TableId, usize)>,
-    columns: HashMap<(TableId, String), ColumnId>,
-    primary_keys: HashMap<TableId, Vec<ColumnId>>,
-}
-
-impl IoTCatalog {
-    fn new() -> Self {
-        let mut tables = HashMap::new();
-        tables.insert("readings".to_string(), (1, 4));
-        tables.insert("public.readings".to_string(), (1, 4));
-        tables.insert("testdb.readings".to_string(), (1, 4));
-
-        let mut columns = HashMap::new();
-        columns.insert((1, "sensor_id".to_string()), 0);
-        columns.insert((1, "temperature".to_string()), 1);
-        columns.insert((1, "humidity".to_string()), 2);
-        columns.insert((1, "location".to_string()), 3);
-
-        let mut primary_keys = HashMap::new();
-        primary_keys.insert(1, vec![0]); // sensor_id is PK
-
-        Self {
-            tables,
-            columns,
-            primary_keys,
-        }
-    }
-}
-
-impl SchemaCatalog for IoTCatalog {
-    fn table_id(&self, table_name: &str) -> Option<TableId> {
-        self.tables.get(table_name).map(|(id, _)| *id)
-    }
-
-    fn column_id(&self, table_id: TableId, column_name: &str) -> Option<ColumnId> {
-        self.columns
-            .get(&(table_id, column_name.to_string()))
-            .copied()
-    }
-
-    fn table_arity(&self, table_id: TableId) -> Option<usize> {
-        self.tables
-            .values()
-            .find(|(id, _)| *id == table_id)
-            .map(|(_, arity)| *arity)
-    }
-
-    fn schema_fingerprint(&self, _table_id: TableId) -> Option<u64> {
-        Some(0)
-    }
-
-    fn primary_key_columns(&self, table_id: TableId) -> Option<&[ColumnId]> {
-        self.primary_keys.get(&table_id).map(Vec::as_slice)
-    }
+/// Declares the table in both `public` and `testdb` schemas so wal2json
+/// (`public.readings`) and Maxwell (`testdb.readings`) both resolve. A bare
+/// `CREATE TABLE readings ...` is included for the no-schema fallback path.
+fn iot_catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location TEXT);\n\
+         CREATE TABLE public.readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location TEXT);\n\
+         CREATE TABLE testdb.readings (sensor_id INT PRIMARY KEY, temperature DOUBLE PRECISION, humidity DOUBLE PRECISION, location TEXT);",
+    )
+    .expect("iot fixture DDL parses")
 }
 
 // ============================================================================
@@ -419,8 +370,8 @@ fn maxwell_read_changes(output_dir: &str, expected_count: usize) -> Vec<String> 
 // ============================================================================
 
 fn setup_engine(
-    catalog: &Arc<dyn SchemaCatalog>,
-) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds> {
+    catalog: &Arc<ParserDB>,
+) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
     let mut engine = SubscriptionEngine::new(Arc::clone(catalog), PostgreSqlDialect {});
 
     let subscriptions = [
@@ -456,10 +407,10 @@ fn setup_engine(
 // ============================================================================
 
 fn dispatch_events(
-    engine: &mut SubscriptionEngine<PostgreSqlDialect, DefaultIds>,
-    parser: &dyn WalParser,
+    engine: &mut SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
+    parser: &dyn WalParser<ParserDB>,
     messages: &[String],
-    catalog: &dyn SchemaCatalog,
+    catalog: &ParserDB,
 ) -> Vec<BTreeSet<u64>> {
     let mut results = Vec::with_capacity(messages.len());
 
@@ -551,13 +502,13 @@ fn cross_db_cdc_parity() {
     let mx_messages = maxwell_read_changes(&maxwell_path, 4);
 
     // Set up engines — one per CDC source
-    let catalog: Arc<dyn SchemaCatalog> = Arc::new(IoTCatalog::new());
+    let catalog: Arc<ParserDB> = Arc::new(iot_catalog());
     let mut pg_engine = setup_engine(&catalog);
     let mut mx_engine = setup_engine(&catalog);
 
     // Dispatch and collect results
-    let pg_results = dispatch_events(&mut pg_engine, &Wal2JsonV2Parser, &pg_messages, &*catalog);
-    let mx_results = dispatch_events(&mut mx_engine, &MaxwellParser, &mx_messages, &*catalog);
+    let pg_results = dispatch_events(&mut pg_engine, &Wal2JsonV2Parser, &pg_messages, &catalog);
+    let mx_results = dispatch_events(&mut mx_engine, &MaxwellParser, &mx_messages, &catalog);
 
     // Expected matched consumer IDs per event.
     //
