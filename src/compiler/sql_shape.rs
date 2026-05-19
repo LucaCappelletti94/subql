@@ -90,7 +90,13 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
     // Single expression (with or without alias)
     if items.len() == 1 {
         let expr = match &items[0] {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            // `expr`, `expr AS alias`, and Spark-SQL's `expr AS (a1, a2, ...)`
+            // all project the same underlying expression; subql doesn't care
+            // about the alias names, only the expression shape (COUNT/SUM/AVG/
+            // wildcard).
+            SelectItem::UnnamedExpr(e)
+            | SelectItem::ExprWithAlias { expr: e, .. }
+            | SelectItem::ExprWithAliases { expr: e, .. } => e,
             SelectItem::QualifiedWildcard(_, _) => {
                 return Err(RegisterError::UnsupportedSql(
                     "Qualified wildcard (e.g. table.*) not supported in projection".to_string(),

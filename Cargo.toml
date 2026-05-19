@@ -32,15 +32,14 @@ harness = false
 required-features = ["dhat-heap"]
 
 [dependencies]
-# SQL parsing (supports multiple dialects) — aligned with sql-traits' sqlparser
-# source so both crates resolve to the same sqlparser instance.
-sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main", features = ["visitor"] }
+# SQL parsing (supports multiple dialects)
+sqlparser = { version = "0.62", features = ["visitor"] }
 
 # Generic SQL schema traits + canonical SchemaFingerprint (FINGERPRINT_SPEC).
 sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main" }
 
 # Compressed bitmaps for predicate/user sets
-roaring = "0.11.3"
+roaring = "0.11"
 
 # Stable ID allocation (predicates)
 slab = "0.4"
@@ -62,7 +61,7 @@ lz4 = "1.24"           # Fast compression
 thiserror = "2.0"
 
 # Configuration
-toml = "0.9.8"
+toml = "1"
 
 # Optional features
 tracing = { version = "0.1", optional = true }
@@ -71,10 +70,10 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
 # Benchmarking
-criterion = { version = "0.8.2", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Temporary directories for shard tests
-tempfile = "3.8"
+tempfile = "3"
 
 # Structured fuzzing (needed by regression tests)
 arbitrary = { version = "1", features = ["derive"] }
