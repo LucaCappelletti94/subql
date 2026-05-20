@@ -44,17 +44,37 @@ jobs:
       matrix:
         profile:
           - name: default
-            args: ""
-          - name: no-default-features
-            args: "--no-default-features"
+            args: "--all-targets"
           - name: all-features
-            args: "--all-features"
+            args: "--all-targets --all-features"
+          # no_std build: lib only; tests/benches use std-only dev-deps
+          # (proptest, criterion, testcontainers, …) so `--all-targets`
+          # under `--no-default-features` is intentionally not exercised.
+          - name: no-default-features
+            args: "--lib --no-default-features"
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets --locked ${{ matrix.profile.args }}
+      - run: cargo check --workspace --locked ${{ matrix.profile.args }}
+
+  wasm-check:
+    name: check (wasm32-unknown-unknown, no_std)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Canonical "yes, subql is WASM-ready" gate. The dispatch core
+      # (compiler, VM, WAL parsers, in-memory engine) must compile cleanly
+      # for `wasm32-unknown-unknown` under `--no-default-features` so a
+      # web-demo (wasm-bindgen) crate can pull subql in without further
+      # ceremony. Persistence + merge + config remain `std`-only.
+      - run: cargo check --lib --no-default-features --target wasm32-unknown-unknown --locked
 
   unit-tests:
     name: tests (${{ matrix.profile.name }})
@@ -99,6 +119,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps --all-features --locked
       - run: cargo test --workspace --doc --all-features --locked
+      # The README / engine doctests use only the in-memory dispatch
+      # surface (ParserDB, SubscriptionEngine, register, consumers,
+      # aggregate_deltas) — load-bearing proof that the no_std subset is
+      # end-to-end functional. The doctest harness itself still links
+      # libstd; only subql's `std` feature is disabled.
+      - run: cargo test --workspace --doc --no-default-features --locked
 
   msrv:
     name: msrv (1.88)
