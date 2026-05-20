@@ -325,6 +325,7 @@ pub(super) const MAX_SQL_LEN: usize = 8192;
 /// parse times.
 fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
     let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
     let mut consecutive_ops: usize = 0;
 
     for c in sql.bytes() {
@@ -335,6 +336,18 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
             }
             b')' => {
                 paren_depth = paren_depth.saturating_sub(1);
+                consecutive_ops = 0;
+            }
+            // Square brackets: PostgreSQL array subscripts (`arr[1]`) and
+            // SQL Server delimited identifiers (`[col]`). Both balanced
+            // in well-formed input. Unmatched `[` runs drove GenericDialect
+            // into hundreds of ms of array-subscript backtracking.
+            b'[' => {
+                bracket_depth += 1;
+                consecutive_ops = 0;
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
                 consecutive_ops = 0;
             }
             b'+' | b'-' | b'*' | b'/' | b'=' | b'<' | b'>' | b'!' | b'~' => {
@@ -353,7 +366,10 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
             }
         }
 
-        if paren_depth > MAX_EXPR_DEPTH || consecutive_ops > MAX_EXPR_DEPTH {
+        if paren_depth > MAX_EXPR_DEPTH
+            || bracket_depth > MAX_EXPR_DEPTH
+            || consecutive_ops > MAX_EXPR_DEPTH
+        {
             return Err(crate::RegisterError::UnsupportedSql(
                 "Expression nesting too deep".to_string(),
             ));
@@ -363,6 +379,11 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
     if paren_depth != 0 {
         return Err(crate::RegisterError::UnsupportedSql(
             "Unbalanced parentheses".to_string(),
+        ));
+    }
+    if bracket_depth != 0 {
+        return Err(crate::RegisterError::UnsupportedSql(
+            "Unbalanced square brackets".to_string(),
         ));
     }
 
@@ -441,8 +462,18 @@ mod sanity_tests {
     }
 
     #[test]
+    fn rejects_unbalanced_open_brackets() {
+        let err = check_sql_sanity("SELECT * FROM t WHERE a[[[[ = 1").unwrap_err();
+        assert!(
+            matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("square brackets"))
+        );
+    }
+
+    #[test]
     fn accepts_well_formed_sql() {
         check_sql_sanity("SELECT * FROM t WHERE a = 1\nAND b > 2").unwrap();
         check_sql_sanity("SELECT * FROM t WHERE x IN (1, 2, 3)").unwrap();
+        // PG array subscript with balanced brackets is fine.
+        check_sql_sanity("SELECT * FROM t WHERE arr[1] = 5").unwrap();
     }
 }

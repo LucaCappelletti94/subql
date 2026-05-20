@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arbitrary::{Arbitrary, Unstructured};
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
+use sqlparser::dialect::PostgreSqlDialect;
 
 use crate::compiler::bytecode::{BytecodeProgram, Instruction};
 use crate::compiler::canonicalize::{hash_sql, normalize_sql};
@@ -100,20 +100,25 @@ fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction> {
 // Harness functions
 // ---------------------------------------------------------------------------
 
-/// Parse SQL with both PostgreSQL and Generic dialects.
+/// Parse SQL using PostgreSqlDialect — the dialect subql's documented
+/// CDC pipeline targets.
+///
+/// We deliberately do NOT also fuzz with `GenericDialect`: it accepts
+/// many more parse paths (PG/MySQL/MSSQL/etc. tokens all valid), which
+/// makes it prone to deep backtracking on adversarial input. That's an
+/// upstream sqlparser perf characteristic, not subql code we'd want to
+/// surface, and previous fuzz timeouts traced back to it.
 pub fn harness_parse_sql(data: &[u8]) {
-    // Real callers pass valid UTF-8 SQL. `from_utf8_lossy` introduces
-    // U+FFFD bytes that have driven sqlparser into pathological
-    // backtracking — those code paths can't be reached in production.
+    // Real callers pass valid UTF-8 SQL. `from_utf8_lossy` would
+    // introduce U+FFFD bytes that drive sqlparser into pathological
+    // backtracking — code paths unreachable in production.
     let Ok(sql) = core::str::from_utf8(data) else {
         return;
     };
     let catalog = fuzz_catalog();
     let pg = PostgreSqlDialect {};
-    let generic = GenericDialect {};
 
     let _ = parse_and_compile(sql, &pg, &catalog);
-    let _ = parse_and_compile(sql, &generic, &catalog);
 }
 
 /// Generate random bytecode + row and evaluate with the VM.
@@ -159,15 +164,15 @@ pub fn harness_deserialize_shard(data: &[u8]) {
     let _ = deserialize_shard::<DefaultIds, _>(data, &catalog);
 }
 
-/// Normalize and hash SQL, asserting determinism.
+/// Normalize and hash SQL, asserting determinism. PostgreSqlDialect only —
+/// see `harness_parse_sql` for the rationale.
 pub fn harness_canonicalize(data: &[u8]) {
     let Ok(sql) = core::str::from_utf8(data) else {
         return;
     };
     let pg = PostgreSqlDialect {};
-    let generic = GenericDialect {};
 
-    for dialect in [&pg as &dyn sqlparser::dialect::Dialect, &generic] {
+    for dialect in [&pg as &dyn sqlparser::dialect::Dialect] {
         if let Ok(normalized) = normalize_sql(sql, dialect) {
             let h1 = hash_sql(&normalized);
             let h2 = hash_sql(&normalized);

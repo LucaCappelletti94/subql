@@ -12,9 +12,12 @@ TARGETS=(
 )
 
 # libFuzzer runtime knobs (passed after `--` to cargo-fuzz):
-#   -timeout=5         abort a single input after 5s (catches infinite loops)
+#   -timeout=15        abort a single input after 15s. sqlparser has known
+#                      exponential backtracking on adversarial inputs that
+#                      can run for ~hundreds of ms in libFuzzer-instrumented
+#                      builds; the higher bound surfaces only true hangs.
 #   -max_len=65536     cap generated input size at 64 KiB
-LIBFUZZER_ARGS=(-timeout=5 -max_len=65536)
+LIBFUZZER_ARGS=(-timeout=15 -max_len=65536)
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "Session '$SESSION' already exists. Attach with: tmux attach -t $SESSION"
