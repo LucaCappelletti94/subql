@@ -275,7 +275,8 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
 
 /// Parse and validate a single SQL statement from text.
 ///
-/// Encapsulates the common sequence: length check → parse → single-statement assertion.
+/// Encapsulates the common sequence: length / sanity check → parse →
+/// single-statement assertion.
 pub(super) fn parse_single_statement(
     sql: &str,
     dialect: &dyn sqlparser::dialect::Dialect,
@@ -285,6 +286,8 @@ pub(super) fn parse_single_statement(
             "SQL input too long".to_string(),
         ));
     }
+
+    check_sql_sanity(sql)?;
 
     let statements = sqlparser::parser::Parser::parse_sql(dialect, sql).map_err(|e| {
         crate::RegisterError::ParseError {
@@ -312,6 +315,59 @@ pub(super) const MAX_EXPR_DEPTH: usize = 128;
 
 /// Maximum SQL input length (defense-in-depth against pathological inputs).
 pub(super) const MAX_SQL_LEN: usize = 8192;
+
+/// Reject SQL likely to drive sqlparser into pathological backtracking.
+///
+/// Tracks parenthesis nesting and consecutive-operator runs, requires
+/// balanced parens at EOF, and rejects non-whitespace control characters
+/// (NUL, vertical tab, form feed, etc.). Real SQL contains none of those;
+/// fuzz-found inputs that hit them have driven sqlparser to near-exponential
+/// parse times.
+fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
+    let mut paren_depth: usize = 0;
+    let mut consecutive_ops: usize = 0;
+
+    for c in sql.bytes() {
+        match c {
+            b'(' => {
+                paren_depth += 1;
+                consecutive_ops += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                consecutive_ops = 0;
+            }
+            b'+' | b'-' | b'*' | b'/' | b'=' | b'<' | b'>' | b'!' | b'~' => {
+                consecutive_ops += 1;
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => {}
+            // ASCII control characters other than tab/LF/CR have no place
+            // in SQL and are a strong adversarial-input signal.
+            0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F => {
+                return Err(crate::RegisterError::UnsupportedSql(
+                    "Control character in SQL".to_string(),
+                ));
+            }
+            _ => {
+                consecutive_ops = 0;
+            }
+        }
+
+        if paren_depth > MAX_EXPR_DEPTH || consecutive_ops > MAX_EXPR_DEPTH {
+            return Err(crate::RegisterError::UnsupportedSql(
+                "Expression nesting too deep".to_string(),
+            ));
+        }
+    }
+
+    if paren_depth != 0 {
+        return Err(crate::RegisterError::UnsupportedSql(
+            "Unbalanced parentheses".to_string(),
+        ));
+    }
+
+    Ok(())
+}
 
 /// Extract the single table name and WHERE clause from a supported SELECT.
 ///
@@ -357,5 +413,36 @@ pub(super) fn extract_single_table_and_where(
              For INSERT, UPDATE, DELETE, or DDL operations, use your database directly."
                 .to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sanity_tests {
+    use super::check_sql_sanity;
+    use crate::RegisterError;
+
+    #[test]
+    fn rejects_vertical_tab() {
+        let err = check_sql_sanity("SELECT * FROM t WHERE a\x0b= 1").unwrap_err();
+        assert!(matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("Control")));
+    }
+
+    #[test]
+    fn rejects_nul_byte() {
+        let err = check_sql_sanity("SELECT * FROM t WHERE a\x00= 1").unwrap_err();
+        assert!(matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("Control")));
+    }
+
+    #[test]
+    fn rejects_unbalanced_open_parens() {
+        let err = check_sql_sanity("SELECT * FROM t WHERE ((((a = 1").unwrap_err();
+        assert!(matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("Unbalanced")));
+    }
+
+    #[test]
+    fn accepts_well_formed_sql() {
+        check_sql_sanity("SELECT * FROM t WHERE a = 1\nAND b > 2").unwrap();
+        check_sql_sanity("SELECT * FROM t WHERE x IN (1, 2, 3)").unwrap();
     }
 }
