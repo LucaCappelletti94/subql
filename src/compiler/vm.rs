@@ -22,7 +22,8 @@ pub enum VmError {
     /// Invalid column index (should never happen if compilation correct)
     InvalidColumnIndex(u16),
 
-    /// Jump offset points past the end of the program
+    /// Jump offset is invalid: either zero (no forward progress, would loop
+    /// on the jump instruction) or past the end of the program.
     BadJump(usize),
 
     /// Bytecode program terminated with more than one value on the stack (compiler bug).
@@ -71,6 +72,12 @@ impl Vm {
                     // Peek at TOS without popping
                     let top = self.peek_tri()?;
                     if top == Tri::False {
+                        // Zero-offset jumps would re-execute the same
+                        // instruction forever; the compiler never emits them,
+                        // so treat as malformed bytecode.
+                        if *offset == 0 {
+                            return Err(VmError::BadJump(ip));
+                        }
                         let new_ip = ip.saturating_add(*offset);
                         if new_ip > len {
                             return Err(VmError::BadJump(new_ip));
@@ -83,6 +90,9 @@ impl Vm {
                     // Peek at TOS without popping
                     let top = self.peek_tri()?;
                     if top == Tri::True {
+                        if *offset == 0 {
+                            return Err(VmError::BadJump(ip));
+                        }
                         let new_ip = ip.saturating_add(*offset);
                         if new_ip > len {
                             return Err(VmError::BadJump(new_ip));
@@ -2457,6 +2467,46 @@ mod tests {
         ]);
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
+    }
+
+    #[test]
+    fn test_jump_if_false_zero_offset_is_bad_jump() {
+        // A zero-offset taken jump would re-execute itself forever. Fuzz
+        // input that decoded to PushLiteral(Missing) / IsNull / JumpIfTrue(0)
+        // hung the VM until cargo-fuzz's -timeout triggered.
+        let mut vm = Vm::new();
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(false)),
+            Instruction::JumpIfFalse(0),
+        ]);
+        let row = make_row(vec![]);
+        assert!(matches!(vm.eval(&program, &row), Err(VmError::BadJump(1))));
+    }
+
+    #[test]
+    fn test_jump_if_true_zero_offset_is_bad_jump() {
+        let mut vm = Vm::new();
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Missing),
+            Instruction::IsNull, // TOS = Tri::True
+            Instruction::JumpIfTrue(0),
+        ]);
+        let row = make_row(vec![]);
+        assert!(matches!(vm.eval(&program, &row), Err(VmError::BadJump(2))));
+    }
+
+    #[test]
+    fn test_jump_zero_offset_not_taken_falls_through() {
+        // Untaken zero-offset jumps are still allowed (they're harmless,
+        // and rejecting them would break programs that the compiler
+        // never emits but the VM has historically tolerated).
+        let mut vm = Vm::new();
+        let program = BytecodeProgram::new(vec![
+            Instruction::PushLiteral(Cell::Bool(true)),
+            Instruction::JumpIfFalse(0), // condition False → not taken
+        ]);
+        let row = make_row(vec![]);
+        assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
     }
 
     #[test]
