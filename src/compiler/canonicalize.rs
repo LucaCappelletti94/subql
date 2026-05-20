@@ -84,7 +84,10 @@ pub fn hash_sql(normalized: &str) -> PredicateHash {
 /// Reject SQL with excessive nesting before parsing to prevent stack overflow.
 ///
 /// Tracks parenthesis nesting depth and consecutive unary-operator chains,
-/// both of which cause recursive descent in sqlparser.
+/// both of which cause recursive descent in sqlparser. Also rejects inputs
+/// whose parentheses are unbalanced at EOF — those are syntactically invalid
+/// SQL and can drive sqlparser's recursive descent into pathological (near
+/// exponential) backtracking before it eventually gives up.
 fn check_sql_depth(sql: &str) -> Result<(), RegisterError> {
     let mut paren_depth: usize = 0;
     let mut consecutive_ops: usize = 0;
@@ -114,6 +117,13 @@ fn check_sql_depth(sql: &str) -> Result<(), RegisterError> {
             ));
         }
     }
+
+    if paren_depth != 0 {
+        return Err(RegisterError::UnsupportedSql(
+            "Unbalanced parentheses".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -506,6 +516,29 @@ mod tests {
         let result = normalize_sql(sql, &dialect);
 
         assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
+    }
+
+    #[test]
+    fn test_check_sql_depth_rejects_unbalanced_open_parens() {
+        // Unbalanced open parens drove sqlparser's recursive descent into
+        // pathological backtracking — caught by fuzz_canonicalize before
+        // the EOF-balance guard was added.
+        let err = check_sql_depth("SELECT * FROM t WHERE ((((a = 1").unwrap_err();
+        assert!(matches!(err, RegisterError::UnsupportedSql(ref m) if m.contains("Unbalanced")));
+    }
+
+    #[test]
+    fn test_check_sql_depth_accepts_balanced_parens() {
+        check_sql_depth("SELECT * FROM t WHERE (a = 1) AND ((b > 2))").unwrap();
+        check_sql_depth("WHERE x IN (1, 2, 3)").unwrap();
+    }
+
+    #[test]
+    fn test_check_sql_depth_accepts_excess_close_parens() {
+        // saturating_sub means trailing extra `)` clamp to depth=0; the
+        // parser will reject them in its own pass. Our pre-check only
+        // guarantees we don't HAND sqlparser something that hangs.
+        check_sql_depth("SELECT * FROM t WHERE a = 1))))").unwrap();
     }
 
     #[test]
