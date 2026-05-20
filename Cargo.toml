@@ -40,8 +40,9 @@ sqlparser = { version = "0.62", default-features = false }
 # feature is propagated below.
 sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
 
-# Compressed bitmaps for predicate/user sets
-roaring = "0.11"
+# Compressed bitmaps for predicate/user sets. Pinned below 0.11.4 because
+# that release bumped its MSRV to 1.90; subql's MSRV gate is 1.88.
+roaring = ">=0.11, <0.11.4"
 
 # Stable ID allocation (predicates)
 slab = "0.4"
@@ -55,10 +56,9 @@ arc-swap = "1.7"
 # spin-wait overhead vs std Mutex is irrelevant.
 spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex", "once", "lazy"] }
 
-# Fast hashing. ahash's `AHashMap` is std-only, so we use `hashbrown`'s
-# `HashMap`/`HashSet` directly — they're no_std-friendly and use ahash as
-# their default hasher via hashbrown's `default-hasher` feature.
-ahash = { version = "0.8", default-features = false, features = ["compile-time-rng"] }
+# Fast hashing. `hashbrown` is no_std-friendly and ships its own default
+# hasher (foldhash) via the `default-hasher` feature — no direct ahash dep
+# required.
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "serde", "inline-more", "allocator-api2"] }
 seahash = "4.1"        # Deterministic hashing for canonicalization
 
@@ -107,8 +107,6 @@ default = ["std"]
 std = [
     "sqlparser/std",
     "sql-traits/std",
-    "ahash/std",
-    "ahash/runtime-rng",
     "hashbrown/default",
     "serde/std",
     "serde_json/std",

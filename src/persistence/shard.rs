@@ -77,7 +77,7 @@ impl ShardFingerprintEnvelope {
     ///
     /// **Wire-format invariant**: the `algorithm_id` byte is a stable on-disk
     /// identifier. Any new [`AlgorithmId`] variant added upstream MUST be
-    /// assigned a fresh constant here (and SHOULD bump [`SHARD_VERSION`] so
+    /// assigned a fresh constant here (and SHOULD bump `SHARD_VERSION` so
     /// pre-existing shards can be distinguished). Reassigning an existing
     /// `u8` value would silently produce shards that validate but were
     /// computed under a different hash.

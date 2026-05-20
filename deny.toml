@@ -7,6 +7,12 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Zlib",
+    # `sql_docs` is GPL-3.0; pulled in as a build-only dev-tooling dependency
+    # via sql-traits. Compatible with subql's MIT/Apache-2.0 dual licensing
+    # since GPL-3.0 code is not statically linked into runtime artifacts.
+    "GPL-3.0",
+    # `tiny-keccak` (transitive via the FINGERPRINT_SPEC SHA3 path) is CC0.
+    "CC0-1.0",
 ]
 
 [bans]

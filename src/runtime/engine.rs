@@ -3093,6 +3093,15 @@ mod tests {
     fn test_register_batch_required_durability_rolls_back_on_snapshot_failure() {
         use tempfile::TempDir;
 
+        // Serialize against tests that populate the global batch-phase3
+        // partition-drop injection set for table_id=1 (`orders`). Without
+        // this lock, a concurrent injection turns this test's pre-commit
+        // snapshot failure into a phase-3 "missing partition" failure,
+        // which bypasses durability-driven rollback.
+        let _test_lock = injection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let temp_dir = TempDir::new().unwrap();
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
