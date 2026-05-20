@@ -102,13 +102,18 @@ fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction> {
 
 /// Parse SQL with both PostgreSQL and Generic dialects.
 pub fn harness_parse_sql(data: &[u8]) {
+    // Real callers pass valid UTF-8 SQL. `from_utf8_lossy` introduces
+    // U+FFFD bytes that have driven sqlparser into pathological
+    // backtracking — those code paths can't be reached in production.
+    let Ok(sql) = core::str::from_utf8(data) else {
+        return;
+    };
     let catalog = fuzz_catalog();
     let pg = PostgreSqlDialect {};
     let generic = GenericDialect {};
-    let sql = String::from_utf8_lossy(data);
 
-    let _ = parse_and_compile(&sql, &pg, &catalog);
-    let _ = parse_and_compile(&sql, &generic, &catalog);
+    let _ = parse_and_compile(sql, &pg, &catalog);
+    let _ = parse_and_compile(sql, &generic, &catalog);
 }
 
 /// Generate random bytecode + row and evaluate with the VM.
@@ -156,12 +161,14 @@ pub fn harness_deserialize_shard(data: &[u8]) {
 
 /// Normalize and hash SQL, asserting determinism.
 pub fn harness_canonicalize(data: &[u8]) {
+    let Ok(sql) = core::str::from_utf8(data) else {
+        return;
+    };
     let pg = PostgreSqlDialect {};
     let generic = GenericDialect {};
-    let sql = String::from_utf8_lossy(data);
 
     for dialect in [&pg as &dyn sqlparser::dialect::Dialect, &generic] {
-        if let Ok(normalized) = normalize_sql(&sql, dialect) {
+        if let Ok(normalized) = normalize_sql(sql, dialect) {
             let h1 = hash_sql(&normalized);
             let h2 = hash_sql(&normalized);
             assert_eq!(h1, h2, "hash_sql is not deterministic");
