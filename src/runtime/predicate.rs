@@ -6,10 +6,11 @@ use crate::{
     compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
     ColumnId, IdTypes, SubscriptionId, SubscriptionScope,
 };
-use ahash::{AHashMap, AHashSet};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use hashbrown::{HashMap, HashSet};
 use roaring::RoaringBitmap;
 use slab::Slab;
-use std::sync::Arc;
 
 /// Compiled predicate with metadata
 #[derive(Clone, Debug)]
@@ -69,13 +70,13 @@ pub struct PredicateStore<I: IdTypes> {
     /// Slab-allocated predicates (stable IDs)
     pub predicates: Slab<Predicate>,
     /// Hash → candidate PredicateIds (for deduplication with collision checks)
-    pub hash_index: AHashMap<PredicateHash, Vec<PredicateId>>,
+    pub hash_index: HashMap<PredicateHash, Vec<PredicateId>>,
     /// SubscriptionId → SubscriptionBinding
-    pub bindings: AHashMap<SubscriptionId, SubscriptionBinding<I>>,
+    pub bindings: HashMap<SubscriptionId, SubscriptionBinding<I>>,
     /// SessionId → `Vec<SubscriptionId>` (for session cleanup)
-    pub scope_index: AHashMap<I::SessionId, Vec<SubscriptionId>>,
+    pub scope_index: HashMap<I::SessionId, Vec<SubscriptionId>>,
     /// PredicateId → `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate)
-    pub predicate_consumers: AHashMap<PredicateId, RoaringBitmap>,
+    pub predicate_consumers: HashMap<PredicateId, RoaringBitmap>,
 }
 
 impl<I: IdTypes> Clone for PredicateStore<I> {
@@ -96,10 +97,10 @@ impl<I: IdTypes> PredicateStore<I> {
     pub fn new() -> Self {
         Self {
             predicates: Slab::new(),
-            hash_index: AHashMap::new(),
-            bindings: AHashMap::new(),
-            scope_index: AHashMap::new(),
-            predicate_consumers: AHashMap::new(),
+            hash_index: HashMap::new(),
+            bindings: HashMap::new(),
+            scope_index: HashMap::new(),
+            predicate_consumers: HashMap::new(),
         }
     }
 
@@ -225,7 +226,7 @@ impl<I: IdTypes> PredicateStore<I> {
     pub fn get_session_subscriptions(&self, session_id: I::SessionId) -> Option<&[SubscriptionId]> {
         self.scope_index
             .get(&session_id)
-            .map(std::vec::Vec::as_slice)
+            .map(alloc::vec::Vec::as_slice)
     }
 
     /// Returns `true` if any active binding references the given consumer.
@@ -236,7 +237,7 @@ impl<I: IdTypes> PredicateStore<I> {
 
     /// Collect the set of distinct consumer IDs across all active bindings.
     #[must_use]
-    pub fn active_consumer_ids(&self) -> AHashSet<I::ConsumerId> {
+    pub fn active_consumer_ids(&self) -> HashSet<I::ConsumerId> {
         self.bindings.values().map(|b| b.consumer_id).collect()
     }
 

@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use hashbrown::HashMap;
 
 use super::shard::PredicateData;
 
@@ -21,8 +21,8 @@ pub fn predicate_data_equivalent(left: &PredicateData, right: &PredicateData) ->
 pub fn dedup_predicates_by_hash<E>(
     predicates: impl IntoIterator<Item = PredicateData>,
     make_error: impl Fn(String) -> E,
-) -> Result<AHashMap<u128, PredicateData>, E> {
-    let mut unique: AHashMap<u128, PredicateData> = AHashMap::new();
+) -> Result<HashMap<u128, PredicateData>, E> {
+    let mut unique: HashMap<u128, PredicateData> = HashMap::new();
     for pred in predicates {
         if let Some(existing) = unique.get_mut(&pred.hash) {
             if !predicate_data_equivalent(existing, &pred) {

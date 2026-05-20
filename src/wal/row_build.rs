@@ -1,5 +1,7 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use hashbrown::{HashMap, HashSet};
 
 use crate::{catalog_helpers, Cell, ColumnId, RowImage, TableId};
 use sql_traits::prelude::DatabaseLike;

@@ -11,6 +11,9 @@ use super::{
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{Cell, RegisterError, TableId};
+use alloc::borrow::ToOwned;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{Expr, ObjectName, Statement};
 use sqlparser::dialect::Dialect;

@@ -2,10 +2,12 @@
 
 use super::sql_shape;
 use crate::RegisterError;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::hash::{Hash, Hasher};
 use seahash::SeaHasher;
 use sqlparser::ast::{BinaryOperator, Expr, Statement};
 use sqlparser::dialect::Dialect;
-use std::hash::{Hash, Hasher};
 
 /// Predicate hash (128-bit, deterministic)
 pub type PredicateHash = u128;

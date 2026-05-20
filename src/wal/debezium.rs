@@ -5,9 +5,11 @@
 //! Like Maxwell, Debezium provides bare JSON values without column type
 //! metadata, so we use type inference via [`infer_cell_from_json`].
 
-use std::collections::HashMap;
+use alloc::string::String;
 #[cfg(test)]
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use hashbrown::HashMap;
 
 use serde::Deserialize;
 

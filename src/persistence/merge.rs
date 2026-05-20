@@ -3,7 +3,7 @@
 use super::predicate_data::dedup_predicates_by_hash;
 use super::shard::{deserialize_shard, BindingData, ConsumerDictData, PredicateData, ShardPayload};
 use crate::{IdTypes, MergeError, MergeJobId, MergeReport, SubscriptionId, TableId};
-use ahash::AHashMap;
+use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use std::marker::PhantomData;
 use std::sync::{
@@ -48,7 +48,7 @@ struct MergeTask<I: IdTypes, DB: DatabaseLike> {
 
 /// Manager for background merge operations
 pub struct MergeManager<I: IdTypes, DB: DatabaseLike> {
-    jobs: AHashMap<MergeJobId, MergeJob<I>>,
+    jobs: HashMap<MergeJobId, MergeJob<I>>,
     next_job_id: MergeJobId,
     task_sender: Sender<MergeTask<I, DB>>,
     _db: PhantomData<fn() -> DB>,
@@ -99,7 +99,7 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
         }
 
         Self {
-            jobs: AHashMap::new(),
+            jobs: HashMap::new(),
             next_job_id: 1,
             task_sender,
             _db: PhantomData,
@@ -237,7 +237,7 @@ fn merge_shards_impl<I: IdTypes, DB: DatabaseLike>(
     // 4. Filter bindings (remove duplicates, keep most recent by timestamp;
     //    break ties deterministically by predicate_hash so output is stable
     //    regardless of shard input order).
-    let mut unique_bindings: AHashMap<SubscriptionId, BindingData<I>> = AHashMap::new();
+    let mut unique_bindings: HashMap<SubscriptionId, BindingData<I>> = HashMap::new();
 
     for binding in all_bindings {
         unique_bindings

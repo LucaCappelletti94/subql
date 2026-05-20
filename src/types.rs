@@ -1,11 +1,14 @@
 //! Core type definitions for subql
 
+use alloc::collections::BTreeSet;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::fmt::Debug;
+use core::hash::Hash;
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::BTreeSet;
-use std::fmt::Debug;
-use std::hash::Hash;
+#[cfg(feature = "std")]
 use std::path::PathBuf;
-use std::sync::Arc;
 
 // ============================================================================
 // Generic ID Types
@@ -67,8 +70,8 @@ impl<I: IdTypes> Clone for SubscriptionScope<I> {
         *self
     }
 }
-impl<I: IdTypes> std::fmt::Debug for SubscriptionScope<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<I: IdTypes> core::fmt::Debug for SubscriptionScope<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Durable => write!(f, "Durable"),
             Self::Session(id) => f.debug_tuple("Session").field(id).finish(),
@@ -85,9 +88,9 @@ impl<I: IdTypes> PartialEq for SubscriptionScope<I> {
     }
 }
 impl<I: IdTypes> Eq for SubscriptionScope<I> {}
-impl<I: IdTypes> std::hash::Hash for SubscriptionScope<I> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
+impl<I: IdTypes> core::hash::Hash for SubscriptionScope<I> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
         if let Self::Session(id) = self {
             id.hash(state);
         }
@@ -380,8 +383,8 @@ pub struct PrimaryKeyError {
     values_len: usize,
 }
 
-impl std::fmt::Display for PrimaryKeyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for PrimaryKeyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "primary key columns/values length mismatch: columns={}, values={}",
@@ -390,7 +393,7 @@ impl std::fmt::Display for PrimaryKeyError {
     }
 }
 
-impl std::error::Error for PrimaryKeyError {}
+impl core::error::Error for PrimaryKeyError {}
 
 impl PrimaryKeyError {
     /// Number of column IDs in the invalid input.
@@ -513,8 +516,8 @@ pub enum WalEventBuildError {
     FieldNotAllowedForKind(&'static str),
 }
 
-impl std::fmt::Display for WalEventBuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for WalEventBuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::MissingNewRow => write!(f, "missing required field: new_row"),
             Self::MissingOldRow => write!(f, "missing required field: old_row"),
@@ -535,7 +538,7 @@ impl std::fmt::Display for WalEventBuildError {
     }
 }
 
-impl std::error::Error for WalEventBuildError {}
+impl core::error::Error for WalEventBuildError {}
 
 /// Start of fluent `WalEvent` construction.
 #[derive(Clone, Debug)]
@@ -856,8 +859,7 @@ impl WalEvent {
     /// Primary key for row-level events. Truncate returns an empty key.
     #[must_use]
     pub fn pk(&self) -> &PrimaryKey {
-        static EMPTY_PK: std::sync::LazyLock<PrimaryKey> =
-            std::sync::LazyLock::new(PrimaryKey::empty);
+        static EMPTY_PK: spin::Lazy<PrimaryKey> = spin::Lazy::new(PrimaryKey::empty);
         match self {
             Self::Insert { pk, .. } | Self::Update { pk, .. } | Self::Delete { pk, .. } => pk,
             Self::Truncate { .. } => &EMPTY_PK,
@@ -956,6 +958,7 @@ pub struct RegisterResult {
 }
 
 /// Durability policy for registration writes when storage is enabled.
+#[cfg(feature = "std")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DurabilityMode {
@@ -977,6 +980,7 @@ pub struct UnregisterReport {
 }
 
 /// Report from background merge operation
+#[cfg(feature = "std")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MergeReport {
     /// Number of input shards merged
@@ -1051,6 +1055,7 @@ pub trait SubscriptionUnregistration<I: IdTypes>: Send {
 }
 
 /// Durable shard storage operations
+#[cfg(feature = "std")]
 pub trait DurableShardStore: Send {
     /// Snapshot a table partition to durable storage.
     fn snapshot_table(&self, table_id: TableId) -> Result<(), crate::StorageError>;
@@ -1164,8 +1169,8 @@ impl<I: IdTypes> ConsumerNotifications<I> {
     }
 }
 
-impl<I: IdTypes> std::fmt::Debug for ConsumerNotifications<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<I: IdTypes> core::fmt::Debug for ConsumerNotifications<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ConsumerNotifications")
             .field("inserted", &self.inserted)
             .field("deleted", &self.deleted)
@@ -1177,8 +1182,8 @@ impl<I: IdTypes> std::fmt::Debug for ConsumerNotifications<I> {
 /// Iterator over `inserted ∪ updated` consumers — those who should see the
 /// current row state.
 pub struct ConsumerNotificationsIter<I: IdTypes> {
-    inserted: std::vec::IntoIter<I::ConsumerId>,
-    updated: std::vec::IntoIter<I::ConsumerId>,
+    inserted: alloc::vec::IntoIter<I::ConsumerId>,
+    updated: alloc::vec::IntoIter<I::ConsumerId>,
 }
 
 impl<I: IdTypes> Iterator for ConsumerNotificationsIter<I> {
@@ -1235,6 +1240,7 @@ pub trait AggregateDispatch<I: IdTypes>: Send {
 }
 
 /// Background merge operations
+#[cfg(feature = "std")]
 pub trait DurableShardMerge: Send {
     /// Start background merge of shard files for a table.
     fn merge_shards_background(

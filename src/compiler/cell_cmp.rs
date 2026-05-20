@@ -17,17 +17,17 @@ pub fn cells_equal(a: &Cell, b: &Cell) -> bool {
         (Cell::Int(x), Cell::Int(y)) => x == y,
         (Cell::Float(x), Cell::Float(y)) => x
             .partial_cmp(y)
-            .is_some_and(|ord| ord == std::cmp::Ordering::Equal),
+            .is_some_and(|ord| ord == core::cmp::Ordering::Equal),
         // Mixed numeric comparisons: coerce to float
         (Cell::Int(x), Cell::Float(y)) => {
             let xf = *x as f64;
             xf.partial_cmp(y)
-                .is_some_and(|ord| ord == std::cmp::Ordering::Equal)
+                .is_some_and(|ord| ord == core::cmp::Ordering::Equal)
         }
         (Cell::Float(x), Cell::Int(y)) => {
             let yf = *y as f64;
             x.partial_cmp(&yf)
-                .is_some_and(|ord| ord == std::cmp::Ordering::Equal)
+                .is_some_and(|ord| ord == core::cmp::Ordering::Equal)
         }
         (Cell::String(x), Cell::String(y)) => x == y,
         // NULL = NULL is Unknown, not True; all other mismatches → false
@@ -42,7 +42,7 @@ pub fn cells_equal(a: &Cell, b: &Cell) -> bool {
 #[allow(clippy::many_single_char_names, clippy::cast_precision_loss)]
 pub fn compare_ordered_cells<F>(lhs: &Cell, rhs: &Cell, predicate: F) -> Tri
 where
-    F: FnOnce(std::cmp::Ordering) -> bool,
+    F: FnOnce(core::cmp::Ordering) -> bool,
 {
     // NULL or Missing → Unknown
     if lhs.is_null() || lhs.is_missing() || rhs.is_null() || rhs.is_missing() {
@@ -55,7 +55,7 @@ where
             if x.is_nan() || y.is_nan() {
                 return Tri::Unknown;
             }
-            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+            x.partial_cmp(y).unwrap_or(core::cmp::Ordering::Equal)
         }
         // Mixed Int/Float comparisons — coerce to Float
         (Cell::Int(x), Cell::Float(y)) => {
@@ -63,14 +63,15 @@ where
             if y.is_nan() {
                 return Tri::Unknown;
             }
-            x_float.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+            x_float.partial_cmp(y).unwrap_or(core::cmp::Ordering::Equal)
         }
         (Cell::Float(x), Cell::Int(y)) => {
             let y_float = *y as f64;
             if x.is_nan() {
                 return Tri::Unknown;
             }
-            x.partial_cmp(&y_float).unwrap_or(std::cmp::Ordering::Equal)
+            x.partial_cmp(&y_float)
+                .unwrap_or(core::cmp::Ordering::Equal)
         }
         (Cell::String(x), Cell::String(y)) => x.cmp(y),
         _ => return Tri::Unknown, // Type mismatch

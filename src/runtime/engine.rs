@@ -14,6 +14,12 @@ use crate::{
         sql_shape::{AggSpec, QueryProjection},
         BytecodeProgram, PrefilterPlan, Vm,
     },
+    DispatchError, EventKind, IdTypes, RegisterError, RegisterResult, RowImage,
+    SubscriptionDispatch, SubscriptionId, SubscriptionRegistration, SubscriptionRequest,
+    SubscriptionScope, SubscriptionUnregistration, TableId, UnregisterReport, WalEvent,
+};
+#[cfg(feature = "std")]
+use crate::{
     persistence::{
         codec,
         merge::MergeManager,
@@ -23,16 +29,15 @@ use crate::{
             ShardPayload,
         },
     },
-    DispatchError, DurabilityMode, DurableShardMerge, DurableShardStore, EventKind, IdTypes,
-    MergeError, MergeJobId, MergeReport, RegisterError, RegisterResult, RowImage, StorageError,
-    SubscriptionDispatch, SubscriptionId, SubscriptionRegistration, SubscriptionRequest,
-    SubscriptionScope, SubscriptionUnregistration, TableId, UnregisterReport, WalEvent,
+    DurabilityMode, DurableShardMerge, DurableShardStore, MergeError, MergeJobId, MergeReport,
+    StorageError,
 };
-use ahash::{AHashMap, AHashSet};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use hashbrown::{HashMap, HashSet};
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::dialect::Dialect;
-#[cfg(test)]
-use std::collections::HashSet;
+#[cfg(feature = "std")]
 use std::io::Write;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
@@ -49,14 +54,17 @@ struct CompiledSpec<I: IdTypes> {
     hash: u128,
 }
 
+#[cfg(feature = "std")]
 enum DurabilityCheckOutcome {
     Ok,
     RequiredFailure { message: String, post_commit: bool },
 }
 
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
+#[cfg(feature = "std")]
 #[derive(Debug)]
 enum RebuildPayloadError {
     Codec(String),
@@ -99,8 +107,9 @@ fn injected_compile_hash_override(normalized: &str) -> Option<u128> {
     INJECT_COMPILE_HASH_OVERRIDES.with(|cell| cell.borrow().get(normalized).copied())
 }
 
-impl std::fmt::Display for RebuildPayloadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+#[cfg(feature = "std")]
+impl core::fmt::Display for RebuildPayloadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Codec(msg) | Self::Corrupt(msg) => f.write_str(msg),
         }
@@ -117,32 +126,35 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     /// Schema database for table/column resolution
     database: Arc<DB>,
     /// Table partitions (TableId → TablePartition)
-    partitions: AHashMap<TableId, TablePartition<I>>,
+    partitions: HashMap<TableId, TablePartition<I>>,
     /// User dictionaries (TableId → ConsumerDictionary)
-    consumer_dictionaries: AHashMap<TableId, ConsumerDictionary<I>>,
+    consumer_dictionaries: HashMap<TableId, ConsumerDictionary<I>>,
     /// Subscription index for O(1) unregister/upsert lookup.
-    subscription_to_table: AHashMap<SubscriptionId, TableId>,
+    subscription_to_table: HashMap<SubscriptionId, TableId>,
     /// Monotonic counter for auto-assigning subscription IDs (starts at 1).
     next_subscription_id: u64,
     /// Dedup index: (consumer_id, predicate_hash, scope) → existing SubscriptionId.
-    binding_dedup: AHashMap<(I::ConsumerId, u128, SubscriptionScope<I>), SubscriptionId>,
+    binding_dedup: HashMap<(I::ConsumerId, u128, SubscriptionScope<I>), SubscriptionId>,
     /// VM for bytecode evaluation
     vm: Vm,
     /// Optional storage path for durability
+    #[cfg(feature = "std")]
     storage_path: Option<PathBuf>,
     /// Shard rotation threshold (bytes)
     rotation_threshold: usize,
     /// Background merge compaction manager
+    #[cfg(feature = "std")]
     merge_manager: MergeManager<I, DB>,
     /// Persistence strictness policy for registration.
+    #[cfg(feature = "std")]
     durability_mode: DurabilityMode,
 }
 
 /// Look up the partition and consumer dictionary for a table, or return
 /// `DispatchError::UnknownTableId` if either is missing.
 fn table_context<'a, I: IdTypes>(
-    partitions: &'a AHashMap<TableId, TablePartition<I>>,
-    consumer_dicts: &'a AHashMap<TableId, ConsumerDictionary<I>>,
+    partitions: &'a HashMap<TableId, TablePartition<I>>,
+    consumer_dicts: &'a HashMap<TableId, ConsumerDictionary<I>>,
     table_id: TableId,
 ) -> Result<(&'a TablePartition<I>, &'a ConsumerDictionary<I>), DispatchError> {
     let partition = partitions
@@ -248,11 +260,13 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         }
     }
 
+    #[cfg(feature = "std")]
     const fn is_post_commit_dirsync_error(err: &StorageError) -> bool {
         matches!(err, StorageError::PostCommitDirSync(_))
     }
 
     // Not `const fn`: the observability branch calls tracing::warn! which is not const.
+    #[cfg(feature = "std")]
     #[allow(clippy::missing_const_for_fn)]
     fn log_best_effort_durability(message: &str) {
         #[cfg(feature = "observability")]
@@ -261,6 +275,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         let _ = message;
     }
 
+    #[cfg(feature = "std")]
     fn enforce_table_durability(&self, table_id: TableId) -> DurabilityCheckOutcome {
         if self.storage_path.is_none() {
             return DurabilityCheckOutcome::Ok;
@@ -349,15 +364,21 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         Self {
             dialect,
             database,
-            partitions: AHashMap::new(),
-            consumer_dictionaries: AHashMap::new(),
-            subscription_to_table: AHashMap::new(),
+            partitions: HashMap::new(),
+            consumer_dictionaries: HashMap::new(),
+            subscription_to_table: HashMap::new(),
             next_subscription_id: 1,
-            binding_dedup: AHashMap::new(),
+            binding_dedup: HashMap::new(),
             vm: Vm::new(),
+            #[cfg(feature = "std")]
             storage_path: None,
+            #[cfg(feature = "std")]
             rotation_threshold: crate::config::DEFAULT_ROTATION_THRESHOLD,
+            #[cfg(not(feature = "std"))]
+            rotation_threshold: 0,
+            #[cfg(feature = "std")]
             merge_manager: MergeManager::new(),
+            #[cfg(feature = "std")]
             durability_mode: DurabilityMode::Required,
         }
     }
@@ -365,6 +386,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// Create engine with durable storage
     ///
     /// Loads existing shards from storage directory on startup.
+    #[cfg(feature = "std")]
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_storage(
         database: Arc<DB>,
@@ -489,6 +511,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         self.binding_dedup.insert(natural_key, subscription_id);
 
         // 9. Enforce durability policy for this table.
+        #[cfg(feature = "std")]
         if let DurabilityCheckOutcome::RequiredFailure {
             message,
             post_commit,
@@ -609,12 +632,12 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         }
 
         // Phase 2: Group by table and batch-insert
-        let mut table_entries: AHashMap<TableId, BatchEntries<I>> = AHashMap::new();
-        let mut table_result_indices: AHashMap<TableId, Vec<usize>> = AHashMap::new();
-        let mut table_inserted_sub_ids: AHashMap<TableId, Vec<SubscriptionId>> = AHashMap::new();
+        let mut table_entries: HashMap<TableId, BatchEntries<I>> = HashMap::new();
+        let mut table_result_indices: HashMap<TableId, Vec<usize>> = HashMap::new();
+        let mut table_inserted_sub_ids: HashMap<TableId, Vec<SubscriptionId>> = HashMap::new();
 
         // Track which hashes we've already prepared (dedup within batch)
-        let mut batch_hash_to_idx: AHashMap<(TableId, u128, String), usize> = AHashMap::new();
+        let mut batch_hash_to_idx: HashMap<(TableId, u128, String), usize> = HashMap::new();
 
         for (i, entry) in compiled.into_iter().enumerate() {
             let Some(c) = entry else { continue };
@@ -711,7 +734,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         }
 
         // Phase 3: Batch-insert into partitions (single COW + single swap per table)
-        let mut phase3_failed_tables = AHashSet::new();
+        let mut phase3_failed_tables = HashSet::new();
         for (table_id, entries) in table_entries {
             let Some(partition) = self.partitions.get_mut(&table_id) else {
                 phase3_failed_tables.insert(table_id);
@@ -733,35 +756,43 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             }
         }
 
-        let mut failures: Vec<(TableId, String, bool)> = Vec::new();
-        for &table_id in table_result_indices.keys() {
-            if phase3_failed_tables.contains(&table_id) {
-                continue;
+        #[cfg(feature = "std")]
+        {
+            let mut failures: Vec<(TableId, String, bool)> = Vec::new();
+            for &table_id in table_result_indices.keys() {
+                if phase3_failed_tables.contains(&table_id) {
+                    continue;
+                }
+                if let DurabilityCheckOutcome::RequiredFailure {
+                    message,
+                    post_commit,
+                } = self.enforce_table_durability(table_id)
+                {
+                    failures.push((table_id, message, post_commit));
+                }
             }
-            if let DurabilityCheckOutcome::RequiredFailure {
-                message,
-                post_commit,
-            } = self.enforce_table_durability(table_id)
-            {
-                failures.push((table_id, message, post_commit));
-            }
-        }
 
-        if !failures.is_empty() && self.durability_mode == DurabilityMode::Required {
-            for (table_id, message, post_commit) in failures {
-                if !post_commit {
-                    if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
-                        for &sub_id in sub_ids {
-                            let _ = self.unregister_subscription_internal(sub_id);
+            if !failures.is_empty() && self.durability_mode == DurabilityMode::Required {
+                for (table_id, message, post_commit) in failures {
+                    if !post_commit {
+                        if let Some(sub_ids) = table_inserted_sub_ids.get(&table_id) {
+                            for &sub_id in sub_ids {
+                                let _ = self.unregister_subscription_internal(sub_id);
+                            }
+                        }
+                    }
+                    if let Some(indices) = table_result_indices.get(&table_id) {
+                        for &idx in indices {
+                            results[idx] = Err(RegisterError::Storage(message.clone()));
                         }
                     }
                 }
-                if let Some(indices) = table_result_indices.get(&table_id) {
-                    for &idx in indices {
-                        results[idx] = Err(RegisterError::Storage(message.clone()));
-                    }
-                }
             }
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = phase3_failed_tables;
+            let _ = table_inserted_sub_ids;
         }
 
         results
@@ -1026,8 +1057,8 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
         // Collect subscription IDs to remove
         let mut to_remove = Vec::new();
-        let mut removed_consumer_candidates: AHashMap<TableId, AHashSet<I::ConsumerId>> =
-            AHashMap::new();
+        let mut removed_consumer_candidates: HashMap<TableId, HashSet<I::ConsumerId>> =
+            HashMap::new();
 
         for (&table_id, partition) in &self.partitions {
             let snapshot = partition.load_snapshot();
@@ -1056,7 +1087,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                 continue;
             };
 
-            let active_consumers: AHashSet<I::ConsumerId> = self
+            let active_consumers: HashSet<I::ConsumerId> = self
                 .partitions
                 .get(&table_id)
                 .map(|partition| {
@@ -1193,6 +1224,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     // Persistence Methods
     // ========================================================================
 
+    #[cfg(feature = "std")]
     fn sync_parent_dir(path: &Path) -> Result<(), StorageError> {
         #[cfg(test)]
         if Self::should_inject_parent_dir_sync_failure(path) {
@@ -1224,6 +1256,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         Ok(())
     }
 
+    #[cfg(feature = "std")]
     fn durable_atomic_replace(
         storage_path: &Path,
         shard_path: &Path,
@@ -1299,6 +1332,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// Snapshot table partition to disk
     ///
     /// Serializes all predicates, bindings, and consumer dictionary to a shard file.
+    #[cfg(feature = "std")]
     pub fn snapshot_table(&self, table_id: TableId) -> Result<(), StorageError> {
         let storage_path = self
             .storage_path
@@ -1389,6 +1423,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         )
     }
 
+    #[cfg(feature = "std")]
     fn rebuild_entries_from_payload(
         payload: &ShardPayload<I>,
     ) -> Result<(ConsumerDictionary<I>, BatchEntries<I>), RebuildPayloadError> {
@@ -1407,8 +1442,8 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         )?;
 
         // Build bindings grouped by predicate hash; IDs are assigned during add_batch.
-        let mut bindings_by_hash: AHashMap<u128, Vec<SubscriptionBinding<I>>> = AHashMap::new();
-        let mut consumers_with_bindings = AHashSet::new();
+        let mut bindings_by_hash: HashMap<u128, Vec<SubscriptionBinding<I>>> = HashMap::new();
+        let mut consumers_with_bindings = HashSet::new();
         for binding_data in &payload.bindings {
             if !pred_hash_to_data.contains_key(&binding_data.predicate_hash) {
                 return Err(RebuildPayloadError::Corrupt(format!(
@@ -1484,6 +1519,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         Ok((consumer_dict, entries))
     }
 
+    #[cfg(feature = "std")]
     fn replace_table_state(
         &mut self,
         table_id: TableId,
@@ -1514,6 +1550,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         }
     }
 
+    #[cfg(feature = "std")]
     fn rebuild_and_replace_table_state(
         &mut self,
         table_id: TableId,
@@ -1527,6 +1564,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     /// Load shard from disk into partition
+    #[cfg(feature = "std")]
     fn load_shard(&mut self, table_id: TableId, path: &Path) -> Result<(), StorageError> {
         let bytes = std::fs::read(path)
             .map_err(|e| StorageError::Io(format!("Failed to read shard: {e}")))?;
@@ -1548,6 +1586,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         Ok(())
     }
 
+    #[cfg(feature = "std")]
     fn parse_table_id_from_shard_path(path: &Path) -> Option<Result<TableId, String>> {
         if path.extension().and_then(|s| s.to_str()) != Some("shard") {
             return None;
@@ -1563,6 +1602,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     // Not `const fn`: the observability branch calls tracing::warn! which is not const.
+    #[cfg(feature = "std")]
     #[allow(clippy::missing_const_for_fn)]
     fn log_ignored_shard_filename(path: &Path, reason: &str) {
         #[cfg(feature = "observability")]
@@ -1576,6 +1616,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     /// Load all shards from storage directory
+    #[cfg(feature = "std")]
     fn load_all_shards(&mut self) -> Result<(), StorageError> {
         let storage_path = self
             .storage_path
@@ -1604,7 +1645,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
         shard_files.sort_by(|(_, left), (_, right)| left.cmp(right));
 
-        let mut seen_tables: AHashMap<TableId, PathBuf> = AHashMap::new();
+        let mut seen_tables: HashMap<TableId, PathBuf> = HashMap::new();
         for (table_id, path) in &shard_files {
             if let Some(first_path) = seen_tables.insert(*table_id, path.clone()) {
                 return Err(StorageError::Corrupt(format!(
@@ -1623,6 +1664,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     /// Check if rotation is needed for a table
+    #[cfg(feature = "std")]
     fn should_rotate(&self, table_id: TableId) -> Result<bool, StorageError> {
         let partition = self
             .partitions
@@ -1644,6 +1686,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     /// Set durability mode for registration-time persistence.
+    #[cfg(feature = "std")]
     pub const fn set_durability_mode(&mut self, mode: DurabilityMode) {
         self.durability_mode = mode;
     }
@@ -1655,6 +1698,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     /// Get current durability mode.
+    #[cfg(feature = "std")]
     #[must_use]
     pub const fn durability_mode(&self) -> DurabilityMode {
         self.durability_mode
@@ -1669,6 +1713,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// Reads the given shard files from the storage directory, spawns a background
     /// merge thread, and returns a job ID. Use `try_complete_merge` to poll for
     /// completion and swap the merged shard in.
+    #[cfg(feature = "std")]
     pub fn merge_shards_background(
         &mut self,
         table_id: TableId,
@@ -1697,6 +1742,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///
     /// Returns `Some(report)` if the merge finished and was swapped in,
     /// `None` if still running.
+    #[cfg(feature = "std")]
     pub fn try_complete_merge(
         &mut self,
         job_id: MergeJobId,
@@ -1708,7 +1754,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         let had_live_table_state = self.partitions.contains_key(&merged.table_id)
             || self.consumer_dictionaries.contains_key(&merged.table_id);
         if had_live_table_state {
-            let live_subscriptions: AHashSet<SubscriptionId> = self
+            let live_subscriptions: HashSet<SubscriptionId> = self
                 .partitions
                 .get(&merged.table_id)
                 .map(|partition| {
@@ -1722,7 +1768,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                 .bindings
                 .retain(|binding| live_subscriptions.contains(&binding.subscription_id));
 
-            let merged_subscriptions: AHashSet<SubscriptionId> = merged
+            let merged_subscriptions: HashSet<SubscriptionId> = merged
                 .payload
                 .bindings
                 .iter()
@@ -1730,7 +1776,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                 .collect();
             let missing_count = live_subscriptions
                 .iter()
-                .filter(|sub_id| !merged_subscriptions.contains(sub_id))
+                .filter(|sub_id| !merged_subscriptions.contains(*sub_id))
                 .count();
             if missing_count > 0 {
                 return Err(MergeError::BuildFailed(format!(
@@ -1747,6 +1793,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     /// Get number of active merge jobs
+    #[cfg(feature = "std")]
     #[must_use]
     pub fn active_merge_jobs(&self) -> usize {
         self.merge_manager.active_jobs()
@@ -1803,6 +1850,7 @@ impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> crate::Ag
     }
 }
 
+#[cfg(feature = "std")]
 impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> DurableShardStore
     for SubscriptionEngine<D, I, DB>
 {
@@ -1811,6 +1859,7 @@ impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> DurableSh
     }
 }
 
+#[cfg(feature = "std")]
 impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> DurableShardMerge
     for SubscriptionEngine<D, I, DB>
 {

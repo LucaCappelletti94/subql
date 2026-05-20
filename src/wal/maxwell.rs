@@ -5,10 +5,12 @@
 //! column type information — values are bare JSON primitives, so we use
 //! type inference via [`infer_cell_from_json`].
 
-use serde::Deserialize;
-use std::collections::HashMap;
+use alloc::string::String;
 #[cfg(test)]
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use hashbrown::HashMap;
+use serde::Deserialize;
 
 use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig, MapCdcEnvelope};
 use super::{resolve_table, WalParseError, WalParser};

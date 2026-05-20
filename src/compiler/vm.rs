@@ -5,6 +5,7 @@ use super::{
     BytecodeProgram, Instruction, Tri,
 };
 use crate::{Cell, RowImage};
+use alloc::vec::Vec;
 
 /// VM evaluation error
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,25 +139,26 @@ impl Vm {
             }
 
             Instruction::LessThan => {
-                let result = self.compare_ordered(|ord| matches!(ord, std::cmp::Ordering::Less))?;
+                let result =
+                    self.compare_ordered(|ord| matches!(ord, core::cmp::Ordering::Less))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::LessThanOrEqual => {
                 let result =
-                    self.compare_ordered(|ord| !matches!(ord, std::cmp::Ordering::Greater))?;
+                    self.compare_ordered(|ord| !matches!(ord, core::cmp::Ordering::Greater))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::GreaterThan => {
                 let result =
-                    self.compare_ordered(|ord| matches!(ord, std::cmp::Ordering::Greater))?;
+                    self.compare_ordered(|ord| matches!(ord, core::cmp::Ordering::Greater))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::GreaterThanOrEqual => {
                 let result =
-                    self.compare_ordered(|ord| !matches!(ord, std::cmp::Ordering::Less))?;
+                    self.compare_ordered(|ord| !matches!(ord, core::cmp::Ordering::Less))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
@@ -248,10 +250,10 @@ impl Vm {
 
                 // value >= lower AND value <= upper
                 let ge_lower = compare_ordered_cells(&value, &lower, |ord| {
-                    !matches!(ord, std::cmp::Ordering::Less)
+                    !matches!(ord, core::cmp::Ordering::Less)
                 });
                 let le_upper = compare_ordered_cells(&value, &upper, |ord| {
-                    !matches!(ord, std::cmp::Ordering::Greater)
+                    !matches!(ord, core::cmp::Ordering::Greater)
                 });
 
                 let result = ge_lower.and(le_upper);
@@ -385,7 +387,7 @@ impl Vm {
 
     fn compare_ordered<F>(&mut self, f: F) -> Result<Tri, VmError>
     where
-        F: FnOnce(std::cmp::Ordering) -> bool,
+        F: FnOnce(core::cmp::Ordering) -> bool,
     {
         let b = self.pop_cell()?;
         let a = self.pop_cell()?;
@@ -505,17 +507,17 @@ fn numeric_binop(
 
 /// Add two cells: a + b
 fn arithmetic_add(a: Cell, b: Cell) -> Cell {
-    numeric_binop(a, b, i64::saturating_add, std::ops::Add::add)
+    numeric_binop(a, b, i64::saturating_add, core::ops::Add::add)
 }
 
 /// Subtract two cells: a - b
 fn arithmetic_subtract(a: Cell, b: Cell) -> Cell {
-    numeric_binop(a, b, i64::saturating_sub, std::ops::Sub::sub)
+    numeric_binop(a, b, i64::saturating_sub, core::ops::Sub::sub)
 }
 
 /// Multiply two cells: a * b
 fn arithmetic_multiply(a: Cell, b: Cell) -> Cell {
-    numeric_binop(a, b, i64::saturating_mul, std::ops::Mul::mul)
+    numeric_binop(a, b, i64::saturating_mul, core::ops::Mul::mul)
 }
 
 /// Divide two cells: a / b

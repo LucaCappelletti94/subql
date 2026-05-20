@@ -2,7 +2,8 @@
 //!
 //! Shared by all JSON-based WAL parsers (wal2json, Maxwell, Debezium).
 
-use std::sync::Arc;
+use alloc::string::ToString;
+use alloc::sync::Arc;
 
 use super::WalParseError;
 use crate::Cell;

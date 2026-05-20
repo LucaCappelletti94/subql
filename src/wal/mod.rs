@@ -21,8 +21,10 @@ pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Parser};
 
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{catalog_helpers, Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use hashbrown::HashSet;
 use sql_traits::prelude::DatabaseLike;
-use std::collections::HashSet;
 use thiserror::Error;
 
 /// Trait for converting raw WAL bytes into typed [`WalEvent`]s.
@@ -77,7 +79,7 @@ pub(crate) fn parse_json_message<T>(data: &[u8]) -> Result<T, WalParseError>
 where
     T: serde::de::DeserializeOwned,
 {
-    let text = std::str::from_utf8(data).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
+    let text = core::str::from_utf8(data).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
     serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))
 }
 
@@ -246,8 +248,11 @@ pub(crate) fn build_pk_from_resolved(
         }
     }
 
-    PrimaryKey::new(std::sync::Arc::from(columns), std::sync::Arc::from(values))
-        .expect("pk columns and values are built in lockstep")
+    PrimaryKey::new(
+        alloc::sync::Arc::from(columns),
+        alloc::sync::Arc::from(values),
+    )
+    .expect("pk columns and values are built in lockstep")
 }
 
 /// Build a [`PrimaryKey`] from resolved column/value pairs, requiring every
@@ -281,10 +286,11 @@ pub(crate) fn build_pk_from_resolved_strict(
         values.push(cell.clone());
     }
 
-    Ok(
-        PrimaryKey::new(std::sync::Arc::from(columns), std::sync::Arc::from(values))
-            .expect("strict PK construction pushes columns and values in lockstep"),
+    Ok(PrimaryKey::new(
+        alloc::sync::Arc::from(columns),
+        alloc::sync::Arc::from(values),
     )
+    .expect("strict PK construction pushes columns and values in lockstep"))
 }
 
 /// Resolve PK metadata names to column IDs and require each resolved PK column
@@ -397,7 +403,7 @@ pub(crate) fn update_event_with_old_row_completeness(
         .pk(pk)
         .new_row(new_row)
         .maybe_old_row(old_row)
-        .changed_columns(std::sync::Arc::from(changed))
+        .changed_columns(alloc::sync::Arc::from(changed))
         .build()
         .expect("update_event_with_old_row_completeness should build valid update events")
 }
@@ -464,9 +470,9 @@ pub(crate) fn build_event_from_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-    use std::sync::Arc;
 
     #[test]
     fn test_resolve_table_conflicting_matches_errors() {

@@ -1,6 +1,9 @@
 //! Error types for subql
 
-use crate::{persistence::shard::ShardFingerprintEnvelope, MergeJobId, TableId};
+use crate::TableId;
+#[cfg(feature = "std")]
+use crate::{persistence::shard::ShardFingerprintEnvelope, MergeJobId};
+use alloc::string::String;
 use thiserror::Error;
 
 /// Errors during subscription registration
@@ -106,6 +109,7 @@ pub enum DispatchError {
 }
 
 /// Errors during persistence operations
+#[cfg(feature = "std")]
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
 pub enum StorageError {
@@ -147,6 +151,7 @@ pub enum StorageError {
 }
 
 /// Errors during merge operations
+#[cfg(feature = "std")]
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
 pub enum MergeError {

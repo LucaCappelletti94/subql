@@ -5,9 +5,9 @@
 #![allow(clippy::print_stdout, clippy::unnecessary_cast)]
 
 use crate::{Cell, DefaultIds, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent};
+use alloc::sync::Arc;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use std::sync::Arc;
 
 const STATUS_BUCKETS: [&str; 7] = [
     "pending",

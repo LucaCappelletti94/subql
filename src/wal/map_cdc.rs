@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use hashbrown::HashMap;
 
 use super::pg_type::infer_cell_from_json_strict;
 use super::row_build::build_row_from_map_with;
@@ -240,9 +242,9 @@ pub(super) fn convert_map_cdc_event<DB: DatabaseLike>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hashbrown::HashMap;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-    use std::collections::HashMap;
 
     fn orders_catalog() -> ParserDB {
         ParserDB::parse::<PostgreSqlDialect>(

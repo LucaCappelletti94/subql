@@ -6,12 +6,16 @@
 //! Unlike the wal2json parsers (stateless unit structs), pgoutput is
 //! **stateful**: the protocol sends Relation (`'R'`) messages that define
 //! table schemas before DML messages reference them by OID. The parser
-//! caches these in a `Mutex<AHashMap<u32, CachedRelation>>`.
+//! caches these in a `Mutex<HashMap<u32, CachedRelation>>`.
 
-use std::sync::{Arc, Mutex};
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use spin::Mutex;
 
-use ahash::AHashMap;
-use std::collections::{HashSet, VecDeque};
+use alloc::collections::VecDeque;
+use hashbrown::HashMap;
+use hashbrown::HashSet;
 
 use super::pg_type::text_to_cell_strict;
 use super::{
@@ -58,7 +62,7 @@ struct CachedRelation {
 
 #[derive(Default)]
 struct RelationCache {
-    map: AHashMap<u32, CachedRelation>,
+    map: HashMap<u32, CachedRelation>,
     insertion_order: VecDeque<u32>,
 }
 
@@ -179,7 +183,7 @@ impl<'a> Cursor<'a> {
         let start = self.pos;
         while self.pos < self.data.len() {
             if self.data[self.pos] == 0 {
-                let s = std::str::from_utf8(&self.data[start..self.pos])
+                let s = core::str::from_utf8(&self.data[start..self.pos])
                     .map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
                 self.pos += 1; // skip NUL
                 return Ok(s);
@@ -362,10 +366,7 @@ impl PgOutputParser {
 
         // Lock, insert, drop lock immediately.
         {
-            let mut map = self
-                .relations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self.relations.lock();
             map.insert(oid, cached);
         }
 
@@ -375,10 +376,7 @@ impl PgOutputParser {
     /// Look up a cached relation by OID. Clones it out of the Mutex so the
     /// lock is held only briefly.
     fn get_relation(&self, oid: u32) -> Result<CachedRelation, WalParseError> {
-        let map = self
-            .relations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self.relations.lock();
         map.map
             .get(&oid)
             .cloned()
@@ -467,7 +465,7 @@ impl PgOutputParser {
                     WalParseError::MalformedPayload(format!("invalid tuple text length: {len_i32}"))
                 })?;
                 let bytes = cur.read_bytes(len)?;
-                let text = std::str::from_utf8(bytes)
+                let text = core::str::from_utf8(bytes)
                     .map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
                 text_to_cell_strict(text, type_oid)
             }
@@ -920,10 +918,7 @@ mod tests {
                 .expect("relation should parse");
         }
 
-        let cache = parser
-            .relations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = parser.relations.lock();
         assert_eq!(cache.map.len(), MAX_CACHED_RELATIONS);
         drop(cache);
 

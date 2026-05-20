@@ -1,4 +1,5 @@
 use crate::{catalog_helpers, TableId};
+use alloc::string::{String, ToString};
 use sql_traits::prelude::DatabaseLike;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

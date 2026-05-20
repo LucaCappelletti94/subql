@@ -107,7 +107,7 @@ impl Tri {
     }
 }
 
-impl std::ops::Not for Tri {
+impl core::ops::Not for Tri {
     type Output = Self;
 
     fn not(self) -> Self::Output {

@@ -9,9 +9,10 @@ use crate::{
     compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, RowImage, SubscriptionId,
     TableId,
 };
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
-use std::sync::Arc;
 
 /// Immutable snapshot of table partition
 ///

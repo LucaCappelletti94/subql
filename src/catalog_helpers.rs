@@ -11,6 +11,7 @@
 //! Functions: [`table_id`], [`column_id`], [`table_arity`],
 //! [`schema_fingerprint`], [`primary_key_columns`], [`column_type`].
 
+use alloc::vec::Vec;
 use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{FingerprintError, SchemaFingerprint},

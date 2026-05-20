@@ -1,4 +1,5 @@
 use crate::{catalog_helpers, RegisterError};
+use alloc::string::{String, ToString};
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{
     DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,

@@ -1,6 +1,6 @@
 //! ID types for runtime predicate and consumer management
 
-use std::num::NonZeroU32;
+use core::num::NonZeroU32;
 
 /// Predicate identifier (slab index)
 ///

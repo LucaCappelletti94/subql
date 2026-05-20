@@ -32,11 +32,13 @@ harness = false
 required-features = ["dhat-heap"]
 
 [dependencies]
-# SQL parsing (supports multiple dialects)
-sqlparser = { version = "0.62", features = ["visitor"] }
+# SQL parsing (supports multiple dialects).
+sqlparser = { version = "0.62", default-features = false }
 
 # Generic SQL schema traits + canonical SchemaFingerprint (FINGERPRINT_SPEC).
-sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main" }
+# `default-features = false` follows sql-traits' own gating; the `std`
+# feature is propagated below.
+sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
 
 # Compressed bitmaps for predicate/user sets
 roaring = "0.11"
@@ -47,24 +49,35 @@ slab = "0.4"
 # Atomic pointer swap for immutable snapshots
 arc-swap = "1.7"
 
-# Fast hashing
-ahash = "0.8"          # Runtime hashing
+# `spin::Mutex` for the relation cache in the pgoutput parser. We pick spin
+# because it's the standard no_std Mutex (works under WASM where OS threads
+# are absent) and the relation cache is a low-contention surface where
+# spin-wait overhead vs std Mutex is irrelevant.
+spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex", "once", "lazy"] }
+
+# Fast hashing. ahash's `AHashMap` is std-only, so we use `hashbrown`'s
+# `HashMap`/`HashSet` directly — they're no_std-friendly and use ahash as
+# their default hasher via hashbrown's `default-hasher` feature.
+ahash = { version = "0.8", default-features = false, features = ["compile-time-rng"] }
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "serde", "inline-more", "allocator-api2"] }
 seahash = "4.1"        # Deterministic hashing for canonicalization
 
-# Serialization
-serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = "1"       # JSON deserialization (WAL parsers)
-postcard = { version = "1.1", default-features = false, features = ["use-std"] } # Binary encoding
-lz4 = "1.24"           # Fast compression
+# Serialization — all no_std + alloc capable; std features propagated below.
+serde = { version = "1.0", default-features = false, features = ["derive", "rc", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 
 # Error handling
-thiserror = "2.0"
+thiserror = { version = "2.0", default-features = false }
 
-# Configuration
-toml = "1"
+# I/O subsystem deps — only pulled in under the `std` feature. `lz4` wraps
+# a C lib via `std::io`; `toml` depends on `std::fs`/`std::io`. Both are
+# used exclusively by `src/persistence/*` and `src/config.rs`.
+lz4 = { version = "1.24", optional = true }
+toml = { version = "1", optional = true }
 
 # Optional features
-tracing = { version = "0.1", optional = true }
+tracing = { version = "0.1", default-features = false, optional = true }
 dhat = { version = "0.3", optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
@@ -86,12 +99,29 @@ testcontainers = { version = "0.27", features = ["blocking"] }
 proptest = "1"
 
 [features]
-default = []
+default = ["std"]
+# `std` enables the I/O subsystems: persistence (shard codec + background
+# merge), `Config` file load/save, and the durable-shard trait surface on
+# the engine. Disable (`default-features = false`) to build the in-memory
+# dispatch core under `no_std + alloc` — required for the wasm32 target.
+std = [
+    "sqlparser/std",
+    "sql-traits/std",
+    "ahash/std",
+    "ahash/runtime-rng",
+    "hashbrown/default",
+    "serde/std",
+    "serde_json/std",
+    "postcard/use-std",
+    "thiserror/std",
+    "dep:lz4",
+    "dep:toml",
+]
 testing = ["dep:arbitrary"]
-observability = ["dep:tracing"]
+observability = ["dep:tracing", "tracing/std"]
 
-# Memory profiling with dhat
-dhat-heap = ["dep:dhat"]
+# Memory profiling with dhat (std-only).
+dhat-heap = ["std", "dep:dhat"]
 
 [profile.release]
 lto = true

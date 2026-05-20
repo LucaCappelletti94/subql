@@ -1,6 +1,7 @@
 //! VM bytecode instruction set for predicate evaluation
 
 use crate::{Cell, ColumnId};
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// VM instruction for tri-state predicate evaluation

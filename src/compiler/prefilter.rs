@@ -5,11 +5,12 @@
 
 use super::{literals::sql_value_to_cell_lossy, Tri};
 use crate::{Cell, ColumnId, RowImage, TableId};
+use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
-use std::collections::BTreeSet;
-use std::sync::Arc;
 
 /// A normalized prefilter plan used by runtime dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]

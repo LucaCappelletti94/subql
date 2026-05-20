@@ -12,10 +12,11 @@ use crate::{
     compiler::{PlannerAtom, PlannerValue},
     Cell, ColumnId,
 };
-use ahash::AHashMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::cmp::Ordering;
+use hashbrown::HashMap;
 use roaring::RoaringBitmap;
-use std::cmp::Ordering;
-use std::sync::Arc;
 
 /// Indexable cell value (excludes NULL/Missing)
 ///
@@ -124,19 +125,19 @@ impl IndexableAtom {
 #[derive(Clone)]
 pub struct HybridIndexes {
     /// Equality: col → (val → `RoaringBitmap<PredicateId>`)
-    pub equality: AHashMap<ColumnId, AHashMap<IndexableCell, RoaringBitmap>>,
+    pub equality: HashMap<ColumnId, HashMap<IndexableCell, RoaringBitmap>>,
 
     /// Range: col → `Vec<RangeEntry>` (sorted by lower bound)
-    pub range: AHashMap<ColumnId, Vec<RangeEntry>>,
+    pub range: HashMap<ColumnId, Vec<RangeEntry>>,
 
     /// NULL: (col, kind) → `RoaringBitmap<PredicateId>`
-    pub null_checks: AHashMap<(ColumnId, NullKind), RoaringBitmap>,
+    pub null_checks: HashMap<(ColumnId, NullKind), RoaringBitmap>,
 
     /// Fallback: unindexable predicates
     pub fallback: RoaringBitmap,
 
     /// Dependency: col → `RoaringBitmap<PredicateId>` (for UPDATE optimization)
-    pub dependency: AHashMap<ColumnId, RoaringBitmap>,
+    pub dependency: HashMap<ColumnId, RoaringBitmap>,
 
     /// Predicates with no dependency columns (must always be considered for UPDATEs)
     pub dependency_free: RoaringBitmap,
@@ -150,7 +151,7 @@ pub struct HybridIndexes {
     pub agg_fallback: RoaringBitmap,
 
     /// col → aggregate predicates referencing that column (UPDATE optimization)
-    pub agg_dependency: AHashMap<ColumnId, RoaringBitmap>,
+    pub agg_dependency: HashMap<ColumnId, RoaringBitmap>,
 
     /// Aggregate predicates with no dependency columns (always re-evaluated)
     pub agg_dependency_free: RoaringBitmap,
@@ -161,14 +162,14 @@ impl HybridIndexes {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            equality: AHashMap::new(),
-            range: AHashMap::new(),
-            null_checks: AHashMap::new(),
+            equality: HashMap::new(),
+            range: HashMap::new(),
+            null_checks: HashMap::new(),
             fallback: RoaringBitmap::new(),
-            dependency: AHashMap::new(),
+            dependency: HashMap::new(),
             dependency_free: RoaringBitmap::new(),
             agg_fallback: RoaringBitmap::new(),
-            agg_dependency: AHashMap::new(),
+            agg_dependency: HashMap::new(),
             agg_dependency_free: RoaringBitmap::new(),
         }
     }
@@ -182,7 +183,7 @@ impl HybridIndexes {
     /// [`add_predicate`](Self::add_predicate).
     fn populate_dependency(
         free: &mut RoaringBitmap,
-        dep_map: &mut AHashMap<ColumnId, RoaringBitmap>,
+        dep_map: &mut HashMap<ColumnId, RoaringBitmap>,
         pred_id_u32: u32,
         deps: &[ColumnId],
     ) {
@@ -204,7 +205,7 @@ impl HybridIndexes {
     #[must_use]
     pub fn select_update_deps(
         free: &RoaringBitmap,
-        dep_map: &AHashMap<ColumnId, RoaringBitmap>,
+        dep_map: &HashMap<ColumnId, RoaringBitmap>,
         changed_cols: &[ColumnId],
     ) -> RoaringBitmap {
         let mut candidates = free.clone();
@@ -1359,7 +1360,7 @@ mod tests {
         let mut free = RoaringBitmap::new();
         free.insert(0); // pred 0 is dependency-free
 
-        let mut dep_map = AHashMap::new();
+        let mut dep_map = HashMap::new();
         let mut col1_deps = RoaringBitmap::new();
         col1_deps.insert(1); // pred 1 depends on col 1
         dep_map.insert(1_u16, col1_deps);

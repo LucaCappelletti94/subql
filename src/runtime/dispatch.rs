@@ -10,7 +10,8 @@ use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm},
     AggDelta, Cell, ConsumerNotifications, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
 };
-use ahash::AHashMap;
+use alloc::vec::Vec;
+use hashbrown::HashMap;
 use roaring::RoaringBitmap;
 
 /// Consumer dictionary for ordinal ↔ ConsumerId translation
@@ -22,7 +23,7 @@ pub struct ConsumerDictionary<I: IdTypes> {
     /// ConsumerOrdinal → ConsumerId (dense, 0-indexed)
     ordinal_to_consumer: Vec<Option<I::ConsumerId>>,
     /// ConsumerId → ConsumerOrdinal (for reverse lookup)
-    consumer_to_ordinal: AHashMap<I::ConsumerId, ConsumerOrdinal>,
+    consumer_to_ordinal: HashMap<I::ConsumerId, ConsumerOrdinal>,
     /// Recycled ordinals from removed consumers, available for reuse
     free_list: Vec<ConsumerOrdinal>,
 }
@@ -39,7 +40,7 @@ impl<I: IdTypes> ConsumerDictionary<I> {
     pub fn new() -> Self {
         Self {
             ordinal_to_consumer: Vec::new(),
-            consumer_to_ordinal: AHashMap::new(),
+            consumer_to_ordinal: HashMap::new(),
             free_list: Vec::new(),
         }
     }
@@ -485,10 +486,10 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
     let weighted_rows = weighted_rows_for_agg(event)?;
 
     // Separate accumulators for each aggregate kind (avoids mixed-type confusion).
-    let mut count_weights: AHashMap<ConsumerOrdinal, i64> = AHashMap::new();
-    let mut sum_weights: AHashMap<ConsumerOrdinal, f64> = AHashMap::new();
+    let mut count_weights: HashMap<ConsumerOrdinal, i64> = HashMap::new();
+    let mut sum_weights: HashMap<ConsumerOrdinal, f64> = HashMap::new();
     // AVG accumulator: (sum_delta, count_delta)
-    let mut avg_accum: AHashMap<ConsumerOrdinal, (f64, i64)> = AHashMap::new();
+    let mut avg_accum: HashMap<ConsumerOrdinal, (f64, i64)> = HashMap::new();
 
     let snapshot = partition.load_snapshot();
 

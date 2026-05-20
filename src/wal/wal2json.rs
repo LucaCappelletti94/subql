@@ -5,7 +5,9 @@
 //! changes in a transaction into a single message; version 2 emits one message
 //! per change.
 
-use std::sync::Arc;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use serde::Deserialize;
 

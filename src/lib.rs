@@ -1,6 +1,10 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![doc = include_str!("../README.md")]
 
 // Lint configuration is in [lints] section of Cargo.toml
+
+#[macro_use]
+extern crate alloc;
 
 // Re-export public API
 pub use compiler::{AggSpec, QueryProjection};
@@ -30,9 +34,11 @@ mod types;
 
 pub mod catalog_helpers;
 pub mod compiler;
+#[cfg(feature = "std")]
 pub mod config;
 #[cfg(feature = "dhat-heap")]
 pub mod memory_profile_workload;
+#[cfg(feature = "std")]
 pub mod persistence;
 pub mod runtime;
 pub mod wal;
