@@ -4,26 +4,52 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+[package.metadata]
+cargo-fuzz = true
+
 [dependencies]
-honggfuzz = "0.5"
+libfuzzer-sys = "0.4"
 subql = { path = "..", features = ["testing"] }
+
+# Standalone manifest — keeps cargo-fuzz from being absorbed into the
+# parent crate's resolution.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
 
 [[bin]]
 name = "fuzz_parse_sql"
-path = "fuzz_parse_sql.rs"
+path = "fuzz_targets/fuzz_parse_sql.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_vm_eval"
-path = "fuzz_vm_eval.rs"
+path = "fuzz_targets/fuzz_vm_eval.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_deserialize_shard"
-path = "fuzz_deserialize_shard.rs"
+path = "fuzz_targets/fuzz_deserialize_shard.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_canonicalize"
-path = "fuzz_canonicalize.rs"
+path = "fuzz_targets/fuzz_canonicalize.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "fuzz_codec_decode"
-path = "fuzz_codec_decode.rs"
+path = "fuzz_targets/fuzz_codec_decode.rs"
+test = false
+doc = false
+bench = false
