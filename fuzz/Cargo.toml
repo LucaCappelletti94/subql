@@ -11,10 +11,25 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 subql = { path = "..", features = ["testing"] }
 
-# Standalone manifest — keeps cargo-fuzz from being absorbed into the
-# parent crate's resolution.
+# Standalone workspace - kept out of the parent on purpose. The root
+# workspace has `lto = true` on its release profile, and cargo-fuzz
+# layers ASAN + SanCov instrumentation on top, whose `__sancov_gen_*`
+# runtime symbols do not survive LLVM LTO at link time. cargo-fuzz
+# has no `--profile` flag and cargo silently rejects `lto` in
+# per-package profile overrides, so the cleanest fix is to keep this
+# crate in its own workspace with its own (no-LTO) release profile.
 [workspace]
 members = ["."]
+
+# Mirror the root Cargo.toml [patch.crates-io] sqlparser pin. cargo-fuzz's
+# standalone workspace does not inherit the parent workspace's patch
+# table. Pinned to LucaCappelletti94/sqlparser-rs `pathological-combined`,
+# which bundles every unmerged exponential-parse fix surfaced by this
+# very fuzz harness. Keep this rev in lockstep with the root manifest;
+# delete both blocks together once the bundled PRs land and a patched
+# sqlparser release is on crates.io.
+[patch.crates-io]
+sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "f63e42fe13b4a8e4b8c943bb83f23f5d397056ba" }
 
 [profile.release]
 debug = 1
@@ -50,6 +65,27 @@ bench = false
 [[bin]]
 name = "fuzz_codec_decode"
 path = "fuzz_targets/fuzz_codec_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pgoutput"
+path = "fuzz_targets/fuzz_pgoutput.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wal_json_postparse"
+path = "fuzz_targets/fuzz_wal_json_postparse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_aggregate_consistency"
+path = "fuzz_targets/fuzz_aggregate_consistency.rs"
 test = false
 doc = false
 bench = false

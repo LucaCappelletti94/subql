@@ -11,14 +11,19 @@ use arbitrary::{Arbitrary, Unstructured};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
+use std::collections::BTreeMap;
+
 use crate::compiler::bytecode::{BytecodeProgram, Instruction};
 use crate::compiler::canonicalize::{hash_sql, normalize_sql};
 use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
-use crate::types::{Cell, RowImage};
-use crate::DefaultIds;
+use crate::types::{Cell, PrimaryKey, RowImage};
+use crate::wal::{MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Parser, WalParser};
+use crate::{
+    catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest, WalEvent,
+};
 
 /// Build a permissive fuzz schema as a [`ParserDB`].
 ///
@@ -186,6 +191,563 @@ pub fn harness_codec_decode(data: &[u8]) {
     let _ = codec::decode::<ShardPayload<DefaultIds>>(data);
     let _ = codec::decode::<Vec<u8>>(data);
     let _ = codec::decode::<String>(data);
+}
+
+/// Generate a JSON scalar from fuzzer-controlled bytes.
+#[derive(Debug, Arbitrary)]
+enum JsonScalar {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Str(String),
+}
+
+impl JsonScalar {
+    fn into_value(self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(b) => serde_json::Value::Bool(b),
+            Self::I64(i) => serde_json::Value::from(i),
+            Self::F64(f) if f.is_finite() => serde_json::Number::from_f64(f)
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
+            Self::F64(_) => serde_json::Value::Null,
+            Self::Str(s) => serde_json::Value::String(s),
+        }
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct V1OldKeys {
+    keynames: Vec<String>,
+    keytypes: Vec<String>,
+    keyvalues: Vec<JsonScalar>,
+}
+
+#[derive(Debug, Arbitrary)]
+struct V1Change {
+    kind: String,
+    schema: String,
+    table: String,
+    columnnames: Vec<String>,
+    columntypes: Vec<String>,
+    columnvalues: Vec<JsonScalar>,
+    oldkeys: Option<V1OldKeys>,
+}
+
+#[derive(Debug, Arbitrary)]
+struct V1Envelope {
+    xid: Option<u64>,
+    change: Vec<V1Change>,
+}
+
+#[derive(Debug, Arbitrary)]
+struct V2Column {
+    name: String,
+    type_name: String,
+    value: JsonScalar,
+}
+
+#[derive(Debug, Arbitrary)]
+struct V2PkColumn {
+    name: String,
+    type_name: String,
+}
+
+#[derive(Debug, Arbitrary)]
+struct V2Envelope {
+    action: String,
+    schema: Option<String>,
+    table: Option<String>,
+    columns: Option<Vec<V2Column>>,
+    identity: Option<Vec<V2Column>>,
+    pk: Option<Vec<V2PkColumn>>,
+}
+
+#[derive(Debug, Arbitrary)]
+struct MaxwellEnvelope {
+    database: String,
+    table: String,
+    event_type: String,
+    data: Option<Vec<(String, JsonScalar)>>,
+    old: Option<Vec<(String, JsonScalar)>>,
+    primary_key_columns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Arbitrary)]
+enum WalJsonInput {
+    V1(V1Envelope),
+    V2(V2Envelope),
+    Maxwell(MaxwellEnvelope),
+}
+
+/// Build a JSON object from key/value pairs, using a sorted `BTreeMap`-like
+/// `Map` to give deterministic ordering and to allow repeated keys (last
+/// one wins, mirroring serde_json's own behaviour).
+fn obj(pairs: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for (k, v) in pairs {
+        m.insert(k.to_owned(), v);
+    }
+    serde_json::Value::Object(m)
+}
+
+fn arr(items: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
+    serde_json::Value::Array(items.into_iter().collect())
+}
+
+impl V1Envelope {
+    fn into_json(self) -> serde_json::Value {
+        let changes: Vec<serde_json::Value> =
+            self.change.into_iter().map(V1Change::into_json).collect();
+        let mut pairs: Vec<(&str, serde_json::Value)> = Vec::new();
+        if let Some(xid) = self.xid {
+            pairs.push(("xid", serde_json::Value::from(xid)));
+        }
+        pairs.push(("change", serde_json::Value::Array(changes)));
+        obj(pairs)
+    }
+}
+
+impl V1Change {
+    fn into_json(self) -> serde_json::Value {
+        let mut pairs = vec![
+            ("kind", serde_json::Value::String(self.kind)),
+            ("schema", serde_json::Value::String(self.schema)),
+            ("table", serde_json::Value::String(self.table)),
+            (
+                "columnnames",
+                arr(self.columnnames.into_iter().map(serde_json::Value::String)),
+            ),
+            (
+                "columntypes",
+                arr(self.columntypes.into_iter().map(serde_json::Value::String)),
+            ),
+            (
+                "columnvalues",
+                arr(self.columnvalues.into_iter().map(JsonScalar::into_value)),
+            ),
+        ];
+        if let Some(old) = self.oldkeys {
+            pairs.push(("oldkeys", old.into_json()));
+        }
+        obj(pairs)
+    }
+}
+
+impl V1OldKeys {
+    fn into_json(self) -> serde_json::Value {
+        obj(vec![
+            (
+                "keynames",
+                arr(self.keynames.into_iter().map(serde_json::Value::String)),
+            ),
+            (
+                "keytypes",
+                arr(self.keytypes.into_iter().map(serde_json::Value::String)),
+            ),
+            (
+                "keyvalues",
+                arr(self.keyvalues.into_iter().map(JsonScalar::into_value)),
+            ),
+        ])
+    }
+}
+
+impl V2Column {
+    fn into_json(self) -> serde_json::Value {
+        obj(vec![
+            ("name", serde_json::Value::String(self.name)),
+            ("type", serde_json::Value::String(self.type_name)),
+            ("value", self.value.into_value()),
+        ])
+    }
+}
+
+impl V2PkColumn {
+    fn into_json(self) -> serde_json::Value {
+        obj(vec![
+            ("name", serde_json::Value::String(self.name)),
+            ("type", serde_json::Value::String(self.type_name)),
+        ])
+    }
+}
+
+impl V2Envelope {
+    fn into_json(self) -> serde_json::Value {
+        let mut pairs = vec![("action", serde_json::Value::String(self.action))];
+        if let Some(s) = self.schema {
+            pairs.push(("schema", serde_json::Value::String(s)));
+        }
+        if let Some(t) = self.table {
+            pairs.push(("table", serde_json::Value::String(t)));
+        }
+        if let Some(cs) = self.columns {
+            pairs.push(("columns", arr(cs.into_iter().map(V2Column::into_json))));
+        }
+        if let Some(cs) = self.identity {
+            pairs.push(("identity", arr(cs.into_iter().map(V2Column::into_json))));
+        }
+        if let Some(pk) = self.pk {
+            pairs.push(("pk", arr(pk.into_iter().map(V2PkColumn::into_json))));
+        }
+        obj(pairs)
+    }
+}
+
+impl MaxwellEnvelope {
+    fn into_json(self) -> serde_json::Value {
+        fn map_obj(entries: Vec<(String, JsonScalar)>) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            for (k, v) in entries {
+                m.insert(k, v.into_value());
+            }
+            serde_json::Value::Object(m)
+        }
+        let mut pairs = vec![
+            ("database", serde_json::Value::String(self.database)),
+            ("table", serde_json::Value::String(self.table)),
+            ("type", serde_json::Value::String(self.event_type)),
+        ];
+        if let Some(d) = self.data {
+            pairs.push(("data", map_obj(d)));
+        }
+        if let Some(o) = self.old {
+            pairs.push(("old", map_obj(o)));
+        }
+        if let Some(pk) = self.primary_key_columns {
+            pairs.push((
+                "primary_key_columns",
+                arr(pk.into_iter().map(serde_json::Value::String)),
+            ));
+        }
+        obj(pairs)
+    }
+}
+
+/// Drive arbitrary-shaped JSON envelopes through the wal2json v1, wal2json
+/// v2, and Maxwell parsers, skipping raw-bytes JSON tokenisation (which
+/// is serde_json's job, already heavily fuzzed upstream) and exercising
+/// subql's post-parse semantic-validation layer: column-count vs
+/// relation-cache mismatches, JSON-value-to-Cell coercion, sparse-old-row
+/// handling, PK extraction, action-tag dispatch.
+///
+/// Contract: panics are bugs. Any `Err(WalParseError)` is fine.
+pub fn harness_wal_json_postparse(data: &[u8]) {
+    let mut u = Unstructured::new(data);
+    let Ok(input) = WalJsonInput::arbitrary(&mut u) else {
+        return;
+    };
+
+    let (json_value, parser_kind) = match input {
+        WalJsonInput::V1(v) => (v.into_json(), 0u8),
+        WalJsonInput::V2(v) => (v.into_json(), 1u8),
+        WalJsonInput::Maxwell(v) => (v.into_json(), 2u8),
+    };
+
+    let Ok(bytes) = serde_json::to_vec(&json_value) else {
+        return;
+    };
+
+    let catalog = fuzz_catalog();
+    match parser_kind {
+        0 => {
+            let _ = Wal2JsonV1Parser.parse_wal_message(&bytes, &catalog);
+        }
+        1 => {
+            let _ = Wal2JsonV2Parser.parse_wal_message(&bytes, &catalog);
+        }
+        _ => {
+            let _ = MaxwellParser.parse_wal_message(&bytes, &catalog);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate-consistency harness
+// ---------------------------------------------------------------------------
+
+/// Mutation operation against the virtual `orders` table used by
+/// [`harness_aggregate_consistency`]. `Truncate` is intentionally absent:
+/// subql's `aggregate_deltas` semantics on Truncate would require the
+/// engine to know per-consumer running state to negate, which is not
+/// part of the documented API.
+#[derive(Debug, Arbitrary)]
+enum AggOp {
+    Insert {
+        id: u8,
+        amount: Option<i32>,
+        status: Option<u8>,
+    },
+    Update {
+        id: u8,
+        amount: Option<i32>,
+        status: Option<u8>,
+    },
+    Delete {
+        id: u8,
+    },
+}
+
+/// In-virtual-table representation of one row.
+#[derive(Clone, Debug)]
+struct VirtRow {
+    amount: Option<i64>,
+    status: Option<String>,
+}
+
+impl VirtRow {
+    fn from_op(amount: Option<i32>, status: Option<u8>) -> Self {
+        Self {
+            amount: amount.map(i64::from),
+            status: status.map(|b| match b % 4 {
+                0 => "open".into(),
+                1 => "closed".into(),
+                2 => "shipped".into(),
+                _ => "pending".into(),
+            }),
+        }
+    }
+}
+
+/// Build a 3-cell `RowImage` (id, amount, status) matching the
+/// `agg_catalog()` schema.
+fn agg_row_image(id: i64, row: &VirtRow) -> RowImage {
+    let cells = [
+        Cell::Int(id),
+        row.amount.map_or(Cell::Null, Cell::Int),
+        row.status
+            .as_deref()
+            .map_or(Cell::Null, |s| Cell::String(s.into())),
+    ];
+    RowImage {
+        cells: Arc::from(cells.as_slice()),
+    }
+}
+
+/// Build the `agg_catalog()` `ParserDB` once — three columns, single-
+/// column INT PK. Distinct from `fuzz_catalog()` so the column-id
+/// mapping is predictable (id=0, amount=1, status=2).
+fn agg_catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    )
+    .expect("agg fuzz fixture DDL parses")
+}
+
+/// Drive an arbitrary sequence of insert/update/delete operations against
+/// a fixed agg-only consumer set and assert that the engine's incremental
+/// `aggregate_deltas` output matches a from-scratch oracle.
+///
+/// Catches drift in:
+/// - `COUNT(*)` (`AggDelta::Count`) — should equal current virtual-table size.
+/// - `SUM(amount)` (`AggDelta::Sum`) — should equal sum of non-NULL amounts.
+///
+/// Contract: panics are bugs. Assertion failures are bugs.
+pub fn harness_aggregate_consistency(data: &[u8]) {
+    let mut u = Unstructured::new(data);
+    let Ok(ops): arbitrary::Result<Vec<AggOp>> = (|| {
+        let n = u.int_in_range(0usize..=64)?;
+        (0..n).map(|_| AggOp::arbitrary(&mut u)).collect()
+    })() else {
+        return;
+    };
+
+    let database = Arc::new(agg_catalog());
+    let Some(table_id) = catalog_helpers::table_id(database.as_ref(), "orders") else {
+        return;
+    };
+    let pk_col = match catalog_helpers::column_id(database.as_ref(), table_id, "id") {
+        Some(c) => c,
+        None => return,
+    };
+
+    let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(Arc::clone(&database), PostgreSqlDialect {});
+
+    // Register one COUNT(*) consumer (cid=1) and one SUM(amount) consumer
+    // (cid=2). Both registrations may fail under odd dialect quirks; bail
+    // cleanly rather than asserting.
+    if engine
+        .register(SubscriptionRequest::<DefaultIds>::new(
+            1,
+            "SELECT COUNT(*) FROM orders",
+        ))
+        .is_err()
+    {
+        return;
+    }
+    if engine
+        .register(SubscriptionRequest::<DefaultIds>::new(
+            2,
+            "SELECT SUM(amount) FROM orders",
+        ))
+        .is_err()
+    {
+        return;
+    }
+
+    // Engine-side running state per consumer.
+    let mut engine_count: i64 = 0;
+    let mut engine_sum: f64 = 0.0;
+
+    // Virtual table (id -> row), the source of truth for the oracle.
+    let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
+
+    for op in ops {
+        let (event, mutated): (Option<WalEvent>, bool) = match op {
+            AggOp::Insert { id, amount, status } => {
+                let id = i64::from(id);
+                if virt.contains_key(&id) {
+                    (None, false)
+                } else {
+                    let row = VirtRow::from_op(amount, status);
+                    let image = agg_row_image(id, &row);
+                    virt.insert(id, row);
+                    let pk = match PrimaryKey::new(
+                        Arc::from([pk_col].as_slice()),
+                        Arc::from([Cell::Int(id)].as_slice()),
+                    ) {
+                        Ok(pk) => pk,
+                        Err(_) => return,
+                    };
+                    let event = WalEvent::builder(table_id)
+                        .insert()
+                        .pk(pk)
+                        .new_row(image)
+                        .build();
+                    match event {
+                        Ok(e) => (Some(e), true),
+                        Err(_) => return,
+                    }
+                }
+            }
+            AggOp::Update { id, amount, status } => {
+                let id = i64::from(id);
+                let Some(old) = virt.get(&id).cloned() else {
+                    continue;
+                };
+                let new_row = VirtRow::from_op(amount, status);
+                let old_image = agg_row_image(id, &old);
+                let new_image = agg_row_image(id, &new_row);
+                virt.insert(id, new_row);
+                let pk = match PrimaryKey::new(
+                    Arc::from([pk_col].as_slice()),
+                    Arc::from([Cell::Int(id)].as_slice()),
+                ) {
+                    Ok(pk) => pk,
+                    Err(_) => return,
+                };
+                let event = WalEvent::builder(table_id)
+                    .update()
+                    .pk(pk)
+                    .old_row(old_image)
+                    .new_row(new_image)
+                    .build();
+                match event {
+                    Ok(e) => (Some(e), true),
+                    Err(_) => return,
+                }
+            }
+            AggOp::Delete { id } => {
+                let id = i64::from(id);
+                let Some(old) = virt.remove(&id) else {
+                    continue;
+                };
+                let old_image = agg_row_image(id, &old);
+                let pk = match PrimaryKey::new(
+                    Arc::from([pk_col].as_slice()),
+                    Arc::from([Cell::Int(id)].as_slice()),
+                ) {
+                    Ok(pk) => pk,
+                    Err(_) => return,
+                };
+                let event = WalEvent::builder(table_id)
+                    .delete()
+                    .pk(pk)
+                    .old_row(old_image)
+                    .build();
+                match event {
+                    Ok(e) => (Some(e), true),
+                    Err(_) => return,
+                }
+            }
+        };
+
+        if !mutated {
+            continue;
+        }
+        let Some(event) = event else { continue };
+
+        let deltas = match engine.aggregate_deltas(&event) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for (cid, delta) in deltas {
+            match (cid, delta) {
+                (1, AggDelta::Count(d)) => engine_count += d,
+                (2, AggDelta::Sum(d)) => engine_sum += d,
+                _ => {}
+            }
+        }
+
+        // Oracle: COUNT(*) is virtual-table size; SUM(amount) sums
+        // non-NULL amounts.
+        let oracle_count = i64::try_from(virt.len()).unwrap_or(i64::MAX);
+        let oracle_sum: f64 = virt
+            .values()
+            .filter_map(|r| r.amount)
+            .map(|v| v as f64)
+            .sum();
+
+        assert_eq!(
+            engine_count, oracle_count,
+            "COUNT(*) drift: engine={engine_count} oracle={oracle_count}"
+        );
+        let tolerance = 1e-9_f64.max(oracle_sum.abs() * 1e-12);
+        assert!(
+            (engine_sum - oracle_sum).abs() <= tolerance,
+            "SUM(amount) drift: engine={engine_sum} oracle={oracle_sum}"
+        );
+    }
+}
+
+/// Drive raw bytes through the pgoutput binary parser. Exercises both
+/// the cursor-parsing paths in every message-type branch (single-message
+/// mode) and the relation-cache cross-message state (sequenced mode).
+///
+/// Contract: panics are bugs. Any `Err(WalParseError)` is fine.
+pub fn harness_pgoutput(data: &[u8]) {
+    let catalog = fuzz_catalog();
+
+    // Single-message mode: the whole input is one pgoutput message.
+    // Exercises the message-type dispatch and cursor parsing of every
+    // tuple-bearing branch (I/U/D/R/T).
+    {
+        let parser = PgOutputParser::new();
+        let _ = parser.parse_wal_message(data, &catalog);
+    }
+
+    // Sequenced mode: up to 8 length-prefixed chunks fed through the
+    // same parser instance. Lets the mutator populate the relation
+    // cache with one chunk and reference it from a later chunk,
+    // surfacing cache-mismatch and replica-identity bugs that a
+    // single-message harness cannot reach.
+    {
+        let parser = PgOutputParser::new();
+        let mut cur = data;
+        for _ in 0..8 {
+            if cur.len() < 2 {
+                break;
+            }
+            let len = u16::from_le_bytes([cur[0], cur[1]]) as usize;
+            cur = &cur[2..];
+            let take = len.min(cur.len());
+            let (chunk, rest) = cur.split_at(take);
+            cur = rest;
+            let _ = parser.parse_wal_message(chunk, &catalog);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +966,24 @@ mod regression_tests {
     #[test]
     fn regression_fuzz_codec_decode() {
         replay_crashes("fuzz_codec_decode", harness_codec_decode);
+    }
+
+    #[test]
+    fn regression_fuzz_pgoutput() {
+        replay_crashes("fuzz_pgoutput", harness_pgoutput);
+    }
+
+    #[test]
+    fn regression_fuzz_wal_json_postparse() {
+        replay_crashes("fuzz_wal_json_postparse", harness_wal_json_postparse);
+    }
+
+    #[test]
+    fn regression_fuzz_aggregate_consistency() {
+        replay_crashes(
+            "fuzz_aggregate_consistency",
+            harness_aggregate_consistency,
+        );
     }
 
     #[test]
