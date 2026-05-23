@@ -1,9 +1,9 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fa_solid_icons::FaDatabase};
+use dioxus_free_icons::{icons::fa_solid_icons::FaDatabase, Icon};
 
 use crate::presets;
 
-use super::{SharedState, TickSignal, bump};
+use super::{bump, SharedState, TickSignal};
 
 #[component]
 pub fn SchemaPicker() -> Element {

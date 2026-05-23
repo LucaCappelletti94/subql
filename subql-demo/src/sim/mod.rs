@@ -6,8 +6,8 @@
 //! - **Auto**: a one-shot `step` that picks a random action and runs it.
 //!   The component layer drives this on a `gloo_timers` interval.
 
-use rand::Rng;
 use rand::seq::IndexedRandom;
+use rand::Rng;
 
 use crate::state::{DemoError, DemoState};
 
@@ -49,7 +49,9 @@ pub fn do_update_random(state: &mut DemoState) -> Result<(), DemoError> {
         return Ok(());
     };
     let new_row = (state.preset.generator)(&mut state.rng);
-    state.capture.apply_update(&mut state.harness, rowid, new_row)?;
+    state
+        .capture
+        .apply_update(&mut state.harness, rowid, new_row)?;
     state.pump()?;
     Ok(())
 }

@@ -13,7 +13,7 @@
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -31,7 +31,10 @@ fn cases() -> [(&'static str, &'static [u8]); 6] {
         ("parens_commas_dashes_583B_fixed_by_2349", PAREN_COMMA_INPUT),
         ("shift_keywords_527B_fixed_combined", SHIFT_KW_INPUT),
         ("keyword_op_soup_903B_fixed_combined", KW_OP_SOUP_INPUT),
-        ("dollar_quote_bit_3988B_fixed_combined", DOLLAR_QUOTE_BIT_INPUT),
+        (
+            "dollar_quote_bit_3988B_fixed_combined",
+            DOLLAR_QUOTE_BIT_INPUT,
+        ),
     ]
 }
 

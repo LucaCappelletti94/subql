@@ -1,14 +1,14 @@
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    Icon,
     icons::fa_solid_icons::{
         FaBroom, FaForwardStep, FaPause, FaPenToSquare, FaPlay, FaPlus, FaSliders, FaTrash,
     },
+    Icon,
 };
 
 use crate::sim;
 
-use super::{SharedState, TickSignal, bump};
+use super::{bump, SharedState, TickSignal};
 
 #[component]
 pub fn SimControls() -> Element {

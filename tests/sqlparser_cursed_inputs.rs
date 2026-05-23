@@ -85,5 +85,3 @@ fn pathological_inputs_parse_under_deadline() {
         }
     }
 }
-
-

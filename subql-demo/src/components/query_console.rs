@@ -1,9 +1,12 @@
 use dioxus::prelude::*;
 use dioxus_code::{Language, Theme};
 use dioxus_code_editor::CodeEditor;
-use dioxus_free_icons::{Icon, icons::fa_solid_icons::{FaCirclePlus, FaTerminal}};
+use dioxus_free_icons::{
+    icons::fa_solid_icons::{FaCirclePlus, FaTerminal},
+    Icon,
+};
 
-use super::{SharedState, TickSignal, bump};
+use super::{bump, SharedState, TickSignal};
 
 #[component]
 pub fn QueryConsole() -> Element {
@@ -30,7 +33,9 @@ pub fn QueryConsole() -> Element {
             let result = state.borrow_mut().register_consumer(&sql);
             match result {
                 Ok(id) => {
-                    state.borrow_mut().note(format!("registered consumer #{id}"));
+                    state
+                        .borrow_mut()
+                        .note(format!("registered consumer #{id}"));
                     current.set(String::new());
                 }
                 Err(e) => {

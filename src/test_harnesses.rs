@@ -980,10 +980,7 @@ mod regression_tests {
 
     #[test]
     fn regression_fuzz_aggregate_consistency() {
-        replay_crashes(
-            "fuzz_aggregate_consistency",
-            harness_aggregate_consistency,
-        );
+        replay_crashes("fuzz_aggregate_consistency", harness_aggregate_consistency);
     }
 
     #[test]

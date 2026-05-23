@@ -1,5 +1,8 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fa_solid_icons::{FaClockRotateLeft, FaPlug}};
+use dioxus_free_icons::{
+    icons::fa_solid_icons::{FaClockRotateLeft, FaPlug},
+    Icon,
+};
 
 use crate::state::LogEntry;
 

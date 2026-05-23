@@ -161,10 +161,7 @@ impl EventCapture {
         harness.exec_delete(rowid)?;
 
         if let Some(old) = old_image {
-            let pk_value = old
-                .get(self.pk_column)
-                .cloned()
-                .unwrap_or(Cell::Missing);
+            let pk_value = old.get(self.pk_column).cloned().unwrap_or(Cell::Missing);
             let pk = PrimaryKey::new(
                 Arc::from([self.pk_column].as_slice()),
                 Arc::from([pk_value].as_slice()),
@@ -220,8 +217,11 @@ impl EventCapture {
     /// Snapshot of the currently cached rows, sorted by rowid.
     pub fn snapshot_rows(&self) -> Vec<(i64, RowImage)> {
         let g = self.inner.lock().expect("capture poisoned");
-        let mut pairs: Vec<(i64, RowImage)> =
-            g.rowid_to_row.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let mut pairs: Vec<(i64, RowImage)> = g
+            .rowid_to_row
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
         pairs.sort_by_key(|(k, _)| *k);
         pairs
     }

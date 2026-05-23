@@ -56,10 +56,6 @@ dioxus-code-editor = "0.1"
 # Font Awesome icons as inline SVG components.
 dioxus-free-icons = { version = "0.10", features = ["font-awesome-solid"] }
 
-# Time / interval ticks for the auto-loop simulation driver. `web-time`
-# is a wasm-compatible shim for `std::time::Instant`.
-web-time = "1"
-
 # Random row generators for the simulation.
 rand = { version = "0.9", default-features = false, features = ["small_rng"] }
 

@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_code::{Code, Language, SourceCode, Theme};
-use dioxus_free_icons::{Icon, icons::fa_solid_icons::FaUsers};
+use dioxus_free_icons::{icons::fa_solid_icons::FaUsers, Icon};
 
 use crate::state::AggState;
 

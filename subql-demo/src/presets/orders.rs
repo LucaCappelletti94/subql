@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use rand::Rng;
 use rand::rngs::SmallRng;
 use rand::seq::IndexedRandom;
+use rand::Rng;
 
 use subql::Cell;
 

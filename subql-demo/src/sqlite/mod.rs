@@ -2,7 +2,7 @@
 //! to sqlite DDL via pg2sqlite, apply it, and load seed rows.
 //!
 //! The companion [`capture`] module installs diesel hooks that turn sqlite
-//! `INSERT`/`UPDATE`/`DELETE` into SubQL [`WalEvent`s].
+//! `INSERT`/`UPDATE`/`DELETE` into SubQL `WalEvent`s.
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use subql::{Cell, ColumnId, TableId, catalog_helpers};
+use subql::{catalog_helpers, Cell, ColumnId, TableId};
 
 use crate::presets::PresetSchema;
 

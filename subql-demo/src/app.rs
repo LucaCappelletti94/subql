@@ -2,12 +2,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fa_solid_icons::FaBolt};
+use dioxus_free_icons::{icons::fa_solid_icons::FaBolt, Icon};
 
 use crate::components::{
-    SharedState, TickSignal, consumer_panel::ConsumerPanel, event_log::EventLog,
-    query_console::QueryConsole, schema_picker::SchemaPicker, schema_view::SchemaView,
-    sim_controls::SimControls,
+    consumer_panel::ConsumerPanel, event_log::EventLog, query_console::QueryConsole,
+    schema_picker::SchemaPicker, schema_view::SchemaView, sim_controls::SimControls, SharedState,
+    TickSignal,
 };
 use crate::state::DemoState;
 

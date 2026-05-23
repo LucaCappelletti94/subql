@@ -6,8 +6,8 @@
 
 use std::collections::VecDeque;
 
-use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
@@ -17,8 +17,8 @@ use subql::{
 };
 
 use crate::presets::{self, PresetSchema};
-use crate::sqlite::{HarnessError, SqliteHarness};
 use crate::sqlite::capture::{CapturedHook, EventCapture};
+use crate::sqlite::{HarnessError, SqliteHarness};
 
 const EVENT_LOG_CAP: usize = 50;
 
@@ -65,7 +65,13 @@ impl AggState {
         match (self, delta) {
             (Self::Count(c), AggDelta::Count(d)) => *c += d,
             (Self::Sum(s), AggDelta::Sum(d)) => *s += d,
-            (Self::Avg { sum, count }, AggDelta::Avg { sum_delta, count_delta }) => {
+            (
+                Self::Avg { sum, count },
+                AggDelta::Avg {
+                    sum_delta,
+                    count_delta,
+                },
+            ) => {
                 *sum += sum_delta;
                 *count += count_delta;
             }
