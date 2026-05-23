@@ -24,8 +24,15 @@ TARGETS=(
 #                      a release > 0.62.0 ships), but we keep the 15s
 #                      headroom as defense in depth against new pathological
 #                      inputs the fuzzer may surface.
-#   -max_len=65536     cap generated input size at 64 KiB
-LIBFUZZER_ARGS=(-timeout=15 -max_len=65536)
+#   -max_len=65536     cap generated input size at 64 KiB.
+#   -rss_limit_mb=8192 raise libFuzzer's RSS ceiling from the 2 GiB default.
+#                      `fuzz_aggregate_consistency` constructs and drops a
+#                      fresh `SubscriptionEngine` per iteration; under ASAN
+#                      the allocator fragments and total RSS drifts past
+#                      2 GiB after ~50k iterations even though no single
+#                      input is large. 8 GiB gives ample headroom on this
+#                      machine and lets the fuzzer keep going.
+LIBFUZZER_ARGS=(-timeout=15 -max_len=65536 -rss_limit_mb=8192)
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "Session '$SESSION' already exists. Attach with: tmux attach -t $SESSION"
