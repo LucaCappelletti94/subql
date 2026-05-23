@@ -1,0 +1,78 @@
+[package]
+name = "subql-demo"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+description = "Dioxus web demo of subql: PG schema -> sqlite-wasm-rs -> CDC events via diesel hooks"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Core engine, built in no_std + alloc mode (wasm-friendly).
+subql = { path = "..", default-features = false }
+
+# Generic SQL schema traits, same git pin as subql.
+sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
+
+# PG dialect parser; the workspace [patch.crates-io] redirects this to the
+# visitor-wasm fork.
+sqlparser = { version = "0.62", default-features = false }
+
+# PG-DDL -> SQLite-DDL translator. Single PG DDL string per preset is fed
+# both into subql's ParserDB and into pg2sqlite::translate to produce the
+# SQLite-side schema applied via diesel.
+#
+# `default-features = false` keeps git2 (which transitively pulls in
+# libssh2-sys + libz-sys C code) out of the dep tree so the demo can
+# cross-compile to `wasm32-unknown-unknown`.
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false }
+
+# Diesel SQLite (workspace patch redirects to the sqlite3_update_hook fork
+# providing on_insert / on_update / on_delete hooks).
+diesel = { version = "2", default-features = false, features = ["sqlite"] }
+
+# Dioxus web (wasm32) renderer. Only needed on wasm targets; on native we
+# only build for type-checking.
+dioxus = { version = "0.7", features = ["web"] }
+
+# Syntax-highlighted code blocks + editable SQL surface for the query
+# console and consumer panel. `default-features = false` drops the
+# compile-time `code!` macro path (which we do not use) and keeps the
+# dep tree small. Build note (mirrors pg2sqlite/examples/web-playground):
+# these crates pull in `arborium-tree-sitter`, whose C grammars do not
+# link cleanly under cargo's `dev` profile (undefined `stderr` from the
+# wasm-shim header set). They link fine under `release` (LTO + opt-level
+# = "z" DCEs the cold `fprintf(stderr, ...)` branches in
+# `arborium-tree-sitter/src/alloc.c` before lld sees them). Use
+# `dx serve --release` for the demo - debug iteration is fine because
+# the demo's Rust is small; the cost is the one-shot `arborium-*` C
+# build.
+dioxus-code = { version = "0.1", default-features = false, features = ["lang-sql"] }
+dioxus-code-editor = "0.1"
+
+# Font Awesome icons as inline SVG components.
+dioxus-free-icons = { version = "0.10", features = ["font-awesome-solid"] }
+
+# Time / interval ticks for the auto-loop simulation driver. `web-time`
+# is a wasm-compatible shim for `std::time::Instant`.
+web-time = "1"
+
+# Random row generators for the simulation.
+rand = { version = "0.9", default-features = false, features = ["small_rng"] }
+
+# Logging plumbing during demo dev.
+log = "0.4"
+
+# Structured error types for the demo's sqlite/capture layer.
+thiserror = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browser sqlite, exposing the libsqlite3 C ABI that diesel's sqlite backend
+# links against. Pure wasm: no native shim is built.
+sqlite-wasm-rs = "0.5"
+console_error_panic_hook = "0.1"
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }

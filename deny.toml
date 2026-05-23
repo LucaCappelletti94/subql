@@ -20,15 +20,20 @@ multiple-versions = "warn"
 wildcards = "warn"
 deny = []
 
-# Allow git dependency for sqlparser (upstream requires git version)
-[[bans.skip]]
-name = "sqlparser"
-reason = "upstream requires git dependency"
-
 [advisories]
 ignore = []
 
 [sources]
 unknown-registry = "warn"
 unknown-git = "warn"
-allow-git = ["https://github.com/apache/datafusion-sqlparser-rs"]
+allow-git = [
+    # sqlparser pinned via [patch.crates-io] to LucaCappelletti94's fork at
+    # the `pathological2` branch (PR apache/datafusion-sqlparser-rs#2349).
+    # Repoint at upstream apache/datafusion-sqlparser-rs once #2349 merges.
+    "https://github.com/LucaCappelletti94/sqlparser-rs",
+    "https://github.com/apache/datafusion-sqlparser-rs",
+    # diesel sqlite hooks (PR #4969); subql-demo uses hook-driven WAL emulation.
+    "https://github.com/LucaCappelletti94/diesel",
+    # pg2sqlite, the PG-DDL -> SQLite-DDL translator the demo uses for preset schemas.
+    "https://github.com/LucaCappelletti94/pg2sqlite",
+]

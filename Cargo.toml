@@ -1,3 +1,30 @@
+[workspace]
+members = ["subql-demo"]
+# `fuzz/` is intentionally a separate workspace, not a member here.
+# cargo-fuzz layers ASAN + SanCov on top of the workspace's release
+# profile, and ASAN's runtime symbols don't survive LLVM LTO, so the
+# fuzz binaries need `lto = false`. Cargo's per-package profile
+# override doesn't actually accept `lto` (despite the docs listing it),
+# and cargo-fuzz has no `--profile` flag, so the only working options
+# are (a) drop LTO from the workspace `release` profile, hurting subql
+# benches and the dioxus demo's wasm bundle size, or (b) keep fuzz as
+# its own workspace with its own profile and mirror the root
+# `[patch.crates-io]` block. We picked (b); see `fuzz/Cargo.toml`.
+exclude = ["fuzz"]
+
+[patch.crates-io]
+# Diesel sqlite hooks (PR #4969). Drop once the PR lands in a diesel release.
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "sqlite3_update_hook" }
+# sqlparser pinned to the `pathological-combined` branch of the
+# LucaCappelletti94 fork. This branch bundles every unmerged
+# sqlparser-rs fix surfaced by subql's fuzz harness so far, on top of
+# upstream main (which already carries the merged #2343 visitor no_std
+# fix and the merged #2344 compound-chain exponential fix). Repoint at
+# apache main once the bundled PRs land and a sqlparser release > 0.62.0
+# ships.
+sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "f63e42fe13b4a8e4b8c943bb83f23f5d397056ba" }
+sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "f63e42fe13b4a8e4b8c943bb83f23f5d397056ba" }
+
 [package]
 name = "subql"
 version = "0.1.0"
@@ -30,6 +57,14 @@ harness = false
 name = "memory"
 harness = false
 required-features = ["dhat-heap"]
+
+# Time the two cursed fuzz inputs that libFuzzer flagged as timeouts under
+# the instrumented build, against an uninstrumented release. Sets the floor
+# for how much headroom the libFuzzer `-timeout=N` knob actually needs.
+[[bench]]
+name = "sqlparser_cursed"
+harness = false
+required-features = ["testing"]
 
 [dependencies]
 # SQL parsing (supports multiple dialects).
@@ -125,14 +160,25 @@ dhat-heap = ["std", "dep:dhat"]
 lto = true
 codegen-units = 1
 opt-level = 3
+# Strip DWARF info. dx 0.7 defaults to embedding debug symbols in wasm
+# (--debug-symbols=true), which makes binaryen abort during wasm-opt with
+# "compile unit size was incorrect". Stripping in the linker keeps
+# wasm-opt happy without losing release-grade optimisation, and shrinks
+# subql's own release binaries too.
+strip = "debuginfo"
+debug = false
 
 [profile.bench]
 inherits = "release"
 
-[lints.rust]
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 # Groups
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

@@ -1,0 +1,9 @@
+[application]
+name = "subql-demo"
+default_platform = "web"
+
+[web.app]
+title = "SubQL demo"
+
+[web.watcher]
+watch_path = ["src"]
