@@ -535,6 +535,57 @@ fn agg_catalog() -> ParserDB {
     .expect("agg fuzz fixture DDL parses")
 }
 
+/// Pre-built engine + table metadata shared across every iteration of
+/// [`harness_aggregate_consistency`] within a fuzz worker. Reusing the
+/// engine across iterations is the load-bearing reason this exists: the
+/// harness would otherwise drop and re-create a `SubscriptionEngine` on
+/// every call, and under ASAN that allocator churn drifts the worker's
+/// RSS past libFuzzer's default limit after tens of thousands of
+/// iterations even though no individual iteration leaks.
+///
+/// Cargo-fuzz runs single-threaded, so the `thread_local!` cell is
+/// shared by every iteration on the only worker thread. Re-entrancy is
+/// not possible.
+struct AggEngineCell {
+    engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
+    table_id: crate::TableId,
+    pk_col: crate::ColumnId,
+}
+
+impl AggEngineCell {
+    fn new() -> Self {
+        let database = Arc::new(agg_catalog());
+        let table_id = catalog_helpers::table_id(database.as_ref(), "orders")
+            .expect("agg_catalog must expose an `orders` table");
+        let pk_col = catalog_helpers::column_id(database.as_ref(), table_id, "id")
+            .expect("agg_catalog `orders` must expose an `id` column");
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(Arc::clone(&database), PostgreSqlDialect {});
+        engine
+            .register(SubscriptionRequest::<DefaultIds>::new(
+                1,
+                "SELECT COUNT(*) FROM orders",
+            ))
+            .expect("registering COUNT(*) consumer should succeed against agg_catalog");
+        engine
+            .register(SubscriptionRequest::<DefaultIds>::new(
+                2,
+                "SELECT SUM(amount) FROM orders",
+            ))
+            .expect("registering SUM(amount) consumer should succeed against agg_catalog");
+        Self {
+            engine,
+            table_id,
+            pk_col,
+        }
+    }
+}
+
+std::thread_local! {
+    static AGG_ENGINE: std::cell::RefCell<AggEngineCell> =
+        std::cell::RefCell::new(AggEngineCell::new());
+}
+
 /// Drive an arbitrary sequence of insert/update/delete operations against
 /// a fixed agg-only consumer set and assert that the engine's incremental
 /// `aggregate_deltas` output matches a from-scratch oracle.
@@ -553,57 +604,56 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
         return;
     };
 
-    let database = Arc::new(agg_catalog());
-    let Some(table_id) = catalog_helpers::table_id(database.as_ref(), "orders") else {
-        return;
-    };
-    let pk_col = match catalog_helpers::column_id(database.as_ref(), table_id, "id") {
-        Some(c) => c,
-        None => return,
-    };
+    AGG_ENGINE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let table_id = cell.table_id;
+        let pk_col = cell.pk_col;
 
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(Arc::clone(&database), PostgreSqlDialect {});
+        // Engine-side running state per consumer (fresh each iteration,
+        // because the oracle restarts from an empty virtual table).
+        let mut engine_count: i64 = 0;
+        let mut engine_sum: f64 = 0.0;
 
-    // Register one COUNT(*) consumer (cid=1) and one SUM(amount) consumer
-    // (cid=2). Both registrations may fail under odd dialect quirks; bail
-    // cleanly rather than asserting.
-    if engine
-        .register(SubscriptionRequest::<DefaultIds>::new(
-            1,
-            "SELECT COUNT(*) FROM orders",
-        ))
-        .is_err()
-    {
-        return;
-    }
-    if engine
-        .register(SubscriptionRequest::<DefaultIds>::new(
-            2,
-            "SELECT SUM(amount) FROM orders",
-        ))
-        .is_err()
-    {
-        return;
-    }
+        // Virtual table (id -> row), the source of truth for the oracle.
+        let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
 
-    // Engine-side running state per consumer.
-    let mut engine_count: i64 = 0;
-    let mut engine_sum: f64 = 0.0;
-
-    // Virtual table (id -> row), the source of truth for the oracle.
-    let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
-
-    for op in ops {
-        let (event, mutated): (Option<WalEvent>, bool) = match op {
-            AggOp::Insert { id, amount, status } => {
-                let id = i64::from(id);
-                if virt.contains_key(&id) {
-                    (None, false)
-                } else {
-                    let row = VirtRow::from_op(amount, status);
-                    let image = agg_row_image(id, &row);
-                    virt.insert(id, row);
+        for op in ops {
+            let (event, mutated): (Option<WalEvent>, bool) = match op {
+                AggOp::Insert { id, amount, status } => {
+                    let id = i64::from(id);
+                    if virt.contains_key(&id) {
+                        (None, false)
+                    } else {
+                        let row = VirtRow::from_op(amount, status);
+                        let image = agg_row_image(id, &row);
+                        virt.insert(id, row);
+                        let pk = match PrimaryKey::new(
+                            Arc::from([pk_col].as_slice()),
+                            Arc::from([Cell::Int(id)].as_slice()),
+                        ) {
+                            Ok(pk) => pk,
+                            Err(_) => return,
+                        };
+                        let event = WalEvent::builder(table_id)
+                            .insert()
+                            .pk(pk)
+                            .new_row(image)
+                            .build();
+                        match event {
+                            Ok(e) => (Some(e), true),
+                            Err(_) => return,
+                        }
+                    }
+                }
+                AggOp::Update { id, amount, status } => {
+                    let id = i64::from(id);
+                    let Some(old) = virt.get(&id).cloned() else {
+                        continue;
+                    };
+                    let new_row = VirtRow::from_op(amount, status);
+                    let old_image = agg_row_image(id, &old);
+                    let new_image = agg_row_image(id, &new_row);
+                    virt.insert(id, new_row);
                     let pk = match PrimaryKey::new(
                         Arc::from([pk_col].as_slice()),
                         Arc::from([Cell::Int(id)].as_slice()),
@@ -612,104 +662,78 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                         Err(_) => return,
                     };
                     let event = WalEvent::builder(table_id)
-                        .insert()
+                        .update()
                         .pk(pk)
-                        .new_row(image)
+                        .old_row(old_image)
+                        .new_row(new_image)
                         .build();
                     match event {
                         Ok(e) => (Some(e), true),
                         Err(_) => return,
                     }
                 }
+                AggOp::Delete { id } => {
+                    let id = i64::from(id);
+                    let Some(old) = virt.remove(&id) else {
+                        continue;
+                    };
+                    let old_image = agg_row_image(id, &old);
+                    let pk = match PrimaryKey::new(
+                        Arc::from([pk_col].as_slice()),
+                        Arc::from([Cell::Int(id)].as_slice()),
+                    ) {
+                        Ok(pk) => pk,
+                        Err(_) => return,
+                    };
+                    let event = WalEvent::builder(table_id)
+                        .delete()
+                        .pk(pk)
+                        .old_row(old_image)
+                        .build();
+                    match event {
+                        Ok(e) => (Some(e), true),
+                        Err(_) => return,
+                    }
+                }
+            };
+
+            if !mutated {
+                continue;
             }
-            AggOp::Update { id, amount, status } => {
-                let id = i64::from(id);
-                let Some(old) = virt.get(&id).cloned() else {
-                    continue;
-                };
-                let new_row = VirtRow::from_op(amount, status);
-                let old_image = agg_row_image(id, &old);
-                let new_image = agg_row_image(id, &new_row);
-                virt.insert(id, new_row);
-                let pk = match PrimaryKey::new(
-                    Arc::from([pk_col].as_slice()),
-                    Arc::from([Cell::Int(id)].as_slice()),
-                ) {
-                    Ok(pk) => pk,
-                    Err(_) => return,
-                };
-                let event = WalEvent::builder(table_id)
-                    .update()
-                    .pk(pk)
-                    .old_row(old_image)
-                    .new_row(new_image)
-                    .build();
-                match event {
-                    Ok(e) => (Some(e), true),
-                    Err(_) => return,
+            let Some(event) = event else { continue };
+
+            let deltas = match cell.engine.aggregate_deltas(&event) {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            for (cid, delta) in deltas {
+                match (cid, delta) {
+                    (1, AggDelta::Count(d)) => engine_count += d,
+                    (2, AggDelta::Sum(d)) => engine_sum += d,
+                    _ => {}
                 }
             }
-            AggOp::Delete { id } => {
-                let id = i64::from(id);
-                let Some(old) = virt.remove(&id) else {
-                    continue;
-                };
-                let old_image = agg_row_image(id, &old);
-                let pk = match PrimaryKey::new(
-                    Arc::from([pk_col].as_slice()),
-                    Arc::from([Cell::Int(id)].as_slice()),
-                ) {
-                    Ok(pk) => pk,
-                    Err(_) => return,
-                };
-                let event = WalEvent::builder(table_id)
-                    .delete()
-                    .pk(pk)
-                    .old_row(old_image)
-                    .build();
-                match event {
-                    Ok(e) => (Some(e), true),
-                    Err(_) => return,
-                }
-            }
-        };
 
-        if !mutated {
-            continue;
+            // Oracle: COUNT(*) is virtual-table size; SUM(amount) sums
+            // non-NULL amounts.
+            let oracle_count = i64::try_from(virt.len()).unwrap_or(i64::MAX);
+            let oracle_sum: f64 = virt
+                .values()
+                .filter_map(|r| r.amount)
+                .map(|v| v as f64)
+                .sum();
+
+            assert_eq!(
+                engine_count, oracle_count,
+                "COUNT(*) drift: engine={engine_count} oracle={oracle_count}"
+            );
+            let tolerance = 1e-9_f64.max(oracle_sum.abs() * 1e-12);
+            assert!(
+                (engine_sum - oracle_sum).abs() <= tolerance,
+                "SUM(amount) drift: engine={engine_sum} oracle={oracle_sum}"
+            );
         }
-        let Some(event) = event else { continue };
-
-        let deltas = match engine.aggregate_deltas(&event) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        for (cid, delta) in deltas {
-            match (cid, delta) {
-                (1, AggDelta::Count(d)) => engine_count += d,
-                (2, AggDelta::Sum(d)) => engine_sum += d,
-                _ => {}
-            }
-        }
-
-        // Oracle: COUNT(*) is virtual-table size; SUM(amount) sums
-        // non-NULL amounts.
-        let oracle_count = i64::try_from(virt.len()).unwrap_or(i64::MAX);
-        let oracle_sum: f64 = virt
-            .values()
-            .filter_map(|r| r.amount)
-            .map(|v| v as f64)
-            .sum();
-
-        assert_eq!(
-            engine_count, oracle_count,
-            "COUNT(*) drift: engine={engine_count} oracle={oracle_count}"
-        );
-        let tolerance = 1e-9_f64.max(oracle_sum.abs() * 1e-12);
-        assert!(
-            (engine_sum - oracle_sum).abs() <= tolerance,
-            "SUM(amount) drift: engine={engine_sum} oracle={oracle_sum}"
-        );
-    }
+    });
 }
 
 /// Drive raw bytes through the pgoutput binary parser. Exercises both
