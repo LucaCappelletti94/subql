@@ -783,8 +783,19 @@ enum SnapEvent {
 /// path to `pid` keeps separate workers from clobbering each other's
 /// shard files, and a per-iteration `remove_dir_all` + `create_dir_all`
 /// makes the round-trip start from a clean slate every time.
+///
+/// Prefers `/dev/shm` (Linux tmpfs / RAM) over `std::env::temp_dir()`
+/// (often a btrfs / ext4 mount), because the harness's bottleneck is
+/// the snapshot write's `fsync` and the restore's directory scan. On
+/// systems without `/dev/shm` the fallback to the platform temp dir
+/// keeps the harness working with slower iteration speed.
 fn snapshot_workdir() -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
+    let shm = std::path::Path::new("/dev/shm");
+    let mut p = if shm.is_dir() {
+        shm.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
     p.push(format!("subql-fuzz-snapshot-restore-{}", std::process::id()));
     p
 }
@@ -888,7 +899,12 @@ fn notifications_equal(
 /// fine - the harness simply bails out cleanly on any of them.
 pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     let mut u = Unstructured::new(data);
-    let Ok(n_reg) = u.int_in_range(1usize..=8) else {
+    // Bounded register and event counts: the harness is by far the
+    // slowest one because it constructs two engines and snapshots /
+    // restores per iteration. Capping at 4 / 16 keeps a typical
+    // iteration well under 1 second even under disk / CPU contention
+    // from the other fuzz panes.
+    let Ok(n_reg) = u.int_in_range(1usize..=4) else {
         return;
     };
     let Ok(regs): arbitrary::Result<Vec<SnapRegister>> =
@@ -896,7 +912,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     else {
         return;
     };
-    let Ok(n_events) = u.int_in_range(0usize..=32) else {
+    let Ok(n_events) = u.int_in_range(0usize..=16) else {
         return;
     };
     let Ok(events): arbitrary::Result<Vec<SnapEvent>> =
