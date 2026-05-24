@@ -9,6 +9,12 @@
 //! reverted or a new pathological case appears in §1-§8 the test fails
 //! loudly.
 
+// Test-only deadline timer. `eprintln!` records timings to test stderr
+// for diagnostic output, `Err(_)` covers the only failure mode that
+// matters (recv timeout or worker hangup, both indicate the deadline
+// was exceeded).
+#![allow(clippy::print_stderr, clippy::match_wild_err_arm)]
+
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 

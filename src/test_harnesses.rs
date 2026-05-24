@@ -5,6 +5,22 @@
 //!
 //! This module is only compiled under `#[cfg(any(feature = "testing", test))]`.
 
+// Clippy allows scoped to this fuzz-harness module. These lints flag
+// stylistic patterns (manual let-else, items after statements, doc
+// paragraph length, identical match arms, by-value generated test
+// data, and `BTreeMap` contains_key+insert) that are intentional or
+// load-bearing for readability in arbitrary-driven test code. The
+// module is feature-gated behind `testing` and is not part of the
+// production lib build.
+#![allow(
+    clippy::manual_let_else,
+    clippy::too_long_first_doc_paragraph,
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value,
+    clippy::map_entry,
+    clippy::match_same_arms
+)]
+
 use std::sync::Arc;
 
 use arbitrary::{Arbitrary, Unstructured};
@@ -784,6 +800,9 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
             // non-NULL amounts, VAR/STDDEV consumers share a single
             // (sum, sum_sq, count) ground truth.
             let oracle_count = i64::try_from(virt.len()).unwrap_or(i64::MAX);
+            // Amounts originate from `AggOp::Insert/Update.amount: i16`, so
+            // `v: i64` always fits exactly in f64.
+            #[allow(clippy::cast_precision_loss)]
             let oracle_sum: f64 = virt
                 .values()
                 .filter_map(|r| r.amount)
@@ -1089,11 +1108,8 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     }
 
     let mut engine_b: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        match SubscriptionEngine::with_storage(
-            Arc::clone(&database),
-            PostgreSqlDialect {},
-            workdir.clone(),
-        ) {
+        match SubscriptionEngine::with_storage(Arc::clone(&database), PostgreSqlDialect {}, workdir)
+        {
             Ok(e) => e,
             Err(_) => return,
         };
