@@ -1,4 +1,6 @@
-//! Streaming aggregate utilities for COUNT(*), COUNT(col), SUM(col), and AVG(col).
+//! Streaming aggregate utilities for `COUNT(*)`, `COUNT(col)`, `SUM(col)`,
+//! `AVG(col)`, `VAR_POP(col)`, `VAR_SAMP(col)`, `STDDEV_POP(col)`, and
+//! `STDDEV_SAMP(col)`.
 
 use crate::{compiler::AggSpec, AggDelta, ColumnId, RowImage};
 
@@ -37,6 +39,18 @@ pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<
             let value = numeric_cell_value(row, *column)?;
             Some(AggDelta::Avg {
                 sum_delta: value * weight as f64,
+                count_delta: weight,
+            })
+        }
+        AggSpec::VarPop { column }
+        | AggSpec::VarSamp { column }
+        | AggSpec::StddevPop { column }
+        | AggSpec::StddevSamp { column } => {
+            let value = numeric_cell_value(row, *column)?;
+            let w = weight as f64;
+            Some(AggDelta::Stats {
+                sum_delta: value * w,
+                sum_sq_delta: value * value * w,
                 count_delta: weight,
             })
         }
@@ -205,8 +219,70 @@ impl AggKernel for AvgKernel {
     }
 }
 
+/// Variance / standard-deviation kernel. Backs `VAR_POP`, `VAR_SAMP`,
+/// `STDDEV_POP`, and `STDDEV_SAMP`.
+///
+/// Accumulates `sum`, `sum_sq`, and `count` deltas. The same numbers feed
+/// every flavor, so a single kernel covers all four `AggSpec` variants.
+/// The caller derives the final value from the running tuple using the
+/// formulas documented on [`AggDelta::Stats`].
+///
+/// NULL, Missing, NaN, and infinite values are skipped, matching SQL
+/// semantics and the policy used by `SumKernel` / `AvgKernel`.
+#[derive(Debug)]
+pub struct StatsKernel {
+    column: ColumnId,
+    sum_delta: f64,
+    sum_sq_delta: f64,
+    count_delta: i64,
+}
+
+impl StatsKernel {
+    /// Create a new kernel for the given column ID.
+    #[must_use]
+    pub const fn new(column: ColumnId) -> Self {
+        Self {
+            column,
+            sum_delta: 0.0,
+            sum_sq_delta: 0.0,
+            count_delta: 0,
+        }
+    }
+}
+
+impl AggKernel for StatsKernel {
+    #[allow(clippy::cast_precision_loss)]
+    fn apply(&mut self, row: &RowImage, weight: i64) {
+        let Some(v) = numeric_cell_value(row, self.column) else {
+            return;
+        };
+        let w = weight as f64;
+        self.sum_delta = v.mul_add(w, self.sum_delta);
+        self.sum_sq_delta = (v * v).mul_add(w, self.sum_sq_delta);
+        self.count_delta += weight;
+    }
+
+    fn result(&self) -> AggDelta {
+        AggDelta::Stats {
+            sum_delta: self.sum_delta,
+            sum_sq_delta: self.sum_sq_delta,
+            count_delta: self.count_delta,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.sum_delta = 0.0;
+        self.sum_sq_delta = 0.0;
+        self.count_delta = 0;
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops
+)]
 mod tests {
     use super::*;
     use crate::Cell;
@@ -520,5 +596,169 @@ mod tests {
         k.apply(&row(vec![Cell::Int(100)]), 1);
         k.reset();
         assert_eq!(k.result(), AggDelta::Sum(0.0));
+    }
+
+    // --- agg_delta_for_row VAR/STDDEV tests ---
+
+    fn stats(sum: f64, sum_sq: f64, count: i64) -> AggDelta {
+        AggDelta::Stats {
+            sum_delta: sum,
+            sum_sq_delta: sum_sq,
+            count_delta: count,
+        }
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_var_pop_emits_stats() {
+        let row = row(vec![Cell::Int(3)]);
+        let d = agg_delta_for_row(&AggSpec::VarPop { column: 0 }, &row, 1);
+        assert_eq!(d, Some(stats(3.0, 9.0, 1)));
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_var_samp_negative_weight() {
+        let row = row(vec![Cell::Float(2.0)]);
+        let d = agg_delta_for_row(&AggSpec::VarSamp { column: 0 }, &row, -1);
+        assert_eq!(d, Some(stats(-2.0, -4.0, -1)));
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_stddev_pop_skips_null() {
+        let row = row(vec![Cell::Null]);
+        let d = agg_delta_for_row(&AggSpec::StddevPop { column: 0 }, &row, 1);
+        assert_eq!(d, None);
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_stddev_samp_skips_missing() {
+        let row = row(vec![Cell::Int(1), Cell::Missing]);
+        let d = agg_delta_for_row(&AggSpec::StddevSamp { column: 1 }, &row, 1);
+        assert_eq!(d, None);
+    }
+
+    #[test]
+    fn test_agg_delta_for_row_stats_skips_nan_and_inf() {
+        let r1 = row(vec![Cell::Float(f64::NAN)]);
+        let r2 = row(vec![Cell::Float(f64::INFINITY)]);
+        assert_eq!(
+            agg_delta_for_row(&AggSpec::VarPop { column: 0 }, &r1, 1),
+            None
+        );
+        assert_eq!(
+            agg_delta_for_row(&AggSpec::VarSamp { column: 0 }, &r2, 1),
+            None
+        );
+    }
+
+    // --- StatsKernel tests ---
+
+    #[test]
+    fn test_stats_kernel_int_cell() {
+        let mut k = StatsKernel::new(0);
+        k.apply(&row(vec![Cell::Int(4)]), 1);
+        assert_eq!(k.result(), stats(4.0, 16.0, 1));
+    }
+
+    #[test]
+    fn test_stats_kernel_float_cell() {
+        let mut k = StatsKernel::new(0);
+        k.apply(&row(vec![Cell::Float(2.5)]), 1);
+        assert_eq!(k.result(), stats(2.5, 6.25, 1));
+    }
+
+    #[test]
+    fn test_stats_kernel_null_skipped() {
+        let mut k = StatsKernel::new(0);
+        k.apply(&row(vec![Cell::Null]), 1);
+        assert_eq!(k.result(), stats(0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn test_stats_kernel_missing_skipped() {
+        let mut k = StatsKernel::new(1);
+        k.apply(&row(vec![Cell::Int(1)]), 1);
+        assert_eq!(k.result(), stats(0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn test_stats_kernel_nan_skipped() {
+        let mut k = StatsKernel::new(0);
+        k.apply(&row(vec![Cell::Float(f64::NAN)]), 1);
+        assert_eq!(k.result(), stats(0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn test_stats_kernel_inf_skipped() {
+        let mut k = StatsKernel::new(0);
+        k.apply(&row(vec![Cell::Float(f64::INFINITY)]), 1);
+        assert_eq!(k.result(), stats(0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn test_stats_kernel_negative_weight() {
+        let mut k = StatsKernel::new(0);
+        k.apply(&row(vec![Cell::Int(5)]), -1);
+        assert_eq!(k.result(), stats(-5.0, -25.0, -1));
+    }
+
+    #[test]
+    fn test_stats_kernel_update_net() {
+        let mut k = StatsKernel::new(0);
+        k.apply(&row(vec![Cell::Int(3)]), -1); // old row
+        k.apply(&row(vec![Cell::Int(7)]), 1); // new row
+        assert_eq!(k.result(), stats(4.0, 40.0, 0));
+    }
+
+    #[test]
+    fn test_stats_kernel_reset() {
+        let mut k = StatsKernel::new(0);
+        k.apply(&row(vec![Cell::Int(9)]), 1);
+        k.reset();
+        assert_eq!(k.result(), stats(0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn test_stats_kernel_population_variance_formula() {
+        // Sample set [2, 4, 4, 4, 5, 5, 7, 9] has population variance 4.0.
+        let xs = [2, 4, 4, 4, 5, 5, 7, 9];
+        let mut k = StatsKernel::new(0);
+        for x in xs {
+            k.apply(&row(vec![Cell::Int(x)]), 1);
+        }
+        let AggDelta::Stats {
+            sum_delta,
+            sum_sq_delta,
+            count_delta,
+        } = k.result()
+        else {
+            panic!("expected Stats");
+        };
+        let n = count_delta as f64;
+        let var_pop = sum_sq_delta / n - (sum_delta / n).powi(2);
+        assert!((var_pop - 4.0).abs() < 1e-9, "var_pop = {var_pop}");
+    }
+
+    #[test]
+    fn test_stats_kernel_sample_variance_formula() {
+        // [2, 4, 4, 4, 5, 5, 7, 9]: sample variance ~= 4.571428...
+        let xs = [2, 4, 4, 4, 5, 5, 7, 9];
+        let mut k = StatsKernel::new(0);
+        for x in xs {
+            k.apply(&row(vec![Cell::Int(x)]), 1);
+        }
+        let AggDelta::Stats {
+            sum_delta,
+            sum_sq_delta,
+            count_delta,
+        } = k.result()
+        else {
+            panic!("expected Stats");
+        };
+        let n = count_delta as f64;
+        let var_samp = sum_delta.mul_add(-sum_delta / n, sum_sq_delta) / (n - 1.0);
+        assert!(
+            (var_samp - 32.0 / 7.0).abs() < 1e-9,
+            "var_samp = {var_samp}"
+        );
     }
 }

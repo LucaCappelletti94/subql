@@ -490,6 +490,8 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
     let mut sum_weights: HashMap<ConsumerOrdinal, f64> = HashMap::new();
     // AVG accumulator: (sum_delta, count_delta)
     let mut avg_accum: HashMap<ConsumerOrdinal, (f64, i64)> = HashMap::new();
+    // VAR/STDDEV accumulator: (sum_delta, sum_sq_delta, count_delta)
+    let mut stats_accum: HashMap<ConsumerOrdinal, (f64, f64, i64)> = HashMap::new();
 
     let snapshot = partition.load_snapshot();
 
@@ -531,6 +533,16 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
                                 entry.0 += *sum_delta;
                                 entry.1 += *count_delta;
                             }
+                            AggDelta::Stats {
+                                sum_delta,
+                                sum_sq_delta,
+                                count_delta,
+                            } => {
+                                let entry = stats_accum.entry(ord).or_default();
+                                entry.0 += *sum_delta;
+                                entry.1 += *sum_sq_delta;
+                                entry.2 += *count_delta;
+                            }
                         }
                     }
                 }
@@ -562,6 +574,21 @@ pub(crate) fn compute_agg_deltas<I: IdTypes>(
                 uid,
                 AggDelta::Avg {
                     sum_delta: s,
+                    count_delta: c,
+                },
+            ));
+        }
+    }
+    for (ord, (s, sq, c)) in stats_accum
+        .into_iter()
+        .filter(|(_, (s, sq, c))| *s != 0.0 || *sq != 0.0 || *c != 0)
+    {
+        if let Some(uid) = consumer_dict.get_consumer(ord) {
+            result.push((
+                uid,
+                AggDelta::Stats {
+                    sum_delta: s,
+                    sum_sq_delta: sq,
                     count_delta: c,
                 },
             ));

@@ -206,16 +206,22 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     fn make_predicate_from_compiled(compiled: &CompiledSpec<I>) -> (Predicate, Vec<IndexableAtom>) {
         let atoms = Self::index_atoms_from_plan(&compiled.prefilter_plan);
 
-        // For SUM/AVG/COUNT(col) subscriptions, augment dependency_columns with the
-        // aggregate column. This ensures UPDATE events that change only the aggregate column
-        // (not any WHERE column) are still dispatched to the aggregate pipeline.
+        // For aggregate subscriptions that read a column (SUM/AVG/COUNT(col)/
+        // VAR_*/STDDEV_*), augment dependency_columns with the aggregate
+        // column. This ensures UPDATE events that change only the aggregate
+        // column (not any WHERE column) are still dispatched to the aggregate
+        // pipeline.
         let dependency_columns: Arc<[u16]> = {
             let mut dep_cols = compiled.bytecode.dependency_columns.clone();
             let agg_col = match &compiled.projection {
                 QueryProjection::Aggregate(
                     AggSpec::Sum { column }
                     | AggSpec::Avg { column }
-                    | AggSpec::CountColumn { column },
+                    | AggSpec::CountColumn { column }
+                    | AggSpec::VarPop { column }
+                    | AggSpec::VarSamp { column }
+                    | AggSpec::StddevPop { column }
+                    | AggSpec::StddevSamp { column },
                 ) => Some(*column),
                 _ => None,
             };

@@ -1098,6 +1098,29 @@ pub enum AggDelta {
     /// avg            = running_sum / running_count  (when running_count > 0)
     /// ```
     Avg { sum_delta: f64, count_delta: i64 },
+    /// VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP delta. Carries the
+    /// three components needed to update a running variance or standard
+    /// deviation.
+    ///
+    /// The kernel is the same for all four functions. The consumer
+    /// applies the appropriate derivation to the running tuple:
+    /// ```text
+    /// running_sum    += sum_delta
+    /// running_sum_sq += sum_sq_delta
+    /// running_count  += count_delta
+    ///
+    /// // population variance:
+    /// var_pop  = running_sum_sq / N - (running_sum / N)^2
+    /// // sample variance (N >= 2):
+    /// var_samp = (running_sum_sq - (running_sum)^2 / N) / (N - 1)
+    /// stddev_*  = sqrt(var_*)
+    /// ```
+    /// where `N = running_count`.
+    Stats {
+        sum_delta: f64,
+        sum_sq_delta: f64,
+        count_delta: i64,
+    },
 }
 
 /// Per-consumer notification classification from `consumers()`.
