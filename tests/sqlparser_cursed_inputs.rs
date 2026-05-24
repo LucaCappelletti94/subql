@@ -1,12 +1,12 @@
-//! Regression test for seven distinct exponential-parse-time inputs that
+//! Regression test for eight distinct exponential-parse-time inputs that
 //! `subql`'s fuzz harnesses surfaced against `sqlparser` on the
-//! `PostgreSqlDialect` and that have since been fixed (some on
-//! `apache/datafusion-sqlparser-rs` `main` via PRs #2343, #2344, #2349,
-//! the rest on the `LucaCappelletti94/sqlparser-rs` `pathological-combined`
-//! branch that the workspace `[patch.crates-io]` currently pins).
+//! `PostgreSqlDialect`. All are fixed (on `apache/datafusion-sqlparser-rs`
+//! `main` via PRs #2343, #2344, #2349, or on the
+//! `LucaCappelletti94/sqlparser-rs` `pathological-combined` branch that
+//! the workspace `[patch.crates-io]` currently pins).
 //!
 //! Enforces a 1-second ceiling per input. If the upstream patches are
-//! reverted or a new pathological case appears in §1-§7 the test fails
+//! reverted or a new pathological case appears in §1-§8 the test fails
 //! loudly.
 
 use std::sync::mpsc;
@@ -59,6 +59,13 @@ const CURSED_INPUTS: &[(&str, &[u8])] = &[
         "section_7_dollar_quote_bit",
         include_bytes!("../benches/inputs/cursed_dollar_quote_bit_3988b.bin"),
     ),
+    // §8: `CASE` keyword used as identifier-prefix in a chain of
+    // dot/hyphen/`#` operator tokens, surfaced from a fuzz_parse_sql
+    // timeout. Fixed on `pathological-combined`.
+    (
+        "section_8_case_soup",
+        include_bytes!("../benches/inputs/cursed_case_soup_142b.bin"),
+    ),
 ];
 
 #[test]
@@ -85,3 +92,4 @@ fn pathological_inputs_parse_under_deadline() {
         }
     }
 }
+

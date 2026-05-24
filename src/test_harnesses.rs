@@ -736,6 +736,251 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot + restore round-trip harness
+// ---------------------------------------------------------------------------
+
+/// Fixed pool of `SELECT *` queries the snapshot/restore harness picks
+/// from. All target the same `agg_catalog()` `orders` table so
+/// registrations always succeed; the fuzzer controls which subset of
+/// the pool ends up registered and in what order.
+const SNAPSHOT_REGISTER_SQLS: &[&str] = &[
+    "SELECT * FROM orders WHERE amount > 100",
+    "SELECT * FROM orders WHERE status = 'open'",
+    "SELECT * FROM orders WHERE amount IS NULL",
+    "SELECT * FROM orders WHERE id IN (1, 2, 3)",
+    "SELECT * FROM orders WHERE amount BETWEEN 10 AND 100",
+    "SELECT * FROM orders WHERE status = 'shipped' OR amount > 500",
+    "SELECT * FROM orders WHERE amount > 0 AND status = 'pending'",
+    "SELECT * FROM orders WHERE status != 'cancelled'",
+];
+
+#[derive(Debug, Arbitrary)]
+struct SnapRegister {
+    consumer_id: u8,
+    sql_idx: u8,
+}
+
+#[derive(Debug, Arbitrary)]
+enum SnapEvent {
+    Insert {
+        id: u8,
+        amount: Option<i32>,
+        status: Option<u8>,
+    },
+    Update {
+        id: u8,
+        amount: Option<i32>,
+        status: Option<u8>,
+    },
+    Delete {
+        id: u8,
+    },
+}
+
+/// Per-process working directory for the snapshot/restore harness.
+/// libFuzzer spawns one worker process per parallel run; pinning the
+/// path to `pid` keeps separate workers from clobbering each other's
+/// shard files, and a per-iteration `remove_dir_all` + `create_dir_all`
+/// makes the round-trip start from a clean slate every time.
+fn snapshot_workdir() -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("subql-fuzz-snapshot-restore-{}", std::process::id()));
+    p
+}
+
+fn snap_event_to_walevent(
+    op: SnapEvent,
+    table_id: crate::TableId,
+    pk_col: crate::ColumnId,
+    virt: &mut BTreeMap<i64, VirtRow>,
+) -> Option<WalEvent> {
+    match op {
+        SnapEvent::Insert { id, amount, status } => {
+            let id = i64::from(id);
+            if virt.contains_key(&id) {
+                return None;
+            }
+            let row = VirtRow::from_op(amount, status);
+            let image = agg_row_image(id, &row);
+            virt.insert(id, row);
+            let pk = PrimaryKey::new(
+                Arc::from([pk_col].as_slice()),
+                Arc::from([Cell::Int(id)].as_slice()),
+            )
+            .ok()?;
+            WalEvent::builder(table_id)
+                .insert()
+                .pk(pk)
+                .new_row(image)
+                .build()
+                .ok()
+        }
+        SnapEvent::Update { id, amount, status } => {
+            let id = i64::from(id);
+            let old = virt.get(&id).cloned()?;
+            let new_row = VirtRow::from_op(amount, status);
+            let old_image = agg_row_image(id, &old);
+            let new_image = agg_row_image(id, &new_row);
+            virt.insert(id, new_row);
+            let pk = PrimaryKey::new(
+                Arc::from([pk_col].as_slice()),
+                Arc::from([Cell::Int(id)].as_slice()),
+            )
+            .ok()?;
+            WalEvent::builder(table_id)
+                .update()
+                .pk(pk)
+                .old_row(old_image)
+                .new_row(new_image)
+                .build()
+                .ok()
+        }
+        SnapEvent::Delete { id } => {
+            let id = i64::from(id);
+            let old = virt.remove(&id)?;
+            let old_image = agg_row_image(id, &old);
+            let pk = PrimaryKey::new(
+                Arc::from([pk_col].as_slice()),
+                Arc::from([Cell::Int(id)].as_slice()),
+            )
+            .ok()?;
+            WalEvent::builder(table_id)
+                .delete()
+                .pk(pk)
+                .old_row(old_image)
+                .build()
+                .ok()
+        }
+    }
+}
+
+fn notifications_equal(
+    a: &crate::ConsumerNotifications<DefaultIds>,
+    b: &crate::ConsumerNotifications<DefaultIds>,
+) -> bool {
+    let mut a_ins = a.inserted().to_vec();
+    let mut b_ins = b.inserted().to_vec();
+    let mut a_upd = a.updated().to_vec();
+    let mut b_upd = b.updated().to_vec();
+    let mut a_del = a.deleted().to_vec();
+    let mut b_del = b.deleted().to_vec();
+    a_ins.sort_unstable();
+    b_ins.sort_unstable();
+    a_upd.sort_unstable();
+    b_upd.sort_unstable();
+    a_del.sort_unstable();
+    b_del.sort_unstable();
+    a_ins == b_ins && a_upd == b_upd && a_del == b_del
+}
+
+/// Build an engine, register an arbitrary set of subscriptions, snapshot
+/// them to disk, rebuild a fresh engine from the same on-disk shards,
+/// then dispatch an arbitrary event sequence through both engines and
+/// assert their `ConsumerNotifications` match for every event.
+///
+/// Strong oracle: any drift between the in-memory state of the
+/// registering engine and the restored engine surfaces as a real test
+/// failure.
+///
+/// Contract: panics are bugs. Assertion failures are bugs. Errors from
+/// `register`, `snapshot_table`, `with_storage`, or `consumers` are
+/// fine - the harness simply bails out cleanly on any of them.
+pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
+    let mut u = Unstructured::new(data);
+    let Ok(n_reg) = u.int_in_range(1usize..=8) else {
+        return;
+    };
+    let Ok(regs): arbitrary::Result<Vec<SnapRegister>> =
+        (0..n_reg).map(|_| SnapRegister::arbitrary(&mut u)).collect()
+    else {
+        return;
+    };
+    let Ok(n_events) = u.int_in_range(0usize..=32) else {
+        return;
+    };
+    let Ok(events): arbitrary::Result<Vec<SnapEvent>> =
+        (0..n_events).map(|_| SnapEvent::arbitrary(&mut u)).collect()
+    else {
+        return;
+    };
+
+    let workdir = snapshot_workdir();
+    let _ = std::fs::remove_dir_all(&workdir);
+    if std::fs::create_dir_all(&workdir).is_err() {
+        return;
+    }
+
+    let database = Arc::new(agg_catalog());
+    let Some(table_id) = catalog_helpers::table_id(database.as_ref(), "orders") else {
+        return;
+    };
+    let pk_col = match catalog_helpers::column_id(database.as_ref(), table_id, "id") {
+        Some(c) => c,
+        None => return,
+    };
+
+    let mut engine_a: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+        match SubscriptionEngine::with_storage(
+            Arc::clone(&database),
+            PostgreSqlDialect {},
+            workdir.clone(),
+        ) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+    // Track which (consumer_id, sql) pairs we've registered to avoid
+    // duplicate consumer_id collisions, which would fail on the engine
+    // side and desynchronise A and B's view of the consumer set.
+    use std::collections::HashSet;
+    let mut seen_consumers: HashSet<u64> = HashSet::new();
+    for reg in &regs {
+        let cid = u64::from(reg.consumer_id);
+        if !seen_consumers.insert(cid) {
+            continue;
+        }
+        let sql = SNAPSHOT_REGISTER_SQLS[(reg.sql_idx as usize) % SNAPSHOT_REGISTER_SQLS.len()];
+        let _ = engine_a.register(SubscriptionRequest::<DefaultIds>::new(cid, sql));
+    }
+
+    if engine_a.snapshot_table(table_id).is_err() {
+        return;
+    }
+
+    let mut engine_b: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+        match SubscriptionEngine::with_storage(
+            Arc::clone(&database),
+            PostgreSqlDialect {},
+            workdir.clone(),
+        ) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+    let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
+    for op in events {
+        let Some(event) = snap_event_to_walevent(op, table_id, pk_col, &mut virt) else {
+            continue;
+        };
+        let notif_a = match engine_a.consumers(&event) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        let notif_b = match engine_b.consumers(&event) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        assert!(
+            notifications_equal(&notif_a, &notif_b),
+            "snapshot/restore drift: A={:?} B={:?} event={:?}",
+            (notif_a.inserted(), notif_a.updated(), notif_a.deleted()),
+            (notif_b.inserted(), notif_b.updated(), notif_b.deleted()),
+            event.kind(),
+        );
+    }
+}
+
 /// Drive raw bytes through the pgoutput binary parser. Exercises both
 /// the cursor-parsing paths in every message-type branch (single-message
 /// mode) and the relation-cache cross-message state (sequenced mode).
@@ -1005,6 +1250,14 @@ mod regression_tests {
     #[test]
     fn regression_fuzz_aggregate_consistency() {
         replay_crashes("fuzz_aggregate_consistency", harness_aggregate_consistency);
+    }
+
+    #[test]
+    fn regression_fuzz_snapshot_restore_roundtrip() {
+        replay_crashes(
+            "fuzz_snapshot_restore_roundtrip",
+            harness_snapshot_restore_roundtrip,
+        );
     }
 
     #[test]

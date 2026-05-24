@@ -29,7 +29,7 @@ members = ["."]
 # delete both blocks together once the bundled PRs land and a patched
 # sqlparser release is on crates.io.
 [patch.crates-io]
-sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "f63e42fe13b4a8e4b8c943bb83f23f5d397056ba" }
+sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 
 [profile.release]
 debug = 1
@@ -86,6 +86,13 @@ bench = false
 [[bin]]
 name = "fuzz_aggregate_consistency"
 path = "fuzz_targets/fuzz_aggregate_consistency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_snapshot_restore_roundtrip"
+path = "fuzz_targets/fuzz_snapshot_restore_roundtrip.rs"
 test = false
 doc = false
 bench = false

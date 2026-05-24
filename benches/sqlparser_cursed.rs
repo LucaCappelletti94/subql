@@ -23,8 +23,9 @@ const PAREN_COMMA_INPUT: &[u8] = include_bytes!("inputs/cursed_parens_commas_das
 const SHIFT_KW_INPUT: &[u8] = include_bytes!("inputs/cursed_shift_keywords_527b.bin");
 const KW_OP_SOUP_INPUT: &[u8] = include_bytes!("inputs/cursed_keyword_op_soup_903b.bin");
 const DOLLAR_QUOTE_BIT_INPUT: &[u8] = include_bytes!("inputs/cursed_dollar_quote_bit_3988b.bin");
+const CASE_SOUP_INPUT: &[u8] = include_bytes!("inputs/cursed_case_soup_142b.bin");
 
-fn cases() -> [(&'static str, &'static [u8]); 6] {
+fn cases() -> [(&'static str, &'static [u8]); 7] {
     [
         ("parse_sql_919B", PARSE_SQL_INPUT),
         ("canonicalize_135B", CANONICALIZE_INPUT),
@@ -35,6 +36,7 @@ fn cases() -> [(&'static str, &'static [u8]); 6] {
             "dollar_quote_bit_3988B_fixed_combined",
             DOLLAR_QUOTE_BIT_INPUT,
         ),
+        ("case_soup_142B_fixed_combined", CASE_SOUP_INPUT),
     ]
 }
 
