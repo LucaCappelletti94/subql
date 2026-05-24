@@ -8,7 +8,9 @@ use sqlparser::ast::{
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
 const UNSUPPORTED_PROJECTION: &str =
-    "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), or AVG(col) are supported";
+    "Unsupported projection: only SELECT *, COUNT(*), COUNT(col), SUM(col), AVG(col), \
+     VAR_POP(col), VAR_SAMP(col), STDDEV_POP(col), or STDDEV_SAMP(col) are supported \
+     (VARIANCE/STDDEV are accepted as aliases for VAR_SAMP/STDDEV_SAMP)";
 
 /// Projection kind for a subscription SQL statement.
 #[non_exhaustive]
@@ -26,12 +28,29 @@ pub enum QueryProjection {
 pub enum AggSpec {
     /// `SELECT COUNT(*)`
     CountStar,
-    /// `SELECT COUNT(column_name)` — counts non-NULL values; column resolved at registration.
+    /// `SELECT COUNT(column_name)`. Counts non-NULL values. Column resolved
+    /// at registration.
     CountColumn { column: crate::ColumnId },
-    /// `SELECT SUM(column_name)` — column resolved to ColumnId at registration.
+    /// `SELECT SUM(column_name)`. Column resolved to `ColumnId` at registration.
     Sum { column: crate::ColumnId },
-    /// `SELECT AVG(column_name)` — emits both sum and count deltas; column resolved at registration.
+    /// `SELECT AVG(column_name)`. Emits both sum and count deltas. Column
+    /// resolved at registration.
     Avg { column: crate::ColumnId },
+    /// `SELECT VAR_POP(column_name)`. Population variance. Emits `Stats`
+    /// deltas (`sum`, `sum_sq`, `count`). Consumer computes
+    /// `sum_sq / N - (sum / N).powi(2)`.
+    VarPop { column: crate::ColumnId },
+    /// `SELECT VAR_SAMP(column_name)` (alias `VARIANCE`). Sample variance.
+    /// Emits `Stats` deltas. Consumer computes
+    /// `(sum_sq - sum.powi(2) / N) / (N - 1)`, requires `N >= 2`.
+    VarSamp { column: crate::ColumnId },
+    /// `SELECT STDDEV_POP(column_name)`. Population standard deviation.
+    /// Same `Stats` deltas as `VarPop`. Consumer takes `sqrt(var_pop)`.
+    StddevPop { column: crate::ColumnId },
+    /// `SELECT STDDEV_SAMP(column_name)` (alias `STDDEV`). Sample standard
+    /// deviation. Same `Stats` deltas as `VarSamp`. Consumer takes
+    /// `sqrt(var_samp)`.
+    StddevSamp { column: crate::ColumnId },
 }
 
 /// Extract a plain column name from a function argument, if it is a bare
@@ -49,19 +68,103 @@ fn extract_column_arg(arg: &FunctionArg) -> Option<String> {
     }
 }
 
+/// Resolve a single-column numeric-aggregate argument (`SUM`, `AVG`,
+/// `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, plus the `VARIANCE`
+/// and `STDDEV` aliases). Validates that the argument is a plain column
+/// name, rejects `FILTER`/`OVER`/`DISTINCT`/wildcards, and rejects
+/// non-numeric column types when the catalog exposes type information.
+fn resolve_numeric_agg_column<DB: DatabaseLike>(
+    func: &str,
+    f: &sqlparser::ast::Function,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<crate::ColumnId, RegisterError> {
+    let display = func.to_uppercase();
+
+    if f.filter.is_some() {
+        return Err(RegisterError::UnsupportedSql(format!(
+            "{display}(...) FILTER (WHERE ...) not supported"
+        )));
+    }
+    if f.over.is_some() {
+        return Err(RegisterError::UnsupportedSql(
+            WINDOW_FUNCTIONS_NOT_SUPPORTED.to_string(),
+        ));
+    }
+
+    let column = match &f.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+                return Err(RegisterError::UnsupportedSql(format!(
+                    "{display}(DISTINCT ...) not supported"
+                )));
+            }
+            if list.args.len() != 1 {
+                return Err(RegisterError::UnsupportedSql(format!(
+                    "{display} requires exactly one argument"
+                )));
+            }
+            if matches!(
+                &list.args[0],
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+            ) {
+                return Err(RegisterError::UnsupportedSql(format!(
+                    "{display}(*) is not supported, use {display}(column_name)"
+                )));
+            }
+            let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
+                RegisterError::UnsupportedSql(format!(
+                    "{display} argument must be a plain column name, not an expression"
+                ))
+            })?;
+            catalog_helpers::column_id(database, table_id, &col_name).ok_or(
+                RegisterError::UnknownColumn {
+                    table_id,
+                    column: col_name,
+                },
+            )?
+        }
+        _ => {
+            return Err(RegisterError::UnsupportedSql(format!(
+                "{display} requires a column argument"
+            )));
+        }
+    };
+
+    if let Some(col_type) = catalog_helpers::column_type(database, table_id, column) {
+        match col_type {
+            crate::ColumnType::Bool | crate::ColumnType::String => {
+                return Err(RegisterError::UnsupportedSql(format!(
+                    "{display} requires a numeric column (Int or Float), \
+                     but column {column} has type {col_type:?}"
+                )));
+            }
+            crate::ColumnType::Int | crate::ColumnType::Float | crate::ColumnType::Unknown => {}
+        }
+    }
+
+    Ok(column)
+}
+
 /// Extract the `QueryProjection` from a parsed SELECT statement.
 ///
 /// Accepts:
-/// - `SELECT *`                         → `QueryProjection::Rows`
-/// - `SELECT COUNT(*) [AS alias]`       → `QueryProjection::Aggregate(AggSpec::CountStar)`
-/// - `SELECT COUNT(col) [AS alias]`     → `QueryProjection::Aggregate(AggSpec::CountColumn { column })`
-/// - `SELECT SUM(col) [AS alias]`       → `QueryProjection::Aggregate(AggSpec::Sum { column })`
-/// - `SELECT AVG(col) [AS alias]`       → `QueryProjection::Aggregate(AggSpec::Avg { column })`
+/// - `SELECT *`                            -> `QueryProjection::Rows`
+/// - `SELECT COUNT(*) [AS alias]`          -> `Aggregate(CountStar)`
+/// - `SELECT COUNT(col) [AS alias]`        -> `Aggregate(CountColumn { column })`
+/// - `SELECT SUM(col) [AS alias]`          -> `Aggregate(Sum { column })`
+/// - `SELECT AVG(col) [AS alias]`          -> `Aggregate(Avg { column })`
+/// - `SELECT VAR_POP(col) [AS alias]`      -> `Aggregate(VarPop { column })`
+/// - `SELECT VAR_SAMP(col) [AS alias]`     -> `Aggregate(VarSamp { column })`
+/// - `SELECT STDDEV_POP(col) [AS alias]`   -> `Aggregate(StddevPop { column })`
+/// - `SELECT STDDEV_SAMP(col) [AS alias]`  -> `Aggregate(StddevSamp { column })`
+/// - `VARIANCE(col)` is accepted as a `VAR_SAMP` alias.
+/// - `STDDEV(col)` is accepted as a `STDDEV_SAMP` alias.
 ///
 /// Returns `Err(UnsupportedSql)` for any other projection.
 /// Returns `Err(UnknownColumn)` when the aggregate column does not exist in the catalog.
-/// Returns `Err(UnsupportedSql)` when `SUM`/`AVG` is used on a non-numeric column type
-/// (only when the catalog exposes type information via
+/// Returns `Err(UnsupportedSql)` when `SUM`/`AVG`/`VAR_*`/`STDDEV_*` is used on a
+/// non-numeric column type (only when the catalog exposes type information via
 /// [`catalog_helpers::column_type`]).
 #[allow(clippy::too_many_lines)]
 pub(super) fn extract_projection<DB: DatabaseLike>(
@@ -168,93 +271,25 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
                         )),
                     }
                 }
-                Some(func @ ("sum" | "avg")) => {
-                    // SUM(col) and AVG(col) — no FILTER, OVER, or DISTINCT; numeric columns only.
-                    if f.filter.is_some() {
-                        return Err(RegisterError::UnsupportedSql(format!(
-                            "{}(...) FILTER (WHERE ...) not supported",
-                            func.to_uppercase()
-                        )));
-                    }
-                    if f.over.is_some() {
-                        return Err(RegisterError::UnsupportedSql(
-                            WINDOW_FUNCTIONS_NOT_SUPPORTED.to_string(),
-                        ));
-                    }
-
-                    let column = match &f.args {
-                        FunctionArguments::List(list) => {
-                            if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
-                                return Err(RegisterError::UnsupportedSql(format!(
-                                    "{}(DISTINCT ...) not supported",
-                                    func.to_uppercase()
-                                )));
-                            }
-                            if list.args.len() != 1 {
-                                return Err(RegisterError::UnsupportedSql(format!(
-                                    "{} requires exactly one argument",
-                                    func.to_uppercase()
-                                )));
-                            }
-                            if matches!(
-                                &list.args[0],
-                                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                            ) {
-                                return Err(RegisterError::UnsupportedSql(format!(
-                                    "{}(*) is not supported — use {}(column_name)",
-                                    func.to_uppercase(),
-                                    func.to_uppercase()
-                                )));
-                            }
-                            let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
-                                RegisterError::UnsupportedSql(format!(
-                                    "{} argument must be a plain column name, not an expression",
-                                    func.to_uppercase()
-                                ))
-                            })?;
-                            catalog_helpers::column_id(database, table_id, &col_name).ok_or(
-                                RegisterError::UnknownColumn {
-                                    table_id,
-                                    column: col_name,
-                                },
-                            )?
-                        }
-                        _ => {
-                            return Err(RegisterError::UnsupportedSql(format!(
-                                "{} requires a column argument",
-                                func.to_uppercase()
-                            )));
-                        }
+                Some(
+                    func @ ("sum" | "avg" | "var_pop" | "var_samp" | "variance" | "stddev_pop"
+                    | "stddev_samp" | "stddev"),
+                ) => {
+                    let column = resolve_numeric_agg_column(func, f, table_id, database)?;
+                    let spec = match func {
+                        "sum" => AggSpec::Sum { column },
+                        "avg" => AggSpec::Avg { column },
+                        "var_pop" => AggSpec::VarPop { column },
+                        "var_samp" | "variance" => AggSpec::VarSamp { column },
+                        "stddev_pop" => AggSpec::StddevPop { column },
+                        "stddev_samp" | "stddev" => AggSpec::StddevSamp { column },
+                        _ => unreachable!("matched function name above"),
                     };
-
-                    // Reject non-numeric column types when the catalog provides type info.
-                    if let Some(col_type) = catalog_helpers::column_type(database, table_id, column)
-                    {
-                        match col_type {
-                            crate::ColumnType::Bool | crate::ColumnType::String => {
-                                return Err(RegisterError::UnsupportedSql(format!(
-                                    "{} requires a numeric column (Int or Float), \
-                                     but column {} has type {:?}",
-                                    func.to_uppercase(),
-                                    column,
-                                    col_type,
-                                )));
-                            }
-                            crate::ColumnType::Int
-                            | crate::ColumnType::Float
-                            | crate::ColumnType::Unknown => {}
-                        }
-                    }
-
-                    if func == "sum" {
-                        Ok(QueryProjection::Aggregate(AggSpec::Sum { column }))
-                    } else {
-                        Ok(QueryProjection::Aggregate(AggSpec::Avg { column }))
-                    }
+                    Ok(QueryProjection::Aggregate(spec))
                 }
                 Some(name @ ("min" | "max")) => Err(RegisterError::UnsupportedSql(format!(
-                    "{} aggregate not supported — not delta-composable; \
-                         see src/todo.md for design notes",
+                    "{} aggregate not supported, not delta-composable. \
+                     See src/todo.md for design notes.",
                     name.to_uppercase()
                 ))),
                 _ => Err(RegisterError::UnsupportedSql(

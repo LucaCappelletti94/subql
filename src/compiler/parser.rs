@@ -200,6 +200,18 @@ pub(crate) fn projection_hash_input(normalized: &str, projection: &QueryProjecti
         QueryProjection::Aggregate(AggSpec::Avg { column }) => {
             format!("{normalized}\x00AVG({column})")
         }
+        QueryProjection::Aggregate(AggSpec::VarPop { column }) => {
+            format!("{normalized}\x00VAR_POP({column})")
+        }
+        QueryProjection::Aggregate(AggSpec::VarSamp { column }) => {
+            format!("{normalized}\x00VAR_SAMP({column})")
+        }
+        QueryProjection::Aggregate(AggSpec::StddevPop { column }) => {
+            format!("{normalized}\x00STDDEV_POP({column})")
+        }
+        QueryProjection::Aggregate(AggSpec::StddevSamp { column }) => {
+            format!("{normalized}\x00STDDEV_SAMP({column})")
+        }
     }
 }
 
@@ -1886,6 +1898,183 @@ mod tests {
             result.is_ok(),
             "SUM on Int column should be accepted, got: {result:?}"
         );
+    }
+
+    // --- VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP projection tests ---
+
+    fn expect_agg_spec(
+        sql: &str,
+        expected: crate::compiler::sql_shape::AggSpec,
+        catalog: &ParserDB,
+    ) {
+        let dialect = PostgreSqlDialect {};
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, catalog);
+        assert!(result.is_ok(), "{sql:?} should parse, got: {result:?}");
+        let (_, _, _, _, projection) = result.unwrap();
+        assert_eq!(
+            projection,
+            crate::compiler::sql_shape::QueryProjection::Aggregate(expected),
+            "projection mismatch for {sql:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_var_pop_known_column() {
+        let catalog = make_catalog();
+        // orders: id=0, price=1, quantity=2
+        expect_agg_spec(
+            "SELECT VAR_POP(price) FROM orders",
+            crate::compiler::sql_shape::AggSpec::VarPop { column: 1 },
+            &catalog,
+        );
+    }
+
+    #[test]
+    fn test_projection_var_samp_known_column() {
+        let catalog = make_catalog();
+        expect_agg_spec(
+            "SELECT VAR_SAMP(price) FROM orders",
+            crate::compiler::sql_shape::AggSpec::VarSamp { column: 1 },
+            &catalog,
+        );
+    }
+
+    #[test]
+    fn test_projection_variance_alias_maps_to_var_samp() {
+        let catalog = make_catalog();
+        expect_agg_spec(
+            "SELECT VARIANCE(price) FROM orders",
+            crate::compiler::sql_shape::AggSpec::VarSamp { column: 1 },
+            &catalog,
+        );
+    }
+
+    #[test]
+    fn test_projection_stddev_pop_known_column() {
+        let catalog = make_catalog();
+        expect_agg_spec(
+            "SELECT STDDEV_POP(price) FROM orders",
+            crate::compiler::sql_shape::AggSpec::StddevPop { column: 1 },
+            &catalog,
+        );
+    }
+
+    #[test]
+    fn test_projection_stddev_samp_known_column() {
+        let catalog = make_catalog();
+        expect_agg_spec(
+            "SELECT STDDEV_SAMP(price) FROM orders",
+            crate::compiler::sql_shape::AggSpec::StddevSamp { column: 1 },
+            &catalog,
+        );
+    }
+
+    #[test]
+    fn test_projection_stddev_alias_maps_to_stddev_samp() {
+        let catalog = make_catalog();
+        expect_agg_spec(
+            "SELECT STDDEV(price) FROM orders",
+            crate::compiler::sql_shape::AggSpec::StddevSamp { column: 1 },
+            &catalog,
+        );
+    }
+
+    #[test]
+    fn test_projection_var_pop_with_alias() {
+        let catalog = make_catalog();
+        expect_agg_spec(
+            "SELECT VAR_POP(price) AS spread FROM orders WHERE price > 0",
+            crate::compiler::sql_shape::AggSpec::VarPop { column: 1 },
+            &catalog,
+        );
+    }
+
+    #[test]
+    fn test_projection_var_pop_unknown_column() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT VAR_POP(nonexistent) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnknownColumn { .. })),
+            "expected UnknownColumn, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_stddev_distinct_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT STDDEV(DISTINCT price) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for STDDEV(DISTINCT ...), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_var_samp_wildcard_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT VAR_SAMP(*) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for VAR_SAMP(*), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_var_pop_expression_unsupported() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT VAR_POP(price * 2) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for VAR_POP(expr), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_stddev_non_numeric_type_rejected() {
+        let catalog = make_typed_catalog();
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT STDDEV(status) FROM orders";
+        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
+        assert!(
+            matches!(result, Err(RegisterError::UnsupportedSql(_))),
+            "expected UnsupportedSql for STDDEV on String column, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_hash_input_distinguishes_var_flavors() {
+        // VAR_POP, VAR_SAMP, STDDEV_POP, STDDEV_SAMP on the same WHERE clause
+        // must hash to four distinct predicates.
+        use crate::compiler::sql_shape::{AggSpec, QueryProjection};
+        let where_clause = "price > 10";
+        let inputs = [
+            projection_hash_input(
+                where_clause,
+                &QueryProjection::Aggregate(AggSpec::VarPop { column: 1 }),
+            ),
+            projection_hash_input(
+                where_clause,
+                &QueryProjection::Aggregate(AggSpec::VarSamp { column: 1 }),
+            ),
+            projection_hash_input(
+                where_clause,
+                &QueryProjection::Aggregate(AggSpec::StddevPop { column: 1 }),
+            ),
+            projection_hash_input(
+                where_clause,
+                &QueryProjection::Aggregate(AggSpec::StddevSamp { column: 1 }),
+            ),
+        ];
+        let unique: std::collections::HashSet<_> = inputs.iter().collect();
+        assert_eq!(unique.len(), 4, "hash inputs collide: {inputs:?}");
     }
 
     /// Both the compile path and the canonicalize path use `sql_shape::MAX_EXPR_DEPTH`

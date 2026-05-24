@@ -74,10 +74,12 @@ enum RebuildPayloadError {
 #[cfg(test)]
 static INJECT_PARENT_DIR_SYNC_FAILURE_DIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
-static INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES: OnceLock<Mutex<HashSet<TableId>>> =
-    OnceLock::new();
-#[cfg(test)]
 thread_local! {
+    // Phase-3 partition-drop injection is per-thread so that the test
+    // running the injection cannot taint sibling tests that hit the same
+    // `table_id` from a different thread under cargo's parallel runner.
+    static INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES: std::cell::RefCell<HashSet<TableId>> =
+        std::cell::RefCell::new(HashSet::new());
     static INJECT_COMPILE_HASH_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, u128>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
@@ -85,11 +87,6 @@ thread_local! {
 #[cfg(test)]
 fn injected_parent_dir_sync_failure_dirs() -> &'static Mutex<HashSet<PathBuf>> {
     INJECT_PARENT_DIR_SYNC_FAILURE_DIRS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-#[cfg(test)]
-fn injected_batch_phase3_partition_drop_tables() -> &'static Mutex<HashSet<TableId>> {
-    INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 #[cfg(test)]
@@ -206,16 +203,22 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     fn make_predicate_from_compiled(compiled: &CompiledSpec<I>) -> (Predicate, Vec<IndexableAtom>) {
         let atoms = Self::index_atoms_from_plan(&compiled.prefilter_plan);
 
-        // For SUM/AVG/COUNT(col) subscriptions, augment dependency_columns with the
-        // aggregate column. This ensures UPDATE events that change only the aggregate column
-        // (not any WHERE column) are still dispatched to the aggregate pipeline.
+        // For aggregate subscriptions that read a column (SUM/AVG/COUNT(col)/
+        // VAR_*/STDDEV_*), augment dependency_columns with the aggregate
+        // column. This ensures UPDATE events that change only the aggregate
+        // column (not any WHERE column) are still dispatched to the aggregate
+        // pipeline.
         let dependency_columns: Arc<[u16]> = {
             let mut dep_cols = compiled.bytecode.dependency_columns.clone();
             let agg_col = match &compiled.projection {
                 QueryProjection::Aggregate(
                     AggSpec::Sum { column }
                     | AggSpec::Avg { column }
-                    | AggSpec::CountColumn { column },
+                    | AggSpec::CountColumn { column }
+                    | AggSpec::VarPop { column }
+                    | AggSpec::VarSamp { column }
+                    | AggSpec::StddevPop { column }
+                    | AggSpec::StddevSamp { column },
                 ) => Some(*column),
                 _ => None,
             };
@@ -331,12 +334,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
     #[cfg(test)]
     fn should_inject_batch_phase3_partition_drop(table_id: TableId) -> bool {
-        let lock = injected_batch_phase3_partition_drop_tables();
-        let guard = match lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.contains(&table_id)
+        INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES.with(|set| set.borrow().contains(&table_id))
     }
 
     /// Create new subscription engine.
@@ -1980,24 +1978,15 @@ mod tests {
 
     impl BatchPhase3PartitionDropGuard {
         fn for_table(table_id: TableId) -> Self {
-            let lock = injected_batch_phase3_partition_drop_tables();
-            match lock.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            }
-            .insert(table_id);
+            INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES.with(|set| set.borrow_mut().insert(table_id));
             Self { table_id }
         }
     }
 
     impl Drop for BatchPhase3PartitionDropGuard {
         fn drop(&mut self) {
-            let lock = injected_batch_phase3_partition_drop_tables();
-            let mut guard = match lock.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.remove(&self.table_id);
+            INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES
+                .with(|set| set.borrow_mut().remove(&self.table_id));
         }
     }
 

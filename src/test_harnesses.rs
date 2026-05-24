@@ -5,6 +5,22 @@
 //!
 //! This module is only compiled under `#[cfg(any(feature = "testing", test))]`.
 
+// Clippy allows scoped to this fuzz-harness module. These lints flag
+// stylistic patterns (manual let-else, items after statements, doc
+// paragraph length, identical match arms, by-value generated test
+// data, and `BTreeMap` contains_key+insert) that are intentional or
+// load-bearing for readability in arbitrary-driven test code. The
+// module is feature-gated behind `testing` and is not part of the
+// production lib build.
+#![allow(
+    clippy::manual_let_else,
+    clippy::too_long_first_doc_paragraph,
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value,
+    clippy::map_entry,
+    clippy::match_same_arms
+)]
+
 use std::sync::Arc;
 
 use arbitrary::{Arbitrary, Unstructured};
@@ -472,16 +488,24 @@ pub fn harness_wal_json_postparse(data: &[u8]) {
 /// subql's `aggregate_deltas` semantics on Truncate would require the
 /// engine to know per-consumer running state to negate, which is not
 /// part of the documented API.
+///
+/// `amount` is bounded to `i16` (not `i32`) so that squared values stay
+/// well inside f64's exact-integer range (2^53). Streaming variance over
+/// widely varying magnitudes hits unavoidable catastrophic-cancellation
+/// noise when squared values approach or exceed 2^53, and that noise is
+/// not a routing or correctness bug in the engine. The harness's purpose
+/// is to catch routing/semantic drift, so the bound removes the
+/// f64-precision confounder.
 #[derive(Debug, Arbitrary)]
 enum AggOp {
     Insert {
         id: u8,
-        amount: Option<i32>,
+        amount: Option<i16>,
         status: Option<u8>,
     },
     Update {
         id: u8,
-        amount: Option<i32>,
+        amount: Option<i16>,
         status: Option<u8>,
     },
     Delete {
@@ -497,7 +521,7 @@ struct VirtRow {
 }
 
 impl VirtRow {
-    fn from_op(amount: Option<i32>, status: Option<u8>) -> Self {
+    fn from_op(amount: Option<i16>, status: Option<u8>) -> Self {
         Self {
             amount: amount.map(i64::from),
             status: status.map(|b| match b % 4 {
@@ -573,6 +597,26 @@ impl AggEngineCell {
                 "SELECT SUM(amount) FROM orders",
             ))
             .expect("registering SUM(amount) consumer should succeed against agg_catalog");
+        // Register one consumer per VAR/STDDEV flavor. All four share the
+        // same kernel and should receive byte-identical `AggDelta::Stats`
+        // deltas, so registering all four catches per-variant routing or
+        // hash-collision bugs as well as kernel correctness.
+        for (cid, sql) in [
+            (3_u64, "SELECT VAR_POP(amount) FROM orders"),
+            (4_u64, "SELECT VAR_SAMP(amount) FROM orders"),
+            (5_u64, "SELECT STDDEV_POP(amount) FROM orders"),
+            (6_u64, "SELECT STDDEV_SAMP(amount) FROM orders"),
+        ] {
+            engine
+                .register(SubscriptionRequest::<DefaultIds>::new(cid, sql))
+                .expect("registering VAR/STDDEV consumer should succeed against agg_catalog");
+        }
+        engine
+            .register(SubscriptionRequest::<DefaultIds>::new(
+                7,
+                "SELECT AVG(amount) FROM orders",
+            ))
+            .expect("registering AVG(amount) consumer should succeed against agg_catalog");
         Self {
             engine,
             table_id,
@@ -591,10 +635,16 @@ std::thread_local! {
 /// `aggregate_deltas` output matches a from-scratch oracle.
 ///
 /// Catches drift in:
-/// - `COUNT(*)` (`AggDelta::Count`) — should equal current virtual-table size.
-/// - `SUM(amount)` (`AggDelta::Sum`) — should equal sum of non-NULL amounts.
+/// - `COUNT(*)` (`AggDelta::Count`). Should equal current virtual-table size.
+/// - `SUM(amount)` (`AggDelta::Sum`). Should equal sum of non-NULL amounts.
+/// - `AVG(amount)` (`AggDelta::Avg`). Running `(sum, count)` tuple should
+///   equal the oracle tuple recomputed from the virtual table.
+/// - `VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP(amount)` (`AggDelta::Stats`).
+///   Each of the four consumers' running `(sum, sum_sq, count)` tuple
+///   should equal the oracle tuple recomputed from the virtual table.
 ///
 /// Contract: panics are bugs. Assertion failures are bugs.
+#[allow(clippy::too_many_lines)]
 pub fn harness_aggregate_consistency(data: &[u8]) {
     let mut u = Unstructured::new(data);
     let Ok(ops): arbitrary::Result<Vec<AggOp>> = (|| {
@@ -613,6 +663,11 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
         // because the oracle restarts from an empty virtual table).
         let mut engine_count: i64 = 0;
         let mut engine_sum: f64 = 0.0;
+        // AVG(amount): running (sum, count) tuple for consumer cid=7.
+        let mut engine_avg: (f64, i64) = (0.0, 0);
+        // Four running `(sum, sum_sq, count)` tuples, indexed by consumer
+        // id - 3 (so cid 3..=6 maps to slots 0..=3).
+        let mut engine_stats: [(f64, f64, i64); 4] = [(0.0, 0.0, 0); 4];
 
         // Virtual table (id -> row), the source of truth for the oracle.
         let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
@@ -710,18 +765,65 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                 match (cid, delta) {
                     (1, AggDelta::Count(d)) => engine_count += d,
                     (2, AggDelta::Sum(d)) => engine_sum += d,
+                    (
+                        cid @ 3..=6,
+                        AggDelta::Stats {
+                            sum_delta,
+                            sum_sq_delta,
+                            count_delta,
+                        },
+                    ) => {
+                        // cid is bounded to 3..=6 by the match guard, so the
+                        // subtraction and downcast cannot truncate.
+                        #[allow(clippy::cast_possible_truncation)]
+                        let idx = (cid - 3) as usize;
+                        let slot = &mut engine_stats[idx];
+                        slot.0 += sum_delta;
+                        slot.1 += sum_sq_delta;
+                        slot.2 += count_delta;
+                    }
+                    (
+                        7,
+                        AggDelta::Avg {
+                            sum_delta,
+                            count_delta,
+                        },
+                    ) => {
+                        engine_avg.0 += sum_delta;
+                        engine_avg.1 += count_delta;
+                    }
                     _ => {}
                 }
             }
 
-            // Oracle: COUNT(*) is virtual-table size; SUM(amount) sums
-            // non-NULL amounts.
+            // Oracle: COUNT(*) is virtual-table size, SUM(amount) sums
+            // non-NULL amounts, VAR/STDDEV consumers share a single
+            // (sum, sum_sq, count) ground truth.
             let oracle_count = i64::try_from(virt.len()).unwrap_or(i64::MAX);
+            // Amounts originate from `AggOp::Insert/Update.amount: i16`, so
+            // `v: i64` always fits exactly in f64.
+            #[allow(clippy::cast_precision_loss)]
             let oracle_sum: f64 = virt
                 .values()
                 .filter_map(|r| r.amount)
                 .map(|v| v as f64)
                 .sum();
+            let oracle_stats_sum: f64 = oracle_sum;
+            // Amounts originate from `AggOp::Insert/Update.amount: i16`, so
+            // `v: i64` always fits exactly in f64. The precision-loss lint
+            // is theoretically true for arbitrary i64 but not for our range.
+            #[allow(clippy::cast_precision_loss)]
+            let oracle_stats_sum_sq: f64 = virt
+                .values()
+                .filter_map(|r| r.amount)
+                .map(|v| {
+                    let f = v as f64;
+                    f * f
+                })
+                .sum();
+            let oracle_stats_count: i64 =
+                i64::try_from(virt.values().filter(|r| r.amount.is_some()).count())
+                    .unwrap_or(i64::MAX);
 
             assert_eq!(
                 engine_count, oracle_count,
@@ -732,6 +834,42 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                 (engine_sum - oracle_sum).abs() <= tolerance,
                 "SUM(amount) drift: engine={engine_sum} oracle={oracle_sum}"
             );
+
+            // AVG(amount): oracle reuses oracle_sum (sum of non-NULL amounts)
+            // and oracle_stats_count (count of non-NULL amounts).
+            assert_eq!(
+                engine_avg.1, oracle_stats_count,
+                "AVG(amount) count drift: engine={} oracle={oracle_stats_count}",
+                engine_avg.1,
+            );
+            assert!(
+                (engine_avg.0 - oracle_sum).abs() <= tolerance,
+                "AVG(amount) sum drift: engine={} oracle={oracle_sum}",
+                engine_avg.0,
+            );
+
+            // VAR/STDDEV: all four consumers share the same kernel, so
+            // each running tuple must match the oracle independently.
+            // Float tolerance scales with magnitude: sum_sq grows as
+            // amount^2 * count, so the same relative tolerance suffices.
+            let tol_sum_sq = 1e-6_f64.max(oracle_stats_sum_sq.abs() * 1e-10);
+            for (slot_idx, slot) in engine_stats.iter().enumerate() {
+                let cid = slot_idx as u64 + 3;
+                let (s, sq, n) = *slot;
+                assert_eq!(
+                    n, oracle_stats_count,
+                    "consumer {cid} stats count drift: engine={n} oracle={oracle_stats_count}",
+                );
+                assert!(
+                    (s - oracle_stats_sum).abs() <= tolerance,
+                    "consumer {cid} stats sum drift: engine={s} oracle={oracle_stats_sum}",
+                );
+                assert!(
+                    (sq - oracle_stats_sum_sq).abs() <= tol_sum_sq,
+                    "consumer {cid} stats sum_sq drift: \
+                     engine={sq} oracle={oracle_stats_sum_sq}",
+                );
+            }
         }
     });
 }
@@ -765,12 +903,12 @@ struct SnapRegister {
 enum SnapEvent {
     Insert {
         id: u8,
-        amount: Option<i32>,
+        amount: Option<i16>,
         status: Option<u8>,
     },
     Update {
         id: u8,
-        amount: Option<i32>,
+        amount: Option<i16>,
         status: Option<u8>,
     },
     Delete {
@@ -796,7 +934,10 @@ fn snapshot_workdir() -> std::path::PathBuf {
     } else {
         std::env::temp_dir()
     };
-    p.push(format!("subql-fuzz-snapshot-restore-{}", std::process::id()));
+    p.push(format!(
+        "subql-fuzz-snapshot-restore-{}",
+        std::process::id()
+    ));
     p
 }
 
@@ -907,16 +1048,18 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     let Ok(n_reg) = u.int_in_range(1usize..=4) else {
         return;
     };
-    let Ok(regs): arbitrary::Result<Vec<SnapRegister>> =
-        (0..n_reg).map(|_| SnapRegister::arbitrary(&mut u)).collect()
+    let Ok(regs): arbitrary::Result<Vec<SnapRegister>> = (0..n_reg)
+        .map(|_| SnapRegister::arbitrary(&mut u))
+        .collect()
     else {
         return;
     };
     let Ok(n_events) = u.int_in_range(0usize..=16) else {
         return;
     };
-    let Ok(events): arbitrary::Result<Vec<SnapEvent>> =
-        (0..n_events).map(|_| SnapEvent::arbitrary(&mut u)).collect()
+    let Ok(events): arbitrary::Result<Vec<SnapEvent>> = (0..n_events)
+        .map(|_| SnapEvent::arbitrary(&mut u))
+        .collect()
     else {
         return;
     };
@@ -965,11 +1108,8 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     }
 
     let mut engine_b: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        match SubscriptionEngine::with_storage(
-            Arc::clone(&database),
-            PostgreSqlDialect {},
-            workdir.clone(),
-        ) {
+        match SubscriptionEngine::with_storage(Arc::clone(&database), PostgreSqlDialect {}, workdir)
+        {
             Ok(e) => e,
             Err(_) => return,
         };
