@@ -757,7 +757,11 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                             count_delta,
                         },
                     ) => {
-                        let slot = &mut engine_stats[(cid - 3) as usize];
+                        // cid is bounded to 3..=6 by the match guard, so the
+                        // subtraction and downcast cannot truncate.
+                        #[allow(clippy::cast_possible_truncation)]
+                        let idx = (cid - 3) as usize;
+                        let slot = &mut engine_stats[idx];
                         slot.0 += sum_delta;
                         slot.1 += sum_sq_delta;
                         slot.2 += count_delta;
@@ -786,6 +790,10 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                 .map(|v| v as f64)
                 .sum();
             let oracle_stats_sum: f64 = oracle_sum;
+            // Amounts originate from `AggOp::Insert/Update.amount: i16`, so
+            // `v: i64` always fits exactly in f64. The precision-loss lint
+            // is theoretically true for arbitrary i64 but not for our range.
+            #[allow(clippy::cast_precision_loss)]
             let oracle_stats_sum_sq: f64 = virt
                 .values()
                 .filter_map(|r| r.amount)
