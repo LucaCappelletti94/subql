@@ -50,7 +50,9 @@ struct MergeTask<I: IdTypes, DB: DatabaseLike> {
 pub struct MergeManager<I: IdTypes, DB: DatabaseLike> {
     jobs: HashMap<MergeJobId, MergeJob<I>>,
     next_job_id: MergeJobId,
-    task_sender: Sender<MergeTask<I, DB>>,
+    /// Worker pool sender, spawned lazily on the first merge. `None`
+    /// until then, so engines that never merge spawn no threads.
+    task_sender: Option<Sender<MergeTask<I, DB>>>,
     _db: PhantomData<fn() -> DB>,
 }
 
@@ -62,53 +64,61 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
         lock.recv().ok()
     }
 
-    /// Create new merge manager
+    /// Create new merge manager. Worker threads spawn on first merge.
     #[must_use]
     pub fn new() -> Self {
-        let (task_sender, task_receiver) = mpsc::channel::<MergeTask<I, DB>>();
-        let shared_receiver = Arc::new(Mutex::new(task_receiver));
-
-        for _ in 0..MERGE_WORKER_COUNT {
-            let receiver = Arc::clone(&shared_receiver);
-            thread::spawn(move || {
-                loop {
-                    let Some(task) = Self::recv_task(&receiver) else {
-                        break;
-                    };
-
-                    let start = std::time::Instant::now();
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        merge_shards_impl::<I, DB>(
-                            task.table_id,
-                            &task.shard_bytes,
-                            &*task.database,
-                            start,
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err("Merge worker panicked while processing task".to_string())
-                    });
-
-                    // Receiver may have been dropped if caller discarded the job.
-                    if task.result_sender.send(result).is_err() {
-                        #[cfg(feature = "observability")]
-                        tracing::warn!("Merge result receiver dropped before result was sent");
-                    }
-                }
-            });
-        }
-
         Self {
             jobs: HashMap::new(),
             next_job_id: 1,
-            task_sender,
+            task_sender: None,
             _db: PhantomData,
         }
+    }
+
+    /// Spawn the worker pool on first use and return its task sender.
+    fn task_sender(&mut self) -> &Sender<MergeTask<I, DB>> {
+        self.task_sender.get_or_insert_with(|| {
+            let (task_sender, task_receiver) = mpsc::channel::<MergeTask<I, DB>>();
+            let shared_receiver = Arc::new(Mutex::new(task_receiver));
+
+            for _ in 0..MERGE_WORKER_COUNT {
+                let receiver = Arc::clone(&shared_receiver);
+                thread::spawn(move || {
+                    loop {
+                        let Some(task) = Self::recv_task(&receiver) else {
+                            break;
+                        };
+
+                        let start = std::time::Instant::now();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            merge_shards_impl::<I, DB>(
+                                task.table_id,
+                                &task.shard_bytes,
+                                &*task.database,
+                                start,
+                            )
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err("Merge worker panicked while processing task".to_string())
+                        });
+
+                        // Receiver may have been dropped if caller discarded the job.
+                        if task.result_sender.send(result).is_err() {
+                            #[cfg(feature = "observability")]
+                            tracing::warn!("Merge result receiver dropped before result was sent");
+                        }
+                    }
+                });
+            }
+
+            task_sender
+        })
     }
 
     /// Start background merge of shards
     ///
     /// Returns job ID immediately. Merge runs in background thread.
+    /// The worker pool is spawned lazily on the first call.
     pub fn merge_shards_background(
         &mut self,
         table_id: TableId,
@@ -126,7 +136,7 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
             database,
             result_sender: tx,
         };
-        self.task_sender
+        self.task_sender()
             .send(task)
             .map_err(|_| MergeError::BuildFailed("Merge worker pool is unavailable".to_string()))?;
 
@@ -438,6 +448,36 @@ mod tests {
     fn test_merge_manager_default() {
         let manager: MergeManager<DefaultIds, ParserDB> = MergeManager::default();
         assert_eq!(manager.active_jobs(), 0);
+    }
+
+    /// The pool must stay unspawned until the first merge: per-iteration
+    /// engine construction in fuzz harnesses otherwise drifts RSS under ASAN.
+    #[test]
+    fn test_merge_pool_spawns_lazily() {
+        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        assert!(
+            manager.task_sender.is_none(),
+            "new() must not spawn the worker pool"
+        );
+
+        let catalog = Arc::new(make_catalog());
+        let payload: ShardPayload<DefaultIds> = ShardPayload {
+            predicates: vec![],
+            bindings: vec![],
+            consumer_dict: ConsumerDictData {
+                ordinal_to_consumer: vec![],
+            },
+            created_at_unix_ms: 1000,
+        };
+        let shard = serialize_shard(1, &payload, &make_catalog()).unwrap();
+
+        let _ = manager
+            .merge_shards_background(1, vec![shard], catalog)
+            .unwrap();
+        assert!(
+            manager.task_sender.is_some(),
+            "first merge must spawn the worker pool"
+        );
     }
 
     #[test]
