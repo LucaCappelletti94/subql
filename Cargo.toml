@@ -125,6 +125,16 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 # `tokio` and no C deps; the `std` feature below propagates `std` through.
 pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "no-std", default-features = false }
 
+# SQL re-execution wrapper (`src/reexec`, a core module). diesel's core is
+# no_std capable, so it is an unconditional dependency with default-features
+# off. The `hashbrown` feature backs diesel's no_std map shim (its `std`
+# build uses `std::HashMap` instead); subql already depends on hashbrown, so
+# this is free. The `std` feature enriches diesel with `diesel/std`. No
+# backend feature is enabled here on purpose: the wrapper is generic over the
+# connection, so the concrete backend (and any native client-library linkage)
+# is the downstream consumer's choice.
+diesel = { version = "2", default-features = false, features = ["hashbrown"] }
+
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -135,8 +145,10 @@ tempfile = "3"
 # Structured fuzzing (needed by regression tests)
 arbitrary = { version = "1", features = ["derive"] }
 
-# Cross-DB CDC integration test
-diesel = { version = "2", features = ["postgres", "mysql"] }
+# Cross-DB CDC integration test. `sqlite` + `r2d2` added for the in-memory
+# reexec wrapper tests (reexec is a core module; r2d2 provider tests need
+# `--features reexec-r2d2`).
+diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "r2d2"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 
 # Property-based testing
@@ -157,11 +169,19 @@ std = [
     "postcard/use-std",
     "thiserror/std",
     "pg_walstream/std",
+    "diesel/std",
     "dep:lz4",
     "dep:toml",
 ]
 testing = ["dep:arbitrary"]
 observability = ["dep:tracing", "tracing/std"]
+
+# Convenience: a ready-made r2d2-pool connection provider, so callers who do
+# not already run a pool get one out of the box. The r2d2 crate is std-only,
+# so this implies `std`. Purely additive: the core reexec wrapper is always
+# compiled; callers with their own pool (deadpool, bb8, a bare connection)
+# implement the provider trait instead and never enable this.
+reexec-r2d2 = ["std", "diesel/r2d2"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]

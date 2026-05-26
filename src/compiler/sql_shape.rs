@@ -68,19 +68,19 @@ fn extract_column_arg(arg: &FunctionArg) -> Option<String> {
     }
 }
 
-/// Resolve a single-column numeric-aggregate argument (`SUM`, `AVG`,
-/// `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, plus the `VARIANCE`
-/// and `STDDEV` aliases). Validates that the argument is a plain column
-/// name, rejects `FILTER`/`OVER`/`DISTINCT`/wildcards, and rejects
-/// non-numeric column types when the catalog exposes type information.
-fn resolve_numeric_agg_column<DB: DatabaseLike>(
-    func: &str,
+/// Resolve a single bare-column aggregate argument (`SUM(col)`, `MIN(col)`,
+/// etc.) to a `ColumnId`. Rejects `FILTER`, `OVER`, `DISTINCT`, wildcard
+/// arguments, multi-argument calls, and non-column expressions. It does not
+/// constrain the column type; callers that require a numeric column layer
+/// that check on top (see [`resolve_numeric_agg_column`]).
+///
+/// `display` is the upper-cased function name used in error messages.
+pub(crate) fn resolve_single_column_arg<DB: DatabaseLike>(
+    display: &str,
     f: &sqlparser::ast::Function,
     table_id: crate::TableId,
     database: &DB,
 ) -> Result<crate::ColumnId, RegisterError> {
-    let display = func.to_uppercase();
-
     if f.filter.is_some() {
         return Err(RegisterError::UnsupportedSql(format!(
             "{display}(...) FILTER (WHERE ...) not supported"
@@ -92,7 +92,7 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
         ));
     }
 
-    let column = match &f.args {
+    match &f.args {
         FunctionArguments::List(list) => {
             if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
                 return Err(RegisterError::UnsupportedSql(format!(
@@ -122,14 +122,27 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
                     table_id,
                     column: col_name,
                 },
-            )?
+            )
         }
-        _ => {
-            return Err(RegisterError::UnsupportedSql(format!(
-                "{display} requires a column argument"
-            )));
-        }
-    };
+        _ => Err(RegisterError::UnsupportedSql(format!(
+            "{display} requires a column argument"
+        ))),
+    }
+}
+
+/// Resolve a single-column numeric-aggregate argument (`SUM`, `AVG`,
+/// `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, plus the `VARIANCE`
+/// and `STDDEV` aliases). Layers a numeric-type constraint on top of
+/// [`resolve_single_column_arg`]: rejects `Bool`/`String` columns when the
+/// catalog exposes type information.
+fn resolve_numeric_agg_column<DB: DatabaseLike>(
+    func: &str,
+    f: &sqlparser::ast::Function,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<crate::ColumnId, RegisterError> {
+    let display = func.to_uppercase();
+    let column = resolve_single_column_arg(&display, f, table_id, database)?;
 
     if let Some(col_type) = catalog_helpers::column_type(database, table_id, column) {
         match col_type {
@@ -306,6 +319,81 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
             UNSUPPORTED_PROJECTION.to_string(),
         ))
     }
+}
+
+/// A scalar `MIN`/`MAX` aggregate, which the core engine cannot evaluate
+/// incrementally (not delta-composable). Used by the reexec wrapper, which
+/// handles these by re-querying the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalarAggKind {
+    /// `MIN(column)`
+    Min,
+    /// `MAX(column)`
+    Max,
+}
+
+/// Detect a single-column scalar `MIN`/`MAX` projection.
+///
+/// Returns:
+/// - `Ok(Some((kind, column)))` for `SELECT MIN(col)` / `SELECT MAX(col)`
+///   (with or without an alias), the column resolved against the catalog.
+/// - `Ok(None)` when the projection is anything else (`SELECT *`, `COUNT`,
+///   `SUM`, multiple items, a non-function expression, ...). Callers treat
+///   this as "not a scalar MIN/MAX".
+/// - `Err(UnsupportedSql)` for a `MIN`/`MAX` call with an unsupported argument
+///   shape (`DISTINCT`, `FILTER`, `OVER`, wildcard, expression), and
+///   `Err(UnknownColumn)` when the argument names a column not in the table.
+///
+/// Unlike [`extract_projection`], the column type is not constrained: `MIN`
+/// and `MAX` are well-defined on any orderable type.
+pub(crate) fn extract_scalar_aggregate<DB: DatabaseLike>(
+    stmt: &Statement,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<Option<(ScalarAggKind, crate::ColumnId)>, RegisterError> {
+    let select = match stmt {
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Select(s) => s,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    let items = &select.projection;
+    if items.len() != 1 {
+        return Ok(None);
+    }
+
+    let expr = match &items[0] {
+        SelectItem::UnnamedExpr(e)
+        | SelectItem::ExprWithAlias { expr: e, .. }
+        | SelectItem::ExprWithAliases { expr: e, .. } => e,
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return Ok(None),
+    };
+
+    let Expr::Function(f) = expr else {
+        return Ok(None);
+    };
+
+    let func_name = f
+        .name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_lowercase());
+
+    let kind = match func_name.as_deref() {
+        Some("min") => ScalarAggKind::Min,
+        Some("max") => ScalarAggKind::Max,
+        _ => return Ok(None),
+    };
+
+    let display = match kind {
+        ScalarAggKind::Min => "MIN",
+        ScalarAggKind::Max => "MAX",
+    };
+    let column = resolve_single_column_arg(display, f, table_id, database)?;
+    Ok(Some((kind, column)))
 }
 
 /// Parse and validate a single SQL statement from text.

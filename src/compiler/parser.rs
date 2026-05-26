@@ -10,7 +10,7 @@ use super::{
 };
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
-use crate::{Cell, RegisterError, TableId};
+use crate::{Cell, ColumnId, RegisterError, TableId};
 use alloc::borrow::ToOwned;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -145,6 +145,53 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect, DB: DatabaseLike>(
         prefilter_plan,
         pq.projection,
     ))
+}
+
+/// Table identity and WHERE-clause column dependencies for a single-table
+/// SELECT, plus the parsed statement.
+///
+/// Lets callers outside the core compile path (the reexec wrapper) obtain
+/// routing information for queries whose projection the engine does not
+/// support, without re-parsing.
+pub(crate) struct TableAndWhereDeps {
+    pub table_id: TableId,
+    /// The WHERE clause compiled to bytecode, so callers can evaluate row
+    /// membership in-process via the VM. A query with no WHERE compiles to an
+    /// always-true program (matches every row).
+    pub where_program: BytecodeProgram,
+    /// Columns the WHERE clause depends on (mirrors
+    /// `where_program.dependency_columns`).
+    pub where_dependency_columns: Vec<ColumnId>,
+    pub statement: Statement,
+}
+
+/// Parse a single-table SELECT and return its table id, the compiled WHERE
+/// clause (plus its dependency columns), and the parsed statement.
+///
+/// Unlike [`parse_and_compile`], this neither validates nor compiles the
+/// projection, so it succeeds for queries (e.g. `MIN`/`MAX`) the core engine
+/// rejects. It still enforces the single-table statement shape (no joins,
+/// subqueries, or set operations) and resolves the table against the catalog.
+pub(crate) fn parse_table_and_where_deps<D: Dialect, DB: DatabaseLike>(
+    sql: &str,
+    dialect: &D,
+    database: &DB,
+) -> Result<TableAndWhereDeps, RegisterError> {
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+    let (table_name, where_clause) = extract_table_and_where(&stmt)?;
+    let table_id = resolve_table_id(&table_name, database)?;
+    let where_program = match where_clause.as_ref() {
+        Some(expr) => compile_expression(expr, table_id, database)?,
+        // No WHERE clause matches every row.
+        None => BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(true))]),
+    };
+    let where_dependency_columns = where_program.dependency_columns.clone();
+    Ok(TableAndWhereDeps {
+        table_id,
+        where_program,
+        where_dependency_columns,
+        statement: stmt,
+    })
 }
 
 fn resolve_table_id<DB: DatabaseLike>(
@@ -2101,5 +2148,44 @@ mod tests {
             hash_result.is_err(),
             "hash path must reject depth > MAX_EXPR_DEPTH"
         );
+    }
+
+    #[test]
+    fn parse_table_and_where_deps_surfaces_compiled_program() {
+        use crate::compiler::tristate::Tri;
+        use crate::compiler::vm::Vm;
+        use crate::types::RowImage;
+        use alloc::sync::Arc;
+
+        let dialect = PostgreSqlDialect {};
+        let catalog = make_catalog();
+
+        // With a WHERE clause: the program carries dependency columns, mirrored
+        // by `where_dependency_columns`.
+        let with_where = parse_table_and_where_deps(
+            "SELECT MIN(price) FROM orders WHERE quantity > 5",
+            &dialect,
+            &catalog,
+        )
+        .unwrap();
+        assert!(!with_where.where_program.dependency_columns.is_empty());
+        assert_eq!(
+            with_where.where_dependency_columns,
+            with_where.where_program.dependency_columns
+        );
+
+        // No WHERE clause: always-true program, no dependencies, evaluates to
+        // Tri::True against any row.
+        let no_where =
+            parse_table_and_where_deps("SELECT MAX(price) FROM orders", &dialect, &catalog)
+                .unwrap();
+        assert!(no_where.where_program.dependency_columns.is_empty());
+        assert!(no_where.where_dependency_columns.is_empty());
+
+        let mut vm = Vm::new();
+        let row = RowImage {
+            cells: Arc::from([Cell::Int(0)]),
+        };
+        assert_eq!(vm.eval(&no_where.where_program, &row).unwrap(), Tri::True);
     }
 }

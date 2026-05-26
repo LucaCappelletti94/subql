@@ -164,6 +164,18 @@ fn table_context<'a, I: IdTypes>(
 }
 
 impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I, DB> {
+    /// The SQL dialect used for parsing. Exposed for the reexec wrapper, which
+    /// re-parses queries the engine rejects.
+    pub(crate) const fn dialect(&self) -> &D {
+        &self.dialect
+    }
+
+    /// The schema database used for table/column resolution. Exposed for the
+    /// reexec wrapper's classification of rejected queries.
+    pub(crate) fn database(&self) -> &DB {
+        &self.database
+    }
+
     fn index_atoms_from_plan(plan: &PrefilterPlan) -> Vec<IndexableAtom> {
         let mut atoms: Vec<IndexableAtom> = plan
             .trigger_atoms

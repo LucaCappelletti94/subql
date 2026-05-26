@@ -42,6 +42,7 @@ pub mod config;
 pub mod memory_profile_workload;
 #[cfg(feature = "std")]
 pub mod persistence;
+pub mod reexec;
 pub mod runtime;
 pub mod wal;
 
