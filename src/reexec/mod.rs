@@ -32,9 +32,15 @@
 //! from the event's row image, and the database is re-queried ONLY when the
 //! current extreme is removed or displaced (where the next extreme cannot be
 //! known without a scan), or when a row image is too incomplete to decide.
-//! "Total" re-execution (JOIN/HAVING/multi-table, re-run on any relevant event)
-//! is designed-for (the `maintain::QueryRuntime` enum and the `executor` seam
-//! extend to it) but not implemented.
+//! Two further re-execution flavors are designed-for (the `maintain` and
+//! `executor` seams extend to them) but not implemented: **single-table row
+//! re-execution** - a query whose projection is one base table but whose filter
+//! joins/subqueries the engine cannot evaluate in-process, re-run to the
+//! matching rows of that table and emitted as per-table PK-keyed row deltas -
+//! and **aggregate re-execution** (multi-table aggregates, HAVING). Both emit
+//! semantic deltas; downstream (connetto) applies authorization and serializes
+//! them into `sqlite-diff-rs` patchsets. There is no arbitrary-result-set path:
+//! outputs are always per-known-table.
 //!
 //! # Known limitations (v1)
 //!

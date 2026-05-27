@@ -64,13 +64,14 @@ pub struct TextRow {
     v: Option<String>,
 }
 
-// FUTURE (Total re-execution): a `RowSetSource: ConnectionProvider` extension
-// trait, parallel to `ScalarSource`, providing
-// `fn load_rows(&self, sql: &str, schema: &RowSetSchema) -> Result<Vec<RowImage>, ReExecError<Self::Error>>`.
-// It would confine diesel's multi-column decode bounds here (mirroring the
-// `ScalarSource` blanket impl), keeping them out of the front-door API, and the
-// Layer 3 `reexecute` would dispatch to it for `QueryRuntime::Total`. Not
-// implemented in v1 (the wrapper only serves single-table scalar MIN/MAX).
+// FUTURE (single-table row re-execution): a row-loading extension trait
+// parallel to `ScalarSource`. A query whose projection is a single base table
+// (a join/subquery in the filter, output rows of one table) re-executes to the
+// matching rows of that *known* base table, keyed by its primary key; the
+// engine diffs the PK set against the cached one and emits per-table row
+// deltas. The result schema is the catalog-known base table - not an arbitrary
+// result set - so the loader is bounded by that table's columns. Not
+// implemented in v1 (the wrapper serves single-table scalar MIN/MAX).
 
 /// A [`ConnectionProvider`] whose backend can decode the scalar row types
 /// re-execution needs.
