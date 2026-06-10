@@ -9,8 +9,7 @@
 use crate::compiler::cell_cmp::{cells_equal, compare_ordered_cells};
 use crate::compiler::sql_shape::ScalarAggKind;
 use crate::compiler::{BytecodeProgram, Tri, Vm};
-use crate::{Cell, ColumnId, ColumnType, EventKind, RowImage, WalEvent};
-use alloc::string::String;
+use crate::{Cell, ColumnId, EventKind, RowImage, WalEvent};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -25,29 +24,34 @@ pub(super) enum Maintenance {
     Unchanged,
     /// The result changed; the new value was computed in-process.
     Updated(Cell),
-    /// The result cannot be maintained in-process; the driver must re-query.
+    /// The result cannot be maintained in-process; the engine surfaces a
+    /// [`ReExecutionTrigger`](super::ReExecutionTrigger) so the Subscription
+    /// Materializer re-queries the database and calls [`install`] with the
+    /// recomputed value.
+    ///
+    /// [`install`]: super::ReExecEngine::install
     NeedsReexecution,
 }
 
 /// A query maintained by the re-execution layer.
 ///
 /// Implementors never touch the database; when they cannot decide in-process
-/// they return [`Maintenance::NeedsReexecution`] and the driver (Layer 3)
-/// re-queries and calls [`install`](Self::install). Kept object-safe even
-/// though storage uses enum dispatch ([`QueryRuntime`]).
+/// they return [`Maintenance::NeedsReexecution`]. The engine then surfaces a
+/// [`ReExecutionTrigger`](super::ReExecutionTrigger) for the Subscription
+/// Materializer, which re-runs the SQL and calls
+/// [`install`](Self::install) with the recomputed value. The SQL to re-run
+/// and the scalar's [`ColumnType`](crate::ColumnType) are returned to the
+/// materializer at registration time via
+/// [`Registered::ReExec`](crate::reexec::Registered::ReExec) so they live in
+/// the plan, not on the runtime. Kept object-safe even though storage uses
+/// enum dispatch ([`QueryRuntime`]).
 pub(super) trait MaintainedQuery {
     /// Feed a CDC event. `vm` is lent for WHERE-membership evaluation.
     fn on_event(&mut self, event: &WalEvent, vm: &mut Vm) -> Maintenance;
-    /// Adopt a value produced by a Layer 3 re-execution.
+    /// Adopt a value produced by the materializer's re-execution.
     fn install(&mut self, value: Cell);
-    /// The current maintained value (`Cell::Null` when the result set is empty).
-    fn current(&self) -> &Cell;
     /// Columns whose change can affect the result.
     fn dependency_columns(&self) -> &[ColumnId];
-    /// SQL to re-run when `on_event` returns [`Maintenance::NeedsReexecution`].
-    fn reexec_sql(&self) -> &str;
-    /// Decode type for the re-executed scalar.
-    fn column_type(&self) -> ColumnType;
 }
 
 /// Incrementally-maintained single-table scalar `MIN`/`MAX`.
@@ -59,10 +63,8 @@ pub(super) trait MaintainedQuery {
 pub(super) struct MinMaxQuery {
     kind: ScalarAggKind,
     agg_column: ColumnId,
-    column_type: ColumnType,
     where_program: Arc<BytecodeProgram>,
     dependency_columns: Vec<ColumnId>,
-    reexec_sql: String,
     /// Current extreme; `Cell::Null` means the (filtered) set is empty.
     current: Cell,
 }
@@ -71,21 +73,25 @@ impl MinMaxQuery {
     pub(super) const fn new(
         kind: ScalarAggKind,
         agg_column: ColumnId,
-        column_type: ColumnType,
         where_program: Arc<BytecodeProgram>,
         dependency_columns: Vec<ColumnId>,
-        reexec_sql: String,
         initial: Cell,
     ) -> Self {
         Self {
             kind,
             agg_column,
-            column_type,
             where_program,
             dependency_columns,
-            reexec_sql,
             current: initial,
         }
+    }
+
+    /// The current maintained value (`Cell::Null` when the result set is
+    /// empty). Used by the state-machine unit tests; production code reads
+    /// values through the engine's emitted [`ScalarUpdate`]s instead.
+    #[cfg(test)]
+    pub(super) const fn current(&self) -> &Cell {
+        &self.current
     }
 
     /// Whether `row` satisfies the query's WHERE clause (only `Tri::True`
@@ -204,28 +210,17 @@ impl MaintainedQuery for MinMaxQuery {
         self.current = value;
     }
 
-    fn current(&self) -> &Cell {
-        &self.current
-    }
-
     fn dependency_columns(&self) -> &[ColumnId] {
         &self.dependency_columns
-    }
-
-    fn reexec_sql(&self) -> &str {
-        &self.reexec_sql
-    }
-
-    fn column_type(&self) -> ColumnType {
-        self.column_type
     }
 }
 
 /// Enum-dispatch wrapper holding any maintained query.
 ///
-/// A `Total` variant (row-set re-execution) plugs in here once implemented;
-/// the enum keeps the front-door free of trait objects and of the diesel
-/// bounds, which live only in the Layer 3 executor.
+/// A future `Total` variant (single-table row re-execution) and an
+/// aggregate-re-execution variant plug in here without disturbing the engine;
+/// each services the same [`ReExecutionTrigger`](super::ReExecutionTrigger)
+/// seam and is `install`ed identically by the Subscription Materializer.
 pub(super) enum QueryRuntime {
     Partial(MinMaxQuery),
 }
@@ -243,27 +238,9 @@ impl QueryRuntime {
         }
     }
 
-    pub(super) fn current(&self) -> &Cell {
-        match self {
-            Self::Partial(q) => q.current(),
-        }
-    }
-
     pub(super) fn dependency_columns(&self) -> &[ColumnId] {
         match self {
             Self::Partial(q) => q.dependency_columns(),
-        }
-    }
-
-    pub(super) fn reexec_sql(&self) -> &str {
-        match self {
-            Self::Partial(q) => q.reexec_sql(),
-        }
-    }
-
-    pub(super) fn column_type(&self) -> ColumnType {
-        match self {
-            Self::Partial(q) => q.column_type(),
         }
     }
 }
@@ -309,15 +286,7 @@ mod tests {
         if !deps.contains(&PRICE) {
             deps.push(PRICE);
         }
-        MinMaxQuery::new(
-            kind,
-            PRICE,
-            ColumnType::Float,
-            Arc::new(program),
-            deps,
-            "SELECT MIN(price) AS v FROM orders".into(),
-            initial,
-        )
+        MinMaxQuery::new(kind, PRICE, Arc::new(program), deps, initial)
     }
 
     fn row(price: Cell, status: &str) -> RowImage {

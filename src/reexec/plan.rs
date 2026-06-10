@@ -41,7 +41,7 @@ pub(super) struct MinMaxPlan {
     /// The aggregated column.
     pub agg_column: ColumnId,
     /// Type of the aggregated column (`Unknown` when the catalog is silent);
-    /// determines how a re-executed scalar is decoded.
+    /// returned to the materializer so it can decode the re-executed scalar.
     pub column_type: ColumnType,
     /// Columns whose change can alter the result: the aggregated column plus
     /// every column the WHERE clause reads (UPDATE routing optimization).
@@ -49,7 +49,11 @@ pub(super) struct MinMaxPlan {
     /// The compiled WHERE clause, so maintenance can test row membership
     /// in-process via the VM (always-true when the query has no WHERE).
     pub where_program: Arc<BytecodeProgram>,
-    /// The query to re-run on extreme removal, with its projection aliased.
+    /// SQL the Subscription Materializer runs after a
+    /// [`ReExecutionTrigger`](super::ReExecutionTrigger), with its projection
+    /// aliased. Returned to the materializer at registration via
+    /// [`Registered::ReExec`](super::Registered::ReExec); subql itself never
+    /// executes it.
     pub reexec_sql: String,
 }
 
