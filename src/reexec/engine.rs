@@ -11,6 +11,7 @@
 
 use super::maintain::{Maintenance, MinMaxQuery, QueryRuntime};
 use super::plan::{build_plan, MinMaxPlan, QueryPlan};
+use crate::catalog_helpers::table_has_rls;
 use crate::compiler::Vm;
 use crate::{
     Cell, ColumnType, ConsumerNotifications, DispatchError, EventKind, IdTypes, RegisterError,
@@ -182,7 +183,18 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
             Ok(result) => Ok(Registered::Engine(result)),
             Err(RegisterError::UnsupportedSql(msg)) => {
                 match build_plan(&sql, self.inner.dialect(), self.inner.database()) {
-                    Ok(QueryPlan::Partial(plan)) => Ok(self.capture(plan, consumer_id, session)),
+                    Ok(QueryPlan::Partial(plan)) => {
+                        // Per-viewer RLS makes a shared in-process IVM state
+                        // unsafe: different consumers observe different rows.
+                        // Hard-reject the registration; total re-execution
+                        // with per-consumer state is a planned follow-on.
+                        if table_has_rls(self.inner.database(), plan.table_id).unwrap_or(false) {
+                            return Err(RegisterError::AggregatorOnRlsTable {
+                                table_id: plan.table_id,
+                            });
+                        }
+                        Ok(self.capture(plan, consumer_id, session))
+                    }
                     // Not a re-executable query (build_plan rejected it):
                     // surface the engine's original rejection.
                     Err(_) => Err(RegisterError::UnsupportedSql(msg)),
@@ -520,6 +532,36 @@ mod tests {
             Registered::Engine(_) => panic!("expected ReExec"),
         }
         assert_eq!(e.reexec_query_count(), 1);
+    }
+
+    /// A `MIN(price)` registration must hard-reject when `orders` has RLS
+    /// enabled. Per-viewer auth makes a shared in-process IVM state unsafe;
+    /// the wrapper surfaces `RegisterError::AggregatorOnRlsTable` until
+    /// per-consumer total re-execution lands.
+    #[test]
+    fn aggregator_on_rls_table_is_rejected() {
+        let ddl =
+            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);\n\
+                   ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
+        let rls_catalog = ParserDB::parse::<PostgreSqlDialect>(ddl).unwrap();
+        let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
+            Arc::new(rls_catalog),
+            PostgreSqlDialect {},
+        );
+        let mut e = ReExecEngine::new(inner);
+        let err = e
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT MIN(price) FROM orders",
+            ))
+            .unwrap_err();
+        match err {
+            RegisterError::AggregatorOnRlsTable { table_id } => {
+                assert_eq!(table_id, 0, "orders is the only declared table");
+            }
+            other => panic!("expected AggregatorOnRlsTable, got {other:?}"),
+        }
+        assert_eq!(e.reexec_query_count(), 0);
     }
 
     #[test]

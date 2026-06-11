@@ -66,6 +66,13 @@ name = "sqlparser_cursed"
 harness = false
 required-features = ["testing"]
 
+# Integration test for the DieselConnector; uses in-memory SQLite. Gated
+# behind the `executor-diesel` feature so default `cargo test` does not try
+# to compile it.
+[[test]]
+name = "reexec_diesel"
+required-features = ["executor-diesel"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }
@@ -125,6 +132,14 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 # `tokio` and no C deps; the `std` feature below propagates `std` through.
 pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "no-std", default-features = false }
 
+# Optional diesel-backed Connector for the auto-resolving re-execution
+# engine. Off by default - the lib's no_std + alloc / wasm32 surface stays
+# clean unless `executor-diesel` is enabled. Diesel's default features
+# (`with-deprecated` + its internal hashbrown wiring) are kept on; the
+# downstream user activates whichever backend feature their diesel needs
+# (`postgres`, `mysql`, `sqlite`) on their own dep; here we stay
+# backend-agnostic.
+diesel = { version = "2", optional = true }
 
 [dev-dependencies]
 # Benchmarking
@@ -136,8 +151,10 @@ tempfile = "3"
 # Structured fuzzing (needed by regression tests)
 arbitrary = { version = "1", features = ["derive"] }
 
-# Cross-DB CDC integration test (`tests/cdc_cross_db.rs`).
-diesel = { version = "2", features = ["postgres", "mysql"] }
+# Cross-DB CDC integration test (`tests/cdc_cross_db.rs`) plus the
+# DieselConnector integration test (`tests/reexec_diesel.rs`) which uses
+# in-memory SQLite.
+diesel = { version = "2", features = ["postgres", "mysql", "sqlite"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 
 # Property-based testing
@@ -163,6 +180,10 @@ std = [
 ]
 testing = ["dep:arbitrary"]
 observability = ["dep:tracing", "tracing/std"]
+# Opt-in: ship `DieselConnector` plus the auto-resolving engine's diesel
+# bindings. Implies `std` (diesel needs std). The user activates their
+# backend on their own diesel dep.
+executor-diesel = ["std", "dep:diesel"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]

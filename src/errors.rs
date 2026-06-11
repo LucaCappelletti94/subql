@@ -48,6 +48,20 @@ pub enum RegisterError {
     #[error("Schema error: {0}")]
     Schema(String),
 
+    /// Aggregator subscription on a table with row-level security enabled.
+    ///
+    /// Under RLS, different viewers observe different result rows, so a
+    /// single in-process IVM state cannot be shared across consumers. The
+    /// reexec wrapper rejects such registrations until per-consumer total
+    /// re-execution lands.
+    #[error(
+        "Aggregator subscription on RLS-protected table {table_id} requires total re-execution (not yet supported)"
+    )]
+    AggregatorOnRlsTable {
+        /// Table whose RLS made the aggregator unsafe to capture.
+        table_id: TableId,
+    },
+
     /// Storage/persistence error during registration
     #[error("Storage error during registration: {0}")]
     Storage(String),
