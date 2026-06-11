@@ -73,6 +73,14 @@ required-features = ["testing"]
 name = "reexec_diesel"
 required-features = ["executor-diesel"]
 
+# Docker-backed integration test for AutoResolvingEngine + DieselConnector
+# against a real Postgres with logical replication. Tests are #[ignore]d;
+# run explicitly via:
+#   cargo test --test reexec_postgres --features executor-diesel -- --ignored --nocapture
+[[test]]
+name = "reexec_postgres"
+required-features = ["executor-diesel"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }
