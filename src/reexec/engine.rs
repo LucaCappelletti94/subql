@@ -63,15 +63,18 @@ pub enum Registered {
 /// A re-executed scalar whose value changed, to be delivered to its consumer.
 ///
 /// Emitted when the in-process maintenance state machine produced a new value
-/// from the event's row image (no DB round-trip needed).
+/// from the event's row image (no DB round-trip needed). Carries the
+/// originating event's [`Checkpoint`](crate::Checkpoint) when known.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ScalarUpdate<I: IdTypes> {
+pub struct ScalarUpdate<I: IdTypes, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// The captured query whose value changed.
     pub query_id: ReExecQueryId,
     /// Consumer that registered the query.
     pub consumer_id: I::ConsumerId,
     /// The new scalar value (`Cell::Null` if the aggregate is now empty).
     pub value: Cell,
+    /// Position of the event that produced this update, when known.
+    pub checkpoint: Option<C>,
 }
 
 /// Signal that a captured query needs to be re-executed.
@@ -85,24 +88,26 @@ pub struct ScalarUpdate<I: IdTypes> {
 /// pending triggers), and `install` unconditionally overwrites the stored
 /// value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReExecutionTrigger<I: IdTypes> {
+pub struct ReExecutionTrigger<I: IdTypes, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// The captured query needing re-execution.
     pub query_id: ReExecQueryId,
     /// Consumer that registered the query.
     pub consumer_id: I::ConsumerId,
+    /// Position of the event that triggered this re-execution, when known.
+    pub checkpoint: Option<C>,
 }
 
 /// Combined dispatch result: the core engine's per-consumer notifications,
 /// any in-process scalar updates, and any re-execution triggers for the
 /// materializer to service.
-pub struct ReExecNotifications<I: IdTypes> {
+pub struct ReExecNotifications<I: IdTypes, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// View-relative notifications from the core engine.
-    pub engine: ConsumerNotifications<I>,
+    pub engine: ConsumerNotifications<I, C>,
     /// Scalar values that changed in-process (no DB round-trip).
-    pub scalar_updates: Vec<ScalarUpdate<I>>,
+    pub scalar_updates: Vec<ScalarUpdate<I, C>>,
     /// Queries whose maintenance could not resolve in-process; the
     /// materializer must re-execute and call [`ReExecEngine::install`].
-    pub triggers: Vec<ReExecutionTrigger<I>>,
+    pub triggers: Vec<ReExecutionTrigger<I, C>>,
 }
 
 /// Counts from unregistering through the wrapper.
@@ -319,7 +324,10 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
     /// the maintenance state machine for every captured query reading the
     /// event's table. The result carries in-process [`ScalarUpdate`]s and any
     /// [`ReExecutionTrigger`]s the materializer must service.
-    pub fn consumers(&mut self, event: &WalEvent) -> Result<ReExecNotifications<I>, DispatchError> {
+    pub fn consumers<C: crate::Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+    ) -> Result<ReExecNotifications<I, C>, DispatchError> {
         let engine = match self.inner.consumers(event) {
             Ok(notifs) => notifs,
             // A table with only re-execution queries has no engine partition;
@@ -328,7 +336,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
             Err(DispatchError::UnknownTableId(_))
                 if self.table_deps.contains_key(&event.table_id()) =>
             {
-                ConsumerNotifications::empty()
+                ConsumerNotifications::empty().with_checkpoint(event.checkpoint().cloned())
             }
             Err(e) => return Err(e),
         };
@@ -344,10 +352,11 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
 
     /// Feed `event` to each captured query reading its table. Returns
     /// (in-process scalar updates, re-execution triggers).
-    fn dispatch_reexec(
+    #[allow(clippy::type_complexity)]
+    fn dispatch_reexec<C: crate::Checkpoint>(
         &mut self,
-        event: &WalEvent,
-    ) -> (Vec<ScalarUpdate<I>>, Vec<ReExecutionTrigger<I>>) {
+        event: &WalEvent<C>,
+    ) -> (Vec<ScalarUpdate<I, C>>, Vec<ReExecutionTrigger<I, C>>) {
         // Snapshot affected ids before borrowing `reexec`/`vm` mutably.
         let query_ids: Vec<ReExecQueryId> = match self.table_deps.get(&event.table_id()) {
             Some(ids) => ids.iter().copied().collect(),
@@ -379,6 +388,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
             }
 
             let consumer_id = entry.consumer_id;
+            let checkpoint = event.checkpoint().cloned();
             match entry.runtime.on_event(event, vm) {
                 Maintenance::Unchanged => {}
                 Maintenance::Updated(value) => {
@@ -386,12 +396,14 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
                         query_id,
                         consumer_id,
                         value,
+                        checkpoint: checkpoint.clone(),
                     });
                 }
                 Maintenance::NeedsReexecution => {
                     triggers.push(ReExecutionTrigger {
                         query_id,
                         consumer_id,
+                        checkpoint: checkpoint.clone(),
                     });
                 }
             }

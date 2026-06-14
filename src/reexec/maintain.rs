@@ -47,7 +47,12 @@ pub(super) enum Maintenance {
 /// enum dispatch ([`QueryRuntime`]).
 pub(super) trait MaintainedQuery {
     /// Feed a CDC event. `vm` is lent for WHERE-membership evaluation.
-    fn on_event(&mut self, event: &WalEvent, vm: &mut Vm) -> Maintenance;
+    ///
+    /// Generic over the event's [`Checkpoint`](crate::Checkpoint) type
+    /// because the maintenance machine itself does not care about
+    /// positions; it only reads row images. The engine threads checkpoints
+    /// into the emitted notifications around this call.
+    fn on_event<C: crate::Checkpoint>(&mut self, event: &WalEvent<C>, vm: &mut Vm) -> Maintenance;
     /// Adopt a value produced by the materializer's re-execution.
     fn install(&mut self, value: Cell);
     /// Columns whose change can affect the result.
@@ -170,7 +175,7 @@ impl MinMaxQuery {
 }
 
 impl MaintainedQuery for MinMaxQuery {
-    fn on_event(&mut self, event: &WalEvent, vm: &mut Vm) -> Maintenance {
+    fn on_event<C: crate::Checkpoint>(&mut self, event: &WalEvent<C>, vm: &mut Vm) -> Maintenance {
         match event.kind() {
             EventKind::Insert => event
                 .new_row()
@@ -226,7 +231,11 @@ pub(super) enum QueryRuntime {
 }
 
 impl QueryRuntime {
-    pub(super) fn on_event(&mut self, event: &WalEvent, vm: &mut Vm) -> Maintenance {
+    pub(super) fn on_event<C: crate::Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+        vm: &mut Vm,
+    ) -> Maintenance {
         match self {
             Self::Partial(q) => q.on_event(event, vm),
         }

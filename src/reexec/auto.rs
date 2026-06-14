@@ -150,10 +150,10 @@ where
     /// surfaced as [`ReExecError::Connector`].
     ///
     /// [`ReExecutionTrigger`]: super::ReExecutionTrigger
-    pub fn consumers(
+    pub fn consumers<C: crate::Checkpoint>(
         &mut self,
-        event: &WalEvent,
-    ) -> Result<ReExecNotifications<I>, ReExecError<X::Error>> {
+        event: &WalEvent<C>,
+    ) -> Result<ReExecNotifications<I, C>, ReExecError<X::Error>> {
         let ReExecNotifications {
             engine,
             mut scalar_updates,
@@ -174,6 +174,7 @@ where
                 query_id: trigger.query_id,
                 consumer_id: trigger.consumer_id,
                 value,
+                checkpoint: trigger.checkpoint.clone(),
             });
         }
 
