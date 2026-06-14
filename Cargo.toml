@@ -168,6 +168,12 @@ diesel = { version = "2", optional = true }
 # `executor-diesel-postgres-r2d2` feature; ignored otherwise.
 r2d2 = { version = "0.8", optional = true }
 
+# Future-combinator helpers (FuturesUnordered + StreamExt) used by the
+# async auto-resolving engine to dispatch deduplicated triggers
+# concurrently. `alloc` feature only; we do not depend on std-only
+# combinators here.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.8", features = ["html_reports"] }

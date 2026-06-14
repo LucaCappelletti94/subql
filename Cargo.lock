@@ -4257,6 +4257,7 @@ dependencies = [
  "criterion",
  "dhat",
  "diesel",
+ "futures-util",
  "hashbrown 0.16.1",
  "lz4",
  "pg_walstream",

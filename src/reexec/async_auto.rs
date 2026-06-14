@@ -52,6 +52,11 @@ where
     debounce: Option<Duration>,
     /// Last `now_micros` at which each captured query was re-executed.
     last_reexec_at: HashMap<ReExecQueryId, u64>,
+    /// Maximum number of trigger re-executions that may be in flight
+    /// simultaneously during `consumers_batch`. `None` is "unbounded"
+    /// (drive every trigger as a separate concurrent future, capped only
+    /// by the deduplicated trigger count).
+    max_concurrent_reexecutions: Option<usize>,
 }
 
 impl<D, I, DB, X> AsyncAutoResolvingEngine<D, I, DB, X>
@@ -70,7 +75,24 @@ where
             clock: None,
             debounce: None,
             last_reexec_at: HashMap::new(),
+            max_concurrent_reexecutions: None,
         }
+    }
+
+    /// Cap the number of trigger re-executions that may be in flight
+    /// simultaneously during [`consumers_batch`](Self::consumers_batch).
+    ///
+    /// Useful to limit concurrent pressure on the database (e.g. when
+    /// the connector is pool-backed and the pool has limited capacity)
+    /// while still benefiting from parallel dispatch.
+    ///
+    /// Default `None`: every deduplicated trigger is dispatched
+    /// concurrently. Per-event [`consumers`](Self::consumers) is
+    /// unaffected since it only resolves one trigger at a time.
+    #[must_use]
+    pub const fn with_max_concurrent_reexecutions(mut self, cap: usize) -> Self {
+        self.max_concurrent_reexecutions = Some(cap);
+        self
     }
 
     /// Attach a [`Clock`](crate::Clock) for per-query debounce. See
@@ -238,37 +260,73 @@ where
     ///
     /// Runs each event through the inner trigger-emitting engine in input
     /// order, then awaits the connector for each **deduplicated** trigger.
-    /// Today the connector calls are sequential; Phase 6 (Clock + rate
-    /// limiting) will switch to `FuturesUnordered` capped at
-    /// `max_concurrent_reexecutions`. Per-event engine notifications stay
-    /// in input order; the returned [`BatchOutcome::triggers`] is always
-    /// empty after resolution.
+    /// Dispatches the deduplicated triggers concurrently via
+    /// [`FuturesUnordered`](futures_util::stream::FuturesUnordered),
+    /// keeping at most
+    /// [`max_concurrent_reexecutions`](Self::with_max_concurrent_reexecutions)
+    /// in flight at any time (unbounded when not configured). Per-event
+    /// engine notifications stay in input order; the returned
+    /// [`BatchOutcome::triggers`] is always empty after resolution.
     ///
-    /// The first connector failure aborts the whole batch; partial
-    /// notifications are dropped.
+    /// The first connector failure aborts the whole batch (remaining
+    /// in-flight futures are dropped); partial notifications are
+    /// discarded. The caller retries.
     pub async fn consumers_batch<C: crate::Checkpoint>(
         &mut self,
         events: &[WalEvent<C>],
     ) -> Result<BatchOutcome<I, C>, ReExecError<X::Error>> {
+        use futures_util::stream::{StreamExt, TryStreamExt};
+
         let BatchOutcome {
             per_event,
             mut scalar_updates,
             triggers,
         } = self.inner.consumers_batch(events)?;
 
-        for trigger in triggers {
-            if self.debounce_skip(trigger.query_id) {
-                continue;
-            }
-            let ctx = self.contexts.get(&trigger.query_id).expect(
+        // Pre-filter debounced triggers.
+        let actionable: alloc::vec::Vec<_> = triggers
+            .into_iter()
+            .filter(|t| !self.debounce_skip(t.query_id))
+            .collect();
+
+        // Concurrency window. `None` = unbounded; treat 0 as 1 to avoid
+        // a deadlock.
+        let cap = self
+            .max_concurrent_reexecutions
+            .unwrap_or_else(|| actionable.len().max(1))
+            .max(1);
+
+        // Borrow the immutable fields the futures need; `inner`,
+        // `last_reexec_at` etc. stay free for the mutation pass below.
+        // Each future captures the connector + the trigger's resolve
+        // context by reference; the stream is consumed before any
+        // mutable self access.
+        let connector = &self.connector;
+        let contexts = &self.contexts;
+        #[allow(clippy::type_complexity)]
+        let resolved: alloc::vec::Vec<(
+            super::ReExecutionTrigger<I, C>,
+            (Cell, Option<X::Checkpoint>),
+        )> = futures_util::stream::iter(actionable.into_iter().map(|trigger| {
+            let ctx = contexts.get(&trigger.query_id).expect(
                 "every captured query stores its resolve context at register time; \
                  trigger.query_id must exist in `contexts`",
             );
-            let (value, _db_checkpoint) = self
-                .connector
-                .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
-                .await
-                .map_err(ReExecError::Connector)?;
+            let sql = ctx.sql.clone();
+            let column_type = ctx.column_type;
+            let auth = &ctx.auth;
+            async move {
+                let result = connector.execute_scalar(&sql, column_type, auth).await;
+                result.map(|r| (trigger, r))
+            }
+        }))
+        .buffer_unordered(cap)
+        .try_collect()
+        .await
+        .map_err(ReExecError::Connector)?;
+
+        // All borrows released; apply the resolutions.
+        for (trigger, (value, _db_checkpoint)) in resolved {
             self.inner.install(trigger.query_id, value.clone());
             self.stamp_reexec(trigger.query_id);
             scalar_updates.push(ScalarUpdate {
@@ -606,6 +664,49 @@ mod tests {
         assert_eq!(outcome.scalar_updates.len(), 1);
         assert_eq!(outcome.scalar_updates[0].value, Cell::Float(99.0));
         assert!(outcome.triggers.is_empty());
+    }
+
+    /// `with_max_concurrent_reexecutions` does not change the result of
+    /// `consumers_batch` (correctness is preserved); the cap is a
+    /// throughput / fairness knob, not a semantic one.
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn async_engine_consumers_batch_respects_max_concurrent_cap() {
+        // Two distinct captured queries, each displaced once in the
+        // batch. Both must resolve regardless of the cap.
+        let mut e = engine_with_values(vec![Cell::Float(22.0), Cell::Float(11.0)])
+            .with_max_concurrent_reexecutions(1);
+        let qid1 = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec for MIN"),
+        };
+        let qid2 = match e
+            .register(
+                SubscriptionRequest::new(2u64, "SELECT MAX(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec for MAX"),
+        };
+        assert!(e.install(qid1, Cell::Float(7.0)));
+        assert!(e.install(qid2, Cell::Float(7.0)));
+
+        let events = vec![delete_event(1, 7.0)];
+        let outcome = block_on(e.consumers_batch(&events)).unwrap();
+        assert_eq!(e.connector().call_count(), 2);
+        assert_eq!(outcome.scalar_updates.len(), 2);
+        let qids: std::collections::BTreeSet<_> =
+            outcome.scalar_updates.iter().map(|u| u.query_id).collect();
+        assert!(qids.contains(&qid1));
+        assert!(qids.contains(&qid2));
     }
 
     /// `unregister_reexec_query` drops the stored auth context.
