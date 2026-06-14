@@ -22,6 +22,7 @@ pub use wal::{
 // Re-export the sql-traits types subql consumers most often need to spell out
 // at call sites: trait bounds for generic code, the canonical schema
 // fingerprint and its envelope error, and the parser-backed default DB impl.
+pub use checkpoint::{Checkpoint, MysqlBinlogPos, NoCheckpoint, OpaqueCheckpoint, PgLsn};
 pub use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{AlgorithmId, FingerprintError, ParserDB, SchemaFingerprint},
@@ -33,6 +34,7 @@ mod table_resolution;
 mod types;
 
 pub mod catalog_helpers;
+pub mod checkpoint;
 pub mod compiler;
 #[cfg(feature = "std")]
 pub mod config;

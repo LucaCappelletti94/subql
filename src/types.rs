@@ -1,5 +1,6 @@
 //! Core type definitions for subql
 
+use crate::checkpoint::{Checkpoint, NoCheckpoint};
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -455,9 +456,15 @@ impl PrimaryKey {
     }
 }
 
-/// WAL event from PostgreSQL CDC
+/// WAL event from PostgreSQL CDC.
+///
+/// Generic in `C: Checkpoint` so events can carry the source's position
+/// token. Synthetic tests and checkpoint-free contexts may use the default
+/// `C = NoCheckpoint`; CDC sources (wal2json, Maxwell, Debezium) pin their
+/// own concrete `Checkpoint` impl ([`crate::PgLsn`],
+/// [`crate::MysqlBinlogPos`], etc.).
 #[derive(Clone, Debug)]
-pub enum WalEvent {
+pub enum WalEvent<C: Checkpoint = NoCheckpoint> {
     /// Row insertion.
     Insert {
         /// Table this event belongs to.
@@ -466,6 +473,8 @@ pub enum WalEvent {
         pk: PrimaryKey,
         /// New row image.
         new_row: RowImage,
+        /// Position of this event in the source stream, when known.
+        checkpoint: Option<C>,
     },
     /// Row update.
     Update {
@@ -479,6 +488,8 @@ pub enum WalEvent {
         new_row: RowImage,
         /// Columns that changed (for UPDATE optimization).
         changed_columns: Arc<[ColumnId]>,
+        /// Position of this event in the source stream, when known.
+        checkpoint: Option<C>,
     },
     /// Row deletion.
     Delete {
@@ -488,11 +499,15 @@ pub enum WalEvent {
         pk: PrimaryKey,
         /// Old row image.
         old_row: RowImage,
+        /// Position of this event in the source stream, when known.
+        checkpoint: Option<C>,
     },
     /// Table truncate.
     Truncate {
         /// Table this event belongs to.
         table_id: TableId,
+        /// Position of this event in the source stream, when known.
+        checkpoint: Option<C>,
     },
 }
 
@@ -541,44 +556,54 @@ impl core::fmt::Display for WalEventBuildError {
 impl core::error::Error for WalEventBuildError {}
 
 /// Start of fluent `WalEvent` construction.
+///
+/// Call [`with_checkpoint`](Self::with_checkpoint) before [`insert`](Self::insert)
+/// / [`update`](Self::update) / [`delete`](Self::delete) /
+/// [`truncate`](Self::truncate) to anchor the resulting event to a
+/// position. Defaults to `NoCheckpoint` and `checkpoint: None`.
 #[derive(Clone, Debug)]
-pub struct WalEventBuilderStart {
+pub struct WalEventBuilderStart<C: Checkpoint = NoCheckpoint> {
     table_id: TableId,
+    checkpoint: Option<C>,
 }
 
 /// Fluent builder for [`WalEvent::Insert`].
 #[derive(Clone, Debug)]
-pub struct InsertEventBuilder {
+pub struct InsertEventBuilder<C: Checkpoint = NoCheckpoint> {
     table_id: TableId,
     pk_columns: Vec<ColumnId>,
     pk_values: Vec<Cell>,
     new_row: Option<RowImage>,
+    checkpoint: Option<C>,
 }
 
 /// Fluent builder for [`WalEvent::Update`].
 #[derive(Clone, Debug)]
-pub struct UpdateEventBuilder {
+pub struct UpdateEventBuilder<C: Checkpoint = NoCheckpoint> {
     table_id: TableId,
     pk_columns: Vec<ColumnId>,
     pk_values: Vec<Cell>,
     old_row: Option<RowImage>,
     new_row: Option<RowImage>,
     changed_columns: Arc<[ColumnId]>,
+    checkpoint: Option<C>,
 }
 
 /// Fluent builder for [`WalEvent::Delete`].
 #[derive(Clone, Debug)]
-pub struct DeleteEventBuilder {
+pub struct DeleteEventBuilder<C: Checkpoint = NoCheckpoint> {
     table_id: TableId,
     pk_columns: Vec<ColumnId>,
     pk_values: Vec<Cell>,
     old_row: Option<RowImage>,
+    checkpoint: Option<C>,
 }
 
 /// Fluent builder for [`WalEvent::Truncate`].
 #[derive(Clone, Debug)]
-pub struct TruncateEventBuilder {
+pub struct TruncateEventBuilder<C: Checkpoint = NoCheckpoint> {
     table_id: TableId,
+    checkpoint: Option<C>,
 }
 
 fn build_primary_key(
@@ -615,21 +640,42 @@ fn apply_pk(columns: &mut Vec<ColumnId>, values: &mut Vec<Cell>, pk: PrimaryKey)
     }
 }
 
-impl WalEventBuilderStart {
+impl<C: Checkpoint> WalEventBuilderStart<C> {
+    /// Anchor the resulting event to a position. Subsequent
+    /// `insert`/`update`/`delete`/`truncate` calls preserve the checkpoint.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Type-transition the builder to a different checkpoint type by
+    /// providing a checkpoint value. Useful when a no-checkpoint default
+    /// builder needs to become typed once the parser has read the source
+    /// position (`WalEvent::builder(t).with_typed_checkpoint(PgLsn(42))`).
+    #[must_use]
+    pub fn with_typed_checkpoint<C2: Checkpoint>(self, checkpoint: C2) -> WalEventBuilderStart<C2> {
+        WalEventBuilderStart {
+            table_id: self.table_id,
+            checkpoint: Some(checkpoint),
+        }
+    }
+
     /// Start building an INSERT event.
     #[must_use]
-    pub const fn insert(self) -> InsertEventBuilder {
+    pub fn insert(self) -> InsertEventBuilder<C> {
         InsertEventBuilder {
             table_id: self.table_id,
             pk_columns: Vec::new(),
             pk_values: Vec::new(),
             new_row: None,
+            checkpoint: self.checkpoint,
         }
     }
 
     /// Start building an UPDATE event.
     #[must_use]
-    pub fn update(self) -> UpdateEventBuilder {
+    pub fn update(self) -> UpdateEventBuilder<C> {
         UpdateEventBuilder {
             table_id: self.table_id,
             pk_columns: Vec::new(),
@@ -637,30 +683,33 @@ impl WalEventBuilderStart {
             old_row: None,
             new_row: None,
             changed_columns: Arc::from([]),
+            checkpoint: self.checkpoint,
         }
     }
 
     /// Start building a DELETE event.
     #[must_use]
-    pub const fn delete(self) -> DeleteEventBuilder {
+    pub fn delete(self) -> DeleteEventBuilder<C> {
         DeleteEventBuilder {
             table_id: self.table_id,
             pk_columns: Vec::new(),
             pk_values: Vec::new(),
             old_row: None,
+            checkpoint: self.checkpoint,
         }
     }
 
     /// Start building a TRUNCATE event.
     #[must_use]
-    pub const fn truncate(self) -> TruncateEventBuilder {
+    pub fn truncate(self) -> TruncateEventBuilder<C> {
         TruncateEventBuilder {
             table_id: self.table_id,
+            checkpoint: self.checkpoint,
         }
     }
 }
 
-impl InsertEventBuilder {
+impl<C: Checkpoint> InsertEventBuilder<C> {
     /// Set primary key from a prebuilt value.
     #[must_use]
     pub fn pk(mut self, pk: PrimaryKey) -> Self {
@@ -693,19 +742,27 @@ impl InsertEventBuilder {
         self
     }
 
+    /// Anchor the resulting event to a position.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
     /// Build the insert event.
-    pub fn build(self) -> Result<WalEvent, WalEventBuildError> {
+    pub fn build(self) -> Result<WalEvent<C>, WalEventBuildError> {
         let new_row = self.new_row.ok_or(WalEventBuildError::MissingNewRow)?;
         let pk = build_primary_key(self.pk_columns, self.pk_values)?;
         Ok(WalEvent::Insert {
             table_id: self.table_id,
             pk,
             new_row,
+            checkpoint: self.checkpoint,
         })
     }
 }
 
-impl UpdateEventBuilder {
+impl<C: Checkpoint> UpdateEventBuilder<C> {
     /// Set primary key from a prebuilt value.
     #[must_use]
     pub fn pk(mut self, pk: PrimaryKey) -> Self {
@@ -759,8 +816,15 @@ impl UpdateEventBuilder {
         self
     }
 
+    /// Anchor the resulting event to a position.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
     /// Build the update event.
-    pub fn build(self) -> Result<WalEvent, WalEventBuildError> {
+    pub fn build(self) -> Result<WalEvent<C>, WalEventBuildError> {
         let new_row = self.new_row.ok_or(WalEventBuildError::MissingNewRow)?;
         let pk = build_primary_key(self.pk_columns, self.pk_values)?;
         Ok(WalEvent::Update {
@@ -769,11 +833,12 @@ impl UpdateEventBuilder {
             old_row: self.old_row,
             new_row,
             changed_columns: self.changed_columns,
+            checkpoint: self.checkpoint,
         })
     }
 }
 
-impl DeleteEventBuilder {
+impl<C: Checkpoint> DeleteEventBuilder<C> {
     /// Set primary key from a prebuilt value.
     #[must_use]
     pub fn pk(mut self, pk: PrimaryKey) -> Self {
@@ -806,34 +871,60 @@ impl DeleteEventBuilder {
         self
     }
 
+    /// Anchor the resulting event to a position.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
     /// Build the delete event.
-    pub fn build(self) -> Result<WalEvent, WalEventBuildError> {
+    pub fn build(self) -> Result<WalEvent<C>, WalEventBuildError> {
         let old_row = self.old_row.ok_or(WalEventBuildError::MissingOldRow)?;
         let pk = build_primary_key(self.pk_columns, self.pk_values)?;
         Ok(WalEvent::Delete {
             table_id: self.table_id,
             pk,
             old_row,
+            checkpoint: self.checkpoint,
         })
     }
 }
 
-impl TruncateEventBuilder {
+impl<C: Checkpoint> TruncateEventBuilder<C> {
+    /// Anchor the resulting event to a position.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
     /// Build the truncate event.
-    pub const fn build(self) -> Result<WalEvent, WalEventBuildError> {
+    pub fn build(self) -> Result<WalEvent<C>, WalEventBuildError> {
         Ok(WalEvent::Truncate {
             table_id: self.table_id,
+            checkpoint: self.checkpoint,
         })
     }
 }
 
-impl WalEvent {
-    /// Start fluent construction for a WAL event.
+impl WalEvent<NoCheckpoint> {
+    /// Start fluent construction for a WAL event with no checkpoint.
+    ///
+    /// Returns a builder pinned to `NoCheckpoint`; this is what synthetic
+    /// tests and checkpoint-free contexts want. To produce events with a
+    /// concrete checkpoint type, use
+    /// [`WalEventBuilderStart::with_typed_checkpoint`].
     #[must_use]
-    pub const fn builder(table_id: TableId) -> WalEventBuilderStart {
-        WalEventBuilderStart { table_id }
+    pub const fn builder(table_id: TableId) -> WalEventBuilderStart<NoCheckpoint> {
+        WalEventBuilderStart {
+            table_id,
+            checkpoint: None,
+        }
     }
+}
 
+impl<C: Checkpoint> WalEvent<C> {
     /// Event kind.
     #[must_use]
     pub const fn kind(&self) -> EventKind {
@@ -852,7 +943,22 @@ impl WalEvent {
             Self::Insert { table_id, .. }
             | Self::Update { table_id, .. }
             | Self::Delete { table_id, .. }
-            | Self::Truncate { table_id } => *table_id,
+            | Self::Truncate { table_id, .. } => *table_id,
+        }
+    }
+
+    /// Source position of this event in its CDC stream, when known.
+    ///
+    /// `None` when the parser could not determine a position (e.g. wal2json
+    /// messages with no `lsn` field, synthetic test events). Engines + oplogs
+    /// propagate this through to notifications.
+    #[must_use]
+    pub const fn checkpoint(&self) -> Option<&C> {
+        match self {
+            Self::Insert { checkpoint, .. }
+            | Self::Update { checkpoint, .. }
+            | Self::Delete { checkpoint, .. }
+            | Self::Truncate { checkpoint, .. } => checkpoint.as_ref(),
         }
     }
 
