@@ -75,6 +75,8 @@ mod plan;
 pub use auto::{AutoResolvingEngine, SnapshotResult};
 #[cfg(feature = "executor-diesel")]
 pub use connector::DieselConnector;
+#[cfg(feature = "executor-diesel-postgres")]
+pub use connector::PgDieselConnector;
 pub use connector::{Connector, ReExecError, Snapshot};
 pub use engine::{
     ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport, ReExecutionTrigger,

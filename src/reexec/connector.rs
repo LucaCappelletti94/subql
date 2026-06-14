@@ -289,3 +289,98 @@ where
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// PgDieselConnector: LSN-aware sync impl behind `executor-diesel-postgres`.
+// ---------------------------------------------------------------------------
+
+/// Sync [`Connector`] backed by a diesel [`PgConnection`] that anchors
+/// every read to a PostgreSQL WAL position.
+///
+/// On each `execute_scalar` (and future `execute_rows`) call the connector
+/// opens a `READ ONLY REPEATABLE READ` transaction, queries
+/// `pg_current_wal_lsn()` alongside the user's SQL, and returns the
+/// resulting [`Cell`] together with the parsed [`crate::PgLsn`]. The user
+/// query and the LSN observe the same MVCC snapshot, so downstream replay
+/// layers (an oplog, a client cursor) can chain WAL events onto the
+/// snapshot at exactly the position the snapshot was taken.
+///
+/// Holds the connection in a [`RefCell`] for the interior-mutability the
+/// trait's `&self` requires. Not `Send`/`Sync`; for multi-threaded use,
+/// either keep the connector thread-local or implement [`Connector`]
+/// yourself over a connection pool.
+///
+/// # Errors
+///
+/// Returns [`diesel::result::Error`] for any underlying database failure
+/// (network drop, statement error, malformed LSN response).
+#[cfg(feature = "executor-diesel-postgres")]
+pub struct PgDieselConnector {
+    conn: RefCell<diesel::PgConnection>,
+}
+
+#[cfg(feature = "executor-diesel-postgres")]
+impl PgDieselConnector {
+    /// Wrap an owned [`PgConnection`](diesel::PgConnection). The connector
+    /// takes exclusive ownership and serializes access through interior
+    /// mutability.
+    #[must_use]
+    pub const fn new(conn: diesel::PgConnection) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+        }
+    }
+}
+
+#[cfg(feature = "executor-diesel-postgres")]
+#[derive(diesel::QueryableByName)]
+struct PgLsnRow {
+    #[diesel(sql_type = Text)]
+    lsn: String,
+}
+
+#[cfg(feature = "executor-diesel-postgres")]
+fn read_current_lsn(conn: &mut diesel::PgConnection) -> diesel::QueryResult<Option<crate::PgLsn>> {
+    let row: PgLsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn").get_result(conn)?;
+    Ok(crate::PgLsn::parse(&row.lsn))
+}
+
+#[cfg(feature = "executor-diesel-postgres")]
+impl Connector for PgDieselConnector {
+    type AuthContext = ();
+    type Error = diesel::result::Error;
+    type Checkpoint = crate::PgLsn;
+
+    fn execute_scalar(
+        &self,
+        sql: &str,
+        column_type: ColumnType,
+        _auth: &(),
+    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
+        let mut conn = self.conn.borrow_mut();
+        diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            // Pin the transaction's MVCC snapshot so the user query and the
+            // LSN agree on a single point in the WAL.
+            sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
+            let cell = load_cell(conn, sql, column_type)?;
+            let lsn = read_current_lsn(conn)?;
+            Ok((cell, lsn))
+        })
+    }
+
+    fn execute_rows(
+        &self,
+        _sql: &str,
+        _auth: &(),
+    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
+        // Same restriction as DieselConnector: generic row decoding is
+        // deferred to the total row reexec feature.
+        #[allow(clippy::unimplemented)]
+        {
+            unimplemented!(
+                "PgDieselConnector::execute_rows is reserved for total row reexec; \
+                 use the scalar path or supply a custom Connector impl"
+            )
+        }
+    }
+}

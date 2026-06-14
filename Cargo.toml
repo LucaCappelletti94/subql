@@ -76,10 +76,10 @@ required-features = ["executor-diesel"]
 # Docker-backed integration test for AutoResolvingEngine + DieselConnector
 # against a real Postgres with logical replication. Tests are #[ignore]d;
 # run explicitly via:
-#   cargo test --test reexec_postgres --features executor-diesel -- --ignored --nocapture
+#   cargo test --test reexec_postgres --features executor-diesel-postgres -- --ignored --nocapture
 [[test]]
 name = "reexec_postgres"
-required-features = ["executor-diesel"]
+required-features = ["executor-diesel-postgres"]
 
 [dependencies]
 # SQL parsing (supports multiple dialects).
@@ -192,6 +192,12 @@ observability = ["dep:tracing", "tracing/std"]
 # bindings. Implies `std` (diesel needs std). The user activates their
 # backend on their own diesel dep.
 executor-diesel = ["std", "dep:diesel"]
+# Opt-in: ship `PgDieselConnector`, an LSN-aware sync connector built on
+# top of `executor-diesel` + diesel's `postgres` feature. Snapshots taken
+# through this connector carry a `PgLsn` checkpoint read from
+# `pg_current_wal_lsn()` inside the same transaction as the user query,
+# so the snapshot value and the LSN agree on a single point in the WAL.
+executor-diesel-postgres = ["executor-diesel", "diesel?/postgres"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]

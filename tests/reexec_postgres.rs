@@ -16,11 +16,12 @@
 //!     -- --ignored --nocapture
 //! ```
 //!
-//! Gated via `[[test]] required-features = ["executor-diesel"]` in
-//! `Cargo.toml`. The companion test against in-memory SQLite is
+//! Gated via `[[test]] required-features = ["executor-diesel-postgres"]`
+//! in `Cargo.toml`. The companion test against in-memory SQLite is
 //! `tests/reexec_diesel.rs`; that one is a plumbing smoke check, this one
-//! is the production-path proof.
-#![cfg(feature = "executor-diesel")]
+//! is the production-path proof and pulls LSN information from
+//! `pg_current_wal_lsn()` inside snapshot transactions.
+#![cfg(feature = "executor-diesel-postgres")]
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -30,7 +31,9 @@ use std::sync::Arc;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::reexec::{AutoResolvingEngine, Connector, DieselConnector, ReExecEngine, Registered};
+use subql::reexec::{
+    AutoResolvingEngine, Connector, PgDieselConnector, ReExecEngine, Registered, SnapshotResult,
+};
 use subql::{
     Cell, DefaultIds, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Parser, WalEvent,
     WalParser,
@@ -75,16 +78,15 @@ fn catalog() -> Arc<ParserDB> {
     Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"))
 }
 
-#[allow(clippy::type_complexity)]
 fn build_engine(
     catalog: Arc<ParserDB>,
     conn_exec: PgConnection,
-) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, DieselConnector<PgConnection>> {
+) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, PgDieselConnector> {
     let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
         catalog,
         PostgreSqlDialect {},
     );
-    AutoResolvingEngine::new(ReExecEngine::new(inner), DieselConnector::new(conn_exec))
+    AutoResolvingEngine::new(ReExecEngine::new(inner), PgDieselConnector::new(conn_exec))
 }
 
 /// Parse one wal2json v2 message into zero or more [`WalEvent`]s. The parser
@@ -324,4 +326,57 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
     assert_eq!(notifs.scalar_updates[0].query_id, captured_qid);
     assert_eq!(notifs.scalar_updates[0].value, Cell::Float(20.0));
     assert!(notifs.triggers.is_empty());
+}
+
+/// Test 3 - PgDieselConnector::snapshot returns a real PgLsn.
+///
+/// Seeds the table with `(1, 5.0), (2, 9.0)`, registers `MIN(price)`, then
+/// calls `engine.snapshot(qid)` BEFORE any CDC events. The result should be
+/// `SnapshotResult::Scalar(Cell::Float(5.0), Some(PgLsn(_)))` where the
+/// LSN is non-zero (PG always has a position). Subsequent dispatches then
+/// see 5.0 as the current MIN without any further connector calls because
+/// `snapshot` already installed the value.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn snapshot_reads_value_and_lsn_from_pg() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let mut conn_setup = common::pg_connect(port);
+    let conn_exec = common::pg_connect(port);
+
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+
+    let catalog = catalog();
+    let mut engine = build_engine(Arc::clone(&catalog), conn_exec);
+
+    let captured_qid = match engine
+        .register(
+            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+            (),
+        )
+        .expect("captured registration")
+    {
+        Registered::ReExec { query_id, .. } => query_id,
+        Registered::Engine(_) => panic!("expected ReExec"),
+    };
+
+    // Snapshot reads value + LSN inside a single transaction.
+    let snap = engine
+        .snapshot(captured_qid)
+        .expect("snapshot")
+        .expect("query_id exists");
+    let (value, checkpoint) = match snap {
+        SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
+        SnapshotResult::Rows(_, _) => panic!("expected Scalar variant"),
+        other => panic!("unexpected snapshot variant: {other:?}"),
+    };
+    assert_eq!(value, Cell::Float(5.0), "MIN(price) snapshot value");
+
+    let lsn = checkpoint.expect("PgDieselConnector must report a checkpoint");
+    assert!(
+        lsn > subql::PgLsn(0),
+        "pg_current_wal_lsn() should be non-zero on a live server, got {lsn:?}"
+    );
 }
