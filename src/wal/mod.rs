@@ -7,6 +7,8 @@
 mod debezium;
 mod map_cdc;
 mod maxwell;
+#[cfg(feature = "pg-cdc")]
+mod pg_cdc;
 mod pg_type;
 mod pgoutput;
 mod row_build;
@@ -16,6 +18,8 @@ mod wal2json;
 
 pub use debezium::DebeziumParser;
 pub use maxwell::MaxwellParser;
+#[cfg(feature = "pg-cdc")]
+pub use pg_cdc::{PgCdcReader, ReaderError as PgCdcReaderError};
 pub use pgoutput::PgOutputParser;
 pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Parser};
 

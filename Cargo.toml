@@ -89,6 +89,13 @@ required-features = ["executor-diesel-postgres"]
 name = "reexec_postgres_r2d2"
 required-features = ["executor-diesel-postgres-r2d2"]
 
+# Docker-backed integration test for PgCdcReader (polling reader against
+# real PG with a wal2json replication slot). Run with:
+#   cargo test --test pg_cdc --features pg-cdc -- --ignored --nocapture
+[[test]]
+name = "pg_cdc"
+required-features = ["pg-cdc"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }
@@ -221,6 +228,12 @@ executor-diesel-postgres-r2d2 = [
     "dep:r2d2",
     "diesel?/r2d2",
 ]
+# Opt-in: ship `PgCdcReader`, a polling-based PG CDC reader that drains a
+# wal2json replication slot via `pg_logical_slot_get_changes` and parses
+# the messages into `Vec<WalEvent<PgLsn>>`. Caller-driven (the API is
+# sync; consumers wrap in their own loop or async runtime). The native
+# streaming `START_REPLICATION` path is a planned follow-on.
+pg-cdc = ["executor-diesel-postgres"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]
