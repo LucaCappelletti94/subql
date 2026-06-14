@@ -110,6 +110,39 @@ pub struct ReExecNotifications<I: IdTypes, C: crate::Checkpoint = crate::NoCheck
     pub triggers: Vec<ReExecutionTrigger<I, C>>,
 }
 
+/// Result of [`ReExecEngine::consumers_batch`].
+///
+/// Carries per-event engine notifications in input order plus coalesced
+/// scalar updates and triggers across the whole batch. Also returned by
+/// the auto-resolving engines' batch methods (with `triggers` always
+/// empty after resolution).
+///
+/// Coalescing semantics:
+/// * `per_event[i]` carries the engine notifications produced by
+///   `events[i]`, preserving positional alignment so consumer-facing row
+///   deltas stay in commit order.
+/// * `scalar_updates` collects every `ScalarUpdate` produced across the
+///   batch (in-process state-machine resolutions). The same captured
+///   query may appear more than once if its value changes multiple times.
+/// * `triggers` is deduplicated by `query_id` and keeps the **last**
+///   trigger's checkpoint, since the connector reads the cumulative state
+///   at the end of the batch. Under [`AutoResolvingEngine`] /
+///   [`AsyncAutoResolvingEngine`] this field is always empty after
+///   resolution; under [`ReExecEngine`] the caller services the triggers.
+///
+/// [`AutoResolvingEngine`]: super::AutoResolvingEngine
+/// [`AsyncAutoResolvingEngine`]: super::AsyncAutoResolvingEngine
+pub struct BatchOutcome<I: IdTypes, C: crate::Checkpoint = crate::NoCheckpoint> {
+    /// View-relative engine notifications, one entry per input event in
+    /// the order they were supplied.
+    pub per_event: Vec<ConsumerNotifications<I, C>>,
+    /// Scalar updates produced in-process during the batch.
+    pub scalar_updates: Vec<ScalarUpdate<I, C>>,
+    /// Re-execution triggers, deduplicated by `query_id` across the batch
+    /// (last occurrence's checkpoint wins).
+    pub triggers: Vec<ReExecutionTrigger<I, C>>,
+}
+
 /// Counts from unregistering through the wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReExecUnregisterReport {
@@ -316,6 +349,50 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
         sql: &str,
     ) -> Result<UnregisterReport, RegisterError> {
         self.inner.unregister_query(consumer_id, sql)
+    }
+
+    /// Dispatch a batch of CDC events at once, coalescing triggers by
+    /// `query_id` across the whole batch.
+    ///
+    /// Per-event engine notifications are returned in input order in
+    /// [`BatchOutcome::per_event`]; in-process scalar updates accumulate
+    /// across the batch into [`BatchOutcome::scalar_updates`]; triggers
+    /// are deduplicated by `query_id` (last occurrence's checkpoint wins)
+    /// into [`BatchOutcome::triggers`].
+    ///
+    /// A CDC batch of N events that displaces the same captured query's
+    /// extreme K times produces a single trigger here instead of K
+    /// triggers in K successive per-event calls, eliminating redundant
+    /// downstream re-executions.
+    ///
+    /// Per-event `consumers` is unchanged and remains available for
+    /// callers without a natural batch boundary.
+    pub fn consumers_batch<C: crate::Checkpoint>(
+        &mut self,
+        events: &[WalEvent<C>],
+    ) -> Result<BatchOutcome<I, C>, DispatchError> {
+        let mut per_event = Vec::with_capacity(events.len());
+        let mut scalar_updates = Vec::new();
+        // HashMap dedup by query_id; insertion-order across the batch is
+        // discarded, which is correct: the connector reads the cumulative
+        // state at the end of the batch, not any intermediate state.
+        let mut triggers: HashMap<ReExecQueryId, ReExecutionTrigger<I, C>> = HashMap::new();
+        for event in events {
+            let notifs = self.consumers(event)?;
+            per_event.push(notifs.engine);
+            scalar_updates.extend(notifs.scalar_updates);
+            for trigger in notifs.triggers {
+                // Last write wins: overwrites the previous trigger's
+                // checkpoint with the most recent one, matching the
+                // semantics of "the connector reads at the latest point".
+                triggers.insert(trigger.query_id, trigger);
+            }
+        }
+        Ok(BatchOutcome {
+            per_event,
+            scalar_updates,
+            triggers: triggers.into_values().collect(),
+        })
     }
 
     /// Dispatch a CDC event.

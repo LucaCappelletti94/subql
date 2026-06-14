@@ -83,6 +83,6 @@ pub use connector::DieselConnector;
 pub use connector::PgDieselConnector;
 pub use connector::{Connector, ReExecError, Snapshot};
 pub use engine::{
-    ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport, ReExecutionTrigger,
-    Registered, ScalarUpdate,
+    BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
+    ReExecutionTrigger, Registered, ScalarUpdate,
 };

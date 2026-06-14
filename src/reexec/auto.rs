@@ -15,8 +15,8 @@
 
 use super::connector::{Connector, ReExecError};
 use super::engine::{
-    ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport, Registered,
-    ScalarUpdate,
+    BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
+    Registered, ScalarUpdate,
 };
 use crate::RowImage;
 use crate::{
@@ -240,6 +240,53 @@ where
 
         Ok(ReExecNotifications {
             engine,
+            scalar_updates,
+            triggers: Vec::new(),
+        })
+    }
+
+    /// Batch variant of [`consumers`](Self::consumers).
+    ///
+    /// Runs each event through the inner trigger-emitting engine in input
+    /// order, then resolves the **deduplicated** triggers serially via the
+    /// connector. With N events that displace the same captured query K
+    /// times, the connector is called once instead of K times. Per-event
+    /// engine notifications stay in input order; the returned
+    /// [`BatchOutcome::triggers`] is always empty after resolution.
+    ///
+    /// The first connector failure aborts the whole batch; partial
+    /// notifications are dropped. The caller is expected to retry the
+    /// batch.
+    pub fn consumers_batch<C: crate::Checkpoint>(
+        &mut self,
+        events: &[WalEvent<C>],
+    ) -> Result<BatchOutcome<I, C>, ReExecError<X::Error>> {
+        let BatchOutcome {
+            per_event,
+            mut scalar_updates,
+            triggers,
+        } = self.inner.consumers_batch(events)?;
+
+        for trigger in triggers {
+            let ctx = self.contexts.get(&trigger.query_id).expect(
+                "every captured query stores its resolve context at register time; \
+                 trigger.query_id must exist in `contexts`",
+            );
+            let (value, _db_checkpoint) = self
+                .connector
+                .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
+                .map_err(ReExecError::Connector)?;
+            self.inner.install(trigger.query_id, value.clone());
+            scalar_updates.push(ScalarUpdate {
+                query_id: trigger.query_id,
+                consumer_id: trigger.consumer_id,
+                value,
+                checkpoint: trigger.checkpoint.clone(),
+            });
+        }
+
+        Ok(BatchOutcome {
+            per_event,
             scalar_updates,
             triggers: Vec::new(),
         })
@@ -538,6 +585,125 @@ mod tests {
         assert!(e.snapshot(99999).unwrap().is_none());
         // Connector was never called.
         assert_eq!(e.connector().call_count(), 0);
+    }
+
+    /// T4.1 + T4.2: a batch of 3 events that displace the same captured
+    /// query's extreme produces ONE connector call (dedup), and engine
+    /// notifications come back in input order.
+    #[test]
+    fn consumers_batch_coalesces_repeated_triggers() {
+        // Connector serves a single value, which is what we expect since
+        // the trigger should be deduplicated to one call.
+        let mut e = engine_with_values(alloc::vec![Cell::Float(99.0)]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+        };
+        // Bootstrap: extreme is 5.0.
+        assert!(e.install(qid, Cell::Float(5.0)));
+
+        // Three DELETEs of the current extreme. Each one in isolation
+        // would emit a trigger; the batch should collapse them.
+        let events = alloc::vec![
+            delete_event(1, 5.0),
+            delete_event(2, 5.0),
+            delete_event(3, 5.0),
+        ];
+
+        let outcome = e.consumers_batch(&events).unwrap();
+        assert_eq!(
+            outcome.per_event.len(),
+            3,
+            "per_event must align positionally with input"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            1,
+            "three displacing events must collapse to one connector call"
+        );
+        assert_eq!(outcome.scalar_updates.len(), 1);
+        assert_eq!(outcome.scalar_updates[0].value, Cell::Float(99.0));
+        assert!(
+            outcome.triggers.is_empty(),
+            "auto-resolving drains triggers"
+        );
+    }
+
+    /// T4.3: a connector failure mid-batch aborts the whole batch with
+    /// `ReExecError::Connector` and the caller is expected to retry.
+    #[test]
+    fn consumers_batch_connector_error_aborts() {
+        // Empty value queue: connector errors on first call.
+        let mut e = engine_with_values(alloc::vec![]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+        };
+        assert!(e.install(qid, Cell::Float(5.0)));
+
+        let events = alloc::vec![delete_event(1, 5.0)];
+
+        match e.consumers_batch(&events) {
+            Ok(_) => panic!("expected Connector error, got Ok"),
+            Err(ReExecError::Connector(MockError(msg))) => assert_eq!(msg, "queue empty"),
+            Err(other) => panic!("expected Connector error, got {other:?}"),
+        }
+    }
+
+    /// Coalescing only collapses the **same** `query_id`. Distinct captured
+    /// queries each trigger their own connector call.
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn consumers_batch_does_not_coalesce_distinct_queries() {
+        // Two captured queries on the same table. Connector returns 11.0
+        // (popped first) for one and 22.0 (popped second) for the other.
+        // MockConnector pops from the back, so push values in reverse:
+        // first pop = 22.0, second pop = 11.0.
+        let mut e = engine_with_values(alloc::vec![Cell::Float(22.0), Cell::Float(11.0)]);
+        let qid1 = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec for MIN"),
+        };
+        let qid2 = match e
+            .register(
+                SubscriptionRequest::new(2u64, "SELECT MAX(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec for MAX"),
+        };
+        // Bootstrap both at 7.0 so deleting price=7.0 displaces both.
+        assert!(e.install(qid1, Cell::Float(7.0)));
+        assert!(e.install(qid2, Cell::Float(7.0)));
+
+        let events = alloc::vec![delete_event(1, 7.0)];
+        let outcome = e.consumers_batch(&events).unwrap();
+        assert_eq!(e.connector().call_count(), 2, "one call per distinct query");
+        assert_eq!(outcome.scalar_updates.len(), 2);
+        let qids: alloc::collections::BTreeSet<_> =
+            outcome.scalar_updates.iter().map(|u| u.query_id).collect();
+        assert!(qids.contains(&qid1));
+        assert!(qids.contains(&qid2));
     }
 
     #[test]

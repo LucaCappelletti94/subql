@@ -11,8 +11,8 @@ use super::async_connector::AsyncConnector;
 use super::auto::{ResolveContext, SnapshotResult};
 use super::connector::ReExecError;
 use super::engine::{
-    ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport, Registered,
-    ScalarUpdate,
+    BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
+    Registered, ScalarUpdate,
 };
 use crate::{
     Cell, IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport,
@@ -178,6 +178,54 @@ where
 
         Ok(ReExecNotifications {
             engine,
+            scalar_updates,
+            triggers: Vec::new(),
+        })
+    }
+
+    /// Async batch variant of [`consumers`](Self::consumers).
+    ///
+    /// Runs each event through the inner trigger-emitting engine in input
+    /// order, then awaits the connector for each **deduplicated** trigger.
+    /// Today the connector calls are sequential; Phase 6 (Clock + rate
+    /// limiting) will switch to `FuturesUnordered` capped at
+    /// `max_concurrent_reexecutions`. Per-event engine notifications stay
+    /// in input order; the returned [`BatchOutcome::triggers`] is always
+    /// empty after resolution.
+    ///
+    /// The first connector failure aborts the whole batch; partial
+    /// notifications are dropped.
+    pub async fn consumers_batch<C: crate::Checkpoint>(
+        &mut self,
+        events: &[WalEvent<C>],
+    ) -> Result<BatchOutcome<I, C>, ReExecError<X::Error>> {
+        let BatchOutcome {
+            per_event,
+            mut scalar_updates,
+            triggers,
+        } = self.inner.consumers_batch(events)?;
+
+        for trigger in triggers {
+            let ctx = self.contexts.get(&trigger.query_id).expect(
+                "every captured query stores its resolve context at register time; \
+                 trigger.query_id must exist in `contexts`",
+            );
+            let (value, _db_checkpoint) = self
+                .connector
+                .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
+                .await
+                .map_err(ReExecError::Connector)?;
+            self.inner.install(trigger.query_id, value.clone());
+            scalar_updates.push(ScalarUpdate {
+                query_id: trigger.query_id,
+                consumer_id: trigger.consumer_id,
+                value,
+                checkpoint: trigger.checkpoint.clone(),
+            });
+        }
+
+        Ok(BatchOutcome {
+            per_event,
             scalar_updates,
             triggers: Vec::new(),
         })
@@ -468,6 +516,41 @@ mod tests {
             Err(ReExecError::Connector(MockError(msg))) => assert_eq!(msg, "queue empty"),
             Err(other) => panic!("expected Connector error, got {other:?}"),
         }
+    }
+
+    /// Async batch coalesces repeated triggers for the same query into a
+    /// single connector call. Mirrors the sync engine's T4.1 assertion.
+    #[test]
+    fn async_engine_consumers_batch_coalesces_repeated_triggers() {
+        let mut e = engine_with_values(vec![Cell::Float(99.0)]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec"),
+        };
+        assert!(e.install(qid, Cell::Float(5.0)));
+
+        let events = vec![
+            delete_event(1, 5.0),
+            delete_event(2, 5.0),
+            delete_event(3, 5.0),
+        ];
+
+        let outcome = block_on(e.consumers_batch(&events)).unwrap();
+        assert_eq!(outcome.per_event.len(), 3, "per_event positional alignment");
+        assert_eq!(
+            e.connector().call_count(),
+            1,
+            "three displacing events collapse to one connector call"
+        );
+        assert_eq!(outcome.scalar_updates.len(), 1);
+        assert_eq!(outcome.scalar_updates[0].value, Cell::Float(99.0));
+        assert!(outcome.triggers.is_empty());
     }
 
     /// `unregister_reexec_query` drops the stored auth context.
