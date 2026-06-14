@@ -18,6 +18,7 @@ use super::engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     Registered, ScalarUpdate,
 };
+use crate::clock::{duration_between, ClockHandle};
 use crate::RowImage;
 use crate::{
     Cell, ColumnType, IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope,
@@ -25,6 +26,7 @@ use crate::{
 };
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::time::Duration;
 use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::dialect::Dialect;
@@ -85,6 +87,14 @@ where
     inner: ReExecEngine<D, I, DB>,
     connector: X,
     contexts: HashMap<ReExecQueryId, ResolveContext<I, X::AuthContext>>,
+    /// Optional [`Clock`](crate::Clock) used for per-query debounce.
+    clock: Option<ClockHandle>,
+    /// Minimum interval between two re-executions of the same captured
+    /// query. `None` means no debounce. Requires `clock` to be set.
+    debounce: Option<Duration>,
+    /// Last `now_micros` at which each captured query was re-executed.
+    /// Populated only when `clock` + `debounce` are set.
+    last_reexec_at: HashMap<ReExecQueryId, u64>,
 }
 
 impl<D, I, DB, X> AutoResolvingEngine<D, I, DB, X>
@@ -100,7 +110,34 @@ where
             inner,
             connector,
             contexts: HashMap::new(),
+            clock: None,
+            debounce: None,
+            last_reexec_at: HashMap::new(),
         }
+    }
+
+    /// Attach a [`Clock`](crate::Clock) for time-based decisions
+    /// (per-query debounce). Defaults to no clock; without one, debounce
+    /// is silently disabled even if [`with_debounce_per_query`](Self::with_debounce_per_query)
+    /// is set.
+    #[must_use]
+    pub fn with_clock(mut self, clock: ClockHandle) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Configure a minimum interval between two re-executions of the
+    /// same captured query.
+    ///
+    /// Triggers within the window are silently dropped: the connector is
+    /// not called and no [`ScalarUpdate`] is emitted (the engine's stored
+    /// value, set by the prior re-execution, remains current). Requires
+    /// [`with_clock`](Self::with_clock); without a clock the debounce
+    /// config is ignored.
+    #[must_use]
+    pub const fn with_debounce_per_query(mut self, debounce: Duration) -> Self {
+        self.debounce = Some(debounce);
+        self
     }
 
     /// The wrapped trigger-emitting engine.
@@ -111,6 +148,28 @@ where
     /// The connector this engine drives.
     pub const fn connector(&self) -> &X {
         &self.connector
+    }
+
+    /// Whether the trigger for `query_id` should be skipped under the
+    /// debounce policy. Returns `false` (proceed) when no clock + debounce
+    /// is configured, when no prior re-exec is known, or when enough time
+    /// has elapsed.
+    fn debounce_skip(&self, query_id: ReExecQueryId) -> bool {
+        let (Some(clock), Some(window)) = (self.clock.as_ref(), self.debounce) else {
+            return false;
+        };
+        let Some(last_micros) = self.last_reexec_at.get(&query_id).copied() else {
+            return false;
+        };
+        duration_between(last_micros, clock.now_micros()) < window
+    }
+
+    /// Stamp `query_id` with the current clock instant. No-op if clock is
+    /// not configured; debounce stamping is unnecessary without a clock.
+    fn stamp_reexec(&mut self, query_id: ReExecQueryId) {
+        if let Some(clock) = self.clock.as_ref() {
+            self.last_reexec_at.insert(query_id, clock.now_micros());
+        }
     }
 
     /// Number of captured re-execution queries (matches the inner engine).
@@ -216,6 +275,13 @@ where
         } = self.inner.consumers(event)?;
 
         for trigger in triggers {
+            // Debounce: drop the trigger if we re-executed this query
+            // within the configured window. The engine's installed value
+            // (set by the prior re-exec) stays the current view; no
+            // ScalarUpdate emitted.
+            if self.debounce_skip(trigger.query_id) {
+                continue;
+            }
             let ctx = self.contexts.get(&trigger.query_id).expect(
                 "every captured query stores its resolve context at register time; \
                  trigger.query_id must exist in `contexts`",
@@ -230,6 +296,7 @@ where
                 .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
                 .map_err(ReExecError::Connector)?;
             self.inner.install(trigger.query_id, value.clone());
+            self.stamp_reexec(trigger.query_id);
             scalar_updates.push(ScalarUpdate {
                 query_id: trigger.query_id,
                 consumer_id: trigger.consumer_id,
@@ -268,6 +335,9 @@ where
         } = self.inner.consumers_batch(events)?;
 
         for trigger in triggers {
+            if self.debounce_skip(trigger.query_id) {
+                continue;
+            }
             let ctx = self.contexts.get(&trigger.query_id).expect(
                 "every captured query stores its resolve context at register time; \
                  trigger.query_id must exist in `contexts`",
@@ -277,6 +347,7 @@ where
                 .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
                 .map_err(ReExecError::Connector)?;
             self.inner.install(trigger.query_id, value.clone());
+            self.stamp_reexec(trigger.query_id);
             scalar_updates.push(ScalarUpdate {
                 query_id: trigger.query_id,
                 consumer_id: trigger.consumer_id,
@@ -704,6 +775,101 @@ mod tests {
             outcome.scalar_updates.iter().map(|u| u.query_id).collect();
         assert!(qids.contains(&qid1));
         assert!(qids.contains(&qid2));
+    }
+
+    /// T6.1: a second displacing event within the debounce window is
+    /// dropped: connector is not called and no ScalarUpdate is emitted.
+    /// T6.2 in the same test: after the clock ticks past the window the
+    /// next trigger fires normally.
+    #[test]
+    // The `.clone()` below needs the Arc<ManualClock> -> Arc<dyn Clock>
+    // unsize coercion at the assignment site; `Arc::clone(&clock)` would
+    // need an already-coerced source. Allow the clippy lint here.
+    #[allow(clippy::clone_on_ref_ptr)]
+    fn debounce_skips_within_window_and_fires_after() {
+        let clock = alloc::sync::Arc::new(crate::ManualClock::new(0));
+        let engine_clock: crate::ClockHandle = clock.clone();
+        // Two values in the connector queue: one for the first re-exec,
+        // one for the post-window re-exec. The "within window" re-exec
+        // is debounced and never reaches the connector.
+        let mut e = engine_with_values(alloc::vec![Cell::Float(20.0), Cell::Float(7.0)])
+            .with_clock(engine_clock)
+            .with_debounce_per_query(core::time::Duration::from_millis(100));
+
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec"),
+        };
+        assert!(e.install(qid, Cell::Float(5.0)));
+
+        // First displacing event: re-exec proceeds (no prior stamp).
+        let n = e.consumers(&delete_event(1, 5.0)).unwrap();
+        assert_eq!(n.scalar_updates.len(), 1);
+        assert_eq!(n.scalar_updates[0].value, Cell::Float(7.0));
+        assert_eq!(e.connector().call_count(), 1);
+
+        // Second displacing event within 50ms (window is 100ms): skipped.
+        clock.advance(core::time::Duration::from_millis(50));
+        // The engine's MIN is currently 7.0 from the prior re-exec. To
+        // force a second trigger we delete a row matching 7.0.
+        let n = e.consumers(&delete_event(2, 7.0)).unwrap();
+        assert!(
+            n.scalar_updates.is_empty(),
+            "debounced trigger must not emit a ScalarUpdate"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            1,
+            "debounced trigger must not call the connector"
+        );
+
+        // Past the window now: 50ms + 100ms = 150ms total since first.
+        clock.advance(core::time::Duration::from_millis(100));
+        // Reinstall the value the engine thinks is current so the next
+        // displacement is well-defined; the test exercises debounce,
+        // not the state machine.
+        assert!(e.install(qid, Cell::Float(7.0)));
+        let n = e.consumers(&delete_event(3, 7.0)).unwrap();
+        assert_eq!(n.scalar_updates.len(), 1, "post-window trigger must fire");
+        assert_eq!(n.scalar_updates[0].value, Cell::Float(20.0));
+        assert_eq!(e.connector().call_count(), 2);
+    }
+
+    /// Without a configured clock, `with_debounce_per_query` is a no-op:
+    /// triggers fire as normal.
+    #[test]
+    fn debounce_without_clock_is_a_noop() {
+        let mut e = engine_with_values(alloc::vec![Cell::Float(9.0), Cell::Float(7.0)])
+            .with_debounce_per_query(core::time::Duration::from_secs(3600));
+
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec"),
+        };
+        assert!(e.install(qid, Cell::Float(5.0)));
+
+        assert!(!e
+            .consumers(&delete_event(1, 5.0))
+            .unwrap()
+            .scalar_updates
+            .is_empty());
+        // The engine now has 7.0 installed. Deleting it again fires another
+        // trigger - the debounce-without-clock case must NOT skip it.
+        let n = e.consumers(&delete_event(2, 7.0)).unwrap();
+        assert_eq!(n.scalar_updates.len(), 1, "no clock -> no debounce");
+        assert_eq!(e.connector().call_count(), 2);
     }
 
     #[test]

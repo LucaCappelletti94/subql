@@ -14,11 +14,13 @@ use super::engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     Registered, ScalarUpdate,
 };
+use crate::clock::{duration_between, ClockHandle};
 use crate::{
     Cell, IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport,
     WalEvent,
 };
 use alloc::vec::Vec;
+use core::time::Duration;
 use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::dialect::Dialect;
@@ -43,6 +45,13 @@ where
     inner: ReExecEngine<D, I, DB>,
     connector: X,
     contexts: HashMap<ReExecQueryId, ResolveContext<I, X::AuthContext>>,
+    /// Optional [`Clock`](crate::Clock) used for per-query debounce.
+    clock: Option<ClockHandle>,
+    /// Minimum interval between two re-executions of the same captured
+    /// query. Requires `clock` to be set.
+    debounce: Option<Duration>,
+    /// Last `now_micros` at which each captured query was re-executed.
+    last_reexec_at: HashMap<ReExecQueryId, u64>,
 }
 
 impl<D, I, DB, X> AsyncAutoResolvingEngine<D, I, DB, X>
@@ -58,6 +67,44 @@ where
             inner,
             connector,
             contexts: HashMap::new(),
+            clock: None,
+            debounce: None,
+            last_reexec_at: HashMap::new(),
+        }
+    }
+
+    /// Attach a [`Clock`](crate::Clock) for per-query debounce. See
+    /// [`AutoResolvingEngine::with_clock`](super::AutoResolvingEngine::with_clock).
+    #[must_use]
+    pub fn with_clock(mut self, clock: ClockHandle) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Configure a minimum interval between two re-executions of the same
+    /// captured query.
+    ///
+    /// See [`AutoResolvingEngine::with_debounce_per_query`](super::AutoResolvingEngine::with_debounce_per_query)
+    /// for the contract.
+    #[must_use]
+    pub const fn with_debounce_per_query(mut self, debounce: Duration) -> Self {
+        self.debounce = Some(debounce);
+        self
+    }
+
+    fn debounce_skip(&self, query_id: ReExecQueryId) -> bool {
+        let (Some(clock), Some(window)) = (self.clock.as_ref(), self.debounce) else {
+            return false;
+        };
+        let Some(last_micros) = self.last_reexec_at.get(&query_id).copied() else {
+            return false;
+        };
+        duration_between(last_micros, clock.now_micros()) < window
+    }
+
+    fn stamp_reexec(&mut self, query_id: ReExecQueryId) {
+        if let Some(clock) = self.clock.as_ref() {
+            self.last_reexec_at.insert(query_id, clock.now_micros());
         }
     }
 
@@ -158,6 +205,9 @@ where
         } = self.inner.consumers(event)?;
 
         for trigger in triggers {
+            if self.debounce_skip(trigger.query_id) {
+                continue;
+            }
             let ctx = self.contexts.get(&trigger.query_id).expect(
                 "every captured query stores its resolve context at register time; \
                  trigger.query_id must exist in `contexts`",
@@ -168,6 +218,7 @@ where
                 .await
                 .map_err(ReExecError::Connector)?;
             self.inner.install(trigger.query_id, value.clone());
+            self.stamp_reexec(trigger.query_id);
             scalar_updates.push(ScalarUpdate {
                 query_id: trigger.query_id,
                 consumer_id: trigger.consumer_id,
@@ -206,6 +257,9 @@ where
         } = self.inner.consumers_batch(events)?;
 
         for trigger in triggers {
+            if self.debounce_skip(trigger.query_id) {
+                continue;
+            }
             let ctx = self.contexts.get(&trigger.query_id).expect(
                 "every captured query stores its resolve context at register time; \
                  trigger.query_id must exist in `contexts`",
@@ -216,6 +270,7 @@ where
                 .await
                 .map_err(ReExecError::Connector)?;
             self.inner.install(trigger.query_id, value.clone());
+            self.stamp_reexec(trigger.query_id);
             scalar_updates.push(ScalarUpdate {
                 query_id: trigger.query_id,
                 consumer_id: trigger.consumer_id,
