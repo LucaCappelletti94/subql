@@ -48,6 +48,16 @@ pub enum RegisterError {
     #[error("Schema error: {0}")]
     Schema(String),
 
+    /// Subscription registry is at its configured cap and the eviction
+    /// policy is [`crate::EvictionPolicy::Reject`].
+    #[error(
+        "Subscription registry is full: cap={cap}; raise the cap or pick a different eviction policy"
+    )]
+    RegistryFull {
+        /// Configured cap that the registration tried to exceed.
+        cap: usize,
+    },
+
     /// Aggregator subscription on a table with row-level security enabled.
     ///
     /// Under RLS, different viewers observe different result rows, so a

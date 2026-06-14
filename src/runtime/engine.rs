@@ -134,6 +134,12 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     binding_dedup: HashMap<(I::ConsumerId, u128, SubscriptionScope<I>), SubscriptionId>,
     /// VM for bytecode evaluation
     vm: Vm,
+    /// Optional cap on the number of live subscriptions. `None` means no
+    /// cap; the registry can grow unbounded.
+    max_subscriptions: Option<usize>,
+    /// Eviction policy applied when [`max_subscriptions`](Self::max_subscriptions)
+    /// would be exceeded. Default [`EvictionPolicy::Reject`].
+    eviction_policy: crate::EvictionPolicy,
     /// Optional storage path for durability
     #[cfg(feature = "std")]
     storage_path: Option<PathBuf>,
@@ -380,6 +386,8 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             next_subscription_id: 1,
             binding_dedup: HashMap::new(),
             vm: Vm::new(),
+            max_subscriptions: None,
+            eviction_policy: crate::EvictionPolicy::Reject,
             #[cfg(feature = "std")]
             storage_path: None,
             #[cfg(feature = "std")]
@@ -391,6 +399,29 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             #[cfg(feature = "std")]
             durability_mode: DurabilityMode::Required,
         }
+    }
+
+    /// Configure a maximum number of live subscriptions and the policy
+    /// applied when a registration would exceed it.
+    ///
+    /// By default the registry is uncapped. With [`EvictionPolicy::Reject`]
+    /// the cap is hard: `register` returns [`RegisterError::RegistryFull`]
+    /// once the registry is full. With [`EvictionPolicy::EvictOldest`] the
+    /// oldest subscription (lowest [`SubscriptionId`]) is evicted to make
+    /// room and reported in [`RegisterResult::evicted`].
+    ///
+    /// Idempotent re-registrations (matching `(consumer_id, predicate, scope)`)
+    /// never trigger eviction since they do not allocate a new subscription
+    /// slot.
+    #[must_use]
+    pub const fn with_max_subscriptions(
+        mut self,
+        cap: usize,
+        policy: crate::EvictionPolicy,
+    ) -> Self {
+        self.max_subscriptions = Some(cap);
+        self.eviction_policy = policy;
+        self
     }
 
     /// Create engine with durable storage
@@ -476,7 +507,31 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                 predicate_hash: hash,
                 created_new_predicate: false,
                 projection: compiled.projection,
+                evicted: Vec::new(),
             });
+        }
+
+        // 2.5. Enforce subscription registry cap. Idempotent re-registrations
+        // already short-circuited above and never trip the cap.
+        let mut evicted: Vec<SubscriptionId> = Vec::new();
+        if let Some(cap) = self.max_subscriptions {
+            if self.subscription_to_table.len() >= cap {
+                match self.eviction_policy {
+                    crate::EvictionPolicy::Reject => {
+                        return Err(RegisterError::RegistryFull { cap });
+                    }
+                    crate::EvictionPolicy::EvictOldest => {
+                        // Lowest SubscriptionId is the oldest (counter is
+                        // monotonic from 1). O(n) over the registry; for
+                        // realistic caps this is negligible.
+                        if let Some(&oldest) = self.subscription_to_table.keys().min() {
+                            if self.unregister_subscription_internal(oldest).is_some() {
+                                evicted.push(oldest);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 3. Auto-assign a new subscription ID.
@@ -540,6 +595,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             predicate_hash: hash,
             created_new_predicate: created_new,
             projection: compiled.projection,
+            evicted,
         })
     }
 
@@ -620,6 +676,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                             predicate_hash: compiled_spec.hash,
                             created_new_predicate: false,
                             projection: compiled_spec.projection,
+                            evicted: Vec::new(),
                         }));
                         compiled.push(None); // already handled
                         continue;
@@ -631,6 +688,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                         predicate_hash: compiled_spec.hash,
                         created_new_predicate: false, // filled in phase 2
                         projection: compiled_spec.projection.clone(),
+                        evicted: Vec::new(),
                     }));
                     compiled.push(Some(compiled_spec));
                 }
@@ -2064,6 +2122,90 @@ mod tests {
         let reg = result.unwrap();
         assert_eq!(reg.table_id, 1);
         assert!(reg.created_new_predicate);
+        assert!(reg.evicted.is_empty(), "no eviction expected without a cap");
+    }
+
+    /// T5.1: `EvictionPolicy::Reject` rejects registrations past the cap
+    /// with `RegisterError::RegistryFull`.
+    #[test]
+    fn test_register_cap_reject_returns_registry_full() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::Reject);
+
+        assert!(engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .is_ok());
+        assert!(engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 2",
+            ))
+            .is_ok());
+
+        // Third registration is past the cap.
+        match engine.register(SubscriptionRequest::new(
+            3u64,
+            "SELECT * FROM orders WHERE amount > 3",
+        )) {
+            Err(RegisterError::RegistryFull { cap }) => assert_eq!(cap, 2),
+            other => panic!("expected RegistryFull, got {other:?}"),
+        }
+
+        // Idempotent re-registration of an existing subscription does NOT
+        // count against the cap (no new subscription slot allocated).
+        let again = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("idempotent re-register must succeed");
+        assert!(again.evicted.is_empty());
+    }
+
+    /// T5.2: `EvictionPolicy::EvictOldest` makes room by evicting the
+    /// oldest subscription (lowest `SubscriptionId`) and surfaces the
+    /// evicted id in `RegisterResult::evicted`.
+    #[test]
+    fn test_register_cap_evict_oldest_surfaces_evicted_id() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::EvictOldest);
+
+        let first = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("first register");
+        let second = engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 2",
+            ))
+            .expect("second register");
+        assert!(first.evicted.is_empty());
+        assert!(second.evicted.is_empty());
+        assert_eq!(engine.subscription_count(), 2);
+
+        // Third registration triggers eviction of `first`.
+        let third = engine
+            .register(SubscriptionRequest::new(
+                3u64,
+                "SELECT * FROM orders WHERE amount > 3",
+            ))
+            .expect("third register must succeed under EvictOldest");
+        assert_eq!(
+            third.evicted,
+            vec![first.subscription_id],
+            "oldest subscription must be evicted"
+        );
+        assert_eq!(engine.subscription_count(), 2, "registry size stays at cap");
     }
 
     #[test]

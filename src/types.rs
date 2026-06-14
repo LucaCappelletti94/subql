@@ -1060,6 +1060,23 @@ impl<I: IdTypes> SubscriptionRequest<I> {
     }
 }
 
+/// Eviction policy applied when the registry cap is hit.
+///
+/// Default is `Reject`: registrations past the cap fail with
+/// [`crate::RegisterError::RegistryFull`]. Other variants make room for
+/// the incoming subscription by removing an existing one and surface the
+/// evicted [`SubscriptionId`]s in [`RegisterResult::evicted`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EvictionPolicy {
+    /// Hard cap: reject the registration when the registry is full.
+    #[default]
+    Reject,
+    /// Evict the oldest subscription (lowest `SubscriptionId`) and proceed.
+    /// Reports the evicted id via [`RegisterResult::evicted`].
+    EvictOldest,
+}
+
 /// Result of successful subscription registration
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisterResult {
@@ -1075,6 +1092,13 @@ pub struct RegisterResult {
     pub created_new_predicate: bool,
     /// Projection kind for this subscription
     pub projection: crate::compiler::sql_shape::QueryProjection,
+    /// Subscriptions evicted to make room for this registration.
+    ///
+    /// Empty under the default policy ([`EvictionPolicy::Reject`]) and
+    /// when the registry is below cap. Populated when an eviction policy
+    /// freed space; the caller may use this to notify the affected
+    /// clients (e.g. send an "evicted" signal over their transport).
+    pub evicted: Vec<SubscriptionId>,
 }
 
 /// Durability policy for registration writes when storage is enabled.
