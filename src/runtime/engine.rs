@@ -937,10 +937,10 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// assert!(notifs.updated().is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn consumers(
+    pub fn consumers<C: crate::Checkpoint>(
         &mut self,
-        event: &WalEvent,
-    ) -> Result<crate::ConsumerNotifications<I>, DispatchError> {
+        event: &WalEvent<C>,
+    ) -> Result<crate::ConsumerNotifications<I, C>, DispatchError> {
         let (partition, consumer_dict) = table_context(
             &self.partitions,
             &self.consumer_dictionaries,
@@ -1026,9 +1026,9 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// assert!(notifs.inserted().is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn aggregate_deltas(
+    pub fn aggregate_deltas<C: crate::Checkpoint>(
         &mut self,
-        event: &WalEvent,
+        event: &WalEvent<C>,
     ) -> Result<Vec<(I::ConsumerId, crate::AggDelta)>, DispatchError> {
         let (partition, consumer_dict) = table_context(
             &self.partitions,
@@ -5539,7 +5539,8 @@ mod tests {
     /// into_iter() yields inserted ∪ updated.
     #[test]
     fn test_consumer_notifications_into_iter() {
-        let notifs = crate::ConsumerNotifications::<DefaultIds> {
+        let notifs = crate::ConsumerNotifications::<DefaultIds, crate::NoCheckpoint> {
+            checkpoint: None,
             inserted: vec![1, 2],
             deleted: vec![3],
             updated: vec![4, 5],
@@ -5551,7 +5552,8 @@ mod tests {
     /// into_iter() size_hint is correct.
     #[test]
     fn test_consumer_notifications_size_hint() {
-        let notifs = crate::ConsumerNotifications::<DefaultIds> {
+        let notifs = crate::ConsumerNotifications::<DefaultIds, crate::NoCheckpoint> {
+            checkpoint: None,
             inserted: vec![1, 2],
             deleted: vec![3],
             updated: vec![4],

@@ -1235,7 +1235,12 @@ pub enum AggDelta {
 /// deltas), not the base-table operation.  A single base-table UPDATE may
 /// produce `Inserted` for one consumer, `Deleted` for another, and `Updated`
 /// for a third.
-pub struct ConsumerNotifications<I: IdTypes> {
+///
+/// Carries the originating event's [`Checkpoint`] so downstream replay /
+/// oplog code can correlate notifications with positions in the source
+/// stream. Default `C = NoCheckpoint` preserves the original API for
+/// callers that do not care about positions.
+pub struct ConsumerNotifications<I: IdTypes, C: Checkpoint = NoCheckpoint> {
     /// Consumers for whom a row appeared in their result set.
     /// (Base INSERT, or base UPDATE where new row matches but old didn't.)
     pub(crate) inserted: Vec<I::ConsumerId>,
@@ -1245,16 +1250,19 @@ pub struct ConsumerNotifications<I: IdTypes> {
     /// Consumers for whom a row changed but remained in their result set.
     /// (Base UPDATE where both old and new rows match.)
     pub(crate) updated: Vec<I::ConsumerId>,
+    /// Position of the originating event, when known.
+    pub(crate) checkpoint: Option<C>,
 }
 
-impl<I: IdTypes> ConsumerNotifications<I> {
-    /// Create empty notifications.
+impl<I: IdTypes, C: Checkpoint> ConsumerNotifications<I, C> {
+    /// Create empty notifications with no checkpoint.
     #[must_use]
     pub const fn empty() -> Self {
         Self {
             inserted: Vec::new(),
             deleted: Vec::new(),
             updated: Vec::new(),
+            checkpoint: None,
         }
     }
 
@@ -1269,7 +1277,15 @@ impl<I: IdTypes> ConsumerNotifications<I> {
             inserted,
             deleted,
             updated,
+            checkpoint: None,
         }
+    }
+
+    /// Attach a checkpoint to these notifications.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: Option<C>) -> Self {
+        self.checkpoint = checkpoint;
+        self
     }
 
     /// Consumers notified as inserted.
@@ -1290,7 +1306,14 @@ impl<I: IdTypes> ConsumerNotifications<I> {
         &self.updated
     }
 
-    /// Decompose into `(inserted, deleted, updated)`.
+    /// Position of the originating event, when the parser provided one.
+    #[must_use]
+    pub const fn checkpoint(&self) -> Option<&C> {
+        self.checkpoint.as_ref()
+    }
+
+    /// Decompose into `(inserted, deleted, updated)`. The checkpoint is
+    /// dropped; use [`checkpoint`](Self::checkpoint) first if needed.
     #[must_use]
     #[allow(clippy::type_complexity)]
     pub fn into_parts(self) -> (Vec<I::ConsumerId>, Vec<I::ConsumerId>, Vec<I::ConsumerId>) {
@@ -1298,12 +1321,13 @@ impl<I: IdTypes> ConsumerNotifications<I> {
     }
 }
 
-impl<I: IdTypes> core::fmt::Debug for ConsumerNotifications<I> {
+impl<I: IdTypes, C: Checkpoint> core::fmt::Debug for ConsumerNotifications<I, C> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ConsumerNotifications")
             .field("inserted", &self.inserted)
             .field("deleted", &self.deleted)
             .field("updated", &self.updated)
+            .field("checkpoint", &self.checkpoint)
             .finish()
     }
 }
@@ -1328,7 +1352,7 @@ impl<I: IdTypes> Iterator for ConsumerNotificationsIter<I> {
     }
 }
 
-impl<I: IdTypes> IntoIterator for ConsumerNotifications<I> {
+impl<I: IdTypes, C: Checkpoint> IntoIterator for ConsumerNotifications<I, C> {
     type Item = I::ConsumerId;
     type IntoIter = ConsumerNotificationsIter<I>;
 

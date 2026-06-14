@@ -8,7 +8,8 @@ use super::{
 };
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm},
-    AggDelta, Cell, ConsumerNotifications, DispatchError, EventKind, IdTypes, RowImage, WalEvent,
+    AggDelta, Cell, Checkpoint, ConsumerNotifications, DispatchError, EventKind, IdTypes, RowImage,
+    WalEvent,
 };
 use alloc::vec::Vec;
 use hashbrown::HashMap;
@@ -150,8 +151,8 @@ impl<I: IdTypes> Iterator for MatchedConsumers<'_, I> {
 }
 
 /// Select the row image used for dispatch based on event kind.
-fn require_new_row<'a>(
-    event: &'a WalEvent,
+fn require_new_row<'a, C: Checkpoint>(
+    event: &'a WalEvent<C>,
     message: &'static str,
 ) -> Result<&'a RowImage, DispatchError> {
     event
@@ -159,8 +160,8 @@ fn require_new_row<'a>(
         .ok_or(DispatchError::MissingRequiredRowImage(message))
 }
 
-fn require_old_row<'a>(
-    event: &'a WalEvent,
+fn require_old_row<'a, C: Checkpoint>(
+    event: &'a WalEvent<C>,
     message: &'static str,
 ) -> Result<&'a RowImage, DispatchError> {
     event
@@ -168,7 +169,9 @@ fn require_old_row<'a>(
         .ok_or(DispatchError::MissingRequiredRowImage(message))
 }
 
-pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchError> {
+pub(crate) fn select_event_row<C: Checkpoint>(
+    event: &WalEvent<C>,
+) -> Result<&RowImage, DispatchError> {
     match event.kind() {
         EventKind::Insert => require_new_row(event, "INSERT requires new_row"),
         EventKind::Update => require_new_row(event, "UPDATE requires new_row"),
@@ -179,10 +182,10 @@ pub(crate) fn select_event_row(event: &WalEvent) -> Result<&RowImage, DispatchEr
     }
 }
 
-fn notifications_for_truncate<I: IdTypes>(
+fn notifications_for_truncate<I: IdTypes, C: Checkpoint>(
     partition: &TablePartition<I>,
     consumer_dict: &ConsumerDictionary<I>,
-) -> ConsumerNotifications<I> {
+) -> ConsumerNotifications<I, C> {
     let snapshot = partition.load_snapshot();
     let mut ordinals = RoaringBitmap::new();
     for (pred_id, consumers) in &snapshot.predicates.predicate_consumers {
@@ -227,42 +230,44 @@ fn resolve_ordinals<I: IdTypes>(
 ///    - UPDATE: dual-eval (old_row + new_row) → three-way split
 ///    - TRUNCATE: all row subscribers → `deleted`
 /// 3. Return `ConsumerNotifications`
-pub fn dispatch_consumers<I: IdTypes>(
-    event: &WalEvent,
+pub fn dispatch_consumers<I: IdTypes, C: Checkpoint>(
+    event: &WalEvent<C>,
     partition: &TablePartition<I>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
-) -> Result<ConsumerNotifications<I>, DispatchError> {
-    match event.kind() {
+) -> Result<ConsumerNotifications<I, C>, DispatchError> {
+    let checkpoint = event.checkpoint().cloned();
+    let notifs: ConsumerNotifications<I, C> = match event.kind() {
         EventKind::Truncate => {
             let _ = vm;
-            Ok(notifications_for_truncate(partition, consumer_dict))
+            notifications_for_truncate(partition, consumer_dict)
         }
         EventKind::Insert => {
             let row = require_new_row(event, "INSERT requires new_row")?;
             let bitmap = dispatch_single_eval_bitmap(event, row, partition, vm)?;
-            Ok(ConsumerNotifications::from_parts(
+            ConsumerNotifications::from_parts(
                 resolve_ordinals(bitmap, consumer_dict),
                 Vec::new(),
                 Vec::new(),
-            ))
+            )
         }
         EventKind::Delete => {
             let row = require_old_row(event, "DELETE requires old_row")?;
             let bitmap = dispatch_single_eval_bitmap(event, row, partition, vm)?;
-            Ok(ConsumerNotifications::from_parts(
+            ConsumerNotifications::from_parts(
                 Vec::new(),
                 resolve_ordinals(bitmap, consumer_dict),
                 Vec::new(),
-            ))
+            )
         }
-        EventKind::Update => dispatch_update(event, partition, consumer_dict, vm),
-    }
+        EventKind::Update => dispatch_update(event, partition, consumer_dict, vm)?,
+    };
+    Ok(notifs.with_checkpoint(checkpoint))
 }
 
 /// Returns `true` when `old_row` is present and complete (no `Cell::Missing`),
 /// meaning dual-eval is possible for view-relative UPDATE dispatch.
-fn old_row_is_complete(event: &WalEvent) -> bool {
+fn old_row_is_complete<C: Checkpoint>(event: &WalEvent<C>) -> bool {
     event
         .old_row()
         .is_some_and(|row| !row.cells.iter().any(Cell::is_missing))
@@ -275,12 +280,12 @@ fn old_row_is_complete(event: &WalEvent) -> bool {
 /// split is exact. When `old_row` is absent or partial, falls back to single-eval
 /// on `new_row` — all matches go to `updated` (conservative: we cannot prove they
 /// are new entries).
-fn dispatch_update<I: IdTypes>(
-    event: &WalEvent,
+fn dispatch_update<I: IdTypes, C: Checkpoint>(
+    event: &WalEvent<C>,
     partition: &TablePartition<I>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
-) -> Result<ConsumerNotifications<I>, DispatchError> {
+) -> Result<ConsumerNotifications<I, C>, DispatchError> {
     let new_row = require_new_row(event, "UPDATE requires new_row")?;
 
     // When old_row is missing or partial, fall back to single-eval on new_row.
@@ -367,8 +372,8 @@ fn dispatch_update<I: IdTypes>(
 
 /// Single-eval dispatch: evaluate one row, return the matching ordinals bitmap.
 /// Used for INSERT (new_row) and DELETE (old_row).
-fn dispatch_single_eval_bitmap<I: IdTypes>(
-    event: &WalEvent,
+fn dispatch_single_eval_bitmap<I: IdTypes, C: Checkpoint>(
+    event: &WalEvent<C>,
     row: &RowImage,
     partition: &TablePartition<I>,
     vm: &mut Vm,
@@ -437,7 +442,9 @@ where
     Ok(())
 }
 
-fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, DispatchError> {
+fn weighted_rows_for_agg<C: Checkpoint>(
+    event: &WalEvent<C>,
+) -> Result<Vec<(i64, &RowImage)>, DispatchError> {
     match event.kind() {
         EventKind::Insert => Ok(vec![(
             1,
@@ -477,8 +484,8 @@ fn weighted_rows_for_agg(event: &WalEvent) -> Result<Vec<(i64, &RowImage)>, Disp
 /// Zero-net entries are filtered out before returning.
 /// The same user may appear multiple times (once per aggregate kind).
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-pub(crate) fn compute_agg_deltas<I: IdTypes>(
-    event: &WalEvent,
+pub(crate) fn compute_agg_deltas<I: IdTypes, C: Checkpoint>(
+    event: &WalEvent<C>,
     partition: &TablePartition<I>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
