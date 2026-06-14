@@ -168,7 +168,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                 let rel = self.get_relation(relation_id)?;
                 let (new_row, new_resolved) = tuple_cells_full(&rel, &tuple, true)?;
                 let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, database)?;
-                Ok(vec![insert_event(rel.table_id, pk, new_row)?])
+                Ok(vec![insert_event(rel.table_id, pk, new_row, None)?])
             }
 
             LogicalReplicationMessage::Update {
@@ -192,6 +192,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                     old_row,
                     new_row,
                     old_row_complete,
+                    None,
                 )])
             }
 
@@ -212,7 +213,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                     }
                 };
                 let pk = pk_from_old_resolved(&rel, &old_resolved)?;
-                Ok(vec![delete_event(rel.table_id, pk, old_row)?])
+                Ok(vec![delete_event(rel.table_id, pk, old_row, None)?])
             }
 
             LogicalReplicationMessage::Truncate { relation_ids, .. } => {
@@ -220,7 +221,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                 let mut events = Vec::with_capacity(relation_ids.len());
                 for oid in relation_ids {
                     if let Some(rel) = cache.map.get(&oid) {
-                        events.push(truncate_event(rel.table_id)?);
+                        events.push(truncate_event(rel.table_id, None)?);
                     }
                 }
                 Ok(events)

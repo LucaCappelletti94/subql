@@ -109,13 +109,14 @@ where
     parse_json_message(data)
 }
 
-pub(crate) fn parse_single_json_event<T, F>(
+pub(crate) fn parse_single_json_event<T, F, C>(
     data: &[u8],
     build_event: F,
-) -> Result<Vec<WalEvent>, WalParseError>
+) -> Result<Vec<WalEvent<C>>, WalParseError>
 where
     T: serde::de::DeserializeOwned,
-    F: FnOnce(&T) -> Result<Option<WalEvent>, WalParseError>,
+    F: FnOnce(&T) -> Result<Option<WalEvent<C>>, WalParseError>,
+    C: Checkpoint,
 {
     let message: Option<T> = parse_json_message_or_tombstone(data)?;
     let Some(message) = message else {
@@ -124,11 +125,11 @@ where
     Ok(build_event(&message)?.into_iter().collect())
 }
 
-pub(crate) fn skip_unknown_event_kind(
-    result: Result<WalEvent, WalParseError>,
+pub(crate) fn skip_unknown_event_kind<C: Checkpoint>(
+    result: Result<WalEvent<C>, WalParseError>,
     parser_name: &'static str,
     token_name: &'static str,
-) -> Result<Option<WalEvent>, WalParseError> {
+) -> Result<Option<WalEvent<C>>, WalParseError> {
     match result {
         Ok(event) => Ok(Some(event)),
         Err(WalParseError::UnknownEventKind(kind)) => {
@@ -386,12 +387,13 @@ pub(crate) fn old_row_is_complete(old_row: Option<&RowImage>) -> bool {
 }
 
 /// Build INSERT event with consistent defaults.
-pub(crate) fn insert_event(
+pub(crate) fn insert_event<C: Checkpoint>(
     table_id: TableId,
     pk: PrimaryKey,
     new_row: RowImage,
-) -> Result<WalEvent, WalParseError> {
-    WalEvent::builder(table_id)
+    checkpoint: Option<C>,
+) -> Result<WalEvent<C>, WalParseError> {
+    crate::types::WalEventBuilderStart::<C>::new(table_id, checkpoint)
         .insert()
         .pk(pk)
         .new_row(new_row)
@@ -401,13 +403,14 @@ pub(crate) fn insert_event(
 
 /// Build UPDATE event while allowing parsers to disable changed-column
 /// derivation when old-row images are known to be partial.
-pub(crate) fn update_event_with_old_row_completeness(
+pub(crate) fn update_event_with_old_row_completeness<C: Checkpoint>(
     table_id: TableId,
     pk: PrimaryKey,
     old_row: Option<RowImage>,
     new_row: RowImage,
     old_row_complete: bool,
-) -> WalEvent {
+    checkpoint: Option<C>,
+) -> WalEvent<C> {
     let changed = if old_row_complete {
         old_row
             .as_ref()
@@ -416,7 +419,7 @@ pub(crate) fn update_event_with_old_row_completeness(
         Vec::new()
     };
 
-    WalEvent::builder(table_id)
+    crate::types::WalEventBuilderStart::<C>::new(table_id, checkpoint)
         .update()
         .pk(pk)
         .new_row(new_row)
@@ -427,12 +430,13 @@ pub(crate) fn update_event_with_old_row_completeness(
 }
 
 /// Build DELETE event with consistent defaults.
-pub(crate) fn delete_event(
+pub(crate) fn delete_event<C: Checkpoint>(
     table_id: TableId,
     pk: PrimaryKey,
     old_row: RowImage,
-) -> Result<WalEvent, WalParseError> {
-    WalEvent::builder(table_id)
+    checkpoint: Option<C>,
+) -> Result<WalEvent<C>, WalParseError> {
+    crate::types::WalEventBuilderStart::<C>::new(table_id, checkpoint)
         .delete()
         .pk(pk)
         .old_row(old_row)
@@ -441,15 +445,18 @@ pub(crate) fn delete_event(
 }
 
 /// Build TRUNCATE event with consistent defaults.
-pub(crate) fn truncate_event(table_id: TableId) -> Result<WalEvent, WalParseError> {
-    WalEvent::builder(table_id)
+pub(crate) fn truncate_event<C: Checkpoint>(
+    table_id: TableId,
+    checkpoint: Option<C>,
+) -> Result<WalEvent<C>, WalParseError> {
+    crate::types::WalEventBuilderStart::<C>::new(table_id, checkpoint)
         .truncate()
         .build()
         .map_err(|e| WalParseError::MalformedPayload(format!("invalid truncate event: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_event_from_rows(
+pub(crate) fn build_event_from_rows<C: Checkpoint>(
     kind: EventKind,
     table_id: TableId,
     pk: PrimaryKey,
@@ -458,12 +465,13 @@ pub(crate) fn build_event_from_rows(
     old_row_complete: bool,
     missing_new_field: &str,
     missing_old_field: &str,
-) -> Result<WalEvent, WalParseError> {
+    checkpoint: Option<C>,
+) -> Result<WalEvent<C>, WalParseError> {
     match kind {
         EventKind::Insert => {
             let new_row = new_row
                 .ok_or_else(|| WalParseError::MissingField(missing_new_field.to_string()))?;
-            insert_event(table_id, pk, new_row)
+            insert_event(table_id, pk, new_row, checkpoint)
         }
         EventKind::Update => {
             let new_row = new_row
@@ -474,14 +482,15 @@ pub(crate) fn build_event_from_rows(
                 old_row,
                 new_row,
                 old_row_complete,
+                checkpoint,
             ))
         }
         EventKind::Delete => {
             let old_row = old_row
                 .ok_or_else(|| WalParseError::MissingField(missing_old_field.to_string()))?;
-            delete_event(table_id, pk, old_row)
+            delete_event(table_id, pk, old_row, checkpoint)
         }
-        EventKind::Truncate => truncate_event(table_id),
+        EventKind::Truncate => truncate_event(table_id, checkpoint),
     }
 }
 
@@ -648,22 +657,28 @@ mod tests {
 
     #[test]
     fn test_parse_single_json_event_tombstone_returns_empty() {
-        let events = parse_single_json_event::<serde_json::Value, _>(b"null", |_| {
-            Ok(Some(
-                truncate_event(1).expect("truncate_event helper should build valid event"),
-            ))
-        })
-        .expect("tombstone should be ignored");
+        let events =
+            parse_single_json_event::<serde_json::Value, _, crate::NoCheckpoint>(b"null", |_| {
+                Ok(Some(
+                    truncate_event::<crate::NoCheckpoint>(1, None)
+                        .expect("truncate_event helper should build valid event"),
+                ))
+            })
+            .expect("tombstone should be ignored");
         assert!(events.is_empty());
     }
 
     #[test]
     fn test_parse_single_json_event_wraps_one_event() {
-        let events = parse_single_json_event::<serde_json::Value, _>(br#"{"x":1}"#, |_| {
-            Ok(Some(
-                truncate_event(7).expect("truncate_event helper should build valid event"),
-            ))
-        })
+        let events = parse_single_json_event::<serde_json::Value, _, crate::NoCheckpoint>(
+            br#"{"x":1}"#,
+            |_| {
+                Ok(Some(
+                    truncate_event::<crate::NoCheckpoint>(7, None)
+                        .expect("truncate_event helper should build valid event"),
+                ))
+            },
+        )
         .expect("object should parse");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].table_id(), 7);

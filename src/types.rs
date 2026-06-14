@@ -914,12 +914,26 @@ impl WalEvent<NoCheckpoint> {
     /// Returns a builder pinned to `NoCheckpoint`; this is what synthetic
     /// tests and checkpoint-free contexts want. To produce events with a
     /// concrete checkpoint type, use
-    /// [`WalEventBuilderStart::with_typed_checkpoint`].
+    /// [`WalEventBuilderStart::with_typed_checkpoint`] or
+    /// [`WalEventBuilderStart::new`].
     #[must_use]
     pub const fn builder(table_id: TableId) -> WalEventBuilderStart<NoCheckpoint> {
         WalEventBuilderStart {
             table_id,
             checkpoint: None,
+        }
+    }
+}
+
+impl<C: Checkpoint> WalEventBuilderStart<C> {
+    /// Construct a builder pinned to a concrete `Checkpoint` type, with an
+    /// optional checkpoint value. Useful from parser-internal helpers that
+    /// receive an `Option<C>` from the wire format.
+    #[must_use]
+    pub const fn new(table_id: TableId, checkpoint: Option<C>) -> Self {
+        Self {
+            table_id,
+            checkpoint,
         }
     }
 }
