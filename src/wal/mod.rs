@@ -20,7 +20,9 @@ pub use pgoutput::PgOutputParser;
 pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Parser};
 
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
-use crate::{catalog_helpers, Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
+use crate::{
+    catalog_helpers, Cell, Checkpoint, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent,
+};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use hashbrown::HashSet;
@@ -33,6 +35,19 @@ use thiserror::Error;
 /// schema metadata at parse time. A single parser type can implement this
 /// trait for every `DB` (see e.g. [`PgOutputParser`]).
 pub trait WalParser<DB: DatabaseLike>: Send + Sync {
+    /// The [`Checkpoint`] type this parser anchors events with.
+    ///
+    /// PostgreSQL-flavored parsers should choose [`crate::PgLsn`]; MySQL
+    /// parsers choose [`crate::MysqlBinlogPos`]; multi-source or
+    /// position-free parsers use [`crate::NoCheckpoint`].
+    ///
+    /// Today most parsers in subql declare [`crate::NoCheckpoint`]; once
+    /// they read their source's position out of the wire format, they will
+    /// switch to the appropriate concrete type. Adding the associated type
+    /// up-front keeps that switch a single line per parser rather than a
+    /// trait-shape change later.
+    type Checkpoint: Checkpoint;
+
     /// Parse a raw WAL message into zero or more events.
     ///
     /// Batched formats (e.g. wal2json v1) may return multiple events per
@@ -70,8 +85,11 @@ pub trait WalParser<DB: DatabaseLike>: Send + Sync {
     /// );
     /// # Ok::<(), WalParseError>(())
     /// ```
-    fn parse_wal_message(&self, data: &[u8], database: &DB)
-        -> Result<Vec<WalEvent>, WalParseError>;
+    fn parse_wal_message(
+        &self,
+        data: &[u8],
+        database: &DB,
+    ) -> Result<Vec<WalEvent<Self::Checkpoint>>, WalParseError>;
 }
 
 /// Parse a UTF-8 JSON message into a typed payload.

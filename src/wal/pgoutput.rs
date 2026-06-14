@@ -117,6 +117,8 @@ impl PgOutputParser {
 const SKIP_TAGS: &[u8] = b"BCOYMSEcAPKrbp";
 
 impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
+    type Checkpoint = crate::NoCheckpoint;
+
     fn parse_wal_message(
         &self,
         data: &[u8],
@@ -1409,7 +1411,10 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let catalog = orders_catalog();
-        let parser: &dyn WalParser<sql_traits::structs::ParserDB> = &PgOutputParser::new();
+        let parser: &dyn WalParser<
+            sql_traits::structs::ParserDB,
+            Checkpoint = crate::NoCheckpoint,
+        > = &PgOutputParser::new();
 
         // Should compile and work as a trait object
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());

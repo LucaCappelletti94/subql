@@ -53,6 +53,8 @@ struct DebeziumSource {
 pub struct DebeziumParser;
 
 impl<DB: DatabaseLike> WalParser<DB> for DebeziumParser {
+    type Checkpoint = crate::NoCheckpoint;
+
     fn parse_wal_message(
         &self,
         data: &[u8],
@@ -530,7 +532,10 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let catalog = orders_catalog();
-        let parser: &dyn WalParser<sql_traits::structs::ParserDB> = &DebeziumParser;
+        let parser: &dyn WalParser<
+            sql_traits::structs::ParserDB,
+            Checkpoint = crate::NoCheckpoint,
+        > = &DebeziumParser;
 
         let json = r#"{
             "before": null,

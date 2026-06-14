@@ -105,6 +105,8 @@ pub struct Wal2JsonV1Parser;
 pub struct Wal2JsonV2Parser;
 
 impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV1Parser {
+    type Checkpoint = crate::NoCheckpoint;
+
     fn parse_wal_message(
         &self,
         data: &[u8],
@@ -131,6 +133,8 @@ impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV1Parser {
 }
 
 impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV2Parser {
+    type Checkpoint = crate::NoCheckpoint;
+
     fn parse_wal_message(
         &self,
         data: &[u8],
@@ -976,7 +980,10 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let catalog = orders_catalog();
-        let parser: &dyn WalParser<sql_traits::structs::ParserDB> = &Wal2JsonV1Parser;
+        let parser: &dyn WalParser<
+            sql_traits::structs::ParserDB,
+            Checkpoint = crate::NoCheckpoint,
+        > = &Wal2JsonV1Parser;
 
         let json = r#"{
             "change": [{

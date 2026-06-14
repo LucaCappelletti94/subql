@@ -410,7 +410,7 @@ fn setup_engine(
 
 fn dispatch_events(
     engine: &mut SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
-    parser: &dyn WalParser<ParserDB>,
+    parser: &dyn WalParser<ParserDB, Checkpoint = subql::NoCheckpoint>,
     messages: &[String],
     catalog: &ParserDB,
 ) -> Vec<BTreeSet<u64>> {
