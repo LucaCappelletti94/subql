@@ -72,10 +72,10 @@ mod engine;
 mod maintain;
 mod plan;
 
-pub use auto::AutoResolvingEngine;
+pub use auto::{AutoResolvingEngine, SnapshotResult};
 #[cfg(feature = "executor-diesel")]
 pub use connector::DieselConnector;
-pub use connector::{Connector, ReExecError};
+pub use connector::{Connector, ReExecError, Snapshot};
 pub use engine::{
     ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport, ReExecutionTrigger,
     Registered, ScalarUpdate,

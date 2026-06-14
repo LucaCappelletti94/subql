@@ -18,6 +18,7 @@ use super::engine::{
     ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport, Registered,
     ScalarUpdate,
 };
+use crate::RowImage;
 use crate::{
     Cell, ColumnType, IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope,
     UnregisterReport, WalEvent,
@@ -27,6 +28,22 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::dialect::Dialect;
+
+/// Result of [`AutoResolvingEngine::snapshot`]: the captured query's
+/// current value at a known position in the source stream.
+///
+/// Tagged so future captured-query flavors (single-table row re-execution,
+/// multi-table aggregate re-execution) can be added without changing the
+/// engine method's signature.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SnapshotResult<C: crate::Checkpoint> {
+    /// Single-table scalar (today's only flavor): a `MIN`/`MAX` value.
+    Scalar(Cell, Option<C>),
+    /// Reserved: a single-table row set. Will surface when total row
+    /// re-execution lands.
+    Rows(Vec<RowImage>, Option<C>),
+}
 
 /// Per-query state needed to drive an automatic re-execution.
 struct ResolveContext<I: IdTypes, A> {
@@ -137,6 +154,41 @@ where
         self.inner.install(query_id, value)
     }
 
+    /// Bootstrap a captured query by reading its current value through the
+    /// connector and installing the result.
+    ///
+    /// Returns a [`SnapshotResult`] tagged with the connector's
+    /// [`Checkpoint`](Connector::Checkpoint). Today every captured query
+    /// is a scalar (single-table `MIN`/`MAX`), so the variant is always
+    /// `Scalar`; the enum leaves room for the future single-table row
+    /// re-execution flavor without a breaking-bump.
+    ///
+    /// The value is also installed via [`ReExecEngine::install`], so the
+    /// engine is fully primed once this returns. Subsequent
+    /// [`consumers`](Self::consumers) calls see the snapshot as the
+    /// starting state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReExecError::Connector`] if the connector fails. Returns
+    /// `Ok(None)` if `query_id` does not exist; the absence is signaled
+    /// (rather than panicking) so callers can race a snapshot against an
+    /// `unregister_*` without crashing.
+    pub fn snapshot(
+        &mut self,
+        query_id: ReExecQueryId,
+    ) -> Result<Option<SnapshotResult<X::Checkpoint>>, ReExecError<X::Error>> {
+        let Some(ctx) = self.contexts.get(&query_id) else {
+            return Ok(None);
+        };
+        let (value, checkpoint) = self
+            .connector
+            .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
+            .map_err(ReExecError::Connector)?;
+        self.inner.install(query_id, value.clone());
+        Ok(Some(SnapshotResult::Scalar(value, checkpoint)))
+    }
+
     /// Dispatch a CDC event.
     ///
     /// For every [`ReExecutionTrigger`] the inner engine emits, this method
@@ -165,7 +217,12 @@ where
                 "every captured query stores its resolve context at register time; \
                  trigger.query_id must exist in `contexts`",
             );
-            let value = self
+            // The connector also reports the position at which it took
+            // the read (in `_db_checkpoint`); we ignore it here because
+            // the ScalarUpdate is correlated with the *event* that
+            // triggered the re-execution, not the DB-side read position.
+            // Snapshots use the DB-side checkpoint instead (see `snapshot`).
+            let (value, _db_checkpoint) = self
                 .connector
                 .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
                 .map_err(ReExecError::Connector)?;
@@ -263,19 +320,35 @@ mod tests {
     impl Connector for MockConnector {
         type AuthContext = ();
         type Error = MockError;
+        type Checkpoint = crate::NoCheckpoint;
+
         fn execute_scalar(
             &self,
             sql: &str,
             column_type: ColumnType,
             _auth: &(),
-        ) -> Result<Cell, Self::Error> {
+        ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
             self.calls
                 .borrow_mut()
                 .push((String::from(sql), column_type));
-            self.values
+            let cell = self
+                .values
                 .borrow_mut()
                 .pop()
-                .ok_or(MockError("queue empty"))
+                .ok_or(MockError("queue empty"))?;
+            Ok((cell, None))
+        }
+
+        fn execute_rows(
+            &self,
+            _sql: &str,
+            _auth: &(),
+        ) -> Result<super::super::connector::Snapshot<Vec<RowImage>, Self::Checkpoint>, Self::Error>
+        {
+            #[allow(clippy::unimplemented)]
+            {
+                unimplemented!("MockConnector::execute_rows is not exercised in v1 tests")
+            }
         }
     }
 
@@ -415,6 +488,53 @@ mod tests {
             Err(ReExecError::Connector(MockError(msg))) => assert_eq!(msg, "queue empty"),
             Err(other) => panic!("expected Connector error, got {other:?}"),
         }
+    }
+
+    /// `snapshot(query_id)` reads through the connector and installs the
+    /// value so subsequent dispatches see it as the current state.
+    #[test]
+    fn snapshot_installs_via_connector() {
+        let mut e = engine_with_values(alloc::vec![Cell::Float(12.5)]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+        };
+
+        // No bootstrap install: snapshot does it.
+        let snap = e.snapshot(qid).unwrap().expect("query_id exists");
+        match snap {
+            SnapshotResult::Scalar(value, checkpoint) => {
+                assert_eq!(value, Cell::Float(12.5));
+                // MockConnector returns checkpoint = None.
+                assert!(checkpoint.is_none());
+            }
+            SnapshotResult::Rows(_, _) => panic!("expected Scalar"),
+        }
+        assert_eq!(e.connector().call_count(), 1);
+
+        // After snapshot, the engine treats 12.5 as the current MIN.
+        // An insert below it (e.g. 9.0) becomes the new in-process MIN.
+        let n = e.consumers(&insert_event(2, 9.0)).unwrap();
+        assert_eq!(n.scalar_updates.len(), 1);
+        assert_eq!(n.scalar_updates[0].value, Cell::Float(9.0));
+        // No additional connector call: the insert was resolved in-process.
+        assert_eq!(e.connector().call_count(), 1);
+    }
+
+    /// `snapshot(query_id)` on an unknown id returns `Ok(None)` rather
+    /// than panicking so callers can race snapshot against unregister.
+    #[test]
+    fn snapshot_unknown_query_returns_none() {
+        let mut e = engine_with_values(alloc::vec![]);
+        assert!(e.snapshot(99999).unwrap().is_none());
+        // Connector was never called.
+        assert_eq!(e.connector().call_count(), 0);
     }
 
     #[test]

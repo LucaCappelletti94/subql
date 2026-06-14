@@ -32,8 +32,29 @@
 //! expected to retry the batch. Retry policy lives in the Connector impl
 //! (or above the engine), never inside subql.
 
-use crate::{Cell, ColumnType, DispatchError};
+use crate::{Cell, Checkpoint, ColumnType, DispatchError, RowImage};
 use thiserror::Error;
+
+/// A captured-state snapshot of a query's value, together with the
+/// [`Checkpoint`] at which it was read.
+///
+/// Returned by [`Connector::execute_rows`] (and the future
+/// [`AutoResolvingEngine::snapshot`](super::AutoResolvingEngine::snapshot))
+/// so downstream replay layers (oplogs, client cursors) can anchor a
+/// snapshot to a position in the source stream. The `checkpoint` is
+/// `None` when the backend has no native notion of position (e.g.
+/// in-memory SQLite).
+// PartialEq only: callers that need to compare Snapshots get it for Cell
+// scalars (Cell is not Eq because of f64). Deriving Eq would forbid the
+// Cell parameterization.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct Snapshot<T, C: Checkpoint> {
+    /// The snapshot value (a scalar `Cell` or a `Vec<RowImage>`).
+    pub value: T,
+    /// The position at which the snapshot was read, when known.
+    pub checkpoint: Option<C>,
+}
 
 #[cfg(feature = "executor-diesel")]
 use alloc::string::String;
@@ -78,9 +99,17 @@ pub trait Connector {
     ///
     /// [`execute_scalar`]: Self::execute_scalar
     type Error;
+    /// Position token the connector tags reads with.
+    ///
+    /// PG-aware connectors choose [`crate::PgLsn`] and call
+    /// `pg_current_wal_lsn()` inside the same transaction as the read.
+    /// Backends with no native position (in-memory SQLite, MySQL absent of
+    /// binlog tracking) choose [`crate::NoCheckpoint`] and return `None`.
+    type Checkpoint: Checkpoint;
 
     /// Run the re-execution SQL and decode a single scalar value with the
-    /// expected [`ColumnType`].
+    /// expected [`ColumnType`], optionally reporting the position at which
+    /// the read was taken.
     ///
     /// `sql` is exactly the string the plan rendered for re-execution and
     /// returned via [`Registered::ReExec`](super::Registered::ReExec) at
@@ -89,14 +118,29 @@ pub trait Connector {
     /// `QueryableByName` row, sqlx `Row::try_get` slot, etc., or ignore it
     /// and inspect the runtime row shape.
     ///
-    /// An empty result set must return [`Cell::Null`] (matches the
-    /// "set went empty" semantics of MIN/MAX).
+    /// The returned tuple is `(value, Option<checkpoint>)`. The checkpoint
+    /// is informational for downstream replay layers; subql does not gate
+    /// on it. An empty result set must return [`Cell::Null`] as the value
+    /// (matches the "set went empty" semantics of MIN/MAX).
     fn execute_scalar(
         &self,
         sql: &str,
         column_type: ColumnType,
         auth: &Self::AuthContext,
-    ) -> Result<Cell, Self::Error>;
+    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error>;
+
+    /// Run `sql` as a row-returning query and decode every row.
+    ///
+    /// Used by the auto-resolving engine's `snapshot` method to bootstrap
+    /// a subscription, and (in a future phase) by total single-table row
+    /// re-execution. Impls should open a read-only repeatable-read
+    /// transaction so the rows and the returned [`Snapshot::checkpoint`]
+    /// agree on a single point in the source stream.
+    fn execute_rows(
+        &self,
+        sql: &str,
+        auth: &Self::AuthContext,
+    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error>;
 }
 
 /// Error returned by [`AutoResolvingEngine::consumers`].
@@ -207,13 +251,41 @@ where
 {
     type AuthContext = ();
     type Error = diesel::result::Error;
+    /// Backend-agnostic v1 default: this connector does not read the
+    /// underlying source's position. PG-aware variants
+    /// (`PgDieselConnector`, planned) override this to `PgLsn` and read
+    /// `pg_current_wal_lsn()` inside the snapshot transaction.
+    type Checkpoint = crate::NoCheckpoint;
 
     fn execute_scalar(
         &self,
         sql: &str,
         column_type: ColumnType,
         _auth: &(),
-    ) -> Result<Cell, Self::Error> {
-        load_cell(&mut self.conn.borrow_mut(), sql, column_type)
+    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
+        let cell = load_cell(&mut self.conn.borrow_mut(), sql, column_type)?;
+        Ok((cell, None))
+    }
+
+    fn execute_rows(
+        &self,
+        _sql: &str,
+        _auth: &(),
+    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
+        // Row-set decoding through diesel's `sql_query` requires the
+        // caller to know the schema at compile time (each column wants
+        // its own typed accessor). Phase 2 ships the trait shape; the
+        // generic row-decoding path lands with the total reexec feature
+        // (see docs/connetto-alignment-plan.md). For now this method is
+        // wired up as a panic so any caller that opts into it gets a
+        // clear signal that it is not yet implemented for the generic
+        // DieselConnector.
+        #[allow(clippy::unimplemented)]
+        {
+            unimplemented!(
+                "DieselConnector::execute_rows is reserved for total row reexec; \
+                 use the scalar path or supply a custom Connector impl"
+            )
+        }
     }
 }
