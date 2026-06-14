@@ -46,16 +46,19 @@ pub enum SnapshotResult<C: crate::Checkpoint> {
 }
 
 /// Per-query state needed to drive an automatic re-execution.
-struct ResolveContext<I: IdTypes, A> {
+///
+/// Shared by both the sync and async engines; private to the `reexec`
+/// module so the engine internals can read its fields directly.
+pub(super) struct ResolveContext<I: IdTypes, A> {
     /// Re-execution SQL produced by the plan.
-    sql: String,
+    pub(super) sql: String,
     /// Decode type for the scalar result.
-    column_type: ColumnType,
+    pub(super) column_type: ColumnType,
     /// Session owning the query, used to drop contexts on
     /// [`unregister_session`](AutoResolvingEngine::unregister_session).
-    session: Option<I::SessionId>,
+    pub(super) session: Option<I::SessionId>,
     /// Per-subscription auth state, passed verbatim to the connector.
-    auth: A,
+    pub(super) auth: A,
 }
 
 /// Opt-in wrapper that auto-resolves [`ReExecutionTrigger`](super::ReExecutionTrigger)s

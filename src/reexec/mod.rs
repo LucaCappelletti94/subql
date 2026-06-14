@@ -66,12 +66,16 @@
 //!   `AsyncConnector` and `AsyncAutoResolvingEngine` for sqlx/diesel-async
 //!   are planned but not implemented.
 
+mod async_auto;
+mod async_connector;
 mod auto;
 mod connector;
 mod engine;
 mod maintain;
 mod plan;
 
+pub use async_auto::AsyncAutoResolvingEngine;
+pub use async_connector::AsyncConnector;
 pub use auto::{AutoResolvingEngine, SnapshotResult};
 #[cfg(feature = "executor-diesel")]
 pub use connector::DieselConnector;
