@@ -26,6 +26,7 @@ pub use checkpoint::{Checkpoint, MysqlBinlogPos, NoCheckpoint, OpaqueCheckpoint,
 #[cfg(feature = "std")]
 pub use clock::StdClock;
 pub use clock::{Clock, ClockHandle, ManualClock};
+pub use row_set::{row_set_delta, RowSetDelta};
 pub use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{AlgorithmId, FingerprintError, ParserDB, SchemaFingerprint},
@@ -47,6 +48,7 @@ pub mod memory_profile_workload;
 #[cfg(feature = "std")]
 pub mod persistence;
 pub mod reexec;
+pub mod row_set;
 pub mod runtime;
 pub mod wal;
 
