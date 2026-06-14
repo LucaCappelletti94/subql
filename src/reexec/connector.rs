@@ -384,3 +384,112 @@ impl Connector for PgDieselConnector {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// PgR2D2DieselConnector: pool-backed PG impl behind `executor-diesel-postgres-r2d2`.
+// ---------------------------------------------------------------------------
+
+/// Pool-backed [`Connector`] for PostgreSQL.
+///
+/// Wraps an `r2d2::Pool` over `ConnectionManager<PgConnection>`, is
+/// `Send + Sync`, and reads `pg_current_wal_lsn()` inside the same
+/// transaction as the user query for LSN-anchored snapshots.
+///
+/// Use this connector when the engine dispatches re-executions
+/// concurrently (the async engine with `consumers_batch`) or when
+/// snapshots may interleave with CDC re-executions. Each call to
+/// [`execute_scalar`](Connector::execute_scalar) borrows a connection
+/// from the pool for the duration of the transaction and releases it on
+/// completion.
+///
+/// The pool's `get` failures (timeout, pool exhausted) surface as
+/// [`PgR2D2Error::Pool`]; the transaction's diesel errors surface as
+/// [`PgR2D2Error::Diesel`].
+///
+/// `Send + Sync` so it can be shared across async tasks running on a
+/// multi-threaded runtime.
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+pub struct PgR2D2DieselConnector {
+    pool: r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
+}
+
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+impl PgR2D2DieselConnector {
+    /// Wrap an `r2d2::Pool` already configured by the caller (max size,
+    /// connection timeout, etc.).
+    #[must_use]
+    pub const fn new(
+        pool: r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
+    ) -> Self {
+        Self { pool }
+    }
+}
+
+/// Errors returned by [`PgR2D2DieselConnector`]. Distinguishes "could not
+/// get a connection from the pool" from "the database rejected the query"
+/// so callers can decide whether to back off vs. propagate.
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PgR2D2Error {
+    /// The pool refused to hand out a connection (timeout, exhausted,
+    /// shutting down).
+    #[error("r2d2 pool error: {0}")]
+    Pool(r2d2::Error),
+    /// Diesel returned a database error while executing the query.
+    #[error("diesel error: {0}")]
+    Diesel(diesel::result::Error),
+}
+
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+impl From<r2d2::Error> for PgR2D2Error {
+    fn from(e: r2d2::Error) -> Self {
+        Self::Pool(e)
+    }
+}
+
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+impl From<diesel::result::Error> for PgR2D2Error {
+    fn from(e: diesel::result::Error) -> Self {
+        Self::Diesel(e)
+    }
+}
+
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+impl Connector for PgR2D2DieselConnector {
+    type AuthContext = ();
+    type Error = PgR2D2Error;
+    type Checkpoint = crate::PgLsn;
+
+    fn execute_scalar(
+        &self,
+        sql: &str,
+        column_type: ColumnType,
+        _auth: &(),
+    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
+        let mut conn = self.pool.get()?;
+        let result: Result<(Cell, Option<crate::PgLsn>), diesel::result::Error> =
+            diesel::connection::Connection::transaction(&mut *conn, |conn| {
+                sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
+                    .execute(conn)?;
+                let cell = load_cell(conn, sql, column_type)?;
+                let lsn = read_current_lsn(conn)?;
+                Ok((cell, lsn))
+            });
+        Ok(result?)
+    }
+
+    fn execute_rows(
+        &self,
+        _sql: &str,
+        _auth: &(),
+    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
+        #[allow(clippy::unimplemented)]
+        {
+            unimplemented!(
+                "PgR2D2DieselConnector::execute_rows is reserved for total row reexec; \
+                 use the scalar path or supply a custom Connector impl"
+            )
+        }
+    }
+}

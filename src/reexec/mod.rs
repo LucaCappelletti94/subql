@@ -82,6 +82,8 @@ pub use connector::DieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
 pub use connector::PgDieselConnector;
 pub use connector::{Connector, ReExecError, Snapshot};
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
 pub use engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     ReExecutionTrigger, Registered, ScalarUpdate,
