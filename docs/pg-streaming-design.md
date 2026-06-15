@@ -762,6 +762,34 @@ W1.1 → W1.2 → W1.3 sequentially with sources reconstructed per
 measurement) rather than properties of the transport. The
 wire-RTT-floor claim survives both regimes.
 
+### Aside: Phase 1 run-to-run variance
+
+Re-running `examples/phase1_baseline.rs` repeatedly on the same
+hardware (`docs/benchmarks/phase1-2026-06-15-rerun.md`) reveals
+substantial run-to-run variance. Each run sees ~3-5x inflation on at
+least one workload row, but the inflated row rotates: in different
+back-to-back runs we observed W1.1's push median at 4.8 ms, 18.1 ms,
+14.6 ms, and 33.6 ms with no code changes.
+
+Importantly, **the variance affects polling as well as push** at
+similar magnitudes within the same inflated row. That points the
+cause at host-wide noise (PG background work, Docker container
+scheduling, filesystem cache warmup, kernel scheduling jitter)
+rather than a transport-specific regression. The architectural-claim
+ranking (`push < poll@100ms < poll@1000ms`) survives every observed
+run regardless of the absolute number variance.
+
+Two harness adjustments accompany this observation: a short warmup
+pass before the first measured workload (un-measured INSERTs +
+500 ms settle time) and a relaxed assertion strategy that keeps the
+architectural-claim invariant as the load-bearing check while
+demoting per-cell-vs-prior numerical comparisons to printouts. The
+W1.2 and W1.3 investigations (`docs/benchmarks/w1-2-burst-rate-2026-06-15.md`,
+`docs/benchmarks/w1-3-idle-wakeup-2026-06-15.md`) used dedicated
+fresh-source-per-trial rigs that don't carry over the Phase 1
+sequential-source state and produced tight wire-RTT-floor numbers
+across every cell.
+
 ## References
 
 - PostgreSQL logical replication protocol:
