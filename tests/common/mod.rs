@@ -93,9 +93,48 @@ pub fn pg_with_wal2json() -> Container<GenericImage> {
         .expect("start postgres")
 }
 
+/// Same as [`pg_with_wal2json`] but with a short `wal_sender_timeout`
+/// so the server tears down the replication connection if the client
+/// doesn't send a `StandbyStatusUpdate` within the given window.
+/// Used to prove the periodic-pump path keeps the source alive across
+/// idle periods.
+pub fn pg_with_wal2json_impatient(wal_sender_timeout: Duration) -> Container<GenericImage> {
+    ensure_image();
+    let timeout_arg = format!("wal_sender_timeout={}ms", wal_sender_timeout.as_millis());
+    GenericImage::new(PG_IMAGE, PG_TAG)
+        .with_wait_for(WaitFor::message_on_stderr("ready to accept connections"))
+        .with_exposed_port(5432.tcp())
+        .with_env_var("POSTGRES_USER", "subql_test")
+        .with_env_var("POSTGRES_PASSWORD", "subql_test")
+        .with_env_var("POSTGRES_DB", "testdb")
+        .with_cmd([
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_wal_senders=4",
+            "-c",
+            "max_replication_slots=4",
+            "-c",
+            &timeout_arg,
+        ])
+        .with_startup_timeout(Duration::from_secs(60))
+        .start()
+        .expect("start postgres")
+}
+
 /// Build the libpq URL for a Postgres container at the given mapped port.
 pub fn pg_url(port: u16) -> String {
     format!("postgres://subql_test:subql_test@127.0.0.1:{port}/testdb")
+}
+
+/// Build the libpq URL for a Postgres container. Alias for
+/// [`pg_url`] kept around so the pg_streaming e2e is explicit about
+/// the connection being used for replication; `PgStreamingCdcSource`
+/// flips on logical-replication mode programmatically, so no extra
+/// query param is needed in the URL.
+pub fn pg_replication_url(port: u16) -> String {
+    pg_url(port)
 }
 
 /// Establish a diesel [`PgConnection`] against the container at `port`.
@@ -138,5 +177,47 @@ pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
     ))
     .load(conn)
     .expect("pg_logical_slot_get_changes");
+    rows.into_iter().map(|r| r.data).collect()
+}
+
+/// Create a Postgres `PUBLICATION` over a single table. Required before
+/// a pgoutput logical replication slot can stream from that table.
+pub fn create_publication(conn: &mut PgConnection, publication: &str, table: &str) {
+    diesel::sql_query(format!(
+        "CREATE PUBLICATION {publication} FOR TABLE {table}"
+    ))
+    .execute(conn)
+    .expect("create publication");
+}
+
+/// Create a logical replication slot driven by the built-in `pgoutput`
+/// plugin. Pair with [`create_publication`] before draining.
+pub fn create_pgoutput_slot(conn: &mut PgConnection, name: &str) {
+    diesel::sql_query(format!(
+        "SELECT pg_create_logical_replication_slot('{name}', 'pgoutput')"
+    ))
+    .execute(conn)
+    .expect("create pgoutput slot");
+}
+
+/// Drain every queued WAL change from a `pgoutput` slot as raw binary
+/// messages. Each `Vec<u8>` is a single pgoutput message body suitable
+/// for [`subql::PgOutputParser::parse_wal_message`](subql::PgOutputParser).
+/// Uses `proto_version=1`, which is the subset the parser understands.
+pub fn drain_pgoutput_slot(conn: &mut PgConnection, name: &str, publication: &str) -> Vec<Vec<u8>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bytea)]
+        data: Vec<u8>,
+    }
+    let rows: Vec<Row> = diesel::sql_query(format!(
+        "SELECT data FROM pg_logical_slot_get_binary_changes(\
+            '{name}', NULL, NULL, \
+            'proto_version', '1', \
+            'publication_names', '{publication}'\
+        )"
+    ))
+    .load(conn)
+    .expect("pg_logical_slot_get_binary_changes");
     rows.into_iter().map(|r| r.data).collect()
 }

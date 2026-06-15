@@ -24,6 +24,16 @@ diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "sqlite
 # ships.
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+# Materialize's rust-postgres fork: carries the long-stalled
+# upstream PR #778 (CopyBoth + replication mode in Config). Required
+# until rust-postgres/rust-postgres#778 lands. Pinned to a specific
+# commit so the API surface is frozen; bump deliberately. See
+# docs/rust-postgres-pr-778-split-strategy.md for the upstream
+# situation. Workspace siblings (postgres-protocol, postgres-types)
+# are patched together because the fork's versions are coupled.
+tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
+postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
+postgres-types = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
 
 [package]
 name = "subql"
@@ -89,12 +99,69 @@ required-features = ["executor-diesel-postgres"]
 name = "reexec_postgres_r2d2"
 required-features = ["executor-diesel-postgres-r2d2"]
 
-# Docker-backed integration test for PgCdcReader (polling reader against
-# real PG with a wal2json replication slot). Run with:
-#   cargo test --test pg_cdc --features pg-cdc -- --ignored --nocapture
+# Docker-backed integration test for PgStreamingCdcSource (push-based PG
+# CDC source using START_REPLICATION via tokio-postgres). Run with:
+#   cargo test --test pg_streaming_e2e \
+#       --features pg-streaming -- --ignored --nocapture
 [[test]]
-name = "pg_cdc"
-required-features = ["pg-cdc"]
+name = "pg_streaming_e2e"
+required-features = ["pg-streaming"]
+
+# Smoke test for the polling-based PG CDC source. Run with:
+#   cargo test --test polling_smoke --features pg-streaming -- --ignored --nocapture
+[[test]]
+name = "polling_smoke"
+required-features = ["pg-streaming"]
+
+# Differential equivalence test: drives a deterministic DML stream
+# against two slots concurrently, drains both push + poll, asserts
+# they observed identical events. Catches pgoutput parser bugs,
+# tokio-postgres CopyBothDuplex framing regressions, and Materialize-
+# fork drift. Run with:
+#   cargo test --test cdc_equivalence --features pg-streaming -- --ignored --nocapture
+[[test]]
+name = "cdc_equivalence"
+required-features = ["pg-streaming"]
+
+# One-shot empirical benchmark comparing the push-based source against a
+# minimal polling implementation. The polling implementation is
+# INTENTIONALLY NOT shipped in the library (see no-polling-cdc memory
+# rule); this benchmark exists solely to verify the architectural claim
+# that push delivers materially lower latency than polling. Run once,
+# paste numbers into docs/pg-streaming-design.md, do not deploy.
+[[test]]
+name = "polling_vs_push_benchmark"
+required-features = ["pg-streaming"]
+
+# CDC workload benchmarks. Each example reproduces or extends the
+# polling-vs-push comparison across a different workload regime; they
+# are runnable programs (not assertions) whose stdout is meant to be
+# captured into `docs/benchmarks/`. See
+# `docs/cdc-workload-benchmark-plan.md` for the multi-phase plan. All
+# share `examples/cdc_bench_common/mod.rs`; that file is included via
+# `#[path = "cdc_bench_common/mod.rs"] mod common;` in each example.
+# Phase 1 is fully implemented; phases 2-5 are scaffolds with `todo!()`
+# workload bodies, awaiting follow-up implementation.
+
+[[example]]
+name = "phase1_baseline"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "phase2_mixed_iud"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "phase3_bursty"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "phase4_adversarial"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "phase5_schema_sweep"
+required-features = ["pg-streaming"]
 
 [dependencies]
 # SQL parsing (supports multiple dialects).
@@ -174,6 +241,18 @@ r2d2 = { version = "0.8", optional = true }
 # combinators here.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
+# Push-based PG CDC source (`pg-streaming` feature). `tokio-postgres`
+# 0.7 exposes the replication protocol via `CopyBothDuplex` and
+# `simple_query("START_REPLICATION ...")`; there is no separate feature
+# flag for it. `tokio` is pulled with just the channels + runtime +
+# macros + time bits the streaming source needs (no `rt-multi-thread`;
+# the consumer chooses). `bytes` is the buffer type tokio-postgres'
+# `CopyBothDuplex<Bytes>` uses, also needed to hand-roll
+# `StandbyStatusUpdate` messages.
+tokio-postgres = { version = "0.7", optional = true }
+tokio = { version = "1", optional = true, features = ["sync", "rt", "macros", "time"] }
+bytes = { version = "1", optional = true }
+
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -234,12 +313,13 @@ executor-diesel-postgres-r2d2 = [
     "dep:r2d2",
     "diesel?/r2d2",
 ]
-# Opt-in: ship `PgCdcReader`, a polling-based PG CDC reader that drains a
-# wal2json replication slot via `pg_logical_slot_get_changes` and parses
-# the messages into `Vec<WalEvent<PgLsn>>`. Caller-driven (the API is
-# sync; consumers wrap in their own loop or async runtime). The native
-# streaming `START_REPLICATION` path is a planned follow-on.
-pg-cdc = ["executor-diesel-postgres"]
+# Opt-in: ship the push-based PG CDC source. Activates `tokio-postgres`
+# with its `replication` feature for native `START_REPLICATION` support
+# and a `tokio` runtime surface for channels + spawn + timers. Implies
+# `std` (tokio is decidedly not no_std). The trait `CdcSource` itself
+# lives in subql core gated on `std` and is runtime-agnostic; this
+# feature only adds the reference impl.
+pg-streaming = ["std", "dep:tokio-postgres", "dep:tokio", "dep:bytes"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]

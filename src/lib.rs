@@ -9,15 +9,21 @@ extern crate alloc;
 // Re-export public API
 pub use compiler::{AggSpec, QueryProjection};
 pub use errors::*;
+#[cfg(feature = "pg-streaming")]
+pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
 pub use runtime::{
     agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SubscriptionEngine,
     SumKernel,
 };
 pub use types::*;
+#[cfg(feature = "std")]
+pub use wal::CdcSource;
 pub use wal::{
     DebeziumParser, MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Parser,
     WalParseError, WalParser,
 };
+#[cfg(feature = "pg-streaming")]
+pub use wal::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
 
 // Re-export the sql-traits types subql consumers most often need to spell out
 // at call sites: trait bounds for generic code, the canonical schema
@@ -47,6 +53,8 @@ pub mod config;
 pub mod memory_profile_workload;
 #[cfg(feature = "std")]
 pub mod persistence;
+#[cfg(feature = "pg-streaming")]
+pub mod polling;
 pub mod reexec;
 pub mod row_set;
 pub mod runtime;

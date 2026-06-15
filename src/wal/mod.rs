@@ -7,20 +7,24 @@
 mod debezium;
 mod map_cdc;
 mod maxwell;
-#[cfg(feature = "pg-cdc")]
-mod pg_cdc;
+#[cfg(feature = "pg-streaming")]
+mod pg_streaming;
 mod pg_type;
 mod pgoutput;
 mod row_build;
+#[cfg(feature = "std")]
+mod streaming;
 #[cfg(test)]
 mod test_support;
 mod wal2json;
 
 pub use debezium::DebeziumParser;
 pub use maxwell::MaxwellParser;
-#[cfg(feature = "pg-cdc")]
-pub use pg_cdc::{PgCdcReader, ReaderError as PgCdcReaderError};
+#[cfg(feature = "pg-streaming")]
+pub use pg_streaming::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
 pub use pgoutput::PgOutputParser;
+#[cfg(feature = "std")]
+pub use streaming::CdcSource;
 pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Parser};
 
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
