@@ -657,22 +657,63 @@ choice for production data paths remains push (per the
 
 [`no-polling-cdc`]: ../subql/memory/no-polling-cdc.md
 
+### Finding 3: schema complexity scales parse cost equally on both transports
+
+Workload S5 sweeps three schemas: 50-column wide rows, real Pagila
+(15-table DVD-rental, applied verbatim from `pagila-schema.sql`), and
+an append-only audit log paired with an UPDATE-heavy lookup
+(`docs/benchmarks/phase5-2026-06-15.md`).
+
+| Workload | push median | poll @ 10 ms | poll @ 100 ms | poll @ 1000 ms |
+| --- | --- | --- | --- | --- |
+| S5.1 (50-col wide rows) | 32.2 ms | 33.8 ms | 74.9 ms | 522.4 ms |
+| S5.2 (Pagila, 14 base tables) | 3.5 ms | 5.5 ms | 51.0 ms | 491.9 ms |
+| S5.3 (audit + lookup, 4:1) | 3.2 ms | 5.3 ms | 50.7 ms | 461.8 ms |
+
+The 50-column wide-row schema is roughly an order of magnitude slower
+on both transports than the 5-column baseline; the absolute floor
+moves but the polling-vs-push verdict survives (poll @ 100 ms still
+loses to push by ~40 ms). Pagila's full DDL surface (DOMAINs, ENUMs,
+`tsvector`, `text[]`, triggers, schema-qualified ownership, table
+partitioning) is consumed end-to-end through both transports without
+parser drift.
+
+**Operational implication.** Per-event parse cost is dominated by row
+width, not by the number of distinct relations or by the presence of
+exotic types. Schema migrations that widen rows materially (adding
+many columns to a hot table) raise the CDC latency floor for both
+transports symmetrically. Schema migrations that add tables, foreign
+keys, triggers, or partitioning do not move the floor.
+
+**One scope cut**. The Phase 5 example skips Pagila's `payment`
+table, which is `PARTITION BY RANGE (payment_date)`. Under pgoutput
+`proto_version = 1` (what subql's parser currently handles),
+INSERTs into a partitioned parent are emitted with the partition
+CHILD's relation OID rather than the parent's. The
+`publish_via_partition_root` publication option that re-tags
+partition-child events to the parent's identity requires
+`proto_version >= 2`. Adding proto v2 support to `PgOutputParser`
+(streaming-in-progress transactions, two-phase commit, partition
+roots) is a real but bounded follow-up; the existing v1 parser is
+strictly correct for non-partitioned tables.
+
 ### What still holds, what does not
 
 The strict "push delivers at wire-RTT regardless of cadence" claim
-holds on all single-row-COMMIT regimes (Phase 1, W2.1, W2.3, W3.1,
-W3.3, W4.1). It is falsified on W3.2 (large COMMITs at sub-second
-polling cadence), where the per-event framing overhead in
-`CopyBothDuplex` exceeds the next-poll wait.
+holds on all single-row-COMMIT regimes across all five phases
+(Phase 1, W2.1, W2.3, W3.1, W3.3, W4.1, S5.1, S5.2, S5.3). It is
+falsified on W3.2 (large COMMITs at sub-second polling cadence),
+where the per-event framing overhead in `CopyBothDuplex` exceeds the
+next-poll wait.
 
 The weaker "push is the better default for most workloads" claim
 holds across all phases on either the latency or the operational
 axis. Polling has two niche regimes where it wins (large-COMMIT
 workloads, ack-undisciplined consumers); push wins everywhere else.
 
-A future revision of this section should consume the captured Phase 5
-output (schema sweep — wide rows, Pagila, audit log) when that
-example lands.
+Schema complexity (Phase 5) shifts the absolute latency floor for
+both transports symmetrically and does not change the ranking
+between them.
 
 ## References
 
