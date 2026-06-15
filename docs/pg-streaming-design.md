@@ -738,6 +738,30 @@ state, etc.). Not a fundamental wal-sender wake-up cost. The
 wire-RTT-floor claim survives. A re-run of Phase 1 W1.3 with more
 samples would confirm.
 
+### Aside: the W1.2 high-rate tail
+
+Phase 1 W1.2 (500 INSERTs at 2 ms gap, ~500/s) measured a push median
+of 13.9 ms — also ~3x the wire-RTT floor seen in Phase 3 W3.3
+(1000 INSERTs at 10 ms gap, ~100/s, push median 3.4 ms). The first
+natural hypothesis was bounded-channel backpressure on the source's
+internal `event_tx` mpsc, since the default `buffer_capacity = 1024`
+can fill if the receiver task is slower than the producer.
+
+`examples/w1_2_burst_rate.rs`
+(`docs/benchmarks/w1-2-burst-rate-2026-06-15.md`) sweeps event gap
+in `{1, 2, 5, 10, 50}` ms x `buffer_capacity` in `{256, 1024, 4096}`,
+200 isolated events per cell. Every cell's median is 3.1–5.4 ms,
+including at 1000/s (1 ms gap). Buffer size moves nothing at the
+median; only p99/max occasionally wobbles. The bounded-channel
+backpressure hypothesis is **refuted** under isolated conditions.
+
+The Phase 1 W1.2 13.9 ms number, like the W1.3 30 ms number, did not
+reproduce in this dedicated rig. Both anomalies look like artifacts
+of the Phase 1 example's structure (single Tokio runtime running
+W1.1 → W1.2 → W1.3 sequentially with sources reconstructed per
+measurement) rather than properties of the transport. The
+wire-RTT-floor claim survives both regimes.
+
 ## References
 
 - PostgreSQL logical replication protocol:

@@ -172,6 +172,14 @@ required-features = ["pg-streaming"]
 name = "w1_3_idle_wakeup"
 required-features = ["pg-streaming"]
 
+# Focused investigation example: the Phase 1 W1.2 push median (13.9 ms
+# at 500/s vs W3.3's 3.4 ms baseline at 100/s) suggests the source's
+# bounded inner channel backpressures under high event rate. Sweeps
+# event gap x `buffer_capacity` to confirm or refute.
+[[example]]
+name = "w1_2_burst_rate"
+required-features = ["pg-streaming"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }
