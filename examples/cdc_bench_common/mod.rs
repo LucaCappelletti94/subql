@@ -644,3 +644,60 @@ pub async fn collect_full_latencies(
     }
     samples
 }
+
+/// Slow-consumer receiver: like [`spawn_full_event_receiver`] but
+/// the spawned task sleeps `per_event_delay` for every received event
+/// before forwarding it. The sleep happens INSIDE the same task that
+/// owns `source.next_event()`, so `next_event` is not polled during
+/// the sleep — this is the load-bearing backpressure path. Push
+/// backpressures via TCP (the inner task stops reading from
+/// `CopyBothDuplex`); polling backpressures by skipping polls (the
+/// inner task stops issuing `pg_logical_slot_get_binary_changes`).
+///
+/// `observed_at` is recorded AFTER the per-event delay, so the
+/// per-event latency reported by [`collect_full_latencies`] is the
+/// END-TO-END consumer-side latency (transport delivery + the
+/// simulated processing time and any accumulated backlog wait).
+pub fn spawn_slow_event_receiver<S>(
+    mut source: S,
+    per_event_delay: Duration,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<EventObservation>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    S: CdcSource<Checkpoint = PgLsn> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<EventObservation>();
+    let task = tokio::spawn(async move {
+        loop {
+            let next = source.next_event().await;
+            let Ok(Some(ev)) = next else {
+                return;
+            };
+            tokio::time::sleep(per_event_delay).await;
+            let observed_at = Instant::now();
+            let kind = ev.kind();
+            if !matches!(
+                kind,
+                EventKind::Insert | EventKind::Update | EventKind::Delete
+            ) {
+                continue;
+            }
+            let pk_cells = ev.pk().values();
+            let Some(subql::Cell::Int(pk_int)) = pk_cells.first() else {
+                continue;
+            };
+            let observation = EventObservation {
+                table_id: ev.table_id(),
+                pk_int: *pk_int,
+                kind,
+                observed_at,
+            };
+            if tx.send(observation).is_err() {
+                return;
+            }
+        }
+    });
+    (rx, task)
+}
