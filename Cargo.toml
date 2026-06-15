@@ -163,6 +163,15 @@ required-features = ["pg-streaming"]
 name = "phase5_schema_sweep"
 required-features = ["pg-streaming"]
 
+# Focused investigation example: the Phase 1 W1.3 push median (~30 ms
+# after a 3 s idle vs ~5 ms wire RTT) does not match the wire-bound
+# floor the architectural claim predicts. Sweeps idle duration and
+# status-pump cadence to isolate the cause. Output goes to
+# `docs/benchmarks/`.
+[[example]]
+name = "w1_3_idle_wakeup"
+required-features = ["pg-streaming"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }

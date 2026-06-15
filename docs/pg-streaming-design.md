@@ -715,6 +715,29 @@ Schema complexity (Phase 5) shifts the absolute latency floor for
 both transports symmetrically and does not change the ranking
 between them.
 
+### Aside: the W1.3 post-idle "wake-up" tail
+
+Phase 1 W1.3 (3 s idle, then 1 INSERT, repeated 5 times) recorded a
+push median of 29.8 ms — roughly 6x the wire-RTT floor everywhere
+else. The first natural hypothesis was that PG's wal sender quiesces
+during idle and incurs a wake-up cost on the next event.
+
+A focused follow-up run (`examples/w1_3_idle_wakeup.rs`, captured at
+`docs/benchmarks/w1-3-idle-wakeup-2026-06-15.md`) sweeps idle
+durations (0 ms / 100 ms / 500 ms / 1 s / 3 s) x push
+`status_interval` (1 s / 10 s), 5 isolated trials per cell with a
+fresh slot per trial. Every push cell's median is 4.7–6.9 ms,
+regardless of idle duration or pump cadence. The polling control at
+100 ms cadence shows the expected next-poll wait at long idle
+(~51 ms median at 3 s idle).
+
+Provisional read: the Phase 1 number was either noise from 5 samples
+or an artifact of the long-running source observed across 5
+back-to-back bursts (Tokio runtime scheduling state, parser cache
+state, etc.). Not a fundamental wal-sender wake-up cost. The
+wire-RTT-floor claim survives. A re-run of Phase 1 W1.3 with more
+samples would confirm.
+
 ## References
 
 - PostgreSQL logical replication protocol:
