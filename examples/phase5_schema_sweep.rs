@@ -3,37 +3,40 @@
 //! Tests whether schema complexity changes the polling-vs-push verdict.
 //! pgoutput emits a `Relation` message on first contact with each
 //! table; wide rows pay a per-event parse cost proportional to column
-//! count; mixed access patterns (append-only audit + UPDATE-heavy
-//! lookup) exercise both edges at once.
+//! count; mixed access patterns exercise both edges at once.
 //!
 //! Three workloads, four transports:
 //!
 //! - S5.1 — Wide rows. A single 50-column table mixing INT / TEXT /
 //!   BIGINT / DOUBLE PRECISION / TIMESTAMPTZ / JSONB. 200 INSERTs at
-//!   10 ms gap. Per-event parse cost should be higher than the 5-col
-//!   `orders` baseline; transport choice should not change the
-//!   verdict.
-//! - S5.2 — Many tables. 15 narrow tables (`shop_t1..shop_t15`),
-//!   each 4 columns. INSERT rotates across the 15 tables; the first
-//!   15 events trigger pgoutput `Relation` messages, subsequent
-//!   events hit the warm cache. 200 events total at 10 ms gap.
+//!   10 ms gap.
+//! - S5.2 — Pagila (real DVD-rental schema, 15 base tables). The full
+//!   official Pagila schema is applied to PG via `batch_execute` from
+//!   `examples/fixtures/pagila-schema.sql`. The schema includes
+//!   custom DOMAINs, ENUMs, `tsvector` columns, `text[]` arrays, and
+//!   per-table triggers. Triggers are disabled session-wide via
+//!   `SET session_replication_role = 'replica'` so the workload's
+//!   events are the ONLY events the transports see. The subql
+//!   catalog uses a hand-rolled simplified DDL matching Pagila's
+//!   actual column counts / order / PK (sqlparser's PostgreSQL
+//!   dialect does not handle Pagila's full DDL surface). 200 INSERTs
+//!   rotating across the 14 non-partitioned base tables (`actor`,
+//!   `category`, `language`, `country`, `city`, `address`,
+//!   `customer`, `store`, `inventory`, `staff`, `film`, `film_actor`,
+//!   `film_category`, `rental`). Pagila's 15th base table `payment`
+//!   is `PARTITION BY RANGE (payment_date)`; under pgoutput
+//!   `proto_version = 1`, partition-child events are not re-tagged
+//!   to the parent's relation (that requires `proto_version >= 2`
+//!   plus `publish_via_partition_root = true`), so we skip it here.
 //! - S5.3 — Append-only audit + UPDATE-heavy lookup. Two tables:
-//!   `audit_log` (INSERT-only, append) and `lookup_state` (pre-seeded
-//!   with 50 rows, then UPDATEd). Workload rotates 4 inserts to
-//!   `audit_log` for every 1 update to `lookup_state`. 250 events
-//!   total at 10 ms gap.
-//!
-//! Phase 5 does NOT use the 3-table e-commerce schema from
-//! `cdc_bench_common`. It defines its own schemas inline since they
-//! are Phase-5-specific and would bloat the shared module.
+//!   `audit_log` (INSERT-only) and `lookup_state` (pre-seeded, then
+//!   UPDATEd). 4:1 INSERT:UPDATE mix, 250 events at 10 ms gap.
 //!
 //! Run with:
 //!
 //! ```sh
 //! cargo run --release --example phase5_schema_sweep --features pg-streaming
 //! ```
-//!
-//! Pipe to `docs/benchmarks/phase5-<date>.md` to capture the run.
 
 #![cfg(feature = "pg-streaming")]
 #![allow(
@@ -61,6 +64,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use diesel::connection::SimpleConnection;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -77,6 +81,11 @@ use common::{
 const DRAIN_GRACE: Duration = Duration::from_secs(15);
 const POLL_INTERVALS_MS: &[u64] = &[10, 100, 1_000];
 const BUFFER_CAPACITY: usize = 4_096;
+
+/// Real Pagila schema, vendored from
+/// <https://github.com/devrimgunduz/pagila/blob/master/pagila-schema.sql>.
+/// Applied to PG verbatim via `SimpleConnection::batch_execute`.
+const PAGILA_SCHEMA_SQL: &str = include_str!("./fixtures/pagila-schema.sql");
 
 fn current_thread_rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -111,14 +120,11 @@ impl Transport {
 // Schemas
 // ----------------------------------------------------------------------
 
-const NUM_SHOP_TABLES: usize = 15;
-
-fn build_pg_ddl() -> Vec<String> {
+/// S5.1 + S5.3 schema. Applied alongside Pagila so all three workloads
+/// share a single PG container.
+fn build_s5_1_and_s5_3_pg_ddl() -> Vec<String> {
     let mut stmts: Vec<String> = Vec::new();
 
-    // S5.1 — wide_rows: 50 columns of mixed types. The id BIGINT PK
-    // plus 10 INT, 10 TEXT, 10 BIGINT, 10 DOUBLE PRECISION, 5
-    // TIMESTAMPTZ, 5 JSONB = 51 columns total.
     let mut wide = String::from("CREATE TABLE wide_rows (id BIGINT PRIMARY KEY");
     for i in 1..=10 {
         wide.push_str(&format!(", i{i:02} INT"));
@@ -141,16 +147,6 @@ fn build_pg_ddl() -> Vec<String> {
     wide.push(')');
     stmts.push(wide);
 
-    // S5.2 — 15 narrow tables. Same shape across tables to keep the
-    // workload focused on relation-cache count, not per-event parse
-    // cost differences.
-    for k in 1..=NUM_SHOP_TABLES {
-        stmts.push(format!(
-            "CREATE TABLE shop_t{k} (id BIGINT PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL, c INT NOT NULL)"
-        ));
-    }
-
-    // S5.3 — audit log + lookup pair.
     stmts.push(
         "CREATE TABLE audit_log (\
             id BIGINT PRIMARY KEY,\
@@ -171,21 +167,285 @@ fn build_pg_ddl() -> Vec<String> {
         .into(),
     );
 
-    // REPLICA IDENTITY FULL on every table (required for our UPDATE
-    // observability semantics and matches the rest of the benchmarks).
     stmts.push("ALTER TABLE wide_rows REPLICA IDENTITY FULL".into());
-    for k in 1..=NUM_SHOP_TABLES {
-        stmts.push(format!("ALTER TABLE shop_t{k} REPLICA IDENTITY FULL"));
-    }
     stmts.push("ALTER TABLE audit_log REPLICA IDENTITY FULL".into());
     stmts.push("ALTER TABLE lookup_state REPLICA IDENTITY FULL".into());
 
     stmts
 }
 
-fn build_parser_ddl() -> String {
-    let mut ddl = String::new();
+/// The 14 Pagila base tables we publish and run the workload against.
+///
+/// Pagila has a 15th base table, `payment`, which is `PARTITION BY
+/// RANGE (payment_date)` with 7 monthly partitions for 2022. Under
+/// pgoutput `proto_version = 1` (what subql's parser handles),
+/// INSERTs into the partitioned parent are emitted with the
+/// partition CHILD's relation OID rather than the parent's. The
+/// `publish_via_partition_root` publication option that fixes this
+/// requires `proto_version >= 2`. Rather than churn the wire-protocol
+/// parser for this benchmark, we skip `payment` and run S5.2 against
+/// the 14 non-partitioned base tables — still a meaningful
+/// "many-tables" relation-cache stress.
+const PAGILA_BASE_TABLES: &[&str] = &[
+    "actor",
+    "category",
+    "language",
+    "country",
+    "city",
+    "address",
+    "customer",
+    "store",
+    "inventory",
+    "staff",
+    "film",
+    "film_actor",
+    "film_category",
+    "rental",
+];
 
+const NUM_PAGILA_TABLES: usize = 14;
+
+/// Hand-rolled simplified DDL for the 15 Pagila base tables. Column
+/// COUNT, ORDER, and PK must match PG's actual Pagila schema so the
+/// subql parser correctly resolves event rows. Column TYPES are
+/// simplified (custom DOMAINs / ENUMs / tsvector / arrays become
+/// plain INT / TEXT etc.) because sqlparser cannot handle Pagila's
+/// full type surface. subql doesn't need precise type info for pgoutput
+/// parsing; it needs column identity and PK position.
+const PAGILA_PARSER_DDL: &str = "\
+CREATE TABLE actor (\
+    actor_id INTEGER PRIMARY KEY,\
+    first_name TEXT NOT NULL,\
+    last_name TEXT NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+CREATE TABLE category (\
+    category_id INTEGER PRIMARY KEY,\
+    name TEXT NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+CREATE TABLE language (\
+    language_id INTEGER PRIMARY KEY,\
+    name TEXT NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+CREATE TABLE country (\
+    country_id INTEGER PRIMARY KEY,\
+    country TEXT NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+CREATE TABLE city (\
+    city_id INTEGER PRIMARY KEY,\
+    city TEXT NOT NULL,\
+    country_id INTEGER NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+CREATE TABLE address (\
+    address_id INTEGER PRIMARY KEY,\
+    address TEXT NOT NULL,\
+    address2 TEXT,\
+    district TEXT NOT NULL,\
+    city_id INTEGER NOT NULL,\
+    postal_code TEXT,\
+    phone TEXT NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+CREATE TABLE customer (\
+    customer_id INTEGER PRIMARY KEY,\
+    store_id INTEGER NOT NULL,\
+    first_name TEXT NOT NULL,\
+    last_name TEXT NOT NULL,\
+    email TEXT,\
+    address_id INTEGER NOT NULL,\
+    activebool BOOLEAN NOT NULL,\
+    create_date DATE NOT NULL,\
+    last_update TIMESTAMP,\
+    active INTEGER\
+);\
+CREATE TABLE store (\
+    store_id INTEGER PRIMARY KEY,\
+    manager_staff_id INTEGER NOT NULL,\
+    address_id INTEGER NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+CREATE TABLE inventory (\
+    inventory_id INTEGER PRIMARY KEY,\
+    film_id INTEGER NOT NULL,\
+    store_id INTEGER NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+CREATE TABLE staff (\
+    staff_id INTEGER PRIMARY KEY,\
+    first_name TEXT NOT NULL,\
+    last_name TEXT NOT NULL,\
+    address_id INTEGER NOT NULL,\
+    email TEXT,\
+    store_id INTEGER NOT NULL,\
+    active BOOLEAN NOT NULL,\
+    username TEXT NOT NULL,\
+    password TEXT,\
+    last_update TIMESTAMP NOT NULL,\
+    picture TEXT\
+);\
+CREATE TABLE film (\
+    film_id INTEGER PRIMARY KEY,\
+    title TEXT NOT NULL,\
+    description TEXT,\
+    release_year INTEGER,\
+    language_id INTEGER NOT NULL,\
+    original_language_id INTEGER,\
+    rental_duration INTEGER NOT NULL,\
+    rental_rate DECIMAL NOT NULL,\
+    length INTEGER,\
+    replacement_cost DECIMAL NOT NULL,\
+    rating TEXT,\
+    last_update TIMESTAMP NOT NULL,\
+    special_features TEXT,\
+    fulltext TEXT NOT NULL\
+);\
+CREATE TABLE film_actor (\
+    actor_id INTEGER NOT NULL,\
+    film_id INTEGER NOT NULL,\
+    last_update TIMESTAMP NOT NULL,\
+    PRIMARY KEY (actor_id, film_id)\
+);\
+CREATE TABLE film_category (\
+    film_id INTEGER NOT NULL,\
+    category_id INTEGER NOT NULL,\
+    last_update TIMESTAMP NOT NULL,\
+    PRIMARY KEY (film_id, category_id)\
+);\
+CREATE TABLE rental (\
+    rental_id INTEGER PRIMARY KEY,\
+    rental_date TIMESTAMP NOT NULL,\
+    inventory_id INTEGER NOT NULL,\
+    customer_id INTEGER NOT NULL,\
+    return_date TIMESTAMP,\
+    staff_id INTEGER NOT NULL,\
+    last_update TIMESTAMP NOT NULL\
+);\
+";
+
+fn apply_pagila_schema(conn: &mut PgConnection) {
+    // Pagila's dump has ~60 `ALTER ... OWNER TO postgres` statements.
+    // Our test container's superuser is `subql_test`, not `postgres`.
+    // Create a `postgres` role at the same level so those statements
+    // succeed; cheaper than rewriting the dump.
+    conn.batch_execute(
+        "DO $$ BEGIN \
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres') THEN \
+                CREATE ROLE postgres SUPERUSER; \
+            END IF; \
+         END $$",
+    )
+    .expect("create postgres role");
+    // PG handles all the complexity: DOMAINs, ENUMs, FUNCTIONs,
+    // TRIGGERs, ALTER TABLE constraints, partitioning. We just feed
+    // the entire dump in.
+    conn.batch_execute(PAGILA_SCHEMA_SQL)
+        .expect("apply Pagila schema");
+    // Pagila's dump resets `search_path` to empty so it can use
+    // schema-qualified names throughout. Restore it before any of
+    // OUR queries try to use unqualified table names.
+    conn.batch_execute("SET search_path TO public")
+        .expect("restore search_path");
+    // REPLICA IDENTITY FULL on each base table so UPDATE events
+    // carry the full old-row image (matching the rest of the
+    // benchmarks).
+    for table in PAGILA_BASE_TABLES {
+        sql_query(format!("ALTER TABLE public.{table} REPLICA IDENTITY FULL"))
+            .execute(conn)
+            .unwrap_or_else(|e| panic!("REPLICA IDENTITY FULL {table}: {e}"));
+    }
+}
+
+fn apply_phase5_extra_ddl(conn: &mut PgConnection) {
+    for stmt in build_s5_1_and_s5_3_pg_ddl() {
+        sql_query(stmt.as_str())
+            .execute(conn)
+            .unwrap_or_else(|e| panic!("apply DDL `{stmt}`: {e}"));
+    }
+}
+
+fn create_publication(conn: &mut PgConnection, publication: &str) {
+    let mut tables: Vec<String> = vec![
+        "wide_rows".to_string(),
+        "audit_log".to_string(),
+        "lookup_state".to_string(),
+    ];
+    for t in PAGILA_BASE_TABLES {
+        tables.push((*t).to_string());
+    }
+    // `publish_via_partition_root = true` is the load-bearing option:
+    // Pagila's `payment` table is range-partitioned across
+    // `payment_p2022_01..07`. Without this flag, pgoutput tags each
+    // INSERT with the partition CHILD's relation OID (e.g.
+    // `payment_p2022_03`), which our parser DB does not know about.
+    // The source would then return `UnknownTable` and die mid-workload.
+    // With the flag, every event for any partition child is re-tagged
+    // to the parent's relation, which the parser DB does know.
+    sql_query(format!(
+        "CREATE PUBLICATION {publication} FOR TABLE {} WITH (publish_via_partition_root = true)",
+        tables.join(", ")
+    ))
+    .execute(conn)
+    .expect("create publication");
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Phase5TableIds {
+    wide_rows: u32,
+    audit_log: u32,
+    lookup_state: u32,
+    // Pagila base tables, in `PAGILA_BASE_TABLES` order.
+    pagila: [u32; NUM_PAGILA_TABLES],
+}
+
+fn resolve_phase5_table_ids(catalog: &CombinedCatalog) -> Phase5TableIds {
+    let pagila_db: &ParserDB = &catalog.pagila;
+    let extras_db: &ParserDB = &catalog.extras;
+    let mut pagila = [0u32; NUM_PAGILA_TABLES];
+    for (i, name) in PAGILA_BASE_TABLES.iter().enumerate() {
+        pagila[i] = subql::catalog_helpers::table_id(pagila_db, name)
+            .unwrap_or_else(|| panic!("pagila table id for `{name}`"));
+    }
+    Phase5TableIds {
+        wide_rows: subql::catalog_helpers::table_id(extras_db, "wide_rows")
+            .expect("wide_rows table id"),
+        audit_log: subql::catalog_helpers::table_id(extras_db, "audit_log")
+            .expect("audit_log table id"),
+        lookup_state: subql::catalog_helpers::table_id(extras_db, "lookup_state")
+            .expect("lookup_state table id"),
+        pagila,
+    }
+}
+
+/// We need TWO catalogs: one for S5.1+S5.3 (`wide_rows`, `audit_log`,
+/// `lookup_state`) and one for S5.2 (Pagila). Each workload picks the
+/// right one when constructing its CDC source. They cannot be merged
+/// because a single `ParserDB::parse` call assigns table_ids in DDL
+/// order, and the COMBINED order would shift the Pagila ids; keeping
+/// them separate lets each catalog match the publication-time order
+/// PG assigns to its relations.
+struct CombinedCatalog {
+    extras: Arc<ParserDB>,
+    pagila: Arc<ParserDB>,
+}
+
+fn build_catalogs() -> CombinedCatalog {
+    let extras_ddl = build_s5_1_and_s5_3_parser_ddl();
+    CombinedCatalog {
+        extras: Arc::new(
+            ParserDB::parse::<PostgreSqlDialect>(&extras_ddl).expect("extras ParserDB"),
+        ),
+        pagila: Arc::new(
+            ParserDB::parse::<PostgreSqlDialect>(PAGILA_PARSER_DDL).expect("pagila ParserDB"),
+        ),
+    }
+}
+
+fn build_s5_1_and_s5_3_parser_ddl() -> String {
+    let mut ddl = String::new();
     ddl.push_str("CREATE TABLE wide_rows (id BIGINT PRIMARY KEY");
     for i in 1..=10 {
         ddl.push_str(&format!(", i{i:02} INT"));
@@ -202,93 +462,23 @@ fn build_parser_ddl() -> String {
     for i in 1..=5 {
         ddl.push_str(&format!(", ts{i} TIMESTAMP"));
     }
-    // JSONB → sqlparser's PostgreSQL dialect accepts it; subql maps
-    // to ColumnType::Unknown. Phase 5 does not depend on per-cell
-    // typed access for JSONB.
     for i in 1..=5 {
         ddl.push_str(&format!(", j{i} JSONB"));
     }
     ddl.push_str(");");
-
-    for k in 1..=NUM_SHOP_TABLES {
-        ddl.push_str(&format!(
-            "CREATE TABLE shop_t{k} (id BIGINT PRIMARY KEY, a TEXT, b TEXT, c INT);"
-        ));
-    }
     ddl.push_str(
-        "CREATE TABLE audit_log (\
-            id BIGINT PRIMARY KEY,\
-            event_type TEXT,\
-            actor_id BIGINT,\
-            payload TEXT,\
-            ts TIMESTAMP\
-         );",
+        "CREATE TABLE audit_log (id BIGINT PRIMARY KEY, event_type TEXT, actor_id BIGINT, payload TEXT, ts TIMESTAMP);",
     );
     ddl.push_str(
-        "CREATE TABLE lookup_state (\
-            id BIGINT PRIMARY KEY,\
-            name TEXT,\
-            value TEXT,\
-            last_updated_at TIMESTAMP\
-         );",
+        "CREATE TABLE lookup_state (id BIGINT PRIMARY KEY, name TEXT, value TEXT, last_updated_at TIMESTAMP);",
     );
-
     ddl
 }
 
-fn apply_pg_ddl(conn: &mut PgConnection) {
-    for stmt in build_pg_ddl() {
-        sql_query(stmt.as_str())
-            .execute(conn)
-            .unwrap_or_else(|e| panic!("apply DDL `{stmt}`: {e}"));
-    }
-}
-
-fn create_publication(conn: &mut PgConnection, publication: &str) {
-    let mut tables = vec![
-        "wide_rows".to_string(),
-        "audit_log".to_string(),
-        "lookup_state".to_string(),
-    ];
-    for k in 1..=NUM_SHOP_TABLES {
-        tables.push(format!("shop_t{k}"));
-    }
-    sql_query(format!(
-        "CREATE PUBLICATION {publication} FOR TABLE {}",
-        tables.join(", ")
-    ))
-    .execute(conn)
-    .expect("create publication");
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Phase5TableIds {
-    wide_rows: u32,
-    shop: [u32; NUM_SHOP_TABLES],
-    audit_log: u32,
-    lookup_state: u32,
-}
-
-fn resolve_phase5_table_ids(db: &ParserDB) -> Phase5TableIds {
-    let mut shop = [0u32; NUM_SHOP_TABLES];
-    for (k, slot) in shop.iter_mut().enumerate() {
-        *slot = subql::catalog_helpers::table_id(db, &format!("shop_t{}", k + 1))
-            .unwrap_or_else(|| panic!("shop_t{} table id", k + 1));
-    }
-    Phase5TableIds {
-        wide_rows: subql::catalog_helpers::table_id(db, "wide_rows").expect("wide_rows table id"),
-        shop,
-        audit_log: subql::catalog_helpers::table_id(db, "audit_log").expect("audit_log table id"),
-        lookup_state: subql::catalog_helpers::table_id(db, "lookup_state")
-            .expect("lookup_state table id"),
-    }
-}
-
 // ----------------------------------------------------------------------
-// Workload drivers
+// S5.1 — Wide rows
 // ----------------------------------------------------------------------
 
-/// S5.1: 200 INSERTs into the 50-column wide_rows table at 10 ms gap.
 async fn drive_s5_1(
     conn: &mut PgConnection,
     id_base: i64,
@@ -296,8 +486,6 @@ async fn drive_s5_1(
 ) -> HashMap<EventKey, Instant> {
     const COUNT: i64 = 200;
     const GAP: Duration = Duration::from_millis(10);
-    // Build the column-name list once; for VALUES we will splat
-    // deterministic content per row.
     let mut commits: HashMap<EventKey, Instant> = HashMap::with_capacity(COUNT as usize);
     for c in 0..COUNT {
         if c > 0 {
@@ -354,9 +542,20 @@ async fn drive_s5_1(
     commits
 }
 
-/// S5.2: 200 INSERTs rotating across `shop_t1..shop_t15` at 10 ms
-/// gap. The first 15 events trigger pgoutput Relation messages
-/// (cold cache); subsequent events use the warm cache.
+// ----------------------------------------------------------------------
+// S5.2 — Pagila
+// ----------------------------------------------------------------------
+
+/// S5.2: 200 INSERTs rotating across the 15 Pagila base tables at 10
+/// ms gap. Each table receives ~13 events. The FIRST event per table
+/// triggers a pgoutput `Relation` message (cold cache). Triggers are
+/// disabled session-wide so workload events are the only events the
+/// transports see.
+///
+/// FK columns are filled with synthetic values that do NOT need to
+/// satisfy any real Pagila row — `SET session_replication_role =
+/// 'replica'` disables FK enforcement alongside triggers. The
+/// workload's purpose is CDC stress, not data realism.
 async fn drive_s5_2(
     conn: &mut PgConnection,
     id_base: i64,
@@ -364,29 +563,118 @@ async fn drive_s5_2(
 ) -> HashMap<EventKey, Instant> {
     const COUNT: i64 = 200;
     const GAP: Duration = Duration::from_millis(10);
+    conn.batch_execute("SET session_replication_role = 'replica'")
+        .expect("disable triggers and FK enforcement");
     let mut commits: HashMap<EventKey, Instant> = HashMap::with_capacity(COUNT as usize);
     for c in 0..COUNT {
         if c > 0 {
             tokio::time::sleep(GAP).await;
         }
-        let table_index = (c as usize) % NUM_SHOP_TABLES;
-        let table_id = ids.shop[table_index];
-        let table_name = format!("shop_t{}", table_index + 1);
-        let id = id_base + c;
+        let table_index = (c as usize) % NUM_PAGILA_TABLES;
+        let id = (id_base + c) as i32; // Pagila uses integer PKs
         let commit_at = Instant::now();
-        sql_query(format!(
-            "INSERT INTO {table_name} (id, a, b, c) VALUES ({id}, 'a_{id}', 'b_{id}', {c})"
-        ))
-        .execute(conn)
-        .unwrap_or_else(|e| panic!("{table_name} insert id={id}: {e}"));
-        commits.insert((table_id, id, EventKind::Insert), commit_at);
+        let sql = pagila_insert_sql(table_index, id);
+        sql_query(sql.as_str())
+            .execute(conn)
+            .unwrap_or_else(|e| panic!("pagila insert table={table_index} id={id}: {e}"));
+        commits.insert(
+            (ids.pagila[table_index], i64::from(id), EventKind::Insert),
+            commit_at,
+        );
     }
     commits
 }
 
-/// S5.3: append-only audit + UPDATE-heavy lookup. Seed 50 lookup_state
-/// rows (not measured), then drive a 4:1 mix of (audit_log INSERT,
-/// lookup_state UPDATE) for 250 events total at 10 ms gap.
+#[allow(clippy::too_many_lines)]
+fn pagila_insert_sql(table_index: usize, id: i32) -> String {
+    match table_index {
+        0 => format!(
+            // actor
+            "INSERT INTO actor (actor_id, first_name, last_name, last_update) \
+             VALUES ({id}, 'F{id}', 'L{id}', NOW())"
+        ),
+        1 => format!(
+            // category
+            "INSERT INTO category (category_id, name, last_update) \
+             VALUES ({id}, 'cat_{id}', NOW())"
+        ),
+        2 => format!(
+            // language
+            "INSERT INTO language (language_id, name, last_update) \
+             VALUES ({id}, 'lang_{id}', NOW())"
+        ),
+        3 => format!(
+            // country
+            "INSERT INTO country (country_id, country, last_update) \
+             VALUES ({id}, 'country_{id}', NOW())"
+        ),
+        4 => format!(
+            // city
+            "INSERT INTO city (city_id, city, country_id, last_update) \
+             VALUES ({id}, 'city_{id}', {id}, NOW())"
+        ),
+        5 => format!(
+            // address
+            "INSERT INTO address (address_id, address, address2, district, city_id, \
+                                  postal_code, phone, last_update) \
+             VALUES ({id}, '{id} Main St', NULL, 'district_{id}', {id}, '00000', '555-0000', NOW())"
+        ),
+        6 => format!(
+            // customer
+            "INSERT INTO customer (customer_id, store_id, first_name, last_name, email, \
+                                   address_id, activebool, create_date, last_update, active) \
+             VALUES ({id}, 1, 'C{id}', 'CL{id}', 'c{id}@example.invalid', {id}, TRUE, \
+                     CURRENT_DATE, NOW(), 1)"
+        ),
+        7 => format!(
+            // store
+            "INSERT INTO store (store_id, manager_staff_id, address_id, last_update) \
+             VALUES ({id}, {id}, {id}, NOW())"
+        ),
+        8 => format!(
+            // inventory
+            "INSERT INTO inventory (inventory_id, film_id, store_id, last_update) \
+             VALUES ({id}, {id}, 1, NOW())"
+        ),
+        9 => format!(
+            // staff
+            "INSERT INTO staff (staff_id, first_name, last_name, address_id, email, store_id, \
+                                active, username, password, last_update, picture) \
+             VALUES ({id}, 'S{id}', 'SL{id}', {id}, 's{id}@example.invalid', 1, TRUE, \
+                     'u{id}', 'p{id}', NOW(), NULL)"
+        ),
+        10 => format!(
+            // film
+            "INSERT INTO film (film_id, title, description, release_year, language_id, \
+                               original_language_id, rental_duration, rental_rate, length, \
+                               replacement_cost, rating, last_update, special_features, fulltext) \
+             VALUES ({id}, 'Film {id}', 'Desc {id}', 2024, 1, NULL, 3, 4.99, 90, 19.99, 'PG', \
+                     NOW(), ARRAY['trailer']::text[], to_tsvector('english', 'film {id}'))"
+        ),
+        11 => format!(
+            // film_actor
+            "INSERT INTO film_actor (actor_id, film_id, last_update) \
+             VALUES ({id}, {id}, NOW())"
+        ),
+        12 => format!(
+            // film_category
+            "INSERT INTO film_category (film_id, category_id, last_update) \
+             VALUES ({id}, {id}, NOW())"
+        ),
+        13 => format!(
+            // rental
+            "INSERT INTO rental (rental_id, rental_date, inventory_id, customer_id, return_date, \
+                                 staff_id, last_update) \
+             VALUES ({id}, NOW(), {id}, {id}, NULL, 1, NOW())"
+        ),
+        _ => unreachable!("table_index 0..14 only"),
+    }
+}
+
+// ----------------------------------------------------------------------
+// S5.3 — audit + lookup
+// ----------------------------------------------------------------------
+
 async fn drive_s5_3(
     conn: &mut PgConnection,
     id_base: i64,
@@ -395,8 +683,6 @@ async fn drive_s5_3(
     const SEED: i64 = 50;
     const COUNT: i64 = 250;
     const GAP: Duration = Duration::from_millis(10);
-    // Pre-seed lookup_state with 50 rows. These INSERTs happen
-    // BEFORE the slot is created — they are not in commit_times.
     for i in 0..SEED {
         let id = id_base + i;
         sql_query(format!(
@@ -414,7 +700,6 @@ async fn drive_s5_3(
         if c > 0 {
             tokio::time::sleep(GAP).await;
         }
-        // 4:1 audit-insert to lookup-update.
         let do_audit = (c % 5) != 0;
         if do_audit {
             let id = id_base + 100_000 + audit_offset;
@@ -428,7 +713,6 @@ async fn drive_s5_3(
             .unwrap_or_else(|e| panic!("audit insert id={id}: {e}"));
             commits.insert((ids.audit_log, id, EventKind::Insert), commit_at);
         } else {
-            // Update the kth seeded row (k cycles through 0..SEED).
             let id = id_base + (update_offset % SEED);
             update_offset += 1;
             let commit_at = Instant::now();
@@ -437,8 +721,6 @@ async fn drive_s5_3(
             ))
             .execute(conn)
             .unwrap_or_else(|e| panic!("lookup update id={id}: {e}"));
-            // First UPDATE on each seeded row records the EventKey;
-            // later UPDATEs on the same row would collide.
             commits
                 .entry((ids.lookup_state, id, EventKind::Update))
                 .or_insert(commit_at);
@@ -461,8 +743,9 @@ const S5_1: WorkloadDesc = WorkloadDesc {
 };
 const S5_2: WorkloadDesc = WorkloadDesc {
     name: "S5.2",
-    description: "many tables (200 INSERTs rotating across 15 tables at 10ms gap)",
-    id_base: 950_000,
+    description:
+        "Pagila (200 INSERTs rotating across 14 non-partitioned base tables, triggers/FKs off)",
+    id_base: 10_000,
 };
 const S5_3: WorkloadDesc = WorkloadDesc {
     name: "S5.3",
@@ -476,6 +759,13 @@ fn slot_name(workload: &WorkloadDesc, transport: Transport) -> String {
         workload.name.replace('.', "_").to_lowercase(),
         transport.slot_suffix()
     )
+}
+
+fn catalog_for(w: &WorkloadDesc, c: &CombinedCatalog) -> Arc<ParserDB> {
+    match w.name {
+        "S5.2" => Arc::clone(&c.pagila),
+        _ => Arc::clone(&c.extras),
+    }
 }
 
 async fn drive_for_workload(
@@ -544,7 +834,7 @@ async fn measure_poll(
 fn main() {
     assert_docker_available();
     println!("Phase 5 — Schema-size sweep");
-    println!("Wide rows, many tables, and append-only-plus-lookup vs the 5-col baseline.");
+    println!("Wide rows, real Pagila (15-table DVD-rental), and append-only-plus-lookup.");
     println!();
 
     let container = pg_with_wal2json();
@@ -552,13 +842,16 @@ fn main() {
     let mut setup = pg_connect(port);
     let mut dml = pg_connect(port);
 
-    apply_pg_ddl(&mut setup);
+    // Apply Pagila FIRST so its sequences and types exist when later
+    // ALTER TABLE statements run.
+    apply_pagila_schema(&mut setup);
+    apply_phase5_extra_ddl(&mut setup);
+
     let publication = "phase5_pub";
     create_publication(&mut setup, publication);
 
-    let catalog =
-        Arc::new(ParserDB::parse::<PostgreSqlDialect>(&build_parser_ddl()).expect("parse DDL"));
-    let table_ids = resolve_phase5_table_ids(&catalog);
+    let catalogs = build_catalogs();
+    let table_ids = resolve_phase5_table_ids(&catalogs);
     let pg_repl_url = pg_replication_url(port);
     let pg_sql_url = pg_url(port);
 
@@ -582,11 +875,11 @@ fn main() {
             let slot = slot_name(&w, t);
             create_pgoutput_slot(&mut setup, &slot);
             let label = t.label();
-            // Distinct id range per transport to avoid PK collisions.
             let workload_for_run = WorkloadDesc {
                 id_base: w.id_base + (ti as i64) * 10_000,
                 ..w
             };
+            let catalog = catalog_for(&w, &catalogs);
             let stats = rt.block_on(async {
                 match t {
                     Transport::Push => {
@@ -594,7 +887,7 @@ fn main() {
                             pg_repl_url.clone(),
                             slot,
                             publication.to_string(),
-                            Arc::clone(&catalog),
+                            catalog,
                             label,
                             workload_for_run,
                             table_ids,
@@ -607,7 +900,7 @@ fn main() {
                             pg_sql_url.clone(),
                             slot,
                             publication.to_string(),
-                            Arc::clone(&catalog),
+                            catalog,
                             Duration::from_millis(interval_ms),
                             label,
                             workload_for_run,
@@ -637,10 +930,6 @@ fn main() {
         println!();
     }
 
-    // Architectural-claim sanity: schema complexity must not invert
-    // the polling-vs-push verdict at sub-second cadence. Wide rows
-    // and many-tables both pay extra parse cost equally across
-    // transports.
     for (w, row) in &all_stats {
         let push_median = row[0].median();
         let poll_100_median = row[2].median();
@@ -658,6 +947,6 @@ fn main() {
     }
     println!("Phase 5 architectural-claim check: PASS");
     println!(
-        "  schema complexity (wide rows, many tables, mixed access) does not invert the verdict."
+        "  schema complexity (wide rows, real Pagila, mixed access) does not invert the verdict."
     );
 }
