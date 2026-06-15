@@ -790,6 +790,41 @@ fresh-source-per-trial rigs that don't carry over the Phase 1
 sequential-source state and produced tight wire-RTT-floor numbers
 across every cell.
 
+### Smoothed Phase 1 (the reproducible headline)
+
+`examples/phase1_smoothed.rs` combines the lessons from the W1.2 and
+W1.3 investigations: each cell runs 3 trials with a fresh slot and
+fresh source per trial, samples are pooled across trials, and event
+counts scale with polling cadence so wall-clock stays roughly
+constant per cell. Total wall-clock ~5 min on the project hardware.
+
+Three back-to-back runs against the same hardware
+(`docs/benchmarks/phase1-smoothed-2026-06-15.md`) reveal a clean
+structural picture:
+
+| run | push median | poll @ 100 ms median | poll @ 1000 ms median |
+| ---:| ---:| ---:| ---:|
+| 1 | 16.0 ms | 50.1 ms | 540.0 ms |
+| 2 | 3.8 ms | 50.0 ms | 539.8 ms |
+| 3 | 4.3 ms | 49.8 ms | 527.7 ms |
+
+`poll @ 100 ms` and `poll @ 1000 ms` medians are stable within 1 %
+across runs because they are dominated by the polling cadence
+(~P/2). `push` and `poll @ 10 ms` medians fluctuate with host load
+(busy/quiet shell, cargo background, etc.) but the MIN of each is
+always the wire-RTT floor (~3-4 ms).
+
+**The operationally meaningful number is the polling savings vs push**,
+which is stable across all three runs:
+
+| polling cadence | push savings vs polling (median) |
+| ---:| ---:|
+| 100 ms | ~45 ms |
+| 1000 ms | ~525 ms |
+
+Those two numbers reproduce. They match the theoretical `P/2`
+prediction. They are what the polling-vs-push verdict actually says.
+
 ## References
 
 - PostgreSQL logical replication protocol:

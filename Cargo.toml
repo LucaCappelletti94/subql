@@ -180,6 +180,13 @@ required-features = ["pg-streaming"]
 name = "w1_2_burst_rate"
 required-features = ["pg-streaming"]
 
+# Smoothed Phase 1: per cell, runs multiple trials with a fresh
+# source per trial and pools the samples. Produces tight, stable
+# numbers usable as the headline polling-vs-push comparison.
+[[example]]
+name = "phase1_smoothed"
+required-features = ["pg-streaming"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }
