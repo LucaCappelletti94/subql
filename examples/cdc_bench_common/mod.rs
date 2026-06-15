@@ -526,3 +526,121 @@ pub async fn collect_latencies(
     }
     samples
 }
+
+// ----------------------------------------------------------------------
+// Multi-event-kind receiver + collector (Phase 2+)
+// ----------------------------------------------------------------------
+
+/// Resolved table IDs for the 3-table e-commerce schema. Use
+/// [`resolve_table_ids`] to populate from a parser-backed catalog;
+/// pass the result into workload drivers that emit events across
+/// multiple tables.
+#[derive(Debug, Clone, Copy)]
+pub struct TableIds {
+    pub users: u32,
+    pub orders: u32,
+    pub order_items: u32,
+}
+
+/// Resolve the three e-commerce table names to subql's compact
+/// `TableId` values via the parser-backed catalog. Panics if a table
+/// is missing (the schema should always be set up by [`setup_schema`]
+/// before this is called).
+pub fn resolve_table_ids(db: &ParserDB) -> TableIds {
+    TableIds {
+        users: subql::catalog_helpers::table_id(db, "users").expect("users table id"),
+        orders: subql::catalog_helpers::table_id(db, "orders").expect("orders table id"),
+        order_items: subql::catalog_helpers::table_id(db, "order_items")
+            .expect("order_items table id"),
+    }
+}
+
+/// A single CDC event observation. Phase 2+ workloads correlate these
+/// against per-`(table, pk, kind)` commit timestamps so Insert /
+/// Update / Delete events on the same row can be tracked separately.
+#[derive(Debug, Clone)]
+pub struct EventObservation {
+    pub table_id: u32,
+    pub pk_int: i64,
+    pub kind: EventKind,
+    pub observed_at: Instant,
+}
+
+/// Key into a multi-event-kind commit-times map. The kind is part of
+/// the key because the same `(table, pk)` may have several events in
+/// a workload (e.g. W2.1 inserts, updates, then deletes the same row).
+pub type EventKey = (u32, i64, EventKind);
+
+/// Generic event receiver that surfaces Insert / Update / Delete
+/// events (Truncate dropped). Uses `ev.pk()` for the primary key so
+/// the receiver handles Delete events (which have no `new_row`)
+/// uniformly with Insert and Update.
+pub fn spawn_full_event_receiver<S>(
+    mut source: S,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<EventObservation>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    S: CdcSource<Checkpoint = PgLsn> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<EventObservation>();
+    let task = tokio::spawn(async move {
+        loop {
+            let next = source.next_event().await;
+            let Ok(Some(ev)) = next else {
+                return;
+            };
+            let observed_at = Instant::now();
+            let kind = ev.kind();
+            if !matches!(
+                kind,
+                EventKind::Insert | EventKind::Update | EventKind::Delete
+            ) {
+                continue;
+            }
+            let pk_cells = ev.pk().values();
+            let Some(subql::Cell::Int(pk_int)) = pk_cells.first() else {
+                continue;
+            };
+            let observation = EventObservation {
+                table_id: ev.table_id(),
+                pk_int: *pk_int,
+                kind,
+                observed_at,
+            };
+            if tx.send(observation).is_err() {
+                return;
+            }
+        }
+    });
+    (rx, task)
+}
+
+/// Wait for every entry in `commit_times` to be observed, or
+/// `deadline` to elapse. Returns per-event COMMIT-to-observation
+/// latencies in observation order. Events not in `commit_times` (e.g.
+/// from a prior run on the same slot) are skipped.
+pub async fn collect_full_latencies(
+    commit_times: &HashMap<EventKey, Instant>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<EventObservation>,
+    deadline: Instant,
+) -> Vec<Duration> {
+    let mut samples = Vec::with_capacity(commit_times.len());
+    let mut seen: HashSet<EventKey> = HashSet::new();
+    while samples.len() < commit_times.len() && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(opt) = tokio::time::timeout(remaining, rx.recv()).await else {
+            break;
+        };
+        let Some(ob) = opt else { break };
+        let key = (ob.table_id, ob.pk_int, ob.kind);
+        if !seen.insert(key) {
+            continue;
+        }
+        if let Some(commit_at) = commit_times.get(&key) {
+            samples.push(ob.observed_at.saturating_duration_since(*commit_at));
+        }
+    }
+    samples
+}
