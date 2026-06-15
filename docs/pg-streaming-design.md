@@ -554,6 +554,126 @@ dispatch engine completes predicate fan-out in sub-millisecond; an
 intake that adds 50–550 ms per event would dominate the end-to-end
 latency budget and erase the design's reason for existing.
 
+The Phase 1 workload-matrix benchmark (`examples/phase1_baseline.rs`,
+captured at `docs/benchmarks/phase1-2026-06-15.md`) reproduces the
+table above within ±14 % on every cell using the same methodology
+against the library polling helper. The harness asserts the prior
+table within `[0.5x, 2x]`; if a future change broke either transport
+the assertion would catch it.
+
+## Multi-phase workload findings
+
+The single-INSERT benchmark above measures the wire-RTT floor and the
+polling-interval floor in a clean, isolated setting. To check whether
+the verdict holds across realistic workloads, a five-phase plan
+(`docs/cdc-workload-benchmark-plan.md`) drives polling vs. push
+across mixed-DML, multi-table-commit, bursty, large-transaction,
+slow-consumer, and WAL-retention regimes. Each phase is its own
+example under `examples/phase{N}_*.rs`, with raw output captured
+under `docs/benchmarks/phase{N}-<date>.md`.
+
+The headline result holds: push beats polling on per-event median
+latency in every cell of every phase, with TWO exceptions that are
+themselves engineering findings worth surfacing.
+
+### Finding 1: polling at sub-second cadence beats push on large COMMITs
+
+Workload W3.2 commits 1000 rows in a single transaction, three
+commits 2 s apart. pgoutput emits all 1000 events to the slot at
+COMMIT time. Both transports see the same 1000 events but deliver
+them differently:
+
+- Push reads them one frame at a time through `CopyBothDuplex`,
+  paying the per-frame `XLogData` header (25 bytes per event) and a
+  Tokio task wakeup per frame.
+- Polling drains them all in one `pg_logical_slot_get_binary_changes`
+  query — one round trip for 1000 events, no per-event framing
+  overhead.
+
+Measured on the project workstation (`docs/benchmarks/phase3-2026-06-15.md`):
+
+| Transport | min | median | mean | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| **push** | 2.6 ms | 7.3 ms | 7.3 ms | 12.9 ms | 13.3 ms |
+| poll @ 10 ms | 2.7 ms | **3.6 ms** | 3.6 ms | 4.7 ms | 4.7 ms |
+| poll @ 100 ms | 2.9 ms | **3.5 ms** | 3.5 ms | 4.2 ms | 4.2 ms |
+| poll @ 1000 ms | 739.4 ms | 761.0 ms | 761.8 ms | 785.0 ms | 785.0 ms |
+
+Polling at 10 ms and 100 ms beats push by ~4 ms per event median.
+Polling's MAX (4.7 ms) beats push's MAX (13.3 ms) by ~8 ms,
+reflecting the absence of per-event task wakeups in the polling path.
+
+There is a measurement caveat: with only three independent commits,
+all 1000 events of a commit share `commit_at` and `observed_at`, so
+the per-event medians are 1000 copies of three random draws of
+"next-poll-cycle offset". The qualitative direction (polling beats
+push on large-COMMIT throughput) is robust; the exact magnitude
+varies run-to-run.
+
+**Operational implication.** Workloads dominated by large transactions
+(ETL backfills, bulk INSERTs, schema migrations that touch many rows)
+may see lower end-to-end latency from polling at 100 ms than from
+push, while paying a higher latency floor on isolated single-row
+commits. Mixed workloads — single-row commits AND occasional bulk
+batches — favor push, since the bulk batches are a small fraction of
+total events.
+
+### Finding 2: push leaves WAL on the server when consumers forget to ack; polling cannot
+
+Workload W4.3 drives 1000 INSERTs at 10 ms gap (10 s total) without
+ever calling `source.ack()`. After the workload completes, the test
+queries `pg_current_wal_lsn() - confirmed_flush_lsn` for each slot
+(`docs/benchmarks/phase4-2026-06-15.md`):
+
+| Transport | median latency | slot lag at end |
+| --- | --- | --- |
+| **push** | 4.8 ms | **219,680 bytes** |
+| poll @ 10 ms | 5.6 ms | 0 bytes |
+| poll @ 100 ms | 50.2 ms | 0 bytes |
+| poll @ 1000 ms | 517.3 ms | 0 bytes |
+
+Push leaves ~220 KB of unflushed WAL on the server because
+`confirmed_flush_lsn` only advances on an explicit `StandbyStatusUpdate`
+carrying a `flush_lsn` value, and the source only sends that when
+the consumer calls `ack()`. Polling drains via
+`pg_logical_slot_get_binary_changes`, which auto-advances
+`confirmed_flush_lsn` as a side effect of the query — no ack call is
+needed (or possible; `PollingPgCdcSource::ack` is intentionally a
+no-op).
+
+**Operational implication.** A push consumer that forgets to ack will
+accumulate WAL on the server indefinitely. At sustained workload
+rates this can fill PG's data volume in hours. The polling source has
+this safety property baked in: as long as the consumer drains, WAL
+cannot accumulate. The asymmetry is in the protocol, not in the
+implementation.
+
+This is reason enough to consider polling for workloads where ack
+discipline cannot be guaranteed (e.g. fan-out consumers with
+unreliable downstream sinks, or operators who want a hard upper
+bound on WAL retention regardless of consumer behavior). The default
+choice for production data paths remains push (per the
+[`no-polling-cdc`] guidance), but the trade-off is now visible.
+
+[`no-polling-cdc`]: ../subql/memory/no-polling-cdc.md
+
+### What still holds, what does not
+
+The strict "push delivers at wire-RTT regardless of cadence" claim
+holds on all single-row-COMMIT regimes (Phase 1, W2.1, W2.3, W3.1,
+W3.3, W4.1). It is falsified on W3.2 (large COMMITs at sub-second
+polling cadence), where the per-event framing overhead in
+`CopyBothDuplex` exceeds the next-poll wait.
+
+The weaker "push is the better default for most workloads" claim
+holds across all phases on either the latency or the operational
+axis. Polling has two niche regimes where it wins (large-COMMIT
+workloads, ack-undisciplined consumers); push wins everywhere else.
+
+A future revision of this section should consume the captured Phase 5
+output (schema sweep — wide rows, Pagila, audit log) when that
+example lands.
+
 ## References
 
 - PostgreSQL logical replication protocol:
