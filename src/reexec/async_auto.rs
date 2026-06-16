@@ -19,11 +19,71 @@ use crate::{
     Cell, IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport,
     WalEvent,
 };
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use async_lock::{Semaphore, SemaphoreGuardArc};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::dialect::Dialect;
+
+/// Internal state for the persistent re-execution concurrency cap.
+///
+/// The cap is enforced by an [`async_lock::Semaphore`]; the
+/// [`AtomicUsize`] tracks how many permits are currently held so callers
+/// can read [`AsyncAutoResolvingEngine::inflight`] without re-deriving
+/// it from the semaphore itself (which `async-lock` does not expose).
+struct ThrottleState {
+    sem: Arc<Semaphore>,
+    inflight: Arc<AtomicUsize>,
+    cap: usize,
+}
+
+/// RAII guard returned by the throttle's acquire path. Releases the
+/// semaphore permit and decrements the inflight counter on drop, even
+/// when dropped because the awaiting future was cancelled.
+struct InflightGuard {
+    inflight: Arc<AtomicUsize>,
+    _permit: SemaphoreGuardArc,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Acquire a throttle permit if a cap is configured. Returns `None`
+/// when no cap is set (the unbounded case), avoiding any
+/// synchronisation overhead in that path. The returned guard releases
+/// the permit on drop, which makes the call cancellation-safe: a
+/// future that is dropped while awaiting `acquire_permit` (because the
+/// outer `try_collect` short-circuited on a connector error or because
+/// the caller cancelled) leaves the semaphore in a clean state.
+async fn acquire_permit(
+    throttle: Option<&(Arc<Semaphore>, Arc<AtomicUsize>)>,
+    query_id: ReExecQueryId,
+) -> Option<InflightGuard> {
+    let Some((sem, inflight)) = throttle else {
+        let _ = query_id;
+        return None;
+    };
+    let permit = Arc::clone(sem).acquire_arc().await;
+    let now = inflight.fetch_add(1, Ordering::AcqRel) + 1;
+    #[cfg(feature = "observability")]
+    tracing::trace!(
+        query_id,
+        inflight = now,
+        "subql reexec throttle: permit acquired",
+    );
+    #[cfg(not(feature = "observability"))]
+    let _ = now;
+    Some(InflightGuard {
+        inflight: Arc::clone(inflight),
+        _permit: permit,
+    })
+}
 
 /// Auto-resolving engine driven by an [`AsyncConnector`].
 ///
@@ -52,11 +112,13 @@ where
     debounce: Option<Duration>,
     /// Last `now_micros` at which each captured query was re-executed.
     last_reexec_at: HashMap<ReExecQueryId, u64>,
-    /// Maximum number of trigger re-executions that may be in flight
-    /// simultaneously during `consumers_batch`. `None` is "unbounded"
-    /// (drive every trigger as a separate concurrent future, capped only
-    /// by the deduplicated trigger count).
-    max_concurrent_reexecutions: Option<usize>,
+    /// Persistent throttle state that caps how many
+    /// `connector.execute_scalar` calls are in flight at any moment
+    /// across every [`consumers`](Self::consumers) and
+    /// [`consumers_batch`](Self::consumers_batch) call.
+    ///
+    /// `None` means unbounded (no throttle).
+    permits: Option<ThrottleState>,
 }
 
 impl<D, I, DB, X> AsyncAutoResolvingEngine<D, I, DB, X>
@@ -75,24 +137,56 @@ where
             clock: None,
             debounce: None,
             last_reexec_at: HashMap::new(),
-            max_concurrent_reexecutions: None,
+            permits: None,
         }
     }
 
     /// Cap the number of trigger re-executions that may be in flight
-    /// simultaneously during [`consumers_batch`](Self::consumers_batch).
+    /// simultaneously across all [`consumers`](Self::consumers) and
+    /// [`consumers_batch`](Self::consumers_batch) calls.
     ///
-    /// Useful to limit concurrent pressure on the database (e.g. when
-    /// the connector is pool-backed and the pool has limited capacity)
-    /// while still benefiting from parallel dispatch.
+    /// The cap is enforced by a persistent semaphore on the engine: each
+    /// `connector.execute_scalar(...)` acquires a permit before running
+    /// and releases it on completion (including cancellation). With cap
+    /// `N`, no more than `N` SQL queries are in flight at any moment,
+    /// regardless of whether triggers arrive one per event or in batched
+    /// bursts.
+    ///
+    /// **Behavior change.** Prior to this version, the cap applied
+    /// per-batch only (consumed by `buffer_unordered` inside
+    /// `consumers_batch` and ignored by per-event `consumers`). It now
+    /// applies globally and is honored by both flows.
     ///
     /// Default `None`: every deduplicated trigger is dispatched
-    /// concurrently. Per-event [`consumers`](Self::consumers) is
-    /// unaffected since it only resolves one trigger at a time.
+    /// concurrently. The connector's own pool may still throttle.
+    ///
+    /// A `cap` of 0 is treated as 1 to avoid a deadlock.
     #[must_use]
-    pub const fn with_max_concurrent_reexecutions(mut self, cap: usize) -> Self {
-        self.max_concurrent_reexecutions = Some(cap);
+    pub fn with_max_concurrent_reexecutions(mut self, cap: usize) -> Self {
+        let cap = cap.max(1);
+        self.permits = Some(ThrottleState {
+            sem: Arc::new(Semaphore::new(cap)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            cap,
+        });
         self
+    }
+
+    /// Number of re-execution permits currently held, i.e. concurrent
+    /// connector calls in flight. Returns 0 when no cap is configured
+    /// (unbounded mode does not track inflight). Useful for operator
+    /// dashboards alerting on sustained `inflight ~= cap`.
+    #[must_use]
+    pub fn inflight(&self) -> usize {
+        self.permits
+            .as_ref()
+            .map_or(0, |state| state.inflight.load(Ordering::Acquire))
+    }
+
+    /// Configured concurrency cap, if any. `None` means unbounded.
+    #[must_use]
+    pub fn concurrency_cap(&self) -> Option<usize> {
+        self.permits.as_ref().map(|s| s.cap)
     }
 
     /// Attach a [`Clock`](crate::Clock) for per-query debounce. See
@@ -220,25 +314,64 @@ where
         &mut self,
         event: &WalEvent<C>,
     ) -> Result<ReExecNotifications<I, C>, ReExecError<X::Error>> {
+        use futures_util::stream::{StreamExt, TryStreamExt};
+
         let ReExecNotifications {
             engine,
             mut scalar_updates,
             triggers,
         } = self.inner.consumers(event)?;
 
-        for trigger in triggers {
-            if self.debounce_skip(trigger.query_id) {
-                continue;
-            }
-            let ctx = self.contexts.get(&trigger.query_id).expect(
+        // Pre-filter debounced triggers.
+        let actionable: Vec<_> = triggers
+            .into_iter()
+            .filter(|t| !self.debounce_skip(t.query_id))
+            .collect();
+
+        if actionable.is_empty() {
+            return Ok(ReExecNotifications {
+                engine,
+                scalar_updates,
+                triggers: Vec::new(),
+            });
+        }
+
+        // Borrow the immutable fields the futures need; `inner` and
+        // `last_reexec_at` stay free for the post-resolution mutation.
+        let connector = &self.connector;
+        let contexts = &self.contexts;
+        let throttle = self
+            .permits
+            .as_ref()
+            .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
+        let actionable_len = actionable.len();
+
+        #[allow(clippy::type_complexity)]
+        let resolved: Vec<(
+            super::ReExecutionTrigger<I, C>,
+            (Cell, Option<X::Checkpoint>),
+        )> = futures_util::stream::iter(actionable.into_iter().map(|trigger| {
+            let ctx = contexts.get(&trigger.query_id).expect(
                 "every captured query stores its resolve context at register time; \
                  trigger.query_id must exist in `contexts`",
             );
-            let (value, _db_checkpoint) = self
-                .connector
-                .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
-                .await
-                .map_err(ReExecError::Connector)?;
+            let sql = ctx.sql.clone();
+            let column_type = ctx.column_type;
+            let auth = &ctx.auth;
+            let throttle = throttle.clone();
+            async move {
+                let _guard = acquire_permit(throttle.as_ref(), trigger.query_id).await;
+                let result = connector.execute_scalar(&sql, column_type, auth).await;
+                result.map(|r| (trigger, r))
+            }
+        }))
+        .buffer_unordered(actionable_len)
+        .try_collect()
+        .await
+        .map_err(ReExecError::Connector)?;
+
+        // All borrows released; apply the resolutions.
+        for (trigger, (value, _db_checkpoint)) in resolved {
             self.inner.install(trigger.query_id, value.clone());
             self.stamp_reexec(trigger.query_id);
             scalar_updates.push(ScalarUpdate {
@@ -289,20 +422,29 @@ where
             .filter(|t| !self.debounce_skip(t.query_id))
             .collect();
 
-        // Concurrency window. `None` = unbounded; treat 0 as 1 to avoid
-        // a deadlock.
-        let cap = self
-            .max_concurrent_reexecutions
-            .unwrap_or_else(|| actionable.len().max(1))
-            .max(1);
+        if actionable.is_empty() {
+            return Ok(BatchOutcome {
+                per_event,
+                scalar_updates,
+                triggers: Vec::new(),
+            });
+        }
 
         // Borrow the immutable fields the futures need; `inner`,
         // `last_reexec_at` etc. stay free for the mutation pass below.
         // Each future captures the connector + the trigger's resolve
         // context by reference; the stream is consumed before any
-        // mutable self access.
+        // mutable self access. The persistent throttle (if configured)
+        // is the only concurrency cap; `buffer_unordered` polls every
+        // future and the semaphore gates real connector concurrency.
         let connector = &self.connector;
         let contexts = &self.contexts;
+        let throttle = self
+            .permits
+            .as_ref()
+            .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
+        let actionable_len = actionable.len();
+
         #[allow(clippy::type_complexity)]
         let resolved: alloc::vec::Vec<(
             super::ReExecutionTrigger<I, C>,
@@ -315,12 +457,14 @@ where
             let sql = ctx.sql.clone();
             let column_type = ctx.column_type;
             let auth = &ctx.auth;
+            let throttle = throttle.clone();
             async move {
+                let _guard = acquire_permit(throttle.as_ref(), trigger.query_id).await;
                 let result = connector.execute_scalar(&sql, column_type, auth).await;
                 result.map(|r| (trigger, r))
             }
         }))
-        .buffer_unordered(cap)
+        .buffer_unordered(actionable_len)
         .try_collect()
         .await
         .map_err(ReExecError::Connector)?;
@@ -726,5 +870,156 @@ mod tests {
         assert_eq!(e.contexts.len(), 1);
         assert!(e.unregister_reexec_query(qid));
         assert_eq!(e.contexts.len(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // Re-execution concurrency throttle
+    // ----------------------------------------------------------------
+    //
+    // The `MockAsyncConnector` futures complete in one poll, so the
+    // tests here cannot observe the *peak* inflight count during a
+    // batch (that needs a real multi-tasking runtime; integration
+    // tests exercise it). Unit tests validate the invariants that DO
+    // hold under `block_on`: the accessors, the post-batch invariant
+    // (`inflight == 0`), the zero-cap normalisation, and the
+    // result-preservation contract.
+
+    /// No cap by default: `inflight()` is 0, `concurrency_cap()` is `None`.
+    #[test]
+    fn throttle_disabled_by_default() {
+        let e = engine_with_values(vec![]);
+        assert_eq!(e.inflight(), 0);
+        assert_eq!(e.concurrency_cap(), None);
+    }
+
+    /// `with_max_concurrent_reexecutions(n)` records `n` as the cap and
+    /// starts with `inflight() == 0`.
+    #[test]
+    fn throttle_set_cap_observable_via_accessors() {
+        let e = engine_with_values(vec![]).with_max_concurrent_reexecutions(4);
+        assert_eq!(e.concurrency_cap(), Some(4));
+        assert_eq!(e.inflight(), 0);
+    }
+
+    /// `cap = 0` is normalised to 1 to prevent a deadlock on first
+    /// `acquire`.
+    #[test]
+    fn throttle_zero_cap_normalised_to_one() {
+        let e = engine_with_values(vec![]).with_max_concurrent_reexecutions(0);
+        assert_eq!(e.concurrency_cap(), Some(1));
+    }
+
+    /// Cleanup invariant: after a successful `consumers_batch` the
+    /// inflight counter is back to 0. Tests that the `InflightGuard`
+    /// drop path actually fires when futures complete.
+    #[test]
+    fn throttle_inflight_returns_to_zero_after_batch() {
+        let mut e = engine_with_values(vec![Cell::Float(22.0), Cell::Float(11.0)])
+            .with_max_concurrent_reexecutions(1);
+        let qid1 = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec"),
+        };
+        let qid2 = match e
+            .register(
+                SubscriptionRequest::new(2u64, "SELECT MAX(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec"),
+        };
+        assert!(e.install(qid1, Cell::Float(7.0)));
+        assert!(e.install(qid2, Cell::Float(7.0)));
+
+        let _ = block_on(e.consumers_batch(&[delete_event(1, 7.0)])).unwrap();
+        assert_eq!(
+            e.inflight(),
+            0,
+            "every InflightGuard must drop after batch completes"
+        );
+    }
+
+    /// Cleanup invariant on the error path: when the connector fails
+    /// mid-batch, every permit must still be released.
+    #[test]
+    fn throttle_inflight_returns_to_zero_after_connector_error() {
+        // Two captured queries, only one cell in the queue: the second
+        // connector call hits "queue empty" and the batch aborts.
+        let mut e = engine_with_values(vec![Cell::Float(22.0)]).with_max_concurrent_reexecutions(2);
+        let qid1 = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec"),
+        };
+        let qid2 = match e
+            .register(
+                SubscriptionRequest::new(2u64, "SELECT MAX(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered::ReExec { query_id, .. } => query_id,
+            Registered::Engine(_) => panic!("expected ReExec"),
+        };
+        assert!(e.install(qid1, Cell::Float(7.0)));
+        assert!(e.install(qid2, Cell::Float(7.0)));
+
+        assert!(block_on(e.consumers_batch(&[delete_event(1, 7.0)])).is_err());
+        assert_eq!(
+            e.inflight(),
+            0,
+            "InflightGuards must drop even when the batch aborts on connector error"
+        );
+    }
+
+    /// The throttle preserves correctness: total connector call count
+    /// equals the number of deduplicated triggers regardless of cap.
+    /// Mirrors `respects_max_concurrent_cap` above but is explicit
+    /// about the throttle.
+    #[test]
+    fn throttle_total_call_count_unchanged_with_cap() {
+        // Three queries, one trigger each, cap = 1.
+        let values = vec![Cell::Float(30.0), Cell::Float(20.0), Cell::Float(10.0)];
+        let mut e = engine_with_values(values).with_max_concurrent_reexecutions(1);
+        let qids: Vec<_> = (1u64..=3)
+            .map(|c| {
+                match e
+                    .register(
+                        SubscriptionRequest::new(
+                            c,
+                            "SELECT MIN(price) FROM orders WHERE quantity = 1",
+                        ),
+                        (),
+                    )
+                    .unwrap()
+                {
+                    Registered::ReExec { query_id, .. } => query_id,
+                    Registered::Engine(_) => panic!("expected ReExec"),
+                }
+            })
+            .collect();
+        for q in &qids {
+            assert!(e.install(*q, Cell::Float(7.0)));
+        }
+        let outcome = block_on(e.consumers_batch(&[delete_event(1, 7.0)])).unwrap();
+        assert_eq!(
+            e.connector().call_count(),
+            3,
+            "three distinct queries each get one connector call regardless of cap"
+        );
+        assert_eq!(outcome.scalar_updates.len(), 3);
     }
 }

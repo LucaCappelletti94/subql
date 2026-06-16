@@ -330,6 +330,12 @@ r2d2 = { version = "0.8", optional = true }
 # combinators here.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
+# Runtime-agnostic async primitives. Used by the async auto-resolving
+# engine for its persistent re-execution concurrency cap (a `Semaphore`
+# acquired by every connector call). Works under `no_std + alloc`, so
+# we do not have to pull tokio just to get an async semaphore.
+async-lock = { version = "3", default-features = false }
+
 # Push-based PG CDC source (`pg-streaming` feature). `tokio-postgres`
 # 0.7 exposes the replication protocol via `CopyBothDuplex` and
 # `simple_query("START_REPLICATION ...")`; there is no separate feature
@@ -360,6 +366,11 @@ testcontainers = { version = "0.27", features = ["blocking"] }
 
 # Property-based testing
 proptest = "1"
+
+# Multi-task async runtime for tests that need real concurrency (e.g.
+# `tests/reexec_throttle.rs`, which observes peak in-flight connector
+# calls during a batch). Just enough features to spawn tasks and sleep.
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 
 [features]
 default = ["std"]
