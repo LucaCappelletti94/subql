@@ -204,6 +204,54 @@ required-features = ["pg-streaming"]
 name = "scale_retention"
 required-features = ["pg-streaming"]
 
+# Decouples writer side from CDC side: Experiment W (writers only,
+# no CDC consumers) vs Experiment C (single batched writer + N CDC
+# consumers at fixed total rate). Tests whether the N=100 cliff
+# observed in scale_consumers Experiment A is a write-side or CDC-
+# side bottleneck.
+[[example]]
+name = "scale_isolation"
+required-features = ["pg-streaming"]
+
+# 2D mesh: (N consumers x producer rate) grid. Emits long-form rows
+# usable as a heatmap, mapping the saturation surface as two
+# independent axes.
+[[example]]
+name = "scale_mesh"
+required-features = ["pg-streaming"]
+
+# Sanity check that two fresh PG containers with identical schema
+# produce CDC events that resolve to the same parser TableId via a
+# shared Arc<ParserDB>. If this passes, the mesh substrate can share
+# one catalog across M sources; if it fails, a per-source oid_remap
+# is needed in MultiSourceFanIn.
+[[example]]
+name = "mesh_oid_sanity"
+required-features = ["pg-streaming"]
+
+# Mesh topology T1: M independent PG containers, no PG-to-PG
+# replication, both subscription geometries (one-per-sub G1 and
+# many-per-sub G2), uniform and skewed load shapes.
+[[example]]
+name = "mesh_independent"
+required-features = ["pg-streaming"]
+
+# Mesh topology T2: PG-native logical replication tree. One primary
+# + (M-1) subscribers, all on a shared Docker network. Writers
+# commit on the primary only; the per-node CdcSource latency
+# difference quantifies the replication-delay tax.
+[[example]]
+name = "mesh_logical_rep"
+required-features = ["pg-streaming"]
+
+# Mesh topology T3: sharded workload across M independent PGs. G2
+# geometry only (one subscription spans all shards via
+# MultiSourceFanIn). Headline metric: per-shard drain fairness =
+# per-source drain rate / per-source write rate.
+[[example]]
+name = "mesh_sharded"
+required-features = ["pg-streaming"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }

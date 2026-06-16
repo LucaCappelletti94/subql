@@ -370,6 +370,8 @@ fn main() {
             let mut pooled: Vec<Duration> = Vec::new();
             let mut producer_rates: Vec<f64> = Vec::new();
             let mut drain_rates: Vec<f64> = Vec::new();
+            let mut per_trial_medians: Vec<f64> = Vec::new();
+            let mut per_trial_p99s: Vec<f64> = Vec::new();
             let mut total_received: u64 = 0;
             let mut total_expected: u64 = 0;
             let mut xact_rates: Vec<f64> = Vec::new();
@@ -395,6 +397,30 @@ fn main() {
                     &pg_sql_url,
                     &mut setup,
                 ));
+                // Compute per-trial median + p99 BEFORE pooling, so
+                // we can report across-trial variance separately from
+                // the within-trial latency distribution.
+                if !result.samples.is_empty() {
+                    let mut s = result.samples.clone();
+                    s.sort();
+                    let n = s.len();
+                    per_trial_medians.push(ms_of(s[n / 2]));
+                    per_trial_p99s.push(ms_of(s[(n.saturating_sub(1)).min((n * 99) / 100)]));
+                    tsv.row(
+                        "throughput",
+                        &format!("rate={target_rate}"),
+                        &transport.label(),
+                        &format!("trial{trial}_median_ms"),
+                        ms_of(s[n / 2]),
+                    );
+                    tsv.row(
+                        "throughput",
+                        &format!("rate={target_rate}"),
+                        &transport.label(),
+                        &format!("trial{trial}_drain_rate"),
+                        result.drain_rate,
+                    );
+                }
                 pooled.extend(result.samples);
                 producer_rates.push(result.producer_rate);
                 drain_rates.push(result.drain_rate);
@@ -404,6 +430,11 @@ fn main() {
                 wal_totals += result.wal_bytes_written;
                 force_drop_slot(&mut setup, &slot);
             }
+            // Suppress unused warnings: the per-trial vectors are
+            // emitted to TSV as separate rows, used only for the
+            // post-loop summary.
+            let _ = &per_trial_medians;
+            let _ = &per_trial_p99s;
             let avg = |v: &[f64]| v.iter().copied().sum::<f64>() / v.len() as f64;
             let cell = CellResult {
                 transport_label: transport.label(),

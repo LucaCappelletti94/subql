@@ -123,11 +123,11 @@ pub fn pg_with_wal2json() -> Container<GenericImage> {
             "-c",
             "wal_level=logical",
             "-c",
-            "max_wal_senders=128",
+            "max_wal_senders=384",
             "-c",
-            "max_replication_slots=128",
+            "max_replication_slots=384",
             "-c",
-            "max_connections=256",
+            "max_connections=512",
         ])
         .with_startup_timeout(Duration::from_secs(60))
         .start()
@@ -1044,4 +1044,326 @@ pub fn aggregate_throughput(counts: &[u64], window: Duration) -> (u64, f64) {
     #[allow(clippy::cast_precision_loss)]
     let rate = total as f64 / window.as_secs_f64().max(1e-6);
     (total, rate)
+}
+
+// ============================================================================
+// Mesh substrate
+// ============================================================================
+//
+// Multi-PG benchmark primitives. The mesh OID sanity check
+// (`examples/mesh_oid_sanity.rs`) confirmed that fresh PG containers
+// running identical DDL deterministically assign matching PG OIDs
+// AND that those OIDs translate to identical parser TableIds via a
+// shared `Arc<ParserDB>`, so one catalog can be shared across the
+// whole mesh and no `oid_remap` is needed.
+
+/// One node in the mesh. The `container` field keeps the underlying
+/// PG container alive; dropping a `MeshNode` shuts the container
+/// down. `dml_conn` is a long-lived connection for setup queries
+/// (publication, slots, snapshots). Writers open their own
+/// short-lived connections via `sql_url`.
+pub struct MeshNode {
+    pub container: Container<GenericImage>,
+    pub port: u16,
+    pub source_id: u16,
+    pub dml_conn: PgConnection,
+    pub repl_url: String,
+    pub sql_url: String,
+}
+
+/// Spawn `m` independent PG containers in sequence with identical
+/// schema, each carrying the supplied publication. Returns one
+/// `MeshNode` per container with monotonically assigned source_ids
+/// starting at 0.
+#[must_use]
+pub fn spawn_mesh(m: usize, publication: &str) -> Vec<MeshNode> {
+    let mut nodes = Vec::with_capacity(m);
+    for idx in 0..m {
+        let container = pg_with_wal2json();
+        let port = pg_port(&container);
+        let mut dml_conn = pg_connect(port);
+        setup_schema(&mut dml_conn);
+        create_publication_all(&mut dml_conn, publication);
+        // Insert the sentinel users row so `orders` INSERTs at id=1
+        // satisfy the FK. Slots are pre-created later so this
+        // sentinel does not appear in the WAL stream.
+        sql_query(
+            "INSERT INTO users (id, email, name, last_login_at) \
+             VALUES (1, 'sentinel@example.invalid', 'sentinel', NOW()) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&mut dml_conn)
+        .expect("insert mesh sentinel users row");
+        nodes.push(MeshNode {
+            container,
+            port,
+            source_id: u16::try_from(idx).expect("source_id fits in u16"),
+            dml_conn,
+            repl_url: pg_replication_url(port),
+            sql_url: pg_url(port),
+        });
+    }
+    nodes
+}
+
+/// Writer-side workload shape across the mesh.
+#[derive(Debug, Clone, Copy)]
+pub enum WriterProfile {
+    /// Every PG receives the same per-PG event rate.
+    Uniform { rate_per_pg: u64 },
+    /// One PG drives `hot_rate`, the others drive `cold_rate`.
+    Skewed {
+        hot_idx: usize,
+        hot_rate: u64,
+        cold_rate: u64,
+    },
+}
+
+impl WriterProfile {
+    #[must_use]
+    pub const fn rate_for(self, pg_idx: usize) -> u64 {
+        match self {
+            Self::Uniform { rate_per_pg } => rate_per_pg,
+            Self::Skewed {
+                hot_idx,
+                hot_rate,
+                cold_rate,
+            } => {
+                if pg_idx == hot_idx {
+                    hot_rate
+                } else {
+                    cold_rate
+                }
+            }
+        }
+    }
+}
+
+/// A CDC event observation tagged with the source PG it came from.
+/// Used downstream by [`MultiSourceFanIn`] so a single engine /
+/// measurement loop can disambiguate cross-source events.
+#[derive(Debug, Clone)]
+pub struct TaggedEvent {
+    pub source_id: u16,
+    pub table_id: u32,
+    pub pk_int: i64,
+    pub kind: EventKind,
+    pub observed_at: Instant,
+}
+
+/// Multi-source fan-in adapter. Owns one tokio task per source and
+/// forwards all events into a single shared `mpsc::UnboundedReceiver`
+/// with the source_id attached. The G2 geometry (one engine sees
+/// events from many PGs) is implemented on top of this.
+pub struct MultiSourceFanIn {
+    pub rx: tokio::sync::mpsc::UnboundedReceiver<TaggedEvent>,
+    pub tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl MultiSourceFanIn {
+    /// Spawn one drain task per `(source_id, source)` pair. Events
+    /// not carrying a PK Int (e.g. Truncate, or PKs with non-Int
+    /// types) are dropped silently, matching [`spawn_full_event_receiver`].
+    pub fn spawn<S>(sources: Vec<(u16, S)>) -> Self
+    where
+        S: CdcSource<Checkpoint = PgLsn> + Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
+        let mut tasks = Vec::with_capacity(sources.len());
+        for (source_id, mut source) in sources {
+            let tx_clone = tx.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let next = source.next_event().await;
+                    let Ok(Some(ev)) = next else {
+                        return;
+                    };
+                    let observed_at = Instant::now();
+                    let kind = ev.kind();
+                    if !matches!(
+                        kind,
+                        EventKind::Insert | EventKind::Update | EventKind::Delete
+                    ) {
+                        continue;
+                    }
+                    let pk_cells = ev.pk().values();
+                    let Some(Cell::Int(pk_int)) = pk_cells.first() else {
+                        continue;
+                    };
+                    let event = TaggedEvent {
+                        source_id,
+                        table_id: ev.table_id(),
+                        pk_int: *pk_int,
+                        kind,
+                        observed_at,
+                    };
+                    if tx_clone.send(event).is_err() {
+                        return;
+                    }
+                }
+            });
+            tasks.push(task);
+        }
+        Self { rx, tasks }
+    }
+
+    /// Abort every drain task. Use after a measurement window closes.
+    pub fn abort_all(&self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// Snapshot of the whole mesh at one wall-clock instant. Just a
+/// `Vec<ServerLoadSnapshot>` indexed by source_id.
+#[derive(Debug, Clone)]
+pub struct MeshLoadSnapshot {
+    pub per_node: Vec<ServerLoadSnapshot>,
+}
+
+/// Take a `MeshLoadSnapshot` by walking each node's `dml_conn` once.
+pub fn snapshot_mesh_load(nodes: &mut [MeshNode]) -> MeshLoadSnapshot {
+    let per_node = nodes
+        .iter_mut()
+        .map(|n| snapshot_server_load(&mut n.dml_conn))
+        .collect();
+    MeshLoadSnapshot { per_node }
+}
+
+/// Per-source commit-time map: writer thread records the wall-clock
+/// instant at which each row was committed, keyed by
+/// `(table_id, pk_int, EventKind::Insert)`.
+pub type CommitMap = HashMap<EventKey, Instant>;
+
+/// Drive one batched-INSERT writer thread per mesh node according to
+/// `profile`. Returns the per-source commit maps once all writer
+/// threads finish. Uses the OS-thread + `tokio::sync::oneshot` pattern
+/// from `examples/scale_throughput.rs` so the current-thread tokio
+/// runtime keeps driving the consumer side during the window.
+///
+/// `id_base` is the starting PK for source 0; each source_id reserves
+/// 100_000_000 IDs above the previous, so PK collisions between
+/// sources are impossible within any reasonable window.
+pub fn mesh_writer_rt(
+    nodes: &[MeshNode],
+    profile: WriterProfile,
+    duration: Duration,
+    id_base: i64,
+    orders_table_id: u32,
+) -> impl std::future::Future<Output = Vec<CommitMap>> + Send + 'static {
+    let plan: Vec<(u16, String, u64, i64)> = nodes
+        .iter()
+        .map(|n| {
+            let rate = profile.rate_for(n.source_id as usize);
+            let per_source_id_base = id_base + i64::from(n.source_id) * 100_000_000;
+            (n.source_id, n.sql_url.clone(), rate, per_source_id_base)
+        })
+        .collect();
+    drive_mesh_writers(plan, duration, orders_table_id)
+}
+
+async fn drive_mesh_writers(
+    plan: Vec<(u16, String, u64, i64)>,
+    duration: Duration,
+    orders_table_id: u32,
+) -> Vec<CommitMap> {
+    use diesel::connection::SimpleConnection;
+
+    let n_nodes = plan.len();
+    let mut joins = Vec::with_capacity(n_nodes);
+    for (source_id, pg_url, rate, per_source_id_base) in plan {
+        let (tx, rx) = tokio::sync::oneshot::channel::<CommitMap>();
+        std::thread::spawn(move || {
+            let mut commits: CommitMap =
+                HashMap::with_capacity(((rate as usize) * duration.as_secs() as usize).max(1024));
+            if rate == 0 {
+                let _ = tx.send(commits);
+                return;
+            }
+            let mut conn = PgConnection::establish(&pg_url).expect("PG writer conn");
+            let batch_size: u64 = if rate >= 10_000 {
+                50
+            } else if rate >= 5_000 {
+                20
+            } else if rate >= 1_000 {
+                5
+            } else {
+                1
+            };
+            let batches_per_sec = rate.div_ceil(batch_size);
+            let gap = Duration::from_secs_f64(1.0 / batches_per_sec as f64);
+            let end = Instant::now() + duration;
+            let mut id = per_source_id_base;
+            while Instant::now() < end {
+                let batch_start = Instant::now();
+                if batch_size == 1 {
+                    let commit_at = Instant::now();
+                    sql_query(format!(
+                        "INSERT INTO orders (id, user_id, status, total_cents, updated_at) \
+                         VALUES ({id}, 1, 'paid', {p}, NOW())",
+                        p = id * 100
+                    ))
+                    .execute(&mut conn)
+                    .unwrap_or_else(|e| panic!("source {source_id} insert id={id}: {e}"));
+                    commits.insert((orders_table_id, id, EventKind::Insert), commit_at);
+                    id += 1;
+                } else {
+                    let mut stmts = String::from("BEGIN;");
+                    let commit_at = Instant::now();
+                    for _ in 0..batch_size {
+                        use std::fmt::Write as _;
+                        let _ = write!(
+                            stmts,
+                            " INSERT INTO orders (id, user_id, status, total_cents, updated_at) \
+                              VALUES ({id}, 1, 'paid', {p}, NOW());",
+                            p = id * 100
+                        );
+                        commits.insert((orders_table_id, id, EventKind::Insert), commit_at);
+                        id += 1;
+                    }
+                    stmts.push_str(" COMMIT;");
+                    conn.batch_execute(&stmts)
+                        .unwrap_or_else(|e| panic!("source {source_id} batch: {e}"));
+                }
+                if let Some(remaining) = gap.checked_sub(batch_start.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+            }
+            let _ = tx.send(commits);
+        });
+        joins.push((source_id, rx));
+    }
+    let mut out: Vec<CommitMap> = (0..n_nodes).map(|_| HashMap::new()).collect();
+    for (source_id, rx) in joins {
+        let commits = rx.await.unwrap_or_else(|_| HashMap::new());
+        out[source_id as usize] = commits;
+    }
+    out
+}
+
+/// Compute per-source latency stats given the per-source commit maps
+/// and a flat list of `TaggedEvent`s drained during the window. Each
+/// returned `Vec<Duration>` is the per-source pooled latencies.
+#[must_use]
+pub fn pool_mesh_latencies(
+    commits: &[CommitMap],
+    observations: &[TaggedEvent],
+) -> Vec<Vec<Duration>> {
+    let mut out: Vec<Vec<Duration>> = (0..commits.len()).map(|_| Vec::new()).collect();
+    let mut seen: Vec<HashSet<EventKey>> = (0..commits.len()).map(|_| HashSet::new()).collect();
+    for ev in observations {
+        let key = (ev.table_id, ev.pk_int, ev.kind);
+        let idx = ev.source_id as usize;
+        if idx >= commits.len() {
+            continue;
+        }
+        if !seen[idx].insert(key) {
+            continue;
+        }
+        if let Some(commit_at) = commits[idx].get(&key) {
+            out[idx].push(ev.observed_at.saturating_duration_since(*commit_at));
+        }
+    }
+    out
 }

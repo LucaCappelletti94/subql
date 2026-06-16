@@ -60,8 +60,9 @@ use common::{
 };
 use subql::EventKind;
 
-const WINDOW: Duration = Duration::from_secs(30);
-const CONSUMER_COUNTS: &[usize] = &[1, 5, 10, 30, 100];
+const WINDOW: Duration = Duration::from_secs(20);
+const TRIALS_PER_CELL: usize = 3;
+const CONSUMER_COUNTS: &[usize] = &[1, 5, 10, 30, 50, 70, 100];
 const PER_CONSUMER_RATE_A: u64 = 200;
 const SHARED_RATE_B: u64 = 1_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -277,112 +278,168 @@ fn main() {
     for &experiment in &[Experiment::PerConsumerProducers, Experiment::SharedProducer] {
         for &n in CONSUMER_COUNTS {
             for transport in [Transport::Push, Transport::Poll] {
-                let label_prefix = format!("scale_c_{}", experiment.label());
-                let slots = match transport {
-                    Transport::Push => precreate_push_slots(&mut setup, &label_prefix, n),
-                    Transport::Poll => {
-                        precreate_poll_slots(&mut setup, &label_prefix, POLL_INTERVAL, n)
-                    }
-                };
-                // Each cell needs MAX_N * per_producer_width = 100 * 1M = 100M
-                // distinct ids. Use a 500M increment to leave plenty of headroom.
-                id_counter += 500_000_000;
-                let id_base = id_counter;
-
-                let baseline = snapshot_server_load(&mut setup);
-                let pg_sql_url_cloned = pg_sql_url.clone();
-                let pg_repl_url_cloned = pg_repl_url.clone();
-                let catalog_cloned = Arc::clone(&catalog);
-                let table_id = table_ids.orders;
-
-                let pooled_latencies = rt.block_on(async move {
-                    let handles = match transport {
-                        Transport::Push => {
-                            spawn_n_push_consumers(
-                                n,
-                                &label_prefix,
-                                &pg_repl_url_cloned,
-                                publication,
-                                Arc::clone(&catalog_cloned),
-                                STATUS_INTERVAL,
-                                BUFFER_CAPACITY,
-                            )
-                            .await
-                        }
-                        Transport::Poll => {
-                            spawn_n_poll_consumers(
-                                n,
-                                &label_prefix,
-                                &pg_sql_url_cloned,
-                                publication,
-                                Arc::clone(&catalog_cloned),
-                                POLL_INTERVAL,
-                                BUFFER_CAPACITY,
-                            )
-                            .await
-                        }
-                    };
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-
-                    let (commits_per_producer, producer_tasks) = match experiment {
-                        Experiment::PerConsumerProducers => {
-                            spawn_n_producers(
-                                n,
-                                &pg_sql_url_cloned,
-                                id_base,
-                                PER_CONSUMER_RATE_A,
-                                WINDOW,
-                                table_id,
-                            )
-                            .await
-                        }
-                        Experiment::SharedProducer => {
-                            spawn_n_producers(
-                                1,
-                                &pg_sql_url_cloned,
-                                id_base,
-                                SHARED_RATE_B,
-                                WINDOW,
-                                table_id,
-                            )
-                            .await
-                        }
-                    };
-                    for t in producer_tasks {
-                        let _ = t.await;
-                    }
-
-                    let deadline = Instant::now() + Duration::from_secs(5) + POLL_INTERVAL * 4;
-                    let observations = drain_n(handles, deadline).await;
-                    pool_latencies(&commits_per_producer, &observations)
-                });
-                let after = snapshot_server_load(&mut setup);
-                let delta = snapshot_delta(&baseline, &after);
-
+                let mut per_trial_medians: Vec<f64> = Vec::new();
+                let mut per_trial_xact: Vec<f64> = Vec::new();
+                let mut per_trial_active_pid: Vec<i64> = Vec::new();
+                let mut pooled_latencies_all: Vec<Duration> = Vec::new();
                 let scale_key = format!("{}_n{n}", experiment.label());
                 let cell_key = transport.label().to_string();
-                if pooled_latencies.is_empty() {
+
+                for trial in 0..TRIALS_PER_CELL {
+                    let label_prefix = format!("scale_c_{}_t{trial}", experiment.label());
+                    let slots = match transport {
+                        Transport::Push => precreate_push_slots(&mut setup, &label_prefix, n),
+                        Transport::Poll => {
+                            precreate_poll_slots(&mut setup, &label_prefix, POLL_INTERVAL, n)
+                        }
+                    };
+                    // Per-trial id increment. MAX_N * per_producer_width = 100 * 1M.
+                    // Use 500M to leave headroom and never collide.
+                    id_counter += 500_000_000;
+                    let id_base = id_counter;
+
+                    let baseline = snapshot_server_load(&mut setup);
+                    let pg_sql_url_cloned = pg_sql_url.clone();
+                    let pg_repl_url_cloned = pg_repl_url.clone();
+                    let catalog_cloned = Arc::clone(&catalog);
+                    let table_id = table_ids.orders;
+
+                    let trial_latencies = rt.block_on(async move {
+                        let handles = match transport {
+                            Transport::Push => {
+                                spawn_n_push_consumers(
+                                    n,
+                                    &label_prefix,
+                                    &pg_repl_url_cloned,
+                                    publication,
+                                    Arc::clone(&catalog_cloned),
+                                    STATUS_INTERVAL,
+                                    BUFFER_CAPACITY,
+                                )
+                                .await
+                            }
+                            Transport::Poll => {
+                                spawn_n_poll_consumers(
+                                    n,
+                                    &label_prefix,
+                                    &pg_sql_url_cloned,
+                                    publication,
+                                    Arc::clone(&catalog_cloned),
+                                    POLL_INTERVAL,
+                                    BUFFER_CAPACITY,
+                                )
+                                .await
+                            }
+                        };
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+
+                        let (commits_per_producer, producer_tasks) = match experiment {
+                            Experiment::PerConsumerProducers => {
+                                spawn_n_producers(
+                                    n,
+                                    &pg_sql_url_cloned,
+                                    id_base,
+                                    PER_CONSUMER_RATE_A,
+                                    WINDOW,
+                                    table_id,
+                                )
+                                .await
+                            }
+                            Experiment::SharedProducer => {
+                                spawn_n_producers(
+                                    1,
+                                    &pg_sql_url_cloned,
+                                    id_base,
+                                    SHARED_RATE_B,
+                                    WINDOW,
+                                    table_id,
+                                )
+                                .await
+                            }
+                        };
+                        for t in producer_tasks {
+                            let _ = t.await;
+                        }
+
+                        let deadline = Instant::now() + Duration::from_secs(5) + POLL_INTERVAL * 4;
+                        let observations = drain_n(handles, deadline).await;
+                        pool_latencies(&commits_per_producer, &observations)
+                    });
+                    let after = snapshot_server_load(&mut setup);
+                    let delta = snapshot_delta(&baseline, &after);
+
+                    if !trial_latencies.is_empty() {
+                        let stats = LatencyStats::new(cell_key.clone(), trial_latencies.clone());
+                        let median = ms_of(stats.median());
+                        let p99 = ms_of(stats.p99());
+                        per_trial_medians.push(median);
+                        per_trial_xact.push(delta.xact_commit_per_sec);
+                        per_trial_active_pid.push(delta.active_pid_count_end);
+                        tsv.row(
+                            "consumers",
+                            &scale_key,
+                            &cell_key,
+                            &format!("trial{trial}_median_ms"),
+                            median,
+                        );
+                        tsv.row(
+                            "consumers",
+                            &scale_key,
+                            &cell_key,
+                            &format!("trial{trial}_p99_ms"),
+                            p99,
+                        );
+                        tsv.row(
+                            "consumers",
+                            &scale_key,
+                            &cell_key,
+                            &format!("trial{trial}_xact_commit_per_sec"),
+                            delta.xact_commit_per_sec,
+                        );
+                        tsv.row(
+                            "consumers",
+                            &scale_key,
+                            &cell_key,
+                            &format!("trial{trial}_tup_inserted_per_sec"),
+                            delta.tup_inserted_per_sec,
+                        );
+                        tsv.row_int(
+                            "consumers",
+                            &scale_key,
+                            &cell_key,
+                            &format!("trial{trial}_active_pid_count_end"),
+                            delta.active_pid_count_end,
+                        );
+                    }
+                    pooled_latencies_all.extend(trial_latencies);
+
+                    for slot in &slots {
+                        force_drop_slot(&mut setup, slot);
+                    }
+                }
+
+                // Per-cell pooled summary across trials.
+                if pooled_latencies_all.is_empty() {
                     println!(
-                        "  {:<35}  N={:>3}  {:<10}  NO SAMPLES  active_pid_end={}",
+                        "  {:<35}  N={:>3}  {:<10}  NO SAMPLES (any trial)",
                         experiment.label(),
                         n,
                         cell_key,
-                        delta.active_pid_count_end,
                     );
                 } else {
-                    let stats = LatencyStats::new(cell_key.clone(), pooled_latencies.clone());
+                    let stats = LatencyStats::new(cell_key.clone(), pooled_latencies_all.clone());
                     tsv.row(
                         "consumers",
                         &scale_key,
                         &cell_key,
-                        "median_ms",
+                        "pooled_median_ms",
                         ms_of(stats.median()),
                     );
                     tsv.row(
                         "consumers",
                         &scale_key,
                         &cell_key,
-                        "p99_ms",
+                        "pooled_p99_ms",
                         ms_of(stats.p99()),
                     );
                     tsv.row(
@@ -392,60 +449,64 @@ fn main() {
                         "samples",
                         stats.samples.len() as f64,
                     );
+                    // Across-trial mean + std for the summary printout.
+                    let avg = |v: &[f64]| -> f64 {
+                        if v.is_empty() {
+                            0.0
+                        } else {
+                            v.iter().sum::<f64>() / v.len() as f64
+                        }
+                    };
+                    let stddev = |v: &[f64]| -> f64 {
+                        if v.len() < 2 {
+                            0.0
+                        } else {
+                            let m = avg(v);
+                            let var = v.iter().map(|x| (x - m).powi(2)).sum::<f64>()
+                                / (v.len() - 1) as f64;
+                            var.sqrt()
+                        }
+                    };
+                    let median_mean = avg(&per_trial_medians);
+                    let median_std = stddev(&per_trial_medians);
+                    let xact_mean = avg(&per_trial_xact);
+                    let xact_std = stddev(&per_trial_xact);
                     println!(
-                        "  {:<35}  N={:>3}  {:<10}  median={:>6.1}ms  p99={:>6.1}ms  active_pid_end={}  xact/s={:.0}  tup/s={:.0}",
+                        "  {:<35}  N={:>3}  {:<10}  median(mean±std)={median_mean:>6.1}±{median_std:.1}ms  pooled={:>6.1}ms  xact/s={xact_mean:.0}±{xact_std:.0}",
                         experiment.label(),
                         n,
                         cell_key,
                         ms_of(stats.median()),
-                        ms_of(stats.p99()),
-                        delta.active_pid_count_end,
-                        delta.xact_commit_per_sec,
-                        delta.tup_inserted_per_sec,
+                    );
+                    tsv.row(
+                        "consumers",
+                        &scale_key,
+                        &cell_key,
+                        "across_trial_median_mean_ms",
+                        median_mean,
+                    );
+                    tsv.row(
+                        "consumers",
+                        &scale_key,
+                        &cell_key,
+                        "across_trial_median_std_ms",
+                        median_std,
+                    );
+                    tsv.row(
+                        "consumers",
+                        &scale_key,
+                        &cell_key,
+                        "across_trial_xact_mean",
+                        xact_mean,
+                    );
+                    tsv.row(
+                        "consumers",
+                        &scale_key,
+                        &cell_key,
+                        "across_trial_xact_std",
+                        xact_std,
                     );
                 }
-                tsv.row(
-                    "consumers",
-                    &scale_key,
-                    &cell_key,
-                    "xact_commit_per_sec",
-                    delta.xact_commit_per_sec,
-                );
-                tsv.row(
-                    "consumers",
-                    &scale_key,
-                    &cell_key,
-                    "tup_inserted_per_sec",
-                    delta.tup_inserted_per_sec,
-                );
-                tsv.row_int(
-                    "consumers",
-                    &scale_key,
-                    &cell_key,
-                    "active_pid_count_end",
-                    delta.active_pid_count_end,
-                );
-                tsv.row_int(
-                    "consumers",
-                    &scale_key,
-                    &cell_key,
-                    "active_query_count_end",
-                    delta.active_query_count_end,
-                );
-                tsv.row_int(
-                    "consumers",
-                    &scale_key,
-                    &cell_key,
-                    "slot_count_end",
-                    delta.slot_count_end,
-                );
-                tsv.row_int(
-                    "consumers",
-                    &scale_key,
-                    &cell_key,
-                    "wal_bytes_written",
-                    delta.wal_bytes_written,
-                );
                 tsv.row_int(
                     "consumers",
                     &scale_key,
@@ -453,10 +514,21 @@ fn main() {
                     "consumer_count",
                     n as i64,
                 );
-
-                for slot in &slots {
-                    force_drop_slot(&mut setup, slot);
-                }
+                // Per-trial active_pid is what scaled; emit the mean for
+                // an across-trial number consumers of the TSV can read.
+                let active_mean: f64 = if per_trial_active_pid.is_empty() {
+                    0.0
+                } else {
+                    per_trial_active_pid.iter().sum::<i64>() as f64
+                        / per_trial_active_pid.len() as f64
+                };
+                tsv.row(
+                    "consumers",
+                    &scale_key,
+                    &cell_key,
+                    "across_trial_active_pid_end_mean",
+                    active_mean,
+                );
             }
             println!();
         }

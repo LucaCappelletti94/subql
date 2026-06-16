@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 1000 600"
+     width="1000" height="600"
+     font-family="Inter, Helvetica, Arial, sans-serif">
+  <title>subql mesh topology T2: PG-native logical replication tree</title>
+  <desc>One primary Postgres takes writes; (M-1) replicas receive
+        replicated rows via PG-native CREATE SUBSCRIPTION. subql
+        consumers attach to every node and observe a ~130 ms delay
+        on replicas relative to the primary.</desc>
+
+  <defs>
+    <style type="text/css"><![CDATA[
+      .role          { stroke-width: 1.5; }
+      .role-writer   { fill: #e8f5e9; stroke: #2e7d32; }
+      .role-pg       { fill: #e8f5e9; stroke: #2e7d32; }
+      .role-pg-replica { fill: #f1f8e9; stroke: #558b2f; stroke-width: 1.5;
+                         stroke-dasharray: 4 3; }
+      .role-pub      { fill: #c8e6c9; stroke: #2e7d32; }
+      .role-slot     { fill: #fff3e0; stroke: #ef6c00; }
+      .role-cdc      { fill: #ede7f6; stroke: #5e35b1; }
+      .role-app      { fill: none; stroke: #1565c0; stroke-width: 1.5;
+                       stroke-dasharray: 6 4; }
+
+      .ink           { fill: #212121; font-size: 14px; }
+      .ink-small     { fill: #212121; font-size: 11px; }
+      .ink-title     { fill: #212121; font-size: 20px; font-weight: 600; }
+      .ink-caption   { fill: #424242; font-size: 12px; font-style: italic; }
+      .ink-label     { fill: #424242; font-size: 11px; font-weight: 500; }
+      .ink-replica   { fill: #0277bd; font-size: 12px; font-weight: 600; }
+
+      .arrow         { fill: none; stroke-linecap: round; }
+      .evt           { stroke: #424242; stroke-width: 2; }
+      .replication   { stroke: #0288d1; stroke-width: 2.5;
+                       stroke-dasharray: 6 4; }
+    ]]></style>
+    <marker id="head-evt" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#424242"/>
+    </marker>
+    <marker id="head-replication" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0288d1"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text class="ink-title" x="500" y="40" text-anchor="middle">
+    topology T2: PG-native logical replication tree
+  </text>
+  <text class="ink-caption" x="500" y="62" text-anchor="middle">
+    one primary takes writes; replicas observe ~130 ms later
+  </text>
+
+  <!-- subql container at top -->
+  <rect class="role role-app" x="80" y="100" width="880" height="120"
+        rx="10" ry="10"/>
+  <text class="ink" x="500" y="128" text-anchor="middle">subql</text>
+
+  <!-- CDC consumers (one per PG) -->
+  <rect class="role role-cdc" x="120" y="148" width="160" height="40"
+        rx="6" ry="6"/>
+  <text class="ink-small" x="200" y="172" text-anchor="middle">
+    CDC consumer (primary)
+  </text>
+
+  <rect class="role role-cdc" x="440" y="148" width="160" height="40"
+        rx="6" ry="6"/>
+  <text class="ink-small" x="520" y="172" text-anchor="middle">
+    CDC consumer (replica 1)
+  </text>
+
+  <rect class="role role-cdc" x="760" y="148" width="160" height="40"
+        rx="6" ry="6"/>
+  <text class="ink-small" x="840" y="172" text-anchor="middle">
+    CDC consumer (replica 2)
+  </text>
+
+  <!-- Primary PG -->
+  <rect class="role role-pg" x="100" y="320" width="200" height="180"
+        rx="8" ry="8"/>
+  <text class="ink" x="200" y="350" text-anchor="middle">
+    Postgres (primary)
+  </text>
+  <rect class="role role-writer" x="120" y="366" width="76" height="30"
+        rx="4" ry="4"/>
+  <text class="ink-small" x="158" y="385" text-anchor="middle">writer</text>
+  <rect class="role role-pub" x="208" y="366" width="76" height="30"
+        rx="4" ry="4"/>
+  <text class="ink-small" x="246" y="385" text-anchor="middle">pub</text>
+  <rect class="role role-slot" x="120" y="412" width="164" height="34"
+        rx="4" ry="4"/>
+  <text class="ink-small" x="202" y="433" text-anchor="middle">slot</text>
+  <text class="ink-small" x="200" y="476" text-anchor="middle"
+        style="fill:#424242">+0 ms (origin)</text>
+
+  <!-- Replica 1 -->
+  <rect class="role role-pg-replica" x="420" y="320" width="200" height="180"
+        rx="8" ry="8"/>
+  <text class="ink" x="520" y="350" text-anchor="middle">
+    Postgres (replica 1)
+  </text>
+  <rect class="role role-pub" x="528" y="366" width="76" height="30"
+        rx="4" ry="4"/>
+  <text class="ink-small" x="566" y="385" text-anchor="middle">pub</text>
+  <rect class="role role-slot" x="440" y="366" width="76" height="30"
+        rx="4" ry="4"/>
+  <text class="ink-small" x="478" y="385" text-anchor="middle">slot</text>
+  <text class="ink-small" x="520" y="425" text-anchor="middle">
+    (no writer - apply worker only)
+  </text>
+  <text class="ink-replica" x="520" y="476" text-anchor="middle">
+    +130 ms
+  </text>
+
+  <!-- Replica 2 -->
+  <rect class="role role-pg-replica" x="740" y="320" width="200" height="180"
+        rx="8" ry="8"/>
+  <text class="ink" x="840" y="350" text-anchor="middle">
+    Postgres (replica 2)
+  </text>
+  <rect class="role role-pub" x="848" y="366" width="76" height="30"
+        rx="4" ry="4"/>
+  <text class="ink-small" x="886" y="385" text-anchor="middle">pub</text>
+  <rect class="role role-slot" x="760" y="366" width="76" height="30"
+        rx="4" ry="4"/>
+  <text class="ink-small" x="798" y="385" text-anchor="middle">slot</text>
+  <text class="ink-small" x="840" y="425" text-anchor="middle">
+    (no writer - apply worker only)
+  </text>
+  <text class="ink-replica" x="840" y="476" text-anchor="middle">
+    +130 ms
+  </text>
+
+  <!-- Event flow from each PG up to its CDC consumer -->
+  <line class="arrow evt" x1="200" y1="318" x2="200" y2="190"
+        marker-end="url(#head-evt)"/>
+  <line class="arrow evt" x1="520" y1="318" x2="520" y2="190"
+        marker-end="url(#head-evt)"/>
+  <line class="arrow evt" x1="840" y1="318" x2="840" y2="190"
+        marker-end="url(#head-evt)"/>
+
+  <!-- PG-native logical replication from primary to replicas -->
+  <path class="arrow replication" d="M300 410 Q360 410 418 410"
+        marker-end="url(#head-replication)"/>
+  <text class="ink-replica" x="360" y="400" text-anchor="middle">
+    PG logical replication
+  </text>
+
+  <path class="arrow replication" d="M300 432 Q500 540 740 432"
+        marker-end="url(#head-replication)"/>
+  <text class="ink-replica" x="520" y="555" text-anchor="middle">
+    PG logical replication
+  </text>
+</svg>
