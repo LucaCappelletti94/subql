@@ -28,9 +28,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::{
-    AdvanceCursorError, DefaultIds, OpaqueCheckpoint, SubscriptionEngine, SubscriptionId,
-};
+use subql::{AdvanceCursorError, DefaultIds, OpaqueCheckpoint, SubscriptionEngine, SubscriptionId};
 
 const MAX_SESSIONS: u64 = 4;
 const MAX_SUBS: u64 = 4;
@@ -42,7 +40,10 @@ type Model = HashMap<(SessionId, SubscriptionId), OpaqueCheckpoint>;
 
 fn fresh_engine() -> Engine {
     SubscriptionEngine::new(
-        Arc::new(ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE orders (id INT PRIMARY KEY);").unwrap()),
+        Arc::new(
+            ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE orders (id INT PRIMARY KEY);")
+                .unwrap(),
+        ),
         PostgreSqlDialect {},
     )
 }
@@ -185,7 +186,13 @@ fn assert_invariants(engine: &Engine, model: &Model) {
 
         let mut model_pairs: Vec<(SubscriptionId, OpaqueCheckpoint)> = model
             .iter()
-            .filter_map(|((sess, sub), c)| if *sess == s { Some((*sub, c.clone())) } else { None })
+            .filter_map(|((sess, sub), c)| {
+                if *sess == s {
+                    Some((*sub, c.clone()))
+                } else {
+                    None
+                }
+            })
             .collect();
         model_pairs.sort_by_key(|(sub, _)| *sub);
 
