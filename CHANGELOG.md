@@ -10,6 +10,8 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Added
 
+- Per-`(session, subscription)` resume cursor on `SubscriptionEngine` for connetto-rs `Q6.4`. Materializer-pushed model: explicit `advance_cursor(session_id, sub_id, checkpoint)` after each successful dispatch. Monotonic by default (a rewind returns `AdvanceCursorError::NonMonotonic` without mutating); `force_set_cursor(...)` is the snapshot-bootstrap / recovery escape hatch. Reads via `cursor_for(...)` and `cursors_for_session(...)`. Explicit removal via `drop_cursor(...)`. Cleanup is automatic on `unregister_session(...)` (drops every cursor for that session) and `unregister_subscription(...)` (drops every cursor for that subscription across every session). Cursors are stored as `OpaqueCheckpoint` so the engine stays free of a struct-level `C: Checkpoint` generic; the materializer serialises its concrete checkpoint type at the boundary. In-memory only; on engine restart every client gets a full re-sync on reconnect, matching `Q5.4`.
+- `AdvanceCursorError::NonMonotonic { previous, attempted }` returned by `advance_cursor` on a rewind attempt.
 - `AsyncAutoResolvingEngine::inflight() -> usize` reports the number of re-execution permits currently held (concurrent connector calls in flight). Returns 0 when no cap is configured.
 - `AsyncAutoResolvingEngine::concurrency_cap() -> Option<usize>` reports the configured cap.
 - `async-lock` dependency (runtime-agnostic `Semaphore`, `no_std + alloc`).

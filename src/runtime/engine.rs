@@ -226,6 +226,19 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     /// Persistence strictness policy for registration.
     #[cfg(feature = "std")]
     durability_mode: DurabilityMode,
+    /// Per-`(session, subscription)` resume cursor.
+    ///
+    /// Stored as an [`OpaqueCheckpoint`] so the engine does not have to
+    /// carry a struct-level `C: Checkpoint` generic; the materializer
+    /// serialises its concrete checkpoint type (`PgLsn`,
+    /// `MysqlBinlogPos`, ...) to bytes before installing, deserialises
+    /// on read. The map's cleanup is hooked into
+    /// [`unregister_session`](Self::unregister_session) and the
+    /// per-subscription unregister paths so cursors never outlive
+    /// their owning subscription.
+    ///
+    /// See `connetto-rs` Q6.4 for the underlying delegation.
+    resume_cursors: HashMap<(I::SessionId, SubscriptionId), crate::OpaqueCheckpoint>,
 }
 
 /// Look up the partition and consumer dictionary for a table, or return
@@ -475,6 +488,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             merge_manager: MergeManager::new(),
             #[cfg(feature = "std")]
             durability_mode: DurabilityMode::Required,
+            resume_cursors: HashMap::new(),
         }
     }
 
@@ -1081,9 +1095,121 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// Unregister a subscription
     ///
     /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
+    /// Also drops every per-session resume cursor associated with this
+    /// `subscription_id` so cursors never outlive their owning subscription.
     pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
-        self.unregister_subscription_internal(subscription_id)
-            .is_some()
+        let removed = self
+            .unregister_subscription_internal(subscription_id)
+            .is_some();
+        self.resume_cursors
+            .retain(|(_, sub_id), _| *sub_id != subscription_id);
+        removed
+    }
+
+    // ----------------------------------------------------------------
+    // Per-`(session, subscription)` resume cursor API. See
+    // `connetto-rs` Q6.4 (`docs/architecture/open-questions.md`) for
+    // the underlying contract. The cursor is the position the
+    // materializer last successfully dispatched to the client; on
+    // reconnect the materializer compares it against its own oplog
+    // watermark to decide catchup vs full re-sync.
+    // ----------------------------------------------------------------
+
+    /// Advance the resume cursor for `(session_id, sub_id)` to
+    /// `checkpoint`.
+    ///
+    /// Returns `Ok(None)` when no cursor was previously stored for the
+    /// pair (i.e. this is the first advance), and `Ok(Some(previous))`
+    /// when an existing cursor was overwritten.
+    ///
+    /// Returns [`AdvanceCursorError::NonMonotonic`] when `checkpoint`
+    /// is strictly less than the stored value (a rewind) and **does
+    /// not** mutate the map. A successful dispatch never moves a
+    /// client backwards in the CDC stream, so a rewind is always a
+    /// caller bug; use [`force_set_cursor`](Self::force_set_cursor)
+    /// for the legitimate snapshot-bootstrap / recovery escape hatch.
+    ///
+    /// # Errors
+    ///
+    /// [`AdvanceCursorError::NonMonotonic`] when `checkpoint < previous`.
+    pub fn advance_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+        checkpoint: crate::OpaqueCheckpoint,
+    ) -> Result<Option<crate::OpaqueCheckpoint>, crate::AdvanceCursorError> {
+        if let Some(previous) = self.resume_cursors.get(&(session_id, sub_id)) {
+            if checkpoint < *previous {
+                return Err(crate::AdvanceCursorError::NonMonotonic {
+                    previous: previous.clone(),
+                    attempted: checkpoint,
+                });
+            }
+        }
+        Ok(self.resume_cursors.insert((session_id, sub_id), checkpoint))
+    }
+
+    /// Set the resume cursor for `(session_id, sub_id)`
+    /// unconditionally, bypassing the monotonic check enforced by
+    /// [`advance_cursor`](Self::advance_cursor).
+    ///
+    /// The intended use is snapshot bootstrap (the materializer
+    /// installs the snapshot LSN after the initial sync) and
+    /// operator-driven recovery from a stuck state. The normal
+    /// happy-path dispatch flow should always use
+    /// [`advance_cursor`](Self::advance_cursor).
+    ///
+    /// Returns the previously stored cursor, if any.
+    pub fn force_set_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+        checkpoint: crate::OpaqueCheckpoint,
+    ) -> Option<crate::OpaqueCheckpoint> {
+        self.resume_cursors.insert((session_id, sub_id), checkpoint)
+    }
+
+    /// Look up the current resume cursor for `(session_id, sub_id)`.
+    #[must_use]
+    pub fn cursor_for(
+        &self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+    ) -> Option<&crate::OpaqueCheckpoint> {
+        self.resume_cursors.get(&(session_id, sub_id))
+    }
+
+    /// Iterator over `(subscription_id, cursor)` for every cursor stored
+    /// against `session_id`. The order is unspecified.
+    ///
+    /// Typical usage on reconnect: the materializer iterates this to
+    /// build the catchup plan for every subscription the session was
+    /// observing.
+    pub fn cursors_for_session(
+        &self,
+        session_id: I::SessionId,
+    ) -> impl Iterator<Item = (SubscriptionId, &crate::OpaqueCheckpoint)> + '_ {
+        self.resume_cursors.iter().filter_map(move |((s, sub), c)| {
+            if *s == session_id {
+                Some((*sub, c))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Remove the resume cursor for `(session_id, sub_id)` and return
+    /// the previously stored value, if any. Intended for the
+    /// materializer's "I am done with this subscription on this
+    /// session" path; routine cleanup happens automatically via
+    /// [`unregister_session`](Self::unregister_session) and
+    /// [`unregister_subscription`](Self::unregister_subscription).
+    pub fn drop_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+    ) -> Option<crate::OpaqueCheckpoint> {
+        self.resume_cursors.remove(&(session_id, sub_id))
     }
 
     fn cleanup_consumer_if_unreferenced(&mut self, table_id: TableId, consumer_id: I::ConsumerId) {
@@ -1472,7 +1598,13 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     /// Unregister all subscriptions for a session
+    ///
+    /// Also drops every resume cursor stored for `session_id` (across
+    /// every subscription) so cursors never outlive their owning
+    /// session.
     pub fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
+        self.resume_cursors.retain(|(s, _), _| *s != session_id);
+
         let mut removed_bindings = 0;
         let mut removed_predicates = 0;
         let mut removed_consumers = 0;
@@ -6545,5 +6677,137 @@ mod tests {
         };
         let iter = notifs.into_iter();
         assert_eq!(iter.size_hint(), (3, Some(3)));
+    }
+
+    // ----------------------------------------------------------------
+    // Per-`(session, subscription)` resume cursor (Q6.4)
+    // ----------------------------------------------------------------
+
+    fn cursor(bytes: &[u8]) -> crate::OpaqueCheckpoint {
+        crate::OpaqueCheckpoint(bytes.to_vec())
+    }
+
+    fn cursor_engine() -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
+        SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
+            make_catalog(),
+            PostgreSqlDialect {},
+        )
+    }
+
+    /// First `advance_cursor` on a `(session, sub)` returns `Ok(None)`
+    /// and stores the value.
+    #[test]
+    fn resume_cursor_first_advance_returns_none() {
+        let mut e = cursor_engine();
+        let result = e.advance_cursor(7u64, 42u64, cursor(b"\x00\x01"));
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(e.cursor_for(7u64, 42u64), Some(&cursor(b"\x00\x01")));
+    }
+
+    /// Monotonic advance returns `Ok(Some(previous))` and updates the
+    /// stored value.
+    #[test]
+    fn resume_cursor_monotonic_advance_returns_previous() {
+        let mut e = cursor_engine();
+        let _ = e.advance_cursor(7u64, 42u64, cursor(b"\x00\x01")).unwrap();
+        let result = e.advance_cursor(7u64, 42u64, cursor(b"\x00\x02"));
+        assert!(matches!(result, Ok(Some(_))));
+        assert_eq!(result.unwrap(), Some(cursor(b"\x00\x01")));
+        assert_eq!(e.cursor_for(7u64, 42u64), Some(&cursor(b"\x00\x02")));
+    }
+
+    /// Rewind is rejected with `NonMonotonic` and the stored value is
+    /// unchanged.
+    #[test]
+    fn resume_cursor_rewind_is_rejected_and_does_not_mutate() {
+        let mut e = cursor_engine();
+        let _ = e.advance_cursor(7u64, 42u64, cursor(b"\x00\x05")).unwrap();
+        let result = e.advance_cursor(7u64, 42u64, cursor(b"\x00\x03"));
+        assert_eq!(
+            result,
+            Err(crate::AdvanceCursorError::NonMonotonic {
+                previous: cursor(b"\x00\x05"),
+                attempted: cursor(b"\x00\x03"),
+            })
+        );
+        assert_eq!(
+            e.cursor_for(7u64, 42u64),
+            Some(&cursor(b"\x00\x05")),
+            "rewind must not mutate the stored cursor"
+        );
+    }
+
+    /// `force_set_cursor` overwrites unconditionally and returns the
+    /// previous value.
+    #[test]
+    fn resume_cursor_force_set_overwrites_unconditionally() {
+        let mut e = cursor_engine();
+        let _ = e.advance_cursor(7u64, 42u64, cursor(b"\x00\x09")).unwrap();
+        let prev = e.force_set_cursor(7u64, 42u64, cursor(b"\x00\x01"));
+        assert_eq!(prev, Some(cursor(b"\x00\x09")));
+        assert_eq!(e.cursor_for(7u64, 42u64), Some(&cursor(b"\x00\x01")));
+    }
+
+    /// `cursors_for_session` iterates only the requested session.
+    #[test]
+    fn resume_cursor_cursors_for_session_filters_correctly() {
+        let mut e = cursor_engine();
+        e.advance_cursor(1u64, 100u64, cursor(b"\x00\x01")).unwrap();
+        e.advance_cursor(1u64, 200u64, cursor(b"\x00\x02")).unwrap();
+        e.advance_cursor(2u64, 100u64, cursor(b"\x00\x03")).unwrap();
+        let mut session_one: Vec<(SubscriptionId, crate::OpaqueCheckpoint)> = e
+            .cursors_for_session(1u64)
+            .map(|(s, c)| (s, c.clone()))
+            .collect();
+        session_one.sort_by_key(|(s, _)| *s);
+        assert_eq!(
+            session_one,
+            vec![(100u64, cursor(b"\x00\x01")), (200u64, cursor(b"\x00\x02")),]
+        );
+    }
+
+    /// `unregister_session` drops every cursor with `session_id == s`
+    /// and leaves cursors for other sessions intact.
+    #[test]
+    fn resume_cursor_unregister_session_drops_session_cursors_only() {
+        let mut e = cursor_engine();
+        e.advance_cursor(1u64, 100u64, cursor(b"\x00\x01")).unwrap();
+        e.advance_cursor(1u64, 200u64, cursor(b"\x00\x02")).unwrap();
+        e.advance_cursor(2u64, 100u64, cursor(b"\x00\x03")).unwrap();
+
+        let _ = e.unregister_session(1u64);
+
+        assert_eq!(e.cursor_for(1u64, 100u64), None);
+        assert_eq!(e.cursor_for(1u64, 200u64), None);
+        assert_eq!(e.cursor_for(2u64, 100u64), Some(&cursor(b"\x00\x03")));
+    }
+
+    /// `unregister_subscription` drops every cursor with that
+    /// `sub_id`, across every session, and leaves cursors for other
+    /// subscriptions intact.
+    #[test]
+    fn resume_cursor_unregister_subscription_drops_sub_cursors_across_sessions() {
+        let mut e = cursor_engine();
+        e.advance_cursor(1u64, 100u64, cursor(b"\x00\x01")).unwrap();
+        e.advance_cursor(2u64, 100u64, cursor(b"\x00\x02")).unwrap();
+        e.advance_cursor(1u64, 200u64, cursor(b"\x00\x03")).unwrap();
+
+        // 100 is not actually a registered subscription, but the cursor
+        // cleanup runs unconditionally on the resume_cursors map.
+        let _ = e.unregister_subscription(100u64);
+
+        assert_eq!(e.cursor_for(1u64, 100u64), None);
+        assert_eq!(e.cursor_for(2u64, 100u64), None);
+        assert_eq!(e.cursor_for(1u64, 200u64), Some(&cursor(b"\x00\x03")));
+    }
+
+    /// `drop_cursor` returns the removed cursor and clears the entry.
+    #[test]
+    fn resume_cursor_drop_cursor_returns_and_removes() {
+        let mut e = cursor_engine();
+        e.advance_cursor(7u64, 42u64, cursor(b"\x00\x01")).unwrap();
+        let dropped = e.drop_cursor(7u64, 42u64);
+        assert_eq!(dropped, Some(cursor(b"\x00\x01")));
+        assert_eq!(e.cursor_for(7u64, 42u64), None);
     }
 }

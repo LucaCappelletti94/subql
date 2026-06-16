@@ -6,6 +6,30 @@ use crate::{persistence::shard::ShardFingerprintEnvelope, MergeJobId};
 use alloc::string::String;
 use thiserror::Error;
 
+/// Errors returned by [`crate::SubscriptionEngine::advance_cursor`].
+///
+/// Triggered only when the materializer tries to install a cursor that
+/// is strictly older than the one already stored for that
+/// `(session, subscription)` pair, which would never be correct: a
+/// successful dispatch never moves a client *backwards* in the CDC
+/// stream. If a rewind is genuinely needed (snapshot bootstrap,
+/// recovery from a stuck state), use
+/// [`crate::SubscriptionEngine::force_set_cursor`] instead.
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AdvanceCursorError {
+    /// The proposed cursor is strictly older than the one already
+    /// stored. The map is NOT mutated when this error is returned.
+    #[error("cursor rewind rejected: previous={previous:?}, attempted={attempted:?}")]
+    NonMonotonic {
+        /// Cursor already stored for `(session, subscription)` at the
+        /// moment of the call.
+        previous: crate::OpaqueCheckpoint,
+        /// Cursor the caller tried to install.
+        attempted: crate::OpaqueCheckpoint,
+    },
+}
+
 /// Errors during subscription registration
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
