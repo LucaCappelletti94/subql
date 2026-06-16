@@ -123,9 +123,11 @@ pub fn pg_with_wal2json() -> Container<GenericImage> {
             "-c",
             "wal_level=logical",
             "-c",
-            "max_wal_senders=32",
+            "max_wal_senders=128",
             "-c",
-            "max_replication_slots=32",
+            "max_replication_slots=128",
+            "-c",
+            "max_connections=256",
         ])
         .with_startup_timeout(Duration::from_secs(60))
         .start()
@@ -700,4 +702,346 @@ where
         }
     });
     (rx, task)
+}
+
+// ----------------------------------------------------------------------
+// Server-side load snapshots
+// ----------------------------------------------------------------------
+
+/// Snapshot of PG server-side counters at a moment in time. Pair two
+/// snapshots with [`snapshot_delta`] to compute rates and totals over
+/// a measurement window.
+#[derive(Debug, Clone)]
+pub struct ServerLoadSnapshot {
+    pub taken_at: Instant,
+    pub xact_commit: i64,
+    pub xact_rollback: i64,
+    pub tup_inserted: i64,
+    pub tup_updated: i64,
+    pub tup_deleted: i64,
+    pub active_query_count: i64,
+    pub active_pid_count: i64,
+    pub slot_count: i64,
+    pub current_wal_lsn_bytes: i64,
+    pub per_slot_lag_bytes: Vec<(String, i64)>,
+}
+
+/// Take a [`ServerLoadSnapshot`] against the given DB connection.
+pub fn snapshot_server_load(conn: &mut PgConnection) -> ServerLoadSnapshot {
+    use diesel::sql_types::BigInt;
+
+    #[derive(diesel::QueryableByName)]
+    struct DbRow {
+        #[diesel(sql_type = BigInt)]
+        xact_commit: i64,
+        #[diesel(sql_type = BigInt)]
+        xact_rollback: i64,
+        #[diesel(sql_type = BigInt)]
+        tup_inserted: i64,
+        #[diesel(sql_type = BigInt)]
+        tup_updated: i64,
+        #[diesel(sql_type = BigInt)]
+        tup_deleted: i64,
+    }
+    let db: DbRow = sql_query(
+        "SELECT \
+            COALESCE(xact_commit, 0)::BIGINT AS xact_commit, \
+            COALESCE(xact_rollback, 0)::BIGINT AS xact_rollback, \
+            COALESCE(tup_inserted, 0)::BIGINT AS tup_inserted, \
+            COALESCE(tup_updated, 0)::BIGINT AS tup_updated, \
+            COALESCE(tup_deleted, 0)::BIGINT AS tup_deleted \
+         FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .get_result(conn)
+    .expect("query pg_stat_database");
+
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+    let active_q: CountRow = sql_query(
+        "SELECT COUNT(*)::BIGINT AS count FROM pg_stat_activity \
+         WHERE state = 'active' AND backend_type = 'client backend'",
+    )
+    .get_result(conn)
+    .expect("query active query count");
+
+    let active_pid: CountRow = sql_query(
+        "SELECT COUNT(*)::BIGINT AS count FROM pg_replication_slots \
+         WHERE active_pid IS NOT NULL",
+    )
+    .get_result(conn)
+    .expect("query active pid count");
+
+    let slot_total: CountRow =
+        sql_query("SELECT COUNT(*)::BIGINT AS count FROM pg_replication_slots")
+            .get_result(conn)
+            .expect("query slot count");
+
+    #[derive(diesel::QueryableByName)]
+    struct LsnRow {
+        #[diesel(sql_type = BigInt)]
+        lsn_bytes: i64,
+    }
+    let lsn: LsnRow =
+        sql_query("SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::BIGINT AS lsn_bytes")
+            .get_result(conn)
+            .expect("query current wal lsn");
+
+    #[derive(diesel::QueryableByName)]
+    struct SlotLagRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        slot_name: String,
+        #[diesel(sql_type = BigInt)]
+        lag_bytes: i64,
+    }
+    let slot_lags: Vec<SlotLagRow> = sql_query(
+        "SELECT slot_name, \
+            (pg_current_wal_lsn() - confirmed_flush_lsn)::BIGINT AS lag_bytes \
+         FROM pg_replication_slots \
+         WHERE confirmed_flush_lsn IS NOT NULL \
+         ORDER BY slot_name",
+    )
+    .load(conn)
+    .expect("query per-slot lag");
+
+    ServerLoadSnapshot {
+        taken_at: Instant::now(),
+        xact_commit: db.xact_commit,
+        xact_rollback: db.xact_rollback,
+        tup_inserted: db.tup_inserted,
+        tup_updated: db.tup_updated,
+        tup_deleted: db.tup_deleted,
+        active_query_count: active_q.count,
+        active_pid_count: active_pid.count,
+        slot_count: slot_total.count,
+        current_wal_lsn_bytes: lsn.lsn_bytes,
+        per_slot_lag_bytes: slot_lags
+            .into_iter()
+            .map(|r| (r.slot_name, r.lag_bytes))
+            .collect(),
+    }
+}
+
+/// Delta between two server-side snapshots: rates per second for
+/// counter columns plus end values for gauges.
+#[derive(Debug, Clone)]
+pub struct ServerLoadDelta {
+    pub window_secs: f64,
+    pub xact_commit_per_sec: f64,
+    pub xact_rollback_per_sec: f64,
+    pub tup_inserted_per_sec: f64,
+    pub tup_updated_per_sec: f64,
+    pub tup_deleted_per_sec: f64,
+    pub active_query_count_end: i64,
+    pub active_pid_count_end: i64,
+    pub slot_count_end: i64,
+    pub wal_bytes_written: i64,
+}
+
+#[must_use]
+pub fn snapshot_delta(before: &ServerLoadSnapshot, after: &ServerLoadSnapshot) -> ServerLoadDelta {
+    let window_secs = after
+        .taken_at
+        .saturating_duration_since(before.taken_at)
+        .as_secs_f64()
+        .max(1e-6);
+    #[allow(clippy::cast_precision_loss)]
+    let rate = |a: i64, b: i64| -> f64 { (a - b) as f64 / window_secs };
+    ServerLoadDelta {
+        window_secs,
+        xact_commit_per_sec: rate(after.xact_commit, before.xact_commit),
+        xact_rollback_per_sec: rate(after.xact_rollback, before.xact_rollback),
+        tup_inserted_per_sec: rate(after.tup_inserted, before.tup_inserted),
+        tup_updated_per_sec: rate(after.tup_updated, before.tup_updated),
+        tup_deleted_per_sec: rate(after.tup_deleted, before.tup_deleted),
+        active_query_count_end: after.active_query_count,
+        active_pid_count_end: after.active_pid_count,
+        slot_count_end: after.slot_count,
+        wal_bytes_written: after.current_wal_lsn_bytes - before.current_wal_lsn_bytes,
+    }
+}
+
+// ----------------------------------------------------------------------
+// TSV output helper
+// ----------------------------------------------------------------------
+
+/// Append-only TSV writer: every example writes one row per
+/// (experiment, scale_key, cell_key, metric, value). Schema is
+/// deliberately long-form so external tools (pandas, gnuplot) can
+/// pivot freely without parsing free-text Markdown.
+pub struct TsvWriter {
+    file: std::fs::File,
+}
+
+impl TsvWriter {
+    /// Open `path` for writing, truncating any existing file, and
+    /// emit the schema header.
+    pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let mut file = std::fs::File::create(path)?;
+        std::io::Write::write_all(
+            &mut file,
+            b"experiment\tscale_key\tcell_key\tmetric\tvalue\n",
+        )?;
+        Ok(Self { file })
+    }
+
+    pub fn row(
+        &mut self,
+        experiment: &str,
+        scale_key: &str,
+        cell_key: &str,
+        metric: &str,
+        value: f64,
+    ) {
+        let line = format!("{experiment}\t{scale_key}\t{cell_key}\t{metric}\t{value:.6}\n");
+        std::io::Write::write_all(&mut self.file, line.as_bytes()).expect("TSV row write");
+    }
+
+    pub fn row_int(
+        &mut self,
+        experiment: &str,
+        scale_key: &str,
+        cell_key: &str,
+        metric: &str,
+        value: i64,
+    ) {
+        let line = format!("{experiment}\t{scale_key}\t{cell_key}\t{metric}\t{value}\n");
+        std::io::Write::write_all(&mut self.file, line.as_bytes()).expect("TSV row write");
+    }
+}
+
+// ----------------------------------------------------------------------
+// Multi-consumer harness
+// ----------------------------------------------------------------------
+
+/// Force-drop a replication slot. Pair with the per-trial slot
+/// lifecycle so a single example can re-use slot names across trials
+/// without hitting `max_replication_slots`.
+pub fn force_drop_slot(conn: &mut PgConnection, slot: &str) {
+    let _ = sql_query(format!(
+        "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+         WHERE slot_name = '{slot}' AND active_pid IS NOT NULL"
+    ))
+    .execute(conn);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = sql_query(format!(
+        "SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots \
+         WHERE slot_name = '{slot}'"
+    ))
+    .execute(conn);
+}
+
+/// Handle returned by the multi-consumer harness.
+pub struct ConsumerHandle {
+    pub slot_name: String,
+    pub rx: tokio::sync::mpsc::UnboundedReceiver<EventObservation>,
+    pub task: tokio::task::JoinHandle<()>,
+    pub task_exited_handle: Arc<core::sync::atomic::AtomicBool>,
+}
+
+/// Pre-create N pgoutput slots for push consumers. Use BEFORE
+/// [`spawn_n_push_consumers`] so each source's `connect` validation
+/// succeeds.
+pub fn precreate_push_slots(conn: &mut PgConnection, label_prefix: &str, n: usize) -> Vec<String> {
+    let mut names = Vec::with_capacity(n);
+    for i in 0..n {
+        let slot = format!("{label_prefix}_push_n{n}_c{i}");
+        create_pgoutput_slot(conn, &slot);
+        names.push(slot);
+    }
+    names
+}
+
+/// Mirror of [`precreate_push_slots`] for polling consumers; the
+/// poll-interval enters the slot name so different cadence sweeps in
+/// one example don't collide.
+pub fn precreate_poll_slots(
+    conn: &mut PgConnection,
+    label_prefix: &str,
+    poll_interval: Duration,
+    n: usize,
+) -> Vec<String> {
+    let mut names = Vec::with_capacity(n);
+    for i in 0..n {
+        let slot = format!("{label_prefix}_poll{}_n{n}_c{i}", poll_interval.as_millis());
+        create_pgoutput_slot(conn, &slot);
+        names.push(slot);
+    }
+    names
+}
+
+/// Spawn `n` push consumers, each with its own pre-created slot.
+pub async fn spawn_n_push_consumers(
+    n: usize,
+    label_prefix: &str,
+    pg_repl_url: &str,
+    publication: &str,
+    catalog: Arc<ParserDB>,
+    status_interval: Duration,
+    buffer_capacity: usize,
+) -> Vec<ConsumerHandle> {
+    use subql::{PgStreamingCdcSource, PgStreamingConfig};
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let slot = format!("{label_prefix}_push_n{n}_c{i}");
+        let config = PgStreamingConfig::new(pg_repl_url.to_string(), &slot, publication)
+            .status_interval(status_interval)
+            .buffer_capacity(buffer_capacity);
+        let source = PgStreamingCdcSource::connect(config, Arc::clone(&catalog))
+            .await
+            .expect("connect push source");
+        let task_exited_handle = source.task_exited_handle();
+        let (rx, task) = spawn_full_event_receiver(source);
+        handles.push(ConsumerHandle {
+            slot_name: slot,
+            rx,
+            task,
+            task_exited_handle,
+        });
+    }
+    handles
+}
+
+/// Spawn `n` polling consumers, each with its own pre-created slot.
+pub async fn spawn_n_poll_consumers(
+    n: usize,
+    label_prefix: &str,
+    pg_sql_url: &str,
+    publication: &str,
+    catalog: Arc<ParserDB>,
+    poll_interval: Duration,
+    buffer_capacity: usize,
+) -> Vec<ConsumerHandle> {
+    use subql::{PollingPgCdcConfig, PollingPgCdcSource};
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let slot = format!("{label_prefix}_poll{}_n{n}_c{i}", poll_interval.as_millis());
+        let config = PollingPgCdcConfig::new(pg_sql_url.to_string(), &slot, publication)
+            .poll_interval(poll_interval)
+            .buffer_capacity(buffer_capacity);
+        let source = PollingPgCdcSource::connect(config, Arc::clone(&catalog))
+            .await
+            .expect("connect polling source");
+        let task_exited_handle = source.task_exited_handle();
+        let (rx, task) = spawn_full_event_receiver(source);
+        handles.push(ConsumerHandle {
+            slot_name: slot,
+            rx,
+            task,
+            task_exited_handle,
+        });
+    }
+    handles
+}
+
+/// Aggregate per-consumer event counts into a single throughput
+/// summary `(total_events, events_per_second)`.
+#[must_use]
+pub fn aggregate_throughput(counts: &[u64], window: Duration) -> (u64, f64) {
+    let total: u64 = counts.iter().sum();
+    #[allow(clippy::cast_precision_loss)]
+    let rate = total as f64 / window.as_secs_f64().max(1e-6);
+    (total, rate)
 }

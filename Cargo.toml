@@ -187,6 +187,23 @@ required-features = ["pg-streaming"]
 name = "phase1_smoothed"
 required-features = ["pg-streaming"]
 
+# Scale benchmark suite: three examples that together quantify where
+# push beats polling and by how much across realistic deployment
+# scales. Outputs both Markdown stdout AND parallel .tsv files for
+# external plotting. See docs/cdc-scale-report-2026-06-15.md for the
+# synthesis report.
+[[example]]
+name = "scale_throughput"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "scale_consumers"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "scale_retention"
+required-features = ["pg-streaming"]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }
