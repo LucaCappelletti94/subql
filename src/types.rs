@@ -337,6 +337,51 @@ mod tests {
                 .unwrap();
         assert_eq!(some_bytes, session_bytes);
     }
+
+    #[test]
+    fn test_subscriptions_view_iterates_metadata_entries() {
+        let entries: Vec<SubscriptionMetadata<DefaultIds>> = vec![
+            SubscriptionMetadata {
+                subscription_id: 1,
+                consumer_id: 10,
+                scope: SubscriptionScope::Durable,
+                last_dispatch_at: None,
+                dispatch_count: 0,
+            },
+            SubscriptionMetadata {
+                subscription_id: 2,
+                consumer_id: 20,
+                scope: SubscriptionScope::Session(99),
+                last_dispatch_at: Some(1_000_000),
+                dispatch_count: 4,
+            },
+        ];
+
+        let view = SubscriptionsView::<DefaultIds>::new(&entries);
+        assert_eq!(view.len(), 2);
+        assert!(!view.is_empty());
+
+        let collected: Vec<u64> = view.iter().map(|m| m.subscription_id).collect();
+        assert_eq!(collected, vec![1, 2]);
+
+        let coldest = view
+            .iter()
+            .min_by_key(|m| m.dispatch_count)
+            .map(|m| m.subscription_id);
+        assert_eq!(coldest, Some(1));
+
+        let least_active = view
+            .iter()
+            .min_by_key(|m| m.last_dispatch_at.unwrap_or(0))
+            .map(|m| m.subscription_id);
+        assert_eq!(least_active, Some(1));
+
+        let session_count = view
+            .iter()
+            .filter(|m| matches!(m.scope, SubscriptionScope::Session(_)))
+            .count();
+        assert_eq!(session_count, 1);
+    }
 }
 
 /// Row image: array of cells indexed by `ColumnId`
@@ -986,6 +1031,65 @@ impl<C: Checkpoint> WalEvent<C> {
         }
     }
 
+    /// Replace this event's checkpoint with one of a different type.
+    ///
+    /// Useful when a parser produces events anchored to one checkpoint
+    /// type (e.g. [`crate::NoCheckpoint`] for parsers that read only the
+    /// plugin payload) and an outer transport supplies the actual
+    /// position out-of-band (e.g. the LSN carried in a pgoutput
+    /// `XLogData` frame header). The event's structural content
+    /// (`table_id`, `pk`, row images, `changed_columns`) is preserved
+    /// byte-for-byte; only the checkpoint type and value change.
+    #[must_use]
+    pub fn set_checkpoint<C2: Checkpoint>(self, new_checkpoint: Option<C2>) -> WalEvent<C2> {
+        match self {
+            Self::Insert {
+                table_id,
+                pk,
+                new_row,
+                checkpoint: _,
+            } => WalEvent::Insert {
+                table_id,
+                pk,
+                new_row,
+                checkpoint: new_checkpoint,
+            },
+            Self::Update {
+                table_id,
+                pk,
+                old_row,
+                new_row,
+                changed_columns,
+                checkpoint: _,
+            } => WalEvent::Update {
+                table_id,
+                pk,
+                old_row,
+                new_row,
+                changed_columns,
+                checkpoint: new_checkpoint,
+            },
+            Self::Delete {
+                table_id,
+                pk,
+                old_row,
+                checkpoint: _,
+            } => WalEvent::Delete {
+                table_id,
+                pk,
+                old_row,
+                checkpoint: new_checkpoint,
+            },
+            Self::Truncate {
+                table_id,
+                checkpoint: _,
+            } => WalEvent::Truncate {
+                table_id,
+                checkpoint: new_checkpoint,
+            },
+        }
+    }
+
     /// Old row image if present.
     #[must_use]
     pub const fn old_row(&self) -> Option<&RowImage> {
@@ -1066,15 +1170,417 @@ impl<I: IdTypes> SubscriptionRequest<I> {
 /// [`crate::RegisterError::RegistryFull`]. Other variants make room for
 /// the incoming subscription by removing an existing one and surface the
 /// evicted [`SubscriptionId`]s in [`RegisterResult::evicted`].
+///
+/// For closure-based policies that pick the victim per-call (e.g. fair
+/// share across tenants, custom heuristics that read live activity
+/// counters), use
+/// [`SubscriptionEngine::with_custom_eviction`](crate::SubscriptionEngine::with_custom_eviction)
+/// instead of this enum.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use sql_traits::structs::ParserDB;
+/// use sqlparser::dialect::PostgreSqlDialect;
+/// use subql::{
+///     DefaultIds, EvictionPolicy, RegisterError, SubscriptionEngine,
+///     SubscriptionRequest,
+/// };
+///
+/// let database = Arc::new(
+///     ParserDB::parse::<PostgreSqlDialect>(
+///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+///     )?,
+/// );
+///
+/// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+///     SubscriptionEngine::new(database, PostgreSqlDialect {})
+///         .with_max_subscriptions(1, EvictionPolicy::EvictOldest);
+///
+/// let first = engine.register(SubscriptionRequest::new(
+///     1u64,
+///     "SELECT * FROM orders WHERE amount > 1",
+/// ))?;
+/// let second = engine.register(SubscriptionRequest::new(
+///     2u64,
+///     "SELECT * FROM orders WHERE amount > 2",
+/// ))?;
+///
+/// // The cap was already at 1 when `second` was registered, so the
+/// // oldest subscription got evicted to make room.
+/// assert_eq!(second.evicted, vec![first.subscription_id]);
+/// assert_eq!(engine.subscription_count(), 1);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum EvictionPolicy {
     /// Hard cap: reject the registration when the registry is full.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     DefaultIds, EvictionPolicy, RegisterError, SubscriptionEngine,
+    ///     SubscriptionRequest,
+    /// };
+    ///
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    ///     )?,
+    /// );
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
+    ///         .with_max_subscriptions(1, EvictionPolicy::Reject);
+    ///
+    /// engine.register(SubscriptionRequest::new(
+    ///     1u64,
+    ///     "SELECT * FROM orders WHERE amount > 1",
+    /// ))?;
+    ///
+    /// match engine.register(SubscriptionRequest::new(
+    ///     2u64,
+    ///     "SELECT * FROM orders WHERE amount > 2",
+    /// )) {
+    ///     Err(RegisterError::RegistryFull { cap }) => assert_eq!(cap, 1),
+    ///     other => panic!("expected RegistryFull, got {other:?}"),
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[default]
     Reject,
     /// Evict the oldest subscription (lowest `SubscriptionId`) and proceed.
     /// Reports the evicted id via [`RegisterResult::evicted`].
+    ///
+    /// See the [enum-level doctest](EvictionPolicy) for a runnable
+    /// example.
     EvictOldest,
+    /// Evict the subscription with the oldest `last_dispatch_at`.
+    /// Subscriptions never matched by an event are considered "least
+    /// active" (their `last_dispatch_at` is `None`, treated as -infinity)
+    /// and are evicted first; ties resolve by oldest `SubscriptionId`.
+    ///
+    /// Requires activity stamping: configuring this policy makes
+    /// [`SubscriptionEngine::consumers`](crate::SubscriptionEngine::consumers)
+    /// record the subscriptions that contributed to each match.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     catalog_helpers, Cell, ClockHandle, DefaultIds, EvictionPolicy, ManualClock,
+    ///     PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
+    /// };
+    ///
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    ///     )?,
+    /// );
+    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let clock = Arc::new(ManualClock::new(0));
+    /// let handle: ClockHandle = clock.clone();
+    ///
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
+    ///         .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive)
+    ///         .with_activity_clock(handle);
+    ///
+    /// let make_event = |id: i64, amount: i64| -> Result<_, Box<dyn std::error::Error>> {
+    ///     Ok(WalEvent::builder(orders_id)
+    ///         .insert()
+    ///         .pk(PrimaryKey::new(Arc::from([0u16]), Arc::from([Cell::Int(id)]))?)
+    ///         .new_row(RowImage {
+    ///             cells: Arc::from([Cell::Int(id), Cell::Int(amount)]),
+    ///         })
+    ///         .build()?)
+    /// };
+    ///
+    /// // Register and stamp `first` early. Predicate matches amount = 5.
+    /// let first = engine.register(SubscriptionRequest::new(
+    ///     1u64,
+    ///     "SELECT * FROM orders WHERE amount = 5",
+    /// ))?;
+    /// clock.advance(Duration::from_micros(10));
+    /// engine.consumers(&make_event(1, 5)?)?;
+    ///
+    /// // Register `second` and stamp it later. Predicate matches amount = 10
+    /// // exclusively, so `first` is not re-stamped.
+    /// let _second = engine.register(SubscriptionRequest::new(
+    ///     2u64,
+    ///     "SELECT * FROM orders WHERE amount = 10",
+    /// ))?;
+    /// clock.advance(Duration::from_micros(20));
+    /// engine.consumers(&make_event(2, 10)?)?;
+    ///
+    /// // Third registration hits the cap. `first` was stamped at t=10
+    /// // and `_second` at t=30 — `first` is the least active and is
+    /// // evicted to make room.
+    /// let third = engine.register(SubscriptionRequest::new(
+    ///     3u64,
+    ///     "SELECT * FROM orders WHERE amount = 999",
+    /// ))?;
+    /// assert_eq!(third.evicted, vec![first.subscription_id]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    EvictLeastActive,
+    /// Evict the subscription with the lowest `dispatch_count` (the
+    /// "coldest" subscription, with the fewest matches over its
+    /// lifetime). Ties resolve by oldest `SubscriptionId`.
+    ///
+    /// Requires activity stamping (see [`EvictLeastActive`](Self::EvictLeastActive)).
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     catalog_helpers, Cell, DefaultIds, EvictionPolicy, PrimaryKey, RowImage,
+    ///     SubscriptionEngine, SubscriptionRequest, WalEvent,
+    /// };
+    ///
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    ///     )?,
+    /// );
+    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    ///
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
+    ///         .with_max_subscriptions(2, EvictionPolicy::EvictColdest);
+    ///
+    /// let _hot = engine.register(SubscriptionRequest::new(
+    ///     1u64,
+    ///     "SELECT * FROM orders WHERE amount = 5",
+    /// ))?;
+    /// let cold = engine.register(SubscriptionRequest::new(
+    ///     2u64,
+    ///     "SELECT * FROM orders WHERE amount = 9999",
+    /// ))?;
+    /// for i in 0..3 {
+    ///     let event = WalEvent::builder(orders_id)
+    ///         .insert()
+    ///         .pk(PrimaryKey::new(Arc::from([0u16]), Arc::from([Cell::Int(i)]))?)
+    ///         .new_row(RowImage {
+    ///             cells: Arc::from([Cell::Int(i), Cell::Int(5)]),
+    ///         })
+    ///         .build()?;
+    ///     engine.consumers(&event)?;
+    /// }
+    /// let third = engine.register(SubscriptionRequest::new(
+    ///     3u64,
+    ///     "SELECT * FROM orders WHERE amount = 7",
+    /// ))?;
+    /// assert_eq!(third.evicted, vec![cold.subscription_id]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    EvictColdest,
+    /// Prefer evicting session-scoped subscriptions before durable ones.
+    /// Among session subscriptions, the oldest `SubscriptionId` is
+    /// evicted first. If no session subscriptions exist, falls back to
+    /// [`EvictOldest`](Self::EvictOldest).
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest,
+    ///     SubscriptionScope,
+    /// };
+    ///
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    ///     )?,
+    /// );
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
+    ///         .with_max_subscriptions(2, EvictionPolicy::EvictBySession);
+    ///
+    /// let _durable = engine.register(SubscriptionRequest::new(
+    ///     1u64,
+    ///     "SELECT * FROM orders WHERE amount > 1",
+    /// ))?;
+    /// let session = engine.register(
+    ///     SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE amount > 2")
+    ///         .scope(SubscriptionScope::Session(7_777)),
+    /// )?;
+    ///
+    /// let third = engine.register(SubscriptionRequest::new(
+    ///     3u64,
+    ///     "SELECT * FROM orders WHERE amount > 3",
+    /// ))?;
+    /// assert_eq!(third.evicted, vec![session.subscription_id]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    EvictBySession,
+    /// Evict from the consumer currently holding the most live
+    /// subscriptions ("the biggest hog"). Among that consumer's
+    /// subscriptions, the oldest `SubscriptionId` is evicted first.
+    /// Ties between consumers (same count) resolve by lowest consumer id.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest,
+    /// };
+    ///
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    ///     )?,
+    /// );
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
+    ///         .with_max_subscriptions(3, EvictionPolicy::EvictByConsumer);
+    ///
+    /// let hog_a = engine.register(SubscriptionRequest::new(
+    ///     1u64,
+    ///     "SELECT * FROM orders WHERE amount > 1",
+    /// ))?;
+    /// let _hog_b = engine.register(SubscriptionRequest::new(
+    ///     1u64,
+    ///     "SELECT * FROM orders WHERE amount > 2",
+    /// ))?;
+    /// let _other = engine.register(SubscriptionRequest::new(
+    ///     2u64,
+    ///     "SELECT * FROM orders WHERE amount > 3",
+    /// ))?;
+    /// let fourth = engine.register(SubscriptionRequest::new(
+    ///     3u64,
+    ///     "SELECT * FROM orders WHERE amount > 4",
+    /// ))?;
+    /// // Consumer 1 was the biggest hog (2 subs). The oldest of its
+    /// // subscriptions is evicted.
+    /// assert_eq!(fourth.evicted, vec![hog_a.subscription_id]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    EvictByConsumer,
+}
+
+/// Snapshot of a single subscription's metadata.
+///
+/// Surfaced through [`SubscriptionsView`] to the closure passed to
+/// [`SubscriptionEngine::with_custom_eviction`](crate::SubscriptionEngine::with_custom_eviction).
+/// Activity-aware policies use `last_dispatch_at` / `dispatch_count` to
+/// pick a victim; scope/consumer-aware policies use `scope` / `consumer_id`.
+/// Subscriptions never matched by an event have `last_dispatch_at = None`
+/// and `dispatch_count = 0`.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct SubscriptionMetadata<I: IdTypes> {
+    /// Engine-assigned subscription identifier (monotonic; lower is older).
+    pub subscription_id: SubscriptionId,
+    /// Consumer who owns this subscription.
+    pub consumer_id: I::ConsumerId,
+    /// Lifetime scope: durable or session-bound.
+    pub scope: SubscriptionScope<I>,
+    /// Microsecond timestamp from the engine's activity clock at the most
+    /// recent dispatch that matched this subscription, or `None` if it
+    /// has never matched. Compare with other entries within the same
+    /// view, never with absolute wall-clock time.
+    pub last_dispatch_at: Option<u64>,
+    /// Number of dispatch events that matched this subscription since
+    /// registration. Saturates at `u64::MAX`.
+    pub dispatch_count: u64,
+}
+
+impl<I: IdTypes> SubscriptionMetadata<I> {
+    /// Construct a [`SubscriptionMetadata`] with the canonical fields.
+    /// The struct is `#[non_exhaustive]`; use this constructor (rather
+    /// than a struct literal) so callers compile across future field
+    /// additions.
+    #[must_use]
+    pub const fn new(
+        subscription_id: SubscriptionId,
+        consumer_id: I::ConsumerId,
+        scope: SubscriptionScope<I>,
+        last_dispatch_at: Option<u64>,
+        dispatch_count: u64,
+    ) -> Self {
+        Self {
+            subscription_id,
+            consumer_id,
+            scope,
+            last_dispatch_at,
+            dispatch_count,
+        }
+    }
+}
+
+/// Borrowed read-only view of every live subscription, used by custom
+/// eviction closures.
+///
+/// Cheap to construct (borrows the engine's internal HashMap entries).
+/// The closure must not retain the borrow past the call; lifetime is
+/// bounded to the single call into the custom eviction function.
+///
+/// ```
+/// use subql::{DefaultIds, SubscriptionMetadata, SubscriptionScope, SubscriptionsView};
+///
+/// let entries: Vec<SubscriptionMetadata<DefaultIds>> = vec![
+///     SubscriptionMetadata::new(1, 10, SubscriptionScope::Durable, Some(100), 5),
+///     SubscriptionMetadata::new(2, 10, SubscriptionScope::Durable, None, 0),
+/// ];
+/// let view = SubscriptionsView::<DefaultIds>::new(&entries);
+/// let coldest = view.iter().min_by_key(|m| m.dispatch_count).unwrap();
+/// assert_eq!(coldest.subscription_id, 2);
+/// ```
+pub struct SubscriptionsView<'a, I: IdTypes> {
+    entries: &'a [SubscriptionMetadata<I>],
+}
+
+impl<'a, I: IdTypes> SubscriptionsView<'a, I> {
+    /// Build a view from a slice of metadata. Public so eviction closures
+    /// can be unit-tested with hand-rolled views.
+    #[must_use]
+    pub const fn new(entries: &'a [SubscriptionMetadata<I>]) -> Self {
+        Self { entries }
+    }
+
+    /// Iterator over the metadata entries.
+    pub fn iter(&self) -> core::slice::Iter<'_, SubscriptionMetadata<I>> {
+        self.entries.iter()
+    }
+
+    /// Number of live subscriptions in the view.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no live subscriptions are present.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Borrow the underlying metadata slice.
+    #[must_use]
+    pub const fn as_slice(&self) -> &[SubscriptionMetadata<I>] {
+        self.entries
+    }
+}
+
+impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
+    type Item = &'a SubscriptionMetadata<I>;
+    type IntoIter = core::slice::Iter<'a, SubscriptionMetadata<I>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
 }
 
 /// Result of successful subscription registration

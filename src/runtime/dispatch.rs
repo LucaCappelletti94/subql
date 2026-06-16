@@ -2,14 +2,14 @@
 
 use super::{
     agg::agg_delta_for_row,
-    ids::ConsumerOrdinal,
+    ids::{ConsumerOrdinal, PredicateId},
     partition::TablePartition,
     predicate::{Predicate, PredicateStore},
 };
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm},
     AggDelta, Cell, Checkpoint, ConsumerNotifications, DispatchError, EventKind, IdTypes, RowImage,
-    WalEvent,
+    SubscriptionId, WalEvent,
 };
 use alloc::vec::Vec;
 use hashbrown::HashMap;
@@ -182,9 +182,10 @@ pub(crate) fn select_event_row<C: Checkpoint>(
     }
 }
 
-fn notifications_for_truncate<I: IdTypes, C: Checkpoint>(
+fn notifications_for_truncate_with_stamps<I: IdTypes, C: Checkpoint>(
     partition: &TablePartition<I>,
     consumer_dict: &ConsumerDictionary<I>,
+    stamps: &mut Vec<SubscriptionId>,
 ) -> ConsumerNotifications<I, C> {
     let snapshot = partition.load_snapshot();
     let mut ordinals = RoaringBitmap::new();
@@ -194,6 +195,7 @@ fn notifications_for_truncate<I: IdTypes, C: Checkpoint>(
         };
         if matches!(pred.projection, QueryProjection::Rows) {
             ordinals |= consumers;
+            collect_stamps_for_predicate(&snapshot.predicates, *pred_id, consumers, stamps);
         }
     }
     let deleted = resolve_ordinals(ordinals, consumer_dict);
@@ -236,15 +238,36 @@ pub fn dispatch_consumers<I: IdTypes, C: Checkpoint>(
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
 ) -> Result<ConsumerNotifications<I, C>, DispatchError> {
+    let (notifs, _) = dispatch_consumers_with_stamps(event, partition, consumer_dict, vm)?;
+    Ok(notifs)
+}
+
+/// Sibling of [`dispatch_consumers`] that additionally returns the
+/// `SubscriptionId`s whose bindings contributed to a match.
+///
+/// Used by activity-aware eviction policies (`EvictLeastActive`,
+/// `EvictColdest`, and any custom policy that reads activity stats) to
+/// stamp the matched subscriptions in O(1) per matched pair via the
+/// `binding_lookup` index on `PredicateStore`. Callers that do not need
+/// stamps should continue calling [`dispatch_consumers`], which discards
+/// the stamp vector.
+pub fn dispatch_consumers_with_stamps<I: IdTypes, C: Checkpoint>(
+    event: &WalEvent<C>,
+    partition: &TablePartition<I>,
+    consumer_dict: &ConsumerDictionary<I>,
+    vm: &mut Vm,
+) -> Result<(ConsumerNotifications<I, C>, Vec<SubscriptionId>), DispatchError> {
     let checkpoint = event.checkpoint().cloned();
+    let mut stamps: Vec<SubscriptionId> = Vec::new();
     let notifs: ConsumerNotifications<I, C> = match event.kind() {
         EventKind::Truncate => {
             let _ = vm;
-            notifications_for_truncate(partition, consumer_dict)
+            notifications_for_truncate_with_stamps(partition, consumer_dict, &mut stamps)
         }
         EventKind::Insert => {
             let row = require_new_row(event, "INSERT requires new_row")?;
-            let bitmap = dispatch_single_eval_bitmap(event, row, partition, vm)?;
+            let bitmap =
+                dispatch_single_eval_bitmap_with_stamps(event, row, partition, vm, &mut stamps)?;
             ConsumerNotifications::from_parts(
                 resolve_ordinals(bitmap, consumer_dict),
                 Vec::new(),
@@ -253,16 +276,33 @@ pub fn dispatch_consumers<I: IdTypes, C: Checkpoint>(
         }
         EventKind::Delete => {
             let row = require_old_row(event, "DELETE requires old_row")?;
-            let bitmap = dispatch_single_eval_bitmap(event, row, partition, vm)?;
+            let bitmap =
+                dispatch_single_eval_bitmap_with_stamps(event, row, partition, vm, &mut stamps)?;
             ConsumerNotifications::from_parts(
                 Vec::new(),
                 resolve_ordinals(bitmap, consumer_dict),
                 Vec::new(),
             )
         }
-        EventKind::Update => dispatch_update(event, partition, consumer_dict, vm)?,
+        EventKind::Update => {
+            dispatch_update_with_stamps(event, partition, consumer_dict, vm, &mut stamps)?
+        }
     };
-    Ok(notifs.with_checkpoint(checkpoint))
+    Ok((notifs.with_checkpoint(checkpoint), stamps))
+}
+
+fn collect_stamps_for_predicate<I: IdTypes>(
+    predicates: &PredicateStore<I>,
+    pred_id: PredicateId,
+    consumers: &RoaringBitmap,
+    out: &mut Vec<SubscriptionId>,
+) {
+    for ord_u32 in consumers {
+        let ord = ConsumerOrdinal::new(ord_u32);
+        if let Some(sub_ids) = predicates.binding_lookup.get(&(pred_id, ord)) {
+            out.extend_from_slice(sub_ids);
+        }
+    }
 }
 
 /// Returns `true` when `old_row` is present and complete (no `Cell::Missing`),
@@ -280,18 +320,20 @@ fn old_row_is_complete<C: Checkpoint>(event: &WalEvent<C>) -> bool {
 /// split is exact. When `old_row` is absent or partial, falls back to single-eval
 /// on `new_row` — all matches go to `updated` (conservative: we cannot prove they
 /// are new entries).
-fn dispatch_update<I: IdTypes, C: Checkpoint>(
+fn dispatch_update_with_stamps<I: IdTypes, C: Checkpoint>(
     event: &WalEvent<C>,
     partition: &TablePartition<I>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm,
+    stamps: &mut Vec<SubscriptionId>,
 ) -> Result<ConsumerNotifications<I, C>, DispatchError> {
     let new_row = require_new_row(event, "UPDATE requires new_row")?;
 
     // When old_row is missing or partial, fall back to single-eval on new_row.
     // All matches go to `updated` (we can't distinguish entered vs stayed).
     if !old_row_is_complete(event) {
-        let bitmap = dispatch_single_eval_bitmap(event, new_row, partition, vm)?;
+        let bitmap =
+            dispatch_single_eval_bitmap_with_stamps(event, new_row, partition, vm, stamps)?;
         return Ok(ConsumerNotifications::from_parts(
             Vec::new(),
             Vec::new(),
@@ -355,9 +397,18 @@ fn dispatch_update<I: IdTypes, C: Checkpoint>(
 
         if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
             match (new_match, old_match) {
-                (true, false) => inserted_ordinals |= bitmap,
-                (false, true) => deleted_ordinals |= bitmap,
-                (true, true) => updated_ordinals |= bitmap,
+                (true, false) => {
+                    inserted_ordinals |= bitmap;
+                    collect_stamps_for_predicate(&snapshot.predicates, pred_id, bitmap, stamps);
+                }
+                (false, true) => {
+                    deleted_ordinals |= bitmap;
+                    collect_stamps_for_predicate(&snapshot.predicates, pred_id, bitmap, stamps);
+                }
+                (true, true) => {
+                    updated_ordinals |= bitmap;
+                    collect_stamps_for_predicate(&snapshot.predicates, pred_id, bitmap, stamps);
+                }
                 (false, false) => {}
             }
         }
@@ -370,13 +421,15 @@ fn dispatch_update<I: IdTypes, C: Checkpoint>(
     ))
 }
 
-/// Single-eval dispatch: evaluate one row, return the matching ordinals bitmap.
+/// Single-eval dispatch: evaluate one row, return the matching ordinals bitmap
+/// and accumulate matched subscription ids into `stamps`.
 /// Used for INSERT (new_row) and DELETE (old_row).
-fn dispatch_single_eval_bitmap<I: IdTypes, C: Checkpoint>(
+fn dispatch_single_eval_bitmap_with_stamps<I: IdTypes, C: Checkpoint>(
     event: &WalEvent<C>,
     row: &RowImage,
     partition: &TablePartition<I>,
     vm: &mut Vm,
+    stamps: &mut Vec<SubscriptionId>,
 ) -> Result<RoaringBitmap, DispatchError> {
     let candidates = partition.select_candidates(row, event.kind(), event.changed_columns());
     let snapshot = partition.load_snapshot();
@@ -390,6 +443,7 @@ fn dispatch_single_eval_bitmap<I: IdTypes, C: Checkpoint>(
         |pred, consumers| {
             if matches!(pred.projection, QueryProjection::Rows) {
                 matching_ordinals |= consumers;
+                collect_stamps_for_predicate(&snapshot.predicates, pred.id, consumers, stamps);
             }
             Ok(())
         },

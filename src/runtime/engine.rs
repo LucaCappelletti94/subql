@@ -2,7 +2,9 @@
 
 use super::indexes::IndexableAtom;
 use super::{
-    dispatch::{dispatch_consumers, select_event_row, ConsumerDictionary},
+    dispatch::{
+        dispatch_consumers, dispatch_consumers_with_stamps, select_event_row, ConsumerDictionary,
+    },
     ids::{ConsumerOrdinal, PredicateId},
     partition::TablePartition,
     predicate::{Predicate, SubscriptionBinding},
@@ -43,6 +45,69 @@ use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
 type BatchEntries<I> = Vec<(Predicate, Vec<IndexableAtom>, Vec<SubscriptionBinding<I>>)>;
+
+/// Per-subscription activity counters used by activity-aware eviction
+/// policies (e.g. `EvictLeastActive`, `EvictColdest`) to decide which
+/// subscription to evict when the registry cap is hit.
+///
+/// Stamped on dispatch in `consumers()` only when an activity-aware
+/// eviction policy is configured. Subscriptions never dispatched have
+/// `last_dispatch_at = None` and `dispatch_count = 0`.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct ActivityStats {
+    pub(crate) last_dispatch_at: Option<u64>,
+    pub(crate) dispatch_count: u64,
+}
+
+/// Closure type for custom eviction policies. Picks the victim id from
+/// a borrowed snapshot of every live subscription, or `None` to leave
+/// the registry untouched (registration falls through to `Reject`).
+type CustomEvictor<I> =
+    Arc<dyn Fn(&crate::SubscriptionsView<'_, I>) -> Option<SubscriptionId> + Send + Sync + 'static>;
+
+/// Internal dispatch shape for the configured eviction behavior.
+///
+/// `BuiltIn` wraps the user-facing [`crate::EvictionPolicy`] enum;
+/// `Custom` holds a closure provided through
+/// [`SubscriptionEngine::with_custom_eviction`]. Held internally so the
+/// public `EvictionPolicy` enum stays plain `Copy` (closures break
+/// `Copy`/`Eq`/`Hash`).
+enum EvictionStrategy<I: IdTypes> {
+    BuiltIn(crate::EvictionPolicy),
+    Custom(CustomEvictor<I>),
+}
+
+impl<I: IdTypes> Clone for EvictionStrategy<I> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::BuiltIn(p) => Self::BuiltIn(*p),
+            Self::Custom(f) => Self::Custom(Arc::clone(f)),
+        }
+    }
+}
+
+impl<I: IdTypes> Default for EvictionStrategy<I> {
+    fn default() -> Self {
+        Self::BuiltIn(crate::EvictionPolicy::Reject)
+    }
+}
+
+impl<I: IdTypes> EvictionStrategy<I> {
+    /// Returns true when the configured strategy reads per-subscription
+    /// activity stats, i.e. dispatch should stamp `last_dispatch_at`
+    /// and `dispatch_count` to keep those counters live.
+    const fn needs_activity_tracking(&self) -> bool {
+        match self {
+            Self::BuiltIn(p) => matches!(
+                p,
+                crate::EvictionPolicy::EvictLeastActive | crate::EvictionPolicy::EvictColdest
+            ),
+            // Custom closures see activity stats through `SubscriptionsView`,
+            // so we assume they want them tracked.
+            Self::Custom(_) => true,
+        }
+    }
+}
 
 struct CompiledSpec<I: IdTypes> {
     spec: SubscriptionRequest<I>,
@@ -137,9 +202,19 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     /// Optional cap on the number of live subscriptions. `None` means no
     /// cap; the registry can grow unbounded.
     max_subscriptions: Option<usize>,
-    /// Eviction policy applied when [`max_subscriptions`](Self::max_subscriptions)
-    /// would be exceeded. Default [`EvictionPolicy::Reject`].
-    eviction_policy: crate::EvictionPolicy,
+    /// Eviction strategy applied when [`max_subscriptions`](Self::max_subscriptions)
+    /// would be exceeded. Default `BuiltIn(EvictionPolicy::Reject)`.
+    eviction_strategy: EvictionStrategy<I>,
+    /// Monotonic clock used by activity-aware eviction policies to stamp
+    /// `last_dispatch_at`. Lazy-initialised to a `StdClock` the first time
+    /// an activity-aware policy is configured; remains `None` for the
+    /// default (no cap) and for non-activity policies so dispatch stays
+    /// allocation-free.
+    activity_clock: Option<crate::ClockHandle>,
+    /// Per-subscription activity counters. Populated only when an
+    /// activity-aware policy is configured; empty otherwise so dispatch
+    /// pays no cost.
+    subscription_activity: HashMap<SubscriptionId, ActivityStats>,
     /// Optional storage path for durability
     #[cfg(feature = "std")]
     storage_path: Option<PathBuf>,
@@ -387,7 +462,9 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             binding_dedup: HashMap::new(),
             vm: Vm::new(),
             max_subscriptions: None,
-            eviction_policy: crate::EvictionPolicy::Reject,
+            eviction_strategy: EvictionStrategy::default(),
+            activity_clock: None,
+            subscription_activity: HashMap::new(),
             #[cfg(feature = "std")]
             storage_path: None,
             #[cfg(feature = "std")]
@@ -401,26 +478,123 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         }
     }
 
-    /// Configure a maximum number of live subscriptions and the policy
-    /// applied when a registration would exceed it.
+    /// Configure a maximum number of live subscriptions and the built-in
+    /// policy applied when a registration would exceed it.
     ///
-    /// By default the registry is uncapped. With [`EvictionPolicy::Reject`]
+    /// By default the registry is uncapped. With [`crate::EvictionPolicy::Reject`]
     /// the cap is hard: `register` returns [`RegisterError::RegistryFull`]
-    /// once the registry is full. With [`EvictionPolicy::EvictOldest`] the
-    /// oldest subscription (lowest [`SubscriptionId`]) is evicted to make
-    /// room and reported in [`RegisterResult::evicted`].
+    /// once the registry is full. With [`crate::EvictionPolicy::EvictOldest`]
+    /// the oldest subscription (lowest [`SubscriptionId`]) is evicted to
+    /// make room; activity-aware policies such as
+    /// [`crate::EvictionPolicy::EvictLeastActive`] /
+    /// [`crate::EvictionPolicy::EvictColdest`] additionally enable
+    /// per-subscription dispatch stamping; topological policies such as
+    /// [`crate::EvictionPolicy::EvictBySession`] /
+    /// [`crate::EvictionPolicy::EvictByConsumer`] pick the victim from a
+    /// preferred slice of the registry. In every non-`Reject` case the
+    /// evicted ids are surfaced in [`RegisterResult::evicted`].
+    ///
+    /// For closure-based custom policies see
+    /// [`Self::with_custom_eviction`].
     ///
     /// Idempotent re-registrations (matching `(consumer_id, predicate, scope)`)
     /// never trigger eviction since they do not allocate a new subscription
     /// slot.
     #[must_use]
-    pub const fn with_max_subscriptions(
-        mut self,
-        cap: usize,
-        policy: crate::EvictionPolicy,
-    ) -> Self {
+    pub fn with_max_subscriptions(mut self, cap: usize, policy: crate::EvictionPolicy) -> Self {
         self.max_subscriptions = Some(cap);
-        self.eviction_policy = policy;
+        self.eviction_strategy = EvictionStrategy::BuiltIn(policy);
+        self.ensure_activity_clock_for_strategy();
+        self
+    }
+
+    /// Configure a maximum number of live subscriptions and a custom
+    /// closure that picks the eviction victim when the cap is hit.
+    ///
+    /// `evictor` receives a [`crate::SubscriptionsView`] over every live
+    /// subscription (id, consumer, scope, activity counters) and returns
+    /// either `Some(id)` to evict that subscription, or `None` to leave
+    /// the registry untouched. When the closure returns `None`, the
+    /// registration falls through to a `Reject` outcome and `register`
+    /// returns [`RegisterError::RegistryFull`].
+    ///
+    /// Closures see live `dispatch_count` / `last_dispatch_at` values:
+    /// configuring this builder turns on activity stamping in
+    /// [`Self::consumers`], so the activity stats stay current.
+    ///
+    /// The closure runs synchronously on the registration path; keep it
+    /// cheap. It must be `Send + Sync + 'static` so the engine remains
+    /// `Send + Sync` whenever `I` is.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest,
+    ///     SubscriptionsView,
+    /// };
+    ///
+    /// let database = Arc::new(
+    ///     ParserDB::parse::<PostgreSqlDialect>(
+    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    ///     )?,
+    /// );
+    /// // Evict the subscription belonging to the lowest consumer id.
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {}).with_custom_eviction(
+    ///         2,
+    ///         |view: &SubscriptionsView<'_, DefaultIds>| {
+    ///             view.iter()
+    ///                 .min_by_key(|m| m.consumer_id)
+    ///                 .map(|m| m.subscription_id)
+    ///         },
+    ///     );
+    ///
+    /// let low = engine.register(SubscriptionRequest::new(
+    ///     1u64,
+    ///     "SELECT * FROM orders WHERE amount > 1",
+    /// ))?;
+    /// let _high = engine.register(SubscriptionRequest::new(
+    ///     9u64,
+    ///     "SELECT * FROM orders WHERE amount > 2",
+    /// ))?;
+    /// let third = engine.register(SubscriptionRequest::new(
+    ///     5u64,
+    ///     "SELECT * FROM orders WHERE amount > 3",
+    /// ))?;
+    /// assert_eq!(third.evicted, vec![low.subscription_id]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn with_custom_eviction<F>(mut self, cap: usize, evictor: F) -> Self
+    where
+        F: Fn(&crate::SubscriptionsView<'_, I>) -> Option<SubscriptionId> + Send + Sync + 'static,
+    {
+        self.max_subscriptions = Some(cap);
+        self.eviction_strategy = EvictionStrategy::Custom(Arc::new(evictor));
+        self.ensure_activity_clock_for_strategy();
+        self
+    }
+
+    fn ensure_activity_clock_for_strategy(&mut self) {
+        if self.eviction_strategy.needs_activity_tracking() && self.activity_clock.is_none() {
+            #[cfg(feature = "std")]
+            {
+                self.activity_clock = Some(Arc::new(crate::StdClock::new()));
+            }
+        }
+    }
+
+    /// Replace the activity clock used by activity-aware eviction
+    /// policies. Useful in tests to drive `last_dispatch_at` with a
+    /// `ManualClock`; production builds should rely on the default
+    /// `StdClock` selected by the builder methods.
+    #[must_use]
+    pub fn with_activity_clock(mut self, clock: crate::ClockHandle) -> Self {
+        self.activity_clock = Some(clock);
         self
     }
 
@@ -516,20 +690,12 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         let mut evicted: Vec<SubscriptionId> = Vec::new();
         if let Some(cap) = self.max_subscriptions {
             if self.subscription_to_table.len() >= cap {
-                match self.eviction_policy {
-                    crate::EvictionPolicy::Reject => {
-                        return Err(RegisterError::RegistryFull { cap });
+                if let Some(victim) = self.pick_eviction_victim() {
+                    if self.unregister_subscription_internal(victim).is_some() {
+                        evicted.push(victim);
                     }
-                    crate::EvictionPolicy::EvictOldest => {
-                        // Lowest SubscriptionId is the oldest (counter is
-                        // monotonic from 1). O(n) over the registry; for
-                        // realistic caps this is negligible.
-                        if let Some(&oldest) = self.subscription_to_table.keys().min() {
-                            if self.unregister_subscription_internal(oldest).is_some() {
-                                evicted.push(oldest);
-                            }
-                        }
-                    }
+                } else {
+                    return Err(RegisterError::RegistryFull { cap });
                 }
             }
         }
@@ -707,8 +873,44 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         // Track which hashes we've already prepared (dedup within batch)
         let mut batch_hash_to_idx: HashMap<(TableId, u128, String), usize> = HashMap::new();
 
+        // Pending count = subscriptions allocated during this batch that
+        // are not yet visible in `self.subscription_to_table` (the new-
+        // predicate / same-batch-dup paths defer the insert to phase 3).
+        // The existing-predicate path inserts immediately, so it does
+        // not contribute here.
+        let mut pending_uncommitted: usize = 0;
+        // Evictions attributed to the spec that triggered them. Filled
+        // when the cap-branch picks a victim.
+        let mut evicted_per_spec: HashMap<usize, Vec<SubscriptionId>> = HashMap::new();
+
         for (i, entry) in compiled.into_iter().enumerate() {
             let Some(c) = entry else { continue };
+
+            // Enforce the registry cap before allocating a sub id. The
+            // projected post-batch size is `subscription_to_table.len()
+            // + pending_uncommitted`; if that already exceeds the cap,
+            // try to evict via the configured strategy.
+            if let Some(cap) = self.max_subscriptions {
+                while self.subscription_to_table.len() + pending_uncommitted >= cap {
+                    let Some(victim) = self.pick_eviction_victim() else {
+                        // Strategy declined to evict (Reject or custom
+                        // closure returned None). Reject this spec.
+                        results[i] = Err(RegisterError::RegistryFull { cap });
+                        break;
+                    };
+                    if self.unregister_subscription_internal(victim).is_some() {
+                        evicted_per_spec.entry(i).or_default().push(victim);
+                    } else {
+                        // Defensive: victim disappeared; do not loop.
+                        results[i] = Err(RegisterError::RegistryFull { cap });
+                        break;
+                    }
+                }
+                // If the spec was just rejected, skip the rest of phase 2 for it.
+                if results[i].is_err() {
+                    continue;
+                }
+            }
 
             // Auto-assign subscription ID.
             let subscription_id = self.next_subscription_id;
@@ -745,6 +947,8 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             let dedup_key = (c.table_id, c.hash, c.normalized.clone());
 
             if let Some(pred_id) = existing {
+                // Existing-predicate path commits subscription_to_table
+                // immediately below — does NOT add to pending_uncommitted.
                 let binding = Self::make_binding(&c.spec, subscription_id, pred_id, consumer_ord);
                 partition.add_binding(binding, pred_id);
                 self.subscription_to_table
@@ -765,6 +969,8 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                     consumer_ord,
                 );
                 entries[batch_idx].2.push(binding);
+                // Deferred to phase 3.
+                pending_uncommitted += 1;
                 created_new = false;
             } else {
                 let (pred, atoms) = Self::make_predicate_from_compiled(&c);
@@ -779,16 +985,22 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                 let batch_idx = entries.len();
                 entries.push((pred, atoms, vec![binding]));
                 batch_hash_to_idx.insert(dedup_key, batch_idx);
+                // Deferred to phase 3.
+                pending_uncommitted += 1;
                 created_new = true;
             }
 
             self.binding_dedup.insert(natural_key, subscription_id);
 
-            // Fill in the result
+            // Fill in the result, including any evictions credited to
+            // this spec by the cap branch above.
             if let Ok(ref mut result) = results[i] {
                 result.subscription_id = subscription_id;
                 result.normalized_sql = c.normalized;
                 result.created_new_predicate = created_new;
+                if let Some(ev) = evicted_per_spec.remove(&i) {
+                    result.evicted = ev;
+                }
             }
         }
 
@@ -887,6 +1099,108 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         }
     }
 
+    /// Collect a [`crate::SubscriptionMetadata`] snapshot for every live
+    /// subscription. Allocates one `Vec` per call; only invoked from the
+    /// register cap-branch and the custom-eviction closure path, so it
+    /// is off the hot dispatch path.
+    fn collect_subscription_metadata(&self) -> Vec<crate::SubscriptionMetadata<I>> {
+        let mut out: Vec<crate::SubscriptionMetadata<I>> =
+            Vec::with_capacity(self.subscription_to_table.len());
+        for (&sub_id, &table_id) in &self.subscription_to_table {
+            let Some(partition) = self.partitions.get(&table_id) else {
+                continue;
+            };
+            let snapshot = partition.load_snapshot();
+            let Some(binding) = snapshot.predicates.bindings.get(&sub_id) else {
+                continue;
+            };
+            let stats = self
+                .subscription_activity
+                .get(&sub_id)
+                .copied()
+                .unwrap_or_default();
+            out.push(crate::SubscriptionMetadata {
+                subscription_id: sub_id,
+                consumer_id: binding.consumer_id,
+                scope: binding.scope,
+                last_dispatch_at: stats.last_dispatch_at,
+                dispatch_count: stats.dispatch_count,
+            });
+        }
+        out
+    }
+
+    /// Select a victim subscription id from the registry according to the
+    /// configured eviction strategy. Returns `None` when the strategy
+    /// declines to evict (e.g. `Reject`, or a custom closure that
+    /// returned `None`). Idempotent re-registrations short-circuit before
+    /// this is called.
+    fn pick_eviction_victim(&self) -> Option<SubscriptionId> {
+        match &self.eviction_strategy {
+            EvictionStrategy::BuiltIn(crate::EvictionPolicy::Reject) => None,
+            EvictionStrategy::BuiltIn(crate::EvictionPolicy::EvictOldest) => {
+                self.subscription_to_table.keys().copied().min()
+            }
+            EvictionStrategy::BuiltIn(crate::EvictionPolicy::EvictLeastActive) => {
+                self.collect_subscription_metadata()
+                    .into_iter()
+                    .min_by(|a, b| {
+                        // None (never matched) sorts before Some: such
+                        // subscriptions are evicted before any with a
+                        // recorded stamp. Ties resolve by oldest id.
+                        a.last_dispatch_at
+                            .cmp(&b.last_dispatch_at)
+                            .then(a.subscription_id.cmp(&b.subscription_id))
+                    })
+                    .map(|m| m.subscription_id)
+            }
+            EvictionStrategy::BuiltIn(crate::EvictionPolicy::EvictColdest) => self
+                .collect_subscription_metadata()
+                .into_iter()
+                .min_by(|a, b| {
+                    a.dispatch_count
+                        .cmp(&b.dispatch_count)
+                        .then(a.subscription_id.cmp(&b.subscription_id))
+                })
+                .map(|m| m.subscription_id),
+            EvictionStrategy::BuiltIn(crate::EvictionPolicy::EvictBySession) => {
+                let metas = self.collect_subscription_metadata();
+                let session_victim = metas
+                    .iter()
+                    .filter(|m| matches!(m.scope, SubscriptionScope::Session(_)))
+                    .min_by_key(|m| m.subscription_id)
+                    .map(|m| m.subscription_id);
+                session_victim.or_else(|| metas.iter().map(|m| m.subscription_id).min())
+            }
+            EvictionStrategy::BuiltIn(crate::EvictionPolicy::EvictByConsumer) => {
+                let metas = self.collect_subscription_metadata();
+                if metas.is_empty() {
+                    return None;
+                }
+                let mut per_consumer: HashMap<I::ConsumerId, usize> = HashMap::new();
+                for m in &metas {
+                    *per_consumer.entry(m.consumer_id).or_insert(0) += 1;
+                }
+                // Largest holder wins; ties resolve by lowest consumer id
+                // so the choice is deterministic across HashMap orderings.
+                let target_consumer = per_consumer
+                    .into_iter()
+                    .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                    .map(|(c, _)| c)?;
+                metas
+                    .iter()
+                    .filter(|m| m.consumer_id == target_consumer)
+                    .min_by_key(|m| m.subscription_id)
+                    .map(|m| m.subscription_id)
+            }
+            EvictionStrategy::Custom(evictor) => {
+                let metas = self.collect_subscription_metadata();
+                let view = crate::SubscriptionsView::new(metas.as_slice());
+                evictor(&view)
+            }
+        }
+    }
+
     /// Internal unregister helper.
     ///
     /// Returns `Some(predicate_removed)` if subscription existed, else `None`.
@@ -905,6 +1219,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                 .and_then(|partition| partition.remove_binding_detail(subscription_id));
             if let Some(removal) = removal {
                 self.subscription_to_table.remove(&subscription_id);
+                self.subscription_activity.remove(&subscription_id);
                 if let Some(key) = dedup_key {
                     self.binding_dedup.remove(&key);
                 }
@@ -927,6 +1242,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
         if let Some((table_id, removal)) = removed {
             self.subscription_to_table.remove(&subscription_id);
+            self.subscription_activity.remove(&subscription_id);
             if let Some(key) = dedup_key {
                 self.binding_dedup.remove(&key);
             }
@@ -1011,6 +1327,11 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         &mut self,
         event: &WalEvent<C>,
     ) -> Result<crate::ConsumerNotifications<I, C>, DispatchError> {
+        // Activity-aware policies stamp matched subscriptions through the
+        // `_with_stamps` dispatch variant. Default (no activity tracking)
+        // takes the cheaper path that allocates no stamp vector.
+        let needs_stamps = self.eviction_strategy.needs_activity_tracking();
+
         let (partition, consumer_dict) = table_context(
             &self.partitions,
             &self.consumer_dictionaries,
@@ -1018,6 +1339,12 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         )?;
 
         if event.kind() == EventKind::Truncate {
+            if needs_stamps {
+                let (notifs, stamps) =
+                    dispatch_consumers_with_stamps(event, partition, consumer_dict, &mut self.vm)?;
+                self.stamp_activity(&stamps);
+                return Ok(notifs);
+            }
             return dispatch_consumers(event, partition, consumer_dict, &mut self.vm);
         }
 
@@ -1036,7 +1363,34 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             self.validate_row_arity(event.table_id(), row)?;
         }
 
-        dispatch_consumers(event, partition, consumer_dict, &mut self.vm)
+        let (partition, consumer_dict) = table_context(
+            &self.partitions,
+            &self.consumer_dictionaries,
+            event.table_id(),
+        )?;
+
+        if needs_stamps {
+            let (notifs, stamps) =
+                dispatch_consumers_with_stamps(event, partition, consumer_dict, &mut self.vm)?;
+            self.stamp_activity(&stamps);
+            Ok(notifs)
+        } else {
+            dispatch_consumers(event, partition, consumer_dict, &mut self.vm)
+        }
+    }
+
+    fn stamp_activity(&mut self, stamped_subs: &[SubscriptionId]) {
+        if stamped_subs.is_empty() {
+            return;
+        }
+        let now = self.activity_clock.as_ref().map(|c| c.now_micros());
+        for &sub_id in stamped_subs {
+            let entry = self.subscription_activity.entry(sub_id).or_default();
+            entry.dispatch_count = entry.dispatch_count.saturating_add(1);
+            if let Some(now_micros) = now {
+                entry.last_dispatch_at = Some(now_micros);
+            }
+        }
     }
 
     /// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), …).
@@ -2206,6 +2560,483 @@ mod tests {
             "oldest subscription must be evicted"
         );
         assert_eq!(engine.subscription_count(), 2, "registry size stays at cap");
+    }
+
+    /// T5.3: `EvictLeastActive` evicts the subscription with the oldest
+    /// `last_dispatch_at` (or `None`, treated as -infinity) once the cap
+    /// is full. A `ManualClock` makes the test deterministic.
+    #[test]
+    fn test_register_cap_evict_least_active() {
+        use crate::ManualClock;
+        use core::time::Duration;
+
+        let catalog = make_catalog();
+        let orders_id = orders_tid(&catalog);
+        let clock = Arc::new(ManualClock::new(0));
+        let handle: crate::ClockHandle = clock.clone();
+
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::EvictLeastActive)
+                .with_activity_clock(handle);
+
+        let first = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("first register");
+        // Match first: dispatch an event whose row beats amount > 1.
+        clock.advance(Duration::from_micros(10));
+        let event_a = build_insert_event(
+            orders_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(1), Cell::Int(5), Cell::String("p".into())]),
+            },
+        );
+        engine.consumers(&event_a).expect("dispatch first");
+
+        let second = engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 100",
+            ))
+            .expect("second register");
+        clock.advance(Duration::from_micros(20));
+        let event_b = build_insert_event(
+            orders_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(2)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(2), Cell::Int(500), Cell::String("p".into())]),
+            },
+        );
+        engine.consumers(&event_b).expect("dispatch second");
+
+        // Both at the cap. `first` was stamped at t=10, `second` at t=30.
+        // Third registration evicts `first` (least active).
+        let third = engine
+            .register(SubscriptionRequest::new(
+                3u64,
+                "SELECT * FROM orders WHERE amount > 999",
+            ))
+            .expect("third register under EvictLeastActive");
+        assert_eq!(
+            third.evicted,
+            vec![first.subscription_id],
+            "the least recently active subscription is evicted"
+        );
+        // `second` survives.
+        assert!(engine
+            .subscription_to_table
+            .contains_key(&second.subscription_id));
+    }
+
+    /// T5.4: `EvictColdest` evicts the subscription with the lowest
+    /// `dispatch_count`. Tie-break: oldest `SubscriptionId`.
+    #[test]
+    fn test_register_cap_evict_coldest() {
+        let catalog = make_catalog();
+        let orders_id = orders_tid(&catalog);
+
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::EvictColdest);
+
+        let hot = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 0",
+            ))
+            .expect("register hot");
+        let cold = engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 1000",
+            ))
+            .expect("register cold");
+
+        // Dispatch five events that match only `hot`.
+        for i in 0..5 {
+            let event = build_insert_event(
+                orders_id,
+                PrimaryKey {
+                    columns: Arc::from([0u16]),
+                    values: Arc::from([Cell::Int(i)]),
+                },
+                RowImage {
+                    cells: Arc::from([Cell::Int(i), Cell::Int(5), Cell::String("p".into())]),
+                },
+            );
+            engine.consumers(&event).expect("dispatch hot");
+        }
+
+        let third = engine
+            .register(SubscriptionRequest::new(
+                3u64,
+                "SELECT * FROM orders WHERE amount > 7",
+            ))
+            .expect("third register under EvictColdest");
+        assert_eq!(
+            third.evicted,
+            vec![cold.subscription_id],
+            "the coldest subscription (lowest dispatch_count) is evicted"
+        );
+        assert!(engine
+            .subscription_to_table
+            .contains_key(&hot.subscription_id));
+    }
+
+    /// T5.5: `EvictBySession` prefers session-scoped subscriptions over
+    /// durable ones.
+    #[test]
+    fn test_register_cap_evict_by_session_prefers_session_scope() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::EvictBySession);
+
+        let durable = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("register durable");
+        let session = engine
+            .register(
+                SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE amount > 2")
+                    .scope(SubscriptionScope::Session(7777)),
+            )
+            .expect("register session");
+
+        let third = engine
+            .register(SubscriptionRequest::new(
+                3u64,
+                "SELECT * FROM orders WHERE amount > 3",
+            ))
+            .expect("third register under EvictBySession");
+
+        assert_eq!(
+            third.evicted,
+            vec![session.subscription_id],
+            "session-scoped subscription must be evicted before durable"
+        );
+        assert!(engine
+            .subscription_to_table
+            .contains_key(&durable.subscription_id));
+    }
+
+    /// T5.5b: when no session-scoped subscriptions exist, `EvictBySession`
+    /// falls back to `EvictOldest` behavior.
+    #[test]
+    fn test_register_cap_evict_by_session_falls_back_to_oldest_when_all_durable() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::EvictBySession);
+
+        let first = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("first");
+        let _second = engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 2",
+            ))
+            .expect("second");
+
+        let third = engine
+            .register(SubscriptionRequest::new(
+                3u64,
+                "SELECT * FROM orders WHERE amount > 3",
+            ))
+            .expect("third");
+        assert_eq!(
+            third.evicted,
+            vec![first.subscription_id],
+            "with no session subscriptions, the oldest durable is evicted"
+        );
+    }
+
+    /// T5.6: `EvictByConsumer` evicts from the consumer holding the most
+    /// live subscriptions ("biggest hog"). Tie-break: oldest sub id.
+    #[test]
+    fn test_register_cap_evict_by_consumer_picks_biggest_hog() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(3, crate::EvictionPolicy::EvictByConsumer);
+
+        let hog_a = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("hog A");
+        let _hog_b = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 2",
+            ))
+            .expect("hog B");
+        let lone = engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 3",
+            ))
+            .expect("consumer 2 single");
+
+        // Fourth registration from consumer 3 trips the cap. Consumer 1
+        // is the biggest hog (2 subs); its oldest sub (hog_a) is evicted.
+        let fourth = engine
+            .register(SubscriptionRequest::new(
+                3u64,
+                "SELECT * FROM orders WHERE amount > 4",
+            ))
+            .expect("fourth");
+        assert_eq!(
+            fourth.evicted,
+            vec![hog_a.subscription_id],
+            "EvictByConsumer must take the oldest sub from the biggest holder"
+        );
+        assert!(engine
+            .subscription_to_table
+            .contains_key(&lone.subscription_id));
+    }
+
+    /// T5.6b: `EvictByConsumer` with a single consumer falls back to
+    /// `EvictOldest`.
+    #[test]
+    fn test_register_cap_evict_by_consumer_single_consumer_falls_back_to_oldest() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::EvictByConsumer);
+
+        let first = engine
+            .register(SubscriptionRequest::new(
+                42u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("first");
+        let _second = engine
+            .register(SubscriptionRequest::new(
+                42u64,
+                "SELECT * FROM orders WHERE amount > 2",
+            ))
+            .expect("second");
+
+        let third = engine
+            .register(SubscriptionRequest::new(
+                42u64,
+                "SELECT * FROM orders WHERE amount > 3",
+            ))
+            .expect("third");
+        assert_eq!(
+            third.evicted,
+            vec![first.subscription_id],
+            "with a single consumer, evict the oldest of that consumer's subs"
+        );
+    }
+
+    /// T5.7: custom closure drives eviction. The closure receives a
+    /// `SubscriptionsView` and returns the subscription id to evict.
+    #[test]
+    fn test_register_cap_custom_closure_picks_victim() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {}).with_custom_eviction(
+                2,
+                |view: &crate::SubscriptionsView<'_, DefaultIds>| {
+                    view.iter()
+                        .max_by_key(|m| m.subscription_id)
+                        .map(|m| m.subscription_id)
+                },
+            );
+
+        let _first = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("first");
+        let second = engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 2",
+            ))
+            .expect("second");
+
+        // Custom closure picks the highest sub id (== `second`).
+        let third = engine
+            .register(SubscriptionRequest::new(
+                3u64,
+                "SELECT * FROM orders WHERE amount > 3",
+            ))
+            .expect("third");
+        assert_eq!(
+            third.evicted,
+            vec![second.subscription_id],
+            "custom closure must pick the eviction target"
+        );
+    }
+
+    /// T5.9: `register_batch` honors the registry cap. With
+    /// `EvictionPolicy::Reject` the over-cap specs in a batch surface
+    /// as per-spec `RegistryFull` errors while earlier specs succeed.
+    #[test]
+    fn test_register_batch_cap_reject_returns_registry_full_per_spec() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::Reject);
+
+        let specs = vec![
+            SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE amount > 1"),
+            SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE amount > 2"),
+            SubscriptionRequest::new(3u64, "SELECT * FROM orders WHERE amount > 3"),
+            SubscriptionRequest::new(4u64, "SELECT * FROM orders WHERE amount > 4"),
+        ];
+        let results = engine.register_batch(specs);
+
+        assert!(results[0].is_ok(), "first spec fits under cap");
+        assert!(results[1].is_ok(), "second spec hits cap exactly");
+        assert!(
+            matches!(results[2], Err(RegisterError::RegistryFull { cap: 2 })),
+            "third spec is past cap, got {:?}",
+            results[2],
+        );
+        assert!(
+            matches!(results[3], Err(RegisterError::RegistryFull { cap: 2 })),
+            "fourth spec is past cap, got {:?}",
+            results[3],
+        );
+        assert_eq!(engine.subscription_count(), 2);
+    }
+
+    /// T5.10: `register_batch` triggers eviction per over-cap spec under
+    /// `EvictOldest`, and surfaces evicted ids in each spec's result.
+    #[test]
+    fn test_register_batch_cap_evict_oldest_evicts_per_spec() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_max_subscriptions(2, crate::EvictionPolicy::EvictOldest);
+
+        let pre1 = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("pre1");
+        let pre2 = engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 2",
+            ))
+            .expect("pre2");
+        assert_eq!(engine.subscription_count(), 2);
+
+        let specs = vec![
+            SubscriptionRequest::new(3u64, "SELECT * FROM orders WHERE amount > 3"),
+            SubscriptionRequest::new(4u64, "SELECT * FROM orders WHERE amount > 4"),
+        ];
+        let results = engine.register_batch(specs);
+
+        let r0 = results[0].as_ref().expect("first batch entry");
+        let r1 = results[1].as_ref().expect("second batch entry");
+        assert_eq!(
+            r0.evicted,
+            vec![pre1.subscription_id],
+            "first over-cap spec evicts the original oldest"
+        );
+        assert_eq!(
+            r1.evicted,
+            vec![pre2.subscription_id],
+            "second over-cap spec evicts the new oldest"
+        );
+        assert_eq!(engine.subscription_count(), 2);
+    }
+
+    /// T5.11: `register_batch` mixes successful evictions with rejected
+    /// specs when the custom closure declines some.
+    #[test]
+    fn test_register_batch_cap_custom_closure_mixed() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {}).with_custom_eviction(
+                1,
+                |view: &crate::SubscriptionsView<'_, DefaultIds>| {
+                    // Evict only when the registry holds an even-id sub.
+                    view.iter()
+                        .find(|m| m.subscription_id % 2 == 0)
+                        .map(|m| m.subscription_id)
+                },
+            );
+
+        engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("pre");
+        // First batch entry hits cap with no even-id sub present, closure
+        // returns None → RegistryFull. Second entry would also be rejected.
+        let results = engine.register_batch(vec![
+            SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE amount > 2"),
+            SubscriptionRequest::new(3u64, "SELECT * FROM orders WHERE amount > 3"),
+        ]);
+        assert!(matches!(
+            results[0],
+            Err(RegisterError::RegistryFull { cap: 1 })
+        ));
+        assert!(matches!(
+            results[1],
+            Err(RegisterError::RegistryFull { cap: 1 })
+        ));
+    }
+
+    /// T5.8: a custom closure returning `None` makes registration fall
+    /// through to `RegistryFull { cap }`. Allows hybrid policies that
+    /// sometimes reject instead of evicting.
+    #[test]
+    fn test_register_cap_custom_closure_none_rejects() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+                .with_custom_eviction(2, |_view: &crate::SubscriptionsView<'_, DefaultIds>| None);
+
+        engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("first");
+        engine
+            .register(SubscriptionRequest::new(
+                2u64,
+                "SELECT * FROM orders WHERE amount > 2",
+            ))
+            .expect("second");
+
+        match engine.register(SubscriptionRequest::new(
+            3u64,
+            "SELECT * FROM orders WHERE amount > 3",
+        )) {
+            Err(RegisterError::RegistryFull { cap }) => assert_eq!(cap, 2),
+            other => {
+                panic!("expected RegistryFull when custom closure returns None, got {other:?}")
+            }
+        }
     }
 
     #[test]

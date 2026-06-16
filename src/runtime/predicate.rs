@@ -77,6 +77,14 @@ pub struct PredicateStore<I: IdTypes> {
     pub scope_index: HashMap<I::SessionId, Vec<SubscriptionId>>,
     /// PredicateId → `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate)
     pub predicate_consumers: HashMap<PredicateId, RoaringBitmap>,
+    /// (PredicateId, ConsumerOrdinal) → SubscriptionIds bound to that pair.
+    ///
+    /// A single (predicate, consumer) pair may carry multiple subscription
+    /// ids when the same consumer subscribes under different scopes (e.g.
+    /// one durable and one session-scoped). Used by activity-aware eviction
+    /// policies to stamp the matched subscriptions after dispatch in O(1)
+    /// per matched pair instead of an O(B) scan over `bindings`.
+    pub binding_lookup: HashMap<(PredicateId, ConsumerOrdinal), Vec<SubscriptionId>>,
 }
 
 impl<I: IdTypes> Clone for PredicateStore<I> {
@@ -87,6 +95,7 @@ impl<I: IdTypes> Clone for PredicateStore<I> {
             bindings: self.bindings.clone(),
             scope_index: self.scope_index.clone(),
             predicate_consumers: self.predicate_consumers.clone(),
+            binding_lookup: self.binding_lookup.clone(),
         }
     }
 }
@@ -101,6 +110,7 @@ impl<I: IdTypes> PredicateStore<I> {
             bindings: HashMap::new(),
             scope_index: HashMap::new(),
             predicate_consumers: HashMap::new(),
+            binding_lookup: HashMap::new(),
         }
     }
 
@@ -254,6 +264,14 @@ impl<I: IdTypes> PredicateStore<I> {
             .entry(pred_id)
             .or_default()
             .insert(consumer_ord.get());
+
+        let subs = self
+            .binding_lookup
+            .entry((pred_id, consumer_ord))
+            .or_default();
+        if !subs.contains(&sub_id) {
+            subs.push(sub_id);
+        }
     }
 
     fn remove_binding_indexes(&mut self, binding: SubscriptionBinding<I>) {
@@ -270,6 +288,14 @@ impl<I: IdTypes> PredicateStore<I> {
                 if bitmap.is_empty() {
                     self.predicate_consumers.remove(&binding.predicate_id);
                 }
+            }
+        }
+
+        let lookup_key = (binding.predicate_id, binding.consumer_ordinal);
+        if let Some(subs) = self.binding_lookup.get_mut(&lookup_key) {
+            subs.retain(|&id| id != sub_id);
+            if subs.is_empty() {
+                self.binding_lookup.remove(&lookup_key);
             }
         }
 
@@ -583,6 +609,81 @@ mod tests {
 
         assert!(store.is_consumer_referenced(42));
         assert!(!store.is_consumer_referenced(99));
+    }
+
+    /// Step 0 (eviction-policy plumbing): `binding_lookup` resolves
+    /// `(predicate_id, consumer_ordinal) -> Vec<SubscriptionId>`. Used by
+    /// activity-aware eviction policies to stamp the right subscriptions
+    /// after dispatch matches a predicate.
+    #[test]
+    fn test_binding_lookup_resolves_subscription_id() {
+        let mut store = PredicateStore::<DefaultIds>::new();
+        let pred = make_predicate(0, 0xBEEF, 1);
+        let pred_id = store.add_predicate(pred);
+        let ord = ConsumerOrdinal::new(7);
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 555,
+            predicate_id: pred_id,
+            consumer_id: 42,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+
+        assert_eq!(
+            store.binding_lookup.get(&(pred_id, ord)),
+            Some(&vec![555]),
+            "binding_lookup must surface the subscription id for the matched pair"
+        );
+
+        let _ = store.remove_binding(555);
+        assert!(
+            !store.binding_lookup.contains_key(&(pred_id, ord)),
+            "binding_lookup must be pruned when no bindings remain"
+        );
+    }
+
+    /// Step 0: two scopes on the same (predicate, consumer) pair both
+    /// surface from `binding_lookup`.
+    #[test]
+    fn test_binding_lookup_handles_multiple_scopes_per_pair() {
+        let mut store = PredicateStore::<DefaultIds>::new();
+        let pred = make_predicate(0, 0xCAFE, 1);
+        let pred_id = store.add_predicate(pred);
+        let ord = ConsumerOrdinal::new(0);
+
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 1,
+            predicate_id: pred_id,
+            consumer_id: 9,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Durable,
+            updated_at_unix_ms: 0,
+        });
+        store.add_binding(SubscriptionBinding {
+            subscription_id: 2,
+            predicate_id: pred_id,
+            consumer_id: 9,
+            consumer_ordinal: ord,
+            scope: SubscriptionScope::Session(100),
+            updated_at_unix_ms: 0,
+        });
+
+        let mut subs = store
+            .binding_lookup
+            .get(&(pred_id, ord))
+            .cloned()
+            .unwrap_or_default();
+        subs.sort_unstable();
+        assert_eq!(subs, vec![1, 2]);
+
+        let _ = store.remove_binding(1);
+        assert_eq!(
+            store.binding_lookup.get(&(pred_id, ord)),
+            Some(&vec![2]),
+            "removing one of two bindings leaves the other in the lookup"
+        );
     }
 
     #[test]
