@@ -20,6 +20,8 @@ All claims below are anchored to specific rows in those captures.
 
 `examples/scale_throughput.rs` sweeps producer rate from 100/s to 25_000/s, 3 trials per cell, fresh source per trial. The producer runs on a dedicated OS thread so the single-threaded tokio runtime serves the consumer task without contention.
 
+![Latency vs event rate](benchmarks/plots/scale-throughput-latency.png)
+
 Pooled per-event median latency:
 
 | producer rate (/s) | push | poll @ 10 ms | poll @ 100 ms | poll @ 1000 ms |
@@ -49,6 +51,10 @@ These savings reproduce across every cell, every re-run, and every workload phas
 
 - **A**: N dedicated producers, each driving ~200 ev/s. Total rate = `N × 200/s`. Matches real SaaS multi-tenant fan-out.
 - **B**: 1 shared producer at 1k ev/s. N consumers drain the same publication. Isolates per-consumer cost from rate growth.
+
+![Latency vs consumer count](benchmarks/plots/scale-consumers-latency.png)
+
+![Server-side commit rate vs consumer count](benchmarks/plots/scale-consumers-server-load.png)
 
 ### Experiment B (controlled rate, isolated per-consumer cost)
 
@@ -81,6 +87,10 @@ The N=1/5 cells in this re-run were contaminated by host contention with a paral
 ## Finding 3: WAL retention asymmetry
 
 `examples/scale_retention.rs` runs three scenarios across {push, poll@100ms} × N in {5, 30}. Slot lag sampled every 5 s for a 90 s window. Crucially, the benchmark consumers **never call `ack()`** on the push side — this exposes the worst-case push retention behavior. In a real deployment, a well-behaved push consumer would ack and its slot lag would track time-since-last-ack instead.
+
+![WAL retention time-series, N=30](benchmarks/plots/scale-retention-timeseries.png)
+
+The vertical scale gap between the top row (push, in MB) and bottom row (polling, in KB) is the headline of this report: polling auto-cleans, push retains. In the bottom-right panel you can clearly see the crashed polling slot's lag start growing at t=30s (the dotted gray line) and accumulate linearly thereafter while the healthy polling slots stay at ~0 KB.
 
 ### Scenario A: all consumers healthy
 
@@ -122,6 +132,10 @@ The N=1/5 cells in this re-run were contaminated by host contention with a paral
 **Per-slot independence holds for crashed consumers too**: healthy slots' lag is independent of the crashed slot's growth. This contradicts the folklore that "one bad consumer pins WAL for everyone" — that's only true if you have ONE slot with multiple consumers reading from it (which neither transport allows in this benchmark's setup).
 
 ## Finding 4: throughput ceiling
+
+![Drain rate vs producer rate](benchmarks/plots/scale-throughput-ceiling.png)
+
+The dashed gray line is `drain = producer` (perfect keep-up). Polling at 100 ms diverges from it past ~1k events/sec; push and polling at 1000 ms stay close to it through 25k/s.
 
 From the scale_throughput drain rate column:
 
@@ -187,3 +201,11 @@ cargo run --release --example scale_retention --features pg-streaming
 Run them SEQUENTIALLY, not in parallel — host contention from concurrent runs visibly degrades the lower-rate / lower-N cells (visible in the scale_consumers Experiment A N=1/5 numbers above).
 
 Each takes 10-25 minutes wall-clock on the reference hardware. The TSV files at `docs/benchmarks/scale-*-2026-06-15.tsv` are long-form `(experiment, scale_key, cell_key, metric, value)` rows suitable for plotting in pandas / gnuplot / Excel without parsing the Markdown.
+
+To regenerate the plots embedded above:
+
+```sh
+./docs/benchmarks/plot.py
+```
+
+The script is a self-contained PEP 723 file (`uv` shebang) — no project setup needed. It reads the three TSVs and writes PNGs to `docs/benchmarks/plots/`.
