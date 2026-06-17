@@ -789,6 +789,17 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// In required durability mode, pre-commit snapshot failures are rolled back.
     /// Post-commit directory fsync failures are surfaced but not rolled back.
     ///
+    /// **Parity with `register()`**. The returned `Vec` is guaranteed to
+    /// be element-for-element equal to what calling `register()` in a
+    /// loop on a fresh engine with the same configuration would have
+    /// produced, including within-batch idempotent duplicates
+    /// (collapsed onto the first occurrence's `SubscriptionId`) and
+    /// the `evicted` accounting under an eviction policy. When an
+    /// active eviction policy is configured (anything other than
+    /// `Reject`), the implementation transparently falls back to a
+    /// sequential `register()` loop to maintain parity; the bulk-COW
+    /// fast path applies to the no-cap and `Reject`-cap cases.
+    ///
     /// # Examples
     /// ```
     /// use std::sync::Arc;
@@ -833,11 +844,46 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         &mut self,
         specs: Vec<SubscriptionRequest<I>>,
     ) -> Vec<Result<RegisterResult, RegisterError>> {
+        // Eviction-aware fallback: when an active-eviction policy is
+        // configured, within-batch eviction would have to consider
+        // pending-but-not-yet-committed sub_ids that
+        // `pick_eviction_victim` does not see. Rather than thread that
+        // visibility through every policy's selection logic
+        // (`EvictLeastActive` / `EvictColdest` / `EvictBy*` all need
+        // activity metadata pending subs do not have), we fall back to
+        // a sequential `register()` loop in that case. The bulk-COW
+        // optimization still applies when there is no cap or when the
+        // policy is `Reject` (the common cases at startup-bootstrap).
+        if self.max_subscriptions.is_some() {
+            let eviction_active = !matches!(
+                self.eviction_strategy,
+                EvictionStrategy::BuiltIn(crate::EvictionPolicy::Reject)
+            );
+            if eviction_active {
+                return specs.into_iter().map(|s| self.register(s)).collect();
+            }
+        }
+
         // Phase 1: Parse and compile all specs (can fail individually).
         // Idempotent duplicates are short-circuited before binding creation.
         let mut compiled: Vec<Option<CompiledSpec<I>>> = Vec::with_capacity(specs.len());
         let mut results: Vec<Result<RegisterResult, RegisterError>> =
             Vec::with_capacity(specs.len());
+        // Within-batch natural-key dedup. Maps the natural key of a
+        // freshly-compiled, not-yet-committed binding to the result
+        // index that owns it. When a later spec in the same batch
+        // matches one of these, we defer setting its `subscription_id`
+        // until Phase 2 has assigned the primary's id, then copy it
+        // over (or mirror the primary's error). Without this, a
+        // duplicate `(consumer, predicate_hash, scope)` triple within
+        // the same batch would diverge from the sequential
+        // `register()` path, which would short-circuit the duplicate
+        // onto the existing binding.
+        let mut batch_natural_dedup: HashMap<(I::ConsumerId, u128, SubscriptionScope<I>), usize> =
+            HashMap::new();
+        // Pairs of `(duplicate_index, primary_index)` to reconcile
+        // after Phase 2.
+        let mut deferred_dup_copies: Vec<(usize, usize)> = Vec::new();
 
         for spec in specs {
             match self.compile_spec(spec) {
@@ -861,6 +907,27 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                         compiled.push(None); // already handled
                         continue;
                     }
+                    // Check within-batch dedup against earlier specs in
+                    // this same batch.
+                    if let Some(&primary_idx) = batch_natural_dedup.get(&natural_key) {
+                        let dup_idx = results.len();
+                        deferred_dup_copies.push((dup_idx, primary_idx));
+                        results.push(Ok(RegisterResult {
+                            subscription_id: 0, // copied from primary after Phase 2
+                            table_id: compiled_spec.table_id,
+                            normalized_sql: compiled_spec.normalized,
+                            predicate_hash: compiled_spec.hash,
+                            created_new_predicate: false,
+                            projection: compiled_spec.projection,
+                            evicted: Vec::new(),
+                        }));
+                        compiled.push(None);
+                        continue;
+                    }
+                    // First occurrence of this natural key within the
+                    // batch; record so subsequent duplicates can defer
+                    // onto it.
+                    batch_natural_dedup.insert(natural_key, results.len());
                     results.push(Ok(RegisterResult {
                         subscription_id: 0, // filled in phase 2
                         table_id: compiled_spec.table_id,
@@ -1087,6 +1154,31 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         {
             let _ = phase3_failed_tables;
             let _ = table_inserted_sub_ids;
+        }
+
+        // Phase 4: Within-batch duplicate reconciliation. For every
+        // duplicate spec that pointed at an earlier primary in this
+        // batch, mirror the primary's outcome so the duplicate's
+        // `Result` matches what a sequential `register()` loop would
+        // return: same `SubscriptionId` on success, same error on
+        // failure.
+        for (dup_idx, primary_idx) in deferred_dup_copies {
+            match &results[primary_idx] {
+                Ok(primary_ok) => {
+                    let primary_sub_id = primary_ok.subscription_id;
+                    let primary_normalized = primary_ok.normalized_sql.clone();
+                    if let Ok(dup_ok) = &mut results[dup_idx] {
+                        dup_ok.subscription_id = primary_sub_id;
+                        if dup_ok.normalized_sql.is_empty() {
+                            dup_ok.normalized_sql = primary_normalized;
+                        }
+                    }
+                }
+                Err(primary_err) => {
+                    let cloned = primary_err.clone();
+                    results[dup_idx] = Err(cloned);
+                }
+            }
         }
 
         results

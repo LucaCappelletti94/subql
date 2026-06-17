@@ -6,6 +6,7 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 
 ### Changed
 
+- `SubscriptionEngine::register_batch(specs)` now guarantees per-index parity with calling `register(spec)` in a loop. Two divergences are closed: within-batch idempotent duplicates now collapse onto the first occurrence's `SubscriptionId` (matching the sequential dedup path) instead of being assigned fresh ids; and when an active eviction policy is configured (anything other than `Reject`), the implementation transparently falls back to a sequential `register()` loop so within-batch evictions can see pending sub_ids the bulk path could not. Surfaced by `tests/proptest_register_batch_parity.rs`.
 - `AsyncAutoResolvingEngine::with_max_concurrent_reexecutions(usize)` now configures a **persistent** global concurrency cap on re-execution connector calls. Previously the cap applied per `consumers_batch` call only (consumed by `buffer_unordered`) and was ignored by per-event `consumers`. The cap is now honored by both flows and persists across calls via an `async_lock::Semaphore` stored on the engine. `cap = 0` is normalised to 1 to avoid a deadlock. Connetto-rs `Q5.5`.
 
 ### Added
