@@ -116,6 +116,15 @@ tracing = { version = "0.1", default-features = false, optional = true }
 dhat = { version = "0.3", optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
+# PostgreSQL logical-replication (`pgoutput`) parser. Backs the
+# `PgOutputParser` adapter in `src/wal/pgoutput.rs`. Pinned to the
+# `no-std` branch of the maintainer's fork while PR #74 is under review;
+# upstream main already carries the `pgoutput-encoder` and optional-`tokio`
+# features that `no-std` builds on top of. Default features are off so
+# subql's `--no-default-features` build stays `no_std + alloc` with no
+# `tokio` and no C deps; the `std` feature below propagates `std` through.
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "no-std", default-features = false }
+
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -147,6 +156,7 @@ std = [
     "serde_json/std",
     "postcard/use-std",
     "thiserror/std",
+    "pg_walstream/std",
     "dep:lz4",
     "dep:toml",
 ]
