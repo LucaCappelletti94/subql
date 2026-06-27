@@ -134,7 +134,6 @@ slow-consumer test.
 | `tests/pg_streaming_e2e.rs` | MODIFIED | New `events_received_counter_tracks_pushed_events` test. |
 | `tests/polling_vs_push_benchmark.rs` | UNTOUCHED | Step 8 will refactor this to use `PollingPgCdcSource` instead of inline hand-rolled polling. |
 | `docs/cdc-workload-benchmark-plan.md` | DONE | Full plan; multi-phase scenarios. Reference, not implementation. |
-| `docs/pg-streaming-design.md` | UNTOUCHED | Has the one-shot benchmark numbers in § "Empirical polling-vs-push latency". Step 6 should add or update this section after Phase 1 reproduces those numbers. |
 | `docs/benchmarks/pg-streaming-latency-2026-06-15.txt` | UNTOUCHED | Raw prior numbers. Step 6 compares against these. |
 
 ## Verification state
@@ -168,10 +167,10 @@ All passing as of handoff:
   take minutes by definition. Gate them behind a CLI arg / env var
   so the default `cargo run --example phase4_adversarial` finishes
   fast.
-- **Materialize fork pin** is in `Cargo.toml` `[patch.crates-io]`,
-  pinned to a specific rev. The equivalence test catches drift on
-  rev bumps. See [[rust-postgres-pr-778-split-strategy]] for the
-  upstream situation.
+- **`pg_walstream` git pin** is in `Cargo.toml`, pointing at the
+  maintainer's `no-std` branch. The `pg-streaming` feature pulls the
+  `rustls-tls` backend on top. The equivalence test catches drift on
+  rev bumps.
 
 ## Resume command
 

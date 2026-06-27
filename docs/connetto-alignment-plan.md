@@ -329,7 +329,7 @@ Long-running WAL reader. Runtime-agnostic. Caller-driven.
 
 Changes:
 
-- New feature `pg-cdc = ["executor-diesel", "dep:tokio-postgres"]` or similar. The postgres-async driver could be `tokio-postgres` or a sync polling loop. Decide during implementation, with the constraint that no specific runtime is mandated.
+- New feature `pg-cdc = ["executor-diesel", "pg_walstream/rustls-tls"]` or similar, reusing the same `pg_walstream` native backend the `pg-streaming` feature already pulls. The runtime stays caller-driven via `tokio`'s minimal feature set.
 - `pub struct PgCdcReader { ... }` with methods:
   - `pub async fn next_batch(&mut self) -> Result<Vec<WalEvent<PgLsn>>, ReaderError>`.
   - `pub async fn advance(&mut self, ckpt: PgLsn) -> Result<(), ReaderError>`. Advances the replication slot's confirmed-flushed pointer.
@@ -393,7 +393,7 @@ Each phase is independently mergeable. Suggested PR shape: one PR per phase, seq
 - `cargo fmt --check` clean.
 - `cargo check --no-default-features` green at every phase. The default no_std + alloc surface stays clean.
 - `cargo check --no-default-features --target wasm32-unknown-unknown` green at every phase.
-- `cargo tree --no-default-features -e=normal` has no diesel, no r2d2, no tokio-postgres.
+- `cargo tree --no-default-features -e=normal` has no diesel, no r2d2, no tokio (only the always-on `pg_walstream` parser bits stay).
 - The existing testcontainers tests (`tests/cdc_cross_db.rs`, `tests/reexec_postgres.rs`) keep passing under their existing `cargo test ... -- --ignored` invocations.
 
 ## Out of scope, riding follow-ons
@@ -406,7 +406,7 @@ Each phase is independently mergeable. Suggested PR shape: one PR per phase, seq
 ## Pitfalls and decisions deferred to implementation
 
 - Checkpoint for SQLite in tests. SQLite has no native WAL position usable as a checkpoint. Either ship `NoCheckpoint` (a unit-like marker impl) or accept that `DieselConnector<SqliteConnection>` sets `type Checkpoint = OpaqueCheckpoint` and always returns `None` for the optional. Decide during phase 2.
-- pg-cdc underlying driver. `diesel-postgres` is sync, the reader needs async for `next_batch` to be a future. Likely add `tokio-postgres` (or `rust-postgres-async`) for the reader path only. Decide during phase 9.
+- pg-cdc underlying driver. `diesel-postgres` is sync, the reader needs async for `next_batch` to be a future. `pg_walstream`'s `rustls-tls` backend is already on subql's `pg-streaming` feature; the same dep powers the reader path here.
 - Async-fn-in-trait Send bounds. Use `+ Send` on the trait's `async fn` returns. If a downstream user needs `!Send`, they implement their own trait variant. Document this in the trait's rustdoc.
 - Clock trait minimalism. Resist scope creep. Only `now()` is in scope for v1.
 - `EvictLeastActive` activity tracking. A per-subscription `last_dispatch_at: Option<Instant>` field is the simplest path. Avoid more elaborate decay models in v1.

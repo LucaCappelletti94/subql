@@ -24,16 +24,6 @@ diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "sqlite
 # ships.
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
-# Materialize's rust-postgres fork: carries the long-stalled
-# upstream PR #778 (CopyBoth + replication mode in Config). Required
-# until rust-postgres/rust-postgres#778 lands. Pinned to a specific
-# commit so the API surface is frozen; bump deliberately. See
-# docs/rust-postgres-pr-778-split-strategy.md for the upstream
-# situation. Workspace siblings (postgres-protocol, postgres-types)
-# are patched together because the fork's versions are coupled.
-tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
-postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
-postgres-types = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
 
 [package]
 name = "subql"
@@ -100,7 +90,7 @@ name = "reexec_postgres_r2d2"
 required-features = ["executor-diesel-postgres-r2d2"]
 
 # Docker-backed integration test for PgStreamingCdcSource (push-based PG
-# CDC source using START_REPLICATION via tokio-postgres). Run with:
+# CDC source using START_REPLICATION via pg_walstream). Run with:
 #   cargo test --test pg_streaming_e2e \
 #       --features pg-streaming -- --ignored --nocapture
 [[test]]
@@ -115,9 +105,8 @@ required-features = ["pg-streaming"]
 
 # Differential equivalence test: drives a deterministic DML stream
 # against two slots concurrently, drains both push + poll, asserts
-# they observed identical events. Catches pgoutput parser bugs,
-# tokio-postgres CopyBothDuplex framing regressions, and Materialize-
-# fork drift. Run with:
+# they observed identical events. Catches pgoutput parser bugs and
+# pg_walstream native-backend stream framing regressions. Run with:
 #   cargo test --test cdc_equivalence --features pg-streaming -- --ignored --nocapture
 [[test]]
 name = "cdc_equivalence"
@@ -128,7 +117,7 @@ required-features = ["pg-streaming"]
 # INTENTIONALLY NOT shipped in the library (see no-polling-cdc memory
 # rule); this benchmark exists solely to verify the architectural claim
 # that push delivers materially lower latency than polling. Run once,
-# paste numbers into docs/pg-streaming-design.md, do not deploy.
+# paste numbers into `docs/benchmarks/`, do not deploy.
 [[test]]
 name = "polling_vs_push_benchmark"
 required-features = ["pg-streaming"]
@@ -336,16 +325,15 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # we do not have to pull tokio just to get an async semaphore.
 async-lock = { version = "3", default-features = false }
 
-# Push-based PG CDC source (`pg-streaming` feature). `tokio-postgres`
-# 0.7 exposes the replication protocol via `CopyBothDuplex` and
-# `simple_query("START_REPLICATION ...")`; there is no separate feature
-# flag for it. `tokio` is pulled with just the channels + runtime +
-# macros + time bits the streaming source needs (no `rt-multi-thread`;
-# the consumer chooses). `bytes` is the buffer type tokio-postgres'
-# `CopyBothDuplex<Bytes>` uses, also needed to hand-roll
-# `StandbyStatusUpdate` messages.
-tokio-postgres = { version = "0.7", optional = true }
+# Push-based PG CDC source (`pg-streaming` feature). `pg_walstream` is
+# the unconditional parser dep above; the `rustls-tls` feature added by
+# the `pg-streaming` cargo feature pulls the pure-Rust native backend.
+# `tokio` is pulled with just the channels + runtime + macros + time
+# bits the streaming source needs (no `rt-multi-thread`; the consumer
+# chooses). `bytes` is the buffer type pg_walstream's stream surfaces;
+# `tokio-util` is what its `CancellationToken` lives in.
 tokio = { version = "1", optional = true, features = ["sync", "rt", "macros", "time"] }
+tokio-util = { version = "0.7", optional = true }
 bytes = { version = "1", optional = true }
 
 [dev-dependencies]
@@ -413,13 +401,19 @@ executor-diesel-postgres-r2d2 = [
     "dep:r2d2",
     "diesel?/r2d2",
 ]
-# Opt-in: ship the push-based PG CDC source. Activates `tokio-postgres`
-# with its `replication` feature for native `START_REPLICATION` support
-# and a `tokio` runtime surface for channels + spawn + timers. Implies
-# `std` (tokio is decidedly not no_std). The trait `CdcSource` itself
-# lives in subql core gated on `std` and is runtime-agnostic; this
-# feature only adds the reference impl.
-pg-streaming = ["std", "dep:tokio-postgres", "dep:tokio", "dep:bytes"]
+# Opt-in: ship the push-based PG CDC source. Activates `pg_walstream`'s
+# `rustls-tls` native backend (pure-Rust, no libpq, no C deps beyond
+# `cmake` for `aws-lc-rs`) and a `tokio` runtime surface for channels +
+# spawn + timers. Implies `std` (tokio is decidedly not no_std). The
+# trait `CdcSource` itself lives in subql core gated on `std` and is
+# runtime-agnostic; this feature only adds the reference impl.
+pg-streaming = [
+    "std",
+    "pg_walstream/rustls-tls",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:bytes",
+]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]
