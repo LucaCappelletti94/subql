@@ -9,11 +9,25 @@
 //! permissive, different evicted targets, different `SubscriptionId`
 //! assignment, different normalised SQL) is a bug.
 //!
-//! Scope. We test parity under three configurations:
+//! Scope. We test parity across the full eviction-policy surface plus
+//! a `with_custom_eviction` closure:
 //! 1. Default config (uncapped registry).
 //! 2. `EvictionPolicy::Reject` with a small cap.
-//! 3. `EvictionPolicy::EvictOldest` with a small cap (the eviction
-//!    path is the richest source of divergence risk).
+//! 3. `EvictionPolicy::EvictOldest` with a small cap.
+//! 4. `EvictionPolicy::EvictLeastActive` with a small cap.
+//! 5. `EvictionPolicy::EvictColdest` with a small cap.
+//! 6. `EvictionPolicy::EvictBySession` with mixed Durable/Session specs.
+//! 7. `EvictionPolicy::EvictByConsumer` with consumer-id variation.
+//! 8. A `with_custom_eviction` closure (lowest consumer id wins).
+//!
+//! Policies 4 and 5 require activity tracking; the engine auto-installs
+//! a `StdClock` when the policy needs it (`ensure_activity_clock_for_strategy`),
+//! so no extra wiring is needed here. With no dispatch happening
+//! between registrations, every subscription has the same activity
+//! stats (`last_dispatch_at = None`, `dispatch_count = 0`), so the tie
+//! breaker (oldest `SubscriptionId`) decides every eviction. That keeps
+//! the test focused on *registration-path* parity rather than dispatch
+//! interleavings, which is what `register_batch` actually owns.
 
 #![allow(
     clippy::unwrap_used,
@@ -29,7 +43,7 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{
     DefaultIds, EvictionPolicy, RegisterError, RegisterResult, SubscriptionEngine,
-    SubscriptionRequest,
+    SubscriptionRequest, SubscriptionScope, SubscriptionsView,
 };
 
 const CATALOG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -43,6 +57,12 @@ fn fresh(cap: Option<usize>, policy: Option<EvictionPolicy>) -> Engine {
         engine = engine.with_max_subscriptions(cap, policy);
     }
     engine
+}
+
+fn fresh_custom(cap: usize) -> Engine {
+    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap());
+    SubscriptionEngine::new(catalog, PostgreSqlDialect {})
+        .with_custom_eviction(cap, lowest_consumer_evictor)
 }
 
 /// Distinct SQL strings per `(consumer, tag)` so registrations are not
@@ -66,6 +86,46 @@ fn arb_spec_pairs() -> impl Strategy<Value = Vec<(u64, u32)>> {
 
 fn materialise(pairs: &[(u64, u32)]) -> Vec<SubscriptionRequest<DefaultIds>> {
     pairs.iter().map(|(c, t)| build_spec(*c, *t)).collect()
+}
+
+/// Scope marker that the generator picks per spec. `None` means
+/// `Durable` (the default); `Some(n)` means `Session(n)`.
+type ScopeChoice = Option<u64>;
+
+fn arb_scoped_spec_triples() -> impl Strategy<Value = Vec<(u64, u32, ScopeChoice)>> {
+    vec(
+        (
+            0u64..6,
+            0u32..32,
+            prop_oneof![Just(None), (0u64..4).prop_map(Some)],
+        ),
+        0..16,
+    )
+}
+
+fn materialise_scoped(triples: &[(u64, u32, ScopeChoice)]) -> Vec<SubscriptionRequest<DefaultIds>> {
+    triples
+        .iter()
+        .map(|(c, t, scope)| {
+            let req = build_spec(*c, *t);
+            match scope {
+                None => req.scope(SubscriptionScope::Durable),
+                Some(sess) => req.scope(SubscriptionScope::Session(*sess)),
+            }
+        })
+        .collect()
+}
+
+/// Deterministic, non-capturing eviction closure: pick the
+/// subscription belonging to the lowest consumer id, tie-broken by the
+/// lowest `SubscriptionId`. The same closure is installed on both
+/// engines under test, so parity is well-defined.
+fn lowest_consumer_evictor(
+    view: &SubscriptionsView<'_, DefaultIds>,
+) -> Option<subql::SubscriptionId> {
+    view.iter()
+        .min_by_key(|m| (m.consumer_id, m.subscription_id))
+        .map(|m| m.subscription_id)
 }
 
 /// Per-index equality check. `RegisterResult` derives `PartialEq` and
@@ -219,6 +279,105 @@ proptest! {
     ) {
         let mut engine_batch = fresh(Some(cap), Some(EvictionPolicy::EvictOldest));
         let mut engine_seq = fresh(Some(cap), Some(EvictionPolicy::EvictOldest));
+
+        let batch_results = engine_batch.register_batch(materialise(&pairs));
+        let seq_results = run_sequential(&mut engine_seq, materialise(&pairs));
+
+        assert_results_match(&batch_results, &seq_results)?;
+        assert_engine_state_match(&engine_batch, &engine_seq)?;
+    }
+
+    /// `EvictLeastActive` cap. Activity stats start at zero for every
+    /// subscription (no dispatch fires during these tests), so the
+    /// policy degrades to its tie breaker: oldest `SubscriptionId`.
+    /// Parity is still meaningful because the *fallback to a
+    /// sequential register loop* triggered by an active policy
+    /// (see the bug fix in `register_batch`) is what's under test here.
+    #[test]
+    fn parity_evict_least_active_cap(
+        cap in 1usize..=4,
+        pairs in arb_spec_pairs(),
+    ) {
+        let mut engine_batch = fresh(Some(cap), Some(EvictionPolicy::EvictLeastActive));
+        let mut engine_seq = fresh(Some(cap), Some(EvictionPolicy::EvictLeastActive));
+
+        let batch_results = engine_batch.register_batch(materialise(&pairs));
+        let seq_results = run_sequential(&mut engine_seq, materialise(&pairs));
+
+        assert_results_match(&batch_results, &seq_results)?;
+        assert_engine_state_match(&engine_batch, &engine_seq)?;
+    }
+
+    /// `EvictColdest` cap. Same shape as the least-active case:
+    /// `dispatch_count = 0` for every sub here, so victim selection
+    /// falls back to oldest `SubscriptionId`. The interesting bit is
+    /// that the sequential-fallback path inside `register_batch` must
+    /// agree with the plain sequential loop, which is exactly what
+    /// commit `95b435d` corrected.
+    #[test]
+    fn parity_evict_coldest_cap(
+        cap in 1usize..=4,
+        pairs in arb_spec_pairs(),
+    ) {
+        let mut engine_batch = fresh(Some(cap), Some(EvictionPolicy::EvictColdest));
+        let mut engine_seq = fresh(Some(cap), Some(EvictionPolicy::EvictColdest));
+
+        let batch_results = engine_batch.register_batch(materialise(&pairs));
+        let seq_results = run_sequential(&mut engine_seq, materialise(&pairs));
+
+        assert_results_match(&batch_results, &seq_results)?;
+        assert_engine_state_match(&engine_batch, &engine_seq)?;
+    }
+
+    /// `EvictBySession` cap with a mix of `Durable` and `Session`
+    /// specs. Scope-aware policies are interesting under batching
+    /// because the within-batch fallback must surface the scope of
+    /// pending subs the same way the sequential loop sees freshly
+    /// committed subs.
+    #[test]
+    fn parity_evict_by_session_cap(
+        cap in 1usize..=4,
+        triples in arb_scoped_spec_triples(),
+    ) {
+        let mut engine_batch = fresh(Some(cap), Some(EvictionPolicy::EvictBySession));
+        let mut engine_seq = fresh(Some(cap), Some(EvictionPolicy::EvictBySession));
+
+        let batch_results = engine_batch.register_batch(materialise_scoped(&triples));
+        let seq_results = run_sequential(&mut engine_seq, materialise_scoped(&triples));
+
+        assert_results_match(&batch_results, &seq_results)?;
+        assert_engine_state_match(&engine_batch, &engine_seq)?;
+    }
+
+    /// `EvictByConsumer` cap. Consumer-id varies across specs, so the
+    /// "biggest hog" metric is non-trivial. Parity asserts the batch
+    /// path computes the same hog ranking as the sequential loop after
+    /// every registration.
+    #[test]
+    fn parity_evict_by_consumer_cap(
+        cap in 1usize..=4,
+        pairs in arb_spec_pairs(),
+    ) {
+        let mut engine_batch = fresh(Some(cap), Some(EvictionPolicy::EvictByConsumer));
+        let mut engine_seq = fresh(Some(cap), Some(EvictionPolicy::EvictByConsumer));
+
+        let batch_results = engine_batch.register_batch(materialise(&pairs));
+        let seq_results = run_sequential(&mut engine_seq, materialise(&pairs));
+
+        assert_results_match(&batch_results, &seq_results)?;
+        assert_engine_state_match(&engine_batch, &engine_seq)?;
+    }
+
+    /// Custom eviction closure (lowest consumer id wins). Confirms the
+    /// `with_custom_eviction` builder is honoured by `register_batch`'s
+    /// fallback path the same way the sequential loop honours it.
+    #[test]
+    fn parity_custom_eviction_lowest_consumer(
+        cap in 1usize..=4,
+        pairs in arb_spec_pairs(),
+    ) {
+        let mut engine_batch = fresh_custom(cap);
+        let mut engine_seq = fresh_custom(cap);
 
         let batch_results = engine_batch.register_batch(materialise(&pairs));
         let seq_results = run_sequential(&mut engine_seq, materialise(&pairs));
