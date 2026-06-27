@@ -15,6 +15,8 @@ pub use runtime::{
     agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SubscriptionEngine,
     SumKernel,
 };
+#[cfg(feature = "sqlite-cdc")]
+pub use sqlite_cdc::{PgOutputBridge, SqliteCdcConfig, SqliteCdcError, SqliteCdcSource};
 pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
@@ -58,6 +60,8 @@ pub mod polling;
 pub mod reexec;
 pub mod row_set;
 pub mod runtime;
+#[cfg(feature = "sqlite-cdc")]
+pub mod sqlite_cdc;
 pub mod wal;
 
 #[cfg(any(feature = "testing", test))]
