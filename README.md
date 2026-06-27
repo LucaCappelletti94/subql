@@ -9,21 +9,11 @@
 
 SQL subscription dispatch engine for Change Data Capture fanout.
 
-`subql` dispatches CDC row events to consumers based on SQL `WHERE` subscriptions.
-It compiles SQL predicates once, deduplicates equivalent predicates across consumers, and
-uses hybrid indexes to prune candidates before VM evaluation.
+`subql` dispatches CDC row events to consumers based on SQL `WHERE` subscriptions. It compiles SQL predicates once, deduplicates equivalent predicates across consumers, and uses hybrid indexes to prune candidates before VM evaluation.
 
 ## Features
 
-- SQL-correct tri-state logic (`TRUE`/`FALSE`/`UNKNOWN`)
-- Hybrid indexing (equality/range/NULL/fallback)
-- Predicate deduplication across subscribers
-- Session-bound and durable subscriptions
-- Optional shard persistence with background merge
-- Pluggable WAL parsers (`PgOutput`, `wal2json` v1/v2, Debezium, Maxwell)
-- Table-level `TRUNCATE` CDC event support
-- Multiple SQL dialects through `sqlparser`
-- Streaming aggregate subscriptions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`
+Predicates compile once. Equivalent SQL is deduplicated across subscribers, then hybrid indexes (equality, range, `IS NULL`, plus a fallback set for the rest) prune candidates before the VM evaluates. The VM honors SQL three-valued logic (`TRUE`, `FALSE`, `UNKNOWN`), routes session-bound and durable subscriptions through the same path, and persists predicate state to durable shards with background merge when the `std` feature is on. WAL inputs are pluggable: `PgOutput`, `wal2json` v1 and v2, Debezium, and Maxwell parsers all feed into the same dispatch path, including table-level `TRUNCATE` events. Streaming aggregate subscriptions cover `COUNT(*)`, `COUNT(col)`, `SUM(col)`, and `AVG(col)`. Anything `sqlparser` accepts (multiple SQL dialects) is fair game on the predicate side.
 
 ## Quick Start
 
@@ -66,15 +56,9 @@ assert_eq!(notifs.inserted(), vec![42]);
 
 ## Streaming Aggregates
 
-`subql` supports streaming aggregate subscriptions alongside row-match subscriptions.
-Instead of `SELECT *`, register a `SELECT COUNT(*)`, `SELECT COUNT(col)`,
-`SELECT SUM(col)`, or `SELECT AVG(col)` query. The engine then emits signed
-**deltas** via `aggregate_deltas()` — the caller maintains the running total.
+`subql` supports streaming aggregate subscriptions alongside row-match subscriptions. Instead of `SELECT *`, register a `SELECT COUNT(*)`, `SELECT COUNT(col)`, `SELECT SUM(col)`, or `SELECT AVG(col)` query. The engine then emits signed **deltas** via `aggregate_deltas()`, and the caller maintains the running total.
 
-Aggregate subscribers never appear in `consumers()` output and vice versa.
-For `UPDATE` aggregate deltas, CDC events must include both old and new row
-images. If a source omits old images (`before`/`old`), `aggregate_deltas()`
-returns an error for update events.
+Aggregate subscribers never appear in `consumers()` output and vice versa. For `UPDATE` aggregate deltas, CDC events must include both old and new row images. If a source omits old images (`before` / `old`), `aggregate_deltas()` returns an error for update events.
 
 ```rust
 use std::sync::Arc;
@@ -137,8 +121,7 @@ assert_eq!(deltas, vec![
 | `SELECT SUM(col) FROM t WHERE …` | `Sum(f64)` | skips `NULL`/`NaN`/`Inf` |
 | `SELECT AVG(col) FROM t WHERE …` | `Avg { sum_delta, count_delta }` | caller divides to get the new average |
 
-For `AVG`, the caller accumulates `running_sum` and `running_count` separately,
-then computes the average as `running_sum / running_count` on demand:
+For `AVG`, the caller accumulates `running_sum` and `running_count` separately, then computes the average as `running_sum / running_count` on demand:
 
 ```rust
 use std::sync::Arc;
@@ -189,10 +172,7 @@ if let AggDelta::Avg { sum_delta, count_delta } = delta {
 
 ### Type validation
 
-Column types come from the SQL DDL parsed into `ParserDB`. When a column's
-type can be determined (e.g. `INT`, `REAL`, `TEXT`), the engine rejects
-`SUM` or `AVG` over non-numeric columns (`Bool`, `String`) at registration
-time with a `RegisterError::UnsupportedSql`.
+Column types come from the SQL DDL parsed into `ParserDB`. When a column's type can be determined (e.g. `INT`, `REAL`, `TEXT`), the engine rejects `SUM` or `AVG` over non-numeric columns (`Bool`, `String`) at registration time with a `RegisterError::UnsupportedSql`.
 
 ```rust
 use std::sync::Arc;
@@ -221,41 +201,4 @@ assert!(engine
     .is_err());
 
 # Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-## CI
-
-The workflow in `.github/workflows/ci.yml` runs:
-
-- `cargo fmt --all --check`
-- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-- `cargo check --locked` matrix (`default`, `--no-default-features`, `--all-features`)
-- `cargo test --locked` matrix (`default`, `--all-features`)
-- ignored cross-DB integration test (`cdc_cross_db`)
-- docs + doctests with rustdoc warnings denied
-- MSRV check (`1.88`)
-- bench compile check (`cargo bench --no-run --locked`)
-- fuzz target compile check (`fuzz/Cargo.toml`)
-- `cargo audit`
-
-All cargo CI commands use `--locked` for deterministic dependency resolution.
-
-## Pre-commit Hook
-
-This repo includes a Rust pre-commit hook at `.githooks/pre-commit` that runs:
-
-- `cargo fmt --all --check`
-- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-- `cargo test --workspace --lib --tests --locked`
-
-Install once per clone:
-
-```bash
-./scripts/install-git-hooks.sh
-```
-
-Skip tests for a single commit:
-
-```bash
-SUBQL_PRECOMMIT_SKIP_TESTS=1 git commit -m "..."
 ```
