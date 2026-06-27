@@ -1174,6 +1174,317 @@ pub fn harness_pgoutput(data: &[u8]) {
         }
     }
 }
+/// Tier-3 full end-to-end fuzz harness.
+///
+/// Drives an arbitrary DML stream through [`crate::SqliteCdcSource`],
+/// routes each emitted [`WalEvent`] through [`crate::PgOutputBridge`]
+/// and [`PgOutputParser`], and dispatches the parser's output through
+/// a populated [`SubscriptionEngine`]. Exercises the whole pipeline
+/// (catalog plus triggers plus shadow log plus IR translation plus
+/// `pgoutput` encode plus `pgoutput` decode plus VM dispatch) on every
+/// input, using the in-process `SqliteCdcSource` as a stand-in for a
+/// real PostgreSQL source.
+///
+/// # Invariants enforced at fixture build time
+///
+/// Several seams of the harness use fixed inputs (the DDL string, the
+/// connection target, the subscription SQL). A regression that breaks
+/// any of them should crash the very first fuzz iteration, never report
+/// "green" while silently fuzzing nothing. The init path asserts:
+///
+/// * the fixed PG DDL parses into a [`ParserDB`],
+/// * the in-memory SQLite connection opens,
+/// * the SQLite-side schema applies through `pg2sqlite`,
+/// * every fixed [`SubscriptionRequest`] compiles and registers.
+///
+/// # Per-iteration contract
+///
+/// Panics inside `bridge.encode_event`, `parser.parse_wal_message`,
+/// `engine.consumers`, or any of the Diesel paths are bugs. Errors at
+/// those seams are fine because adversarial DML can legitimately
+/// produce them (constraint violations, malformed WAL bytes the parser
+/// rejects, dispatch errors when an UPDATE arrives without the old
+/// row), but the result is fed to [`core::hint::black_box`] so the
+/// optimizer cannot dead-code-eliminate the dispatch.
+#[cfg(feature = "sqlite-cdc")]
+pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
+    use core::cell::RefCell;
+    use core::hint::black_box;
+
+    // libfuzzer hands us tiny inputs too: bail out early so we do not
+    // pay the (cached but still nonzero) fixture-borrow cost.
+    if data.len() < 2 {
+        return;
+    }
+
+    // Reuse one fixture per thread across iterations. The init path
+    // hard-asserts every constant invariant so a regression crashes
+    // the first iter rather than producing silent "green" runs.
+    thread_local! {
+        static FIXTURE: RefCell<E2eFixture> = RefCell::new(E2eFixture::init());
+    }
+
+    FIXTURE.with(|cell| {
+        let mut fixture = cell.borrow_mut();
+        fixture.reset();
+        let mut u = Unstructured::new(data);
+
+        // With a cached fixture each op stays cheap, so cap higher than
+        // the per-iter throw-away version: more mutations per input
+        // reach the dispatch path.
+        let op_count = u.int_in_range(0u8..=64).unwrap_or(0);
+        for _ in 0..op_count {
+            // 4 % chance of injecting a synthetic Truncate event. The
+            // SQLite source has no TRUNCATE analog, so this is the only
+            // way the bridge's Truncate arm and the engine's Truncate
+            // dispatch fire in this harness.
+            if u.int_in_range(0u8..=24).unwrap_or(0) == 0 {
+                let event = WalEvent::builder(fixture.table_id).truncate().build();
+                if let Ok(event) = event {
+                    fixture.route_event(&event);
+                }
+                continue;
+            }
+
+            let Some(sql) = next_dml(&mut u, fixture.table_id) else {
+                return;
+            };
+            // Execute the DML against SQLite. Errors here are
+            // adversarial-input territory (constraint violations,
+            // syntax we did not anticipate) and skipped.
+            if fixture.source.execute(&sql).is_err() {
+                continue;
+            }
+            fixture.drain_and_dispatch(&mut |ev| {
+                let _ = black_box(ev);
+            });
+        }
+    });
+}
+
+#[cfg(feature = "sqlite-cdc")]
+struct E2eFixture {
+    catalog: Arc<ParserDB>,
+    table_id: crate::TableId,
+    engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
+    source: crate::SqliteCdcSource,
+    bridge: crate::PgOutputBridge,
+    parser: PgOutputParser,
+}
+
+#[cfg(feature = "sqlite-cdc")]
+impl E2eFixture {
+    /// Fixed PG-dialect DDL for the `orders` table. Single-column INT
+    /// primary key, one nullable INT, one nullable TEXT. Composite PK
+    /// and REPLICA IDENTITY DEFAULT (key-only old tuples) belong in a
+    /// separate harness with its own fixture.
+    const PG_DDL: &'static str =
+        "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
+
+    /// Subscriptions the engine dispatches against. Mirrors the fixed
+    /// query set in `tests/proptest_sqlite_dispatch.rs`.
+    const SUBSCRIPTIONS: &'static [(u64, &'static str)] = &[
+        (1, "SELECT * FROM orders WHERE amount > 100"),
+        (2, "SELECT * FROM orders WHERE status = 'paid'"),
+        (3, "SELECT * FROM orders WHERE amount < 50"),
+        (4, "SELECT * FROM orders WHERE id = 5"),
+        (5, "SELECT * FROM orders WHERE amount IS NULL"),
+    ];
+
+    fn init() -> Self {
+        use diesel::{Connection, SqliteConnection};
+
+        use crate::{PgOutputBridge, SqliteCdcConfig, SqliteCdcSource};
+
+        let catalog_db = ParserDB::parse::<PostgreSqlDialect>(Self::PG_DDL)
+            .expect("fuzz fixture DDL must parse (regression: invariant broken)");
+        let catalog = Arc::new(catalog_db);
+        let table_id = catalog_helpers::table_id(&*catalog, "orders")
+            .expect("fuzz fixture orders table must resolve");
+
+        let mut engine = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
+            Arc::clone(&catalog),
+            PostgreSqlDialect {},
+        );
+        for (consumer_id, sql) in Self::SUBSCRIPTIONS {
+            engine
+                .register(SubscriptionRequest::new(*consumer_id, *sql))
+                .expect("fuzz fixture subscription must register");
+        }
+
+        let conn =
+            SqliteConnection::establish(":memory:").expect("in-memory SQLite connection must open");
+        let source = SqliteCdcSource::with_pg_ddl(conn, Self::PG_DDL, SqliteCdcConfig::default())
+            .expect("SqliteCdcSource must construct from fixed PG DDL");
+
+        Self {
+            catalog,
+            table_id,
+            engine,
+            source,
+            bridge: PgOutputBridge::new(),
+            parser: PgOutputParser::new(),
+        }
+    }
+
+    /// Clear shadow + table state between iterations. The connection,
+    /// triggers, engine, bridge, and parser all survive.
+    fn reset(&mut self) {
+        // The bulk DELETE fires one trigger per row, leaving DELETE
+        // entries on the shadow log we need to drain so the next
+        // iter's events arrive in deterministic order.
+        let _ = self.source.execute("DELETE FROM orders");
+        while let Ok(Some(_)) = self.source.poll_next_event() {
+            // Discard residual shadow-log entries from the bulk DELETE.
+        }
+    }
+
+    /// Drain every shadow-log entry into the dispatch chain, calling
+    /// `sink` with whatever the engine returned for each parsed event.
+    fn drain_and_dispatch<F>(&mut self, sink: &mut F)
+    where
+        F: FnMut(
+            &Result<
+                crate::ConsumerNotifications<DefaultIds, crate::NoCheckpoint>,
+                crate::DispatchError,
+            >,
+        ),
+    {
+        loop {
+            let event = match self.source.poll_next_event() {
+                Ok(Some(ev)) => ev,
+                Ok(None) | Err(_) => break,
+            };
+            self.route_event_inner(&event, sink);
+        }
+    }
+
+    /// Encode → parse → dispatch a single `WalEvent`. Used by both the
+    /// SQLite-sourced events and the synthetic Truncate-injection
+    /// path.
+    fn route_event(&mut self, event: &WalEvent) {
+        self.route_event_inner(event, &mut |result| {
+            let _ = core::hint::black_box(result);
+        });
+    }
+
+    fn route_event_inner<F>(&mut self, event: &WalEvent, sink: &mut F)
+    where
+        F: FnMut(
+            &Result<
+                crate::ConsumerNotifications<DefaultIds, crate::NoCheckpoint>,
+                crate::DispatchError,
+            >,
+        ),
+    {
+        let frames = match self.bridge.encode_event(event, &*self.catalog) {
+            Ok(frames) => frames,
+            Err(_) => return,
+        };
+        for frame in frames {
+            let Ok(parsed_events) = self.parser.parse_wal_message(&frame, &*self.catalog) else {
+                continue;
+            };
+            for parsed in parsed_events {
+                let result = self.engine.consumers(&parsed);
+                sink(&result);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sqlite-cdc")]
+fn next_dml(u: &mut Unstructured<'_>, _table_id: crate::TableId) -> Option<String> {
+    // Six branches widen the previous `0u8..=2` mix: NULL inserts, NULL
+    // updates, and PK-changing updates all exercise paths the original
+    // generator left starved.
+    Some(match u.int_in_range(0u8..=5).ok()? {
+        0 => {
+            // INSERT with concrete values.
+            let id = u.int_in_range(1i32..=8).ok()?;
+            let amount = u.int_in_range(-200i32..=200).ok()?;
+            let status = pick_status(u);
+            alloc_format(format_args!(
+                "INSERT INTO orders (id, amount, status) VALUES ({id}, {amount}, '{status}')"
+            ))
+        }
+        1 => {
+            // INSERT with NULL amount and / or status. Exercises the
+            // Cell::Null branch end-to-end, including the
+            // `amount IS NULL` subscription registered above.
+            let id = u.int_in_range(1i32..=8).ok()?;
+            let amount = if bool::arbitrary(u).ok()? {
+                "NULL".to_string()
+            } else {
+                u.int_in_range(-200i32..=200).ok()?.to_string()
+            };
+            let status = if bool::arbitrary(u).ok()? {
+                "NULL".to_string()
+            } else {
+                alloc_format(format_args!("'{}'", pick_status(u)))
+            };
+            alloc_format(format_args!(
+                "INSERT INTO orders (id, amount, status) VALUES ({id}, {amount}, {status})"
+            ))
+        }
+        2 => {
+            // UPDATE with concrete values, may be a no-op.
+            let id = u.int_in_range(1i32..=8).ok()?;
+            let amount = u.int_in_range(-200i32..=200).ok()?;
+            let status = pick_status(u);
+            alloc_format(format_args!(
+                "UPDATE orders SET amount = {amount}, status = '{status}' WHERE id = {id}"
+            ))
+        }
+        3 => {
+            // UPDATE that sets amount or status to NULL.
+            let id = u.int_in_range(1i32..=8).ok()?;
+            let amount = if bool::arbitrary(u).ok()? {
+                "NULL".to_string()
+            } else {
+                u.int_in_range(-200i32..=200).ok()?.to_string()
+            };
+            let status = if bool::arbitrary(u).ok()? {
+                "NULL".to_string()
+            } else {
+                alloc_format(format_args!("'{}'", pick_status(u)))
+            };
+            alloc_format(format_args!(
+                "UPDATE orders SET amount = {amount}, status = {status} WHERE id = {id}"
+            ))
+        }
+        4 => {
+            // PK-changing UPDATE. SQLite allows it directly when the
+            // new id is unused; otherwise the statement fails with a
+            // UNIQUE constraint, which the harness swallows. Either
+            // outcome is interesting for the dispatch path.
+            let old_id = u.int_in_range(1i32..=8).ok()?;
+            let new_id = u.int_in_range(1i32..=8).ok()?;
+            alloc_format(format_args!(
+                "UPDATE orders SET id = {new_id} WHERE id = {old_id}"
+            ))
+        }
+        _ => {
+            let id = u.int_in_range(1i32..=8).ok()?;
+            alloc_format(format_args!("DELETE FROM orders WHERE id = {id}"))
+        }
+    })
+}
+
+#[cfg(feature = "sqlite-cdc")]
+fn pick_status(u: &mut Unstructured<'_>) -> &'static str {
+    const STATUSES: &[&str] = &["paid", "open", "closed", "pending"];
+    let idx = u.int_in_range(0usize..=STATUSES.len() - 1).unwrap_or(0);
+    STATUSES[idx]
+}
+
+#[cfg(feature = "sqlite-cdc")]
+fn alloc_format(args: core::fmt::Arguments<'_>) -> String {
+    use core::fmt::Write;
+    let mut out = String::new();
+    let _ = out.write_fmt(args);
+    out
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
