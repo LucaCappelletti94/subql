@@ -294,7 +294,7 @@ where
 // PgDieselConnector: LSN-aware sync impl behind `executor-diesel-postgres`.
 // ---------------------------------------------------------------------------
 
-/// Sync [`Connector`] backed by a diesel [`PgConnection`] that anchors
+/// Sync [`Connector`] backed by a diesel `PgConnection` that anchors
 /// every read to a PostgreSQL WAL position.
 ///
 /// On each `execute_scalar` (and future `execute_rows`) call the connector
