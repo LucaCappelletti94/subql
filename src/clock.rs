@@ -75,6 +75,15 @@ pub struct ManualClock {
 
 impl ManualClock {
     /// Create a clock starting at `start_micros`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use subql::{Clock, ManualClock};
+    ///
+    /// let clock = ManualClock::new(1_000_000);
+    /// assert_eq!(clock.now_micros(), 1_000_000);
+    /// ```
     #[must_use]
     pub const fn new(start_micros: u64) -> Self {
         Self {
@@ -83,6 +92,17 @@ impl ManualClock {
     }
 
     /// Advance the clock by `by`. Saturates at `u64::MAX`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use subql::{Clock, ManualClock};
+    ///
+    /// let clock = ManualClock::new(0);
+    /// clock.advance(Duration::from_millis(250));
+    /// assert_eq!(clock.now_micros(), 250_000);
+    /// ```
     pub fn advance(&self, by: Duration) {
         let add = u64::try_from(by.as_micros()).unwrap_or(u64::MAX);
         self.micros.fetch_add(add, Ordering::SeqCst);

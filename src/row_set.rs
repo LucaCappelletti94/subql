@@ -19,6 +19,17 @@ use hashbrown::HashMap;
 ///
 /// Order within each bucket is unspecified; callers that care about
 /// stable ordering should sort by PK after the call.
+///
+/// # Examples
+///
+/// ```
+/// use subql::RowSetDelta;
+///
+/// let delta = RowSetDelta::default();
+/// assert!(delta.inserted.is_empty());
+/// assert!(delta.deleted.is_empty());
+/// assert!(delta.updated.is_empty());
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct RowSetDelta {
     /// Rows that appeared in `next` but were not in `prev`.
@@ -38,6 +49,31 @@ pub struct RowSetDelta {
 /// key and may produce spurious matches.
 ///
 /// Complexity: O(prev.len() + next.len()) hashed comparisons.
+///
+/// # Examples
+///
+/// One PK appears only in `next` (insert), one only in `prev`
+/// (delete), one in both with differing cells (update).
+///
+/// ```
+/// use std::sync::Arc;
+/// use subql::{row_set_delta, Cell, ColumnId, RowImage};
+///
+/// let prev = vec![
+///     RowImage { cells: Arc::from([Cell::Int(1), Cell::String("paid".into())]) },
+///     RowImage { cells: Arc::from([Cell::Int(2), Cell::String("open".into())]) },
+/// ];
+/// let next = vec![
+///     RowImage { cells: Arc::from([Cell::Int(1), Cell::String("shipped".into())]) },
+///     RowImage { cells: Arc::from([Cell::Int(3), Cell::String("paid".into())]) },
+/// ];
+/// let pk_cols: &[ColumnId] = &[0];
+///
+/// let delta = row_set_delta(&prev, &next, pk_cols);
+/// assert_eq!(delta.inserted.len(), 1);
+/// assert_eq!(delta.deleted.len(), 1);
+/// assert_eq!(delta.updated.len(), 1);
+/// ```
 #[must_use]
 pub fn row_set_delta(prev: &[RowImage], next: &[RowImage], pk_cols: &[ColumnId]) -> RowSetDelta {
     let mut prev_by_pk: HashMap<Vec<u8>, &RowImage> = HashMap::with_capacity(prev.len());

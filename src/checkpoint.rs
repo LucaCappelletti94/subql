@@ -48,6 +48,16 @@ impl Checkpoint for PgLsn {}
 impl PgLsn {
     /// Parse a PostgreSQL hex LSN string like `"0/3A29C8"` into a [`PgLsn`].
     /// Returns `None` if the string does not match the expected shape.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use subql::PgLsn;
+    ///
+    /// let lsn = PgLsn::parse("0/3A29C8").unwrap();
+    /// assert_eq!(lsn, PgLsn(0x003A_29C8));
+    /// assert!(PgLsn::parse("not-an-lsn").is_none());
+    /// ```
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let (hi, lo) = s.split_once('/')?;
@@ -62,6 +72,18 @@ impl PgLsn {
 /// has file id `42`).
 ///
 /// Ordering is lexicographic on `(file, pos)`.
+///
+/// # Examples
+///
+/// ```
+/// use subql::MysqlBinlogPos;
+///
+/// let a = MysqlBinlogPos { file: 42, pos: 100 };
+/// let b = MysqlBinlogPos { file: 42, pos: 200 };
+/// let c = MysqlBinlogPos { file: 43, pos: 50 };
+/// assert!(a < b);
+/// assert!(b < c);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MysqlBinlogPos {
     /// Numeric suffix of the binlog file name.
@@ -77,6 +99,16 @@ impl Checkpoint for MysqlBinlogPos {}
 /// A backend-defined byte sequence with lexicographic ordering. Use this
 /// when a backend's checkpoint does not fit the typed variants above
 /// (custom WAL formats, in-tree experiments, third-party CDC sources).
+///
+/// # Examples
+///
+/// ```
+/// use subql::OpaqueCheckpoint;
+///
+/// let early = OpaqueCheckpoint(vec![0x00, 0x10]);
+/// let later = OpaqueCheckpoint(vec![0x00, 0x20]);
+/// assert!(early < later);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OpaqueCheckpoint(pub Vec<u8>);
 
@@ -103,6 +135,15 @@ impl Checkpoint for OpaqueCheckpoint {}
 ///
 /// All instances compare equal under `Ord` since there is no position to
 /// order by. Treat this as a zero-information marker.
+///
+/// # Examples
+///
+/// ```
+/// use subql::NoCheckpoint;
+///
+/// assert_eq!(NoCheckpoint, NoCheckpoint);
+/// let _: NoCheckpoint = NoCheckpoint::default();
+/// ```
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
