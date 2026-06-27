@@ -9,11 +9,7 @@
 
 SQL subscription dispatch engine for Change Data Capture fanout.
 
-`subql` dispatches CDC row events to consumers based on SQL `WHERE` subscriptions. It compiles SQL predicates once, deduplicates equivalent predicates across consumers, and uses hybrid indexes to prune candidates before VM evaluation.
-
-## Features
-
-Predicates compile once. Equivalent SQL is deduplicated across subscribers, then hybrid indexes (equality, range, `IS NULL`, plus a fallback set for the rest) prune candidates before the VM evaluates. The VM honors SQL three-valued logic (`TRUE`, `FALSE`, `UNKNOWN`), routes session-bound and durable subscriptions through the same path, and persists predicate state to durable shards with background merge when the `std` feature is on. WAL inputs are pluggable: `PgOutput`, `wal2json` v1 and v2, Debezium, and Maxwell parsers all feed into the same dispatch path, including table-level `TRUNCATE` events. Streaming aggregate subscriptions cover `COUNT(*)`, `COUNT(col)`, `SUM(col)`, and `AVG(col)`. Anything `sqlparser` accepts (multiple SQL dialects) is fair game on the predicate side.
+`subql` dispatches CDC row events to consumers based on SQL `WHERE` subscriptions. Predicates compile once. Equivalent SQL is deduplicated across subscribers, then hybrid indexes (equality, range, `IS NULL`, plus a fallback set for the rest) prune candidates before the VM evaluates. The VM honors SQL three-valued logic (`TRUE`, `FALSE`, `UNKNOWN`), routes session-bound and durable subscriptions through the same path, and persists predicate state to durable shards with background merge when the `std` feature is on. WAL inputs are pluggable: `PgOutput`, `wal2json` v1 and v2, Debezium, and Maxwell parsers all feed into the same dispatch path, including table-level `TRUNCATE` events. Streaming aggregate subscriptions cover `COUNT(*)`, `COUNT(col)`, `SUM(col)`, and `AVG(col)`. Anything `sqlparser` accepts (multiple SQL dialects) is fair game on the predicate side.
 
 ## Quick Start
 
