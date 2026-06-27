@@ -2,8 +2,8 @@
 //!
 //! Tests that want to drive [`SqliteCdcSource`](super::SqliteCdcSource)
 //! from a single PostgreSQL `CREATE TABLE` source pass the same DDL
-//! string both to subql's [`ParserDB`] (the engine's catalog) and to
-//! [`pg2sqlite::translate`] (the SQLite-side schema). This module wraps
+//! string both to subql's `ParserDB` (the engine's catalog) and to
+//! `pg2sqlite::translate` (the SQLite-side schema). This module wraps
 //! the latter so callers do not have to thread `Pg2SqliteOptions`,
 //! string conversions, and Diesel `batch_execute` chains themselves.
 
