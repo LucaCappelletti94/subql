@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-subql = { path = "..", features = ["testing"] }
+subql = { path = "..", features = ["testing", "sqlite-cdc"] }
 
 # Standalone workspace - kept out of the parent on purpose. The root
 # workspace has `lto = true` on its release profile, and cargo-fuzz
@@ -72,6 +72,13 @@ bench = false
 [[bin]]
 name = "fuzz_pgoutput"
 path = "fuzz_targets/fuzz_pgoutput.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sqlite_pgoutput_e2e"
+path = "fuzz_targets/fuzz_sqlite_pgoutput_e2e.rs"
 test = false
 doc = false
 bench = false

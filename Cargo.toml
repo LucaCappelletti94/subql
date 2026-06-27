@@ -73,6 +73,40 @@ required-features = ["testing"]
 name = "reexec_diesel"
 required-features = ["executor-diesel"]
 
+# Smoke test for the in-process SQLite-backed `CdcSource`. Gated behind
+# the `sqlite-cdc` feature so default `cargo test` skips it.
+[[test]]
+name = "sqlite_cdc_smoke"
+required-features = ["sqlite-cdc"]
+
+# Full DML coverage (INSERT/UPDATE/DELETE on single-PK and composite-PK
+# tables) for the in-process SQLite-backed `CdcSource`.
+[[test]]
+name = "sqlite_cdc_dml"
+required-features = ["sqlite-cdc"]
+
+# Property test: arbitrary DML sequences against a reference model for
+# the in-process SQLite-backed `CdcSource`.
+[[test]]
+name = "proptest_sqlite_cdc"
+required-features = ["sqlite-cdc"]
+
+# End-to-end dispatch property test (Tier-2 + Tier-3): drives the source
+# plus the real `SubscriptionEngine` and a fixed query set, verifies
+# dispatched `ConsumerNotifications` against a Rust-side oracle. The
+# Tier-3 path also encodes events through `PgOutputBridge` and decodes
+# them back through `PgOutputParser`.
+[[test]]
+name = "proptest_sqlite_dispatch"
+required-features = ["sqlite-cdc"]
+
+# Tier-3 round-trip property test for `PgOutputBridge`: arbitrary
+# `WalEvent` shapes encoded through the bridge must round trip back
+# through `PgOutputParser` unchanged.
+[[test]]
+name = "proptest_pgoutput_bridge"
+required-features = ["sqlite-cdc"]
+
 # Docker-backed integration test for AutoResolvingEngine + DieselConnector
 # against a real Postgres with logical replication. Tests are #[ignore]d;
 # run explicitly via:
@@ -313,6 +347,12 @@ diesel = { version = "2", optional = true }
 # `executor-diesel-postgres-r2d2` feature; ignored otherwise.
 r2d2 = { version = "0.8", optional = true }
 
+# PG-DDL to SQLite-DDL translator used by the in-process `SqliteCdcSource`
+# (`sqlite-cdc` feature). Gated on the feature so default builds do not
+# pull it in. `default-features = false` drops git2 and the libssh2 +
+# libz C deps it transitively pulls.
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
+
 # Future-combinator helpers (FuturesUnordered + StreamExt) used by the
 # async auto-resolving engine to dispatch deduplicated triggers
 # concurrently. `alloc` feature only; we do not depend on std-only
@@ -412,6 +452,23 @@ pg-streaming = [
     "pg_walstream/rustls-tls",
     "dep:tokio",
     "dep:tokio-util",
+    "dep:bytes",
+]
+
+# Opt-in: ship the in-process SQLite-backed CDC source for Tier-2 + Tier-3
+# testing. Installs triggers on a Diesel `SqliteConnection` and surfaces
+# row mutations as `WalEvent`s through the same `CdcSource` trait the PG
+# transports implement. The `PgOutputBridge` encodes `WalEvent`s as
+# `pgoutput` bytes via `pg_walstream`'s encoder so the production
+# `PgOutputParser` decodes them back inside `cargo test` (no Docker).
+# Activates Diesel's `sqlite` backend and pulls in `pg2sqlite` for
+# translating PG `CREATE TABLE` DDL onto SQLite. Test-only feature, off
+# by default, never appears in production builds.
+sqlite-cdc = [
+    "std",
+    "executor-diesel",
+    "diesel?/sqlite",
+    "dep:pg2sqlite",
     "dep:bytes",
 ]
 
