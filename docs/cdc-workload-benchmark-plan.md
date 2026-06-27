@@ -5,12 +5,10 @@
 The one-shot benchmark in `tests/polling_vs_push_benchmark.rs` measured
 single-INSERT latency for both transports and produced clean
 wire-bound numbers (push 4.6 ms median; poll @ 100 ms = 57.9 ms;
-poll @ 1 s = 554 ms; see `docs/pg-streaming-design.md` §
-"Empirical polling-vs-push latency"). That settled the headline
-claim. It did *not* settle the broader question: across realistic
-CDC workloads, is push always preferable to polling, or does
-polling have regimes where it's acceptable (or better) on metrics
-other than per-event latency?
+poll @ 1 s = 554 ms). That settled the headline claim. It did *not*
+settle the broader question: across realistic CDC workloads, is push
+always preferable to polling, or does polling have regimes where it
+is acceptable (or better) on metrics other than per-event latency?
 
 This document is the plan for the next round of empirical work.
 Three asks from the user, each addressed in its own section below:
@@ -18,7 +16,7 @@ Three asks from the user, each addressed in its own section below:
 1. A multi-phase plan covering distinct schemas and scenarios.
 2. Which polling infrastructure belongs in the crate, and whether
    any of it has value as ground truth for catching parser /
-   `tokio-postgres` stream regressions.
+   `pg_walstream` stream regressions.
 3. Where the sophisticated benchmark code should live, given the
    tests will be too heavy for `cargo test` and produce
    documentation rather than assertions.
@@ -47,7 +45,7 @@ we get useful data quickly, even if we stop early.
 
 ### Phase 2 — Multi-table schema with I/U/D mix
 
-**Schema:** the e-commerce sketch from `docs/pg-streaming-design.md`:
+**Schema:** the e-commerce sketch used by the benchmark example:
 
 ```sql
 CREATE TABLE users (
@@ -134,7 +132,7 @@ The current repo has polling-shaped code in three places. Each warrants a differ
 | Location | Code | Status today |
 | --- | --- | --- |
 | `tests/common/mod.rs` | `drain_slot()` (wal2json), `drain_pgoutput_slot()` (binary) | Test helpers; used by `tests/pgoutput_e2e.rs` and `tests/eviction_e2e.rs` to drain slots in side connections |
-| `tests/polling_vs_push_benchmark.rs` | Polling receiver task with `tokio-postgres` + ticker loop | Benchmark only; carries a "DO NOT LIFT INTO LIBRARY" banner |
+| `tests/polling_vs_push_benchmark.rs` | Polling receiver task with `pg_walstream` + ticker loop | Benchmark only; carries a "DO NOT LIFT INTO LIBRARY" banner |
 | `src/wal/pg_streaming.rs` | (push code only) | The production CDC intake — pure push, no polling |
 
 ### Where polling has legitimate value
@@ -182,8 +180,8 @@ fn push_and_poll_observe_identical_event_streams() {
 
 This test catches three classes of regression that no single-transport test catches:
 - pgoutput parser bugs that affect only certain message shapes.
-- `tokio-postgres` `CopyBothDuplex` stream framing bugs (events dropped, reordered, duplicated).
-- Materialize fork drift (we pin a specific rev; a future bump might subtly change behavior).
+- `pg_walstream` native-backend stream framing bugs (events dropped, reordered, duplicated).
+- `pg_walstream` git-rev drift (we pin a specific upstream rev; a future bump might subtly change behavior).
 
 The cost is minimal: ~150 LOC of equivalence test using infrastructure we already have (the wal2json drain helper) + the existing push source. **I recommend we add this as a permanent regression test.** It belongs in `tests/`, not in `examples/`, because it's an assertion, not a benchmark.
 
@@ -207,7 +205,7 @@ The new benchmark suite has properties that make `tests/` the wrong home:
 
 - **Long-running.** A full Phase 4 sweep is ~1 hour of wall-clock. `cargo test --test xxx -- --ignored` is awkward for this. `cargo run --example xxx --release` is the canonical Rust pattern for runnable measurement programs.
 - **Output-not-assertions.** The benchmarks produce numbers we paste into docs. There are no fail-the-build assertions to make; the existing one-shot benchmark already covers the load-bearing "push beats poll @ 100ms" claim.
-- **Heavy dependencies on PG container + pgoutput parser + tokio-postgres.** Putting these under `cargo test` slows the default test run.
+- **Heavy dependencies on PG container + pgoutput parser + `pg_walstream`.** Putting these under `cargo test` slows the default test run.
 
 **Proposed layout:**
 
@@ -253,7 +251,7 @@ required-features = ["pg-streaming"]
 **Why not a separate crate:**
 - One more workspace member to maintain.
 - Cargo's example mechanism already provides the isolation we need.
-- Pulling subql + tokio-postgres + diesel via a sibling crate doubles the dependency-resolution surface for nothing.
+- Pulling subql + `pg_walstream` + diesel via a sibling crate doubles the dependency-resolution surface for nothing.
 
 ## Pitfalls and what I'd flag in advance
 
@@ -270,7 +268,7 @@ Per phase:
 
 1. Run the example. Confirm Docker is reachable.
 2. Pipe output to `docs/benchmarks/phase{N}-{date}.md`.
-3. Add a synthesis paragraph to `docs/pg-streaming-design.md` § "Empirical polling-vs-push latency" pointing at the new tables.
+3. Update the synthesis paragraph in the relevant benchmark doc under `docs/benchmarks/` to point at the new tables.
 4. If the differential equivalence test (proposed) was added: run `cargo test --test cdc_equivalence --features pg-streaming -- --ignored`.
 5. Confirm all existing tests still pass (no regression on the streaming source).
 
