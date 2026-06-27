@@ -53,6 +53,13 @@ jobs:
           # under `--no-default-features` is intentionally not exercised.
           - name: no-default-features
             args: "--lib --no-default-features"
+          # `sqlite-cdc` activated in isolation. Catches unconditional
+          # uses of items that should be feature-gated under
+          # `executor-diesel`, `pg-streaming`, or other neighbours; the
+          # `all-features` row would mask such regressions because every
+          # neighbour is also on.
+          - name: sqlite-cdc
+            args: "--all-targets --features sqlite-cdc"
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
