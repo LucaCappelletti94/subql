@@ -93,7 +93,11 @@ fn build_engine(
 /// emits 0 events for relation-only messages (begin/commit/relation), which
 /// the test must tolerate.
 #[allow(dead_code)] // used by the step-3 / step-4 tests
-fn parse_message(parser: &Wal2JsonV2Parser, catalog: &ParserDB, msg: &str) -> Vec<WalEvent> {
+fn parse_message(
+    parser: &Wal2JsonV2Parser,
+    catalog: &ParserDB,
+    msg: &str,
+) -> Vec<WalEvent<subql::PgLsn>> {
     parser
         .parse_wal_message(msg.as_bytes(), catalog)
         .expect("wal2json parse")
@@ -223,7 +227,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     );
 
     let parser = Wal2JsonV2Parser;
-    let mut events: Vec<WalEvent> = Vec::new();
+    let mut events: Vec<WalEvent<subql::PgLsn>> = Vec::new();
     for msg in &msgs {
         events.extend(parse_message(&parser, &catalog, msg));
     }
@@ -315,7 +319,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
 
     let msgs = common::drain_slot(&mut conn_setup, SLOT);
     let parser = Wal2JsonV2Parser;
-    let mut events: Vec<WalEvent> = Vec::new();
+    let mut events: Vec<WalEvent<subql::PgLsn>> = Vec::new();
     for msg in &msgs {
         events.extend(parse_message(&parser, &catalog, msg));
     }
