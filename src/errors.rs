@@ -6,6 +6,30 @@ use crate::{persistence::shard::ShardFingerprintEnvelope, MergeJobId};
 use alloc::string::String;
 use thiserror::Error;
 
+/// Errors returned by [`crate::SubscriptionEngine::advance_cursor`].
+///
+/// Triggered only when the materializer tries to install a cursor that
+/// is strictly older than the one already stored for that
+/// `(session, subscription)` pair, which would never be correct: a
+/// successful dispatch never moves a client *backwards* in the CDC
+/// stream. If a rewind is genuinely needed (snapshot bootstrap,
+/// recovery from a stuck state), use
+/// [`crate::SubscriptionEngine::force_set_cursor`] instead.
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AdvanceCursorError {
+    /// The proposed cursor is strictly older than the one already
+    /// stored. The map is NOT mutated when this error is returned.
+    #[error("cursor rewind rejected: previous={previous:?}, attempted={attempted:?}")]
+    NonMonotonic {
+        /// Cursor already stored for `(session, subscription)` at the
+        /// moment of the call.
+        previous: crate::OpaqueCheckpoint,
+        /// Cursor the caller tried to install.
+        attempted: crate::OpaqueCheckpoint,
+    },
+}
+
 /// Errors during subscription registration
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
@@ -47,6 +71,30 @@ pub enum RegisterError {
     /// Generic schema-resolution error reported by the underlying database.
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Subscription registry is at its configured cap and the eviction
+    /// policy is [`crate::EvictionPolicy::Reject`].
+    #[error(
+        "Subscription registry is full: cap={cap}; raise the cap or pick a different eviction policy"
+    )]
+    RegistryFull {
+        /// Configured cap that the registration tried to exceed.
+        cap: usize,
+    },
+
+    /// Aggregator subscription on a table with row-level security enabled.
+    ///
+    /// Under RLS, different viewers observe different result rows, so a
+    /// single in-process IVM state cannot be shared across consumers. The
+    /// reexec wrapper rejects such registrations until per-consumer total
+    /// re-execution lands.
+    #[error(
+        "Aggregator subscription on RLS-protected table {table_id} requires total re-execution (not yet supported)"
+    )]
+    AggregatorOnRlsTable {
+        /// Table whose RLS made the aggregator unsafe to capture.
+        table_id: TableId,
+    },
 
     /// Storage/persistence error during registration
     #[error("Storage error during registration: {0}")]

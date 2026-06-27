@@ -24,6 +24,16 @@ diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "sqlite
 # ships.
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+# Materialize's rust-postgres fork: carries the long-stalled
+# upstream PR #778 (CopyBoth + replication mode in Config). Required
+# until rust-postgres/rust-postgres#778 lands. Pinned to a specific
+# commit so the API surface is frozen; bump deliberately. See
+# docs/rust-postgres-pr-778-split-strategy.md for the upstream
+# situation. Workspace siblings (postgres-protocol, postgres-types)
+# are patched together because the fork's versions are coupled.
+tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
+postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
+postgres-types = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
 
 [package]
 name = "subql"
@@ -65,6 +75,182 @@ required-features = ["dhat-heap"]
 name = "sqlparser_cursed"
 harness = false
 required-features = ["testing"]
+
+# Integration test for the DieselConnector; uses in-memory SQLite. Gated
+# behind the `executor-diesel` feature so default `cargo test` does not try
+# to compile it.
+[[test]]
+name = "reexec_diesel"
+required-features = ["executor-diesel"]
+
+# Docker-backed integration test for AutoResolvingEngine + DieselConnector
+# against a real Postgres with logical replication. Tests are #[ignore]d;
+# run explicitly via:
+#   cargo test --test reexec_postgres --features executor-diesel-postgres -- --ignored --nocapture
+[[test]]
+name = "reexec_postgres"
+required-features = ["executor-diesel-postgres"]
+
+# Docker-backed integration test for PgR2D2DieselConnector (pool-backed
+# PG connector). Run with:
+#   cargo test --test reexec_postgres_r2d2 \
+#       --features executor-diesel-postgres-r2d2 -- --ignored --nocapture
+[[test]]
+name = "reexec_postgres_r2d2"
+required-features = ["executor-diesel-postgres-r2d2"]
+
+# Docker-backed integration test for PgStreamingCdcSource (push-based PG
+# CDC source using START_REPLICATION via tokio-postgres). Run with:
+#   cargo test --test pg_streaming_e2e \
+#       --features pg-streaming -- --ignored --nocapture
+[[test]]
+name = "pg_streaming_e2e"
+required-features = ["pg-streaming"]
+
+# Smoke test for the polling-based PG CDC source. Run with:
+#   cargo test --test polling_smoke --features pg-streaming -- --ignored --nocapture
+[[test]]
+name = "polling_smoke"
+required-features = ["pg-streaming"]
+
+# Differential equivalence test: drives a deterministic DML stream
+# against two slots concurrently, drains both push + poll, asserts
+# they observed identical events. Catches pgoutput parser bugs,
+# tokio-postgres CopyBothDuplex framing regressions, and Materialize-
+# fork drift. Run with:
+#   cargo test --test cdc_equivalence --features pg-streaming -- --ignored --nocapture
+[[test]]
+name = "cdc_equivalence"
+required-features = ["pg-streaming"]
+
+# One-shot empirical benchmark comparing the push-based source against a
+# minimal polling implementation. The polling implementation is
+# INTENTIONALLY NOT shipped in the library (see no-polling-cdc memory
+# rule); this benchmark exists solely to verify the architectural claim
+# that push delivers materially lower latency than polling. Run once,
+# paste numbers into docs/pg-streaming-design.md, do not deploy.
+[[test]]
+name = "polling_vs_push_benchmark"
+required-features = ["pg-streaming"]
+
+# CDC workload benchmarks. Each example reproduces or extends the
+# polling-vs-push comparison across a different workload regime; they
+# are runnable programs (not assertions) whose stdout is meant to be
+# captured into `docs/benchmarks/`. See
+# `docs/cdc-workload-benchmark-plan.md` for the multi-phase plan. All
+# share `examples/cdc_bench_common/mod.rs`; that file is included via
+# `#[path = "cdc_bench_common/mod.rs"] mod common;` in each example.
+# Phase 1 is fully implemented; phases 2-5 are scaffolds with `todo!()`
+# workload bodies, awaiting follow-up implementation.
+
+[[example]]
+name = "phase1_baseline"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "phase2_mixed_iud"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "phase3_bursty"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "phase4_adversarial"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "phase5_schema_sweep"
+required-features = ["pg-streaming"]
+
+# Focused investigation example: the Phase 1 W1.3 push median (~30 ms
+# after a 3 s idle vs ~5 ms wire RTT) does not match the wire-bound
+# floor the architectural claim predicts. Sweeps idle duration and
+# status-pump cadence to isolate the cause. Output goes to
+# `docs/benchmarks/`.
+[[example]]
+name = "w1_3_idle_wakeup"
+required-features = ["pg-streaming"]
+
+# Focused investigation example: the Phase 1 W1.2 push median (13.9 ms
+# at 500/s vs W3.3's 3.4 ms baseline at 100/s) suggests the source's
+# bounded inner channel backpressures under high event rate. Sweeps
+# event gap x `buffer_capacity` to confirm or refute.
+[[example]]
+name = "w1_2_burst_rate"
+required-features = ["pg-streaming"]
+
+# Smoothed Phase 1: per cell, runs multiple trials with a fresh
+# source per trial and pools the samples. Produces tight, stable
+# numbers usable as the headline polling-vs-push comparison.
+[[example]]
+name = "phase1_smoothed"
+required-features = ["pg-streaming"]
+
+# Scale benchmark suite: three examples that together quantify where
+# push beats polling and by how much across realistic deployment
+# scales. Outputs both Markdown stdout AND parallel .tsv files for
+# external plotting. See docs/cdc-scale-report-2026-06-15.md for the
+# synthesis report.
+[[example]]
+name = "scale_throughput"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "scale_consumers"
+required-features = ["pg-streaming"]
+
+[[example]]
+name = "scale_retention"
+required-features = ["pg-streaming"]
+
+# Decouples writer side from CDC side: Experiment W (writers only,
+# no CDC consumers) vs Experiment C (single batched writer + N CDC
+# consumers at fixed total rate). Tests whether the N=100 cliff
+# observed in scale_consumers Experiment A is a write-side or CDC-
+# side bottleneck.
+[[example]]
+name = "scale_isolation"
+required-features = ["pg-streaming"]
+
+# 2D mesh: (N consumers x producer rate) grid. Emits long-form rows
+# usable as a heatmap, mapping the saturation surface as two
+# independent axes.
+[[example]]
+name = "scale_mesh"
+required-features = ["pg-streaming"]
+
+# Sanity check that two fresh PG containers with identical schema
+# produce CDC events that resolve to the same parser TableId via a
+# shared Arc<ParserDB>. If this passes, the mesh substrate can share
+# one catalog across M sources; if it fails, a per-source oid_remap
+# is needed in MultiSourceFanIn.
+[[example]]
+name = "mesh_oid_sanity"
+required-features = ["pg-streaming"]
+
+# Mesh topology T1: M independent PG containers, no PG-to-PG
+# replication, both subscription geometries (one-per-sub G1 and
+# many-per-sub G2), uniform and skewed load shapes.
+[[example]]
+name = "mesh_independent"
+required-features = ["pg-streaming"]
+
+# Mesh topology T2: PG-native logical replication tree. One primary
+# + (M-1) subscribers, all on a shared Docker network. Writers
+# commit on the primary only; the per-node CdcSource latency
+# difference quantifies the replication-delay tax.
+[[example]]
+name = "mesh_logical_rep"
+required-features = ["pg-streaming"]
+
+# Mesh topology T3: sharded workload across M independent PGs. G2
+# geometry only (one subscription spans all shards via
+# MultiSourceFanIn). Headline metric: per-shard drain fairness =
+# per-source drain rate / per-source write rate.
+[[example]]
+name = "mesh_sharded"
+required-features = ["pg-streaming"]
 
 [dependencies]
 # SQL parsing (supports multiple dialects).
@@ -125,6 +311,43 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 # `tokio` and no C deps; the `std` feature below propagates `std` through.
 pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "no-std", default-features = false }
 
+# Optional diesel-backed Connector for the auto-resolving re-execution
+# engine. Off by default - the lib's no_std + alloc / wasm32 surface stays
+# clean unless `executor-diesel` is enabled. Diesel's default features
+# (`with-deprecated` + its internal hashbrown wiring) are kept on; the
+# downstream user activates whichever backend feature their diesel needs
+# (`postgres`, `mysql`, `sqlite`) on their own dep; here we stay
+# backend-agnostic.
+diesel = { version = "2", optional = true }
+
+# Connection-pool dep used by `PgR2D2DieselConnector`. Activated by the
+# `executor-diesel-postgres-r2d2` feature; ignored otherwise.
+r2d2 = { version = "0.8", optional = true }
+
+# Future-combinator helpers (FuturesUnordered + StreamExt) used by the
+# async auto-resolving engine to dispatch deduplicated triggers
+# concurrently. `alloc` feature only; we do not depend on std-only
+# combinators here.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# Runtime-agnostic async primitives. Used by the async auto-resolving
+# engine for its persistent re-execution concurrency cap (a `Semaphore`
+# acquired by every connector call). Works under `no_std + alloc`, so
+# we do not have to pull tokio just to get an async semaphore.
+async-lock = { version = "3", default-features = false }
+
+# Push-based PG CDC source (`pg-streaming` feature). `tokio-postgres`
+# 0.7 exposes the replication protocol via `CopyBothDuplex` and
+# `simple_query("START_REPLICATION ...")`; there is no separate feature
+# flag for it. `tokio` is pulled with just the channels + runtime +
+# macros + time bits the streaming source needs (no `rt-multi-thread`;
+# the consumer chooses). `bytes` is the buffer type tokio-postgres'
+# `CopyBothDuplex<Bytes>` uses, also needed to hand-roll
+# `StandbyStatusUpdate` messages.
+tokio-postgres = { version = "0.7", optional = true }
+tokio = { version = "1", optional = true, features = ["sync", "rt", "macros", "time"] }
+bytes = { version = "1", optional = true }
+
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -135,12 +358,19 @@ tempfile = "3"
 # Structured fuzzing (needed by regression tests)
 arbitrary = { version = "1", features = ["derive"] }
 
-# Cross-DB CDC integration test
-diesel = { version = "2", features = ["postgres", "mysql"] }
+# Cross-DB CDC integration test (`tests/cdc_cross_db.rs`) plus the
+# DieselConnector integration test (`tests/reexec_diesel.rs`) which uses
+# in-memory SQLite.
+diesel = { version = "2", features = ["postgres", "mysql", "sqlite"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 
 # Property-based testing
 proptest = "1"
+
+# Multi-task async runtime for tests that need real concurrency (e.g.
+# `tests/reexec_throttle.rs`, which observes peak in-flight connector
+# calls during a batch). Just enough features to spawn tasks and sleep.
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 
 [features]
 default = ["std"]
@@ -162,6 +392,34 @@ std = [
 ]
 testing = ["dep:arbitrary"]
 observability = ["dep:tracing", "tracing/std"]
+# Opt-in: ship `DieselConnector` plus the auto-resolving engine's diesel
+# bindings. Implies `std` (diesel needs std). The user activates their
+# backend on their own diesel dep.
+executor-diesel = ["std", "dep:diesel"]
+# Opt-in: ship `PgDieselConnector`, an LSN-aware sync connector built on
+# top of `executor-diesel` + diesel's `postgres` feature. Snapshots taken
+# through this connector carry a `PgLsn` checkpoint read from
+# `pg_current_wal_lsn()` inside the same transaction as the user query,
+# so the snapshot value and the LSN agree on a single point in the WAL.
+executor-diesel-postgres = ["executor-diesel", "diesel?/postgres"]
+# Opt-in: ship `PgR2D2DieselConnector`, the pool-backed analogue of
+# `PgDieselConnector`. Wraps `r2d2::Pool<ConnectionManager<PgConnection>>`,
+# is `Send + Sync`, and reads `pg_current_wal_lsn()` inside the same
+# transaction as the user query for LSN-anchored snapshots. Required when
+# the auto-resolving engine dispatches connector calls concurrently or
+# when snapshots may overlap CDC re-executions.
+executor-diesel-postgres-r2d2 = [
+    "executor-diesel-postgres",
+    "dep:r2d2",
+    "diesel?/r2d2",
+]
+# Opt-in: ship the push-based PG CDC source. Activates `tokio-postgres`
+# with its `replication` feature for native `START_REPLICATION` support
+# and a `tokio` runtime surface for channels + spawn + timers. Implies
+# `std` (tokio is decidedly not no_std). The trait `CdcSource` itself
+# lives in subql core gated on `std` and is runtime-agnostic; this
+# feature only adds the reference impl.
+pg-streaming = ["std", "dep:tokio-postgres", "dep:tokio", "dep:bytes"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]

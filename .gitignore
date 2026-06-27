@@ -27,6 +27,11 @@ hfuzz_target/
 fuzz/hfuzz_workspace/
 fuzz/hfuzz_target/
 
+# Proptest failure replay seeds. The project does not track these (any
+# regression that survives should land as a hand-written test); kept
+# locally so proptest can replay between runs but ignored by git.
+**/*.proptest-regressions
+
 # Added by cargo
 
 /target

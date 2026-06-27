@@ -9,7 +9,8 @@
 //! identifier-resolution rules so call sites never reinvent them.
 //!
 //! Functions: [`table_id`], [`column_id`], [`table_arity`],
-//! [`schema_fingerprint`], [`primary_key_columns`], [`column_type`].
+//! [`schema_fingerprint`], [`primary_key_columns`], [`column_type`],
+//! [`table_has_rls`].
 
 use alloc::vec::Vec;
 use sql_traits::{
@@ -155,6 +156,20 @@ pub fn column_type<DB: DatabaseLike>(
     Some(column_type_from_token(
         canonical_type_token(column.data_type(database)).as_str(),
     ))
+}
+
+/// Whether the table has row-level security enabled (per
+/// [`TableLike::has_row_level_security`]).
+///
+/// Returns `None` when the table id is unknown. The reexec wrapper consults
+/// this when classifying aggregator queries: under RLS, different viewers
+/// observe different result rows, so a single in-process IVM state would be
+/// unsafe to share across consumers. The wrapper rejects such registrations
+/// until per-consumer total re-execution lands.
+#[must_use]
+pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<bool> {
+    let table = database.table_by_id(table_id as usize)?;
+    Some(table.has_row_level_security(database))
 }
 
 /// Map a canonical sql-traits type token onto subql's [`ColumnType`].
