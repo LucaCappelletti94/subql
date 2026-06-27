@@ -61,21 +61,33 @@ jobs:
       - run: cargo check --workspace --locked ${{ matrix.profile.args }}
 
   wasm-check:
-    name: check (wasm32-unknown-unknown, no_std)
+    name: check (${{ matrix.target }}, no_std)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # Canonical browser/wasm-bindgen surface. A web-demo crate must
+          # be able to pull subql in under `--no-default-features` without
+          # further ceremony.
+          - wasm32-unknown-unknown
+          # WASI surface for server-side wasm runtimes (wasmtime, wasmer,
+          # spin). Same `no_std + alloc` subset of subql; verifying both
+          # triples on every push catches accidental target-specific
+          # regressions before they reach a downstream consumer.
+          - wasm32-wasip1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      # Canonical "yes, subql is WASM-ready" gate. The dispatch core
-      # (compiler, VM, WAL parsers, in-memory engine) must compile cleanly
-      # for `wasm32-unknown-unknown` under `--no-default-features` so a
-      # web-demo (wasm-bindgen) crate can pull subql in without further
-      # ceremony. Persistence + merge + config remain `std`-only.
-      - run: cargo check --lib --no-default-features --target wasm32-unknown-unknown --locked
+      # The dispatch core (compiler, VM, WAL parsers, in-memory engine)
+      # must compile cleanly under `--no-default-features` for every wasm
+      # target subql advertises. Persistence + merge + config remain
+      # `std`-only.
+      - run: cargo check --lib --no-default-features --target ${{ matrix.target }} --locked
 
   unit-tests:
     name: tests (${{ matrix.profile.name }})
