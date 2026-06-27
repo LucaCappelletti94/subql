@@ -64,9 +64,9 @@ impl PgOutputBridge {
     ///
     /// # Examples
     ///
-    /// Tier-3 round trip: drive DML through [`SqliteCdcSource`], encode
-    /// the resulting event as `pgoutput` bytes, decode it back through
-    /// [`crate::PgOutputParser`], dispatch with the engine.
+    /// Tier-3 round trip: drive DML through [`crate::SqliteCdcSource`],
+    /// encode the resulting event as `pgoutput` bytes, decode it back
+    /// through [`crate::PgOutputParser`], dispatch with the engine.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -122,7 +122,7 @@ impl PgOutputBridge {
     }
 
     /// Encode a [`WalEvent`] as one or two `pgoutput` wire frames ready
-    /// to feed into [`crate::PgOutputParser::parse_wal_message`].
+    /// to feed into [`crate::PgOutputParser`]'s `parse_wal_message`.
     ///
     /// The first call for any given table emits two frames: a
     /// [`Relation`] message followed by the data message. Later calls

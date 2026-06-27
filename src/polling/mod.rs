@@ -28,7 +28,10 @@
 //!
 //! Polling uses `pg_logical_slot_get_binary_changes`, which
 //! auto-advances the slot's `confirmed_flush_lsn` as a side effect of
-//! the drain. Consequently, [`PollingPgCdcSource::ack`] is a **no-op**.
+//! the drain. Consequently, the `ack` method on the [`CdcSource`] impl
+//! for [`PollingPgCdcSource`] is a **no-op**.
+//!
+//! [`CdcSource`]: crate::CdcSource
 
 #![cfg(feature = "pg-streaming")]
 

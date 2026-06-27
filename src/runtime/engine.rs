@@ -1214,7 +1214,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// pair (i.e. this is the first advance), and `Ok(Some(previous))`
     /// when an existing cursor was overwritten.
     ///
-    /// Returns [`AdvanceCursorError::NonMonotonic`] when `checkpoint`
+    /// Returns [`crate::AdvanceCursorError::NonMonotonic`] when `checkpoint`
     /// is strictly less than the stored value (a rewind) and **does
     /// not** mutate the map. A successful dispatch never moves a
     /// client backwards in the CDC stream, so a rewind is always a
@@ -1223,7 +1223,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///
     /// # Errors
     ///
-    /// [`AdvanceCursorError::NonMonotonic`] when `checkpoint < previous`.
+    /// [`crate::AdvanceCursorError::NonMonotonic`] when `checkpoint < previous`.
     pub fn advance_cursor(
         &mut self,
         session_id: I::SessionId,
