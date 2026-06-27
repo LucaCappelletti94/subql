@@ -39,7 +39,7 @@ pub(super) fn parse_map_cdc_json_message<T, DB: DatabaseLike>(
 where
     T: serde::de::DeserializeOwned + MapCdcEnvelope,
 {
-    super::parse_single_json_event::<T, _>(data, |message| {
+    super::parse_single_json_event::<T, _, crate::NoCheckpoint>(data, |message| {
         if message.skip_message() {
             return Ok(None);
         }
@@ -165,6 +165,7 @@ pub(super) fn convert_map_cdc_event<DB: DatabaseLike>(
                 false,
                 config.required_new_field,
                 config.required_old_field,
+                None,
             )
         }
         EventKind::Update => {
@@ -205,6 +206,7 @@ pub(super) fn convert_map_cdc_event<DB: DatabaseLike>(
                 compute_changed,
                 config.required_new_field,
                 config.required_old_field,
+                None,
             )
         }
         EventKind::Delete => {
@@ -224,6 +226,7 @@ pub(super) fn convert_map_cdc_event<DB: DatabaseLike>(
                 false,
                 config.required_new_field,
                 config.required_old_field,
+                None,
             )
         }
         EventKind::Truncate => build_event_from_rows(
@@ -235,6 +238,7 @@ pub(super) fn convert_map_cdc_event<DB: DatabaseLike>(
             false,
             config.required_new_field,
             config.required_old_field,
+            None,
         ),
     }
 }

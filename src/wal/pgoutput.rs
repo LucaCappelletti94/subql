@@ -117,6 +117,8 @@ impl PgOutputParser {
 const SKIP_TAGS: &[u8] = b"BCOYMSEcAPKrbp";
 
 impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
+    type Checkpoint = crate::NoCheckpoint;
+
     fn parse_wal_message(
         &self,
         data: &[u8],
@@ -166,7 +168,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                 let rel = self.get_relation(relation_id)?;
                 let (new_row, new_resolved) = tuple_cells_full(&rel, &tuple, true)?;
                 let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, database)?;
-                Ok(vec![insert_event(rel.table_id, pk, new_row)?])
+                Ok(vec![insert_event(rel.table_id, pk, new_row, None)?])
             }
 
             LogicalReplicationMessage::Update {
@@ -190,6 +192,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                     old_row,
                     new_row,
                     old_row_complete,
+                    None,
                 )])
             }
 
@@ -210,7 +213,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                     }
                 };
                 let pk = pk_from_old_resolved(&rel, &old_resolved)?;
-                Ok(vec![delete_event(rel.table_id, pk, old_row)?])
+                Ok(vec![delete_event(rel.table_id, pk, old_row, None)?])
             }
 
             LogicalReplicationMessage::Truncate { relation_ids, .. } => {
@@ -218,7 +221,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                 let mut events = Vec::with_capacity(relation_ids.len());
                 for oid in relation_ids {
                     if let Some(rel) = cache.map.get(&oid) {
-                        events.push(truncate_event(rel.table_id)?);
+                        events.push(truncate_event(rel.table_id, None)?);
                     }
                 }
                 Ok(events)
@@ -1409,7 +1412,10 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let catalog = orders_catalog();
-        let parser: &dyn WalParser<sql_traits::structs::ParserDB> = &PgOutputParser::new();
+        let parser: &dyn WalParser<
+            sql_traits::structs::ParserDB,
+            Checkpoint = crate::NoCheckpoint,
+        > = &PgOutputParser::new();
 
         // Should compile and work as a trait object
         let rel_msg = build_relation_msg(16384, "public", "orders", &orders_columns());

@@ -408,9 +408,9 @@ fn setup_engine(
 // Dispatch and collect matched consumers
 // ============================================================================
 
-fn dispatch_events(
+fn dispatch_events<C: subql::Checkpoint>(
     engine: &mut SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
-    parser: &dyn WalParser<ParserDB>,
+    parser: &dyn WalParser<ParserDB, Checkpoint = C>,
     messages: &[String],
     catalog: &ParserDB,
 ) -> Vec<BTreeSet<u64>> {

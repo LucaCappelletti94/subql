@@ -54,6 +54,8 @@ struct MaxwellMessage {
 pub struct MaxwellParser;
 
 impl<DB: DatabaseLike> WalParser<DB> for MaxwellParser {
+    type Checkpoint = crate::NoCheckpoint;
+
     fn parse_wal_message(
         &self,
         data: &[u8],
@@ -550,7 +552,7 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let catalog = maxwell_e_catalog();
-        let parser: &dyn WalParser<ParserDB> = &MaxwellParser;
+        let parser: &dyn WalParser<ParserDB, Checkpoint = crate::NoCheckpoint> = &MaxwellParser;
 
         let json = r#"{
             "database":"test","table":"e","type":"insert",

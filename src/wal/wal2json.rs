@@ -75,6 +75,11 @@ struct Wal2JsonV2Message {
     pub identity: Option<Vec<Wal2JsonV2Column>>,
     #[serde(default)]
     pub pk: Option<Vec<Wal2JsonV2PkColumn>>,
+    /// PostgreSQL LSN in `"hi/lo"` hex notation when wal2json was invoked
+    /// with `include-lsn=true`. Absent otherwise; `convert_v2_message`
+    /// surfaces `Some(PgLsn)` when present and parsable.
+    #[serde(default)]
+    pub lsn: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +110,8 @@ pub struct Wal2JsonV1Parser;
 pub struct Wal2JsonV2Parser;
 
 impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV1Parser {
+    type Checkpoint = crate::NoCheckpoint;
+
     fn parse_wal_message(
         &self,
         data: &[u8],
@@ -131,12 +138,14 @@ impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV1Parser {
 }
 
 impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV2Parser {
+    type Checkpoint = crate::PgLsn;
+
     fn parse_wal_message(
         &self,
         data: &[u8],
         database: &DB,
-    ) -> Result<Vec<WalEvent>, WalParseError> {
-        super::parse_single_json_event::<Wal2JsonV2Message, _>(data, |msg| {
+    ) -> Result<Vec<WalEvent<Self::Checkpoint>>, WalParseError> {
+        super::parse_single_json_event::<Wal2JsonV2Message, _, crate::PgLsn>(data, |msg| {
             // Skip non-row transactional metadata messages.
             if matches!(msg.action.as_str(), "B" | "C" | "M") {
                 return Ok(None);
@@ -236,7 +245,7 @@ fn convert_v1_change<DB: DatabaseLike>(
     let table_id = resolve_table(&change.schema, &change.table, database)?;
 
     if kind == EventKind::Truncate {
-        return truncate_event(table_id);
+        return truncate_event(table_id, None);
     }
 
     if matches!(kind, EventKind::Insert | EventKind::Update)
@@ -300,6 +309,7 @@ fn convert_v1_change<DB: DatabaseLike>(
         old_row_complete,
         "columnnames/columntypes/columnvalues",
         "oldkeys",
+        None,
     )
 }
 
@@ -310,7 +320,7 @@ fn convert_v1_change<DB: DatabaseLike>(
 fn convert_v2_message<DB: DatabaseLike>(
     msg: &Wal2JsonV2Message,
     database: &DB,
-) -> Result<WalEvent, WalParseError> {
+) -> Result<WalEvent<crate::PgLsn>, WalParseError> {
     let kind = parse_v2_kind(&msg.action)?;
 
     let schema = msg.schema.as_deref().unwrap_or("");
@@ -318,6 +328,11 @@ fn convert_v2_message<DB: DatabaseLike>(
         WalParseError::JsonError("data message (I/U/D) missing 'table' field".to_string())
     })?;
     let table_id = resolve_table(schema, table, database)?;
+
+    // Parse PG LSN if wal2json was invoked with include-lsn=true. Malformed
+    // strings are dropped silently (the parser does not gate event emission
+    // on a present checkpoint - oplog / replay can fall back to None).
+    let checkpoint = msg.lsn.as_deref().and_then(crate::PgLsn::parse);
 
     let (new_row, new_resolved) = match kind {
         EventKind::Insert | EventKind::Update => {
@@ -401,6 +416,7 @@ fn convert_v2_message<DB: DatabaseLike>(
         old_row_complete,
         "columns",
         "identity",
+        checkpoint,
     )
 }
 
@@ -976,7 +992,10 @@ mod tests {
     #[test]
     fn trait_object_compiles() {
         let catalog = orders_catalog();
-        let parser: &dyn WalParser<sql_traits::structs::ParserDB> = &Wal2JsonV1Parser;
+        let parser: &dyn WalParser<
+            sql_traits::structs::ParserDB,
+            Checkpoint = crate::NoCheckpoint,
+        > = &Wal2JsonV1Parser;
 
         let json = r#"{
             "change": [{
