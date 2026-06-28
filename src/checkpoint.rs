@@ -1,14 +1,14 @@
 //! Checkpoint trait and concrete impls.
 //!
 //! A [`Checkpoint`] is an opaque, ordered token that anchors a point in a
-//! CDC stream. PostgreSQL uses an 8-byte LSN ([`PgLsn`]); MySQL uses a
-//! `(file, position)` pair ([`MysqlBinlogPos`]); custom or unknown sources
+//! CDC stream. PostgreSQL uses an 8-byte LSN ([`PgLsn`]). MySQL uses a
+//! `(file, position)` pair ([`MysqlBinlogPos`]). Custom or unknown sources
 //! use [`OpaqueCheckpoint`]. Engines pin one `C: Checkpoint` per
 //! construction so events from a parser pinned to a different checkpoint
 //! type are a compile-time error rather than a runtime mismatch.
 //!
 //! The [`NoCheckpoint`] marker exists for synthetic tests and contexts that
-//! genuinely have no notion of position; production CDC code should use a
+//! genuinely have no notion of position. Production CDC code should use a
 //! real impl.
 
 use alloc::vec::Vec;
@@ -28,7 +28,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 ///   any specific scope.
 ///
 /// No methods. Backends differ in **shape**, not in what subql does with
-/// checkpoints; the trait is purely a marker.
+/// checkpoints. The trait is purely a marker.
 pub trait Checkpoint:
     Ord + Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
 {
@@ -38,7 +38,7 @@ pub trait Checkpoint:
 /// record.
 ///
 /// Wire formatted by PostgreSQL as `0/3A29C8`. The numeric value is the
-/// 64-bit absolute byte position in the WAL stream; ordering is the
+/// 64-bit absolute byte position in the WAL stream. Ordering is the
 /// natural integer ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PgLsn(pub u64);

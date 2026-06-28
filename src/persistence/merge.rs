@@ -193,7 +193,7 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> Default for MergeManager<I, DB> {
     }
 }
 
-/// Perform merge operation
+/// Milliseconds since the UNIX epoch for `now`.
 fn unix_ms_from(now: std::time::SystemTime) -> Result<u64, String> {
     let elapsed = now
         .duration_since(std::time::UNIX_EPOCH)
@@ -439,10 +439,6 @@ mod tests {
         assert_eq!(report.output_predicates, 50);
         assert!((report.dedup_ratio - 2.0).abs() < 0.01);
     }
-
-    // ========================================================================
-    // Phase 3: Push to 95% Coverage - Merge Completion
-    // ========================================================================
 
     #[test]
     fn test_merge_manager_default() {
@@ -809,7 +805,7 @@ mod tests {
         let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
 
         let (tx, rx) = mpsc::channel::<Result<MergedShard<DefaultIds>, String>>();
-        // Drop the sender immediately — simulates thread panic
+        // Drop the sender immediately: simulates thread panic
         drop(tx);
 
         let job_id = manager.next_job_id;
@@ -894,7 +890,7 @@ mod tests {
         manager.next_job_id += 1;
         manager.jobs.insert(job_id, MergeJob { receiver: rx });
 
-        // Before sending anything, check — should be "still running"
+        // Before sending anything, check: should be "still running"
         let result = manager.try_get_result(job_id);
         assert!(matches!(result, Ok(None)));
 
@@ -932,7 +928,7 @@ mod tests {
     // worker concurrency is no longer reachable through this fixture.
 
     // =========================================================================
-    // D3 — Merge determinism: equal-timestamp tie-breaking
+    // D3 merge determinism: equal-timestamp tie-breaking
     // =========================================================================
 
     #[test]
@@ -955,7 +951,7 @@ mod tests {
         };
 
         // Two bindings with same subscription_id and identical updated_at_unix_ms
-        // but different predicate_hash — output must be deterministic.
+        // but different predicate_hash: output must be deterministic.
         let binding_a = BindingData::<DefaultIds> {
             subscription_id: 42,
             predicate_hash: 0xAAAA,
@@ -993,7 +989,7 @@ mod tests {
 
         let start = Instant::now();
 
-        // Run merge twice in both shard orders — result must be identical
+        // Run merge twice in both shard orders: result must be identical
         let result_fwd = merge_shards_impl::<DefaultIds, ParserDB>(
             1,
             &[shard1.clone(), shard2.clone()],
@@ -1016,7 +1012,7 @@ mod tests {
     }
 
     // =========================================================================
-    // D4 — Merge output ordering is deterministic
+    // D4 merge output ordering is deterministic
     // =========================================================================
 
     #[test]

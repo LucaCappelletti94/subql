@@ -73,7 +73,7 @@ impl Vm {
                     let top = self.peek_tri()?;
                     if top == Tri::False {
                         // Zero-offset jumps would re-execute the same
-                        // instruction forever; the compiler never emits them,
+                        // instruction forever. The compiler never emits them,
                         // so treat as malformed bytecode.
                         if *offset == 0 {
                             return Err(VmError::BadJump(ip));
@@ -218,7 +218,7 @@ impl Vm {
                     return Ok(());
                 }
 
-                // Check if cell matches any literal; track NULL presence in RHS
+                // Check if cell matches any literal. Track NULL presence in RHS
                 let mut has_null_rhs = false;
                 let mut found = false;
                 for lit in literals {
@@ -233,7 +233,7 @@ impl Vm {
                 let result = if found {
                     Tri::True
                 } else if has_null_rhs {
-                    // x IN (1, NULL) → UNKNOWN when x doesn't match 1 (SQL standard)
+                    // x IN (1, NULL) -> UNKNOWN when x doesn't match 1 (SQL standard)
                     Tri::Unknown
                 } else {
                     Tri::False
@@ -246,7 +246,7 @@ impl Vm {
                 let lower = self.pop_cell()?;
                 let value = self.pop_cell()?;
 
-                // Any NULL/Missing → Unknown
+                // Any NULL/Missing -> Unknown
                 if value.is_null()
                     || value.is_missing()
                     || lower.is_null()
@@ -274,7 +274,7 @@ impl Vm {
                 let pattern = self.pop_cell()?;
                 let string = self.pop_cell()?;
 
-                // NULL in either position → Unknown
+                // NULL in either position -> Unknown
                 if string.is_null()
                     || string.is_missing()
                     || pattern.is_null()
@@ -289,7 +289,7 @@ impl Vm {
                     if let (Cell::String(s), Cell::String(p)) = (&string, &pattern) {
                         (s.as_ref(), p.as_ref())
                     } else {
-                        // Type mismatch → Unknown
+                        // Type mismatch -> Unknown
                         self.stack.push(StackValue::Tri(Tri::Unknown));
                         return Ok(());
                     };
@@ -387,7 +387,7 @@ impl Vm {
         let b = self.pop_cell()?;
         let a = self.pop_cell()?;
 
-        // NULL or Missing → Unknown
+        // NULL or Missing -> Unknown
         if a.is_null() || a.is_missing() || b.is_null() || b.is_missing() {
             return Ok(Tri::Unknown);
         }
@@ -532,7 +532,7 @@ fn arithmetic_multiply(a: Cell, b: Cell) -> Cell {
 
 /// Divide two cells: a / b
 ///
-/// Always returns Float (SQL semantics). Division by zero → NULL.
+/// Always returns Float (SQL semantics). Division by zero -> NULL.
 #[allow(clippy::needless_pass_by_value, clippy::cast_precision_loss)]
 fn arithmetic_divide(a: Cell, b: Cell) -> Cell {
     if let Some(null) = null_propagate_binary(&a, &b) {
@@ -560,7 +560,7 @@ fn arithmetic_divide(a: Cell, b: Cell) -> Cell {
 
 /// Modulo two cells: a % b
 ///
-/// Integer operation only (coerces to Int first). Modulo by zero → NULL.
+/// Integer operation only (coerces to Int first). Modulo by zero -> NULL.
 #[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
 fn arithmetic_modulo(a: Cell, b: Cell) -> Cell {
     if let Some(null) = null_propagate_binary(&a, &b) {
@@ -747,11 +747,11 @@ mod tests {
             Instruction::GreaterThan,
         ]);
 
-        // 60 + 50 = 110 > 100 ✓
+        // 60 + 50 = 110 > 100 (true)
         let row = make_row(vec![Cell::Int(60), Cell::Int(50)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // 30 + 40 = 70 > 100 ✗
+        // 30 + 40 = 70 > 100 (false)
         let row = make_row(vec![Cell::Int(30), Cell::Int(40)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
 
@@ -759,7 +759,7 @@ mod tests {
         let row = make_row(vec![Cell::Int(50), Cell::Float(60.5)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // NULL + anything = NULL → Unknown
+        // NULL + anything = NULL -> Unknown
         let row = make_row(vec![Cell::Null, Cell::Int(50)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
@@ -777,11 +777,11 @@ mod tests {
             Instruction::GreaterThan,
         ]);
 
-        // 500 - 100 = 400 > 300 ✓
+        // 500 - 100 = 400 > 300 (true)
         let row = make_row(vec![Cell::Int(500), Cell::Int(100)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // 400 - 200 = 200 > 300 ✗
+        // 400 - 200 = 200 > 300 (false)
         let row = make_row(vec![Cell::Int(400), Cell::Int(200)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
     }
@@ -799,11 +799,11 @@ mod tests {
             Instruction::GreaterThan,
         ]);
 
-        // 50 * 30 = 1500 > 1000 ✓
+        // 50 * 30 = 1500 > 1000 (true)
         let row = make_row(vec![Cell::Int(50), Cell::Int(30)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // 10 * 50 = 500 > 1000 ✗
+        // 10 * 50 = 500 > 1000 (false)
         let row = make_row(vec![Cell::Int(10), Cell::Int(50)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
     }
@@ -821,15 +821,15 @@ mod tests {
             Instruction::GreaterThan,
         ]);
 
-        // 500 / 4 = 125.0 > 100.0 ✓
+        // 500 / 4 = 125.0 > 100.0 (true)
         let row = make_row(vec![Cell::Int(500), Cell::Int(4)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // 300 / 5 = 60.0 > 100.0 ✗
+        // 300 / 5 = 60.0 > 100.0 (false)
         let row = make_row(vec![Cell::Int(300), Cell::Int(5)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
 
-        // Division by zero = NULL → Unknown
+        // Division by zero = NULL -> Unknown
         let row = make_row(vec![Cell::Int(500), Cell::Int(0)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
@@ -847,15 +847,15 @@ mod tests {
             Instruction::Equal,
         ]);
 
-        // 100 % 10 = 0 ✓
+        // 100 % 10 = 0 (true)
         let row = make_row(vec![Cell::Int(100)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // 105 % 10 = 5 ≠ 0 ✗
+        // 105 % 10 = 5 != 0 (false)
         let row = make_row(vec![Cell::Int(105)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
 
-        // Modulo by zero = NULL → Unknown
+        // Modulo by zero = NULL -> Unknown
         let row = make_row(vec![Cell::Int(100)]);
         let program_div_zero = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
@@ -880,19 +880,19 @@ mod tests {
             Instruction::Between,
         ]);
 
-        // elevation = 25 is in [-50, 50] ✓
+        // elevation = 25 is in [-50, 50] (true)
         let row = make_row(vec![Cell::Int(25)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // elevation = -30 is in [-50, 50] ✓
+        // elevation = -30 is in [-50, 50] (true)
         let row = make_row(vec![Cell::Int(-30)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // elevation = 75 is NOT in [-50, 50] ✗
+        // elevation = 75 is NOT in [-50, 50] (false)
         let row = make_row(vec![Cell::Int(75)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
 
-        // -NULL = NULL → Unknown
+        // -NULL = NULL -> Unknown
         let program_null = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Null),
             Instruction::Negate,
@@ -919,11 +919,11 @@ mod tests {
             Instruction::GreaterThan,   // (a - b) > (0.5 * b)
         ]);
 
-        // 150 - 100 = 50 > 0.5 * 100 = 50 ✗ (equal, not greater)
+        // 150 - 100 = 50 > 0.5 * 100 = 50 (false) (equal, not greater)
         let row = make_row(vec![Cell::Int(150), Cell::Int(100)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
 
-        // 160 - 100 = 60 > 0.5 * 100 = 50 ✓
+        // 160 - 100 = 60 > 0.5 * 100 = 50 (true)
         let row = make_row(vec![Cell::Int(160), Cell::Int(100)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
     }
@@ -983,7 +983,7 @@ mod tests {
 
         let row = make_row(vec![Cell::Int(1)]);
 
-        // Missing column → IsNull returns True (Missing is treated as NULL)
+        // Missing column -> IsNull returns True (Missing is treated as NULL)
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
     }
 
@@ -1002,7 +1002,7 @@ mod tests {
 
         let row = make_row(vec![]);
 
-        // Type mismatch → NULL → Unknown
+        // Type mismatch -> NULL -> Unknown
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
 
         let row = make_row(vec![]);
 
-        // Missing → NULL → Unknown
+        // Missing -> NULL -> Unknown
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
 
@@ -1038,7 +1038,7 @@ mod tests {
 
         let row = make_row(vec![]);
 
-        // Type mismatch → Unknown
+        // Type mismatch -> Unknown
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
 
@@ -1057,7 +1057,7 @@ mod tests {
 
         let row = make_row(vec![]);
 
-        // Type mismatch → Unknown
+        // Type mismatch -> Unknown
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
 
@@ -1146,7 +1146,7 @@ mod tests {
 
             let row = make_row(vec![]);
 
-            // Any NULL → Unknown
+            // Any NULL -> Unknown
             assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
         }
     }
@@ -1163,7 +1163,7 @@ mod tests {
 
         let row = make_row(vec![]);
 
-        // NULL IN (...) → Unknown
+        // NULL IN (...) -> Unknown
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
 
@@ -1245,13 +1245,9 @@ mod tests {
 
         let row = make_row(vec![]);
 
-        // Type mismatch → NULL → Unknown
+        // Type mismatch -> NULL -> Unknown
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
     }
-
-    // ========================================================================
-    // Phase 1: Additional Error Path Coverage Tests
-    // ========================================================================
 
     #[test]
     fn test_stack_not_empty_after_eval() {
@@ -1270,7 +1266,7 @@ mod tests {
 
         let row = make_row(vec![]);
 
-        // Stack has 2 values → MalformedProgram error (compiler bug detected)
+        // Stack has 2 values -> MalformedProgram error (compiler bug detected)
         let result = vm.eval(&program, &row);
         assert_eq!(result, Err(VmError::MalformedProgram));
     }
@@ -1800,10 +1796,6 @@ mod tests {
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
     }
 
-    // ========================================================================
-    // Phase 3: Push to 95% Coverage - VM Completion
-    // ========================================================================
-
     #[test]
     fn test_stack_underflow_pop_cell() {
         let mut vm = Vm::new();
@@ -1959,10 +1951,6 @@ mod tests {
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
     }
-
-    // ========================================================================
-    // Phase 3C: Final Push to 95% - VM Completion
-    // ========================================================================
 
     #[test]
     fn test_arithmetic_subtract_float_float() {
@@ -2239,7 +2227,7 @@ mod tests {
     fn test_nan_comparison_returns_unknown() {
         let mut vm = Vm::new();
 
-        // NaN < 5.0 → Unknown
+        // NaN < 5.0 -> Unknown
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Float(f64::NAN)),
             Instruction::PushLiteral(Cell::Float(5.0)),
@@ -2249,7 +2237,7 @@ mod tests {
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
 
-        // 5.0 > NaN → Unknown
+        // 5.0 > NaN -> Unknown
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Float(5.0)),
             Instruction::PushLiteral(Cell::Float(f64::NAN)),
@@ -2258,7 +2246,7 @@ mod tests {
 
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
 
-        // NaN == NaN → Unknown (via ordered comparison)
+        // NaN == NaN -> Unknown (via ordered comparison)
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Float(f64::NAN)),
             Instruction::PushLiteral(Cell::Float(f64::NAN)),
@@ -2272,7 +2260,7 @@ mod tests {
     fn test_nan_int_comparison_returns_unknown() {
         let mut vm = Vm::new();
 
-        // NaN < Int → Unknown
+        // NaN < Int -> Unknown
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Float(f64::NAN)),
             Instruction::PushLiteral(Cell::Int(5)),
@@ -2282,7 +2270,7 @@ mod tests {
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
 
-        // Int < NaN → Unknown
+        // Int < NaN -> Unknown
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Int(5)),
             Instruction::PushLiteral(Cell::Float(f64::NAN)),
@@ -2386,7 +2374,7 @@ mod tests {
     fn test_short_circuit_and_false_in_chain() {
         let mut vm = Vm::new();
 
-        // False AND True AND True → short-circuits at first False
+        // False AND True AND True -> short-circuits at first False
         // The first JumpIfFalse must skip the entire rest of the program
         let program = BytecodeProgram::new(vec![
             // First: push False
@@ -2503,7 +2491,7 @@ mod tests {
         let mut vm = Vm::new();
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Bool(true)),
-            Instruction::JumpIfFalse(0), // condition False → not taken
+            Instruction::JumpIfFalse(0), // condition False -> not taken
         ]);
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
@@ -2513,7 +2501,7 @@ mod tests {
     fn test_in_null_rhs_unknown() {
         let mut vm = Vm::new();
 
-        // 42 IN (1, NULL) → UNKNOWN (SQL standard)
+        // 42 IN (1, NULL) -> UNKNOWN (SQL standard)
         let program = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::In(vec![Cell::Int(1), Cell::Null]),
@@ -2521,7 +2509,7 @@ mod tests {
         let row = make_row(vec![Cell::Int(42)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
 
-        // 1 IN (1, NULL) → TRUE (matched before hitting NULL)
+        // 1 IN (1, NULL) -> TRUE (matched before hitting NULL)
         let program = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::In(vec![Cell::Int(1), Cell::Null]),
@@ -2529,7 +2517,7 @@ mod tests {
         let row = make_row(vec![Cell::Int(1)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // 0 IN (1, NULL) → UNKNOWN (no match, but NULL present)
+        // 0 IN (1, NULL) -> UNKNOWN (no match, but NULL present)
         let program = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::In(vec![Cell::Int(1), Cell::Null]),
@@ -2537,7 +2525,7 @@ mod tests {
         let row = make_row(vec![Cell::Int(0)]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::Unknown);
 
-        // 0 IN (1, 2) → FALSE (no NULL, no match)
+        // 0 IN (1, 2) -> FALSE (no NULL, no match)
         let program = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::In(vec![Cell::Int(1), Cell::Int(2)]),
@@ -2585,7 +2573,7 @@ mod tests {
     fn test_int_float_cross_type_equality() {
         let mut vm = Vm::new();
 
-        // Cell::Int(5) == Cell::Float(5.0) → True
+        // Cell::Int(5) == Cell::Float(5.0) -> True
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Int(5)),
             Instruction::PushLiteral(Cell::Float(5.0)),
@@ -2594,7 +2582,7 @@ mod tests {
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // Cell::Float(5.0) == Cell::Int(5) → True (reversed)
+        // Cell::Float(5.0) == Cell::Int(5) -> True (reversed)
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Float(5.0)),
             Instruction::PushLiteral(Cell::Int(5)),
@@ -2602,7 +2590,7 @@ mod tests {
         ]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::True);
 
-        // Cell::Int(5) == Cell::Float(5.1) → False
+        // Cell::Int(5) == Cell::Float(5.1) -> False
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Int(5)),
             Instruction::PushLiteral(Cell::Float(5.1)),
@@ -2610,7 +2598,7 @@ mod tests {
         ]);
         assert_eq!(vm.eval(&program, &row).unwrap(), Tri::False);
 
-        // IN list: 5 IN (5.0, 6.0) → True
+        // IN list: 5 IN (5.0, 6.0) -> True
         let program = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::In(vec![Cell::Float(5.0), Cell::Float(6.0)]),
@@ -2628,10 +2616,10 @@ mod tests {
         let program = BytecodeProgram::new(vec![
             Instruction::PushLiteral(Cell::Int(1)),
             Instruction::PushLiteral(Cell::Int(1)),
-            Instruction::Equal, // Tri::True — left on stack
+            Instruction::Equal, // Tri::True, left on stack
             Instruction::PushLiteral(Cell::Int(2)),
             Instruction::PushLiteral(Cell::Int(2)),
-            Instruction::Equal, // Tri::True — also left on stack; stack has 2 values
+            Instruction::Equal, // Tri::True, also left on stack. Stack now has 2 values
         ]);
         let row = make_row(vec![]);
         assert_eq!(vm.eval(&program, &row), Err(VmError::MalformedProgram));

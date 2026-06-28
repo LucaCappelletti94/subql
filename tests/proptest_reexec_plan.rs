@@ -17,8 +17,8 @@
 //!    every cell type, so neither the classifier nor the engine has
 //!    grounds to reject them.
 //! 2. **The reported `column_type` matches the column's declared type.**
-//!    `MIN(price)` returns `ColumnType::Float`; `MIN(quantity)`
-//!    returns `ColumnType::Int`; `MIN(status)` returns
+//!    `MIN(price)` returns `ColumnType::Float`. `MIN(quantity)`
+//!    returns `ColumnType::Int`. `MIN(status)` returns
 //!    `ColumnType::String`.
 //! 3. **The returned SQL carries the canonical projection alias `v`.**
 //!    Materializers load the scalar back by that alias.
@@ -72,7 +72,7 @@ impl AggCol {
 
 /// WHERE-clause column generator. We restrict WHERE comparisons to
 /// numeric columns so a randomly chosen op + integer literal is always
-/// a valid SQL predicate; mixing strings here would require quoting
+/// a valid SQL predicate. Mixing strings here would require quoting
 /// and an op subset, which is out of scope for this test.
 #[derive(Debug, Clone, Copy)]
 enum WhereCol {
@@ -233,8 +233,8 @@ proptest! {
     }
 
     /// Distinct re-exec queries in the same engine get distinct
-    /// `query_id`s. Reusing the same SQL is allowed to dedup or not;
-    /// this test only asserts uniqueness when the SQL strings differ
+    /// `query_id`s. Reusing the same SQL is allowed to dedup or not.
+    /// This test only asserts uniqueness when the SQL strings differ
     /// after the classifier's canonical rendering, so we restrict to
     /// `(agg, col)` combinations that produce distinct rendered SQL.
     #[test]

@@ -4,8 +4,8 @@
 //! without further changes.
 //!
 //! Each fixture declares a placeholder table whose name sorts before
-//! `orders` (alphabetically); this keeps the `orders` table id stable at
-//! `1` — matching the existing test bodies' hardcoded
+//! `orders` alphabetically. This keeps the `orders` table id stable at
+//! `1`, matching the existing test bodies' hardcoded
 //! `assert_eq!(ev.table_id(), 1)` expectations under `ParserDB`'s
 //! deterministic, sort-order-based table id assignment.
 

@@ -37,7 +37,7 @@ pub struct Predicate {
     pub updated_at_unix_ms: u64,
 }
 
-/// Subscription binding (consumer → predicate → subscription)
+/// Subscription binding (consumer -> predicate -> subscription)
 #[derive(Debug)]
 pub struct SubscriptionBinding<I: IdTypes> {
     /// Engine-assigned subscription identifier
@@ -69,15 +69,15 @@ impl<I: IdTypes> Copy for SubscriptionBinding<I> {}
 pub struct PredicateStore<I: IdTypes> {
     /// Slab-allocated predicates (stable IDs)
     pub predicates: Slab<Predicate>,
-    /// Hash → candidate PredicateIds (for deduplication with collision checks)
+    /// Hash -> candidate PredicateIds (for deduplication with collision checks)
     pub hash_index: HashMap<PredicateHash, Vec<PredicateId>>,
-    /// SubscriptionId → SubscriptionBinding
+    /// SubscriptionId -> SubscriptionBinding
     pub bindings: HashMap<SubscriptionId, SubscriptionBinding<I>>,
-    /// SessionId → `Vec<SubscriptionId>` (for session cleanup)
+    /// SessionId -> `Vec<SubscriptionId>` (for session cleanup)
     pub scope_index: HashMap<I::SessionId, Vec<SubscriptionId>>,
-    /// PredicateId → `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate)
+    /// PredicateId -> `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate)
     pub predicate_consumers: HashMap<PredicateId, RoaringBitmap>,
-    /// (PredicateId, ConsumerOrdinal) → SubscriptionIds bound to that pair.
+    /// (PredicateId, ConsumerOrdinal) -> SubscriptionIds bound to that pair.
     ///
     /// A single (predicate, consumer) pair may carry multiple subscription
     /// ids when the same consumer subscribes under different scopes (e.g.
@@ -510,10 +510,6 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // Phase 3: Push to 95% Coverage - Predicate Completion
-    // ========================================================================
-
     #[test]
     fn test_increment_refcount_nonexistent() {
         let mut store = PredicateStore::<DefaultIds>::new();
@@ -611,7 +607,7 @@ mod tests {
         assert!(!store.is_consumer_referenced(99));
     }
 
-    /// Step 0 (eviction-policy plumbing): `binding_lookup` resolves
+    /// `binding_lookup` resolves
     /// `(predicate_id, consumer_ordinal) -> Vec<SubscriptionId>`. Used by
     /// activity-aware eviction policies to stamp the right subscriptions
     /// after dispatch matches a predicate.
@@ -644,7 +640,7 @@ mod tests {
         );
     }
 
-    /// Step 0: two scopes on the same (predicate, consumer) pair both
+    /// Two scopes on the same (predicate, consumer) pair both
     /// surface from `binding_lookup`.
     #[test]
     fn test_binding_lookup_handles_multiple_scopes_per_pair() {

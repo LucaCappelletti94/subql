@@ -1,4 +1,4 @@
-//! Tier-2 end-to-end dispatch proptest.
+//! End-to-end dispatch proptest.
 //!
 //! Composes [`SqliteCdcSource`] with [`SubscriptionEngine`] and a fixed
 //! set of registered queries, drives arbitrary DML through both the
@@ -10,8 +10,7 @@
 //! What this exercises beyond `proptest_sqlite_cdc.rs`: the WAL event
 //! produced by the source is fed into the real engine (compile + VM
 //! dispatch + view-relative delta computation), not just inspected for
-//! shape. A passing run is the Step-4 deliverable from the handoff:
-//! the Tier-2 payoff that proves the whole ingest-to-dispatch chain
+//! shape. A passing run proves the whole ingest-to-dispatch chain
 //! works without Docker.
 //!
 //! Generator constraint: `amount` and `id` are bounded i32 ranges. The
@@ -48,8 +47,8 @@ const STATUSES: &[&str] = &["paid", "open", "closed", "pending"];
 
 /// A registered query plus a Rust closure that evaluates the same
 /// predicate. The closure is the oracle the proptest checks the engine
-/// against. `deps` lists the column ordinals the predicate reads;
-/// subql's UPDATE dispatch skips re-evaluation when none of those
+/// against. `deps` lists the column ordinals the predicate reads.
+/// Subql's UPDATE dispatch skips re-evaluation when none of those
 /// columns changed, so the oracle needs to know which columns each
 /// predicate depends on to mirror that.
 #[derive(Clone, Copy)]
@@ -310,17 +309,17 @@ proptest! {
         prop_assert!(trailing.is_none(), "shadow log should be empty after drain");
     }
 
-    /// Tier-3 dispatch: the same arbitrary DML, but every `WalEvent` is
+    /// pgoutput round-trip dispatch: the same arbitrary DML, but every `WalEvent` is
     /// routed through [`PgOutputBridge`] and back through
     /// [`PgOutputParser`] before reaching the engine. The resulting
     /// [`subql::ConsumerNotifications`] must equal the same oracle the
-    /// Tier-2 test uses, proving the bridge plus the production parser
+    /// end-to-end dispatch test uses, proving the bridge plus the production parser
     /// preserve dispatch semantics across the wire format. A failure
     /// here means either the bridge mis-encodes a shape the engine
     /// dispatches on, or the parser decodes it into an event the engine
     /// treats differently.
     #[test]
-    fn tier3_dispatch_matches_oracle_across_arbitrary_dml(
+    fn pgoutput_roundtrip_dispatch_matches_oracle_across_arbitrary_dml(
         ops in prop::collection::vec(op_strategy(), 0..25),
     ) {
         let subs = subscriptions();
@@ -374,17 +373,17 @@ proptest! {
         }
 
         for (i, exp) in expected.iter().enumerate() {
-            let tier2_event = source
+            let dispatch_event = source
                 .poll_next_event()
                 .unwrap()
                 .unwrap_or_else(|| panic!("expected event #{i} but the shadow log was empty"));
 
-            // Encode the Tier-2 event as pgoutput bytes, decode them
+            // Encode the dispatch event as pgoutput bytes, decode them
             // back through the production parser, dispatch on the
             // result. Bridge state survives across loop iterations so a
             // Relation message is emitted once per table.
             let frames = bridge
-                .encode_event(&tier2_event, &*catalog)
+                .encode_event(&dispatch_event, &*catalog)
                 .expect("bridge encodes catalog-resident event");
             let mut decoded: Vec<_> = Vec::new();
             for frame in frames {
@@ -396,7 +395,7 @@ proptest! {
             prop_assert_eq!(
                 decoded.len(), 1,
                 "event {} ({:?}) must decode to exactly one event after the Relation cache warms",
-                i, tier2_event.kind()
+                i, dispatch_event.kind()
             );
             let parsed = decoded.into_iter().next().unwrap();
             let notifs = engine.consumers(&parsed).unwrap();
@@ -410,15 +409,15 @@ proptest! {
 
             prop_assert_eq!(
                 &actual_inserted, &exp.inserted,
-                "Tier-3 event {} ({:?}) inserted mismatch", i, parsed.kind()
+                "pgoutput round-trip event {} ({:?}) inserted mismatch", i, parsed.kind()
             );
             prop_assert_eq!(
                 &actual_deleted, &exp.deleted,
-                "Tier-3 event {} ({:?}) deleted mismatch", i, parsed.kind()
+                "pgoutput round-trip event {} ({:?}) deleted mismatch", i, parsed.kind()
             );
             prop_assert_eq!(
                 &actual_updated, &exp.updated,
-                "Tier-3 event {} ({:?}) updated mismatch", i, parsed.kind()
+                "pgoutput round-trip event {} ({:?}) updated mismatch", i, parsed.kind()
             );
 
             match parsed.kind() {

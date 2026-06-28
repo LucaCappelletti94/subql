@@ -1,4 +1,4 @@
-//! Layer 2 — maintenance.
+//! Layer 2: maintenance.
 //!
 //! Per-query state machines that consume CDC events and decide, in-process,
 //! whether the query's result is unchanged, has a newly-computed value, or
@@ -20,11 +20,11 @@ const MISSING: Cell = Cell::Missing;
 /// Outcome of feeding one CDC event to a maintained query.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Maintenance {
-    /// The result provably did not change; emit nothing, no database access.
+    /// The result provably did not change. Emit nothing, no database access.
     Unchanged,
-    /// The result changed; the new value was computed in-process.
+    /// The result changed. The new value was computed in-process.
     Updated(Cell),
-    /// The result cannot be maintained in-process; the engine surfaces a
+    /// The result cannot be maintained in-process. The engine surfaces a
     /// [`ReExecutionTrigger`](super::ReExecutionTrigger) so the Subscription
     /// Materializer re-queries the database and calls [`install`] with the
     /// recomputed value.
@@ -35,7 +35,7 @@ pub(super) enum Maintenance {
 
 /// A query maintained by the re-execution layer.
 ///
-/// Implementors never touch the database; when they cannot decide in-process
+/// Implementors never touch the database. When they cannot decide in-process
 /// they return [`Maintenance::NeedsReexecution`]. The engine then surfaces a
 /// [`ReExecutionTrigger`](super::ReExecutionTrigger) for the Subscription
 /// Materializer, which re-runs the SQL and calls
@@ -50,7 +50,7 @@ pub(super) trait MaintainedQuery {
     ///
     /// Generic over the event's [`Checkpoint`](crate::Checkpoint) type
     /// because the maintenance machine itself does not care about
-    /// positions; it only reads row images. The engine threads checkpoints
+    /// positions. It only reads row images. The engine threads checkpoints
     /// into the emitted notifications around this call.
     fn on_event<C: crate::Checkpoint>(&mut self, event: &WalEvent<C>, vm: &mut Vm) -> Maintenance;
     /// Adopt a value produced by the materializer's re-execution.
@@ -61,7 +61,7 @@ pub(super) trait MaintainedQuery {
 
 /// Incrementally-maintained single-table scalar `MIN`/`MAX`.
 ///
-/// Inserts and most updates/deletes are handled in memory; a database re-query
+/// Inserts and most updates/deletes are handled in memory. A database re-query
 /// is required only when the current extreme value is removed or displaced
 /// (then we cannot know the next extreme without scanning), or when an event's
 /// row image is too incomplete to decide.
@@ -70,7 +70,7 @@ pub(super) struct MinMaxQuery {
     agg_column: ColumnId,
     where_program: Arc<BytecodeProgram>,
     dependency_columns: Vec<ColumnId>,
-    /// Current extreme; `Cell::Null` means the (filtered) set is empty.
+    /// Current extreme. `Cell::Null` means the (filtered) set is empty.
     current: Cell,
 }
 
@@ -92,7 +92,7 @@ impl MinMaxQuery {
     }
 
     /// The current maintained value (`Cell::Null` when the result set is
-    /// empty). Used by the state-machine unit tests; production code reads
+    /// empty). Used by the state-machine unit tests. Production code reads
     /// values through the engine's emitted [`ScalarUpdate`]s instead.
     #[cfg(test)]
     pub(super) const fn current(&self) -> &Cell {
@@ -100,7 +100,7 @@ impl MinMaxQuery {
     }
 
     /// Whether `row` satisfies the query's WHERE clause (only `Tri::True`
-    /// counts; NULL/Unknown excludes the row, per SQL).
+    /// counts. NULL/Unknown excludes the row, per SQL).
     fn matches(&self, row: &RowImage, vm: &mut Vm) -> bool {
         matches!(vm.eval(&self.where_program, row), Ok(Tri::True))
     }
@@ -119,7 +119,7 @@ impl MinMaxQuery {
     }
 
     /// Whether `candidate` would become the new extreme versus `current`.
-    /// A non-present candidate (NULL/Missing) never participates; into an
+    /// A non-present candidate (NULL/Missing) never participates. Into an
     /// empty set (current Null) any present value wins.
     fn is_more_extreme(&self, candidate: &Cell) -> bool {
         if !candidate.is_present() {
@@ -154,7 +154,7 @@ impl MinMaxQuery {
     }
 
     /// Delete half: decide whether removing `row` displaces the extreme. Does
-    /// not mutate state; returns only `Unchanged` or `NeedsReexecution`.
+    /// not mutate state. Returns only `Unchanged` or `NeedsReexecution`.
     fn on_delete_row(&self, row: &RowImage, vm: &mut Vm) -> Maintenance {
         // A sparse image cannot be reasoned about: re-query.
         if self.any_dependency_missing(row) {
@@ -223,8 +223,8 @@ impl MaintainedQuery for MinMaxQuery {
 /// Enum-dispatch wrapper holding any maintained query.
 ///
 /// A future `Total` variant (single-table row re-execution) and an
-/// aggregate-re-execution variant plug in here without disturbing the engine;
-/// each services the same [`ReExecutionTrigger`](super::ReExecutionTrigger)
+/// aggregate-re-execution variant plug in here without disturbing the engine.
+/// Each services the same [`ReExecutionTrigger`](super::ReExecutionTrigger)
 /// seam and is `install`ed identically by the Subscription Materializer.
 pub(super) enum QueryRuntime {
     Partial(MinMaxQuery),

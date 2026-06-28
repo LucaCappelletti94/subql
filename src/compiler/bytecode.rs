@@ -12,13 +12,13 @@ pub enum Instruction {
     // ========================================================================
     /// Push a literal cell value onto stack
     ///
-    /// Stack: [...] → [..., cell]
+    /// Stack: [...] -> [..., cell]
     PushLiteral(Cell),
 
     /// Load cell from row at column index and push onto stack
     ///
     /// If column out of bounds, pushes Cell::Missing.
-    /// Stack: [...] → [..., cell]
+    /// Stack: [...] -> [..., cell]
     LoadColumn(ColumnId),
 
     // ========================================================================
@@ -26,33 +26,33 @@ pub enum Instruction {
     // ========================================================================
     /// Equal: a = b
     ///
-    /// NULL-safe: NULL = NULL → Unknown (not True!)
-    /// Stack: [..., a, b] → [..., Tri]
+    /// NULL-safe: NULL = NULL -> Unknown (not True!)
+    /// Stack: [..., a, b] -> [..., Tri]
     Equal,
 
     /// Not equal: a != b
     ///
-    /// Stack: [..., a, b] → [..., Tri]
+    /// Stack: [..., a, b] -> [..., Tri]
     NotEqual,
 
     /// Less than: a < b
     ///
-    /// Stack: [..., a, b] → [..., Tri]
+    /// Stack: [..., a, b] -> [..., Tri]
     LessThan,
 
     /// Less than or equal: a <= b
     ///
-    /// Stack: [..., a, b] → [..., Tri]
+    /// Stack: [..., a, b] -> [..., Tri]
     LessThanOrEqual,
 
     /// Greater than: a > b
     ///
-    /// Stack: [..., a, b] → [..., Tri]
+    /// Stack: [..., a, b] -> [..., Tri]
     GreaterThan,
 
     /// Greater than or equal: a >= b
     ///
-    /// Stack: [..., a, b] → [..., Tri]
+    /// Stack: [..., a, b] -> [..., Tri]
     GreaterThanOrEqual,
 
     // ========================================================================
@@ -60,12 +60,12 @@ pub enum Instruction {
     // ========================================================================
     /// IS NULL check
     ///
-    /// Stack: [..., cell] → [..., Tri]
+    /// Stack: [..., cell] -> [..., Tri]
     IsNull,
 
     /// IS NOT NULL check
     ///
-    /// Stack: [..., cell] → [..., Tri]
+    /// Stack: [..., cell] -> [..., Tri]
     IsNotNull,
 
     // ========================================================================
@@ -73,12 +73,12 @@ pub enum Instruction {
     // ========================================================================
     /// AND with tri-state semantics
     ///
-    /// Stack: [..., a, b] → [..., Tri]
+    /// Stack: [..., a, b] -> [..., Tri]
     And,
 
     /// OR with tri-state semantics
     ///
-    /// Stack: [..., a, b] → [..., Tri]
+    /// Stack: [..., a, b] -> [..., Tri]
     Or,
 
     // ========================================================================
@@ -86,7 +86,7 @@ pub enum Instruction {
     // ========================================================================
     /// NOT with tri-state semantics
     ///
-    /// Stack: [..., tri] → [..., Tri]
+    /// Stack: [..., tri] -> [..., Tri]
     Not,
 
     // ========================================================================
@@ -94,46 +94,46 @@ pub enum Instruction {
     // ========================================================================
     /// Add: a + b
     ///
-    /// Type coercion: Int + Int → Int, otherwise Float
-    /// NULL propagation: NULL + anything → NULL
-    /// Stack: [..., a, b] → [..., Cell]
+    /// Type coercion: Int + Int -> Int, otherwise Float
+    /// NULL propagation: NULL + anything -> NULL
+    /// Stack: [..., a, b] -> [..., Cell]
     Add,
 
     /// Subtract: a - b
     ///
-    /// Type coercion: Int - Int → Int, otherwise Float
-    /// NULL propagation: NULL - anything → NULL
-    /// Stack: [..., a, b] → [..., Cell]
+    /// Type coercion: Int - Int -> Int, otherwise Float
+    /// NULL propagation: NULL - anything -> NULL
+    /// Stack: [..., a, b] -> [..., Cell]
     Subtract,
 
     /// Multiply: a * b
     ///
-    /// Type coercion: Int * Int → Int, otherwise Float
-    /// NULL propagation: NULL * anything → NULL
-    /// Stack: [..., a, b] → [..., Cell]
+    /// Type coercion: Int * Int -> Int, otherwise Float
+    /// NULL propagation: NULL * anything -> NULL
+    /// Stack: [..., a, b] -> [..., Cell]
     Multiply,
 
     /// Divide: a / b
     ///
     /// Always returns Float (SQL semantics)
-    /// Division by zero → NULL
-    /// NULL propagation: NULL / anything → NULL
-    /// Stack: [..., a, b] → [..., Cell]
+    /// Division by zero -> NULL
+    /// NULL propagation: NULL / anything -> NULL
+    /// Stack: [..., a, b] -> [..., Cell]
     Divide,
 
     /// Modulo: a % b
     ///
     /// Integer operation only (coerces to Int first)
-    /// Modulo by zero → NULL
-    /// NULL propagation: NULL % anything → NULL
-    /// Stack: [..., a, b] → [..., Cell]
+    /// Modulo by zero -> NULL
+    /// NULL propagation: NULL % anything -> NULL
+    /// Stack: [..., a, b] -> [..., Cell]
     Modulo,
 
     /// Negate: -a (unary minus)
     ///
-    /// Type preserved: Int → Int, Float → Float
-    /// NULL propagation: -NULL → NULL
-    /// Stack: [..., a] → [..., Cell]
+    /// Type preserved: Int -> Int, Float -> Float
+    /// NULL propagation: -NULL -> NULL
+    /// Stack: [..., a] -> [..., Cell]
     Negate,
 
     // ========================================================================
@@ -141,19 +141,19 @@ pub enum Instruction {
     // ========================================================================
     /// IN (...) - checks if top of stack is in literal set
     ///
-    /// NULL IN (...) → Unknown
-    /// Stack: [..., cell] → [..., Tri]
+    /// NULL IN (...) -> Unknown
+    /// Stack: [..., cell] -> [..., Tri]
     In(Vec<Cell>),
 
     /// BETWEEN a AND b - checks if value is in range [a, b]
     ///
     /// Pops upper, lower, value. Equivalent to: value >= lower AND value <= upper
-    /// Stack: [..., value, lower, upper] → [..., Tri]
+    /// Stack: [..., value, lower, upper] -> [..., Tri]
     Between,
 
-    /// LIKE pattern matching (optional, can defer to Phase 2)
+    /// LIKE pattern matching
     ///
-    /// Stack: [..., string, pattern] → [..., Tri]
+    /// Stack: [..., string, pattern] -> [..., Tri]
     Like { case_sensitive: bool },
 
     // ========================================================================
@@ -165,7 +165,7 @@ pub enum Instruction {
     /// the second AND operand + the And instruction). The False stays on stack
     /// as the result. If not False, execution continues normally.
     ///
-    /// Stack: [..., tri] → [..., tri] (no change, just control flow)
+    /// Stack: [..., tri] -> [..., tri] (no change, just control flow)
     JumpIfFalse(usize),
 
     /// Jump forward if top of stack is Tri::True (for OR short-circuit)
@@ -174,7 +174,7 @@ pub enum Instruction {
     /// the second OR operand + the Or instruction). The True stays on stack
     /// as the result. If not True, execution continues normally.
     ///
-    /// Stack: [..., tri] → [..., tri] (no change, just control flow)
+    /// Stack: [..., tri] -> [..., tri] (no change, just control flow)
     JumpIfTrue(usize),
 }
 

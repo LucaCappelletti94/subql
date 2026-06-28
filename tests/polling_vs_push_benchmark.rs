@@ -1,21 +1,16 @@
 //! # One-shot polling-vs-push latency benchmark
 //!
-//! Compares the two library transports — [`subql::PgStreamingCdcSource`]
-//! (push) and [`subql::PollingPgCdcSource`] — across three polling
-//! cadences (10 ms, 100 ms, 1 s). The expected outcome is that push
-//! delivers events at the wire-RTT floor while polling at cadence `P`
-//! adds roughly `P / 2` average latency on top.
-//!
-//! Both transports are first-class library types; this benchmark
-//! exists to keep the empirical claim honest. The richer workload
-//! sweep lives in `examples/phase{1..5}_*.rs`. Run this if you want
-//! the one-line answer.
+//! Compares the two library transports, [`subql::PgStreamingCdcSource`]
+//! (push) and [`subql::PollingPgCdcSource`], across three polling
+//! cadences (10 ms, 100 ms, 1 s). Expected: push delivers at the
+//! wire-RTT floor while polling at cadence `P` adds roughly `P / 2`
+//! average latency on top.
 //!
 //! ## Methodology
 //!
 //! Same PG container, same pgoutput byte format, same async runtime.
 //! The receiver task is spawned FIRST so its polling clock is
-//! already running; inserts are then driven at intervals larger than
+//! already running. Inserts are then driven at intervals larger than
 //! the polling interval so each commit lands at a random offset
 //! within the next polling cycle. Without that, all inserts would
 //! accumulate before the first poll fires and the polling interval

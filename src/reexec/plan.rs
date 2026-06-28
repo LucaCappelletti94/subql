@@ -1,7 +1,7 @@
-//! Layer 1 — classification.
+//! Layer 1: classification.
 //!
 //! Turns a SQL string the core engine rejected into a re-execution plan. The
-//! engine itself decides the "native" case (it accepts the query); this layer
+//! engine itself decides the "native" case (it accepts the query). This layer
 //! only runs for rejected queries and produces a [`QueryPlan`] describing how
 //! the re-execution layer should maintain it.
 
@@ -40,8 +40,8 @@ pub(super) struct MinMaxPlan {
     pub kind: ScalarAggKind,
     /// The aggregated column.
     pub agg_column: ColumnId,
-    /// Type of the aggregated column (`Unknown` when the catalog is silent);
-    /// returned to the materializer so it can decode the re-executed scalar.
+    /// Type of the aggregated column (`Unknown` when the catalog is silent).
+    /// Returned to the materializer so it can decode the re-executed scalar.
     pub column_type: ColumnType,
     /// Columns whose change can alter the result: the aggregated column plus
     /// every column the WHERE clause reads (UPDATE routing optimization).
@@ -52,7 +52,7 @@ pub(super) struct MinMaxPlan {
     /// SQL the Subscription Materializer runs after a
     /// [`ReExecutionTrigger`](super::ReExecutionTrigger), with its projection
     /// aliased. Returned to the materializer at registration via
-    /// [`Registered::ReExec`](super::Registered::ReExec); subql itself never
+    /// [`Registered::ReExec`](super::Registered::ReExec). Subql itself never
     /// executes it.
     pub reexec_sql: String,
 }
@@ -103,7 +103,7 @@ pub(super) fn build_plan<D: Dialect, DB: DatabaseLike>(
 
 /// Re-render `stmt` with its single projection aliased as
 /// [`REEXEC_VALUE_ALIAS`], producing the re-execution query. AST mutation and
-/// rendering are `sqlparser`'s job; subql only sets the alias. Returns `None`
+/// rendering are `sqlparser`'s job. Subql only sets the alias. Returns `None`
 /// if the statement is not the single-projection SELECT shape
 /// [`extract_scalar_aggregate`] already validated.
 fn render_aliased_scalar(stmt: &Statement) -> Option<String> {

@@ -43,11 +43,10 @@ use crate::{
 
 /// Build a permissive fuzz schema as a [`ParserDB`].
 ///
-/// Declares an `orders` table with a wide selection of column names that
-/// are commonly produced by the SQL fuzzer (`amount`, `status`, `id`, plus
-/// a generous bank of generic `c0`-`c15` columns). The fuzzer may still
-/// feed SQL that references columns/tables not in this fixture — those
-/// inputs simply fail SQL resolution, which is fine for crash testing.
+/// Declares an `orders` table with column names the SQL fuzzer commonly
+/// produces (`amount`, `status`, `id`, plus generic `c0`-`c15`). SQL
+/// referencing columns or tables absent from this fixture fails SQL
+/// resolution, which is fine for crash testing.
 #[must_use]
 pub fn fuzz_catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(
@@ -121,18 +120,18 @@ fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction> {
 // Harness functions
 // ---------------------------------------------------------------------------
 
-/// Parse SQL using PostgreSqlDialect — the dialect subql's documented
-/// CDC pipeline targets.
+/// Parse SQL using PostgreSqlDialect, the dialect subql's CDC pipeline
+/// targets.
 ///
 /// We deliberately do NOT also fuzz with `GenericDialect`: it accepts
-/// many more parse paths (PG/MySQL/MSSQL/etc. tokens all valid), which
-/// makes it prone to deep backtracking on adversarial input. That's an
-/// upstream sqlparser perf characteristic, not subql code we'd want to
-/// surface, and previous fuzz timeouts traced back to it.
+/// many more parse paths (PG/MySQL/MSSQL tokens all valid), making it
+/// prone to deep backtracking on adversarial input. That is an upstream
+/// sqlparser perf characteristic, not subql code, and previous fuzz
+/// timeouts traced back to it.
 pub fn harness_parse_sql(data: &[u8]) {
     // Real callers pass valid UTF-8 SQL. `from_utf8_lossy` would
     // introduce U+FFFD bytes that drive sqlparser into pathological
-    // backtracking — code paths unreachable in production.
+    // backtracking, code paths unreachable in production.
     let Ok(sql) = core::str::from_utf8(data) else {
         return;
     };
@@ -185,8 +184,8 @@ pub fn harness_deserialize_shard(data: &[u8]) {
     let _ = deserialize_shard::<DefaultIds, _>(data, &catalog);
 }
 
-/// Normalize and hash SQL, asserting determinism. PostgreSqlDialect only —
-/// see `harness_parse_sql` for the rationale.
+/// Normalize and hash SQL, asserting determinism. PostgreSqlDialect only.
+/// See `harness_parse_sql` for the rationale.
 pub fn harness_canonicalize(data: &[u8]) {
     let Ok(sql) = core::str::from_utf8(data) else {
         return;
@@ -549,7 +548,7 @@ fn agg_row_image(id: i64, row: &VirtRow) -> RowImage {
     }
 }
 
-/// Build the `agg_catalog()` `ParserDB` once — three columns, single-
+/// Build the `agg_catalog()` `ParserDB` once: three columns, single-
 /// column INT PK. Distinct from `fuzz_catalog()` so the column-id
 /// mapping is predictable (id=0, amount=1, status=2).
 fn agg_catalog() -> ParserDB {
@@ -880,7 +879,7 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
 
 /// Fixed pool of `SELECT *` queries the snapshot/restore harness picks
 /// from. All target the same `agg_catalog()` `orders` table so
-/// registrations always succeed; the fuzzer controls which subset of
+/// registrations always succeed. The fuzzer controls which subset of
 /// the pool ends up registered and in what order.
 const SNAPSHOT_REGISTER_SQLS: &[&str] = &[
     "SELECT * FROM orders WHERE amount > 100",
@@ -917,10 +916,10 @@ enum SnapEvent {
 }
 
 /// Per-process working directory for the snapshot/restore harness.
-/// libFuzzer spawns one worker process per parallel run; pinning the
+/// libFuzzer spawns one worker process per parallel run. Pinning the
 /// path to `pid` keeps separate workers from clobbering each other's
 /// shard files, and a per-iteration `remove_dir_all` + `create_dir_all`
-/// makes the round-trip start from a clean slate every time.
+/// starts each round-trip from a clean slate.
 ///
 /// Prefers `/dev/shm` (Linux tmpfs / RAM) over `std::env::temp_dir()`
 /// (often a btrfs / ext4 mount), because the harness's bottleneck is
@@ -1174,7 +1173,7 @@ pub fn harness_pgoutput(data: &[u8]) {
         }
     }
 }
-/// Tier-3 full end-to-end fuzz harness.
+/// pgoutput round-trip full end-to-end fuzz harness.
 ///
 /// Drives an arbitrary DML stream through [`crate::SqliteCdcSource`],
 /// routes each emitted [`WalEvent`] through [`crate::PgOutputBridge`]
@@ -1359,9 +1358,8 @@ impl E2eFixture {
         }
     }
 
-    /// Encode → parse → dispatch a single `WalEvent`. Used by both the
-    /// SQLite-sourced events and the synthetic Truncate-injection
-    /// path.
+    /// Encode -> parse -> dispatch a single `WalEvent`. Used by both the
+    /// SQLite-sourced events and the synthetic Truncate-injection path.
     fn route_event(&mut self, event: &WalEvent) {
         self.route_event_inner(event, &mut |result| {
             let _ = core::hint::black_box(result);
@@ -1455,7 +1453,7 @@ fn next_dml(u: &mut Unstructured<'_>, _table_id: crate::TableId) -> Option<Strin
         }
         4 => {
             // PK-changing UPDATE. SQLite allows it directly when the
-            // new id is unused; otherwise the statement fails with a
+            // new id is unused. Otherwise the statement fails with a
             // UNIQUE constraint, which the harness swallows. Either
             // outcome is interesting for the dispatch path.
             let old_id = u.int_in_range(1i32..=8).ok()?;
@@ -1627,7 +1625,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Regression tests — replay crash files from tests/crashes/{harness_name}/
+// Regression tests: replay crash files from tests/crashes/{harness_name}/
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1654,7 +1652,7 @@ mod regression_tests {
 
         let entries = match fs::read_dir(&crash_dir) {
             Ok(e) => e,
-            Err(_) => return, // directory missing — nothing to replay
+            Err(_) => return, // directory missing, nothing to replay
         };
 
         for entry in entries {

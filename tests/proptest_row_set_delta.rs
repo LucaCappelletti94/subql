@@ -16,7 +16,7 @@
 //! 4. **Bucket disjointness.** The PK sets of `inserted`, `deleted`,
 //!    and `updated` are pairwise disjoint for any inputs.
 //! 5. **Bucket completeness.** Every PK in `next` lands in exactly one
-//!    of `inserted` / `updated` / (untouched-but-present); every PK in
+//!    of `inserted` / `updated` / (untouched-but-present). Every PK in
 //!    `prev` lands in exactly one of `deleted` / `updated` /
 //!    (untouched-but-present).
 //! 6. **Reconstruction.** Starting from `prev` and applying the delta
@@ -84,7 +84,7 @@ fn arb_composite_pk_set() -> impl Strategy<Value = Vec<RowImage>> {
 
 /// Project the PK cells out of `row` as a sortable / hashable tuple. We
 /// know every row in these tests stores `Cell::Int` in the PK slot, so
-/// extracting via `Cell::Int` is total — anything else is a test bug.
+/// extracting via `Cell::Int` is total. Anything else is a test bug.
 fn pk_of(row: &RowImage, pk_cols: &[ColumnId]) -> Vec<i64> {
     pk_cols
         .iter()
@@ -169,7 +169,7 @@ proptest! {
         prop_assert_eq!(deleted_pks, expected_pks);
     }
 
-    /// Bucket disjointness + completeness: every PK in `prev` ∪ `next`
+    /// Bucket disjointness + completeness: every PK in `prev` or `next`
     /// lands in exactly one of {inserted, deleted, updated, unchanged}.
     #[test]
     fn buckets_disjoint_and_complete(
@@ -188,31 +188,31 @@ proptest! {
         // Pairwise disjoint.
         prop_assert!(
             inserted_pks.is_disjoint(&deleted_pks),
-            "inserted ∩ deleted nonempty: {:?}",
+            "inserted and deleted not disjoint: {:?}",
             inserted_pks.intersection(&deleted_pks).collect::<Vec<_>>(),
         );
         prop_assert!(
             inserted_pks.is_disjoint(&updated_pks),
-            "inserted ∩ updated nonempty: {:?}",
+            "inserted and updated not disjoint: {:?}",
             inserted_pks.intersection(&updated_pks).collect::<Vec<_>>(),
         );
         prop_assert!(
             deleted_pks.is_disjoint(&updated_pks),
-            "deleted ∩ updated nonempty: {:?}",
+            "deleted and updated not disjoint: {:?}",
             deleted_pks.intersection(&updated_pks).collect::<Vec<_>>(),
         );
 
-        // `inserted` ⊆ next \ prev (by PK).
+        // `inserted` is next minus prev (by PK).
         let prev_pks: BTreeSet<Vec<i64>> = prev.iter().map(|r| pk_of(r, PK_COLS_SINGLE)).collect();
         let next_pks: BTreeSet<Vec<i64>> = next.iter().map(|r| pk_of(r, PK_COLS_SINGLE)).collect();
         let expected_inserts: BTreeSet<Vec<i64>> = next_pks.difference(&prev_pks).cloned().collect();
         prop_assert_eq!(&inserted_pks, &expected_inserts);
 
-        // `deleted` ⊆ prev \ next.
+        // `deleted` is prev minus next.
         let expected_deletes: BTreeSet<Vec<i64>> = prev_pks.difference(&next_pks).cloned().collect();
         prop_assert_eq!(&deleted_pks, &expected_deletes);
 
-        // `updated` ⊆ prev ∩ next.
+        // `updated` is a subset of prev intersect next.
         let intersection: BTreeSet<Vec<i64>> =
             prev_pks.intersection(&next_pks).cloned().collect();
         prop_assert!(updated_pks.is_subset(&intersection));

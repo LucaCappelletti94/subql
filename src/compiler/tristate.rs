@@ -22,9 +22,9 @@ impl Tri {
     /// | True    | Unknown | Unknown |
     /// | False   | True    | False   |
     /// | False   | False   | False   |
-    /// | False   | Unknown | False   | ← short-circuit
+    /// | False   | Unknown | False   | <- short-circuit
     /// | Unknown | True    | Unknown |
-    /// | Unknown | False   | False   | ← short-circuit
+    /// | Unknown | False   | False   | <- short-circuit
     /// | Unknown | Unknown | Unknown |
     /// ```
     #[must_use]
@@ -47,11 +47,11 @@ impl Tri {
     /// |---------|---------|---------|
     /// | True    | True    | True    |
     /// | True    | False   | True    |
-    /// | True    | Unknown | True    | ← short-circuit
+    /// | True    | Unknown | True    | <- short-circuit
     /// | False   | True    | True    |
     /// | False   | False   | False   |
     /// | False   | Unknown | Unknown |
-    /// | Unknown | True    | True    | ← short-circuit
+    /// | Unknown | True    | True    | <- short-circuit
     /// | Unknown | False   | Unknown |
     /// | Unknown | Unknown | Unknown |
     /// ```
@@ -86,7 +86,7 @@ impl Tri {
         }
     }
 
-    /// Converts to `Option<bool>` (Unknown → None)
+    /// Converts to `Option<bool>` (Unknown becomes None)
     #[must_use]
     pub const fn to_option(self) -> Option<bool> {
         match self {
@@ -96,7 +96,7 @@ impl Tri {
         }
     }
 
-    /// Converts from `Option<bool>` (None → Unknown)
+    /// Converts from `Option<bool>` (None becomes Unknown)
     #[must_use]
     pub const fn from_option(opt: Option<bool>) -> Self {
         match opt {

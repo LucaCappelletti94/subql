@@ -425,10 +425,10 @@ fn dispatch_events<C: subql::Checkpoint>(
             let notifs = engine
                 .consumers(event)
                 .unwrap_or_else(|e| panic!("Dispatch failed for event {i}: {e}"));
-            // Collect every bucket — the view-relative consumers API splits
-            // matches across inserted/deleted/updated; a DELETE's matches
-            // live in `deleted`, which `into_iter()` (which yields only
-            // inserted ∪ updated) would silently drop.
+            // Collect every bucket. The view-relative consumers API splits
+            // matches across inserted/deleted/updated. A DELETE's matches
+            // live in `deleted`, which `into_iter()` (yielding only
+            // inserted plus updated) would silently drop.
             let consumers: BTreeSet<u64> = notifs
                 .inserted()
                 .iter()
@@ -512,7 +512,7 @@ fn cross_db_cdc_parity() {
     let pg_messages = pg_read_changes(&mut pg);
     let mx_messages = maxwell_read_changes(&maxwell_path, 4);
 
-    // Set up engines — one per CDC source
+    // Set up engines, one per CDC source
     let catalog: Arc<ParserDB> = Arc::new(iot_catalog());
     let mut pg_engine = setup_engine(&catalog);
     let mut mx_engine = setup_engine(&catalog);
@@ -530,7 +530,7 @@ fn cross_db_cdc_parity() {
     let expected: Vec<BTreeSet<u64>> = vec![
         BTreeSet::from([1, 2, 4]), // INSERT (1, 35, 45, 'warehouse-A'): temp>30, loc match, sensor match
         BTreeSet::from([3]),       // INSERT (2, 28, 35, 'warehouse-B'): hum<40 AND temp>25
-        BTreeSet::from([1]), // UPDATE sensor_id=1 temp=40: only temp changed → only temp>30 re-evaluated
+        BTreeSet::from([1]), // UPDATE sensor_id=1 temp=40: only temp changed -> only temp>30 re-evaluated
         BTreeSet::from([3]), // DELETE sensor_id=2: old row matches hum<40 AND temp>25
     ];
 

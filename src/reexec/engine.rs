@@ -4,9 +4,9 @@
 //! subql is **DB-free**: it classifies and maintains in-process. When the
 //! maintenance state machine cannot resolve a result on its own (extreme
 //! removal, or future Total/aggregate triggers), the engine emits a
-//! [`ReExecutionTrigger`] for the caller. The caller (the Subscription
-//! Materializer in connetto-rs) services the trigger - re-runs the query,
-//! authorizes, builds a patchset - and feeds the recomputed value back via
+//! [`ReExecutionTrigger`] for the caller. The caller (a downstream
+//! subscription materializer) services the trigger: re-runs the query,
+//! authorizes, builds a patchset, then feeds the recomputed value back via
 //! [`ReExecEngine::install`].
 
 use super::maintain::{Maintenance, MinMaxQuery, QueryRuntime};
@@ -105,7 +105,7 @@ pub struct ReExecNotifications<I: IdTypes, C: crate::Checkpoint = crate::NoCheck
     pub engine: ConsumerNotifications<I, C>,
     /// Scalar values that changed in-process (no DB round-trip).
     pub scalar_updates: Vec<ScalarUpdate<I, C>>,
-    /// Queries whose maintenance could not resolve in-process; the
+    /// Queries whose maintenance could not resolve in-process. The
     /// materializer must re-execute and call [`ReExecEngine::install`].
     pub triggers: Vec<ReExecutionTrigger<I, C>>,
 }
@@ -128,7 +128,7 @@ pub struct ReExecNotifications<I: IdTypes, C: crate::Checkpoint = crate::NoCheck
 ///   trigger's checkpoint, since the connector reads the cumulative state
 ///   at the end of the batch. Under [`AutoResolvingEngine`] /
 ///   [`AsyncAutoResolvingEngine`] this field is always empty after
-///   resolution; under [`ReExecEngine`] the caller services the triggers.
+///   resolution. Under [`ReExecEngine`] the caller services the triggers.
 ///
 /// [`AutoResolvingEngine`]: super::AutoResolvingEngine
 /// [`AsyncAutoResolvingEngine`]: super::AsyncAutoResolvingEngine
@@ -157,7 +157,7 @@ pub struct ReExecUnregisterReport {
 /// Registration flows through this type: queries the core engine supports pass
 /// straight through, and single-table scalar `MIN`/`MAX` queries it rejects are
 /// captured here and maintained incrementally. The wrapper never opens a
-/// database connection; the materializer services [`ReExecutionTrigger`]s and
+/// database connection. The materializer services [`ReExecutionTrigger`]s and
 /// calls [`install`](Self::install).
 pub struct ReExecEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     inner: SubscriptionEngine<D, I, DB>,
@@ -355,8 +355,8 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
     /// `query_id` across the whole batch.
     ///
     /// Per-event engine notifications are returned in input order in
-    /// [`BatchOutcome::per_event`]; in-process scalar updates accumulate
-    /// across the batch into [`BatchOutcome::scalar_updates`]; triggers
+    /// [`BatchOutcome::per_event`]. In-process scalar updates accumulate
+    /// across the batch into [`BatchOutcome::scalar_updates`]. Triggers
     /// are deduplicated by `query_id` (last occurrence's checkpoint wins)
     /// into [`BatchOutcome::triggers`].
     ///
@@ -624,8 +624,8 @@ mod tests {
     }
 
     /// A `MIN(price)` registration must hard-reject when `orders` has RLS
-    /// enabled. Per-viewer auth makes a shared in-process IVM state unsafe;
-    /// the wrapper surfaces `RegisterError::AggregatorOnRlsTable` until
+    /// enabled. Per-viewer auth makes a shared in-process IVM state unsafe.
+    /// The wrapper surfaces `RegisterError::AggregatorOnRlsTable` until
     /// per-consumer total re-execution lands.
     #[test]
     fn aggregator_on_rls_table_is_rejected() {

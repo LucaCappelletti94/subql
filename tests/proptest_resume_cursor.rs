@@ -1,5 +1,5 @@
 //! Property-based tests for the per-`(session, subscription)` resume
-//! cursor introduced by `connetto-rs` Q6.4.
+//! cursor.
 //!
 //! Model-based: every action that mutates the engine's cursor state
 //! also runs against a reference `HashMap<(SessionId, SubscriptionId),
@@ -138,7 +138,7 @@ fn step(engine: &mut Engine, model: &mut Model, action: Action) {
 
 /// Tiny helper: drop-in `assert_eq!` that panics on mismatch (proptest's
 /// `prop_assert_eq!` returns a `TestCaseError`, but we are not inside a
-/// `proptest!` body in `step`; the surrounding closure unwraps).
+/// `proptest!` body in `step`. The surrounding closure unwraps).
 macro_rules! prop_assert_eq_static {
     ($left:expr, $right:expr) => {{
         let l = $left;

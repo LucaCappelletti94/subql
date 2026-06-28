@@ -9,7 +9,7 @@
 //! 2. A `MIN` over an empty result set decodes as [`Cell::Null`].
 //!
 //! The lib's unit tests cover the "no DB call on insert above the
-//! extreme" optimization with a `MockConnector`; here we only assert the
+//! extreme" optimization with a `MockConnector`. Here we only assert the
 //! Diesel side of the round-trip. Each test seeds SQLite with whatever
 //! state the connector is expected to read at re-execution time, then
 //! dispatches a CDC event that forces the engine to call the connector.

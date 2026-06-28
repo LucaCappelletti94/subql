@@ -2,7 +2,7 @@
 //! logical replication enabled.
 //!
 //! Each test that wants them does `mod common;` at the top of its file. Cargo
-//! recompiles this module per integration-test crate; that's the price of
+//! recompiles this module per integration-test crate. That's the price of
 //! integration-test isolation and is fine for a handful of helpers.
 //!
 //! Requires Docker. The `pg_with_wal2json` helper builds the custom
@@ -130,7 +130,7 @@ pub fn pg_url(port: u16) -> String {
 
 /// Build the libpq URL for a Postgres container. Alias for
 /// [`pg_url`] kept around so the pg_streaming e2e is explicit about
-/// the connection being used for replication; `PgStreamingCdcSource`
+/// the connection being used for replication. `PgStreamingCdcSource`
 /// flips on logical-replication mode programmatically, so no extra
 /// query param is needed in the URL.
 pub fn pg_replication_url(port: u16) -> String {
@@ -148,7 +148,7 @@ pub fn pg_port(c: &Container<GenericImage>) -> u16 {
 }
 
 /// Create a logical replication slot driven by `wal2json`. Idempotent only
-/// within a fresh container; calling twice with the same name on the same
+/// within a fresh container. Calling twice with the same name on the same
 /// instance errors.
 pub fn create_slot(conn: &mut PgConnection, name: &str) {
     diesel::sql_query(format!(

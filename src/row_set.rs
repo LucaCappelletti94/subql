@@ -17,7 +17,7 @@ use hashbrown::HashMap;
 /// `updated`:  rows whose PK exists in both but whose cell contents
 ///             differ. The tuple is `(prev_row, next_row)`.
 ///
-/// Order within each bucket is unspecified; callers that care about
+/// Order within each bucket is unspecified. Callers that care about
 /// stable ordering should sort by PK after the call.
 ///
 /// # Examples
@@ -45,7 +45,7 @@ pub struct RowSetDelta {
 ///
 /// Inputs must be deduplicated by PK (the caller's snapshot results
 /// normally are). Every row in `prev` and `next` is expected to contain
-/// the columns in `pk_cols`; rows missing a PK column hash to a partial
+/// the columns in `pk_cols`. Rows missing a PK column hash to a partial
 /// key and may produce spurious matches.
 ///
 /// Complexity: O(prev.len() + next.len()) hashed comparisons.
@@ -179,7 +179,7 @@ mod tests {
         // Same id=1, different p (a "composite key" using both cols).
         let prev = [row(1, 5)];
         let next = [row(1, 7)];
-        // PK = (id, p): the next row has a different PK → insert + delete.
+        // PK = (id, p): the next row has a different PK -> insert + delete.
         let delta = row_set_delta(&prev, &next, &[0, 1]);
         assert_eq!(delta.inserted.len(), 1);
         assert_eq!(delta.deleted.len(), 1);

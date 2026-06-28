@@ -219,19 +219,6 @@ jobs:
       - run: cargo install cargo-udeps --locked
       - run: cargo +nightly udeps --all-targets --workspace
 
-  scripts:
-    name: Shellcheck
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
-          if compgen -G "scripts/*.sh" > /dev/null 2>&1; then
-            shellcheck scripts/*.sh
-          else
-            echo "No shell scripts found, skipping"
-          fi
-
   audit:
     name: security audit
     runs-on: ubuntu-latest

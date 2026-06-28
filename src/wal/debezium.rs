@@ -118,7 +118,7 @@ impl MapCdcEnvelope for DebeziumEnvelope {
     }
 
     fn skip_message(&self) -> bool {
-        // Skip message/heartbeat ops — they contain no row data.
+        // Skip message/heartbeat ops: they contain no row data.
         self.op == "m"
     }
 }
@@ -363,7 +363,7 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        // No PK source → empty PK
+        // No PK source: empty PK
         assert!(ev.pk().columns.is_empty());
         assert!(ev.pk().values.is_empty());
     }
@@ -455,7 +455,7 @@ mod tests {
         let catalog = orders_catalog();
         let parser = DebeziumParser;
 
-        // "x" is not a known Debezium op; it must be skipped, not error.
+        // "x" is not a known Debezium op. It must be skipped, not error.
         let json = r#"{
             "before": null,
             "after": {"id": 1},
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn update_pk_change_uses_pre_update_pk() {
-        // When a PK column changes (id: 1 → 2), the emitted PK must be the
+        // When a PK column changes (id: 1 -> 2), the emitted PK must be the
         // pre-update value (1), not the post-update value (2).
         let catalog = orders_catalog();
         let parser = DebeziumParser;

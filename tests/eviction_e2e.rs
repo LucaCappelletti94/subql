@@ -10,9 +10,9 @@
 //! - `EvictLeastActive` stamps activity from real dispatch (not synthetic
 //!   events) and picks the least recently stamped subscription.
 //! - `register_batch` enforces the cap end-to-end: surviving subscriptions
-//!   match subsequent real WAL events; evicted ones do not.
+//!   match subsequent real WAL events. Evicted ones do not.
 //!
-//! `#[ignore]`d; run with:
+//! `#[ignore]`d. Run with:
 //!
 //! ```sh
 //! cargo test --test eviction_e2e -- --ignored --nocapture
@@ -217,7 +217,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
         s_c.evicted
     );
 
-    // Real WAL: insert id=1 — s_a was the only subscriber, and it has
+    // Real WAL: insert id=1. s_a was the only subscriber and it has
     // been evicted, so nobody matches.
     sql_query("INSERT INTO orders VALUES (10, 5.0)")
         .execute(&mut dml)
@@ -249,7 +249,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
 ///
 /// Note: `pick_eviction_victim` only inspects already-committed bindings
 /// in `subscription_to_table`, not the in-flight batch entries that are
-/// deferred to phase 3. So a batch can only evict subscriptions that
+/// deferred to the partition-insert phase of register_batch. So a batch can only evict subscriptions that
 /// existed before the batch started. The test exercises that contract by
 /// pre-registering enough subscriptions to absorb every over-cap eviction.
 #[test]

@@ -5,7 +5,7 @@
 //! `now_micros()` method returning a monotonically non-decreasing
 //! microsecond counter from some implementation-defined origin.
 //!
-//! [`StdClock`] is the default, available under the `std` feature; it
+//! [`StdClock`] is the default, available under the `std` feature. It
 //! reads `std::time::Instant`. [`ManualClock`] is for tests and ticks
 //! only when the test calls [`ManualClock::advance`].
 
@@ -66,7 +66,7 @@ impl Clock for StdClock {
 /// Test-controlled clock. Starts at zero (or a caller-supplied origin)
 /// and only advances when [`advance`](Self::advance) is called.
 ///
-/// Thread-safe via an atomic counter; useful in async tests that want
+/// Thread-safe via an atomic counter. Useful in async tests that want
 /// deterministic timing across `block_on` boundaries.
 #[derive(Debug)]
 pub struct ManualClock {

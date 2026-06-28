@@ -15,15 +15,15 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 use roaring::RoaringBitmap;
 
-/// Consumer dictionary for ordinal ↔ ConsumerId translation
+/// Consumer dictionary translating between ordinals and ConsumerIds.
 ///
-/// Maps dense ordinals (0-based, used in bitmaps) to sparse ConsumerIds.
-/// Enables efficient RoaringBitmap operations while supporting arbitrary ConsumerIds.
+/// Maps dense ordinals (0-based, used in bitmaps) to sparse ConsumerIds, so
+/// RoaringBitmap operations stay efficient for arbitrary ConsumerIds.
 #[derive(Clone, Debug)]
 pub struct ConsumerDictionary<I: IdTypes> {
-    /// ConsumerOrdinal → ConsumerId (dense, 0-indexed)
+    /// ConsumerOrdinal -> ConsumerId (dense, 0-indexed)
     ordinal_to_consumer: Vec<Option<I::ConsumerId>>,
-    /// ConsumerId → ConsumerOrdinal (for reverse lookup)
+    /// ConsumerId -> ConsumerOrdinal (for reverse lookup)
     consumer_to_ordinal: HashMap<I::ConsumerId, ConsumerOrdinal>,
     /// Recycled ordinals from removed consumers, available for reuse
     free_list: Vec<ConsumerOrdinal>,
@@ -123,7 +123,7 @@ impl<I: IdTypes> Default for ConsumerDictionary<I> {
 
 /// Zero-allocation iterator over matched consumer IDs.
 ///
-/// Owns the `RoaringBitmap` (already heap-allocated during dispatch — moving
+/// Owns the `RoaringBitmap` (already heap-allocated during dispatch, so moving
 /// it is just a pointer move) and borrows the `ConsumerDictionary` to translate
 /// ordinals into consumer IDs.
 pub struct MatchedConsumers<'a, I: IdTypes> {
@@ -224,14 +224,11 @@ fn resolve_ordinals<I: IdTypes>(
 
 /// Dispatch event to interested consumers, returning view-relative notifications.
 ///
-/// Main dispatch algorithm:
-/// 1. Validate event
-/// 2. Route by event kind:
-///    - INSERT: single-eval against new_row → all matches to `inserted`
-///    - DELETE: single-eval against old_row → all matches to `deleted`
-///    - UPDATE: dual-eval (old_row + new_row) → three-way split
-///    - TRUNCATE: all row subscribers → `deleted`
-/// 3. Return `ConsumerNotifications`
+/// Routes by event kind:
+/// - INSERT: single-eval against new_row, all matches to `inserted`
+/// - DELETE: single-eval against old_row, all matches to `deleted`
+/// - UPDATE: dual-eval (old_row + new_row), three-way split
+/// - TRUNCATE: all row subscribers to `deleted`
 pub fn dispatch_consumers<I: IdTypes, C: Checkpoint>(
     event: &WalEvent<C>,
     partition: &TablePartition<I>,
@@ -242,15 +239,13 @@ pub fn dispatch_consumers<I: IdTypes, C: Checkpoint>(
     Ok(notifs)
 }
 
-/// Sibling of [`dispatch_consumers`] that additionally returns the
-/// `SubscriptionId`s whose bindings contributed to a match.
+/// Like [`dispatch_consumers`] but also returns the `SubscriptionId`s whose
+/// bindings contributed to a match.
 ///
-/// Used by activity-aware eviction policies (`EvictLeastActive`,
-/// `EvictColdest`, and any custom policy that reads activity stats) to
-/// stamp the matched subscriptions in O(1) per matched pair via the
-/// `binding_lookup` index on `PredicateStore`. Callers that do not need
-/// stamps should continue calling [`dispatch_consumers`], which discards
-/// the stamp vector.
+/// Used by activity-aware eviction policies (`EvictLeastActive`, `EvictColdest`,
+/// and custom policies reading activity stats) to stamp matched subscriptions in
+/// O(1) per matched pair via the `binding_lookup` index on `PredicateStore`.
+/// Callers that do not need stamps should use [`dispatch_consumers`].
 pub fn dispatch_consumers_with_stamps<I: IdTypes, C: Checkpoint>(
     event: &WalEvent<C>,
     partition: &TablePartition<I>,
@@ -318,8 +313,8 @@ fn old_row_is_complete<C: Checkpoint>(event: &WalEvent<C>) -> bool {
 ///
 /// When a complete `old_row` is available (REPLICA IDENTITY FULL), the three-way
 /// split is exact. When `old_row` is absent or partial, falls back to single-eval
-/// on `new_row` — all matches go to `updated` (conservative: we cannot prove they
-/// are new entries).
+/// on `new_row`, sending all matches to `updated` (conservative: we cannot prove
+/// they are new entries).
 fn dispatch_update_with_stamps<I: IdTypes, C: Checkpoint>(
     event: &WalEvent<C>,
     partition: &TablePartition<I>,
@@ -512,7 +507,7 @@ fn weighted_rows_for_agg<C: Checkpoint>(
             let old_row = event
                 .old_row()
                 .ok_or_else(|| DispatchError::AggregateUpdateRequiresOldRow(event.table_id()))?;
-            // Reject partial old rows — Cell::Missing would produce unsound deltas
+            // Reject partial old rows: Cell::Missing would produce unsound deltas
             if old_row.cells.iter().any(Cell::is_missing) {
                 return Err(DispatchError::AggregateUpdateRequiresOldRow(
                     event.table_id(),
@@ -525,18 +520,17 @@ fn weighted_rows_for_agg<C: Checkpoint>(
     }
 }
 
-/// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), …).
+/// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), ...).
 ///
 /// Delta normalization per event kind:
-/// - `Insert`   → `[(+1, new_row)]`
-/// - `Delete`   → `[(-1, old_row)]`
-/// - `Update`   → `[(-1, old_row), (+1, new_row)]`
-/// - `Truncate` → `Err(TruncateRequiresReset)`
+/// - `Insert`   -> `[(+1, new_row)]`
+/// - `Delete`   -> `[(-1, old_row)]`
+/// - `Update`   -> `[(-1, old_row), (+1, new_row)]`
+/// - `Truncate` -> `Err(TruncateRequiresReset)`
 ///
-/// For each `(weight, row)` pair the function selects agg candidate
-/// predicates, prefilters, VM-evaluates, and accumulates weight per user.
-/// Zero-net entries are filtered out before returning.
-/// The same user may appear multiple times (once per aggregate kind).
+/// For each `(weight, row)` pair, selects agg candidate predicates, prefilters,
+/// VM-evaluates, and accumulates weight per user. Zero-net entries are filtered
+/// out. The same user may appear multiple times (once per aggregate kind).
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 pub(crate) fn compute_agg_deltas<I: IdTypes, C: Checkpoint>(
     event: &WalEvent<C>,
@@ -994,7 +988,7 @@ mod tests {
             .expect("event builder should be valid");
 
         let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        // old_row age=17 (no match), new_row age=25 (match) → consumer enters (inserted)
+        // old_row age=17 (no match), new_row age=25 (match): consumer enters (inserted)
         assert!(
             notifs.inserted().contains(&42),
             "Consumer 42 should be inserted (age > 18 with new age=25, old age=17)"
@@ -1141,7 +1135,7 @@ mod tests {
             .pk(make_pk(1))
             .new_row(make_row(20))
             .build()
-            .expect("event builder should be valid"); // 20 > 10 → matches
+            .expect("event builder should be valid"); // 20 > 10, matches
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(
@@ -1167,7 +1161,7 @@ mod tests {
             .pk(make_pk(1))
             .new_row(make_row(5))
             .build()
-            .expect("event builder should be valid"); // 5 ≤ 10 → no match
+            .expect("event builder should be valid"); // 5 <= 10, no match
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(
@@ -1239,7 +1233,7 @@ mod tests {
 
         make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
 
-        // old_row has Cell::Missing at column 1 — partial image
+        // old_row has Cell::Missing at column 1: partial image
         let event = WalEvent::builder(1)
             .update()
             .new_row(make_row(20))
@@ -1415,7 +1409,7 @@ mod tests {
             .pk(make_pk(1))
             .new_row(make_sum_row(crate::Cell::Int(20)))
             .build()
-            .expect("event builder should be valid"); // 20 > 10 → matches
+            .expect("event builder should be valid"); // 20 > 10, matches
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
@@ -1437,7 +1431,7 @@ mod tests {
             .pk(make_pk(1))
             .new_row(make_sum_row(crate::Cell::Int(5)))
             .build()
-            .expect("event builder should be valid"); // 5 ≤ 10 → no match
+            .expect("event builder should be valid"); // 5 <= 10, no match
 
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
         assert!(deltas.is_empty());
@@ -1598,8 +1592,8 @@ mod tests {
 
         make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
 
-        // Row too short — column 1 (amount) is missing
-        // WHERE amount > 10 evaluates to Unknown → no match
+        // Row too short: column 1 (amount) is missing
+        // WHERE amount > 10 evaluates to Unknown, no match
         let event = WalEvent::builder(1)
             .insert()
             .pk(make_pk(1))
@@ -1633,7 +1627,7 @@ mod tests {
 
         // WHERE amount > 10 won't match 2.5, so no delta
         let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(deltas.is_empty(), "2.5 ≤ 10, so WHERE does not match");
+        assert!(deltas.is_empty(), "2.5 <= 10, so WHERE does not match");
     }
 
     #[test]

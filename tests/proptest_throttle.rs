@@ -5,14 +5,14 @@
 //! arbitrary `(num_triggers, cap, per-call delay)` tuples and asserts
 //! the same load-bearing invariants on every case:
 //!
-//! 1. **Cap respected.** `peak inflight ≤ cap` for every schedule the
+//! 1. **Cap respected.** `peak inflight <= cap` for every schedule the
 //!    runtime produces.
 //! 2. **No dropped work.** `total_calls == num_triggers` exactly. The
 //!    throttle must not skip or double-count.
 //! 3. **Clean shutdown.** `inflight` returns to 0 after the batch.
 //! 4. **Per-trigger outcome.** `scalar_updates.len() == num_triggers`.
 //!
-//! Each case spins up its own `current_thread` tokio runtime; proptest
+//! Each case spins up its own `current_thread` tokio runtime. Proptest
 //! itself is synchronous so we use `block_on`. To keep wall-clock
 //! reasonable we cap the delay at 8 ms and run 32 cases, giving an
 //! upper bound around `32 * 6 * 8 ms = 1.5 s` for the slowest path
@@ -198,7 +198,7 @@ proptest! {
     })]
 
     /// For every `(num_triggers, cap, delay)`:
-    ///   peak inflight ≤ cap, total_calls == num_triggers,
+    ///   peak inflight <= cap, total_calls == num_triggers,
     ///   scalar_updates.len() == num_triggers, inflight returns to 0.
     #[test]
     fn throttle_invariants_hold(

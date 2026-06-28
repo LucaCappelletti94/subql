@@ -2,7 +2,6 @@
 //!
 //! Quick verification that the polling source connects to a real
 //! Postgres, drains an INSERT, and the observability counters update.
-//! The heavy comparative benchmarks live in `examples/`.
 
 #![cfg(feature = "pg-streaming")]
 #![allow(clippy::unwrap_used, clippy::print_stdout)]

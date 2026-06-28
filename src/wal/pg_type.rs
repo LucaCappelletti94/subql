@@ -1,4 +1,4 @@
-//! PostgreSQL type string → [`Cell`] conversion.
+//! PostgreSQL type string to [`Cell`] conversion.
 //!
 //! Shared by all JSON-based WAL parsers (wal2json, Maxwell, Debezium).
 
@@ -26,7 +26,7 @@ pub(super) fn json_value_to_cell_strict(
         return Ok(Cell::Null);
     }
 
-    // Detect array types (PostgreSQL prefix '_') — not yet supported
+    // Detect array types (PostgreSQL prefix '_'), not yet supported
     let ty = pg_type.to_ascii_lowercase();
     if ty.starts_with('_') {
         return Err(WalParseError::MalformedPayload(format!(
@@ -48,7 +48,7 @@ pub(super) fn json_value_to_cell_strict(
         // Boolean
         "boolean" | "bool" => bool_cell_strict(value, field),
 
-        // Everything else → String (including known text-like types)
+        // Everything else -> String (including known text-like types)
         _ => Ok(string_cell(value)),
     }
 }
@@ -119,7 +119,7 @@ fn float_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, Wal
 }
 
 /// Parse a boolean cell strictly. Accepts JSON booleans and common textual
-/// encodings; rejects all other values.
+/// encodings. Rejects all other values.
 fn bool_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalParseError> {
     match value {
         serde_json::Value::Bool(b) => Ok(Cell::Bool(*b)),
@@ -215,7 +215,7 @@ pub(super) fn text_to_cell_strict(text: &str, type_oid: u32) -> Result<Cell, Wal
         1082 | 1083 | 1114 | 1184 | 1266 | 1186 => Ok(Cell::String(Arc::from(text))),
         // json, jsonb
         114 | 3802 => Ok(Cell::String(Arc::from(text))),
-        // everything else → String fallback
+        // everything else: String fallback
         _ => Ok(Cell::String(Arc::from(text))),
     }
 }
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn array_type_prefix_stripped() {
-        // _int4 is an int4 array type — now returns error in strict mode,
+        // _int4 is an int4 array type: strict mode returns an error,
         // non-strict falls back to string
         assert_eq!(
             json_value_to_cell(&json!(42), "_int4"),
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn int_fractional_non_strict_falls_back_to_string() {
-        // Strict conversion rejects fractional ints; non-strict helper falls back to string.
+        // Strict conversion rejects fractional ints. Non-strict helper falls back to string.
         assert_eq!(
             json_value_to_cell(&json!(3.7), "int4"),
             Cell::String(Arc::from("3.7"))

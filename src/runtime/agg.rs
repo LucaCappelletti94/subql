@@ -60,20 +60,20 @@ pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<
 /// Trait for streaming aggregate kernels.
 ///
 /// Kernels accumulate signed-weight deltas produced by the dispatch pipeline.
-/// One kernel instance is created per evaluation pass; the result is returned
+/// One kernel instance is created per evaluation pass. The result is returned
 /// to the caller after all deltas have been applied.
 ///
 /// # Caller contract
 /// The engine handles only WAL-driven deltas. Callers must:
-/// 1. **Bootstrap** — query the DB for the initial aggregate before subscribing.
-/// 2. **Accumulate** — `running_value += delta` on each `aggregate_deltas` call.
-/// 3. **Require old UPDATE images** — aggregate UPDATE deltas need both old and
-///    new row images; CDC sources that omit `before`/`old` rows cannot produce
+/// 1. **Bootstrap**: query the DB for the initial aggregate before subscribing.
+/// 2. **Accumulate**: `running_value += delta` on each `aggregate_deltas` call.
+/// 3. **Require old UPDATE images**: aggregate UPDATE deltas need both old and
+///    new row images. CDC sources that omit `before`/`old` rows cannot produce
 ///    correct UPDATE deltas.
-/// 4. **Reset on policy change** — RLS/ACL changes produce no WAL events;
-///    re-query the DB and replace the stored value.
-/// 5. **Reset on TRUNCATE** — engine returns `Err(TruncateRequiresReset)`;
-///    caller must re-query and replace the stored value.
+/// 4. **Reset on policy change**: RLS/ACL changes produce no WAL events. Re-query
+///    the DB and replace the stored value.
+/// 5. **Reset on TRUNCATE**: engine returns `Err(TruncateRequiresReset)`. Caller
+///    must re-query and replace the stored value.
 pub trait AggKernel: Send {
     /// Apply a signed-weight delta for a matched row.
     ///
@@ -88,7 +88,7 @@ pub trait AggKernel: Send {
     fn reset(&mut self);
 }
 
-/// COUNT(*) kernel — counts matching rows with signed weights.
+/// COUNT(*) kernel: counts matching rows with signed weights.
 #[derive(Default, Debug)]
 pub struct CountKernel {
     delta: i64,
@@ -108,7 +108,7 @@ impl AggKernel for CountKernel {
     }
 }
 
-/// COUNT(column) kernel — counts non-NULL, non-Missing values with signed weights.
+/// COUNT(column) kernel: counts non-NULL, non-Missing values with signed weights.
 #[derive(Debug)]
 pub struct CountColumnKernel {
     column: ColumnId,
@@ -140,7 +140,7 @@ impl AggKernel for CountColumnKernel {
     }
 }
 
-/// SUM(column) kernel — accumulates signed weighted column values.
+/// SUM(column) kernel: accumulates signed weighted column values.
 #[derive(Debug)]
 pub struct SumKernel {
     column: ColumnId,
@@ -173,7 +173,7 @@ impl AggKernel for SumKernel {
     }
 }
 
-/// AVG(column) kernel — accumulates both sum and count deltas for running-average updates.
+/// AVG(column) kernel: accumulates both sum and count deltas for running-average updates.
 ///
 /// Emits `AggDelta::Avg { sum_delta, count_delta }`. The caller maintains
 /// `running_sum` and `running_count` and computes `AVG = running_sum / running_count`.
