@@ -1891,6 +1891,64 @@ impl<I: IdTypes, C: Checkpoint> core::fmt::Debug for ConsumerNotifications<I, C>
     }
 }
 
+/// Combined output of [`dispatch`](crate::SubscriptionEngine::dispatch): row-set
+/// notifications plus aggregate deltas for one event.
+pub struct DispatchOutput<I: IdTypes, C: Checkpoint = NoCheckpoint> {
+    notifications: ConsumerNotifications<I, C>,
+    aggregate_deltas: Vec<(I::ConsumerId, AggDelta)>,
+}
+
+impl<I: IdTypes, C: Checkpoint> DispatchOutput<I, C> {
+    pub(crate) const fn from_parts(
+        notifications: ConsumerNotifications<I, C>,
+        aggregate_deltas: Vec<(I::ConsumerId, AggDelta)>,
+    ) -> Self {
+        Self {
+            notifications,
+            aggregate_deltas,
+        }
+    }
+
+    /// Per-consumer, view-relative row notifications (insert/delete/update).
+    #[must_use]
+    pub const fn notifications(&self) -> &ConsumerNotifications<I, C> {
+        &self.notifications
+    }
+
+    /// Signed aggregate deltas, one entry per `(consumer, aggregate kind)`.
+    #[must_use]
+    pub fn aggregate_deltas(&self) -> &[(I::ConsumerId, AggDelta)] {
+        &self.aggregate_deltas
+    }
+
+    /// Every consumer affected by this event, from either path, sorted and
+    /// deduplicated.
+    #[must_use]
+    pub fn notified(&self) -> Vec<I::ConsumerId> {
+        let mut ids: Vec<I::ConsumerId> = self
+            .notifications
+            .inserted()
+            .iter()
+            .chain(self.notifications.updated())
+            .chain(self.notifications.deleted())
+            .copied()
+            .collect();
+        ids.extend(self.aggregate_deltas.iter().map(|(cid, _)| *cid));
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// `true` when no consumer was affected by this event.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.aggregate_deltas.is_empty()
+            && self.notifications.inserted().is_empty()
+            && self.notifications.updated().is_empty()
+            && self.notifications.deleted().is_empty()
+    }
+}
+
 /// Iterator over `inserted` and `updated` consumers: those who should see
 /// the current row state.
 pub struct ConsumerNotificationsIter<I: IdTypes> {

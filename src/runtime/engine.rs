@@ -1672,6 +1672,53 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         super::dispatch::compute_agg_deltas(event, partition, consumer_dict, &mut self.vm)
     }
 
+    /// Dispatch one event through the row-set and aggregate paths at once.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{
+    ///     catalog_helpers, AggDelta, Cell, DefaultIds, RowImage, SubscriptionEngine,
+    ///     SubscriptionRequest, WalEvent,
+    /// };
+    ///
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
+    ///
+    /// engine.register(SubscriptionRequest::new(7, "SELECT * FROM orders WHERE amount > 100"))?;
+    /// engine.register(SubscriptionRequest::new(9, "SELECT COUNT(*) FROM orders WHERE status = 'paid'"))?;
+    ///
+    /// let event = WalEvent::builder(orders_id)
+    ///     .insert()
+    ///     .new_row(RowImage {
+    ///         cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("paid".into())]),
+    ///     })
+    ///     .build()?;
+    ///
+    /// let out = engine.dispatch(&event)?;
+    /// assert_eq!(out.notifications().inserted(), vec![7]);
+    /// assert_eq!(out.aggregate_deltas(), &[(9, AggDelta::Count(1))]);
+    /// assert_eq!(out.notified(), vec![7, 9]); // deduped union of both paths
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn dispatch<C: crate::Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+    ) -> Result<crate::DispatchOutput<I, C>, DispatchError> {
+        let notifications = self.consumers(event)?;
+        let aggregate_deltas = self.aggregate_deltas(event)?;
+        Ok(crate::DispatchOutput::from_parts(
+            notifications,
+            aggregate_deltas,
+        ))
+    }
+
     /// Unregister all subscriptions for a session
     ///
     /// Also drops every resume cursor stored for `session_id` (across

@@ -12,8 +12,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
 use subql::{
-    AggDelta, AggSpec, ConsumerNotifications, DefaultIds, QueryProjection, RegisterError,
-    SubscriptionEngine, SubscriptionRequest, WalEvent,
+    AggDelta, AggSpec, DefaultIds, QueryProjection, RegisterError, SubscriptionEngine,
+    SubscriptionRequest, WalEvent,
 };
 
 use crate::presets::{self, PresetSchema};
@@ -216,7 +216,9 @@ impl DemoState {
     }
 
     fn dispatch_one(&mut self, event: &WalEvent) -> Result<(), DemoError> {
-        let notifications: ConsumerNotifications<DefaultIds> = self.engine.consumers(event)?;
+        let out = self.engine.dispatch(event)?;
+
+        let notifications = out.notifications();
         for &cid in notifications.inserted() {
             if let Some(c) = self.find_consumer_mut(cid) {
                 c.counters.inserted += 1;
@@ -232,31 +234,16 @@ impl DemoState {
                 c.counters.updated += 1;
             }
         }
-
-        let agg_deltas = self.engine.aggregate_deltas(event)?;
-        for (cid, delta) in &agg_deltas {
+        for (cid, delta) in out.aggregate_deltas() {
             if let Some(c) = self.find_consumer_mut(*cid) {
                 c.agg.apply(delta);
             }
         }
 
-        let kind = event_kind_label(event);
-        let summary = summarize_event(event);
-        let mut notified: Vec<u64> = notifications
-            .inserted()
-            .iter()
-            .chain(notifications.updated())
-            .chain(notifications.deleted())
-            .copied()
-            .collect();
-        notified.extend(agg_deltas.iter().map(|(cid, _)| *cid));
-        notified.sort_unstable();
-        notified.dedup();
-
         self.push_log(LogEntry::Event {
-            kind,
-            summary,
-            notified,
+            kind: event_kind_label(event),
+            summary: summarize_event(event),
+            notified: out.notified(),
         });
         Ok(())
     }
