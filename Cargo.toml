@@ -1,5 +1,5 @@
 [workspace]
-members = ["subql-demo"]
+members = ["subql-demo", "wasm-verify"]
 # `fuzz/` is intentionally a separate workspace, not a member here.
 # cargo-fuzz layers ASAN + SanCov on top of the workspace's release
 # profile, and ASAN's runtime symbols don't survive LLVM LTO, so the

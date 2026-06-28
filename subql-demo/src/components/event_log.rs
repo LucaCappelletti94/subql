@@ -1,8 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaClockRotateLeft, FaPlug},
-    Icon,
-};
+use dioxus_free_icons::{icons::fa_solid_icons::FaClockRotateLeft, Icon};
 
 use crate::state::LogEntry;
 
@@ -16,7 +13,6 @@ pub fn EventLog() -> Element {
 
     let s = state.borrow();
     let entries: Vec<LogEntry> = s.event_log.iter().rev().cloned().collect();
-    let hooks = s.snapshot_hooks(20);
     drop(s);
 
     rsx! {
@@ -46,26 +42,6 @@ pub fn EventLog() -> Element {
                     LogEntry::Note(text) => rsx! {
                         div { class: "muted", "[note] {text}" }
                     },
-                }
-            }
-        }
-        h3 {
-            Icon { width: 14, height: 14, icon: FaPlug, class: "h-icon".to_string() }
-            " Diesel hook firings (raw)"
-        }
-        div { class: "log",
-            for hook in hooks.iter().rev() {
-                {
-                    let op = format!("{:?}", hook.op);
-                    let table = hook.table_name.clone();
-                    let rowid = hook.rowid;
-                    rsx! {
-                        div {
-                            span { class: "muted",
-                                "{op} table={table} rowid={rowid}"
-                            }
-                        }
-                    }
                 }
             }
         }

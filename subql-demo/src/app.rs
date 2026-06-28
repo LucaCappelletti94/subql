@@ -30,8 +30,7 @@ pub fn App() -> Element {
             " SubQL demo"
         }
         p { class: "muted",
-            "PG schema -> sqlite-wasm-rs -> diesel hooks -> SubQL dispatch. ",
-            "All in the browser."
+            "PG schema -> pg2sqlite -> SQLite -> SqliteCdcSource -> SubQL dispatch."
         }
         div { class: "layout",
             div {

@@ -1,140 +1,13 @@
-//! sqlite-side harness: open in-memory sqlite, translate the preset's PG DDL
-//! to sqlite DDL via pg2sqlite, apply it, and load seed rows.
+//! SQL helpers for driving the in-browser sqlite through `SqliteCdcSource`.
 //!
-//! The companion [`capture`] module installs diesel hooks that turn sqlite
-//! `INSERT`/`UPDATE`/`DELETE` into SubQL `WalEvent`s.
+//! The demo no longer hand-rolls change capture. It builds DML statement
+//! strings here and hands them to [`subql::SqliteCdcSource::execute`], which
+//! captures every row mutation via triggers and surfaces real `WalEvent`s.
 
-use diesel::connection::SimpleConnection;
-use diesel::prelude::*;
-use diesel::sqlite::SqliteConnection;
+use subql::Cell;
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use sql_traits::structs::ParserDB;
-use sqlparser::dialect::PostgreSqlDialect;
-
-use subql::{catalog_helpers, Cell, ColumnId, TableId};
-
-use crate::presets::PresetSchema;
-
-pub mod capture;
-
-#[derive(Debug, thiserror::Error)]
-pub enum HarnessError {
-    #[error("diesel connection: {0}")]
-    Connection(#[from] diesel::ConnectionError),
-    #[error("diesel query: {0}")]
-    Query(#[from] diesel::result::Error),
-    #[error("pg2sqlite: {0}")]
-    Translate(String),
-    #[error("sql-traits parse: {0}")]
-    ParserDb(String),
-    #[error("table or column `{0}` not found in parsed schema")]
-    UnknownTable(String),
-}
-
-pub struct SqliteHarness {
-    pub conn: SqliteConnection,
-    pub table_id: TableId,
-    pub table_name: String,
-    pub columns: Vec<String>,
-    pub column_ids: Vec<ColumnId>,
-}
-
-impl SqliteHarness {
-    /// Build a fresh in-memory sqlite, apply the preset's translated DDL,
-    /// build a SubQL `ParserDB` from the same PG source, and load seed rows.
-    pub fn open(preset: &PresetSchema) -> Result<Self, HarnessError> {
-        let mut conn = SqliteConnection::establish(":memory:")?;
-
-        let sqlite_statements = Pg2Sqlite::default()
-            .sql(preset.pg_ddl)
-            .map_err(|e| HarnessError::Translate(format!("{e}")))?
-            .translate(&Pg2SqliteOptions::default())
-            .map_err(|e| HarnessError::Translate(format!("{e}")))?;
-
-        for stmt in &sqlite_statements {
-            conn.batch_execute(&stmt.to_string())?;
-        }
-
-        let database = ParserDB::parse::<PostgreSqlDialect>(preset.pg_ddl)
-            .map_err(|e| HarnessError::ParserDb(format!("{e}")))?;
-
-        let resolved = catalog_helpers::resolve_table(&database, preset.table_name, preset.columns)
-            .ok_or_else(|| HarnessError::UnknownTable(preset.table_name.into()))?;
-        let table_id = resolved.table_id;
-        let column_ids = resolved.column_ids;
-
-        let mut harness = Self {
-            conn,
-            table_id,
-            table_name: preset.table_name.into(),
-            columns: preset.columns.iter().map(|s| (*s).to_string()).collect(),
-            column_ids,
-        };
-
-        for row in (preset.seed_rows)() {
-            harness.exec_insert(&row)?;
-        }
-
-        Ok(harness)
-    }
-
-    /// Run an `INSERT` against the wrapped table. Returns the assigned `rowid`.
-    pub fn exec_insert(&mut self, row: &[Cell]) -> Result<i64, HarnessError> {
-        let cols = self.columns.join(", ");
-        let values = row
-            .iter()
-            .map(cell_to_sql_literal)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {table} ({cols}) VALUES ({values})",
-            table = self.table_name,
-        );
-        self.conn.batch_execute(&sql)?;
-        let rowid = diesel::dsl::sql::<diesel::sql_types::BigInt>("SELECT last_insert_rowid()")
-            .get_result::<i64>(&mut self.conn)?;
-        Ok(rowid)
-    }
-
-    /// Replace the row at `rowid` with the given cell values.
-    pub fn exec_update(&mut self, rowid: i64, new_row: &[Cell]) -> Result<(), HarnessError> {
-        let sets = self
-            .columns
-            .iter()
-            .zip(new_row.iter())
-            .map(|(c, v)| format!("{c} = {}", cell_to_sql_literal(v)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "UPDATE {table} SET {sets} WHERE rowid = {rowid}",
-            table = self.table_name,
-        );
-        self.conn.batch_execute(&sql)?;
-        Ok(())
-    }
-
-    /// Delete the row at `rowid`.
-    pub fn exec_delete(&mut self, rowid: i64) -> Result<(), HarnessError> {
-        let sql = format!(
-            "DELETE FROM {table} WHERE rowid = {rowid}",
-            table = self.table_name,
-        );
-        self.conn.batch_execute(&sql)?;
-        Ok(())
-    }
-
-    /// Wipe the entire table.
-    pub fn exec_truncate(&mut self) -> Result<(), HarnessError> {
-        let sql = format!("DELETE FROM {table}", table = self.table_name);
-        self.conn.batch_execute(&sql)?;
-        Ok(())
-    }
-}
-
-/// Render a `Cell` as a sqlite literal. Sufficient for the preset-driven
-/// demo where data shape is fully controlled by the simulation.
-fn cell_to_sql_literal(cell: &Cell) -> String {
+/// Render a `Cell` as a sqlite literal.
+pub fn cell_to_sql_literal(cell: &Cell) -> String {
     match cell {
         Cell::Missing | Cell::Null => "NULL".into(),
         Cell::Bool(b) => (if *b { "1" } else { "0" }).into(),
@@ -147,10 +20,56 @@ fn cell_to_sql_literal(cell: &Cell) -> String {
             }
         }
         Cell::String(s) => format!("'{}'", s.replace('\'', "''")),
-        // Cell is `#[non_exhaustive]`; treat any future variant we don't know
-        // about as NULL on the sqlite side. The demo only emits the variants
-        // above through its preset generators, so this should not fire in
-        // practice.
+        // Cell is `#[non_exhaustive]`; render unknown variants as NULL.
         _ => "NULL".into(),
     }
+}
+
+/// `INSERT INTO <table> (<cols>) VALUES (<lits>)`.
+#[must_use]
+pub fn insert_sql(table: &str, columns: &[String], row: &[Cell]) -> String {
+    let cols = columns.join(", ");
+    let values = row
+        .iter()
+        .map(cell_to_sql_literal)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT INTO {table} ({cols}) VALUES ({values})")
+}
+
+/// `UPDATE <table> SET <col = lit, ...> WHERE <pk_col> = <pk_lit>`.
+#[must_use]
+pub fn update_sql(
+    table: &str,
+    columns: &[String],
+    pk_col: &str,
+    pk_val: &Cell,
+    new_row: &[Cell],
+) -> String {
+    let sets = columns
+        .iter()
+        .zip(new_row.iter())
+        .map(|(c, v)| format!("{c} = {}", cell_to_sql_literal(v)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "UPDATE {table} SET {sets} WHERE {pk_col} = {}",
+        cell_to_sql_literal(pk_val)
+    )
+}
+
+/// `DELETE FROM <table> WHERE <pk_col> = <pk_lit>`.
+#[must_use]
+pub fn delete_sql(table: &str, pk_col: &str, pk_val: &Cell) -> String {
+    format!(
+        "DELETE FROM {table} WHERE {pk_col} = {}",
+        cell_to_sql_literal(pk_val)
+    )
+}
+
+/// `DELETE FROM <table>` (sqlite has no `TRUNCATE`; a whole-table delete is
+/// captured by the per-row triggers, one event per row).
+#[must_use]
+pub fn truncate_sql(table: &str) -> String {
+    format!("DELETE FROM {table}")
 }

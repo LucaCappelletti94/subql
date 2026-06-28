@@ -20,7 +20,7 @@ pub fn SchemaView() -> Element {
         .zip(s.preset.column_types.iter())
         .map(|(c, t)| (*c, *t))
         .collect();
-    let rows = s.capture.snapshot_rows();
+    let rows: Vec<subql::RowImage> = s.rows.clone();
     let row_count = rows.len();
     drop(s);
 
@@ -34,7 +34,7 @@ pub fn SchemaView() -> Element {
             code { "{table_name}" }
         }
         p { class: "muted",
-            "{row_count} row(s) currently in sqlite. ",
+            "{row_count} row(s) materialized from the CDC stream. ",
             if row_count > max_visible {
                 "Showing first {max_visible}."
             }
@@ -42,7 +42,6 @@ pub fn SchemaView() -> Element {
         table { class: "schema-table",
             thead {
                 tr {
-                    th { "rowid" }
                     for (col, ty) in columns.iter() {
                         th {
                             "{col}"
@@ -53,9 +52,8 @@ pub fn SchemaView() -> Element {
                 }
             }
             tbody {
-                for (rowid, image) in visible_rows {
+                for image in &visible_rows {
                     tr {
-                        td { class: "muted", "{rowid}" }
                         for cell in image.iter() {
                             td { "{cell_display(cell)}" }
                         }

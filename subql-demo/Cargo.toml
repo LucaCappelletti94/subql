@@ -4,34 +4,28 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.88"
 publish = false
-description = "Dioxus web demo of subql: PG schema -> sqlite-wasm-rs -> CDC events via diesel hooks"
+description = "Dioxus web demo of subql: PG schema -> sqlite-wasm-rs -> CDC events via SqliteCdcSource"
 license = "MIT"
 
 [lints]
 workspace = true
 
 [dependencies]
-# Core engine, built in no_std + alloc mode (wasm-friendly).
-subql = { path = "..", default-features = false }
+# Core engine with the in-process SQLite CDC source. `sqlite-cdc` pulls
+# diesel/sqlite + pg2sqlite (PG-DDL -> SQLite translation) inside subql, so
+# the demo drives capture entirely through `SqliteCdcSource`.
+subql = { path = "..", default-features = false, features = ["sqlite-cdc"] }
 
-# Generic SQL schema traits, same git pin as subql.
+# Generic SQL schema traits, same git pin as subql. Used to build the
+# engine-side `ParserDB` catalog from each preset's PG DDL.
 sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
 
 # PG dialect parser. The workspace [patch.crates-io] redirects this to the
 # visitor-wasm fork.
 sqlparser = { version = "0.62", default-features = false }
 
-# PG-DDL -> SQLite-DDL translator. Single PG DDL string per preset is fed
-# both into subql's ParserDB and into pg2sqlite::translate to produce the
-# SQLite-side schema applied via diesel.
-#
-# `default-features = false` keeps git2 (which transitively pulls in
-# libssh2-sys + libz-sys C code) out of the dep tree so the demo can
-# cross-compile to `wasm32-unknown-unknown`.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false }
-
-# Diesel SQLite (workspace patch redirects to the sqlite3_update_hook fork
-# providing on_insert / on_update / on_delete hooks).
+# Diesel SQLite (workspace patch redirects to the sqlite3_update_hook fork).
+# The demo opens the in-memory connection and hands it to SqliteCdcSource.
 diesel = { version = "2", default-features = false, features = ["sqlite"] }
 
 # Dioxus web (wasm32) renderer. Only needed on wasm targets. On native we

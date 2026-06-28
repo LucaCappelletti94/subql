@@ -1,0 +1,22 @@
+[package]
+name = "wasm-verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Headless-wasm smoke test that SqliteCdcSource runs in the browser."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The engine with the in-process SQLite CDC source under test.
+subql = { path = "..", default-features = false, features = ["sqlite-cdc"] }
+# Same diesel sqlite backend the demo uses (workspace [patch] redirects to the fork).
+diesel = { version = "2", default-features = false, features = ["sqlite"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browser sqlite providing the libsqlite3 C ABI diesel links against.
+sqlite-wasm-rs = "0.5"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
