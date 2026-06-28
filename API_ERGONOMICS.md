@@ -87,7 +87,7 @@ let t = catalog_helpers::resolve_table(&catalog, name)?;
 // t.table_id, t.column_ids, t.primary_key, t.column_id("status")
 ```
 
-## [ ] E4 - registration turbofish + projection sniffing
+## [x] E4 - registration turbofish + projection sniffing
 
 Registration needs a turbofish, and detecting an aggregate query means matching
 the `QueryProjection` enum.

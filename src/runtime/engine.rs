@@ -771,6 +771,35 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         })
     }
 
+    /// Register a `SELECT` for `consumer_id`, building the
+    /// [`SubscriptionRequest`] with the engine's own id types (no turbofish).
+    ///
+    /// ```
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::{DefaultIds, SubscriptionEngine};
+    ///
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
+    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
+    ///
+    /// let rows = engine.register_select(1, "SELECT * FROM orders WHERE amount > 100")?;
+    /// assert!(rows.aggregate_spec().is_none());
+    ///
+    /// let agg = engine.register_select(2, "SELECT COUNT(*) FROM orders")?;
+    /// assert!(agg.aggregate_spec().is_some());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn register_select(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        sql: impl Into<String>,
+    ) -> Result<RegisterResult, RegisterError> {
+        self.register(SubscriptionRequest::new(consumer_id, sql))
+    }
+
     /// Register multiple subscriptions in a single batch.
     ///
     /// Significantly more efficient than calling `register()` in a loop:

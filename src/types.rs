@@ -1591,6 +1591,18 @@ pub struct RegisterResult {
     pub evicted: Vec<SubscriptionId>,
 }
 
+impl RegisterResult {
+    /// The aggregate spec when the registered query is an aggregate, else
+    /// `None` for a row-set (`SELECT *`) query.
+    #[must_use]
+    pub const fn aggregate_spec(&self) -> Option<&crate::AggSpec> {
+        match &self.projection {
+            crate::QueryProjection::Aggregate(spec) => Some(spec),
+            crate::QueryProjection::Rows => None,
+        }
+    }
+}
+
 /// Durability policy for registration writes when storage is enabled.
 #[cfg(feature = "std")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

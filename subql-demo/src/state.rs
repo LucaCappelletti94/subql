@@ -11,10 +11,7 @@ use rand::SeedableRng;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use subql::{
-    AggAccumulator, DefaultIds, QueryProjection, RegisterError, SubscriptionEngine,
-    SubscriptionRequest, WalEvent,
-};
+use subql::{AggAccumulator, DefaultIds, RegisterError, SubscriptionEngine, WalEvent};
 
 use crate::presets::{self, PresetSchema};
 use crate::sqlite::capture::{CapturedHook, EventCapture};
@@ -134,13 +131,8 @@ impl DemoState {
         let consumer_id = self.next_consumer_id;
         self.next_consumer_id += 1;
         let sql = sql.into();
-        let req = SubscriptionRequest::<DefaultIds>::new(consumer_id, sql.clone());
-        let result = self.engine.register(req)?;
-
-        let agg = match &result.projection {
-            QueryProjection::Aggregate(spec) => Some(AggAccumulator::from_spec(spec)),
-            _ => None,
-        };
+        let result = self.engine.register_select(consumer_id, sql.clone())?;
+        let agg = result.aggregate_spec().map(AggAccumulator::from_spec);
 
         self.consumers.push(ConsumerEntry {
             consumer_id,
