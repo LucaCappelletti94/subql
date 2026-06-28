@@ -65,7 +65,7 @@ format!("{acc}");   // Display
 Note: `AggDelta` already covers Count/Sum/Avg/Stats (var/stddev). The library has
 the math, the caller should not re-derive it.
 
-## [ ] E3 - table resolver
+## [x] E3 - table resolver
 
 Resolving a table's id, columns, and primary key is 18 lines of stitched
 `catalog_helpers` calls.

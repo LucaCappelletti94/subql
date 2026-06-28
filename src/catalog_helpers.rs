@@ -8,7 +8,7 @@
 //! the `usize` <-> `u32`/`u16` boundary conversion and centralize the
 //! identifier-resolution rules so call sites never reinvent them.
 //!
-//! Functions: [`table_id`], [`column_id`], [`table_arity`],
+//! Functions: [`table_id`], [`column_id`], [`resolve_table`], [`table_arity`],
 //! [`schema_fingerprint`], [`primary_key_columns`], [`column_type`],
 //! [`table_has_rls`].
 
@@ -137,6 +137,55 @@ pub fn primary_key_columns<DB: DatabaseLike>(
             .filter_map(|id| u16::try_from(id).ok())
             .collect(),
     )
+}
+
+/// A table resolved to subql's compact ids, returned by [`resolve_table`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedTable {
+    /// Compact id of the table.
+    pub table_id: TableId,
+    /// Ids of the requested columns, in the order their names were passed.
+    pub column_ids: Vec<ColumnId>,
+    /// Primary-key column ids, in declaration order (empty when none).
+    pub primary_key: Vec<ColumnId>,
+}
+
+/// Resolve a table and a set of its columns in one call.
+///
+/// Bundles [`table_id`], a [`column_id`] lookup per name, and
+/// [`primary_key_columns`]. Returns `None` if the table or any named column is
+/// not found.
+///
+/// ```
+/// use sql_traits::structs::ParserDB;
+/// use sqlparser::dialect::PostgreSqlDialect;
+/// use subql::catalog_helpers;
+///
+/// let db = ParserDB::parse::<PostgreSqlDialect>(
+///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+/// )?;
+/// let t = catalog_helpers::resolve_table(&db, "orders", &["id", "amount", "status"]).unwrap();
+/// assert_eq!(t.column_ids, vec![0, 1, 2]);
+/// assert_eq!(t.primary_key, vec![0]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use]
+pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
+    database: &DB,
+    table_name: &str,
+    columns: &[S],
+) -> Option<ResolvedTable> {
+    let table_id = table_id(database, table_name)?;
+    let mut column_ids = Vec::with_capacity(columns.len());
+    for name in columns {
+        column_ids.push(column_id(database, table_id, name.as_ref())?);
+    }
+    let primary_key = primary_key_columns(database, table_id)?;
+    Some(ResolvedTable {
+        table_id,
+        column_ids,
+        primary_key,
+    })
 }
 
 /// Resolve a column's type into subql's [`ColumnType`] enum.
