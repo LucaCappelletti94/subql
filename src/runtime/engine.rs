@@ -186,7 +186,7 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     /// SQL dialect for parsing
     dialect: D,
     /// Schema database for table/column resolution
-    database: Arc<DB>,
+    database: DB,
     /// Table partitions (TableId -> TablePartition)
     partitions: HashMap<TableId, TablePartition<I>>,
     /// User dictionaries (TableId -> ConsumerDictionary)
@@ -222,7 +222,7 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     rotation_threshold: usize,
     /// Background merge compaction manager
     #[cfg(feature = "std")]
-    merge_manager: MergeManager<I, DB>,
+    merge_manager: MergeManager<I>,
     /// Persistence strictness policy for registration.
     #[cfg(feature = "std")]
     durability_mode: DurabilityMode,
@@ -262,9 +262,12 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         &self.dialect
     }
 
-    /// The schema database used for table/column resolution. Exposed for the
-    /// reexec wrapper's classification of rejected queries.
-    pub(crate) fn database(&self) -> &DB {
+    /// The schema catalog the engine resolves tables/columns against.
+    ///
+    /// Borrow it when you need to read the schema alongside a live engine
+    /// (e.g. to resolve a `TableId` for building `WalEvent`s) without keeping
+    /// a separate catalog instance.
+    pub const fn database(&self) -> &DB {
         &self.database
     }
 
@@ -284,7 +287,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
     fn compile_spec(&self, spec: SubscriptionRequest<I>) -> Result<CompiledSpec<I>, RegisterError> {
         let (table_id, bytecode, normalized, prefilter_plan, projection) =
-            parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &*self.database)?;
+            parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &self.database)?;
 
         // Disambiguate hash: same WHERE clause with different projection kind must map to
         // distinct predicates.
@@ -445,16 +448,13 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///
     /// # Examples
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{DefaultIds, SubscriptionEngine};
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE orders (id INT);")
-    ///         .expect("DDL parses"),
-    /// );
+    /// let database = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE orders (id INT);")
+    ///     .expect("DDL parses");
     ///
     /// let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
@@ -462,7 +462,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// assert_eq!(engine.subscription_count(), 0);
     /// ```
     #[must_use]
-    pub fn new(database: Arc<DB>, dialect: D) -> Self {
+    pub fn new(database: DB, dialect: D) -> Self {
         Self {
             dialect,
             database,
@@ -540,7 +540,6 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///
     /// # Examples
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -549,11 +548,9 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///     SubscriptionsView,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
     /// // Evict the subscription belonging to the lowest consumer id.
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {}).with_custom_eviction(
@@ -616,7 +613,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     #[cfg(feature = "std")]
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_storage(
-        database: Arc<DB>,
+        database: DB,
         dialect: D,
         storage_path: PathBuf,
     ) -> Result<Self, StorageError> {
@@ -640,7 +637,6 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///
     /// # Examples
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -648,12 +644,10 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///     catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
-    ///     )?,
-    /// );
-    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
@@ -800,7 +794,6 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///
     /// # Examples
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -808,12 +801,10 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///     catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
-    ///     )?,
-    /// );
-    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
@@ -1510,12 +1501,10 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///     SubscriptionRequest, WalEvent,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
-    ///     )?,
-    /// );
-    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
@@ -1635,12 +1624,10 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ///     SubscriptionRequest, WalEvent,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
-    ///     )?,
-    /// );
-    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
@@ -1766,7 +1753,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         consumer_id: I::ConsumerId,
         sql: &str,
     ) -> Result<UnregisterReport, RegisterError> {
-        let (table_id, hash) = parse_and_resolve_hash(sql, &self.dialect, &*self.database)?;
+        let (table_id, hash) = parse_and_resolve_hash(sql, &self.dialect, &self.database)?;
 
         let empty = UnregisterReport {
             removed_bindings: 0,
@@ -1828,7 +1815,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
     /// Validate that a row image has the expected arity for its table.
     fn validate_row_arity(&self, table_id: TableId, row: &RowImage) -> Result<(), DispatchError> {
-        let expected = catalog_helpers::table_arity(&*self.database, table_id)
+        let expected = catalog_helpers::table_arity(&self.database, table_id)
             .ok_or(DispatchError::UnknownTableArity(table_id))?;
         let got = row.len();
         if got != expected {
@@ -2052,7 +2039,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         };
 
         // Serialize shard
-        let bytes = serialize_shard::<I, DB>(table_id, &payload, &*self.database)?;
+        let bytes = serialize_shard::<I, DB>(table_id, &payload, &self.database)?;
 
         // Write to disk atomically (temp file + fsync + rename + parent-dir fsync).
         let shard_path = storage_path.join(format!("table_{table_id}.shard"));
@@ -2211,7 +2198,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         let bytes = std::fs::read(path)
             .map_err(|e| StorageError::Io(format!("Failed to read shard: {e}")))?;
 
-        let (header, payload) = deserialize_shard::<I, DB>(&bytes, &*self.database)?;
+        let (header, payload) = deserialize_shard::<I, DB>(&bytes, &self.database)?;
         if header.table_id != table_id {
             return Err(StorageError::Corrupt(format!(
                 "Shard table ID mismatch: filename table_id {table_id}, header table_id {}",
@@ -2372,12 +2359,12 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             shard_bytes.push(bytes);
         }
 
-        // Delegate to merge manager
-        self.merge_manager.merge_shards_background(
-            table_id,
-            shard_bytes,
-            Arc::clone(&self.database),
-        )
+        // Compute the table's fingerprint envelope here (we have the catalog),
+        // and hand the worker that small value instead of the whole catalog.
+        let fingerprint = crate::persistence::shard::expected_envelope(&self.database, table_id)
+            .map_err(MergeError::Storage)?;
+        self.merge_manager
+            .merge_shards_background(table_id, shard_bytes, fingerprint)
     }
 
     /// Poll for merge completion and swap the result into the live partition
@@ -2457,10 +2444,13 @@ impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> Subscript
 impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionDispatch<I>
     for SubscriptionEngine<D, I, DB>
 {
-    fn consumers(
+    type Notifications<C: crate::Checkpoint> = crate::ConsumerNotifications<I, C>;
+    type Error = DispatchError;
+
+    fn consumers<C: crate::Checkpoint>(
         &mut self,
-        event: &WalEvent,
-    ) -> Result<crate::ConsumerNotifications<I>, DispatchError> {
+        event: &WalEvent<C>,
+    ) -> Result<Self::Notifications<C>, Self::Error> {
         Self::consumers(self, event)
     }
 }
@@ -2542,15 +2532,13 @@ mod tests {
     /// `orders` is assigned table id `1` and a second known table is at
     /// id `2`, matching tests that serialize shards with header
     /// `table_id = 2` to exercise filename/header mismatch paths.
-    fn make_catalog() -> Arc<ParserDB> {
-        Arc::new(
-            ParserDB::parse::<PostgreSqlDialect>(
-                "CREATE TABLE _engine_pad (id INT);\n\
-                 CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);\n\
-                 CREATE TABLE z_other (id INT PRIMARY KEY);",
-            )
-            .expect("orders fixture DDL parses"),
+    fn make_catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE _engine_pad (id INT);\n\
+             CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);\n\
+             CREATE TABLE z_other (id INT PRIMARY KEY);",
         )
+        .expect("orders fixture DDL parses")
     }
 
     /// Helper: orders table_id for the standard fixture. With the padded
@@ -4598,7 +4586,7 @@ mod tests {
         };
 
         // Serialize shard with catalog fingerprint
-        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &catalog).unwrap();
 
         // Write corrupt shard to disk
         let shard_path = temp_dir.path().join("table_1.shard");
@@ -4672,7 +4660,7 @@ mod tests {
             created_at_unix_ms: 2000,
         };
 
-        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &catalog).unwrap();
         std::fs::write(temp_dir.path().join("table_1.shard"), shard_bytes).unwrap();
 
         let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
@@ -4706,7 +4694,7 @@ mod tests {
         };
 
         // Header table_id = 2, filename implies table_id = 1.
-        let shard_bytes = serialize_shard::<DefaultIds, _>(2, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(2, &payload, &catalog).unwrap();
         let shard_path = temp_dir.path().join("table_1.shard");
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
@@ -4758,7 +4746,7 @@ mod tests {
             },
             created_at_unix_ms: 0,
         };
-        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &catalog).unwrap();
 
         std::fs::write(temp_dir.path().join("table_1.shard"), &shard_bytes).unwrap();
         std::fs::write(temp_dir.path().join("not_a_table_id.shard"), b"junk").unwrap();
@@ -4792,7 +4780,7 @@ mod tests {
             },
             created_at_unix_ms: 0,
         };
-        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &catalog).unwrap();
 
         std::fs::write(temp_dir.path().join("table_1.shard"), &shard_bytes).unwrap();
         std::fs::write(temp_dir.path().join("table_001.shard"), &shard_bytes).unwrap();
@@ -4943,13 +4931,13 @@ mod tests {
         let (_, _, gt_sql_normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount > 100",
             &PostgreSqlDialect {},
-            &*catalog,
+            &catalog,
         )
         .expect("normalization for gt SQL should succeed");
         let (_, _, lt_sql_normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount < 50",
             &PostgreSqlDialect {},
-            &*catalog,
+            &catalog,
         )
         .expect("normalization for lt SQL should succeed");
 
@@ -5299,7 +5287,7 @@ mod tests {
         let (_table_id, program, normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount < 50",
             &PostgreSqlDialect {},
-            &*catalog,
+            &catalog,
         )
         .unwrap();
         let hash = canonicalize::hash_sql(&normalized);
@@ -5330,7 +5318,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let shard_path = tmp.path().join("table_1_merged.shard");
-        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &catalog).unwrap();
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         let job_id = engine
@@ -5380,7 +5368,7 @@ mod tests {
         let (_table_id, program, normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount < 50",
             &PostgreSqlDialect {},
-            &*catalog,
+            &catalog,
         )
         .unwrap();
         let hash = canonicalize::hash_sql(&normalized);
@@ -5412,7 +5400,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let shard_path = tmp.path().join("table_1_merged.shard");
-        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &payload, &catalog).unwrap();
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         let job_id = engine
@@ -5452,7 +5440,7 @@ mod tests {
         let (_table_id, program, normalized) = crate::compiler::parse_compile_and_normalize(
             "SELECT * FROM orders WHERE amount > 100",
             &PostgreSqlDialect {},
-            &*catalog,
+            &catalog,
         )
         .unwrap();
         let hash = canonicalize::hash_sql(&normalized);
@@ -5495,7 +5483,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let shard_path = tmp.path().join("table_1_stale.shard");
-        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &stale_payload, &*catalog).unwrap();
+        let shard_bytes = serialize_shard::<DefaultIds, _>(1, &stale_payload, &catalog).unwrap();
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
         let job_id = engine

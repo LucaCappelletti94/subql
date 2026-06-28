@@ -577,13 +577,13 @@ struct AggEngineCell {
 
 impl AggEngineCell {
     fn new() -> Self {
-        let database = Arc::new(agg_catalog());
-        let table_id = catalog_helpers::table_id(database.as_ref(), "orders")
+        let database = agg_catalog();
+        let table_id = catalog_helpers::table_id(&database, "orders")
             .expect("agg_catalog must expose an `orders` table");
-        let pk_col = catalog_helpers::column_id(database.as_ref(), table_id, "id")
+        let pk_col = catalog_helpers::column_id(&database, table_id, "id")
             .expect("agg_catalog `orders` must expose an `id` column");
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(Arc::clone(&database), PostgreSqlDialect {});
+            SubscriptionEngine::new(database, PostgreSqlDialect {});
         engine
             .register(SubscriptionRequest::<DefaultIds>::new(
                 1,
@@ -1069,21 +1069,18 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
         return;
     }
 
-    let database = Arc::new(agg_catalog());
-    let Some(table_id) = catalog_helpers::table_id(database.as_ref(), "orders") else {
+    let database = agg_catalog();
+    let Some(table_id) = catalog_helpers::table_id(&database, "orders") else {
         return;
     };
-    let pk_col = match catalog_helpers::column_id(database.as_ref(), table_id, "id") {
+    let pk_col = match catalog_helpers::column_id(&database, table_id, "id") {
         Some(c) => c,
         None => return,
     };
 
     let mut engine_a: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        match SubscriptionEngine::with_storage(
-            Arc::clone(&database),
-            PostgreSqlDialect {},
-            workdir.clone(),
-        ) {
+        match SubscriptionEngine::with_storage(agg_catalog(), PostgreSqlDialect {}, workdir.clone())
+        {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -1107,8 +1104,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     }
 
     let mut engine_b: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        match SubscriptionEngine::with_storage(Arc::clone(&database), PostgreSqlDialect {}, workdir)
-        {
+        match SubscriptionEngine::with_storage(database, PostgreSqlDialect {}, workdir) {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -1263,7 +1259,7 @@ pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
 
 #[cfg(feature = "sqlite-cdc")]
 struct E2eFixture {
-    catalog: Arc<ParserDB>,
+    catalog: ParserDB,
     table_id: crate::TableId,
     engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
     source: crate::SqliteCdcSource,
@@ -1297,12 +1293,12 @@ impl E2eFixture {
 
         let catalog_db = ParserDB::parse::<PostgreSqlDialect>(Self::PG_DDL)
             .expect("fuzz fixture DDL must parse (regression: invariant broken)");
-        let catalog = Arc::new(catalog_db);
-        let table_id = catalog_helpers::table_id(&*catalog, "orders")
+        let table_id = catalog_helpers::table_id(&catalog_db, "orders")
             .expect("fuzz fixture orders table must resolve");
 
         let mut engine = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            Arc::clone(&catalog),
+            ParserDB::parse::<PostgreSqlDialect>(Self::PG_DDL)
+                .expect("fuzz fixture DDL must parse"),
             PostgreSqlDialect {},
         );
         for (consumer_id, sql) in Self::SUBSCRIPTIONS {
@@ -1317,7 +1313,7 @@ impl E2eFixture {
             .expect("SqliteCdcSource must construct from fixed PG DDL");
 
         Self {
-            catalog,
+            catalog: catalog_db,
             table_id,
             engine,
             source,
@@ -1375,12 +1371,12 @@ impl E2eFixture {
             >,
         ),
     {
-        let frames = match self.bridge.encode_event(event, &*self.catalog) {
+        let frames = match self.bridge.encode_event(event, &self.catalog) {
             Ok(frames) => frames,
             Err(_) => return,
         };
         for frame in frames {
-            let Ok(parsed_events) = self.parser.parse_wal_message(&frame, &*self.catalog) else {
+            let Ok(parsed_events) = self.parser.parse_wal_message(&frame, &self.catalog) else {
                 continue;
             };
             for parsed in parsed_events {

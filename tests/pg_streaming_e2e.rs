@@ -17,7 +17,6 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use diesel::{sql_query, RunQueryDsl};
@@ -55,7 +54,7 @@ fn connect_against_real_pg() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
         .status_interval(Duration::from_secs(10))
         .buffer_capacity(1024);
@@ -112,7 +111,7 @@ fn next_event_delivers_insert_within_latency_budget() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
 
     // Latency budget for COMMIT-to-event delivery: wire-bound (single-digit
@@ -184,7 +183,7 @@ fn ack_advances_confirmed_flush_lsn() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
 
     current_thread_rt().block_on(async move {
@@ -277,7 +276,7 @@ fn pump_increments_status_update_counter_during_idle() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
         .status_interval(Duration::from_millis(100));
 
@@ -335,7 +334,7 @@ fn connection_survives_wal_sender_timeout() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
         .status_interval(Duration::from_millis(500));
 
@@ -402,7 +401,7 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     // Tiny buffer forces back-pressure: 100 inserts >> 4-slot channel.
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
         .buffer_capacity(4);
@@ -488,7 +487,7 @@ fn drop_source_shuts_down_inner_task() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication)
         .status_interval(Duration::from_millis(100));
 
@@ -559,7 +558,7 @@ fn events_received_counter_tracks_pushed_events() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
 
     current_thread_rt().block_on(async move {

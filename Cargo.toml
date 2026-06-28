@@ -281,6 +281,11 @@ proptest = "1"
 # calls during a batch). Just enough features to spawn tasks and sleep.
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 
+# UUID-keyed `IdTypes` guard tests (`tests/uuid_id_types.rs`): proves the
+# engine's consumer/session id generic works with a non-`u64` type and that
+# such ids survive the snapshot/restore serde path.
+uuid = { version = "1", features = ["serde"] }
+
 [features]
 default = ["std"]
 # `std` enables the I/O subsystems: persistence (shard codec + background

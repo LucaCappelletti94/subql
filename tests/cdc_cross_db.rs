@@ -10,7 +10,6 @@
 //! ```
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::prelude::*;
@@ -371,10 +370,8 @@ fn maxwell_read_changes(output_dir: &str, expected_count: usize) -> Vec<String> 
 // Engine setup
 // ============================================================================
 
-fn setup_engine(
-    catalog: &Arc<ParserDB>,
-) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
-    let mut engine = SubscriptionEngine::new(Arc::clone(catalog), PostgreSqlDialect {});
+fn setup_engine(catalog: ParserDB) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
+    let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
     let subscriptions = [
         (
@@ -513,9 +510,9 @@ fn cross_db_cdc_parity() {
     let mx_messages = maxwell_read_changes(&maxwell_path, 4);
 
     // Set up engines, one per CDC source
-    let catalog: Arc<ParserDB> = Arc::new(iot_catalog());
-    let mut pg_engine = setup_engine(&catalog);
-    let mut mx_engine = setup_engine(&catalog);
+    let catalog = iot_catalog();
+    let mut pg_engine = setup_engine(iot_catalog());
+    let mut mx_engine = setup_engine(iot_catalog());
 
     // Dispatch and collect results
     let pg_results = dispatch_events(&mut pg_engine, &Wal2JsonV2Parser, &pg_messages, &catalog);

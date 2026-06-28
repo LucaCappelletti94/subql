@@ -204,9 +204,8 @@ pub fn run_memory_profile(show_progress: bool) {
     println!("======================");
     println!();
 
-    let catalog = Arc::new(bench_catalog());
     let mut engine =
-        SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
+        SubscriptionEngine::<_, DefaultIds, ParserDB>::new(bench_catalog(), PostgreSqlDialect {});
 
     println!("Registering 100,000 predicates with realistic tree shapes...");
     if !show_progress {

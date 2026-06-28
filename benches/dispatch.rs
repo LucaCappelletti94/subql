@@ -209,7 +209,7 @@ const fn realistic_workload_seed(subscription_ix: u64) -> u64 {
 fn build_scaling_engine(
     predicate_count: usize,
 ) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
-    let catalog = Arc::new(bench_catalog());
+    let catalog = bench_catalog();
     let mut engine =
         SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -515,7 +515,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     let mut equality_engine = {
-        let catalog = Arc::new(bench_catalog());
+        let catalog = bench_catalog();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -546,7 +546,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     });
 
     let mut range_engine = {
-        let catalog = Arc::new(bench_catalog());
+        let catalog = bench_catalog();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -577,7 +577,7 @@ fn index_efficiency_benchmark(c: &mut Criterion) {
     });
 
     let mut complex_engine = {
-        let catalog = Arc::new(bench_catalog());
+        let catalog = bench_catalog();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -626,7 +626,7 @@ fn registration_benchmark(c: &mut Criterion) {
         let mut next_seed = 1_u64;
         b.iter_batched(
             || {
-                let catalog = Arc::new(bench_catalog());
+                let catalog = bench_catalog();
                 let engine = SubscriptionEngine::<_, DefaultIds, ParserDB>::new(
                     catalog,
                     PostgreSqlDialect {},
@@ -648,7 +648,7 @@ fn registration_benchmark(c: &mut Criterion) {
         let mut next_seed = 1_u64;
         b.iter_batched(
             || {
-                let catalog = Arc::new(bench_catalog());
+                let catalog = bench_catalog();
                 let mut engine = SubscriptionEngine::<_, DefaultIds, ParserDB>::new(
                     catalog,
                     PostgreSqlDialect {},
@@ -685,7 +685,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     let mut high_dedup_engine = {
-        let catalog = Arc::new(bench_catalog());
+        let catalog = bench_catalog();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 
@@ -717,7 +717,7 @@ fn deduplication_benchmark(c: &mut Criterion) {
     });
 
     let mut low_dedup_engine = {
-        let catalog = Arc::new(bench_catalog());
+        let catalog = bench_catalog();
         let mut engine =
             SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
 

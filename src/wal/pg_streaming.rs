@@ -119,9 +119,8 @@ pub enum PgStreamingError {
 
 /// Push-based Postgres CDC source. See the [`crate::CdcSource`] trait for
 /// the lifecycle contract.
-pub struct PgStreamingCdcSource<DB: DatabaseLike> {
+pub struct PgStreamingCdcSource {
     config: PgStreamingConfig,
-    catalog: Arc<DB>,
     event_rx: tokio::sync::mpsc::Receiver<Result<WalEvent<PgLsn>, PgStreamingError>>,
     ack_tx: tokio::sync::mpsc::UnboundedSender<PgLsn>,
     status_updates_sent: Arc<AtomicU64>,
@@ -137,7 +136,7 @@ pub struct PgStreamingCdcSource<DB: DatabaseLike> {
     task: tokio::task::JoinHandle<()>,
 }
 
-impl<DB: DatabaseLike + 'static> PgStreamingCdcSource<DB> {
+impl PgStreamingCdcSource {
     /// Open a replication-mode connection to Postgres, issue
     /// `START_REPLICATION` against the configured slot, and spawn the
     /// inner task that streams typed events into the source's channel.
@@ -149,9 +148,9 @@ impl<DB: DatabaseLike + 'static> PgStreamingCdcSource<DB> {
     ///   exist with the `pgoutput` plugin.
     /// - `config.url` is a libpq conninfo string. The source appends
     ///   `replication=database` if the caller did not.
-    pub async fn connect(
+    pub async fn connect<DB: DatabaseLike + 'static>(
         config: PgStreamingConfig,
-        catalog: Arc<DB>,
+        catalog: DB,
     ) -> Result<Self, PgStreamingError> {
         let conninfo = ensure_replication_param(&config.url);
         let slot_name = config.slot_name.clone();
@@ -186,7 +185,6 @@ impl<DB: DatabaseLike + 'static> PgStreamingCdcSource<DB> {
         let shutdown_token = CancellationToken::new();
         let task_token = shutdown_token.clone();
 
-        let task_catalog = Arc::clone(&catalog);
         let status_updates_sent = Arc::new(AtomicU64::new(0));
         let task_status_counter = Arc::clone(&status_updates_sent);
         let events_received = Arc::new(AtomicU64::new(0));
@@ -197,7 +195,7 @@ impl<DB: DatabaseLike + 'static> PgStreamingCdcSource<DB> {
 
         let task = tokio::spawn(streaming_task(
             conn,
-            task_catalog,
+            catalog,
             event_tx,
             ack_rx,
             task_status_counter,
@@ -209,7 +207,6 @@ impl<DB: DatabaseLike + 'static> PgStreamingCdcSource<DB> {
 
         Ok(Self {
             config,
-            catalog,
             event_rx,
             ack_tx,
             status_updates_sent,
@@ -251,12 +248,6 @@ impl<DB: DatabaseLike + 'static> PgStreamingCdcSource<DB> {
         Arc::clone(&self.task_exited)
     }
 
-    /// Borrow the catalog the source resolves table/column metadata against.
-    #[must_use]
-    pub fn catalog(&self) -> &DB {
-        &self.catalog
-    }
-
     /// Borrow the configuration the source was built with.
     #[must_use]
     pub const fn config(&self) -> &PgStreamingConfig {
@@ -264,7 +255,7 @@ impl<DB: DatabaseLike + 'static> PgStreamingCdcSource<DB> {
     }
 }
 
-impl<DB: DatabaseLike> Drop for PgStreamingCdcSource<DB> {
+impl Drop for PgStreamingCdcSource {
     fn drop(&mut self) {
         // Cooperative shutdown: cancel the token so the inner task's
         // `get_copy_data_async` arm wakes immediately; belt-and-braces
@@ -274,7 +265,7 @@ impl<DB: DatabaseLike> Drop for PgStreamingCdcSource<DB> {
     }
 }
 
-impl<DB: DatabaseLike + 'static> crate::CdcSource for PgStreamingCdcSource<DB> {
+impl crate::CdcSource for PgStreamingCdcSource {
     type Checkpoint = PgLsn;
     type Error = PgStreamingError;
 
@@ -316,7 +307,7 @@ impl<DB: DatabaseLike + 'static> crate::CdcSource for PgStreamingCdcSource<DB> {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn streaming_task<DB: DatabaseLike>(
     mut conn: PgReplicationConnection,
-    catalog: Arc<DB>,
+    catalog: DB,
     event_tx: tokio::sync::mpsc::Sender<Result<WalEvent<PgLsn>, PgStreamingError>>,
     mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<PgLsn>,
     status_counter: Arc<AtomicU64>,
@@ -389,7 +380,7 @@ async fn streaming_task<DB: DatabaseLike>(
                         let payload = &bytes[XLOG_DATA_HEADER_LEN..];
                         latest_received_lsn = latest_received_lsn.max(wal_end);
 
-                        match parser.parse_wal_message(payload, &*catalog) {
+                        match parser.parse_wal_message(payload, &catalog) {
                             Ok(events) => {
                                 for ev in events {
                                     let typed = ev.set_checkpoint(Some(PgLsn(start_lsn)));

@@ -515,6 +515,20 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
     }
 }
 
+impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static>
+    crate::SubscriptionDispatch<I> for ReExecEngine<D, I, DB>
+{
+    type Notifications<C: crate::Checkpoint> = ReExecNotifications<I, C>;
+    type Error = DispatchError;
+
+    fn consumers<C: crate::Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+    ) -> Result<Self::Notifications<C>, Self::Error> {
+        Self::consumers(self, event)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -534,7 +548,7 @@ mod tests {
     type TestEngine = ReExecEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
 
     fn engine() -> TestEngine {
-        let inner = SubscriptionEngine::new(Arc::new(catalog()), PostgreSqlDialect {});
+        let inner = SubscriptionEngine::new(catalog(), PostgreSqlDialect {});
         ReExecEngine::new(inner)
     }
 
@@ -634,7 +648,7 @@ mod tests {
                    ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
         let rls_catalog = ParserDB::parse::<PostgreSqlDialect>(ddl).unwrap();
         let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            Arc::new(rls_catalog),
+            rls_catalog,
             PostgreSqlDialect {},
         );
         let mut e = ReExecEngine::new(inner);

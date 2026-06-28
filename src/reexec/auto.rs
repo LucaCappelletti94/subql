@@ -393,6 +393,25 @@ where
     }
 }
 
+impl<D, I, DB, X> crate::SubscriptionDispatch<I> for AutoResolvingEngine<D, I, DB, X>
+where
+    D: Dialect + Send + Sync,
+    I: IdTypes,
+    DB: DatabaseLike + 'static,
+    X: Connector + Send,
+    X::AuthContext: Send,
+{
+    type Notifications<C: crate::Checkpoint> = ReExecNotifications<I, C>;
+    type Error = ReExecError<X::Error>;
+
+    fn consumers<C: crate::Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+    ) -> Result<Self::Notifications<C>, Self::Error> {
+        Self::consumers(self, event)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -518,7 +537,7 @@ mod tests {
         values: alloc::vec::Vec<Cell>,
     ) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, MockConnector> {
         let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            Arc::new(catalog()),
+            catalog(),
             PostgreSqlDialect {},
         );
         AutoResolvingEngine::new(ReExecEngine::new(inner), MockConnector::new(values))

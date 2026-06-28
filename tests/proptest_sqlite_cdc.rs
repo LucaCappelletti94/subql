@@ -92,7 +92,7 @@ enum ExpectedEvent {
 }
 
 fn build_source() -> SqliteCdcSource {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     sql_query(SQLITE_DDL).execute(&mut conn).unwrap();
     SqliteCdcSource::new(conn, catalog, SqliteCdcConfig::default()).unwrap()

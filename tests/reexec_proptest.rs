@@ -160,7 +160,7 @@ proptest! {
     #[test]
     fn min_partial(ops in prop::collection::vec(op_strategy(), 0..40)) {
         let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            Arc::new(catalog()),
+            catalog(),
             PostgreSqlDialect {},
         );
         let mut engine = ReExecEngine::new(inner);
@@ -218,7 +218,7 @@ proptest! {
     #[test]
     fn max_partial(ops in prop::collection::vec(op_strategy(), 0..40)) {
         let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            Arc::new(catalog()),
+            catalog(),
             PostgreSqlDialect {},
         );
         let mut engine = ReExecEngine::new(inner);

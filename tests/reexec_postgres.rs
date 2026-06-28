@@ -26,8 +26,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -74,12 +72,12 @@ fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
 }
 
 /// Build the in-process catalog the engine + parser share.
-fn catalog() -> Arc<ParserDB> {
-    Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"))
+fn catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
 }
 
 fn build_engine(
-    catalog: Arc<ParserDB>,
+    catalog: ParserDB,
     conn_exec: PgConnection,
 ) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, PgDieselConnector> {
     let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
@@ -120,8 +118,7 @@ fn scaffold_registers_both_subscription_kinds() {
 
     setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
-    let catalog = catalog();
-    let mut engine = build_engine(Arc::clone(&catalog), conn_exec);
+    let mut engine = build_engine(catalog(), conn_exec);
 
     let engine_reg = engine
         .register(
@@ -184,8 +181,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
 
     setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
-    let catalog = catalog();
-    let mut engine = build_engine(Arc::clone(&catalog), conn_exec);
+    let mut engine = build_engine(catalog(), conn_exec);
 
     let engine_consumer: u64 = 1;
     let engine_reg = engine
@@ -229,7 +225,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     let parser = Wal2JsonV2Parser;
     let mut events: Vec<WalEvent<subql::PgLsn>> = Vec::new();
     for msg in &msgs {
-        events.extend(parse_message(&parser, &catalog, msg));
+        events.extend(parse_message(&parser, &catalog(), msg));
     }
     assert_eq!(
         events.len(),
@@ -298,8 +294,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
 
     setup_pg(&mut conn_setup, &[(1, 5.0)]);
 
-    let catalog = catalog();
-    let mut engine = build_engine(Arc::clone(&catalog), conn_exec);
+    let mut engine = build_engine(catalog(), conn_exec);
 
     let captured_qid = match engine
         .register(
@@ -321,7 +316,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
     let parser = Wal2JsonV2Parser;
     let mut events: Vec<WalEvent<subql::PgLsn>> = Vec::new();
     for msg in &msgs {
-        events.extend(parse_message(&parser, &catalog, msg));
+        events.extend(parse_message(&parser, &catalog(), msg));
     }
     assert_eq!(events.len(), 1, "expected exactly one UPDATE event");
 
@@ -352,8 +347,7 @@ fn snapshot_reads_value_and_lsn_from_pg() {
 
     setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
-    let catalog = catalog();
-    let mut engine = build_engine(Arc::clone(&catalog), conn_exec);
+    let mut engine = build_engine(catalog(), conn_exec);
 
     let captured_qid = match engine
         .register(

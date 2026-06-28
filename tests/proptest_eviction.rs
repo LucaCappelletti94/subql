@@ -25,7 +25,6 @@
 )]
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -41,7 +40,7 @@ const CATALOG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, 
 type Engine = SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
 
 fn fresh_engine(cap: usize, policy: EvictionPolicy) -> Engine {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap();
     SubscriptionEngine::new(catalog, PostgreSqlDialect {}).with_max_subscriptions(cap, policy)
 }
 

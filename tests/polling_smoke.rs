@@ -8,7 +8,6 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::{sql_query, RunQueryDsl};
@@ -44,7 +43,7 @@ fn polling_source_drains_insert_and_updates_counters() {
     common::create_publication(&mut setup, publication, "orders");
     common::create_pgoutput_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     // The polling source uses the regular SQL URL, NOT the replication
     // one. Replication mode is push-source-only.
     let config = PollingPgCdcConfig::new(common::pg_url(port), slot, publication)

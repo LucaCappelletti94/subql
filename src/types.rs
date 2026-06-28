@@ -1178,7 +1178,6 @@ impl<I: IdTypes> SubscriptionRequest<I> {
 /// instead of this enum.
 ///
 /// ```
-/// use std::sync::Arc;
 ///
 /// use sql_traits::structs::ParserDB;
 /// use sqlparser::dialect::PostgreSqlDialect;
@@ -1187,11 +1186,9 @@ impl<I: IdTypes> SubscriptionRequest<I> {
 ///     SubscriptionRequest,
 /// };
 ///
-/// let database = Arc::new(
-///     ParserDB::parse::<PostgreSqlDialect>(
-///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-///     )?,
-/// );
+/// let database = ParserDB::parse::<PostgreSqlDialect>(
+///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+/// )?;
 ///
 /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
 ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
@@ -1218,7 +1215,6 @@ pub enum EvictionPolicy {
     /// Hard cap: reject the registration when the registry is full.
     ///
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -1227,11 +1223,9 @@ pub enum EvictionPolicy {
     ///     SubscriptionRequest,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(1, EvictionPolicy::Reject);
@@ -1278,12 +1272,10 @@ pub enum EvictionPolicy {
     ///     PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
-    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     /// let clock = Arc::new(ManualClock::new(0));
     /// let handle: ClockHandle = clock.clone();
     ///
@@ -1346,12 +1338,10 @@ pub enum EvictionPolicy {
     ///     SubscriptionEngine, SubscriptionRequest, WalEvent,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
-    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     ///
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
@@ -1389,7 +1379,6 @@ pub enum EvictionPolicy {
     /// [`EvictOldest`](Self::EvictOldest).
     ///
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -1398,11 +1387,9 @@ pub enum EvictionPolicy {
     ///     SubscriptionScope,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(2, EvictionPolicy::EvictBySession);
@@ -1430,7 +1417,6 @@ pub enum EvictionPolicy {
     /// Ties between consumers (same count) resolve by lowest consumer id.
     ///
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -1438,11 +1424,9 @@ pub enum EvictionPolicy {
     ///     DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(3, EvictionPolicy::EvictByConsumer);
@@ -1667,16 +1651,47 @@ pub trait SubscriptionRegistration<I: IdTypes>: Send {
     fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool;
 }
 
-/// Event dispatch operations
+/// Event dispatch operations.
+///
+/// The associated [`Notifications`](Self::Notifications) type lets each engine
+/// layer return its own notification shape: the base engine yields
+/// [`ConsumerNotifications`], while the re-execution wrappers yield their richer
+/// `ReExecNotifications`. See [`AsyncSubscriptionDispatch`] for the async engine.
 pub trait SubscriptionDispatch<I: IdTypes>: Send {
+    /// Notifications produced for a dispatched event, parameterized by the
+    /// event's checkpoint type.
+    type Notifications<C: Checkpoint>;
+    /// Error returned when dispatch fails.
+    type Error;
+
     /// Get interested consumers for a WAL event.
     ///
     /// Returns view-relative notifications: each consumer sees INSERT/DELETE/UPDATE
     /// relative to their own result set.
-    fn consumers(
+    fn consumers<C: Checkpoint>(
         &mut self,
-        event: &WalEvent,
-    ) -> Result<ConsumerNotifications<I>, crate::DispatchError>;
+        event: &WalEvent<C>,
+    ) -> Result<Self::Notifications<C>, Self::Error>;
+}
+
+/// Async counterpart of [`SubscriptionDispatch`].
+///
+/// Separate trait because the async engine's `consumers` returns a future. The
+/// `+ Send` bound on that future is the point of spelling it out as
+/// return-position `impl Future` rather than `async fn` (same idiom as
+/// [`crate::reexec::AsyncConnector`]).
+pub trait AsyncSubscriptionDispatch<I: IdTypes>: Send {
+    /// Notifications produced for a dispatched event, parameterized by the
+    /// event's checkpoint type.
+    type Notifications<C: Checkpoint>;
+    /// Error returned when dispatch fails.
+    type Error;
+
+    /// Get interested consumers for a WAL event.
+    fn consumers<C: Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications<C>, Self::Error>> + Send;
 }
 
 /// Session lifecycle operations

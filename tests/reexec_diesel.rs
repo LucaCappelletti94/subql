@@ -80,7 +80,7 @@ fn engine(
 ) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, DieselConnector<SqliteConnection>>
 {
     let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-        Arc::new(catalog()),
+        catalog(),
         PostgreSqlDialect {},
     );
     AutoResolvingEngine::new(ReExecEngine::new(inner), DieselConnector::new(conn))

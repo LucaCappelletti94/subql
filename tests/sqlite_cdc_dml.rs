@@ -40,7 +40,7 @@ fn open_with(sqlite_ddl: &str) -> SqliteConnection {
 }
 
 fn make_source(sqlite_ddl: &str, pg_ddl: &str) -> SqliteCdcSource {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(pg_ddl).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl).unwrap();
     let conn = open_with(sqlite_ddl);
     SqliteCdcSource::new(conn, catalog, SqliteCdcConfig::default()).unwrap()
 }

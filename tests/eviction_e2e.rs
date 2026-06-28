@@ -69,11 +69,14 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
     let slot = "subql_evict_oldest_slot";
     common::create_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
-    let _orders_id = catalog_helpers::table_id(&*catalog, "orders").unwrap();
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+    let _orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
     let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(Arc::clone(&catalog), PostgreSqlDialect {})
-            .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
+        SubscriptionEngine::new(
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+            PostgreSqlDialect {},
+        )
+        .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
 
     let s_oldest = engine
         .register(SubscriptionRequest::new(
@@ -160,14 +163,17 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     let slot = "subql_evict_least_active_slot";
     common::create_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let clock = Arc::new(ManualClock::new(0));
     #[allow(clippy::clone_on_ref_ptr)] // explicit dyn-trait unsize coercion
     let handle: ClockHandle = clock.clone();
     let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(Arc::clone(&catalog), PostgreSqlDialect {})
-            .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive)
-            .with_activity_clock(handle);
+        SubscriptionEngine::new(
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+            PostgreSqlDialect {},
+        )
+        .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive)
+        .with_activity_clock(handle);
 
     let s_a = engine
         .register(SubscriptionRequest::new(
@@ -268,10 +274,13 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
     let slot = "subql_evict_batch_slot";
     common::create_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(Arc::clone(&catalog), PostgreSqlDialect {})
-            .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
+        SubscriptionEngine::new(
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+            PostgreSqlDialect {},
+        )
+        .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
 
     // Pre-fill the cap with two subscriptions. The batch below will evict
     // both of them, one per over-cap entry, leaving only the batch entries
@@ -364,10 +373,12 @@ fn register_batch_cannot_evict_in_flight_entries() {
     let slot = "subql_evict_batch_limit_slot";
     common::create_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
     let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(Arc::clone(&catalog), PostgreSqlDialect {})
-            .with_max_subscriptions(1, EvictionPolicy::EvictOldest);
+        SubscriptionEngine::new(
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+            PostgreSqlDialect {},
+        )
+        .with_max_subscriptions(1, EvictionPolicy::EvictOldest);
 
     let _pre = engine
         .register(SubscriptionRequest::new(
@@ -419,10 +430,13 @@ fn reject_keeps_existing_subscriptions_intact() {
     let slot = "subql_evict_reject_slot";
     common::create_slot(&mut setup, slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(Arc::clone(&catalog), PostgreSqlDialect {})
-            .with_max_subscriptions(1, EvictionPolicy::Reject);
+        SubscriptionEngine::new(
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+            PostgreSqlDialect {},
+        )
+        .with_max_subscriptions(1, EvictionPolicy::Reject);
 
     engine
         .register(SubscriptionRequest::new(

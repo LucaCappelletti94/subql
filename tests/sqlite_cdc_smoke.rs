@@ -37,10 +37,10 @@ fn open_sqlite_with_schema() -> SqliteConnection {
 
 #[tokio::test]
 async fn insert_surfaces_as_wal_event_insert() {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
     let conn = open_sqlite_with_schema();
 
-    let mut source = SqliteCdcSource::new(conn, Arc::clone(&catalog), SqliteCdcConfig::default())
+    let mut source = SqliteCdcSource::new(conn, catalog, SqliteCdcConfig::default())
         .expect("source construction must succeed");
 
     let rows = source
@@ -54,7 +54,7 @@ async fn insert_surfaces_as_wal_event_insert() {
         .expect("next_event must succeed")
         .expect("the shadow log should hold exactly one event");
 
-    let expected_table_id = catalog_helpers::table_id(catalog.as_ref(), "orders").unwrap();
+    let expected_table_id = catalog_helpers::table_id(source.catalog(), "orders").unwrap();
 
     assert_eq!(event.kind(), EventKind::Insert);
     assert_eq!(event.table_id(), expected_table_id);

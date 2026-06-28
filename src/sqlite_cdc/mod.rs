@@ -43,8 +43,6 @@
 //! against an in-memory SQLite, with the real ingest path:
 //!
 //! ```
-//! use std::sync::Arc;
-//!
 //! use diesel::{Connection, SqliteConnection};
 //! use sql_traits::structs::ParserDB;
 //! use sqlparser::dialect::PostgreSqlDialect;
@@ -56,9 +54,8 @@
 //! const PG_DDL: &str =
 //!     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
 //!
-//! let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(PG_DDL)?);
 //! let mut engine = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-//!     Arc::clone(&catalog),
+//!     ParserDB::parse::<PostgreSqlDialect>(PG_DDL)?,
 //!     PostgreSqlDialect {},
 //! );
 //! engine.register(SubscriptionRequest::new(42u64, "SELECT * FROM orders WHERE amount > 100"))?;

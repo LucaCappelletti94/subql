@@ -516,6 +516,26 @@ where
     }
 }
 
+impl<D, I, DB, X> crate::AsyncSubscriptionDispatch<I> for AsyncAutoResolvingEngine<D, I, DB, X>
+where
+    D: Dialect + Send + Sync,
+    I: IdTypes,
+    DB: DatabaseLike + 'static,
+    X: AsyncConnector,
+{
+    type Notifications<C: crate::Checkpoint> = ReExecNotifications<I, C>;
+    type Error = ReExecError<X::Error>;
+
+    #[allow(clippy::manual_async_fn)]
+    fn consumers<C: crate::Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications<C>, Self::Error>> + Send
+    {
+        async move { Self::consumers(self, event).await }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -664,7 +684,7 @@ mod tests {
         values: Vec<Cell>,
     ) -> AsyncAutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, MockAsyncConnector> {
         let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            Arc::new(catalog()),
+            catalog(),
             PostgreSqlDialect {},
         );
         AsyncAutoResolvingEngine::new(ReExecEngine::new(inner), MockAsyncConnector::new(values))

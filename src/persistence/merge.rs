@@ -1,11 +1,12 @@
 //! Background merge operations with atomic swap
 
 use super::predicate_data::dedup_predicates_by_hash;
-use super::shard::{deserialize_shard, BindingData, ConsumerDictData, PredicateData, ShardPayload};
+use super::shard::{
+    deserialize_shard_checked, BindingData, ConsumerDictData, PredicateData,
+    ShardFingerprintEnvelope, ShardPayload,
+};
 use crate::{IdTypes, MergeError, MergeJobId, MergeReport, SubscriptionId, TableId};
 use hashbrown::HashMap;
-use sql_traits::prelude::DatabaseLike;
-use std::marker::PhantomData;
 use std::sync::{
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc, Mutex,
@@ -39,25 +40,24 @@ struct MergeJob<I: IdTypes> {
     receiver: Receiver<Result<MergedShard<I>, String>>,
 }
 
-struct MergeTask<I: IdTypes, DB: DatabaseLike> {
+struct MergeTask<I: IdTypes> {
     table_id: TableId,
     shard_bytes: Vec<Vec<u8>>,
-    database: Arc<DB>,
+    fingerprint: ShardFingerprintEnvelope,
     result_sender: Sender<Result<MergedShard<I>, String>>,
 }
 
 /// Manager for background merge operations
-pub struct MergeManager<I: IdTypes, DB: DatabaseLike> {
+pub struct MergeManager<I: IdTypes> {
     jobs: HashMap<MergeJobId, MergeJob<I>>,
     next_job_id: MergeJobId,
     /// Worker pool sender, spawned lazily on the first merge. `None`
     /// until then, so engines that never merge spawn no threads.
-    task_sender: Option<Sender<MergeTask<I, DB>>>,
-    _db: PhantomData<fn() -> DB>,
+    task_sender: Option<Sender<MergeTask<I>>>,
 }
 
-impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
-    fn recv_task(receiver: &Arc<Mutex<Receiver<MergeTask<I, DB>>>>) -> Option<MergeTask<I, DB>> {
+impl<I: IdTypes> MergeManager<I> {
+    fn recv_task(receiver: &Arc<Mutex<Receiver<MergeTask<I>>>>) -> Option<MergeTask<I>> {
         let lock = receiver
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -71,14 +71,13 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
             jobs: HashMap::new(),
             next_job_id: 1,
             task_sender: None,
-            _db: PhantomData,
         }
     }
 
     /// Spawn the worker pool on first use and return its task sender.
-    fn task_sender(&mut self) -> &Sender<MergeTask<I, DB>> {
+    fn task_sender(&mut self) -> &Sender<MergeTask<I>> {
         self.task_sender.get_or_insert_with(|| {
-            let (task_sender, task_receiver) = mpsc::channel::<MergeTask<I, DB>>();
+            let (task_sender, task_receiver) = mpsc::channel::<MergeTask<I>>();
             let shared_receiver = Arc::new(Mutex::new(task_receiver));
 
             for _ in 0..MERGE_WORKER_COUNT {
@@ -91,10 +90,10 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
 
                         let start = std::time::Instant::now();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            merge_shards_impl::<I, DB>(
+                            merge_shards_impl::<I>(
                                 task.table_id,
                                 &task.shard_bytes,
-                                &*task.database,
+                                &task.fingerprint,
                                 start,
                             )
                         }))
@@ -123,7 +122,7 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
         &mut self,
         table_id: TableId,
         shard_bytes: Vec<Vec<u8>>,
-        database: Arc<DB>,
+        fingerprint: ShardFingerprintEnvelope,
     ) -> Result<MergeJobId, MergeError> {
         let job_id = self.next_job_id;
         self.next_job_id += 1;
@@ -133,7 +132,7 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
         let task = MergeTask {
             table_id,
             shard_bytes,
-            database,
+            fingerprint,
             result_sender: tx,
         };
         self.task_sender()
@@ -187,7 +186,7 @@ impl<I: IdTypes, DB: DatabaseLike + 'static> MergeManager<I, DB> {
     }
 }
 
-impl<I: IdTypes, DB: DatabaseLike + 'static> Default for MergeManager<I, DB> {
+impl<I: IdTypes> Default for MergeManager<I> {
     fn default() -> Self {
         Self::new()
     }
@@ -203,10 +202,10 @@ fn unix_ms_from(now: std::time::SystemTime) -> Result<u64, String> {
 }
 
 /// Perform merge operation
-fn merge_shards_impl<I: IdTypes, DB: DatabaseLike>(
+fn merge_shards_impl<I: IdTypes>(
     table_id: TableId,
     shard_bytes: &[Vec<u8>],
-    database: &DB,
+    fingerprint: &ShardFingerprintEnvelope,
     start: std::time::Instant,
 ) -> Result<MergedShard<I>, String> {
     let mut all_predicates = Vec::new();
@@ -215,7 +214,7 @@ fn merge_shards_impl<I: IdTypes, DB: DatabaseLike>(
 
     // 1. Load all shards
     for bytes in shard_bytes {
-        let (header, payload) = deserialize_shard(bytes, database)
+        let (header, payload) = deserialize_shard_checked(bytes, fingerprint)
             .map_err(|e| format!("Shard deserialize error: {e:?}"))?;
 
         if header.table_id != table_id {
@@ -326,7 +325,9 @@ impl From<MergeStats> for MergeReport {
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::super::codec;
-    use super::super::shard::{serialize_shard, ConsumerDictData, PredicateData};
+    use super::super::shard::{
+        expected_envelope, serialize_shard, ConsumerDictData, PredicateData,
+    };
     use super::super::test_support::make_catalog;
     use super::*;
     use crate::{DefaultIds, SubscriptionScope};
@@ -372,8 +373,12 @@ mod tests {
 
         // Merge
         let start = std::time::Instant::now();
-        let result =
-            merge_shards_impl::<DefaultIds, ParserDB>(1, &[shard1, shard2], &catalog, start);
+        let result = merge_shards_impl::<DefaultIds>(
+            1,
+            &[shard1, shard2],
+            &expected_envelope(&catalog, 1).unwrap(),
+            start,
+        );
 
         assert!(result.is_ok());
         let merged = result.unwrap();
@@ -386,9 +391,9 @@ mod tests {
 
     #[test]
     fn test_merge_manager() {
-        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
-        let catalog = Arc::new(make_catalog());
+        let fingerprint = expected_envelope(&make_catalog(), 1).unwrap();
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
@@ -402,7 +407,7 @@ mod tests {
         let shard = serialize_shard(1, &payload, &mock_catalog).unwrap();
 
         let job_id = manager
-            .merge_shards_background(1, vec![shard], catalog)
+            .merge_shards_background(1, vec![shard], fingerprint)
             .unwrap();
 
         // Poll for completion. A fixed sleep is unreliable under
@@ -442,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_merge_manager_default() {
-        let manager: MergeManager<DefaultIds, ParserDB> = MergeManager::default();
+        let manager: MergeManager<DefaultIds> = MergeManager::default();
         assert_eq!(manager.active_jobs(), 0);
     }
 
@@ -450,13 +455,13 @@ mod tests {
     /// engine construction in fuzz harnesses otherwise drifts RSS under ASAN.
     #[test]
     fn test_merge_pool_spawns_lazily() {
-        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
         assert!(
             manager.task_sender.is_none(),
             "new() must not spawn the worker pool"
         );
 
-        let catalog = Arc::new(make_catalog());
+        let fingerprint = expected_envelope(&make_catalog(), 1).unwrap();
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
@@ -468,7 +473,7 @@ mod tests {
         let shard = serialize_shard(1, &payload, &make_catalog()).unwrap();
 
         let _ = manager
-            .merge_shards_background(1, vec![shard], catalog)
+            .merge_shards_background(1, vec![shard], fingerprint)
             .unwrap();
         assert!(
             manager.task_sender.is_some(),
@@ -478,10 +483,10 @@ mod tests {
 
     #[test]
     fn test_merge_manager_active_jobs() {
-        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
         assert_eq!(manager.active_jobs(), 0);
 
-        let catalog = Arc::new(make_catalog());
+        let fingerprint = expected_envelope(&make_catalog(), 1).unwrap();
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
@@ -495,7 +500,7 @@ mod tests {
         let shard = serialize_shard(1, &payload, &mock_catalog).unwrap();
 
         let _job_id = manager
-            .merge_shards_background(1, vec![shard], catalog)
+            .merge_shards_background(1, vec![shard], fingerprint)
             .unwrap();
 
         // Should have 1 active job
@@ -504,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_merge_manager_unknown_job() {
-        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
         // Try to get result for non-existent job
         let result = manager.try_get_result(999);
@@ -513,9 +518,9 @@ mod tests {
 
     #[test]
     fn test_merge_manager_still_running() {
-        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
-        let catalog = Arc::new(make_catalog());
+        let fingerprint = expected_envelope(&make_catalog(), 1).unwrap();
         let payload: ShardPayload<DefaultIds> = ShardPayload {
             predicates: vec![],
             bindings: vec![],
@@ -529,7 +534,7 @@ mod tests {
         let shard = serialize_shard(1, &payload, &mock_catalog).unwrap();
 
         let job_id = manager
-            .merge_shards_background(1, vec![shard], catalog)
+            .merge_shards_background(1, vec![shard], fingerprint)
             .unwrap();
 
         // Immediately check - might still be running
@@ -587,8 +592,12 @@ mod tests {
         let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
 
         let start = std::time::Instant::now();
-        let result =
-            merge_shards_impl::<DefaultIds, ParserDB>(1, &[shard1, shard2], &catalog, start);
+        let result = merge_shards_impl::<DefaultIds>(
+            1,
+            &[shard1, shard2],
+            &expected_envelope(&catalog, 1).unwrap(),
+            start,
+        );
 
         assert!(result.is_ok());
         let merged = result.unwrap();
@@ -647,8 +656,12 @@ mod tests {
         let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
 
         let start = std::time::Instant::now();
-        let result =
-            merge_shards_impl::<DefaultIds, ParserDB>(1, &[shard1, shard2], &catalog, start);
+        let result = merge_shards_impl::<DefaultIds>(
+            1,
+            &[shard1, shard2],
+            &expected_envelope(&catalog, 1).unwrap(),
+            start,
+        );
         assert!(matches!(result, Err(msg) if msg.contains("hash collision")));
     }
 
@@ -713,8 +726,12 @@ mod tests {
         let shard2 = serialize_shard(1, &payload2, &catalog).unwrap();
 
         let start = std::time::Instant::now();
-        let result =
-            merge_shards_impl::<DefaultIds, ParserDB>(1, &[shard1, shard2], &catalog, start);
+        let result = merge_shards_impl::<DefaultIds>(
+            1,
+            &[shard1, shard2],
+            &expected_envelope(&catalog, 1).unwrap(),
+            start,
+        );
 
         assert!(result.is_ok());
         let merged = result.unwrap();
@@ -745,14 +762,14 @@ mod tests {
 
     #[test]
     fn test_merge_with_invalid_shard_bytes() {
-        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
-        let catalog = Arc::new(make_catalog());
+        let fingerprint = expected_envelope(&make_catalog(), 1).unwrap();
         // Invalid shard bytes - will fail to deserialize
         let invalid_shard = vec![0u8, 1, 2, 3, 4, 5];
 
         let job_id = manager
-            .merge_shards_background(1, vec![invalid_shard], catalog)
+            .merge_shards_background(1, vec![invalid_shard], fingerprint)
             .unwrap();
 
         // Poll for the failure outcome instead of a fixed sleep so the test
@@ -793,8 +810,12 @@ mod tests {
 
         let shard_wrong_table = serialize_shard(1, &payload, &catalog).unwrap();
         let start = std::time::Instant::now();
-        let result =
-            merge_shards_impl::<DefaultIds, ParserDB>(0, &[shard_wrong_table], &catalog, start);
+        let result = merge_shards_impl::<DefaultIds>(
+            0,
+            &[shard_wrong_table],
+            &expected_envelope(&catalog, 1).unwrap(),
+            start,
+        );
 
         assert!(matches!(result, Err(msg) if msg.contains("table_id mismatch")));
     }
@@ -802,7 +823,7 @@ mod tests {
     #[test]
     fn test_merge_thread_disconnected() {
         // Simulate thread panic by manually creating a job with a disconnected channel
-        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
         let (tx, rx) = mpsc::channel::<Result<MergedShard<DefaultIds>, String>>();
         // Drop the sender immediately: simulates thread panic
@@ -828,7 +849,7 @@ mod tests {
 
     #[test]
     fn recv_task_recovers_from_poisoned_mutex() {
-        let (task_tx, task_rx) = mpsc::channel::<MergeTask<DefaultIds, ParserDB>>();
+        let (task_tx, task_rx) = mpsc::channel::<MergeTask<DefaultIds>>();
         let receiver = Arc::new(Mutex::new(task_rx));
 
         let poison_target = Arc::clone(&receiver);
@@ -849,13 +870,13 @@ mod tests {
             .send(MergeTask {
                 table_id: 1,
                 shard_bytes: Vec::new(),
-                database: Arc::new(make_catalog()),
+                fingerprint: expected_envelope(&make_catalog(), 1).unwrap(),
                 result_sender,
             })
             .unwrap();
 
         let catch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            MergeManager::<DefaultIds, ParserDB>::recv_task(&receiver)
+            MergeManager::<DefaultIds>::recv_task(&receiver)
         }));
         assert!(catch_result.is_ok(), "poisoned mutex should not panic");
         assert!(
@@ -882,7 +903,7 @@ mod tests {
     #[test]
     fn test_merge_still_running() {
         // Create a channel where sender is alive but hasn't sent yet
-        let mut manager: MergeManager<DefaultIds, ParserDB> = MergeManager::new();
+        let mut manager: MergeManager<DefaultIds> = MergeManager::new();
 
         let (tx, rx) = mpsc::channel::<Result<MergedShard<DefaultIds>, String>>();
 
@@ -990,16 +1011,20 @@ mod tests {
         let start = Instant::now();
 
         // Run merge twice in both shard orders: result must be identical
-        let result_fwd = merge_shards_impl::<DefaultIds, ParserDB>(
+        let result_fwd = merge_shards_impl::<DefaultIds>(
             1,
             &[shard1.clone(), shard2.clone()],
-            &catalog,
+            &expected_envelope(&catalog, 1).unwrap(),
             start,
         )
         .unwrap();
-        let result_rev =
-            merge_shards_impl::<DefaultIds, ParserDB>(1, &[shard2, shard1], &catalog, start)
-                .unwrap();
+        let result_rev = merge_shards_impl::<DefaultIds>(
+            1,
+            &[shard2, shard1],
+            &expected_envelope(&catalog, 1).unwrap(),
+            start,
+        )
+        .unwrap();
 
         // Both runs must pick the same winner (higher predicate_hash wins on tie)
         assert_eq!(result_fwd.payload.bindings.len(), 1);
@@ -1072,17 +1097,17 @@ mod tests {
         let start = Instant::now();
 
         // Run merge twice
-        let r1 = merge_shards_impl::<DefaultIds, ParserDB>(
+        let r1 = merge_shards_impl::<DefaultIds>(
             1,
             std::slice::from_ref(&shard),
-            &catalog,
+            &expected_envelope(&catalog, 1).unwrap(),
             start,
         )
         .unwrap();
-        let r2 = merge_shards_impl::<DefaultIds, ParserDB>(
+        let r2 = merge_shards_impl::<DefaultIds>(
             1,
             std::slice::from_ref(&shard),
-            &catalog,
+            &expected_envelope(&catalog, 1).unwrap(),
             start,
         )
         .unwrap();

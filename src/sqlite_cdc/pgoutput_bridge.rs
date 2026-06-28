@@ -69,8 +69,6 @@ impl PgOutputBridge {
     /// through [`crate::PgOutputParser`], dispatch with the engine.
     ///
     /// ```
-    /// use std::sync::Arc;
-    ///
     /// use diesel::{Connection, SqliteConnection};
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -83,9 +81,8 @@ impl PgOutputBridge {
     /// const PG_DDL: &str =
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
     ///
-    /// let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(PG_DDL)?);
     /// let mut engine = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-    ///     Arc::clone(&catalog),
+    ///     ParserDB::parse::<PostgreSqlDialect>(PG_DDL)?,
     ///     PostgreSqlDialect {},
     /// );
     /// engine.register(SubscriptionRequest::new(
@@ -105,10 +102,10 @@ impl PgOutputBridge {
     /// // the parser's output. This is the pgoutput round trip.
     /// let mut bridge = PgOutputBridge::new();
     /// let parser = PgOutputParser::new();
-    /// let frames = bridge.encode_event(&source_event, &*catalog)?;
+    /// let frames = bridge.encode_event(&source_event, source.catalog())?;
     /// let mut decoded = Vec::new();
     /// for frame in frames {
-    ///     decoded.extend(parser.parse_wal_message(&frame, &*catalog)?);
+    ///     decoded.extend(parser.parse_wal_message(&frame, source.catalog())?);
     /// }
     /// let parsed = decoded.into_iter().next().expect("Insert decodes to one event");
     ///

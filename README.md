@@ -22,12 +22,10 @@ use subql::{
     SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
-let catalog = Arc::new(
-    ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
-    )?,
-);
-let orders_id = catalog_helpers::table_id(&*catalog, "orders").unwrap();
+let catalog = ParserDB::parse::<PostgreSqlDialect>(
+    "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+)?;
+let orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
@@ -65,12 +63,10 @@ use subql::{
     PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
-let catalog = Arc::new(
-    ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
-    )?,
-);
-let orders_id = catalog_helpers::table_id(&*catalog, "orders").unwrap();
+let catalog = ParserDB::parse::<PostgreSqlDialect>(
+    "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
+)?;
+let orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
@@ -129,12 +125,10 @@ use subql::{
     PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
 };
 
-let catalog = Arc::new(
-    ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE scores (id INT PRIMARY KEY, value INT);",
-    )?,
-);
-let scores_id = catalog_helpers::table_id(&*catalog, "scores").unwrap();
+let catalog = ParserDB::parse::<PostgreSqlDialect>(
+    "CREATE TABLE scores (id INT PRIMARY KEY, value INT);",
+)?;
+let scores_id = catalog_helpers::table_id(&catalog, "scores").unwrap();
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
@@ -172,16 +166,13 @@ if let AggDelta::Avg { sum_delta, count_delta } = delta {
 Column types come from the SQL DDL parsed into `ParserDB`. When a column's type can be determined (e.g. `INT`, `REAL`, `TEXT`), the engine rejects `SUM` or `AVG` over non-numeric columns (`Bool`, `String`) at registration time with a `RegisterError::UnsupportedSql`.
 
 ```rust
-use std::sync::Arc;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
-let catalog = Arc::new(
-    ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE products (price REAL, name TEXT, id INT PRIMARY KEY);",
-    )?,
-);
+let catalog = ParserDB::parse::<PostgreSqlDialect>(
+    "CREATE TABLE products (price REAL, name TEXT, id INT PRIMARY KEY);",
+)?;
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 

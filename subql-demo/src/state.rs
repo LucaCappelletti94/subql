@@ -156,7 +156,10 @@ impl DemoState {
         }
         let _ = capture.drain_events(usize::MAX);
 
-        let engine = SubscriptionEngine::new(harness.database.clone(), PostgreSqlDialect {});
+        let engine = SubscriptionEngine::new(
+            ParserDB::parse::<PostgreSqlDialect>(preset.pg_ddl).expect("preset DDL parses"),
+            PostgreSqlDialect {},
+        );
 
         Ok(Self {
             preset,

@@ -19,8 +19,6 @@
 #![allow(clippy::unwrap_used)]
 
 mod common;
-
-use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::r2d2::ConnectionManager;
@@ -62,8 +60,8 @@ fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
     common::create_slot(conn, SLOT);
 }
 
-fn catalog() -> Arc<ParserDB> {
-    Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"))
+fn catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
 }
 
 fn build_pool(port: u16) -> r2d2::Pool<ConnectionManager<PgConnection>> {
@@ -77,7 +75,7 @@ fn build_pool(port: u16) -> r2d2::Pool<ConnectionManager<PgConnection>> {
 }
 
 fn build_engine(
-    catalog: Arc<ParserDB>,
+    catalog: ParserDB,
     pool: r2d2::Pool<ConnectionManager<PgConnection>>,
 ) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, PgR2D2DieselConnector> {
     let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
@@ -112,8 +110,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
     setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
     let pool = build_pool(port);
-    let catalog = catalog();
-    let mut engine = build_engine(Arc::clone(&catalog), pool);
+    let mut engine = build_engine(catalog(), pool);
 
     let captured_qid = match engine
         .register(
@@ -153,7 +150,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
     let parser = Wal2JsonV2Parser;
     let mut events: Vec<WalEvent<subql::PgLsn>> = Vec::new();
     for msg in &msgs {
-        events.extend(parse_message(&parser, &catalog, msg));
+        events.extend(parse_message(&parser, &catalog(), msg));
     }
     assert_eq!(events.len(), 1, "expected one DELETE event");
 

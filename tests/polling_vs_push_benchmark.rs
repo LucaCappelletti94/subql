@@ -46,7 +46,6 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use diesel::{sql_query, RunQueryDsl};
@@ -199,7 +198,7 @@ where
 /// Build a push source against the given slot + publication and
 /// hand it to [`spawn_receiver`].
 async fn spawn_push(
-    catalog: Arc<ParserDB>,
+    catalog: ParserDB,
     pg_url: String,
     slot: String,
     publication: String,
@@ -217,7 +216,7 @@ async fn spawn_push(
 /// Build a polling source at the given cadence and hand it to
 /// [`spawn_receiver`].
 async fn spawn_poll(
-    catalog: Arc<ParserDB>,
+    catalog: ParserDB,
     pg_url: String,
     slot: String,
     publication: String,
@@ -262,7 +261,6 @@ fn polling_vs_push_latency_comparison() {
     let poll100_pub = setup_slot(&mut setup, "bench_poll_100");
     let poll1000_pub = setup_slot(&mut setup, "bench_poll_1000");
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
     let pg_url = common::pg_replication_url(port);
 
     let rt = current_thread_rt();
@@ -270,7 +268,7 @@ fn polling_vs_push_latency_comparison() {
         // --- Push --------------------------------------------------------
         let gap = insert_gap_for_interval(None);
         let (rx, task) = spawn_push(
-            Arc::clone(&catalog),
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             pg_url.clone(),
             "bench_push".to_string(),
             push_pub,
@@ -293,7 +291,7 @@ fn polling_vs_push_latency_comparison() {
         let interval = Duration::from_millis(10);
         let gap = insert_gap_for_interval(Some(interval));
         let (rx, task) = spawn_poll(
-            Arc::clone(&catalog),
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             pg_url.clone(),
             "bench_poll_10".to_string(),
             poll10_pub,
@@ -314,7 +312,7 @@ fn polling_vs_push_latency_comparison() {
         let interval = Duration::from_millis(100);
         let gap = insert_gap_for_interval(Some(interval));
         let (rx, task) = spawn_poll(
-            Arc::clone(&catalog),
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             pg_url.clone(),
             "bench_poll_100".to_string(),
             poll100_pub,
@@ -335,7 +333,7 @@ fn polling_vs_push_latency_comparison() {
         let interval = Duration::from_millis(1000);
         let gap = insert_gap_for_interval(Some(interval));
         let (rx, task) = spawn_poll(
-            Arc::clone(&catalog),
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             pg_url.clone(),
             "bench_poll_1000".to_string(),
             poll1000_pub,
