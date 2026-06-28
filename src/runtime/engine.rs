@@ -2444,10 +2444,13 @@ impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> Subscript
 impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionDispatch<I>
     for SubscriptionEngine<D, I, DB>
 {
-    fn consumers(
+    type Notifications<C: crate::Checkpoint> = crate::ConsumerNotifications<I, C>;
+    type Error = DispatchError;
+
+    fn consumers<C: crate::Checkpoint>(
         &mut self,
-        event: &WalEvent,
-    ) -> Result<crate::ConsumerNotifications<I>, DispatchError> {
+        event: &WalEvent<C>,
+    ) -> Result<Self::Notifications<C>, Self::Error> {
         Self::consumers(self, event)
     }
 }

@@ -1651,16 +1651,47 @@ pub trait SubscriptionRegistration<I: IdTypes>: Send {
     fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool;
 }
 
-/// Event dispatch operations
+/// Event dispatch operations.
+///
+/// The associated [`Notifications`](Self::Notifications) type lets each engine
+/// layer return its own notification shape: the base engine yields
+/// [`ConsumerNotifications`], while the re-execution wrappers yield their richer
+/// `ReExecNotifications`. See [`AsyncSubscriptionDispatch`] for the async engine.
 pub trait SubscriptionDispatch<I: IdTypes>: Send {
+    /// Notifications produced for a dispatched event, parameterized by the
+    /// event's checkpoint type.
+    type Notifications<C: Checkpoint>;
+    /// Error returned when dispatch fails.
+    type Error;
+
     /// Get interested consumers for a WAL event.
     ///
     /// Returns view-relative notifications: each consumer sees INSERT/DELETE/UPDATE
     /// relative to their own result set.
-    fn consumers(
+    fn consumers<C: Checkpoint>(
         &mut self,
-        event: &WalEvent,
-    ) -> Result<ConsumerNotifications<I>, crate::DispatchError>;
+        event: &WalEvent<C>,
+    ) -> Result<Self::Notifications<C>, Self::Error>;
+}
+
+/// Async counterpart of [`SubscriptionDispatch`].
+///
+/// Separate trait because the async engine's `consumers` returns a future. The
+/// `+ Send` bound on that future is the point of spelling it out as
+/// return-position `impl Future` rather than `async fn` (same idiom as
+/// [`crate::AsyncConnector`]).
+pub trait AsyncSubscriptionDispatch<I: IdTypes>: Send {
+    /// Notifications produced for a dispatched event, parameterized by the
+    /// event's checkpoint type.
+    type Notifications<C: Checkpoint>;
+    /// Error returned when dispatch fails.
+    type Error;
+
+    /// Get interested consumers for a WAL event.
+    fn consumers<C: Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications<C>, Self::Error>> + Send;
 }
 
 /// Session lifecycle operations

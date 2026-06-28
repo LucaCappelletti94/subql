@@ -515,6 +515,20 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> ReExecEngine<D, I, DB> 
     }
 }
 
+impl<D: Dialect + Send + Sync, I: IdTypes, DB: DatabaseLike + 'static>
+    crate::SubscriptionDispatch<I> for ReExecEngine<D, I, DB>
+{
+    type Notifications<C: crate::Checkpoint> = ReExecNotifications<I, C>;
+    type Error = DispatchError;
+
+    fn consumers<C: crate::Checkpoint>(
+        &mut self,
+        event: &WalEvent<C>,
+    ) -> Result<Self::Notifications<C>, Self::Error> {
+        Self::consumers(self, event)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
