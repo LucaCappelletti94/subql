@@ -1679,7 +1679,7 @@ pub trait SubscriptionDispatch<I: IdTypes>: Send {
 /// Separate trait because the async engine's `consumers` returns a future. The
 /// `+ Send` bound on that future is the point of spelling it out as
 /// return-position `impl Future` rather than `async fn` (same idiom as
-/// [`crate::AsyncConnector`]).
+/// [`crate::reexec::AsyncConnector`]).
 pub trait AsyncSubscriptionDispatch<I: IdTypes>: Send {
     /// Notifications produced for a dispatched event, parameterized by the
     /// event's checkpoint type.
