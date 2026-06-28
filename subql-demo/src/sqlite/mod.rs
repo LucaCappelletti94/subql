@@ -4,8 +4,6 @@
 //! The companion [`capture`] module installs diesel hooks that turn sqlite
 //! `INSERT`/`UPDATE`/`DELETE` into SubQL `WalEvent`s.
 
-use std::sync::Arc;
-
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
@@ -38,7 +36,6 @@ pub enum HarnessError {
 
 pub struct SqliteHarness {
     pub conn: SqliteConnection,
-    pub database: Arc<ParserDB>,
     pub table_id: TableId,
     pub table_name: String,
     pub columns: Vec<String>,
@@ -63,23 +60,21 @@ impl SqliteHarness {
 
         let database = ParserDB::parse::<PostgreSqlDialect>(preset.pg_ddl)
             .map_err(|e| HarnessError::ParserDb(format!("{e}")))?;
-        let database = Arc::new(database);
 
-        let table_id = catalog_helpers::table_id(database.as_ref(), preset.table_name)
+        let table_id = catalog_helpers::table_id(&database, preset.table_name)
             .ok_or_else(|| HarnessError::UnknownTable(preset.table_name.into()))?;
 
         let column_ids = preset
             .columns
             .iter()
             .map(|col| {
-                catalog_helpers::column_id(database.as_ref(), table_id, col)
+                catalog_helpers::column_id(&database, table_id, col)
                     .ok_or_else(|| HarnessError::UnknownColumn((*col).into()))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut harness = Self {
             conn,
-            database,
             table_id,
             table_name: preset.table_name.into(),
             columns: preset.columns.iter().map(|s| (*s).to_string()).collect(),
