@@ -20,7 +20,7 @@
 //! 7. `EvictionPolicy::EvictByConsumer` with consumer-id variation.
 //! 8. A `with_custom_eviction` closure (lowest consumer id wins).
 //!
-//! Policies 4 and 5 require activity tracking; the engine auto-installs
+//! Policies 4 and 5 require activity tracking. The engine auto-installs
 //! a `StdClock` when the policy needs it (`ensure_activity_clock_for_strategy`),
 //! so no extra wiring is needed here. With no dispatch happening
 //! between registrations, every subscription has the same activity
@@ -66,7 +66,7 @@ fn fresh_custom(cap: usize) -> Engine {
 }
 
 /// Distinct SQL strings per `(consumer, tag)` so registrations are not
-/// constantly hitting the dedup path; some collisions still happen
+/// constantly hitting the dedup path. Some collisions still happen
 /// inside a batch and that is part of what we test.
 fn spec_sql(consumer_id: u64, tag: u32) -> String {
     format!(
@@ -89,7 +89,7 @@ fn materialise(pairs: &[(u64, u32)]) -> Vec<SubscriptionRequest<DefaultIds>> {
 }
 
 /// Scope marker that the generator picks per spec. `None` means
-/// `Durable` (the default); `Some(n)` means `Session(n)`.
+/// `Durable` (the default). `Some(n)` means `Session(n)`.
 type ScopeChoice = Option<u64>;
 
 fn arb_scoped_spec_triples() -> impl Strategy<Value = Vec<(u64, u32, ScopeChoice)>> {

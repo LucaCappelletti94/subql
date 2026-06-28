@@ -1,7 +1,7 @@
-//! Tier-3 in-process `pgoutput` round-trip glue for [`SqliteCdcSource`].
+//! In-process `pgoutput` round-trip glue for [`SqliteCdcSource`].
 //!
 //! [`SqliteCdcSource`] already produces typed [`WalEvent`]s without going
-//! through the wire format. The Tier-3 doctests and proptests want a
+//! through the wire format. The pgoutput round-trip doctests and proptests want a
 //! stronger statement: that the engine produces the same notifications
 //! when its input is `WalEvent`s decoded from real `pgoutput` bytes by
 //! the production [`crate::PgOutputParser`], so the parser surface is
@@ -48,7 +48,7 @@ const REPLICA_IDENTITY_FULL: u8 = b'f';
 /// Tracks which relations have already been announced to a downstream
 /// [`crate::PgOutputParser`].
 ///
-/// A `pgoutput` parser caches relation schemas by OID; data messages
+/// A `pgoutput` parser caches relation schemas by OID. Data messages
 /// fail until a [`Relation`] for their OID arrives. This struct
 /// remembers which `(TableId, OID)` pairs have been emitted so
 /// repeat events for the same table only ship the data frame.
@@ -64,7 +64,7 @@ impl PgOutputBridge {
     ///
     /// # Examples
     ///
-    /// Tier-3 round trip: drive DML through [`crate::SqliteCdcSource`],
+    /// pgoutput round trip: drive DML through [`crate::SqliteCdcSource`],
     /// encode the resulting event as `pgoutput` bytes, decode it back
     /// through [`crate::PgOutputParser`], dispatch with the engine.
     ///
@@ -102,7 +102,7 @@ impl PgOutputBridge {
     ///
     /// // Encode the typed event as pgoutput wire bytes, decode them
     /// // back through the production parser, drive the engine with
-    /// // the parser's output. This is the Tier-3 round trip.
+    /// // the parser's output. This is the pgoutput round trip.
     /// let mut bridge = PgOutputBridge::new();
     /// let parser = PgOutputParser::new();
     /// let frames = bridge.encode_event(&source_event, &*catalog)?;
@@ -280,9 +280,9 @@ const fn pg_type_oid(ctype: ColumnType) -> Oid {
         ColumnType::Bool => 16,
         ColumnType::Int => 20,
         ColumnType::Float => 701,
-        // `text` (25) is the universal pgoutput text container; subql's
-        // `text_to_cell_strict` returns `Cell::String` for it, which
-        // matches what we expect for `Cell::String` round-tripping.
+        // `text` (25) is the universal pgoutput text container, and
+        // subql's `text_to_cell_strict` returns `Cell::String` for it,
+        // which matches what we expect for `Cell::String` round-tripping.
         // `Unknown` shares the same fallback because pgoutput has no
         // "unknown" OID and any value already encoded as text stays
         // textual through the parser.
@@ -293,7 +293,7 @@ const fn pg_type_oid(ctype: ColumnType) -> Oid {
 const fn relation_oid(table_id: TableId) -> Oid {
     // Synthesise an OID from subql's compact `TableId`. The encoder and
     // decoder both live in this test path, so any reversible mapping
-    // works; the parser only uses OIDs as cache keys.
+    // works. The parser only uses OIDs as cache keys.
     table_id
 }
 

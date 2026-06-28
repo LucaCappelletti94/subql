@@ -1153,7 +1153,7 @@ mod tests {
             ),
             Tri::True
         );
-        // Cell::Missing (in-bounds) with is_null: true → Tri::True
+        // Cell::Missing (in-bounds) with is_null: true -> Tri::True
         // (Missing means the column was not included in the CDC image,
         //  which is semantically equivalent to NULL for IS NULL checks)
         assert_eq!(
@@ -1192,7 +1192,7 @@ mod tests {
             eval_equality(&Cell::String("x".into()), &PlannerValue::String("x".into())),
             Tri::True
         );
-        // Int(1) vs Bool(true): cross-type mismatch → False (matching VM behavior).
+        // Int(1) vs Bool(true): cross-type mismatch -> False (matching VM behavior).
         assert_eq!(
             eval_equality(&Cell::Int(1), &PlannerValue::Bool(true)),
             Tri::False
@@ -1219,12 +1219,12 @@ mod tests {
             eval_equality(&Cell::Int(5), &PlannerValue::Float(5.0_f64.to_bits())),
             Tri::True
         );
-        // Non-equal cross-type → False
+        // Non-equal cross-type -> False
         assert_eq!(
             eval_equality(&Cell::Float(5.1), &PlannerValue::Int(5)),
             Tri::False
         );
-        // NULL cell → Unknown
+        // NULL cell -> Unknown
         assert_eq!(
             eval_equality(&Cell::Null, &PlannerValue::Int(5)),
             Tri::Unknown

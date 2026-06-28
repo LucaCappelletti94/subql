@@ -1,8 +1,7 @@
 //! Docker-backed end-to-end tests for [`PgStreamingCdcSource`].
 //!
-//! The body of this file grows across the plan's TDD steps. Each test
-//! is `#[ignore]` so default `cargo test` does not require Docker. Run
-//! with:
+//! Each test is `#[ignore]` so default `cargo test` does not require
+//! Docker. Run with:
 //!
 //! ```sh
 //! cargo test --test pg_streaming_e2e --features pg-streaming \
@@ -36,9 +35,9 @@ fn current_thread_rt() -> tokio::runtime::Runtime {
         .expect("build current-thread tokio runtime")
 }
 
-/// Step 2: open a replication-mode connection and validate it accepts
-/// `IDENTIFY_SYSTEM`. No DML, no streaming yet — this is the bare
-/// constructor contract.
+/// Open a replication-mode connection and validate it accepts
+/// `IDENTIFY_SYSTEM`. No DML, no streaming yet. Bare constructor
+/// contract.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn connect_against_real_pg() {
@@ -91,11 +90,10 @@ fn confirmed_flush_lsn(conn: &mut diesel::PgConnection, slot: &str) -> Option<Pg
         .and_then(|r| PgLsn::parse(&r.confirmed_flush_lsn))
 }
 
-/// Step 3: drive an INSERT in a side connection, assert
+/// Drive an INSERT in a side connection, assert
 /// `source.next_event().await` returns the corresponding `WalEvent` with
-/// COMMIT-to-event-delivery latency under the latency budget. The whole
-/// reason for the push-based intake is that this latency is wire-bound,
-/// not interval-bound.
+/// COMMIT-to-event-delivery latency under the budget. This latency is
+/// wire-bound, not interval-bound.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn next_event_delivers_insert_within_latency_budget() {
@@ -117,11 +115,10 @@ fn next_event_delivers_insert_within_latency_budget() {
     let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
     let config = PgStreamingConfig::new(common::pg_replication_url(port), slot, publication);
 
-    // Latency budget for COMMIT-to-event delivery. The load-bearing claim
-    // of the push-based intake is that this is wire-bound (single-digit
-    // ms on a loopback), not interval-bound. We allow generous headroom
-    // here because the first event after START_REPLICATION includes the
-    // server's own handshake / relation-cache prelude.
+    // Latency budget for COMMIT-to-event delivery: wire-bound (single-digit
+    // ms on a loopback), not interval-bound. Generous headroom because the
+    // first event after START_REPLICATION includes the server's handshake
+    // and relation-cache prelude.
     const LATENCY_BUDGET: Duration = Duration::from_millis(200);
 
     current_thread_rt().block_on(async move {
@@ -136,9 +133,8 @@ fn next_event_delivers_insert_within_latency_budget() {
             .execute(&mut dml)
             .expect("insert");
 
-        // Allow the LATENCY_BUDGET as a hard ceiling; the source must
-        // deliver the event within that window without polling at any
-        // interval.
+        // LATENCY_BUDGET is a hard ceiling: the source must deliver the
+        // event within that window without polling at any interval.
         let event = tokio::time::timeout(LATENCY_BUDGET, source.next_event())
             .await
             .expect("next_event must return within the latency budget")
@@ -164,9 +160,9 @@ fn next_event_delivers_insert_within_latency_budget() {
         .expect("drop slot");
 }
 
-/// Step 4: explicit `ack(upto)` advances the slot's
+/// Explicit `ack(upto)` advances the slot's
 /// `confirmed_flush_lsn` on the server. Without acking, the slot
-/// retains all WAL since slot creation; acking releases it. The
+/// retains all WAL since slot creation. Acking releases it. The
 /// load-bearing claim: an `ack` issued by the caller produces a
 /// visible server-side state change within a short window.
 #[test]
@@ -226,8 +222,8 @@ fn ack_advances_confirmed_flush_lsn() {
         source.ack(last_lsn).await.expect("ack");
 
         // Poll the slot's confirmed_flush_lsn for up to 2s, asserting
-        // it advances to at least `last_lsn`. A no-op `ack` (Step 3
-        // behavior) makes this poll loop time out.
+        // it advances to at least `last_lsn`. A no-op `ack` would
+        // make this poll loop time out.
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut advanced = None;
         while Instant::now() < deadline {
@@ -242,7 +238,7 @@ fn ack_advances_confirmed_flush_lsn() {
 
         let observed = advanced.unwrap_or_else(|| {
             panic!(
-                "confirmed_flush_lsn did not reach {last_lsn:?} within 2s; \
+                "confirmed_flush_lsn did not reach {last_lsn:?} within 2s: \
                  ack() must surface a StandbyStatusUpdate to the server"
             )
         });
@@ -260,8 +256,8 @@ fn ack_advances_confirmed_flush_lsn() {
         .expect("drop slot");
 }
 
-/// Step 5b: the periodic status-update pump bumps the observability
-/// counter on idle. Fast (~500ms) — no DML, no acks, no server-side
+/// The periodic status-update pump bumps the observability
+/// counter on idle. Fast (~500ms), no DML, no acks, no server-side
 /// timeout games. Asserts the inner task fires the interval arm
 /// independently of consumer or server activity.
 #[test]
@@ -303,7 +299,7 @@ fn pump_increments_status_update_counter_during_idle() {
         let observed = source.status_updates_sent();
         assert!(
             observed >= 3,
-            "periodic pump must emit during idle; \
+            "periodic pump must emit during idle: \
              counter = {observed} after 500ms with 100ms interval"
         );
         println!("status_updates_sent after 500ms idle: {observed}");
@@ -314,13 +310,13 @@ fn pump_increments_status_update_counter_during_idle() {
         .expect("drop slot");
 }
 
-/// Step 5d: idle through an impatient server's `wal_sender_timeout`
-/// and confirm the connection survives. Configures PG with
-/// `wal_sender_timeout=3s`; the source's periodic pump
+/// Idle through an impatient server's `wal_sender_timeout`
+/// and confirm the connection survives. PG runs with
+/// `wal_sender_timeout=3s`. The source's periodic pump
 /// (`status_interval=500ms`) sends a `StandbyStatusUpdate` ~10 times
-/// during the idle period — easily enough to keep the connection
-/// alive. After 5s idle, a freshly-issued INSERT must still be
-/// deliverable through `next_event`.
+/// during the idle period, enough to keep the connection alive. After
+/// 5s idle, a freshly-issued INSERT must still be deliverable through
+/// `next_event`.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn connection_survives_wal_sender_timeout() {
@@ -348,9 +344,9 @@ fn connection_survives_wal_sender_timeout() {
             .await
             .expect("connect");
 
-        // Idle for 5s — longer than the 3s wal_sender_timeout. The
+        // Idle for 5s, longer than the 3s wal_sender_timeout. The
         // server tears down replication connections that go silent
-        // for that long; the periodic pump should keep us alive.
+        // for that long. The periodic pump should keep us alive.
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         // If the pump worked, the counter should reflect ~10 pumps
@@ -369,13 +365,13 @@ fn connection_survives_wal_sender_timeout() {
 
         let ev = tokio::time::timeout(Duration::from_secs(1), source.next_event())
             .await
-            .expect("next_event timeout — connection likely torn down")
-            .expect("next_event err — connection likely torn down")
-            .expect("source closed — connection likely torn down");
+            .expect("next_event timeout: connection likely torn down")
+            .expect("next_event err: connection likely torn down")
+            .expect("source closed: connection likely torn down");
         assert_eq!(ev.kind(), EventKind::Insert);
         println!(
-            "survived 5s idle with wal_sender_timeout=3s; \
-             {pumped} pumps emitted; insert still flowed through"
+            "survived 5s idle with wal_sender_timeout=3s, \
+             {pumped} pumps emitted, insert still flowed through"
         );
     });
 
@@ -384,7 +380,7 @@ fn connection_survives_wal_sender_timeout() {
         .expect("drop slot");
 }
 
-/// Step 6: bounded back-pressure. With `buffer_capacity = 4` and 100
+/// Bounded back-pressure. With `buffer_capacity = 4` and 100
 /// inserts in flight, the inner task's event-push must block on
 /// `event_tx.send().await` while the channel is full, then resume as
 /// the consumer drains. No events dropped, order preserved end-to-end.
@@ -470,7 +466,7 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
         .expect("drop slot");
 }
 
-/// Step 7: dropping the source cleanly shuts down the inner task.
+/// Dropping the source cleanly shuts down the inner task.
 /// No panic, no leaked task. The `task_exited` flag flips to true
 /// within a small window after `drop(source)` because the cooperative
 /// shutdown signal makes the task break out of its loop on the next
@@ -505,7 +501,7 @@ fn drop_source_shuts_down_inner_task() {
         // we can observe shutdown from outside its lifetime.
         let task_exited = source.task_exited_handle();
 
-        // Confirm the inner task is actually running first — give it
+        // Confirm the inner task is actually running first. Give it
         // a couple of pump cadences.
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert!(
@@ -541,7 +537,7 @@ fn drop_source_shuts_down_inner_task() {
         .expect("drop slot");
 }
 
-/// Step 1: `events_received` counter is incremented as the inner task
+/// `events_received` counter is incremented as the inner task
 /// pushes events to the consumer channel. Symmetric counter exists on
 /// `PollingPgCdcSource` so generic benchmark code can read throughput
 /// on either transport.

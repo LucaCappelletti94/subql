@@ -38,7 +38,7 @@ pub(super) struct BindingRemoval<I: IdTypes> {
 pub struct TablePartition<I: IdTypes> {
     table_id: TableId,
     snapshot: ArcSwap<TablePartitionSnapshot<I>>,
-    /// COW predicate store — `Arc::clone` for cheap snapshots, `Arc::make_mut` for mutations
+    /// COW predicate store: `Arc::clone` for cheap snapshots, `Arc::make_mut` for mutations
     mutable_predicates: Arc<PredicateStore<I>>,
 }
 
@@ -208,12 +208,12 @@ impl<I: IdTypes> TablePartition<I> {
         let snapshot = self.load_snapshot();
 
         // For Update events with a non-empty changed_cols list, return exactly the
-        // set of predicates that depend on at least one changed column.  We cannot
+        // set of predicates that depend on at least one changed column. We cannot
         // restrict further using the index (which reflects only the *new* row's
         // values): a predicate might have matched the *old* value (e.g. an IS NULL
-        // predicate when the column transitions NULL → non-NULL) and still needs
+        // predicate when the column transitions NULL to non-NULL) and still needs
         // re-evaluation. Returning the full dependency set is always safe because
-        // the VM will evaluate every candidate.
+        // the VM evaluates every candidate.
         if kind == EventKind::Update && !changed_cols.is_empty() {
             return HybridIndexes::select_update_deps(
                 &snapshot.indexes.dependency_free,
@@ -409,11 +409,11 @@ mod tests {
 
         let row = make_row(vec![Cell::Int(100), Cell::Int(200)]);
 
-        // UPDATE with no changed columns → should return empty (except fallback)
+        // UPDATE with no changed columns: should return empty (except fallback)
         let candidates = partition.select_candidates(&row, EventKind::Update, &[]);
         assert!(!candidates.is_empty()); // Fallback is always included
 
-        // UPDATE with changed column 1 → should include predicate
+        // UPDATE with changed column 1: should include predicate
         let candidates = partition.select_candidates(&row, EventKind::Update, &[1]);
         assert!(!candidates.is_empty());
     }
@@ -429,10 +429,6 @@ mod tests {
         // Should be same Arc (cheap clone)
         assert!(Arc::ptr_eq(&snap1, &snap2));
     }
-
-    // ========================================================================
-    // Phase 3: Push to 95% Coverage - Partition Completion
-    // ========================================================================
 
     #[test]
     fn test_remove_binding_refcount_no_predicate_remove() {
@@ -685,7 +681,7 @@ mod tests {
     }
 
     // =========================================================================
-    // C2 — Index × event kind matrix
+    // C2: Index x event kind matrix
     // =========================================================================
 
     #[test]
@@ -786,7 +782,7 @@ mod tests {
             }],
         );
 
-        // INSERT with NULL value — should be candidate
+        // INSERT with NULL value: should be candidate
         let row_null = make_row(vec![Cell::Null]);
         let candidates = partition.select_candidates(&row_null, EventKind::Insert, &[]);
         assert!(
@@ -794,7 +790,7 @@ mod tests {
             "null index must include predicate on INSERT with NULL value"
         );
 
-        // INSERT with non-NULL value — should not be candidate
+        // INSERT with non-NULL value: should not be candidate
         let row_non_null = make_row(vec![Cell::Int(5)]);
         let candidates = partition.select_candidates(&row_non_null, EventKind::Insert, &[]);
         assert!(
@@ -818,7 +814,7 @@ mod tests {
     }
 
     // =========================================================================
-    // C3 — NULL transition updates under changed_columns
+    // C3: NULL transition updates under changed_columns
     // =========================================================================
 
     #[test]
@@ -835,14 +831,14 @@ mod tests {
             }],
         );
 
-        // UPDATE: NULL → value, changed_columns = [0]
+        // UPDATE: NULL to value, changed_columns = [0]
         // New row has non-NULL value but changed_columns contains col 0,
         // so predicate must still be a candidate (old row may have been NULL).
         let new_row = make_row(vec![Cell::Int(10)]);
         let candidates = partition.select_candidates(&new_row, EventKind::Update, &[0]);
         assert!(
             candidates.contains(pred_id.as_u32()),
-            "IS NULL predicate must be a candidate on NULL→value update when col 0 in changed_columns"
+            "IS NULL predicate must be a candidate on NULL-to-value update when col 0 in changed_columns"
         );
     }
 
@@ -860,13 +856,13 @@ mod tests {
             }],
         );
 
-        // UPDATE: value → NULL, changed_columns = [0]
-        // New row has NULL; predicate must be candidate.
+        // UPDATE: value to NULL, changed_columns = [0]
+        // New row has NULL, so predicate must be a candidate.
         let new_row = make_row(vec![Cell::Null]);
         let candidates = partition.select_candidates(&new_row, EventKind::Update, &[0]);
         assert!(
             candidates.contains(pred_id.as_u32()),
-            "IS NULL predicate must be a candidate on value→NULL update when col 0 in changed_columns"
+            "IS NULL predicate must be a candidate on value-to-NULL update when col 0 in changed_columns"
         );
     }
 

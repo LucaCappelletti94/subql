@@ -7,7 +7,7 @@ use crate::{compiler::Tri, Cell};
 
 /// Structural equality for two cells, with cross-type Int/Float coercion.
 ///
-/// Returns `true`  when values are equal (including mixed Int ↔ Float).
+/// Returns `true`  when values are equal (including mixed Int/Float).
 /// Returns `false` for type mismatches that cannot be coerced, or when either
 /// operand is NULL / Missing.
 #[allow(clippy::cast_precision_loss)]
@@ -30,7 +30,7 @@ pub fn cells_equal(a: &Cell, b: &Cell) -> bool {
                 .is_some_and(|ord| ord == core::cmp::Ordering::Equal)
         }
         (Cell::String(x), Cell::String(y)) => x == y,
-        // NULL = NULL is Unknown, not True; all other mismatches → false
+        // NULL = NULL is Unknown, not True. All other mismatches are false
         _ => false,
     }
 }
@@ -44,7 +44,7 @@ pub fn compare_ordered_cells<F>(lhs: &Cell, rhs: &Cell, predicate: F) -> Tri
 where
     F: FnOnce(core::cmp::Ordering) -> bool,
 {
-    // NULL or Missing → Unknown
+    // NULL or Missing -> Unknown
     if lhs.is_null() || lhs.is_missing() || rhs.is_null() || rhs.is_missing() {
         return Tri::Unknown;
     }
@@ -57,7 +57,7 @@ where
             }
             x.partial_cmp(y).unwrap_or(core::cmp::Ordering::Equal)
         }
-        // Mixed Int/Float comparisons — coerce to Float
+        // Mixed Int/Float comparisons: coerce to Float
         (Cell::Int(x), Cell::Float(y)) => {
             let x_float = *x as f64;
             if y.is_nan() {
@@ -102,7 +102,7 @@ mod tests {
     //!    for any non-NULL, non-Missing, non-NaN cell.
     //! 3. **NULL/Missing/NaN are not self-equal.** `cells_equal(x, x)`
     //!    is `false` for `Null`, `Missing`, and `Float(NaN)`.
-    //! 4. **Int ↔ Float coercion is consistent.** For every `i64 n`,
+    //! 4. **Int/Float coercion is consistent.** For every `i64 n`,
     //!    `cells_equal(Int(n), Float(n as f64))` is `true`.
     //! 5. **Ordered comparison short-circuits on NULL/Missing.** Any
     //!    NULL or Missing operand collapses to `Tri::Unknown`

@@ -19,7 +19,7 @@ use super::error::SqliteCdcError;
 
 /// Translate a PG-dialect DDL stream into SQLite-compatible DDL statements.
 ///
-/// Returns one [`String`] per translated statement; callers apply them in
+/// Returns one [`String`] per translated statement. Callers apply them in
 /// order via their preferred Diesel driver. Use [`apply_pg_ddl`] for the
 /// common case of "translate and run against this connection".
 ///

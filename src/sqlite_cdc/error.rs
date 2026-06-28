@@ -93,7 +93,7 @@ pub enum SqliteCdcError {
 
     /// The `pgoutput` round-trip bridge could not translate an event
     /// because the catalog was missing a table, column, or type token
-    /// it needed. Tier-3 doctests and proptests surface here when the
+    /// it needed. The pgoutput round-trip doctests and proptests surface here when the
     /// `ParserDB` falls out of sync with the events the SQLite source
     /// produced.
     #[error("pgoutput bridge: {0}")]

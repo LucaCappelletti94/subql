@@ -2,7 +2,7 @@
 //!
 //! [Maxwell](https://maxwells-daemon.io/) reads MySQL binlogs and emits
 //! one JSON message per row change. Unlike wal2json, Maxwell provides no
-//! column type information — values are bare JSON primitives, so we use
+//! column type information. Values are bare JSON primitives, so we use
 //! type inference via [`infer_cell_from_json`].
 
 use alloc::string::String;
@@ -126,7 +126,7 @@ impl MapCdcEnvelope for MaxwellMessage {
     }
 
     fn skip_message(&self) -> bool {
-        // Skip DDL/schema events and bootstrap control events — they contain no row data.
+        // Skip DDL/schema events and bootstrap control events: they contain no row data.
         matches!(
             self.event_type.as_str(),
             "ddl"
@@ -230,7 +230,7 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        // PK from message — both id and c
+        // PK from message: both id and c
         assert_eq!(ev.pk().columns.len(), 2);
         assert!(ev.pk().columns.contains(&0)); // id
         assert!(ev.pk().columns.contains(&2)); // c
@@ -261,7 +261,7 @@ mod tests {
         let new = ev.new_row().expect("UPDATE should have new_row");
         assert_eq!(new.get(1), Some(&Cell::Float(5.444)));
 
-        // Old row (sparse — only changed columns)
+        // Old row (sparse: only changed columns)
         let old = ev.old_row().expect("UPDATE should have old_row");
         assert_eq!(old.get(1), Some(&Cell::Float(4.2341)));
         assert_eq!(
@@ -389,7 +389,7 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        // No PK source → empty PK
+        // No PK source: empty PK
         assert!(ev.pk().columns.is_empty());
         assert!(ev.pk().values.is_empty());
     }
@@ -467,7 +467,7 @@ mod tests {
         let catalog = maxwell_e_catalog();
         let parser = MaxwellParser;
 
-        // "truncate" is not a known Maxwell event type; it must be skipped, not error.
+        // "truncate" is not a known Maxwell event type. It must be skipped, not error.
         let json = r#"{
             "database":"test","table":"e","type":"truncate",
             "data":{"id":1}
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn update_pk_change_uses_pre_update_pk() {
-        // When a PK column changes (id: 1 → 2), the emitted PK must be the
+        // When a PK column changes (id: 1 -> 2), the emitted PK must be the
         // pre-update value (1), not the post-update value (2).
         let catalog = maxwell_e_catalog();
         let parser = MaxwellParser;

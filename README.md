@@ -9,7 +9,7 @@
 
 SQL subscription dispatch engine for Change Data Capture fanout.
 
-`subql` dispatches CDC row events to consumers based on SQL `WHERE` subscriptions. Predicates compile once. Equivalent SQL is deduplicated across subscribers, then hybrid indexes (equality, range, `IS NULL`, plus a fallback set for the rest) prune candidates before the VM evaluates. The VM honors SQL three-valued logic (`TRUE`, `FALSE`, `UNKNOWN`), routes session-bound and durable subscriptions through the same path, and persists predicate state to durable shards with background merge when the `std` feature is on. WAL inputs are pluggable: `PgOutput`, `wal2json` v1 and v2, Debezium, and Maxwell parsers all feed into the same dispatch path, including table-level `TRUNCATE` events. Streaming aggregate subscriptions cover `COUNT(*)`, `COUNT(col)`, `SUM(col)`, and `AVG(col)`. Anything `sqlparser` accepts (multiple SQL dialects) is fair game on the predicate side.
+`subql` dispatches CDC row events to consumers based on SQL `WHERE` subscriptions. Predicates compile once. Equivalent SQL is deduplicated across subscribers, then hybrid indexes (equality, range, `IS NULL`, and a fallback set) prune candidates before the VM evaluates. The VM honors SQL three-valued logic (`TRUE`, `FALSE`, `UNKNOWN`) and routes session-bound and durable subscriptions through one path. With the `std` feature, predicate state persists to durable shards with background merge. WAL input is pluggable: `PgOutput`, `wal2json` v1 and v2, Debezium, and Maxwell parsers feed the same path, including table-level `TRUNCATE`. Streaming aggregates cover `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, and the variance/standard-deviation family (`VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`). Any SQL `sqlparser` accepts (multiple dialects) works as a predicate.
 
 ## Quick Start
 
@@ -52,9 +52,9 @@ assert_eq!(notifs.inserted(), vec![42]);
 
 ## Streaming Aggregates
 
-`subql` supports streaming aggregate subscriptions alongside row-match subscriptions. Instead of `SELECT *`, register a `SELECT COUNT(*)`, `SELECT COUNT(col)`, `SELECT SUM(col)`, or `SELECT AVG(col)` query. The engine then emits signed **deltas** via `aggregate_deltas()`, and the caller maintains the running total.
+Alongside row-match subscriptions, register a `SELECT COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, or variance/stddev (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) query instead of `SELECT *`. The engine emits signed deltas via `aggregate_deltas()` and the caller keeps the running total.
 
-Aggregate subscribers never appear in `consumers()` output and vice versa. For `UPDATE` aggregate deltas, CDC events must include both old and new row images. If a source omits old images (`before` / `old`), `aggregate_deltas()` returns an error for update events.
+Aggregate subscribers never appear in `consumers()` output, and vice versa. `UPDATE` deltas need both old and new row images. If a source omits old images (`before` / `old`), `aggregate_deltas()` returns an error for update events.
 
 ```rust
 use std::sync::Arc;
@@ -112,10 +112,11 @@ assert_eq!(deltas, vec![
 
 | SQL | `AggDelta` variant | Notes |
 |-----|--------------------|-------|
-| `SELECT COUNT(*) FROM t WHERE …` | `Count(i64)` | ±1 per matching row |
-| `SELECT COUNT(col) FROM t WHERE …` | `Count(i64)` | skips `NULL` cells |
-| `SELECT SUM(col) FROM t WHERE …` | `Sum(f64)` | skips `NULL`/`NaN`/`Inf` |
-| `SELECT AVG(col) FROM t WHERE …` | `Avg { sum_delta, count_delta }` | caller divides to get the new average |
+| `SELECT COUNT(*) FROM t WHERE ...` | `Count(i64)` | +/-1 per matching row |
+| `SELECT COUNT(col) FROM t WHERE ...` | `Count(i64)` | skips `NULL` cells |
+| `SELECT SUM(col) FROM t WHERE ...` | `Sum(f64)` | skips `NULL`/`NaN`/`Inf` |
+| `SELECT AVG(col) FROM t WHERE ...` | `Avg { sum_delta, count_delta }` | caller divides to get the new average |
+| `SELECT VAR_POP(col) FROM t WHERE ...` (also `VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) | `Stats { sum_delta, sum_sq_delta, count_delta }` | caller maintains running sum, sum-of-squares, and count |
 
 For `AVG`, the caller accumulates `running_sum` and `running_count` separately, then computes the average as `running_sum / running_count` on demand:
 
@@ -184,12 +185,12 @@ let catalog = Arc::new(
 let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-// Accepted — price is Float:
+// Accepted, price is Float:
 engine.register(SubscriptionRequest::new(
     1, "SELECT SUM(price) FROM products WHERE id > 0",
 ))?;
 
-// Rejected at registration — name is String:
+// Rejected at registration, name is String:
 assert!(engine
     .register(SubscriptionRequest::new(
         1, "SELECT SUM(name) FROM products WHERE id > 0",

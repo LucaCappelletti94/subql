@@ -82,8 +82,8 @@ pub fn parse_compile_and_normalize<D: Dialect, DB: DatabaseLike>(
     Ok((table_id, program, normalized))
 }
 
-/// Shared front-half of query parsing: parse → extract table + WHERE → resolve
-/// table_id → extract projection → normalize.
+/// Shared front-half of query parsing: parse -> extract table + WHERE -> resolve
+/// table_id -> extract projection -> normalize.
 struct ParsedQuery {
     table_id: TableId,
     where_clause: Option<Expr>,
@@ -319,45 +319,35 @@ fn compile_expr_recursive<DB: DatabaseLike>(
             match op {
                 // Short-circuit logical operators
                 BinaryOperator::And => {
-                    // Compile left operand
                     compile_expr_recursive(left, table_id, database, out, depth + 1)?;
 
-                    // Emit placeholder jump (patched below)
                     let jump_idx = out.len();
-                    out.push(Instruction::JumpIfFalse(0)); // placeholder
+                    out.push(Instruction::JumpIfFalse(0)); // placeholder, patched below
 
-                    // Compile right operand
                     let rhs_start = out.len();
                     compile_expr_recursive(right, table_id, database, out, depth + 1)?;
-
-                    // Emit And
                     out.push(Instruction::And);
 
-                    // Patch jump offset: skip rhs instructions + And instruction
+                    // Offset skips the rhs instructions plus the And.
                     let rhs_len = out.len() - rhs_start;
                     out[jump_idx] = Instruction::JumpIfFalse(rhs_len + 1);
                 }
                 BinaryOperator::Or => {
-                    // Compile left operand
                     compile_expr_recursive(left, table_id, database, out, depth + 1)?;
 
-                    // Emit placeholder jump (patched below)
                     let jump_idx = out.len();
-                    out.push(Instruction::JumpIfTrue(0)); // placeholder
+                    out.push(Instruction::JumpIfTrue(0)); // placeholder, patched below
 
-                    // Compile right operand
                     let rhs_start = out.len();
                     compile_expr_recursive(right, table_id, database, out, depth + 1)?;
-
-                    // Emit Or
                     out.push(Instruction::Or);
 
-                    // Patch jump offset: skip rhs instructions + Or instruction
+                    // Offset skips the rhs instructions plus the Or.
                     let rhs_len = out.len() - rhs_start;
                     out[jump_idx] = Instruction::JumpIfTrue(rhs_len + 1);
                 }
                 _ => {
-                    // All non-short-circuit operators: compile both sides, emit op
+                    // Non-short-circuit operators: compile both sides, emit op.
                     compile_expr_recursive(left, table_id, database, out, depth + 1)?;
                     compile_expr_recursive(right, table_id, database, out, depth + 1)?;
 
@@ -1383,10 +1373,6 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // Phase 1: Additional Error Path Coverage Tests
-    // ========================================================================
-
     #[test]
     fn test_error_parse_failure() {
         let catalog = make_catalog();
@@ -1577,10 +1563,6 @@ mod tests {
             .contains(&Instruction::PushLiteral(Cell::Bool(true))));
     }
 
-    // ========================================================================
-    // Phase 3: Push to 95% Coverage - Parser Completion
-    // ========================================================================
-
     #[test]
     fn test_compound_identifier_unknown_column() {
         let catalog = make_catalog();
@@ -1611,7 +1593,7 @@ mod tests {
         use sqlparser::ast::Value;
 
         // Construct a Value::Number with a string that can't parse as i64 or f64
-        // This is defensive — sqlparser normally validates numbers — but we test it directly
+        // Defensive: sqlparser normally validates numbers, but we test it directly
         let val = Value::Number("not_a_number".to_string(), false);
         let result = sql_value_to_cell_strict(&val);
         assert!(matches!(result, Err(RegisterError::TypeError(_))));
@@ -1790,7 +1772,7 @@ mod tests {
 
     #[test]
     fn test_projection_count_column_known_column() {
-        // COUNT(col) is now supported — counts non-NULL values
+        // COUNT(col) is now supported: counts non-NULL values
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
 

@@ -56,7 +56,7 @@ pub struct EventCapture {
 
 impl EventCapture {
     /// Install the diesel sqlite hook on `harness.conn` and return a capture
-    /// handle. The hook records firings into `hook_log`; the `apply_*`
+    /// handle. The hook records firings into `hook_log`. The `apply_*`
     /// methods are the ones that synthesize `WalEvent`s for dispatch.
     pub fn install(harness: &mut SqliteHarness) -> Self {
         let pk_column = harness.column_ids.first().copied().unwrap_or(0);
@@ -112,7 +112,7 @@ impl EventCapture {
     }
 
     /// Replace the row at `rowid` and emit a [`WalEvent::Update`]. The old
-    /// image is read from the cache; `changed_columns` is computed by
+    /// image is read from the cache. `changed_columns` is computed by
     /// diffing cell-by-cell.
     pub fn apply_update(
         &self,

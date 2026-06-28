@@ -53,7 +53,7 @@ use crate::{PgLsn, WalEvent, WalParser};
 ///
 /// The caller is responsible for creating the publication and the
 /// replication slot before constructing the source. The slot must use
-/// the `pgoutput` plugin (same as push); the polling source drains it
+/// the `pgoutput` plugin (same as push). The polling source drains it
 /// via `pg_logical_slot_get_binary_changes` rather than
 /// `START_REPLICATION`.
 ///
@@ -123,7 +123,7 @@ pub enum PollingPgCdcError {
     /// returned an unparseable row).
     #[error("polling protocol error: {0}")]
     Protocol(String),
-    /// The inner polling task has exited; the source can no longer
+    /// The inner polling task has exited, so the source can no longer
     /// produce events.
     #[error("polling source shut down")]
     SourceClosed,
@@ -161,11 +161,11 @@ impl<DB: DatabaseLike + 'static> PollingPgCdcSource<DB> {
         let slot_name_for_check = config.slot_name.clone();
         let url = config.url.clone();
         // Connect and slot-check are both synchronous on `pg_walstream`'s
-        // libpq surface and would block the calling tokio worker; bounce
-        // both through the blocking pool in a single hop. pg_walstream's
-        // `exec` has no bind-parameter support, so we embed the slot
-        // name; PG validates slot names to `[a-z0-9_]` and we
-        // quote-escape for defense in depth.
+        // libpq surface and would block the calling tokio worker, so
+        // bounce both through the blocking pool in a single hop.
+        // pg_walstream's `exec` has no bind-parameter support, so we
+        // embed the slot name. PG validates slot names to `[a-z0-9_]`
+        // and we quote-escape for defense in depth.
         let slot_check_sql = format!(
             "SELECT 1 FROM pg_replication_slots WHERE slot_name = {}",
             sql_string_literal(&slot_name_for_check),

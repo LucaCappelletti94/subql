@@ -10,9 +10,9 @@
 //! new images, and the synthesised `relation_id` OID).
 //!
 //! What this catches: encoding bugs in the bridge that would silently
-//! produce wire bytes the parser misreads. The Tier-3 doctest in
+//! produce wire bytes the parser misreads. The pgoutput round-trip doctest in
 //! `src/sqlite_cdc/pgoutput_bridge.rs` covers the happy path on a real
-//! SQLite source; this proptest hardens the encoder over the full
+//! SQLite source. This proptest hardens the encoder over the full
 //! `WalEvent` shape space without needing a connection.
 //!
 //! Gated via `[[test]] required-features = ["sqlite-cdc"]`.
@@ -65,7 +65,7 @@ fn cell_status() -> impl Strategy<Value = Cell> {
 }
 
 /// Three-cell row matching the `orders (id, amount, status)` layout.
-/// Every cell is concrete (no `Cell::Missing`); the bridge maps
+/// Every cell is concrete (no `Cell::Missing`). The bridge maps
 /// `Cell::Missing` to pgoutput's `b'u'` (unchanged TOAST) tag, but
 /// emitting it on the new image is invalid in the protocol, and the
 /// parser rejects it.

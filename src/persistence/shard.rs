@@ -17,8 +17,8 @@
 //!
 //! v7 replaces v6's bare 8-byte `u64` fingerprint with the full
 //! `SchemaFingerprint` envelope (algorithm + canonicalization version +
-//! profile + 128-bit digest), as required by FINGERPRINT_SPEC §10–§12.
-//! Older v6 shards refuse to load — this is a clean break, no compat path.
+//! profile + 128-bit digest). Older v6 shards refuse to load: a clean
+//! break, no compat path.
 
 use super::codec;
 use crate::{
@@ -31,24 +31,24 @@ use sql_traits::{
 };
 
 /// Shard format version. v7: full fingerprint envelope replaces the legacy
-/// `u64` field (FINGERPRINT_SPEC §11 / audit §3.3).
+/// `u64` field.
 const SHARD_VERSION: u16 = 7;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 ///
-/// Intentionally separate from [`super::codec::MAX_DECODE_UNCOMPRESSED`] — each
-/// layer enforces its own limit independently.
+/// Separate from [`super::codec::MAX_DECODE_UNCOMPRESSED`]: each layer enforces
+/// its own limit independently.
 const MAX_SHARD_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// Magic bytes for shard identification
 const MAGIC: &[u8; 5] = b"SUBQL";
 
-/// Shard header (49 bytes, fixed size — see module docs for layout).
+/// Shard header (49 bytes, fixed size). See module docs for layout.
 const SHARD_HEADER_SIZE: usize = 49;
 
 /// Numeric algorithm identifier for `AlgorithmId::Sha2_256` in the v7 header.
 ///
-/// `SchemaFingerprint` exposes the algorithm as an enum; for the wire format we
+/// `SchemaFingerprint` exposes the algorithm as an enum. For the wire format we
 /// project it to a single byte. New algorithms added to
 /// [`sql_traits::structs::fingerprint::AlgorithmId`] must be assigned a stable
 /// byte here, with shard-version bumps for any reassignment.
@@ -68,7 +68,7 @@ pub struct ShardFingerprintEnvelope {
     pub canonicalization_version: u16,
     /// Persistence profile identifier (BE on the wire).
     pub profile_id: u16,
-    /// First 128 bits of the digest (fingerprint128 per spec §11).
+    /// First 128 bits of the digest (fingerprint128 per spec section 11).
     pub digest128: [u8; 16],
 }
 
@@ -160,8 +160,8 @@ impl ShardHeader {
     ///
     /// Rejects malformed magic, version mismatch, and any difference in the
     /// fingerprint envelope (algorithm, canonicalization version, profile, or
-    /// digest). There is no zero-fingerprint bypass — every live catalog must
-    /// produce a fingerprint or the shard is rejected.
+    /// digest). No zero-fingerprint bypass: every live catalog must produce a
+    /// fingerprint or the shard is rejected.
     pub fn validate<DB: DatabaseLike>(&self, database: &DB) -> Result<(), StorageError> {
         // Check magic
         if &self.magic != MAGIC {
@@ -180,7 +180,7 @@ impl ShardHeader {
         }
 
         // Compute the live fingerprint via the sql-traits catalog. The catalog
-        // *must* know about this table — there is no graceful fallback path.
+        // *must* know about this table: there is no graceful fallback path.
         let live = catalog_helpers::schema_fingerprint(database, self.table_id)
             .map_err(|e| StorageError::Corrupt(format!("fingerprint computation failed: {e}")))?
             .ok_or_else(|| {
@@ -209,7 +209,7 @@ fn encode_header(header: &ShardHeader) -> [u8; SHARD_HEADER_SIZE] {
     bytes[5..7].copy_from_slice(&header.version.to_le_bytes());
     bytes[7] = header.padding;
     bytes[8..12].copy_from_slice(&header.table_id.to_le_bytes());
-    // Fingerprint envelope (FINGERPRINT_SPEC §10.1: BE for the two u16 fields).
+    // Fingerprint envelope: BE for the two u16 fields.
     bytes[12] = header.fingerprint.algorithm_id;
     bytes[13..15].copy_from_slice(&header.fingerprint.canonicalization_version.to_be_bytes());
     bytes[15..17].copy_from_slice(&header.fingerprint.profile_id.to_be_bytes());
@@ -373,7 +373,7 @@ pub fn deserialize_shard<I: IdTypes, DB: DatabaseLike>(
 ) -> Result<(ShardHeader, ShardPayload<I>), StorageError> {
     let header = decode_header(bytes)?;
 
-    // Size sanity check first — a tampered header claiming `u64::MAX` would
+    // Size sanity check first: a tampered header claiming `u64::MAX` would
     // otherwise burn a SHA-256 catalog recomputation in `validate` before
     // being rejected here.
     if header.uncompressed_size > MAX_SHARD_UNCOMPRESSED_SIZE {
@@ -511,7 +511,7 @@ mod tests {
             .unwrap();
 
         let mut env = ShardFingerprintEnvelope::from_schema(&live);
-        // Flip a single bit of the digest — envelope metadata stays intact.
+        // Flip a single bit of the digest: envelope metadata stays intact.
         env.digest128[0] ^= 0x01;
         let header = ShardHeader::new(tid, env, 100, 80);
 
@@ -565,7 +565,7 @@ mod tests {
     }
 
     /// Shard references a table the live catalog doesn't know about. With v7
-    /// there is no zero-fingerprint bypass — every catalog must produce a
+    /// there is no zero-fingerprint bypass: every catalog must produce a
     /// fingerprint for any table referenced by a shard.
     #[test]
     fn test_unknown_table_is_corrupt() {
@@ -585,9 +585,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::Corrupt(_))));
     }
 
-    // ============================================================================
-    // Step 3 verification tests (audit §3.3 / FINGERPRINT_SPEC §10–§12)
-    // ============================================================================
+    // Fingerprint envelope roundtrip tests.
 
     /// Every envelope field roundtrips through the on-wire header.
     #[test]
@@ -611,7 +609,7 @@ mod tests {
     }
 
     /// Loading a shard whose header carries v6 must fail with
-    /// `VersionMismatch` — no legacy decode path is supported.
+    /// `VersionMismatch`: no legacy decode path is supported.
     #[test]
     fn test_v6_rejected() {
         let catalog = make_catalog();
@@ -637,7 +635,7 @@ mod tests {
     }
 
     /// Writing a shard under one schema and loading it under a different
-    /// schema for the same table id must fail with `SchemaMismatch` — the
+    /// schema for the same table id must fail with `SchemaMismatch`: the
     /// digest differs even though all envelope metadata matches.
     #[test]
     fn test_envelope_mismatch_rejected() {
@@ -659,7 +657,7 @@ mod tests {
 
     /// A header carrying an unknown algorithm_id (e.g. a future hash that the
     /// live catalog isn't emitting) must be rejected. The digest may be
-    /// otherwise valid; the envelope metadata mismatch alone is fatal.
+    /// otherwise valid. The envelope metadata mismatch alone is fatal.
     #[test]
     fn test_algorithm_id_mismatch_rejected() {
         let catalog = make_catalog();

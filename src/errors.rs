@@ -122,7 +122,7 @@ pub enum DispatchError {
     /// CDC sources that omit `before`/`old` images cannot produce correct
     /// aggregate deltas for UPDATE events.
     #[error(
-        "Aggregate UPDATE on table {0} requires old_row image — enable before/old images in CDC source"
+        "Aggregate UPDATE on table {0} requires old_row image. Enable before/old images in CDC source"
     )]
     AggregateUpdateRequiresOldRow(TableId),
 
@@ -132,7 +132,7 @@ pub enum DispatchError {
     /// but available for callers who require exact three-way splits and want to
     /// enforce REPLICA IDENTITY FULL at the application layer.
     #[error(
-        "UPDATE on table {0} requires complete old_row — set REPLICA IDENTITY FULL on source table"
+        "UPDATE on table {0} requires complete old_row. Set REPLICA IDENTITY FULL on source table"
     )]
     UpdateRequiresOldRow(TableId),
 
@@ -152,7 +152,7 @@ pub enum DispatchError {
     ///
     /// The engine cannot compute count deltas for TRUNCATE (no row images).
     /// Caller must re-query the database to obtain the correct count.
-    #[error("TRUNCATE on table {0} requires aggregate count reset — re-query the database")]
+    #[error("TRUNCATE on table {0} requires aggregate count reset. Re-query the database")]
     TruncateRequiresReset(crate::TableId),
 }
 
@@ -286,11 +286,11 @@ mod tests {
         );
         assert_eq!(
             DispatchError::AggregateUpdateRequiresOldRow(7).to_string(),
-            "Aggregate UPDATE on table 7 requires old_row image — enable before/old images in CDC source"
+            "Aggregate UPDATE on table 7 requires old_row image. Enable before/old images in CDC source"
         );
         assert_eq!(
             DispatchError::UpdateRequiresOldRow(5).to_string(),
-            "UPDATE on table 5 requires complete old_row — set REPLICA IDENTITY FULL on source table"
+            "UPDATE on table 5 requires complete old_row. Set REPLICA IDENTITY FULL on source table"
         );
         assert_eq!(
             DispatchError::InvalidRowArity {

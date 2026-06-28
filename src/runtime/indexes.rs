@@ -1,11 +1,11 @@
 //! Hybrid indexing for fast candidate selection
 //!
 //! Five index types:
-//! 1. Equality: (col, val) → predicates with col=val
-//! 2. Range: col → predicates with col IN range
-//! 3. NULL: (col, kind) → predicates checking IS NULL / IS NOT NULL
+//! 1. Equality: (col, val) -> predicates with col=val
+//! 2. Range: col -> predicates with col IN range
+//! 3. NULL: (col, kind) -> predicates checking IS NULL / IS NOT NULL
 //! 4. Fallback: unindexable predicates (LIKE, complex expressions)
-//! 5. Dependency: col → predicates referencing col (for UPDATE optimization)
+//! 5. Dependency: col -> predicates referencing col (for UPDATE optimization)
 
 use super::ids::PredicateId;
 use crate::{
@@ -124,33 +124,33 @@ impl IndexableAtom {
 /// Hybrid indexes for candidate selection
 #[derive(Clone)]
 pub struct HybridIndexes {
-    /// Equality: col → (val → `RoaringBitmap<PredicateId>`)
+    /// Equality: col -> (val -> `RoaringBitmap<PredicateId>`)
     pub equality: HashMap<ColumnId, HashMap<IndexableCell, RoaringBitmap>>,
 
-    /// Range: col → `Vec<RangeEntry>` (sorted by lower bound)
+    /// Range: col -> `Vec<RangeEntry>` (sorted by lower bound)
     pub range: HashMap<ColumnId, Vec<RangeEntry>>,
 
-    /// NULL: (col, kind) → `RoaringBitmap<PredicateId>`
+    /// NULL: (col, kind) -> `RoaringBitmap<PredicateId>`
     pub null_checks: HashMap<(ColumnId, NullKind), RoaringBitmap>,
 
     /// Fallback: unindexable predicates
     pub fallback: RoaringBitmap,
 
-    /// Dependency: col → `RoaringBitmap<PredicateId>` (for UPDATE optimization)
+    /// Dependency: col -> `RoaringBitmap<PredicateId>` (for UPDATE optimization)
     pub dependency: HashMap<ColumnId, RoaringBitmap>,
 
     /// Predicates with no dependency columns (must always be considered for UPDATEs)
     pub dependency_free: RoaringBitmap,
 
     // -----------------------------------------------------------------------
-    // Aggregate (COUNT/SUM/…) predicate indexes — parallel to row indexes.
+    // Aggregate (COUNT/SUM/...) predicate indexes, parallel to row indexes.
     // Kept separate so `select_candidates` never returns agg predicates and
     // `select_agg_candidates` never returns row predicates.
     // -----------------------------------------------------------------------
     /// Aggregate predicates (all of them, for INSERT/DELETE dispatch)
     pub agg_fallback: RoaringBitmap,
 
-    /// col → aggregate predicates referencing that column (UPDATE optimization)
+    /// col -> aggregate predicates referencing that column (UPDATE optimization)
     pub agg_dependency: HashMap<ColumnId, RoaringBitmap>,
 
     /// Aggregate predicates with no dependency columns (always re-evaluated)
@@ -499,7 +499,7 @@ pub fn extract_indexable_atoms(
 
         // Check for 3-instruction patterns
         match instructions.get(i..i.saturating_add(3)) {
-            // Pattern 1: LoadColumn, PushLiteral, Equal → Equality index
+            // Pattern 1: LoadColumn, PushLiteral, Equal -> Equality index
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::Equal],
             ) => {
@@ -512,14 +512,14 @@ pub fn extract_indexable_atoms(
                 i += 3;
             }
 
-            // Pattern 2: LoadColumn, PushLiteral, NotEqual → Skip (not easily indexable)
+            // Pattern 2: LoadColumn, PushLiteral, NotEqual -> Skip (not easily indexable)
             Some(
                 [Instruction::LoadColumn(_), Instruction::PushLiteral(_), Instruction::NotEqual],
             ) => {
                 i += 3;
             }
 
-            // Pattern 3: LoadColumn, PushLiteral, GreaterThan → Range [val+1, ∞)
+            // Pattern 3: LoadColumn, PushLiteral, GreaterThan -> Range [val+1, inf)
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThan],
             ) => {
@@ -533,7 +533,7 @@ pub fn extract_indexable_atoms(
                 i += 3;
             }
 
-            // Pattern 4: LoadColumn, PushLiteral, GreaterThanOrEqual → Range [val, ∞)
+            // Pattern 4: LoadColumn, PushLiteral, GreaterThanOrEqual -> Range [val, inf)
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThanOrEqual],
             ) => {
@@ -547,7 +547,7 @@ pub fn extract_indexable_atoms(
                 i += 3;
             }
 
-            // Pattern 5: LoadColumn, PushLiteral, LessThan → Range (-∞, val-1]
+            // Pattern 5: LoadColumn, PushLiteral, LessThan -> Range (-inf, val-1]
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThan],
             ) => {
@@ -561,7 +561,7 @@ pub fn extract_indexable_atoms(
                 i += 3;
             }
 
-            // Pattern 6: LoadColumn, PushLiteral, LessThanOrEqual → Range (-∞, val]
+            // Pattern 6: LoadColumn, PushLiteral, LessThanOrEqual -> Range (-inf, val]
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThanOrEqual],
             ) => {
@@ -578,7 +578,7 @@ pub fn extract_indexable_atoms(
             _ => {
                 // Check for other patterns
                 match instructions.get(i) {
-                    // Pattern 7: LoadColumn, IsNull → NULL check
+                    // Pattern 7: LoadColumn, IsNull -> NULL check
                     Some(Instruction::LoadColumn(col)) => {
                         if matches!(instructions.get(i + 1), Some(Instruction::IsNull)) {
                             atoms.push(IndexableAtom::Null {
@@ -587,14 +587,14 @@ pub fn extract_indexable_atoms(
                             });
                             i += 2;
                         } else if matches!(instructions.get(i + 1), Some(Instruction::IsNotNull)) {
-                            // Pattern 8: LoadColumn, IsNotNull → NULL check
+                            // Pattern 8: LoadColumn, IsNotNull -> NULL check
                             atoms.push(IndexableAtom::Null {
                                 column_id: *col,
                                 kind: NullKind::IsNotNull,
                             });
                             i += 2;
                         } else if matches!(instructions.get(i + 1), Some(Instruction::In(_))) {
-                            // Pattern 9: LoadColumn, In([...]) → Multiple equality atoms
+                            // Pattern 9: LoadColumn, In([...]) -> Multiple equality atoms
                             if let Some(Instruction::In(values)) = instructions.get(i + 1) {
                                 for val in values {
                                     if let Some(indexable) = IndexableCell::from_cell(val) {
@@ -611,7 +611,7 @@ pub fn extract_indexable_atoms(
                         }
                     }
 
-                    // Pattern 10: LoadColumn, PushLiteral, PushLiteral, Between → Range [lower, upper]
+                    // Pattern 10: LoadColumn, PushLiteral, PushLiteral, Between -> Range [lower, upper]
                     Some(_) => i += 1,
 
                     None => break,
@@ -948,10 +948,6 @@ mod tests {
         assert_eq!(atoms.len(), 1);
         assert!(matches!(atoms[0], IndexableAtom::Fallback));
     }
-
-    // ========================================================================
-    // Phase 3: Push to 95% Coverage - Indexes Completion
-    // ========================================================================
 
     #[test]
     fn test_indexable_cell_from_float() {
@@ -1365,17 +1361,17 @@ mod tests {
         col1_deps.insert(1); // pred 1 depends on col 1
         dep_map.insert(1_u16, col1_deps);
 
-        // No changed columns — only free
+        // No changed columns: only free
         let result = HybridIndexes::select_update_deps(&free, &dep_map, &[]);
         assert!(result.contains(0));
         assert!(!result.contains(1));
 
-        // Changed col 1 — free + col1 deps
+        // Changed col 1: free + col1 deps
         let result = HybridIndexes::select_update_deps(&free, &dep_map, &[1]);
         assert!(result.contains(0));
         assert!(result.contains(1));
 
-        // Changed col 99 — only free (no deps for col 99)
+        // Changed col 99: only free (no deps for col 99)
         let result = HybridIndexes::select_update_deps(&free, &dep_map, &[99]);
         assert!(result.contains(0));
         assert!(!result.contains(1));

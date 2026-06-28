@@ -91,8 +91,8 @@ pub(crate) fn decompress_with_limit(
 
 /// Hard cap for decompressed data in `decode` (defense against decompression bombs).
 ///
-/// Intentionally separate from [`super::shard::MAX_SHARD_UNCOMPRESSED_SIZE`] — each
-/// layer enforces its own limit independently.
+/// Separate from [`super::shard::MAX_SHARD_UNCOMPRESSED_SIZE`]: each layer
+/// enforces its own limit independently.
 pub(super) const MAX_DECODE_UNCOMPRESSED: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// Decompress and deserialize data
@@ -181,7 +181,7 @@ mod tests {
     }
 
     // =========================================================================
-    // D1 — Trailing bytes must be rejected
+    // D1: Trailing bytes must be rejected
     // =========================================================================
 
     #[test]
@@ -221,7 +221,7 @@ mod tests {
     }
 
     // =========================================================================
-    // D2 — decode applies decompression-bomb cap
+    // D2: decode applies decompression-bomb cap
     // =========================================================================
 
     #[test]

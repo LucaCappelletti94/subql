@@ -45,21 +45,20 @@ use thiserror::Error;
 pub trait WalParser<DB: DatabaseLike>: Send + Sync {
     /// The [`Checkpoint`] type this parser anchors events with.
     ///
-    /// PostgreSQL-flavored parsers should choose [`crate::PgLsn`]; MySQL
-    /// parsers choose [`crate::MysqlBinlogPos`]; multi-source or
-    /// position-free parsers use [`crate::NoCheckpoint`].
+    /// PostgreSQL-flavored parsers choose [`crate::PgLsn`]. MySQL parsers
+    /// choose [`crate::MysqlBinlogPos`]. Multi-source or position-free
+    /// parsers use [`crate::NoCheckpoint`].
     ///
-    /// Today most parsers in subql declare [`crate::NoCheckpoint`]; once
-    /// they read their source's position out of the wire format, they will
-    /// switch to the appropriate concrete type. Adding the associated type
-    /// up-front keeps that switch a single line per parser rather than a
-    /// trait-shape change later.
+    /// Most parsers currently declare [`crate::NoCheckpoint`]. Once they
+    /// read their source's position from the wire format they switch to
+    /// the concrete type. Declaring the associated type up-front keeps
+    /// that switch to one line per parser rather than a trait-shape change.
     type Checkpoint: Checkpoint;
 
     /// Parse a raw WAL message into zero or more events.
     ///
     /// Batched formats (e.g. wal2json v1) may return multiple events per
-    /// message; per-change formats (e.g. wal2json v2) return exactly one.
+    /// message. Per-change formats (e.g. wal2json v2) return exactly one.
     ///
     /// # Examples
     /// ```
@@ -532,7 +531,7 @@ mod tests {
         // "public.users" (qualified) and "users" (unqualified). With the
         // two schema-qualified `users` tables above and no bare `users`,
         // we expect an UnknownTable for the unqualified side and a hit on
-        // the qualified side — i.e. resolution **succeeds** to
+        // the qualified side, i.e. resolution succeeds to
         // `public.users`. To exercise the ambiguity error we instead
         // delegate to `resolve_table_reference` with two distinct
         // table-name strings (one playing the role of qualified, the

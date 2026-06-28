@@ -133,7 +133,7 @@ pub(super) struct MapCdcConfig<'a> {
     /// can be derived correctly even from a sparse old row.
     ///
     /// When `false` (e.g. Debezium, wal2json), the old row reflects whatever
-    /// the replica identity captured; a sparse row may be missing columns that
+    /// the replica identity captured. A sparse row may be missing columns that
     /// *did* change, so we only compute `changed_columns` when the old row is
     /// complete (conservative, avoids false negatives).
     pub old_is_changed_columns_only: bool,
@@ -180,7 +180,7 @@ pub(super) fn convert_map_cdc_event<DB: DatabaseLike>(
                 .map_or((None, Vec::new()), |(row, res)| (Some(row), res));
             // Use pre-update PK when the old row is complete (all columns present).
             // A complete old row guarantees PK columns are present, enabling correct
-            // index lookups when a PK column changes (e.g. id: 1 → 2).
+            // index lookups when a PK column changes (e.g. id: 1 -> 2).
             // Sparse old rows (e.g. Debezium DEFAULT replica identity, Maxwell changed-only)
             // may not contain PK columns, so we fall back to the new row's resolved values.
             let old_row_complete = super::old_row_is_complete(old_row.as_ref());
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(event.kind(), EventKind::Update);
         assert!(event.old_row().is_some());
         assert!(event.new_row().is_some());
-        // Partial old row → conservative: changed_columns is empty.
+        // Partial old row, conservative: changed_columns is empty.
         assert!(
             event.changed_columns().is_empty(),
             "partial old row must produce empty changed_columns to avoid false negatives"

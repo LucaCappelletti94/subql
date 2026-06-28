@@ -2,11 +2,11 @@
 //!
 //! [`CdcSource`] abstracts any transport that delivers replication
 //! events to subql as Postgres flushes them (or the equivalent for
-//! other backends). Concrete impls — e.g. `PgStreamingCdcSource` behind
-//! the `pg-streaming` feature — own the underlying connection, parse
+//! other backends). Concrete impls (e.g. `PgStreamingCdcSource` behind
+//! the `pg-streaming` feature) own the underlying connection, parse
 //! the wire bytes via the existing [`crate::wal`] parsers, and surface
-//! typed [`crate::WalEvent`]s through `next_event`. Caller drives the
-//! loop; acks flow back through `ack`.
+//! typed [`crate::WalEvent`]s through `next_event`. The caller drives
+//! the loop. Acks flow back through `ack`.
 //!
 //! The trait is runtime-agnostic: method signatures use `impl Future +
 //! Send` (RPITIT) rather than naming any specific executor. Subql core
@@ -31,13 +31,13 @@ use crate::{Checkpoint, WalEvent};
 /// `Self: Send` and the returned futures are `+ Send` so the trait is
 /// usable as a bound on engines that themselves move between async
 /// tasks. The pattern matches
-/// [`AsyncConnector`](crate::reexec::AsyncConnector); see its
+/// [`AsyncConnector`](crate::reexec::AsyncConnector). See its
 /// documentation for why bare `async fn in trait` is avoided.
 ///
 /// # Lifecycle
 ///
 /// 1. Build the source with backend-specific config.
-/// 2. Loop calling [`next_event`](Self::next_event); each call yields
+/// 2. Loop calling [`next_event`](Self::next_event). Each call yields
 ///    at most one event or returns `Ok(None)` on clean shutdown.
 /// 3. Periodically call [`ack`](Self::ack) with the latest applied
 ///    checkpoint so the upstream server can release retained WAL.
@@ -78,8 +78,8 @@ use crate::{Checkpoint, WalEvent};
 /// ```
 pub trait CdcSource: Send {
     /// Position type this source anchors events with. Postgres sources
-    /// pick [`crate::PgLsn`]; future MySQL sources will pick
-    /// [`crate::MysqlBinlogPos`]; sources without a wire-level
+    /// pick [`crate::PgLsn`]. Future MySQL sources will pick
+    /// [`crate::MysqlBinlogPos`]. Sources without a wire-level
     /// position pick [`crate::NoCheckpoint`].
     type Checkpoint: Checkpoint;
 
@@ -107,7 +107,7 @@ pub trait CdcSource: Send {
     /// `StandbyStatusUpdate`, MySQL slave heartbeat, ...) on a
     /// best-effort cadence so the server can recycle WAL. Calling
     /// `ack` more often than the source's internal status interval is
-    /// safe; calling it less often is also safe but extends the WAL
+    /// safe. Calling it less often is also safe but extends the WAL
     /// retention window.
     fn ack(
         &mut self,
@@ -120,7 +120,7 @@ mod tests {
     // `manual_async_fn` would have us write `async fn next_event(...)`
     // but bare `async fn in trait` does not produce `Send` futures,
     // which the trait signature requires. The `impl Future + Send`
-    // shape is intentional; clippy's suggestion is wrong here.
+    // shape is intentional. Clippy's suggestion is wrong here.
     #![allow(clippy::manual_async_fn)]
 
     use super::*;

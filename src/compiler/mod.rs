@@ -1,4 +1,4 @@
-//! SQL compilation pipeline: parse → normalize → compile to VM bytecode
+//! SQL compilation pipeline: parse -> normalize -> compile to VM bytecode
 
 pub mod bytecode;
 pub mod canonicalize;

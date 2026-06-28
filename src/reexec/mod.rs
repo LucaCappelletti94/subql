@@ -7,7 +7,7 @@
 //!
 //! This module is a *front-door* wrapper that sits above the engine and handles
 //! exactly those rejected queries. Supported queries pass straight through to
-//! the engine untouched; only the rejected ones are captured here.
+//! the engine untouched. Only the rejected ones are captured here.
 //!
 //! # Two engines
 //!
@@ -50,21 +50,21 @@
 //! [`TableLike::has_row_level_security`](sql_traits::prelude::TableLike::has_row_level_security)
 //! true are rejected at register time with
 //! [`RegisterError::AggregatorOnRlsTable`](crate::RegisterError::AggregatorOnRlsTable).
-//! Total per-consumer re-execution lifts this restriction in a follow-on.
+//! Total per-consumer re-execution would lift this restriction (see `MILESTONES.md`).
 //!
 //! # Known limitations (v1)
 //!
 //! - **Ties.** Deleting one of several rows holding the extreme forces a
 //!   re-execution even though the value is unchanged (a tie-count refinement
-//!   is left as future work; correctness never depends on it).
+//!   is left as future work. Correctness never depends on it).
 //! - **Initial values.** subql cannot compute initial values for stateful
 //!   subscriptions (it has no DB on its own). Callers either bootstrap via
 //!   [`ReExecEngine::install`] / [`AutoResolvingEngine::install`] or, under
 //!   the auto-resolving engine, accept whatever the connector returns on
 //!   the first re-execution.
-//! - **Async Connector.** v1 ships a sync [`Connector`] only. An
-//!   `AsyncConnector` and `AsyncAutoResolvingEngine` for sqlx/diesel-async
-//!   are planned but not implemented.
+//! - **Async Connector.** The [`AsyncConnector`] trait and
+//!   [`AsyncAutoResolvingEngine`] ship, but no concrete async backend
+//!   (sqlx, diesel-async) is bundled yet. See `MILESTONES.md`.
 
 mod async_auto;
 mod async_connector;

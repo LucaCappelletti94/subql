@@ -9,7 +9,7 @@ members = ["subql-demo"]
 # are (a) drop LTO from the workspace `release` profile, hurting subql
 # benches and the dioxus demo's wasm bundle size, or (b) keep fuzz as
 # its own workspace with its own profile and mirror the root
-# `[patch.crates-io]` block. We picked (b); see `fuzz/Cargo.toml`.
+# `[patch.crates-io]` block. We picked (b). See `fuzz/Cargo.toml`.
 exclude = ["fuzz"]
 
 [patch.crates-io]
@@ -31,7 +31,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Luca"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "SQL subscription dispatch engine for CDC event fanout"
 repository = "https://github.com/luca/subql"
 readme = "README.md"
@@ -66,7 +66,7 @@ name = "sqlparser_cursed"
 harness = false
 required-features = ["testing"]
 
-# Integration test for the DieselConnector; uses in-memory SQLite. Gated
+# Integration test for the DieselConnector. Uses in-memory SQLite. Gated
 # behind the `executor-diesel` feature so default `cargo test` does not try
 # to compile it.
 [[test]]
@@ -91,16 +91,17 @@ required-features = ["sqlite-cdc"]
 name = "proptest_sqlite_cdc"
 required-features = ["sqlite-cdc"]
 
-# End-to-end dispatch property test (Tier-2 + Tier-3): drives the source
-# plus the real `SubscriptionEngine` and a fixed query set, verifies
-# dispatched `ConsumerNotifications` against a Rust-side oracle. The
-# Tier-3 path also encodes events through `PgOutputBridge` and decodes
-# them back through `PgOutputParser`.
+# End-to-end dispatch property test (in-process dispatch and pgoutput
+# round-trip paths): drives the source plus the real `SubscriptionEngine`
+# and a fixed query set, verifies dispatched `ConsumerNotifications`
+# against a Rust-side oracle. The pgoutput round-trip path also encodes
+# events through `PgOutputBridge` and decodes them back through
+# `PgOutputParser`.
 [[test]]
 name = "proptest_sqlite_dispatch"
 required-features = ["sqlite-cdc"]
 
-# Tier-3 round-trip property test for `PgOutputBridge`: arbitrary
+# pgoutput round-trip property test for `PgOutputBridge`: arbitrary
 # `WalEvent` shapes encoded through the bridge must round trip back
 # through `PgOutputParser` unchanged.
 [[test]]
@@ -146,133 +147,13 @@ required-features = ["pg-streaming"]
 name = "cdc_equivalence"
 required-features = ["pg-streaming"]
 
-# One-shot empirical benchmark comparing the push-based source against a
-# minimal polling implementation. The polling implementation is
-# INTENTIONALLY NOT shipped in the library (see no-polling-cdc memory
-# rule); this benchmark exists solely to verify the architectural claim
-# that push delivers materially lower latency than polling. Run once,
-# paste numbers into `docs/benchmarks/`, do not deploy.
+# One-shot empirical benchmark comparing the two shipped library
+# transports: the push-based `PgStreamingCdcSource` against the polling
+# `PollingPgCdcSource`. Verifies the architectural claim that push
+# delivers materially lower latency than polling at any poll cadence.
+# Run once, paste numbers into `BENCHMARKS.md`.
 [[test]]
 name = "polling_vs_push_benchmark"
-required-features = ["pg-streaming"]
-
-# CDC workload benchmarks. Each example reproduces or extends the
-# polling-vs-push comparison across a different workload regime; they
-# are runnable programs (not assertions) whose stdout is meant to be
-# captured into `docs/benchmarks/`. See
-# `docs/cdc-workload-benchmark-plan.md` for the multi-phase plan. All
-# share `examples/cdc_bench_common/mod.rs`; that file is included via
-# `#[path = "cdc_bench_common/mod.rs"] mod common;` in each example.
-# Phase 1 is fully implemented; phases 2-5 are scaffolds with `todo!()`
-# workload bodies, awaiting follow-up implementation.
-
-[[example]]
-name = "phase1_baseline"
-required-features = ["pg-streaming"]
-
-[[example]]
-name = "phase2_mixed_iud"
-required-features = ["pg-streaming"]
-
-[[example]]
-name = "phase3_bursty"
-required-features = ["pg-streaming"]
-
-[[example]]
-name = "phase4_adversarial"
-required-features = ["pg-streaming"]
-
-[[example]]
-name = "phase5_schema_sweep"
-required-features = ["pg-streaming"]
-
-# Focused investigation example: the Phase 1 W1.3 push median (~30 ms
-# after a 3 s idle vs ~5 ms wire RTT) does not match the wire-bound
-# floor the architectural claim predicts. Sweeps idle duration and
-# status-pump cadence to isolate the cause. Output goes to
-# `docs/benchmarks/`.
-[[example]]
-name = "w1_3_idle_wakeup"
-required-features = ["pg-streaming"]
-
-# Focused investigation example: the Phase 1 W1.2 push median (13.9 ms
-# at 500/s vs W3.3's 3.4 ms baseline at 100/s) suggests the source's
-# bounded inner channel backpressures under high event rate. Sweeps
-# event gap x `buffer_capacity` to confirm or refute.
-[[example]]
-name = "w1_2_burst_rate"
-required-features = ["pg-streaming"]
-
-# Smoothed Phase 1: per cell, runs multiple trials with a fresh
-# source per trial and pools the samples. Produces tight, stable
-# numbers usable as the headline polling-vs-push comparison.
-[[example]]
-name = "phase1_smoothed"
-required-features = ["pg-streaming"]
-
-# Scale benchmark suite: three examples that together quantify where
-# push beats polling and by how much across realistic deployment
-# scales. Outputs both Markdown stdout AND parallel .tsv files for
-# external plotting. See docs/cdc-scale-report-2026-06-15.md for the
-# synthesis report.
-[[example]]
-name = "scale_throughput"
-required-features = ["pg-streaming"]
-
-[[example]]
-name = "scale_consumers"
-required-features = ["pg-streaming"]
-
-[[example]]
-name = "scale_retention"
-required-features = ["pg-streaming"]
-
-# Decouples writer side from CDC side: Experiment W (writers only,
-# no CDC consumers) vs Experiment C (single batched writer + N CDC
-# consumers at fixed total rate). Tests whether the N=100 cliff
-# observed in scale_consumers Experiment A is a write-side or CDC-
-# side bottleneck.
-[[example]]
-name = "scale_isolation"
-required-features = ["pg-streaming"]
-
-# 2D mesh: (N consumers x producer rate) grid. Emits long-form rows
-# usable as a heatmap, mapping the saturation surface as two
-# independent axes.
-[[example]]
-name = "scale_mesh"
-required-features = ["pg-streaming"]
-
-# Sanity check that two fresh PG containers with identical schema
-# produce CDC events that resolve to the same parser TableId via a
-# shared Arc<ParserDB>. If this passes, the mesh substrate can share
-# one catalog across M sources; if it fails, a per-source oid_remap
-# is needed in MultiSourceFanIn.
-[[example]]
-name = "mesh_oid_sanity"
-required-features = ["pg-streaming"]
-
-# Mesh topology T1: M independent PG containers, no PG-to-PG
-# replication, both subscription geometries (one-per-sub G1 and
-# many-per-sub G2), uniform and skewed load shapes.
-[[example]]
-name = "mesh_independent"
-required-features = ["pg-streaming"]
-
-# Mesh topology T2: PG-native logical replication tree. One primary
-# + (M-1) subscribers, all on a shared Docker network. Writers
-# commit on the primary only; the per-node CdcSource latency
-# difference quantifies the replication-delay tax.
-[[example]]
-name = "mesh_logical_rep"
-required-features = ["pg-streaming"]
-
-# Mesh topology T3: sharded workload across M independent PGs. G2
-# geometry only (one subscription spans all shards via
-# MultiSourceFanIn). Headline metric: per-shard drain fairness =
-# per-source drain rate / per-source write rate.
-[[example]]
-name = "mesh_sharded"
 required-features = ["pg-streaming"]
 
 [dependencies]
@@ -280,12 +161,12 @@ required-features = ["pg-streaming"]
 sqlparser = { version = "0.62", default-features = false }
 
 # Generic SQL schema traits + canonical SchemaFingerprint (FINGERPRINT_SPEC).
-# `default-features = false` follows sql-traits' own gating; the `std`
+# `default-features = false` follows sql-traits' own gating. The `std`
 # feature is propagated below.
 sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
 
 # Compressed bitmaps for predicate/user sets. Pinned below 0.11.4 because
-# that release bumped its MSRV to 1.90; subql's MSRV gate is 1.88.
+# that release bumped its MSRV to 1.90. Subql's MSRV gate is 1.88.
 roaring = ">=0.11, <0.11.4"
 
 # Stable ID allocation (predicates)
@@ -306,7 +187,7 @@ spin = { version = "0.10", default-features = false, features = ["mutex", "spin_
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "serde", "inline-more", "allocator-api2"] }
 seahash = "4.1"        # Deterministic hashing for canonicalization
 
-# Serialization — all no_std + alloc capable; std features propagated below.
+# Serialization. All no_std + alloc capable. Std features propagated below.
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
@@ -315,7 +196,7 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0", default-features = false }
 
 # I/O subsystem deps — only pulled in under the `std` feature. `lz4` wraps
-# a C lib via `std::io`; `toml` depends on `std::fs`/`std::io`. Both are
+# a C lib via `std::io`. `toml` depends on `std::fs`/`std::io`. Both are
 # used exclusively by `src/persistence/*` and `src/config.rs`.
 lz4 = { version = "1.24", optional = true }
 toml = { version = "1", optional = true }
@@ -331,20 +212,20 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 # upstream main already carries the `pgoutput-encoder` and optional-`tokio`
 # features that `no-std` builds on top of. Default features are off so
 # subql's `--no-default-features` build stays `no_std + alloc` with no
-# `tokio` and no C deps; the `std` feature below propagates `std` through.
+# `tokio` and no C deps. The `std` feature below propagates `std` through.
 pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "no-std", default-features = false }
 
 # Optional diesel-backed Connector for the auto-resolving re-execution
 # engine. Off by default - the lib's no_std + alloc / wasm32 surface stays
 # clean unless `executor-diesel` is enabled. Diesel's default features
-# (`with-deprecated` + its internal hashbrown wiring) are kept on; the
+# (`with-deprecated` + its internal hashbrown wiring) are kept on. The
 # downstream user activates whichever backend feature their diesel needs
-# (`postgres`, `mysql`, `sqlite`) on their own dep; here we stay
+# (`postgres`, `mysql`, `sqlite`) on their own dep. Here we stay
 # backend-agnostic.
 diesel = { version = "2", optional = true }
 
 # Connection-pool dep used by `PgR2D2DieselConnector`. Activated by the
-# `executor-diesel-postgres-r2d2` feature; ignored otherwise.
+# `executor-diesel-postgres-r2d2` feature. Ignored otherwise.
 r2d2 = { version = "0.8", optional = true }
 
 # PG-DDL to SQLite-DDL translator used by the in-process `SqliteCdcSource`
@@ -355,7 +236,7 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "
 
 # Future-combinator helpers (FuturesUnordered + StreamExt) used by the
 # async auto-resolving engine to dispatch deduplicated triggers
-# concurrently. `alloc` feature only; we do not depend on std-only
+# concurrently. `alloc` feature only. We do not depend on std-only
 # combinators here.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
@@ -366,10 +247,10 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 async-lock = { version = "3", default-features = false }
 
 # Push-based PG CDC source (`pg-streaming` feature). `pg_walstream` is
-# the unconditional parser dep above; the `rustls-tls` feature added by
+# the unconditional parser dep above. The `rustls-tls` feature added by
 # the `pg-streaming` cargo feature pulls the pure-Rust native backend.
 # `tokio` is pulled with just the channels + runtime + macros + time
-# bits the streaming source needs (no `rt-multi-thread`; the consumer
+# bits the streaming source needs (no `rt-multi-thread`. The consumer
 # chooses). `bytes` is the buffer type pg_walstream's stream surfaces;
 # `tokio-util` is what its `CancellationToken` lives in.
 tokio = { version = "1", optional = true, features = ["sync", "rt", "macros", "time"] }
@@ -446,7 +327,7 @@ executor-diesel-postgres-r2d2 = [
 # `cmake` for `aws-lc-rs`) and a `tokio` runtime surface for channels +
 # spawn + timers. Implies `std` (tokio is decidedly not no_std). The
 # trait `CdcSource` itself lives in subql core gated on `std` and is
-# runtime-agnostic; this feature only adds the reference impl.
+# runtime-agnostic. This feature only adds the reference impl.
 pg-streaming = [
     "std",
     "pg_walstream/rustls-tls",
@@ -455,8 +336,9 @@ pg-streaming = [
     "dep:bytes",
 ]
 
-# Opt-in: ship the in-process SQLite-backed CDC source for Tier-2 + Tier-3
-# testing. Installs triggers on a Diesel `SqliteConnection` and surfaces
+# Opt-in: ship the in-process SQLite-backed CDC source for the in-process
+# dispatch and pgoutput round-trip tests. Installs triggers on a Diesel
+# `SqliteConnection` and surfaces
 # row mutations as `WalEvent`s through the same `CdcSource` trait the PG
 # transports implement. The `PgOutputBridge` encodes `WalEvent`s as
 # `pgoutput` bytes via `pg_walstream`'s encoder so the production

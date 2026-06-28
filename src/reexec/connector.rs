@@ -12,23 +12,23 @@
 //!
 //! # Scope
 //!
-//! v1 is **sync only** and exposes a single method, [`Connector::execute_scalar`],
-//! sufficient for the [`MinMaxQuery`](super::maintain) flavor of re-execution.
-//! An async variant (`AsyncConnector`, async-fn-in-trait) and a row-set
-//! method (`execute_rows`, needed for single-table total re-execution) are
-//! planned follow-ons that ride the same auth-context machinery.
+//! [`Connector::execute_scalar`] resolves the [`MinMaxQuery`](super::maintain)
+//! flavor of re-execution and is the only method backed by a shipped impl.
+//! [`Connector::execute_rows`] exists for single-table total re-execution but
+//! the diesel-backed impls still stub it (see `MILESTONES.md`). An async peer
+//! lives in [`AsyncConnector`](super::AsyncConnector).
 //!
 //! # Authorization
 //!
 //! [`Connector::AuthContext`] is an associated type carried per
 //! subscription. Consumers that re-execute under per-viewer auth (e.g.
 //! PostgreSQL RLS via `set_config('request.jwt', ...)`) store the JWT or
-//! identity in the context; consumers without per-viewer state use `()`.
+//! identity in the context. Consumers without per-viewer state use `()`.
 //!
 //! # Error handling
 //!
 //! [`Connector::Error`] propagates as [`ReExecError::Connector`]. A single
-//! Connector failure aborts the entire `consumers()` batch; the caller is
+//! Connector failure aborts the entire `consumers()` batch. The caller is
 //! expected to retry the batch. Retry policy lives in the Connector impl
 //! (or above the engine), never inside subql.
 
@@ -93,7 +93,7 @@ use diesel::{
 /// [`ReExecError::Connector`] and aborts the rest of the dispatch batch.
 pub trait Connector {
     /// Per-subscription auth state carried verbatim to each execution.
-    /// Subql stores it opaquely; the connector's impl interprets it.
+    /// Subql stores it opaquely. The connector's impl interprets it.
     type AuthContext;
     /// Connector-specific error returned by [`execute_scalar`].
     ///
@@ -114,12 +114,12 @@ pub trait Connector {
     /// `sql` is exactly the string the plan rendered for re-execution and
     /// returned via [`Registered::ReExec`](super::Registered::ReExec) at
     /// registration, with its projection already aliased. `column_type`
-    /// is the plan's decode hint; impls may use it to pick the right diesel
+    /// is the plan's decode hint. Impls may use it to pick the right diesel
     /// `QueryableByName` row, sqlx `Row::try_get` slot, etc., or ignore it
     /// and inspect the runtime row shape.
     ///
     /// The returned tuple is `(value, Option<checkpoint>)`. The checkpoint
-    /// is informational for downstream replay layers; subql does not gate
+    /// is informational for downstream replay layers. Subql does not gate
     /// on it. An empty result set must return [`Cell::Null`] as the value
     /// (matches the "set went empty" semantics of MIN/MAX).
     fn execute_scalar(
@@ -132,8 +132,8 @@ pub trait Connector {
     /// Run `sql` as a row-returning query and decode every row.
     ///
     /// Used by the auto-resolving engine's `snapshot` method to bootstrap
-    /// a subscription, and (in a future phase) by total single-table row
-    /// re-execution. Impls should open a read-only repeatable-read
+    /// a subscription, and by total single-table row re-execution once that
+    /// lands (see `MILESTONES.md`). Impls should open a read-only repeatable-read
     /// transaction so the rows and the returned [`Snapshot::checkpoint`]
     /// agree on a single point in the source stream.
     fn execute_rows(
@@ -154,7 +154,7 @@ pub enum ReExecError<E> {
     #[error("dispatch failed: {0}")]
     Dispatch(#[from] DispatchError),
     /// The [`Connector`] failed to execute the re-execution SQL. The whole
-    /// batch is aborted; the caller is expected to retry it.
+    /// batch is aborted. The caller is expected to retry it.
     #[error("connector failed: {0}")]
     Connector(E),
 }
@@ -167,7 +167,7 @@ pub enum ReExecError<E> {
 ///
 /// Holds the connection in a [`RefCell`] for the interior-mutability the
 /// trait's `&self` requires. Not `Send`/`Sync` (diesel connections are not
-/// `Send`); for multi-threaded use, either keep the connector thread-local
+/// `Send`). For multi-threaded use, either keep the connector thread-local
 /// or implement [`Connector`] yourself over a connection pool
 /// (`r2d2::Pool<ConnectionManager<C>>`, `deadpool`, `bb8`).
 ///
@@ -253,7 +253,7 @@ where
     type Error = diesel::result::Error;
     /// Backend-agnostic v1 default: this connector does not read the
     /// underlying source's position. PG-aware variants
-    /// (`PgDieselConnector`, planned) override this to `PgLsn` and read
+    /// (`PgDieselConnector`) override this to `PgLsn` and read
     /// `pg_current_wal_lsn()` inside the snapshot transaction.
     type Checkpoint = crate::NoCheckpoint;
 
@@ -274,9 +274,9 @@ where
     ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
         // Row-set decoding through diesel's `sql_query` requires the
         // caller to know the schema at compile time (each column wants
-        // its own typed accessor). Phase 2 ships the trait shape; the
+        // its own typed accessor). The
         // generic row-decoding path lands with the total reexec feature
-        // (see docs/connetto-alignment-plan.md). For now this method is
+        // (tracked in MILESTONES.md). For now this method is
         // wired up as a panic so any caller that opts into it gets a
         // clear signal that it is not yet implemented for the generic
         // DieselConnector.
@@ -306,7 +306,7 @@ where
 /// snapshot at exactly the position the snapshot was taken.
 ///
 /// Holds the connection in a [`RefCell`] for the interior-mutability the
-/// trait's `&self` requires. Not `Send`/`Sync`; for multi-threaded use,
+/// trait's `&self` requires. Not `Send`/`Sync`. For multi-threaded use,
 /// either keep the connector thread-local or implement [`Connector`]
 /// yourself over a connection pool.
 ///
@@ -403,7 +403,7 @@ impl Connector for PgDieselConnector {
 /// completion.
 ///
 /// The pool's `get` failures (timeout, pool exhausted) surface as
-/// [`PgR2D2Error::Pool`]; the transaction's diesel errors surface as
+/// [`PgR2D2Error::Pool`]. The transaction's diesel errors surface as
 /// [`PgR2D2Error::Diesel`].
 ///
 /// `Send + Sync` so it can be shared across async tasks running on a

@@ -59,12 +59,12 @@ impl IdTypes for DefaultIds {
 pub enum SubscriptionScope<I: IdTypes> {
     /// Persists until explicitly unregistered.
     Durable,
-    /// Bound to a session; auto-removed when the session ends.
+    /// Bound to a session. Auto-removed when the session ends.
     Session(I::SessionId),
 }
 
-// Manual impls avoid derived bounds that would require `I: Copy/Clone/Debug/…`.
-// Only `I::SessionId` (already `Copy + Debug + Hash + …` via `Id`) is needed.
+// Manual impls avoid derived bounds that would require `I: Copy/Clone/Debug/...`.
+// Only `I::SessionId` (already `Copy + Debug + Hash + ...` via `Id`) is needed.
 impl<I: IdTypes> Copy for SubscriptionScope<I> {}
 impl<I: IdTypes> Clone for SubscriptionScope<I> {
     fn clone(&self) -> Self {
@@ -123,11 +123,11 @@ pub type MergeJobId = u64;
 pub enum EventKind {
     /// Row insertion
     Insert,
-    /// Row update (old → new)
+    /// Row update (old -> new)
     Update,
     /// Row deletion
     Delete,
-    /// Table truncate — all rows in the table are removed.
+    /// Table truncate: all rows in the table are removed.
     ///
     /// **Fanout semantics**: TRUNCATE does not carry a row image, so `consumers()`
     /// skips predicate VM evaluation and notifies row subscriptions for the
@@ -505,7 +505,7 @@ impl PrimaryKey {
 ///
 /// Generic in `C: Checkpoint` so events can carry the source's position
 /// token. Synthetic tests and checkpoint-free contexts may use the default
-/// `C = NoCheckpoint`; CDC sources (wal2json, Maxwell, Debezium) pin their
+/// `C = NoCheckpoint`. CDC sources (wal2json, Maxwell, Debezium) pin their
 /// own concrete `Checkpoint` impl ([`crate::PgLsn`],
 /// [`crate::MysqlBinlogPos`], etc.).
 #[derive(Clone, Debug)]
@@ -956,7 +956,7 @@ impl<C: Checkpoint> TruncateEventBuilder<C> {
 impl WalEvent<NoCheckpoint> {
     /// Start fluent construction for a WAL event with no checkpoint.
     ///
-    /// Returns a builder pinned to `NoCheckpoint`; this is what synthetic
+    /// Returns a builder pinned to `NoCheckpoint`. This is what synthetic
     /// tests and checkpoint-free contexts want. To produce events with a
     /// concrete checkpoint type, use
     /// [`WalEventBuilderStart::with_typed_checkpoint`] or
@@ -1039,7 +1039,7 @@ impl<C: Checkpoint> WalEvent<C> {
     /// position out-of-band (e.g. the LSN carried in a pgoutput
     /// `XLogData` frame header). The event's structural content
     /// (`table_id`, `pk`, row images, `changed_columns`) is preserved
-    /// byte-for-byte; only the checkpoint type and value change.
+    /// byte-for-byte. Only the checkpoint type and value change.
     #[must_use]
     pub fn set_checkpoint<C2: Checkpoint>(self, new_checkpoint: Option<C2>) -> WalEvent<C2> {
         match self {
@@ -1261,7 +1261,7 @@ pub enum EvictionPolicy {
     /// Evict the subscription with the oldest `last_dispatch_at`.
     /// Subscriptions never matched by an event are considered "least
     /// active" (their `last_dispatch_at` is `None`, treated as -infinity)
-    /// and are evicted first; ties resolve by oldest `SubscriptionId`.
+    /// and are evicted first. Ties resolve by oldest `SubscriptionId`.
     ///
     /// Requires activity stamping: configuring this policy makes
     /// [`SubscriptionEngine::consumers`](crate::SubscriptionEngine::consumers)
@@ -1320,7 +1320,7 @@ pub enum EvictionPolicy {
     /// engine.consumers(&make_event(2, 10)?)?;
     ///
     /// // Third registration hits the cap. `first` was stamped at t=10
-    /// // and `_second` at t=30 — `first` is the least active and is
+    /// // and `_second` at t=30. `first` is the least active and is
     /// // evicted to make room.
     /// let third = engine.register(SubscriptionRequest::new(
     ///     3u64,
@@ -1476,13 +1476,13 @@ pub enum EvictionPolicy {
 /// Surfaced through [`SubscriptionsView`] to the closure passed to
 /// [`SubscriptionEngine::with_custom_eviction`](crate::SubscriptionEngine::with_custom_eviction).
 /// Activity-aware policies use `last_dispatch_at` / `dispatch_count` to
-/// pick a victim; scope/consumer-aware policies use `scope` / `consumer_id`.
+/// pick a victim. Scope/consumer-aware policies use `scope` / `consumer_id`.
 /// Subscriptions never matched by an event have `last_dispatch_at = None`
 /// and `dispatch_count = 0`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SubscriptionMetadata<I: IdTypes> {
-    /// Engine-assigned subscription identifier (monotonic; lower is older).
+    /// Engine-assigned subscription identifier (monotonic. Lower is older).
     pub subscription_id: SubscriptionId,
     /// Consumer who owns this subscription.
     pub consumer_id: I::ConsumerId,
@@ -1500,7 +1500,7 @@ pub struct SubscriptionMetadata<I: IdTypes> {
 
 impl<I: IdTypes> SubscriptionMetadata<I> {
     /// Construct a [`SubscriptionMetadata`] with the canonical fields.
-    /// The struct is `#[non_exhaustive]`; use this constructor (rather
+    /// The struct is `#[non_exhaustive]`. Use this constructor (rather
     /// than a struct literal) so callers compile across future field
     /// additions.
     #[must_use]
@@ -1525,7 +1525,7 @@ impl<I: IdTypes> SubscriptionMetadata<I> {
 /// eviction closures.
 ///
 /// Cheap to construct (borrows the engine's internal HashMap entries).
-/// The closure must not retain the borrow past the call; lifetime is
+/// The closure must not retain the borrow past the call. Lifetime is
 /// bounded to the single call into the custom eviction function.
 ///
 /// ```
@@ -1602,7 +1602,7 @@ pub struct RegisterResult {
     ///
     /// Empty under the default policy ([`EvictionPolicy::Reject`]) and
     /// when the registry is below cap. Populated when an eviction policy
-    /// freed space; the caller may use this to notify the affected
+    /// freed space. The caller may use this to notify the affected
     /// clients (e.g. send an "evicted" signal over their transport).
     pub evicted: Vec<SubscriptionId>,
 }
@@ -1714,7 +1714,7 @@ pub trait DurableShardStore: Send {
 /// Column value type for aggregate validation at registration time.
 ///
 /// Returned by [`crate::catalog_helpers::column_type`] when the live database
-/// exposes type information for the column; SUM/AVG over `Bool`/`String`
+/// exposes type information for the column. SUM/AVG over `Bool`/`String`
 /// columns is rejected at registration time, while `Unknown` is permissive.
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1727,7 +1727,7 @@ pub enum ColumnType {
     Bool,
     /// UTF-8 string
     String,
-    /// Unknown or mixed type (treated as potentially numeric — no error)
+    /// Unknown or mixed type (treated as potentially numeric, no error)
     Unknown,
 }
 
@@ -1735,11 +1735,11 @@ pub enum ColumnType {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AggDelta {
-    /// COUNT(*) / COUNT(column) delta — always ±1 per matching (non-NULL) row.
+    /// COUNT(*) / COUNT(column) delta: always +/-1 per matching (non-NULL) row.
     Count(i64),
-    /// SUM(column) delta — signed change in the column sum.
+    /// SUM(column) delta: signed change in the column sum.
     Sum(f64),
-    /// AVG(column) delta — both components needed to update a running average.
+    /// AVG(column) delta: both components needed to update a running average.
     ///
     /// Caller maintains `running_sum` and `running_count` separately:
     /// ```text
@@ -1857,7 +1857,7 @@ impl<I: IdTypes, C: Checkpoint> ConsumerNotifications<I, C> {
     }
 
     /// Decompose into `(inserted, deleted, updated)`. The checkpoint is
-    /// dropped; use [`checkpoint`](Self::checkpoint) first if needed.
+    /// dropped. Use [`checkpoint`](Self::checkpoint) first if needed.
     #[must_use]
     #[allow(clippy::type_complexity)]
     pub fn into_parts(self) -> (Vec<I::ConsumerId>, Vec<I::ConsumerId>, Vec<I::ConsumerId>) {
@@ -1876,8 +1876,8 @@ impl<I: IdTypes, C: Checkpoint> core::fmt::Debug for ConsumerNotifications<I, C>
     }
 }
 
-/// Iterator over `inserted ∪ updated` consumers — those who should see the
-/// current row state.
+/// Iterator over `inserted` and `updated` consumers: those who should see
+/// the current row state.
 pub struct ConsumerNotificationsIter<I: IdTypes> {
     inserted: alloc::vec::IntoIter<I::ConsumerId>,
     updated: alloc::vec::IntoIter<I::ConsumerId>,
@@ -1908,7 +1908,7 @@ impl<I: IdTypes, C: Checkpoint> IntoIterator for ConsumerNotifications<I, C> {
     }
 }
 
-/// Aggregate dispatch — delivers typed signed deltas for aggregate subscriptions.
+/// Aggregate dispatch: delivers typed signed deltas for aggregate subscriptions.
 ///
 /// Separate from [`SubscriptionDispatch`] because:
 /// - UPDATE events require evaluating **both** the old row and the new row.
@@ -1918,12 +1918,12 @@ impl<I: IdTypes, C: Checkpoint> IntoIterator for ConsumerNotifications<I, C> {
 /// # Caller contract
 ///
 /// The engine handles only WAL-driven deltas. Callers must:
-/// 1. **Bootstrap** — query the DB for the initial aggregate **before** subscribing.
-/// 2. **Accumulate** — `running_value += delta` on each call.
-/// 3. **Reset on policy change** — RLS/ACL changes produce no WAL events;
-///    re-query the DB and replace the stored value.
-/// 4. **Reset on TRUNCATE** — engine returns `Err(TruncateRequiresReset)`;
-///    caller must re-query and replace the stored value.
+/// 1. **Bootstrap**: query the DB for the initial aggregate **before** subscribing.
+/// 2. **Accumulate**: `running_value += delta` on each call.
+/// 3. **Reset on policy change**: RLS/ACL changes produce no WAL events.
+///    Re-query the DB and replace the stored value.
+/// 4. **Reset on TRUNCATE**: engine returns `Err(TruncateRequiresReset)`.
+///    Re-query and replace the stored value.
 pub trait AggregateDispatch<I: IdTypes>: Send {
     /// Compute typed signed deltas for all matching aggregate subscriptions.
     ///

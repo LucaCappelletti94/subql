@@ -16,9 +16,9 @@ const UNSUPPORTED_PROJECTION: &str =
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QueryProjection {
-    /// `SELECT *` — deliver row events (default, current behaviour).
+    /// `SELECT *`: deliver row events (default, current behaviour).
     Rows,
-    /// `SELECT <aggregate>` — deliver signed count deltas.
+    /// `SELECT <aggregate>`: deliver signed count deltas.
     Aggregate(AggSpec),
 }
 
@@ -70,9 +70,9 @@ fn extract_column_arg(arg: &FunctionArg) -> Option<String> {
 
 /// Resolve a single bare-column aggregate argument (`SUM(col)`, `MIN(col)`,
 /// etc.) to a `ColumnId`. Rejects `FILTER`, `OVER`, `DISTINCT`, wildcard
-/// arguments, multi-argument calls, and non-column expressions. It does not
-/// constrain the column type; callers that require a numeric column layer
-/// that check on top (see [`resolve_numeric_agg_column`]).
+/// arguments, multi-argument calls, and non-column expressions. Does not
+/// constrain the column type. Callers needing a numeric column add that
+/// check on top (see [`resolve_numeric_agg_column`]).
 ///
 /// `display` is the upper-cased function name used in error messages.
 pub(crate) fn resolve_single_column_arg<DB: DatabaseLike>(
@@ -197,7 +197,7 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
 
     let items = &select.projection;
 
-    // SELECT * — single wildcard item
+    // SELECT *: single wildcard item
     if items.len() == 1 {
         if let SelectItem::Wildcard(_) = &items[0] {
             return Ok(QueryProjection::Rows);
@@ -208,7 +208,7 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
     if items.len() == 1 {
         let expr = match &items[0] {
             // `expr`, `expr AS alias`, and Spark-SQL's `expr AS (a1, a2, ...)`
-            // all project the same underlying expression; subql doesn't care
+            // all project the same underlying expression. subql does not care
             // about the alias names, only the expression shape (COUNT/SUM/AVG/
             // wildcard).
             SelectItem::UnnamedExpr(e)
@@ -223,7 +223,7 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
         };
 
         if let Expr::Function(f) = expr {
-            // Get the (unqualified) function name — last ObjectName part.
+            // Get the (unqualified) function name (last ObjectName part).
             let func_name = f
                 .name
                 .0
@@ -233,7 +233,7 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
 
             match func_name.as_deref() {
                 Some("count") => {
-                    // Supports COUNT(*) and COUNT(column) — no FILTER, OVER, or DISTINCT.
+                    // Supports COUNT(*) and COUNT(column): no FILTER, OVER, or DISTINCT.
                     if f.filter.is_some() {
                         return Err(RegisterError::UnsupportedSql(
                             "COUNT FILTER (WHERE ...) not supported".to_string(),
@@ -258,14 +258,14 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
                                     "COUNT requires exactly one argument".to_string(),
                                 ));
                             }
-                            // COUNT(*) — wildcard arg
+                            // COUNT(*): wildcard arg
                             if matches!(
                                 &list.args[0],
                                 FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
                             ) {
                                 return Ok(QueryProjection::Aggregate(AggSpec::CountStar));
                             }
-                            // COUNT(column) — plain column identifier
+                            // COUNT(column): plain column identifier
                             let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
                                 RegisterError::UnsupportedSql(
                                     "COUNT argument must be * or a plain column name, not an expression"
@@ -302,7 +302,7 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
                 }
                 Some(name @ ("min" | "max")) => Err(RegisterError::UnsupportedSql(format!(
                     "{} aggregate not supported, not delta-composable. \
-                     See src/todo.md for design notes.",
+                     See MILESTONES.md for design notes.",
                     name.to_uppercase()
                 ))),
                 _ => Err(RegisterError::UnsupportedSql(
@@ -398,7 +398,7 @@ pub(crate) fn extract_scalar_aggregate<DB: DatabaseLike>(
 
 /// Parse and validate a single SQL statement from text.
 ///
-/// Encapsulates the common sequence: length / sanity check → parse →
+/// Encapsulates the common sequence: length / sanity check -> parse ->
 /// single-statement assertion.
 pub(super) fn parse_single_statement(
     sql: &str,
@@ -443,8 +443,8 @@ pub(super) const MAX_SQL_LEN: usize = 8192;
 ///
 /// Tracks parenthesis nesting and consecutive-operator runs, requires
 /// balanced parens at EOF, and rejects non-whitespace control characters
-/// (NUL, vertical tab, form feed, etc.). Real SQL contains none of those;
-/// fuzz-found inputs that hit them have driven sqlparser to near-exponential
+/// (NUL, vertical tab, form feed, etc.). Real SQL contains none of those.
+/// Fuzz-found inputs that hit them have driven sqlparser to near-exponential
 /// parse times.
 fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
     let mut paren_depth: usize = 0;

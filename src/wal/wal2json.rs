@@ -2,8 +2,8 @@
 //!
 //! [wal2json](https://github.com/eulerto/wal2json) is a PostgreSQL logical
 //! decoding output plugin that emits changes as JSON. Version 1 batches all
-//! changes in a transaction into a single message; version 2 emits one message
-//! per change.
+//! changes in a transaction into a single message. Version 2 emits one
+//! message per change.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -25,7 +25,7 @@ use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
 use sql_traits::prelude::DatabaseLike;
 
 // ============================================================================
-// Serde structs — v1
+// Serde structs: v1
 // ============================================================================
 
 #[derive(Deserialize)]
@@ -57,7 +57,7 @@ struct Wal2JsonV1OldKeys {
 }
 
 // ============================================================================
-// Serde structs — v2
+// Serde structs: v2
 // ============================================================================
 
 #[derive(Deserialize)]
@@ -76,7 +76,7 @@ struct Wal2JsonV2Message {
     #[serde(default)]
     pub pk: Option<Vec<Wal2JsonV2PkColumn>>,
     /// PostgreSQL LSN in `"hi/lo"` hex notation when wal2json was invoked
-    /// with `include-lsn=true`. Absent otherwise; `convert_v2_message`
+    /// with `include-lsn=true`. Absent otherwise. `convert_v2_message`
     /// surfaces `Some(PgLsn)` when present and parsable.
     #[serde(default)]
     pub lsn: Option<String>,
@@ -175,7 +175,7 @@ fn parse_v2_kind(action: &str) -> Result<EventKind, WalParseError> {
 
 /// Build a [`RowImage`] from parallel name/type/value arrays.
 ///
-/// Returns `(row_image, Vec<(ColumnId, Cell)>)` — the vec is used for PK
+/// Returns `(row_image, Vec<(ColumnId, Cell)>)`. The vec is used for PK
 /// extraction.
 fn build_row_from_arrays<DB: DatabaseLike>(
     names: &[String],
@@ -276,7 +276,7 @@ fn convert_v1_change<DB: DatabaseLike>(
     };
 
     let (old_row, pk) = if let Some(ref oldkeys) = change.oldkeys {
-        // Build old row from oldkeys (sparse — only key columns)
+        // Build old row from oldkeys (sparse: only key columns)
         let (row, _) = build_row_from_arrays(
             &oldkeys.keynames,
             &oldkeys.keytypes,
@@ -295,7 +295,7 @@ fn convert_v1_change<DB: DatabaseLike>(
 
         (Some(row), pk)
     } else {
-        // INSERT without oldkeys — extract PK from new row using database metadata
+        // INSERT without oldkeys: extract PK from new row using database metadata
         let pk = pk_from_catalog_or_empty(&new_resolved, table_id, database)?;
         (None, pk)
     };
@@ -391,14 +391,14 @@ fn convert_v2_message<DB: DatabaseLike>(
             )?;
             build_pk_from_resolved(&identity_resolved, &pk_col_ids)
         } else {
-            // No pk metadata — use all identity columns as PK
+            // No pk metadata: use all identity columns as PK
             let cols: Vec<ColumnId> = identity_resolved.iter().map(|(c, _)| *c).collect();
             let vals: Vec<Cell> = identity_resolved.iter().map(|(_, v)| v.clone()).collect();
             PrimaryKey::new(Arc::from(cols), Arc::from(vals))
                 .expect("identity columns and values are built in lockstep")
         }
     } else if let Some(ref pk_cols) = msg.pk {
-        // INSERT — extract PK from new row using pk metadata
+        // INSERT: extract PK from new row using pk metadata
         let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
         let pk_col_ids =
             strict_pk_column_ids_from_names(table_id, &pk_names, &new_resolved, database, "pk")?;
@@ -520,7 +520,7 @@ mod tests {
         assert_eq!(new.get(2), Some(&Cell::Float(149.95)));
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("shipped"))));
 
-        // Old row (sparse — only key columns)
+        // Old row (sparse: only key columns)
         let old = ev.old_row().expect("UPDATE should have old_row");
         assert_eq!(old.get(0), Some(&Cell::Int(1)));
         assert_eq!(old.get(1), Some(&Cell::Missing)); // not in oldkeys
@@ -926,7 +926,7 @@ mod tests {
         let catalog = orders_catalog();
         let parser = Wal2JsonV2Parser;
 
-        // "X" is not a known v2 action; it must be skipped, not error.
+        // "X" is not a known v2 action. It must be skipped, not error.
         let json = r#"{"action":"X","schema":"public","table":"orders"}"#;
         let events = parser
             .parse_wal_message(json.as_bytes(), &catalog)
@@ -940,7 +940,7 @@ mod tests {
     fn v1_unknown_kind_is_skipped() {
         let catalog = orders_catalog();
         let parser = Wal2JsonV1Parser;
-        // "schema_change" is not insert/update/delete; it must be skipped, not error.
+        // "schema_change" is not insert/update/delete. It must be skipped, not error.
         let json = r#"{"change":[{"kind":"schema_change","schema":"public","table":"orders","columnnames":["id"],"columntypes":["integer"],"columnvalues":[1]}]}"#;
         let events = parser
             .parse_wal_message(json.as_bytes(), &catalog)
@@ -1075,7 +1075,7 @@ mod tests {
 
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Update);
-        // No oldkeys → no old_row → changed_columns is empty
+        // No oldkeys, no old_row, changed_columns is empty
         assert!(ev.old_row().is_none());
         assert!(ev.changed_columns().is_empty());
     }
@@ -1139,7 +1139,7 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        // No oldkeys and no catalog PK → empty PK
+        // No oldkeys and no catalog PK: empty PK
         assert!(ev.pk().columns.is_empty());
         assert!(ev.pk().values.is_empty());
     }
@@ -1201,7 +1201,7 @@ mod tests {
             .expect("parse should succeed");
 
         let ev = &events[0];
-        // No pk metadata and no catalog PK → empty PK
+        // No pk metadata and no catalog PK: empty PK
         assert!(ev.pk().columns.is_empty());
         assert!(ev.pk().values.is_empty());
     }
@@ -1234,7 +1234,7 @@ mod tests {
 
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Update);
-        // No identity → no old_row → changed_columns empty
+        // No identity, no old_row, changed_columns empty
         assert!(ev.old_row().is_none());
         assert!(ev.changed_columns().is_empty());
     }

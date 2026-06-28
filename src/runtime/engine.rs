@@ -67,7 +67,7 @@ type CustomEvictor<I> =
 
 /// Internal dispatch shape for the configured eviction behavior.
 ///
-/// `BuiltIn` wraps the user-facing [`crate::EvictionPolicy`] enum;
+/// `BuiltIn` wraps the user-facing [`crate::EvictionPolicy`] enum.
 /// `Custom` holds a closure provided through
 /// [`SubscriptionEngine::with_custom_eviction`]. Held internally so the
 /// public `EvictionPolicy` enum stays plain `Copy` (closures break
@@ -187,32 +187,32 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     dialect: D,
     /// Schema database for table/column resolution
     database: Arc<DB>,
-    /// Table partitions (TableId → TablePartition)
+    /// Table partitions (TableId -> TablePartition)
     partitions: HashMap<TableId, TablePartition<I>>,
-    /// User dictionaries (TableId → ConsumerDictionary)
+    /// User dictionaries (TableId -> ConsumerDictionary)
     consumer_dictionaries: HashMap<TableId, ConsumerDictionary<I>>,
     /// Subscription index for O(1) unregister/upsert lookup.
     subscription_to_table: HashMap<SubscriptionId, TableId>,
     /// Monotonic counter for auto-assigning subscription IDs (starts at 1).
     next_subscription_id: u64,
-    /// Dedup index: (consumer_id, predicate_hash, scope) → existing SubscriptionId.
+    /// Dedup index: (consumer_id, predicate_hash, scope) -> existing SubscriptionId.
     binding_dedup: HashMap<(I::ConsumerId, u128, SubscriptionScope<I>), SubscriptionId>,
     /// VM for bytecode evaluation
     vm: Vm,
     /// Optional cap on the number of live subscriptions. `None` means no
-    /// cap; the registry can grow unbounded.
+    /// cap. The registry can grow unbounded.
     max_subscriptions: Option<usize>,
     /// Eviction strategy applied when [`max_subscriptions`](Self::max_subscriptions)
     /// would be exceeded. Default `BuiltIn(EvictionPolicy::Reject)`.
     eviction_strategy: EvictionStrategy<I>,
     /// Monotonic clock used by activity-aware eviction policies to stamp
     /// `last_dispatch_at`. Lazy-initialised to a `StdClock` the first time
-    /// an activity-aware policy is configured; remains `None` for the
+    /// an activity-aware policy is configured. Remains `None` for the
     /// default (no cap) and for non-activity policies so dispatch stays
     /// allocation-free.
     activity_clock: Option<crate::ClockHandle>,
     /// Per-subscription activity counters. Populated only when an
-    /// activity-aware policy is configured; empty otherwise so dispatch
+    /// activity-aware policy is configured. Empty otherwise so dispatch
     /// pays no cost.
     subscription_activity: HashMap<SubscriptionId, ActivityStats>,
     /// Optional storage path for durability
@@ -229,15 +229,13 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     /// Per-`(session, subscription)` resume cursor.
     ///
     /// Stored as an [`OpaqueCheckpoint`] so the engine does not have to
-    /// carry a struct-level `C: Checkpoint` generic; the materializer
+    /// carry a struct-level `C: Checkpoint` generic. The materializer
     /// serialises its concrete checkpoint type (`PgLsn`,
     /// `MysqlBinlogPos`, ...) to bytes before installing, deserialises
     /// on read. The map's cleanup is hooked into
     /// [`unregister_session`](Self::unregister_session) and the
     /// per-subscription unregister paths so cursors never outlive
     /// their owning subscription.
-    ///
-    /// See `connetto-rs` Q6.4 for the underlying delegation.
     resume_cursors: HashMap<(I::SessionId, SubscriptionId), crate::OpaqueCheckpoint>,
 }
 
@@ -338,7 +336,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         };
 
         let pred = Predicate {
-            // Placeholder; store allocates the authoritative ID.
+            // Placeholder. Store allocates the authoritative ID.
             id: PredicateId::from_slab_index(0),
             hash: compiled.hash,
             normalized_sql: compiled.normalized.clone().into(),
@@ -499,10 +497,10 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// the cap is hard: `register` returns [`RegisterError::RegistryFull`]
     /// once the registry is full. With [`crate::EvictionPolicy::EvictOldest`]
     /// the oldest subscription (lowest [`SubscriptionId`]) is evicted to
-    /// make room; activity-aware policies such as
+    /// make room. Activity-aware policies such as
     /// [`crate::EvictionPolicy::EvictLeastActive`] /
     /// [`crate::EvictionPolicy::EvictColdest`] additionally enable
-    /// per-subscription dispatch stamping; topological policies such as
+    /// per-subscription dispatch stamping. Topological policies such as
     /// [`crate::EvictionPolicy::EvictBySession`] /
     /// [`crate::EvictionPolicy::EvictByConsumer`] pick the victim from a
     /// preferred slice of the registry. In every non-`Reject` case the
@@ -536,7 +534,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// configuring this builder turns on activity stamping in
     /// [`Self::consumers`], so the activity stats stay current.
     ///
-    /// The closure runs synchronously on the registration path; keep it
+    /// The closure runs synchronously on the registration path. Keep it
     /// cheap. It must be `Send + Sync + 'static` so the engine remains
     /// `Send + Sync` whenever `I` is.
     ///
@@ -604,7 +602,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
     /// Replace the activity clock used by activity-aware eviction
     /// policies. Useful in tests to drive `last_dispatch_at` with a
-    /// `ManualClock`; production builds should rely on the default
+    /// `ManualClock`. Production builds should rely on the default
     /// `StdClock` selected by the builder methods.
     #[must_use]
     pub fn with_activity_clock(mut self, clock: crate::ClockHandle) -> Self {
@@ -685,7 +683,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         let table_id = compiled.table_id;
         let hash = compiled.hash;
 
-        // 2. Check dedup index: same (consumer_id, predicate_hash, scope) → idempotent return.
+        // 2. Check dedup index: same (consumer_id, predicate_hash, scope) -> idempotent return.
         let natural_key = (compiled.spec.consumer_id, hash, compiled.spec.scope);
         if let Some(&existing_sub_id) = self.binding_dedup.get(&natural_key) {
             return Ok(RegisterResult {
@@ -797,7 +795,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// the `evicted` accounting under an eviction policy. When an
     /// active eviction policy is configured (anything other than
     /// `Reject`), the implementation transparently falls back to a
-    /// sequential `register()` loop to maintain parity; the bulk-COW
+    /// sequential `register()` loop to maintain parity. The bulk-COW
     /// fast path applies to the no-cap and `Reject`-cap cases.
     ///
     /// # Examples
@@ -925,7 +923,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                         continue;
                     }
                     // First occurrence of this natural key within the
-                    // batch; record so subsequent duplicates can defer
+                    // batch. Record so subsequent duplicates can defer
                     // onto it.
                     batch_natural_dedup.insert(natural_key, results.len());
                     results.push(Ok(RegisterResult {
@@ -982,7 +980,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                     if self.unregister_subscription_internal(victim).is_some() {
                         evicted_per_spec.entry(i).or_default().push(victim);
                     } else {
-                        // Defensive: victim disappeared; do not loop.
+                        // Defensive: victim disappeared. Do not loop.
                         results[i] = Err(RegisterError::RegistryFull { cap });
                         break;
                     }
@@ -1029,7 +1027,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
             if let Some(pred_id) = existing {
                 // Existing-predicate path commits subscription_to_table
-                // immediately below — does NOT add to pending_uncommitted.
+                // immediately below. Does NOT add to pending_uncommitted.
                 let binding = Self::make_binding(&c.spec, subscription_id, pred_id, consumer_ord);
                 partition.add_binding(binding, pred_id);
                 self.subscription_to_table
@@ -1199,12 +1197,10 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     // ----------------------------------------------------------------
-    // Per-`(session, subscription)` resume cursor API. See
-    // `connetto-rs` Q6.4 (`docs/architecture/open-questions.md`) for
-    // the underlying contract. The cursor is the position the
-    // materializer last successfully dispatched to the client; on
-    // reconnect the materializer compares it against its own oplog
-    // watermark to decide catchup vs full re-sync.
+    // Per-`(session, subscription)` resume cursor API. The cursor is the
+    // position the materializer last successfully dispatched to the
+    // client. On reconnect the materializer compares it against its own
+    // oplog watermark to decide catchup vs full re-sync.
     // ----------------------------------------------------------------
 
     /// Advance the resume cursor for `(session_id, sub_id)` to
@@ -1218,7 +1214,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// is strictly less than the stored value (a rewind) and **does
     /// not** mutate the map. A successful dispatch never moves a
     /// client backwards in the CDC stream, so a rewind is always a
-    /// caller bug; use [`force_set_cursor`](Self::force_set_cursor)
+    /// caller bug. Use [`force_set_cursor`](Self::force_set_cursor)
     /// for the legitimate snapshot-bootstrap / recovery escape hatch.
     ///
     /// # Errors
@@ -1293,7 +1289,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// Remove the resume cursor for `(session_id, sub_id)` and return
     /// the previously stored value, if any. Intended for the
     /// materializer's "I am done with this subscription on this
-    /// session" path; routine cleanup happens automatically via
+    /// session" path. Routine cleanup happens automatically via
     /// [`unregister_session`](Self::unregister_session) and
     /// [`unregister_subscription`](Self::unregister_subscription).
     pub fn drop_cursor(
@@ -1318,7 +1314,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     }
 
     /// Collect a [`crate::SubscriptionMetadata`] snapshot for every live
-    /// subscription. Allocates one `Vec` per call; only invoked from the
+    /// subscription. Allocates one `Vec` per call. Only invoked from the
     /// register cap-branch and the custom-eviction closure path, so it
     /// is off the hot dispatch path.
     fn collect_subscription_metadata(&self) -> Vec<crate::SubscriptionMetadata<I>> {
@@ -1399,7 +1395,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                 for m in &metas {
                     *per_consumer.entry(m.consumer_id).or_insert(0) += 1;
                 }
-                // Largest holder wins; ties resolve by lowest consumer id
+                // Largest holder wins. Ties resolve by lowest consumer id
                 // so the choice is deterministic across HashMap orderings.
                 let target_consumer = per_consumer
                     .into_iter()
@@ -1445,7 +1441,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
                 return Some(removal.predicate_removed);
             }
 
-            // Stale index entry; clean it up and fall back to scan.
+            // Stale index entry. Clean it up and fall back to scan.
             self.subscription_to_table.remove(&subscription_id);
         }
 
@@ -1611,7 +1607,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         }
     }
 
-    /// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), …).
+    /// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), ...).
     ///
     /// Returns `Vec<(ConsumerId, AggDelta)>`` where each entry is the net signed change
     /// for that consumer's aggregate predicate. Zero-net entries are omitted.
@@ -1621,12 +1617,12 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     /// - Bootstrap: query the DB for the initial aggregate **before** subscribing.
     /// - Accumulate: `running_value += delta` on each call.
     /// - UPDATE image requirement: aggregate UPDATE deltas require both
-    ///   `old_row` and `new_row`; when CDC omits old images, this API returns
+    ///   `old_row` and `new_row`. When CDC omits old images, this API returns
     ///   `DispatchError::AggregateUpdateRequiresOldRow`.
-    /// - Reset on policy change: RLS/ACL changes produce no WAL events;
-    ///   re-query the DB and replace the stored value.
-    /// - Reset on TRUNCATE: engine returns `Err(TruncateRequiresReset)`;
-    ///   caller must re-query and replace.
+    /// - Reset on policy change: RLS/ACL changes produce no WAL events.
+    ///   Re-query the DB and replace the stored value.
+    /// - Reset on TRUNCATE: engine returns `Err(TruncateRequiresReset)`.
+    ///   Caller must re-query and replace.
     ///
     /// # Examples
     /// ```
@@ -1810,7 +1806,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             }
         }
 
-        // Check if the consumer still has any bindings in this table; if not, clean up.
+        // Check if the consumer still has any bindings in this table. If not, clean up.
         let removed_consumers = if self.partitions.get(&table_id).is_some_and(|partition| {
             let snap = partition.load_snapshot();
             snap.predicates.is_consumer_referenced(consumer_id)
@@ -2269,7 +2265,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             .as_ref()
             .ok_or_else(|| StorageError::Config("No storage path configured".to_string()))?;
 
-        // Read all .shard files (directory must exist — with_storage creates it)
+        // Read all .shard files (directory must exist, with_storage creates it)
         let entries = std::fs::read_dir(storage_path)
             .map_err(|e| StorageError::Io(format!("Failed to read storage directory: {e}")))?;
 
@@ -2558,7 +2554,7 @@ mod tests {
     }
 
     /// Helper: orders table_id for the standard fixture. With the padded
-    /// `make_catalog()` this is `1`; using the helper instead of a literal
+    /// `make_catalog()` this is `1`. Using the helper instead of a literal
     /// keeps tests resilient if the padding strategy changes.
     #[allow(dead_code)]
     fn orders_tid(catalog: &ParserDB) -> TableId {
@@ -3214,7 +3210,7 @@ mod tests {
             ))
             .expect("pre");
         // First batch entry hits cap with no even-id sub present, closure
-        // returns None → RegistryFull. Second entry would also be rejected.
+        // returns None -> RegistryFull. Second entry would also be rejected.
         let results = engine.register_batch(vec![
             SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE amount > 2"),
             SubscriptionRequest::new(3u64, "SELECT * FROM orders WHERE amount > 3"),
@@ -3779,10 +3775,6 @@ mod tests {
         assert_eq!(engine.subscription_count(), 0);
     }
 
-    // ========================================================================
-    // Phase 3: Push to 95% Coverage - Engine Completion
-    // ========================================================================
-
     #[test]
     fn test_predicate_count() {
         let catalog = make_catalog();
@@ -4199,7 +4191,7 @@ mod tests {
         // Now force durability failure and attempt upsert with user=99
         engine.set_rotation_threshold(1);
         engine.set_durability_mode(DurabilityMode::Required);
-        set_dir_mode(temp_dir.path(), 0o500); // read-only → forces pre-commit failure
+        set_dir_mode(temp_dir.path(), 0o500); // read-only forces pre-commit failure
 
         let result = engine.register(SubscriptionRequest {
             consumer_id: 99,
@@ -4590,7 +4582,7 @@ mod tests {
                     scope: SubscriptionScope::Durable,
                     updated_at_unix_ms: 1000,
                 },
-                // Orphan binding — references non-existent predicate hash
+                // Orphan binding: references non-existent predicate hash
                 BindingData {
                     subscription_id: 2,
                     predicate_hash: 0xDEAD, // NO predicate with this hash
@@ -4612,7 +4604,7 @@ mod tests {
         let shard_path = temp_dir.path().join("table_1.shard");
         std::fs::write(&shard_path, shard_bytes).unwrap();
 
-        // Try to load — should fail with Corrupt error about unknown predicate hash
+        // Try to load: should fail with Corrupt error about unknown predicate hash
         let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
@@ -5528,7 +5520,7 @@ mod tests {
     }
 
     // =========================================================================
-    // C1 — TRUNCATE must exclude unregistered consumers (no ghost recipients)
+    // C1: TRUNCATE must exclude unregistered consumers (no ghost recipients)
     // =========================================================================
 
     #[test]
@@ -5558,13 +5550,13 @@ mod tests {
         let notifs = engine.consumers(&event).unwrap();
         assert!(
             notifs.deleted().is_empty(),
-            "TRUNCATE must not fan out to unregistered consumer 42; got: {:?}",
+            "TRUNCATE must not fan out to unregistered consumer 42. Got: {:?}",
             notifs.deleted(),
         );
     }
 
     // =========================================================================
-    // D6 — Crash recovery: partial shard write on startup
+    // D6: Crash recovery: partial shard write on startup
     // =========================================================================
 
     #[test]
@@ -5578,7 +5570,7 @@ mod tests {
         let shard_path = temp_dir.path().join("table_1.shard");
         std::fs::write(&shard_path, b"").unwrap();
 
-        // Engine startup must not panic; it should either skip or return error gracefully.
+        // Engine startup must not panic. It should either skip or return error gracefully.
         let result: Result<SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>, _> =
             SubscriptionEngine::with_storage(
                 catalog,
@@ -5586,7 +5578,7 @@ mod tests {
                 temp_dir.path().to_path_buf(),
             );
 
-        // Either Ok (zero-byte skipped) or a storage error — but no panic
+        // Either Ok (zero-byte skipped) or a storage error, but no panic
         match result {
             Ok(engine) => {
                 // Graceful skip: engine starts with no subscriptions
@@ -5621,11 +5613,11 @@ mod tests {
                 temp_dir.path().to_path_buf(),
             );
 
-        // Must not panic — either a storage error or graceful skip
+        // Must not panic: either a storage error or graceful skip
         if let Ok(engine) = result {
             assert_eq!(engine.subscription_count(), 0);
         }
-        // Err(_) case: expected — corrupt shard returns an error
+        // Err(_) case expected: corrupt shard returns an error
     }
 
     // --- Aggregate-specific engine tests ---
@@ -5749,7 +5741,7 @@ mod tests {
             })
             .unwrap();
 
-        // INSERT with only 2 columns — arity mismatch (expected 3)
+        // INSERT with only 2 columns: arity mismatch (expected 3)
         let event = build_insert_event(
             1,
             PrimaryKey::empty(),
@@ -5927,7 +5919,7 @@ mod tests {
         let mut consumers: Vec<_> = engine.consumers(&event).unwrap().into_iter().collect();
         consumers.sort_unstable();
 
-        // Only user 1 (Rows) should appear; user 2 (COUNT) must not
+        // Only user 1 (Rows) should appear. User 2 (COUNT) must not
         assert_eq!(
             consumers,
             vec![1u64],
@@ -6070,7 +6062,7 @@ mod tests {
             .register(SubscriptionRequest {
                 consumer_id: 42,
                 scope: SubscriptionScope::Durable,
-                // WHERE amount > 0 with NULL amount → WHERE doesn't match → no delta
+                // WHERE amount > 0 with NULL amount -> WHERE doesn't match -> no delta
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 0,
             })
@@ -6187,7 +6179,7 @@ mod tests {
     #[test]
     fn test_sum_column_not_in_where_update_triggers() {
         // SUM(amount) WHERE status = 'active'
-        // UPDATE changes only amount (not status) → delta must still be emitted
+        // UPDATE changes only amount (not status) -> delta must still be emitted
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
@@ -6201,7 +6193,7 @@ mod tests {
             })
             .unwrap();
 
-        // UPDATE: status unchanged (still 'active'), only amount changes 20 → 30
+        // UPDATE: status unchanged (still 'active'), only amount changes 20 -> 30
         // changed_columns = [1] (amount column)
         let event = WalEvent::builder(1)
             .update()
@@ -6343,7 +6335,7 @@ mod tests {
             })
             .unwrap();
 
-        // Unregister with reversed AND clause order — should still match
+        // Unregister with reversed AND clause order: should still match
         let report = engine
             .unregister_query(
                 100,
@@ -6473,7 +6465,7 @@ mod tests {
             ))
             .unwrap();
 
-        // UPDATE: amount 3 → 4
+        // UPDATE: amount 3 -> 4
         let event = WalEvent::builder(1)
             .update()
             .new_row(RowImage {
@@ -6491,11 +6483,11 @@ mod tests {
             .expect("event builder should be valid");
 
         let notifs = engine.consumers(&event).unwrap();
-        // Sub B enters (new matches, old doesn't) → inserted
+        // Sub B enters (new matches, old doesn't) -> inserted
         assert_eq!(notifs.inserted(), vec![2]);
-        // Sub A leaves (old matches, new doesn't) → deleted
+        // Sub A leaves (old matches, new doesn't) -> deleted
         assert_eq!(notifs.deleted(), vec![1]);
-        // No one stayed → updated is empty
+        // No one stayed -> updated is empty
         assert!(notifs.updated().is_empty());
     }
 
@@ -6513,7 +6505,7 @@ mod tests {
             ))
             .unwrap();
 
-        // UPDATE: amount 3 → 4, both match `amount > 0`
+        // UPDATE: amount 3 -> 4, both match `amount > 0`
         let event = WalEvent::builder(1)
             .update()
             .new_row(RowImage {
@@ -6550,7 +6542,7 @@ mod tests {
             ))
             .unwrap();
 
-        // UPDATE: amount 3 → 4, leaves the subscription
+        // UPDATE: amount 3 -> 4, leaves the subscription
         let event = WalEvent::builder(1)
             .update()
             .new_row(RowImage {
@@ -6587,7 +6579,7 @@ mod tests {
             ))
             .unwrap();
 
-        // UPDATE: amount 3 → 4, enters the subscription
+        // UPDATE: amount 3 -> 4, enters the subscription
         let event = WalEvent::builder(1)
             .update()
             .new_row(RowImage {
@@ -6672,7 +6664,7 @@ mod tests {
         assert!(notifs.updated().is_empty());
     }
 
-    /// Missing old_row for UPDATE → graceful degradation (single-eval fallback).
+    /// Missing old_row for UPDATE: graceful degradation (single-eval fallback).
     /// All matching consumers go to `updated` since we can't distinguish.
     #[test]
     fn test_update_missing_old_row_falls_back() {
@@ -6708,7 +6700,7 @@ mod tests {
         assert_eq!(notifs.updated(), vec![1]);
     }
 
-    /// Partial old_row (Cell::Missing) for UPDATE → graceful degradation.
+    /// Partial old_row (Cell::Missing) for UPDATE: graceful degradation.
     #[test]
     fn test_update_partial_old_row_falls_back() {
         let catalog = make_catalog();
@@ -6745,7 +6737,7 @@ mod tests {
         assert_eq!(notifs.updated(), vec![1]);
     }
 
-    /// into_iter() yields inserted ∪ updated.
+    /// into_iter() yields the union of inserted and updated.
     #[test]
     fn test_consumer_notifications_into_iter() {
         let notifs = crate::ConsumerNotifications::<DefaultIds, crate::NoCheckpoint> {
@@ -6772,7 +6764,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Per-`(session, subscription)` resume cursor (Q6.4)
+    // Per-`(session, subscription)` resume cursor
     // ----------------------------------------------------------------
 
     fn cursor(bytes: &[u8]) -> crate::OpaqueCheckpoint {

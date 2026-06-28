@@ -23,7 +23,7 @@ use subql::{
 
 /// Build the proptest fixture: a single 3-column `items` table. A
 /// placeholder table is included before it (alphabetically) so the
-/// `items` table id is stable at 1 — matching the hardcoded
+/// `items` table id is stable at 1, matching the hardcoded
 /// `WalEvent::builder(1)` calls in this file.
 fn proptest_catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(
@@ -384,7 +384,7 @@ proptest! {
                 };
 
                 if !prefilter.may_match(&row) {
-                    // Prefilter says "definitely no match" — VM must agree
+                    // Prefilter says "definitely no match": VM must agree
                     let mut vm = Vm::new();
                     let vm_result = vm.eval(&bytecode, &row);
                     prop_assert!(

@@ -8,21 +8,18 @@
 //!
 //! # Why trigger-driven?
 //!
-//! The original Step 1 design relied on `sqlite3_update_hook` plus a
-//! live-row refetch by `rowid` to build INSERT events. That design is
-//! fine when the consumer drains events between every DML statement,
-//! but it loses row content when several mutations affect the same row
-//! before the consumer catches up (the refetch finds the latest live
-//! state, not the state at hook time). Step 2 replaces the refetch with
-//! a shadow log table populated by SQL triggers: each event records its
-//! own `OLD`/`NEW` row image at the moment of mutation, so batched DML
-//! preserves the per-event state until [`crate::CdcSource::next_event`]
-//! drains it.
+//! An earlier design used `sqlite3_update_hook` plus a live-row refetch
+//! by `rowid`. That loses row content when several mutations hit the
+//! same row before the consumer drains: the refetch finds the latest
+//! live state, not the state at hook time. The shadow log instead
+//! records each event's own `OLD`/`NEW` image at mutation time, so
+//! batched DML preserves per-event state until
+//! [`crate::CdcSource::next_event`] drains it.
 //!
 //! Cells in the shadow log are encoded via SQLite's `json_array` and
 //! decoded back to [`Cell`] values with catalog-aware type coercion
-//! (because JSON conflates integer and floating-point numbers, while
-//! subql distinguishes `Cell::Int` from `Cell::Float`).
+//! (JSON conflates integer and float, while subql distinguishes
+//! `Cell::Int` from `Cell::Float`).
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -124,11 +121,10 @@ pub struct SqliteCdcSource {
 impl SqliteCdcSource {
     /// Build a new source from an owned connection and catalog.
     ///
-    /// The catalog is consulted to discover the SQLite tables for which
-    /// triggers should be installed and the column type metadata used to
-    /// decode shadow-log payloads back into [`Cell`] values. Tables
-    /// present in SQLite but absent from the catalog stay untracked
-    /// (Step 2's contract is "catalog drives coverage").
+    /// The catalog drives which SQLite tables get triggers and supplies
+    /// the column types used to decode shadow-log payloads back into
+    /// [`Cell`] values. Tables present in SQLite but absent from the
+    /// catalog stay untracked.
     ///
     /// # Errors
     ///
@@ -330,7 +326,7 @@ impl SqliteCdcSource {
     ///
     /// # Examples
     ///
-    /// Each DML statement enqueues exactly one event per affected row;
+    /// Each DML statement enqueues exactly one event per affected row.
     /// `poll_next_event` walks the shadow log in deterministic FIFO
     /// order.
     ///

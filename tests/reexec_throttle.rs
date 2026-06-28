@@ -36,7 +36,7 @@ use subql::{
 /// Async connector that waits a fixed delay on every `execute_scalar`
 /// (long enough that many calls can overlap under a multi-task
 /// runtime). Tracks current and peak in-flight counts. The result
-/// queue is FIFO with `Mutex<Vec>::remove(0)`; we pre-load with as many
+/// queue is FIFO with `Mutex<Vec>::remove(0)`. We pre-load with as many
 /// values as there are triggers.
 struct ConcurrencyProbingConnector {
     values: Mutex<Vec<Cell>>,

@@ -30,7 +30,7 @@ use sqlparser::dialect::Dialect;
 
 /// Internal state for the persistent re-execution concurrency cap.
 ///
-/// The cap is enforced by an [`async_lock::Semaphore`]; the
+/// The cap is enforced by an [`async_lock::Semaphore`]. The
 /// [`AtomicUsize`] tracks how many permits are currently held so callers
 /// can read [`AsyncAutoResolvingEngine::inflight`] without re-deriving
 /// it from the semaphore itself (which `async-lock` does not expose).
@@ -87,8 +87,8 @@ async fn acquire_permit(
 
 /// Auto-resolving engine driven by an [`AsyncConnector`].
 ///
-/// Mirrors [`AutoResolvingEngine`](super::AutoResolvingEngine) one-for-one;
-/// see there for the behavior contract. The only difference is that
+/// Mirrors [`AutoResolvingEngine`](super::AutoResolvingEngine) one-for-one.
+/// See there for the behavior contract. The only difference is that
 /// methods which call the connector ([`snapshot`](Self::snapshot),
 /// [`consumers`](Self::consumers)) return futures.
 ///
@@ -240,7 +240,7 @@ where
     }
 
     /// Register a subscription. Sync because registration only touches
-    /// in-memory engine state; the connector is not called.
+    /// in-memory engine state. The connector is not called.
     pub fn register(
         &mut self,
         spec: SubscriptionRequest<I>,
@@ -398,11 +398,11 @@ where
     /// keeping at most
     /// [`max_concurrent_reexecutions`](Self::with_max_concurrent_reexecutions)
     /// in flight at any time (unbounded when not configured). Per-event
-    /// engine notifications stay in input order; the returned
+    /// engine notifications stay in input order. The returned
     /// [`BatchOutcome::triggers`] is always empty after resolution.
     ///
     /// The first connector failure aborts the whole batch (remaining
-    /// in-flight futures are dropped); partial notifications are
+    /// in-flight futures are dropped). Partial notifications are
     /// discarded. The caller retries.
     pub async fn consumers_batch<C: crate::Checkpoint>(
         &mut self,
@@ -497,7 +497,7 @@ where
         report
     }
 
-    /// Unregister a captured query by id; drops its auth context too.
+    /// Unregister a captured query by id. Drops its auth context too.
     pub fn unregister_reexec_query(&mut self, query_id: ReExecQueryId) -> bool {
         let removed = self.inner.unregister_reexec_query(query_id);
         if removed {
@@ -536,7 +536,7 @@ mod tests {
 
     /// No-op `Wake` implementation: the `MockAsyncConnector` futures
     /// never park, so `wake` is never invoked. Built on the safe `Wake`
-    /// trait so the workspace's `forbid(unsafe_code)` lint passes; the
+    /// trait so the workspace's `forbid(unsafe_code)` lint passes. The
     /// nightly-only `Waker::noop` would be the alternative, hence the
     /// `allow` below.
     struct NoopWake;
@@ -546,7 +546,7 @@ mod tests {
     }
 
     /// Tiny block-on for the test futures (which never park). Drives the
-    /// future to completion by polling; if a real-world future returned
+    /// future to completion by polling. If a real-world future returned
     /// Pending it would loop forever, but the `MockAsyncConnector`
     /// futures complete in one poll.
     fn block_on<F: Future>(fut: F) -> F::Output {
@@ -811,7 +811,7 @@ mod tests {
     }
 
     /// `with_max_concurrent_reexecutions` does not change the result of
-    /// `consumers_batch` (correctness is preserved); the cap is a
+    /// `consumers_batch` (correctness is preserved). The cap is a
     /// throughput / fairness knob, not a semantic one.
     #[test]
     #[allow(clippy::similar_names)]

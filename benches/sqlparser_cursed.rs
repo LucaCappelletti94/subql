@@ -1,13 +1,10 @@
-//! Microbenchmarks for the two fuzz-discovered inputs that libFuzzer flagged
+//! Microbenchmarks for the fuzz-discovered inputs that libFuzzer flagged
 //! as timeouts under the cargo-fuzz instrumented build but parse trivially
 //! in a normal release build. Establishes a precise time floor so we can
 //! reason about how much headroom the libFuzzer `-timeout=N` knob needs.
 //!
-//! Both inputs are pinned next to this file so the benchmark stays stable
-//! even if the fuzz artifacts directory is cleaned. Source artifacts:
-//!
-//!   fuzz/artifacts/fuzz_parse_sql/timeout-bf3ef81f...
-//!   fuzz/artifacts/fuzz_canonicalize/timeout-9f326c0e...
+//! The inputs are pinned next to this file (`inputs/cursed_*.bin`) so the
+//! benchmark stays stable even if the fuzz artifacts directory is cleaned.
 #![allow(clippy::unwrap_used)]
 
 use std::hint::black_box;
@@ -29,14 +26,11 @@ const fn cases() -> [(&'static str, &'static [u8]); 7] {
     [
         ("parse_sql_919B", PARSE_SQL_INPUT),
         ("canonicalize_135B", CANONICALIZE_INPUT),
-        ("parens_commas_dashes_583B_fixed_by_2349", PAREN_COMMA_INPUT),
-        ("shift_keywords_527B_fixed_combined", SHIFT_KW_INPUT),
-        ("keyword_op_soup_903B_fixed_combined", KW_OP_SOUP_INPUT),
-        (
-            "dollar_quote_bit_3988B_fixed_combined",
-            DOLLAR_QUOTE_BIT_INPUT,
-        ),
-        ("case_soup_142B_fixed_combined", CASE_SOUP_INPUT),
+        ("parens_commas_dashes_583B", PAREN_COMMA_INPUT),
+        ("shift_keywords_527B", SHIFT_KW_INPUT),
+        ("keyword_op_soup_903B", KW_OP_SOUP_INPUT),
+        ("dollar_quote_bit_3988B", DOLLAR_QUOTE_BIT_INPUT),
+        ("case_soup_142B", CASE_SOUP_INPUT),
     ]
 }
 

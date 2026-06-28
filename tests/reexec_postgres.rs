@@ -3,9 +3,9 @@
 //!
 //! Verifies the production path end to end:
 //! * an engine-supported subscription and a captured (MIN) subscription
-//!   coexist on one engine; each gets the right kind of notification when
-//!   the corresponding WAL event arrives;
-//! * the [`DieselConnector`] re-executes the captured query's SQL against
+//!   coexist on one engine. Each gets the right kind of notification when
+//!   the corresponding WAL event arrives.
+//! * The [`DieselConnector`] re-executes the captured query's SQL against
 //!   real Postgres and decodes a scalar [`Cell`] correctly.
 //!
 //! Requires Docker. Tests are `#[ignore]`d so default `cargo test` does
@@ -18,7 +18,7 @@
 //!
 //! Gated via `[[test]] required-features = ["executor-diesel-postgres"]`
 //! in `Cargo.toml`. The companion test against in-memory SQLite is
-//! `tests/reexec_diesel.rs`; that one is a plumbing smoke check, this one
+//! `tests/reexec_diesel.rs`. That one is a plumbing smoke check, this one
 //! is the production-path proof and pulls LSN information from
 //! `pg_current_wal_lsn()` inside snapshot transactions.
 #![cfg(feature = "executor-diesel-postgres")]
@@ -103,7 +103,7 @@ fn parse_message(
         .expect("wal2json parse")
 }
 
-/// Step 2 scaffold check: container starts, three PG connections, catalog
+/// Harness health check: container starts, three PG connections, catalog
 /// builds, registration of both subscriptions returns the right `Registered`
 /// variants. No DML, no slot drain. Proves the harness is healthy without
 /// asserting CDC semantics.
@@ -167,7 +167,7 @@ fn scaffold_registers_both_subscription_kinds() {
 /// INSERT (id=3 price=11.0) and a DELETE-of-the-current-extreme (id=1
 /// price=5.0) via real PG. The INSERT must match the engine subscription
 /// only (no re-execution). The DELETE removes the current MIN, so the
-/// engine spills `NeedsReexecution`; the auto-resolving engine calls the
+/// engine spills `NeedsReexecution`. The auto-resolving engine calls the
 /// `DieselConnector`, which queries PG and returns the new MIN
 /// (`9.0`, the smallest remaining row). The connector must be called
 /// exactly once across the batch.

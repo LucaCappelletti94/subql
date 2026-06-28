@@ -2,7 +2,7 @@
 //!
 //! Mirrors the sync trait one-for-one, but returns `Send` futures so it
 //! works on multi-threaded async runtimes (tokio multi-thread, async-std,
-//! smol with a worker pool). Sync and async are first-class peers; pick
+//! smol with a worker pool). Sync and async are first-class peers. Pick
 //! the trait that matches the underlying database driver.
 //!
 //! No concrete async impl ships in this phase. The surface is locked in so
@@ -33,8 +33,8 @@ use crate::{Cell, Checkpoint, ColumnType, RowImage};
 /// `Self: Send + Sync` and the return futures are `+ Send` so the trait is
 /// usable as a generic bound on engines that themselves move across
 /// threads. Connector implementations that need `!Send` (single-threaded
-/// embedded async, single-tab WASM) should define their own trait variant;
-/// the sync [`Connector`](super::Connector) is also available as an
+/// embedded async, single-tab WASM) should define their own trait variant.
+/// The sync [`Connector`](super::Connector) is also available as an
 /// alternative.
 pub trait AsyncConnector: Send + Sync {
     /// Per-subscription auth state, passed verbatim to each call.

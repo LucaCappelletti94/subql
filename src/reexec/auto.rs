@@ -49,7 +49,7 @@ pub enum SnapshotResult<C: crate::Checkpoint> {
 
 /// Per-query state needed to drive an automatic re-execution.
 ///
-/// Shared by both the sync and async engines; private to the `reexec`
+/// Shared by both the sync and async engines. Private to the `reexec`
 /// module so the engine internals can read its fields directly.
 pub(super) struct ResolveContext<I: IdTypes, A> {
     /// Re-execution SQL produced by the plan.
@@ -117,7 +117,7 @@ where
     }
 
     /// Attach a [`Clock`](crate::Clock) for time-based decisions
-    /// (per-query debounce). Defaults to no clock; without one, debounce
+    /// (per-query debounce). Defaults to no clock. Without one, debounce
     /// is silently disabled even if [`with_debounce_per_query`](Self::with_debounce_per_query)
     /// is set.
     #[must_use]
@@ -132,7 +132,7 @@ where
     /// Triggers within the window are silently dropped: the connector is
     /// not called and no [`ScalarUpdate`] is emitted (the engine's stored
     /// value, set by the prior re-execution, remains current). Requires
-    /// [`with_clock`](Self::with_clock); without a clock the debounce
+    /// [`with_clock`](Self::with_clock). Without a clock the debounce
     /// config is ignored.
     #[must_use]
     pub const fn with_debounce_per_query(mut self, debounce: Duration) -> Self {
@@ -165,7 +165,7 @@ where
     }
 
     /// Stamp `query_id` with the current clock instant. No-op if clock is
-    /// not configured; debounce stamping is unnecessary without a clock.
+    /// not configured. Debounce stamping is unnecessary without a clock.
     fn stamp_reexec(&mut self, query_id: ReExecQueryId) {
         if let Some(clock) = self.clock.as_ref() {
             self.last_reexec_at.insert(query_id, clock.now_micros());
@@ -222,7 +222,7 @@ where
     /// Returns a [`SnapshotResult`] tagged with the connector's
     /// [`Checkpoint`](Connector::Checkpoint). Today every captured query
     /// is a scalar (single-table `MIN`/`MAX`), so the variant is always
-    /// `Scalar`; the enum leaves room for the future single-table row
+    /// `Scalar`. The enum leaves room for the future single-table row
     /// re-execution flavor without a breaking-bump.
     ///
     /// The value is also installed via [`ReExecEngine::install`], so the
@@ -233,7 +233,7 @@ where
     /// # Errors
     ///
     /// Returns [`ReExecError::Connector`] if the connector fails. Returns
-    /// `Ok(None)` if `query_id` does not exist; the absence is signaled
+    /// `Ok(None)` if `query_id` does not exist. The absence is signaled
     /// (rather than panicking) so callers can race a snapshot against an
     /// `unregister_*` without crashing.
     pub fn snapshot(
@@ -318,10 +318,10 @@ where
     /// order, then resolves the **deduplicated** triggers serially via the
     /// connector. With N events that displace the same captured query K
     /// times, the connector is called once instead of K times. Per-event
-    /// engine notifications stay in input order; the returned
+    /// engine notifications stay in input order. The returned
     /// [`BatchOutcome::triggers`] is always empty after resolution.
     ///
-    /// The first connector failure aborts the whole batch; partial
+    /// The first connector failure aborts the whole batch. Partial
     /// notifications are dropped. The caller is expected to retry the
     /// batch.
     pub fn consumers_batch<C: crate::Checkpoint>(
@@ -372,7 +372,7 @@ where
         report
     }
 
-    /// Unregister a captured query by id; drops its auth context too.
+    /// Unregister a captured query by id. Drops its auth context too.
     /// Returns false if no such query existed.
     pub fn unregister_reexec_query(&mut self, query_id: ReExecQueryId) -> bool {
         let removed = self.inner.unregister_reexec_query(query_id);

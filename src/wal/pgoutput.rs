@@ -1126,14 +1126,14 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // -- Test 9: Unknown message type → skip ---------------------------------
+    // -- Test 9: Unknown message type -> skip --------------------------------
 
     #[test]
     fn unknown_message_type_is_skipped() {
         let catalog = orders_catalog();
         let parser = PgOutputParser::new();
 
-        // 0xFF is not a known pgoutput message type; it must be skipped, not error.
+        // 0xFF is not a known pgoutput message type. It must be skipped, not error.
         let msg = vec![0xFF, 0, 0, 0, 0];
         let events = parser
             .parse_wal_message(&msg, &catalog)
@@ -1144,7 +1144,7 @@ mod tests {
         );
     }
 
-    // -- Test 10: Insert without preceding Relation → UnknownRelationOid -----
+    // -- Test 10: Insert without preceding Relation -> UnknownRelationOid ----
 
     #[test]
     fn insert_without_relation_error() {
@@ -1158,7 +1158,7 @@ mod tests {
         assert!(matches!(err, WalParseError::UnknownRelationOid(99999)));
     }
 
-    // -- Test 11: Truncated messages → TruncatedMessage ----------------------
+    // -- Test 11: Truncated messages -> TruncatedMessage ---------------------
 
     #[test]
     fn truncated_message_error() {
@@ -1198,7 +1198,7 @@ mod tests {
         // pg_walstream does not surface the number of bytes consumed from
         // `parse_wal_message`, so the adapter cannot detect trailing bytes
         // without an upstream API addition. For now we accept that trailing
-        // bytes are silently tolerated; revisit when pg_walstream exposes a
+        // bytes are silently tolerated. Revisit when pg_walstream exposes a
         // `bytes_consumed` accessor or a strict variant.
         let result = parser.parse_wal_message(&insert_msg, &catalog);
         assert!(
@@ -1207,7 +1207,7 @@ mod tests {
         );
     }
 
-    // -- Test 12: NULL columns ('n' tag) → Cell::Null ------------------------
+    // -- Test 12: NULL columns ('n' tag) -> Cell::Null -----------------------
 
     #[test]
     fn null_column_tag() {
@@ -1240,7 +1240,7 @@ mod tests {
         assert_eq!(new.get(3), Some(&Cell::String(Arc::from("active"))));
     }
 
-    // -- Test 13: Unchanged TOAST ('u' tag) → Cell::Missing in OLD tuple -----
+    // -- Test 13: Unchanged TOAST ('u' tag) -> Cell::Missing in OLD tuple ----
 
     #[test]
     fn unchanged_toast_tag_in_old_key_tuple() {
@@ -1431,7 +1431,7 @@ mod tests {
         assert_send_sync::<PgOutputParser>();
     }
 
-    // -- Test: Insert without catalog PK → empty PK --------------------------
+    // -- Test: Insert without catalog PK -> empty PK -------------------------
 
     #[test]
     fn insert_no_catalog_pk() {
@@ -1477,7 +1477,7 @@ mod tests {
         assert!(matches!(err, WalParseError::TruncatedMessage { .. }));
     }
 
-    // -- Test: Delete without identity columns → use all columns as PK -------
+    // -- Test: Delete without identity columns -> use all columns as PK ------
 
     #[test]
     fn delete_no_identity_columns() {
@@ -1858,7 +1858,7 @@ mod tests {
                 .expect("relation should parse");
         }
 
-        // Now try to INSERT using OID 0 — it should have been evicted
+        // Now try to INSERT using OID 0: it should have been evicted
         let insert_msg = build_insert_msg(
             0,
             &[
@@ -1955,7 +1955,7 @@ mod tests {
     #[test]
     fn insert_with_unchanged_toast_tag_is_rejected() {
         // Build an INSERT message where a column's tuple-data tag is b'u' (unchanged-TOAST).
-        // This tag is only valid in old-image tuples; it must be rejected in new-image tuples.
+        // This tag is only valid in old-image tuples. It must be rejected in new-image tuples.
         let parser = PgOutputParser::new();
         let catalog = orders_catalog();
 
@@ -1968,7 +1968,7 @@ mod tests {
             16384,
             &[
                 TupleCol::Text("1".into()),
-                TupleCol::Unchanged, // 'u' tag — invalid in a new-image tuple
+                TupleCol::Unchanged, // 'u' tag, invalid in a new-image tuple
                 TupleCol::Text("50.0".into()),
                 TupleCol::Text("pending".into()),
             ],

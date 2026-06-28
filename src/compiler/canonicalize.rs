@@ -95,7 +95,7 @@ fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
 }
 
 /// Collect all operands of a flattened AND or OR tree.
-/// E.g., `a AND (b AND c)` → [a, b, c]
+/// E.g., `a AND (b AND c)` -> [a, b, c]
 fn collect_flat_children<'a>(expr: &'a Expr, target_op: &BinaryOperator) -> Vec<&'a Expr> {
     match expr {
         Expr::Nested(inner) => collect_flat_children(inner, target_op),
@@ -585,10 +585,6 @@ mod tests {
         assert!(hash > 0);
     }
 
-    // ========================================================================
-    // Phase 1: Error Path Coverage Tests
-    // ========================================================================
-
     #[test]
     fn test_normalize_error_multiple_tables() {
         let dialect = PostgreSqlDialect {};
@@ -758,10 +754,6 @@ mod tests {
         assert!(result.contains("NOT IN"));
     }
 
-    // ========================================================================
-    // Phase 3: Push to 95% Coverage - Canonicalize Completion
-    // ========================================================================
-
     #[test]
     fn test_error_set_operations() {
         let dialect = PostgreSqlDialect {};
@@ -782,7 +774,7 @@ mod tests {
         let sql = "SELECT * FROM t WHERE CAST(a AS text) = 'hello'";
         let result = normalize_sql(sql, &dialect);
 
-        // Should succeed — unknown expr uses debug fallback
+        // Should succeed : unknown expr uses debug fallback
         assert!(result.is_ok());
         let normalized = result.unwrap();
         // The fallback uses {:?} format, so it produces something
@@ -797,7 +789,7 @@ mod tests {
         let sql = "SELECT * FROM t WHERE ~a = 1";
         let result = normalize_sql(sql, &dialect);
 
-        // Should fail — unknown unary op now returns UnsupportedSql error
+        // Should fail : unknown unary op now returns UnsupportedSql error
         assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
     }
 

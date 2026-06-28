@@ -5,7 +5,7 @@
 //! integers chosen for bytecode/bitmap density). `sql-traits` exposes
 //! schemas through [`DatabaseLike`], [`TableLike`] and [`ColumnLike`], which
 //! identify columns and tables via `usize`. These free functions perform
-//! the `usize` ↔ `u32`/`u16` boundary conversion and centralize the
+//! the `usize` <-> `u32`/`u16` boundary conversion and centralize the
 //! identifier-resolution rules so call sites never reinvent them.
 //!
 //! Functions: [`table_id`], [`column_id`], [`table_arity`],
@@ -29,18 +29,17 @@ use crate::types::{ColumnId, ColumnType, TableId};
 ///
 /// Accepts either a bare name (`orders`) or a schema-qualified name
 /// (`public.orders`). Schema qualification is detected by the presence
-/// of a single `.` separator outside of quotes; both halves are passed
+/// of a single `.` separator outside of quotes. Both halves are passed
 /// to [`DatabaseLike::table`] unchanged. Note: the quote-detection is a
 /// simple `.contains('"')` heuristic and does not handle escaped quotes
-/// inside quoted identifiers (e.g. `"a""b".c`); callers parsing such
+/// inside quoted identifiers (e.g. `"a""b".c`). Callers parsing such
 /// identifiers must pre-resolve them.
 ///
-/// Returns `None` when the table is not found **or** when the database's
-/// index for the table exceeds `u32::MAX` — the two cases are
-/// indistinguishable to callers. The latter is effectively unreachable
-/// with any realistic catalog (it implies > 4 billion declared tables),
-/// but consumers writing against untrusted introspection sources should
-/// be aware of the silent collapse.
+/// Returns `None` when the table is not found, or when the database's
+/// index for the table exceeds `u32::MAX`. The two cases are
+/// indistinguishable to callers. The overflow case is effectively
+/// unreachable (it implies > 4 billion declared tables) but can collapse
+/// silently when introspecting untrusted sources.
 #[must_use]
 pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<TableId> {
     // Heuristic split on the first unquoted '.' for schema-qualified names.
@@ -66,10 +65,10 @@ pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<Tab
 /// Identifier matching uses sql-traits' PostgreSQL semantics
 /// (quoted/unquoted aware). Returns `None` when the table is unknown,
 /// the column is not present, or the column's ordinal exceeds `u16::MAX`
-/// (≥ 65536 columns in a single table — unreachable in any sane schema).
+/// (>= 65536 columns in a single table, unreachable in any sane schema).
 ///
 /// **Complexity**: O(n) per call where `n = table.number_of_columns()`.
-/// Callers that need repeated lookups should cache results — this helper
+/// Callers that need repeated lookups should cache results: this helper
 /// performs a linear scan over the table's columns on every invocation.
 #[must_use]
 pub fn column_id<DB: DatabaseLike>(
@@ -108,7 +107,7 @@ pub fn table_arity<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option
 ///
 /// # Errors
 ///
-/// See above — propagates the validation errors from
+/// See above. Propagates the validation errors from
 /// [`compute_persistence_v1`](sql_traits::structs::canonical_bytes_v1).
 pub fn schema_fingerprint<DB: DatabaseLike>(
     database: &DB,
@@ -174,8 +173,8 @@ pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Opti
 
 /// Map a canonical sql-traits type token onto subql's [`ColumnType`].
 ///
-/// `INT` → `Int`, `FLOAT`/`DECIMAL` → `Float` (both are numeric for
-/// SUM/AVG validation), `BOOL` → `Bool`, `STRING` → `String`; everything
+/// `INT` -> `Int`, `FLOAT`/`DECIMAL` -> `Float` (both numeric for
+/// SUM/AVG validation), `BOOL` -> `Bool`, `STRING` -> `String`. Everything
 /// else (`BYTES`, `DATE`, `TIME`, `TIMESTAMP`, `UUID`, `JSON`, `OTHER:*`)
 /// maps to `Unknown` so SUM/AVG over such columns is permitted without
 /// the engine asserting a numeric type.
@@ -263,7 +262,7 @@ mod tests {
         let tid = table_id(&db, "t").unwrap();
         assert_eq!(column_type(&db, tid, 0), Some(ColumnType::Int));
         assert_eq!(column_type(&db, tid, 1), Some(ColumnType::Float));
-        assert_eq!(column_type(&db, tid, 2), Some(ColumnType::Float)); // DECIMAL → Float
+        assert_eq!(column_type(&db, tid, 2), Some(ColumnType::Float)); // DECIMAL -> Float
         assert_eq!(column_type(&db, tid, 3), Some(ColumnType::Bool));
         assert_eq!(column_type(&db, tid, 4), Some(ColumnType::String));
         assert_eq!(column_type(&db, tid, 5), Some(ColumnType::Unknown)); // JSON

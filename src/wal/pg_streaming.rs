@@ -1,7 +1,7 @@
 //! Push-based Postgres CDC source driven by `pg_walstream`'s native backend.
 //!
 //! Owns a `pg_walstream::PgReplicationConnection` opened in replication
-//! mode plus an attached `START_REPLICATION` stream; surfaces typed
+//! mode plus an attached `START_REPLICATION` stream. Surfaces typed
 //! [`crate::WalEvent<PgLsn>`] values through the [`crate::CdcSource`]
 //! trait. Acks flow back to the server as `StandbyStatusUpdate` messages
 //! so the slot's `confirmed_flush_lsn` tracks reality.
@@ -24,7 +24,7 @@ use crate::{PgLsn, WalEvent};
 /// Configuration for a [`PgStreamingCdcSource`].
 ///
 /// The caller is responsible for creating the publication and the
-/// replication slot before constructing the source; `connect` does
+/// replication slot before constructing the source. `connect` does
 /// not auto-create either.
 ///
 /// `#[non_exhaustive]` so future fields can be added without breaking
@@ -488,7 +488,7 @@ const PRIMARY_KEEPALIVE_LEN: usize = 1 + 8 + 8 + 1; // 'k' + end + clock + reply
 
 /// Append `replication=database` to a libpq conninfo string if the
 /// caller did not already include it. Accepts both URL-style
-/// (`postgresql://...`) and key=value forms; the latter just needs the
+/// (`postgresql://...`) and key=value forms. The latter just needs the
 /// param appended.
 fn ensure_replication_param(url: &str) -> String {
     if url.contains("replication=") {

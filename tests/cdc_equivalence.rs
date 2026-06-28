@@ -3,7 +3,7 @@
 //! Drives a deterministic mixed-DML stream against a real Postgres
 //! through TWO slots (one per `CdcSource` impl). Both transports
 //! drain concurrently. The test asserts that after canonicalization
-//! (LSN stripped; ack-driven divergence removed), both observed the
+//! (LSN stripped. Ack-driven divergence removed), both observed the
 //! same events in the same commit order.
 //!
 //! Catches a class of regressions that single-transport tests do not:
@@ -13,15 +13,12 @@
 //!   show the same wrong result. If the parser's behavior differs
 //!   between callers (e.g. state leaks across messages), one
 //!   transport diverges and this test catches it.
-//! - **`tokio-postgres` `CopyBothDuplex` framing regressions.** The
-//!   push source reads events through `CopyBothDuplex`; polling
-//!   reads them via `pg_logical_slot_get_binary_changes`. If a
-//!   `tokio-postgres` update silently changes CopyBoth framing
-//!   semantics, push diverges from poll and this test catches it.
-//! - **Materialize-fork drift.** We pin a specific rev of the fork
-//!   in `Cargo.toml`. If a future bump changes behavior on the push
-//!   side without an equivalent change on the polling side, this
-//!   test surfaces the divergence.
+//! - **`pg_walstream` stream-framing regressions.** The push source
+//!   reads events from `pg_walstream`'s native backend via
+//!   `START_REPLICATION`. Polling reads them via
+//!   `pg_logical_slot_get_binary_changes`. If a `pg_walstream` bump
+//!   silently changes stream framing on the push side, push diverges
+//!   from poll and this test catches it.
 
 #![cfg(feature = "pg-streaming")]
 #![allow(

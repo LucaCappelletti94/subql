@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.88"
 publish = false
 description = "Dioxus web demo of subql: PG schema -> sqlite-wasm-rs -> CDC events via diesel hooks"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [lints]
 workspace = true
@@ -17,7 +17,7 @@ subql = { path = "..", default-features = false }
 # Generic SQL schema traits, same git pin as subql.
 sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
 
-# PG dialect parser; the workspace [patch.crates-io] redirects this to the
+# PG dialect parser. The workspace [patch.crates-io] redirects this to the
 # visitor-wasm fork.
 sqlparser = { version = "0.62", default-features = false }
 
@@ -34,7 +34,7 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "
 # providing on_insert / on_update / on_delete hooks).
 diesel = { version = "2", default-features = false, features = ["sqlite"] }
 
-# Dioxus web (wasm32) renderer. Only needed on wasm targets; on native we
+# Dioxus web (wasm32) renderer. Only needed on wasm targets. On native we
 # only build for type-checking.
 dioxus = { version = "0.7", features = ["web"] }
 
@@ -48,7 +48,7 @@ dioxus = { version = "0.7", features = ["web"] }
 # = "z" DCEs the cold `fprintf(stderr, ...)` branches in
 # `arborium-tree-sitter/src/alloc.c` before lld sees them). Use
 # `dx serve --release` for the demo - debug iteration is fine because
-# the demo's Rust is small; the cost is the one-shot `arborium-*` C
+# the demo's Rust is small. The cost is the one-shot `arborium-*` C
 # build.
 dioxus-code = { version = "0.1", default-features = false, features = ["lang-sql"] }
 dioxus-code-editor = "0.1"

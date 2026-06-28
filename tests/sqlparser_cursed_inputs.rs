@@ -1,12 +1,11 @@
 //! Regression test for eight distinct exponential-parse-time inputs that
 //! `subql`'s fuzz harnesses surfaced against `sqlparser` on the
-//! `PostgreSqlDialect`. All are fixed (on `apache/datafusion-sqlparser-rs`
-//! `main` via PRs #2343, #2344, #2349, or on the
+//! `PostgreSqlDialect`. All are fixed in the
 //! `LucaCappelletti94/sqlparser-rs` `pathological-combined` branch that
-//! the workspace `[patch.crates-io]` currently pins).
+//! the workspace `[patch.crates-io]` currently pins.
 //!
 //! Enforces a 1-second ceiling per input. If the upstream patches are
-//! reverted or a new pathological case appears in §1-§8 the test fails
+//! reverted or a new pathological case appears in sections 1-8 the test fails
 //! loudly.
 
 // Test-only deadline timer. `eprintln!` records timings to test stderr
@@ -36,28 +35,28 @@ const CURSED_INPUTS: &[(&str, &[u8])] = &[
         "section_3_keyword_splice",
         b"if-stf-localtclocal33alt.vocalocanow15alt.vocal1alt.lt.v4.l1altvcalao1lt.lt.v4.l1al33alt.vocalocanow15alt.vocal1alt.lt.v4.l1altvcalao1lt.lt.v4.l1allocaltclocal33alt.vocalocanow15at.vocal1alt.lt.v4.l1altvcallocaltclocal33alt.vocalocanow15alt.vocal1alt.lt.v4.l1altvcalao1lt.lt.v4..l1alt.ll.llocalt.ll.llocalt",
     ),
-    // §4: parens + commas + `--<CR>` line-comment chains, minimised from
-    // a fuzz_canonicalize timeout. Fixed by upstream PR #2349. Loaded as
-    // raw bytes (not a `&str` literal) because the input contains
+    // section 4: parens + commas + `--<CR>` line-comment chains, minimised from
+    // a fuzz_canonicalize timeout. Loaded as raw bytes (not a `&str`
+    // literal) because the input contains
     // embedded `\r` line terminators that are load-bearing for the bug.
     (
         "section_4_paren_comma_cr_dashes",
         include_bytes!("../benches/inputs/cursed_parens_commas_dashes_583b.bin"),
     ),
-    // §5: `<<` shift + keyword-prefix dotted chains, minimised from a
+    // section 5: `<<` shift + keyword-prefix dotted chains, minimised from a
     // fuzz_parse_sql timeout. Fixed on `pathological-combined`.
     (
         "section_5_shift_keywords",
         include_bytes!("../benches/inputs/cursed_shift_keywords_527b.bin"),
     ),
-    // §6: keyword-prefix dotted chains with `?` / `^` / `@` / `~` / `%`
+    // section 6: keyword-prefix dotted chains with `?` / `^` / `@` / `~` / `%`
     // / `$.` operator soup, minimised from a fuzz_parse_sql timeout.
     // Fixed on `pathological-combined`.
     (
         "section_6_keyword_op_soup",
         include_bytes!("../benches/inputs/cursed_keyword_op_soup_903b.bin"),
     ),
-    // §7: PG dollar-quoted strings (with non-ASCII tags) interleaved
+    // section 7: PG dollar-quoted strings (with non-ASCII tags) interleaved
     // with `BIT > Ident` chains and bracketed scientific-notation
     // literals, minimised from a fuzz_canonicalize timeout. Fixed on
     // `pathological-combined`.
@@ -65,7 +64,7 @@ const CURSED_INPUTS: &[(&str, &[u8])] = &[
         "section_7_dollar_quote_bit",
         include_bytes!("../benches/inputs/cursed_dollar_quote_bit_3988b.bin"),
     ),
-    // §8: `CASE` keyword used as identifier-prefix in a chain of
+    // section 8: `CASE` keyword used as identifier-prefix in a chain of
     // dot/hyphen/`#` operator tokens, surfaced from a fuzz_parse_sql
     // timeout. Fixed on `pathological-combined`.
     (
