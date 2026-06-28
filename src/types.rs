@@ -400,6 +400,26 @@ impl RowImage {
         self.cells.get(col_id as usize)
     }
 
+    /// Owned copy of the cell at `col_id`, if present.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use subql::{Cell, RowImage};
+    ///
+    /// let row = RowImage { cells: Arc::from([Cell::Int(7), Cell::String("paid".into())]) };
+    /// assert_eq!(row.cell(0), Some(Cell::Int(7)));
+    /// assert_eq!(row.iter().count(), 2);
+    /// ```
+    #[must_use]
+    pub fn cell(&self, col_id: ColumnId) -> Option<Cell> {
+        self.get(col_id).cloned()
+    }
+
+    /// Iterate the cells in column order.
+    pub fn iter(&self) -> core::slice::Iter<'_, Cell> {
+        self.cells.iter()
+    }
+
     /// Number of columns in this image
     #[must_use]
     pub fn len(&self) -> usize {
@@ -410,6 +430,15 @@ impl RowImage {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.cells.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a RowImage {
+    type Item = &'a Cell;
+    type IntoIter = core::slice::Iter<'a, Cell>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.cells.iter()
     }
 }
 

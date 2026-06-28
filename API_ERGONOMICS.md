@@ -108,7 +108,7 @@ let result = self.engine.register_select(consumer_id, sql)?;  // engine knows it
 if let Some(spec) = result.aggregate_spec() { /* ... */ }
 ```
 
-## [ ] E5 - RowImage cell access
+## [x] E5 - RowImage cell access
 
 Callers reach into the `pub cells: Arc<[Cell]>` field and cast `col as usize`.
 

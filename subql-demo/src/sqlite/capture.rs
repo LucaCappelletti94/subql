@@ -161,7 +161,7 @@ impl EventCapture {
         harness.exec_delete(rowid)?;
 
         if let Some(old) = old_image {
-            let pk_value = old.get(self.pk_column).cloned().unwrap_or(Cell::Missing);
+            let pk_value = old.cell(self.pk_column).unwrap_or(Cell::Missing);
             let pk = PrimaryKey::new(
                 Arc::from([self.pk_column].as_slice()),
                 Arc::from([pk_value].as_slice()),
@@ -249,9 +249,6 @@ fn changed_columns(old: &RowImage, new: &RowImage, column_ids: &[ColumnId]) -> V
     column_ids
         .iter()
         .copied()
-        .filter(|&cid| {
-            let i = cid as usize;
-            old.cells.get(i) != new.cells.get(i)
-        })
+        .filter(|&cid| old.get(cid) != new.get(cid))
         .collect()
 }
