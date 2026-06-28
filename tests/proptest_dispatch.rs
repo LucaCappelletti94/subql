@@ -182,7 +182,7 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..20),
         rows in proptest::collection::vec(row_strategy(), 1..10),
     ) {
-        let catalog = Arc::new(proptest_catalog());
+        let catalog = proptest_catalog();
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
         let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
@@ -247,7 +247,7 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..15),
         rows in proptest::collection::vec(row_strategy(), 1..8),
     ) {
-        let catalog = Arc::new(proptest_catalog());
+        let catalog = proptest_catalog();
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
         let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
@@ -304,7 +304,7 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..15),
         rows in proptest::collection::vec(row_strategy(), 1..8),
     ) {
-        let catalog = Arc::new(proptest_catalog());
+        let catalog = proptest_catalog();
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
         let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
@@ -404,12 +404,12 @@ proptest! {
         predicates in proptest::collection::vec(predicate_strategy(), 1..15),
         rows in proptest::collection::vec(row_strategy(), 1..5),
     ) {
-        let catalog = Arc::new(proptest_catalog());
+        let catalog = proptest_catalog();
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
 
         // Engine 1: individual register
         let mut engine1: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(Arc::clone(&catalog), sqlparser::dialect::PostgreSqlDialect {});
+            SubscriptionEngine::new(proptest_catalog(), sqlparser::dialect::PostgreSqlDialect {});
 
         // Engine 2: batch register
         let mut engine2: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =

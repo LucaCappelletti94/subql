@@ -168,7 +168,7 @@ fn engine_with_first_n_queries(
     let seeded_values: Vec<Cell> = (0..n).map(|i| Cell::Float(100.0 + i as f64)).collect();
     let connector = ConcurrencyProbingConnector::new(seeded_values, delay);
     let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-        Arc::new(catalog()),
+        catalog(),
         PostgreSqlDialect {},
     );
     let mut engine = AsyncAutoResolvingEngine::new(ReExecEngine::new(inner), connector)

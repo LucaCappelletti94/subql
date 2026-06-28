@@ -162,7 +162,14 @@ impl ShardHeader {
     /// fingerprint envelope (algorithm, canonicalization version, profile, or
     /// digest). No zero-fingerprint bypass: every live catalog must produce a
     /// fingerprint or the shard is rejected.
-    pub fn validate<DB: DatabaseLike>(&self, database: &DB) -> Result<(), StorageError> {
+    /// Validate magic, version, and that the shard's stored schema fingerprint
+    /// equals `expected`. Catalog-free: the caller supplies the envelope it
+    /// already computed (or carried across a thread boundary), so this never
+    /// needs a live `DatabaseLike`.
+    pub fn validate_against(
+        &self,
+        expected: &ShardFingerprintEnvelope,
+    ) -> Result<(), StorageError> {
         // Check magic
         if &self.magic != MAGIC {
             return Err(StorageError::Corrupt(format!(
@@ -179,27 +186,22 @@ impl ShardHeader {
             });
         }
 
-        // Compute the live fingerprint via the sql-traits catalog. The catalog
-        // *must* know about this table: there is no graceful fallback path.
-        let live = catalog_helpers::schema_fingerprint(database, self.table_id)
-            .map_err(|e| StorageError::Corrupt(format!("fingerprint computation failed: {e}")))?
-            .ok_or_else(|| {
-                StorageError::Corrupt(format!(
-                    "shard references unknown table {} (no fingerprint available)",
-                    self.table_id,
-                ))
-            })?;
-        let expected = ShardFingerprintEnvelope::from_schema(&live);
-
-        if expected != self.fingerprint {
+        if *expected != self.fingerprint {
             return Err(StorageError::SchemaMismatch {
                 table_id: self.table_id,
-                expected,
+                expected: *expected,
                 got: self.fingerprint,
             });
         }
 
         Ok(())
+    }
+
+    /// Validate the header against a live catalog by computing this table's
+    /// schema fingerprint and delegating to [`Self::validate_against`].
+    pub fn validate<DB: DatabaseLike>(&self, database: &DB) -> Result<(), StorageError> {
+        let expected = expected_envelope(database, self.table_id)?;
+        self.validate_against(&expected)
     }
 }
 
@@ -367,25 +369,41 @@ pub fn serialize_shard<I: IdTypes, DB: DatabaseLike>(
 /// Deserialize shard from bytes
 ///
 /// Returns (header, payload).
-pub fn deserialize_shard<I: IdTypes, DB: DatabaseLike>(
-    bytes: &[u8],
+/// Compute the expected fingerprint envelope for `table_id` from a live
+/// catalog. This is the only place shard validation needs a `DatabaseLike`,
+/// so callers that already hold (or carry) the envelope can skip it.
+pub fn expected_envelope<DB: DatabaseLike>(
     database: &DB,
-) -> Result<(ShardHeader, ShardPayload<I>), StorageError> {
-    let header = decode_header(bytes)?;
+    table_id: TableId,
+) -> Result<ShardFingerprintEnvelope, StorageError> {
+    let live = catalog_helpers::schema_fingerprint(database, table_id)
+        .map_err(|e| StorageError::Corrupt(format!("fingerprint computation failed: {e}")))?
+        .ok_or_else(|| {
+            StorageError::Corrupt(format!(
+                "shard references unknown table {table_id} (no fingerprint available)"
+            ))
+        })?;
+    Ok(ShardFingerprintEnvelope::from_schema(&live))
+}
 
-    // Size sanity check first: a tampered header claiming `u64::MAX` would
-    // otherwise burn a SHA-256 catalog recomputation in `validate` before
-    // being rejected here.
+/// Size sanity check, run before the (more expensive) fingerprint check: a
+/// tampered header claiming `u64::MAX` is rejected here first.
+fn check_payload_size(header: &ShardHeader) -> Result<(), StorageError> {
     if header.uncompressed_size > MAX_SHARD_UNCOMPRESSED_SIZE {
         return Err(StorageError::Corrupt(format!(
             "Uncompressed payload too large: {} > {}",
             header.uncompressed_size, MAX_SHARD_UNCOMPRESSED_SIZE
         )));
     }
+    Ok(())
+}
 
-    // Validate header
-    header.validate(database)?;
-
+/// Decode the payload after the header has already been size-checked and
+/// validated. Shared by both deserialize entry points.
+fn decode_validated_payload<I: IdTypes>(
+    bytes: &[u8],
+    header: ShardHeader,
+) -> Result<(ShardHeader, ShardPayload<I>), StorageError> {
     // Extract payload bytes (skip fixed-size header).
     let payload_bytes = bytes
         .get(SHARD_HEADER_SIZE..)
@@ -412,10 +430,34 @@ pub fn deserialize_shard<I: IdTypes, DB: DatabaseLike>(
         )));
     }
 
-    // Deserialize payload
     let payload: ShardPayload<I> = codec::deserialize(&decompressed)?;
-
     Ok((header, payload))
+}
+
+/// Deserialize a shard, validating its fingerprint against a **precomputed**
+/// envelope, no live catalog required.
+///
+/// Used by the merge worker, which runs off-thread and is handed the envelope
+/// rather than the whole catalog.
+pub fn deserialize_shard_checked<I: IdTypes>(
+    bytes: &[u8],
+    expected: &ShardFingerprintEnvelope,
+) -> Result<(ShardHeader, ShardPayload<I>), StorageError> {
+    let header = decode_header(bytes)?;
+    check_payload_size(&header)?;
+    header.validate_against(expected)?;
+    decode_validated_payload(bytes, header)
+}
+
+/// Deserialize a shard, validating its fingerprint against a live catalog.
+pub fn deserialize_shard<I: IdTypes, DB: DatabaseLike>(
+    bytes: &[u8],
+    database: &DB,
+) -> Result<(ShardHeader, ShardPayload<I>), StorageError> {
+    let header = decode_header(bytes)?;
+    check_payload_size(&header)?;
+    header.validate(database)?;
+    decode_validated_payload(bytes, header)
 }
 
 #[cfg(test)]

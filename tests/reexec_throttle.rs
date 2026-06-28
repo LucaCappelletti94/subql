@@ -170,7 +170,7 @@ fn engine_with_all_queries(
         .collect();
     let connector = ConcurrencyProbingConnector::new(seeded_values, delay);
     let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-        Arc::new(catalog()),
+        catalog(),
         PostgreSqlDialect {},
     );
     let mut engine = AsyncAutoResolvingEngine::new(ReExecEngine::new(inner), connector)

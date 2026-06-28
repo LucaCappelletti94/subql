@@ -131,9 +131,8 @@ pub enum PollingPgCdcError {
 
 /// Polling-based Postgres CDC source. See the module-level docs for
 /// when to choose polling over the default push source.
-pub struct PollingPgCdcSource<DB: DatabaseLike> {
+pub struct PollingPgCdcSource {
     config: PollingPgCdcConfig,
-    catalog: Arc<DB>,
     event_rx: tokio::sync::mpsc::Receiver<Result<WalEvent<PgLsn>, PollingPgCdcError>>,
     polls_issued: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
@@ -150,13 +149,13 @@ pub struct PollingPgCdcSource<DB: DatabaseLike> {
     task: tokio::task::JoinHandle<()>,
 }
 
-impl<DB: DatabaseLike + 'static> PollingPgCdcSource<DB> {
+impl PollingPgCdcSource {
     /// Open a regular SQL connection to Postgres, validate the slot
     /// exists, and spawn the inner task that drains the slot at the
     /// configured cadence.
-    pub async fn connect(
+    pub async fn connect<DB: DatabaseLike + 'static>(
         config: PollingPgCdcConfig,
-        catalog: Arc<DB>,
+        catalog: DB,
     ) -> Result<Self, PollingPgCdcError> {
         let slot_name_for_check = config.slot_name.clone();
         let url = config.url.clone();
@@ -192,7 +191,6 @@ impl<DB: DatabaseLike + 'static> PollingPgCdcSource<DB> {
         let total_drained_events = Arc::new(AtomicU64::new(0));
         let task_exited = Arc::new(AtomicBool::new(false));
 
-        let task_catalog = Arc::clone(&catalog);
         let task_slot = config.slot_name.clone();
         let task_publication = config.publication_name.clone();
         let task_interval = config.poll_interval;
@@ -206,7 +204,7 @@ impl<DB: DatabaseLike + 'static> PollingPgCdcSource<DB> {
         let task = tokio::task::spawn_blocking(move || {
             polling_loop(
                 conn,
-                task_catalog,
+                catalog,
                 task_slot,
                 task_publication,
                 task_interval,
@@ -222,7 +220,6 @@ impl<DB: DatabaseLike + 'static> PollingPgCdcSource<DB> {
 
         Ok(Self {
             config,
-            catalog,
             event_rx,
             polls_issued,
             events_received,
@@ -232,12 +229,6 @@ impl<DB: DatabaseLike + 'static> PollingPgCdcSource<DB> {
             task_exited,
             task,
         })
-    }
-
-    /// Borrow the catalog the source resolves table/column metadata against.
-    #[must_use]
-    pub fn catalog(&self) -> &DB {
-        &self.catalog
     }
 
     /// Borrow the configuration the source was built with.
@@ -298,7 +289,7 @@ impl<DB: DatabaseLike + 'static> PollingPgCdcSource<DB> {
     }
 }
 
-impl<DB: DatabaseLike> Drop for PollingPgCdcSource<DB> {
+impl Drop for PollingPgCdcSource {
     fn drop(&mut self) {
         // Cooperative shutdown: the inner blocking loop polls this flag
         // between iterations. `abort()` does not interrupt a running
@@ -320,7 +311,7 @@ impl<DB: DatabaseLike> Drop for PollingPgCdcSource<DB> {
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn polling_loop<DB: DatabaseLike>(
     mut conn: PgReplicationConnection,
-    catalog: Arc<DB>,
+    catalog: DB,
     slot_name: String,
     publication_name: String,
     poll_interval: Duration,
@@ -395,7 +386,7 @@ fn polling_loop<DB: DatabaseLike>(
                     return;
                 }
             };
-            let events = match parser.parse_wal_message(&bytes, &*catalog) {
+            let events = match parser.parse_wal_message(&bytes, &catalog) {
                 Ok(events) => events,
                 Err(e) => {
                     let _ = event_tx.blocking_send(Err(PollingPgCdcError::Parse(e)));
@@ -416,7 +407,7 @@ fn polling_loop<DB: DatabaseLike>(
     }
 }
 
-impl<DB: DatabaseLike + 'static> crate::CdcSource for PollingPgCdcSource<DB> {
+impl crate::CdcSource for PollingPgCdcSource {
     type Checkpoint = PgLsn;
     type Error = PollingPgCdcError;
 

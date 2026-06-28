@@ -22,7 +22,6 @@
 )]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -40,10 +39,7 @@ type Model = HashMap<(SessionId, SubscriptionId), OpaqueCheckpoint>;
 
 fn fresh_engine() -> Engine {
     SubscriptionEngine::new(
-        Arc::new(
-            ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE orders (id INT PRIMARY KEY);")
-                .unwrap(),
-        ),
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE orders (id INT PRIMARY KEY);").unwrap(),
         PostgreSqlDialect {},
     )
 }

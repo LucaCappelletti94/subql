@@ -27,7 +27,6 @@
 #![allow(clippy::unwrap_used, clippy::print_stdout)]
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
@@ -41,7 +40,7 @@ const CATALOG_DDL: &str = "CREATE TABLE orders (\
 type Engine = ReExecEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
 
 fn fresh_engine() -> Engine {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap();
     ReExecEngine::new(SubscriptionEngine::new(catalog, PostgreSqlDialect {}))
 }
 

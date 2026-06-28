@@ -38,8 +38,8 @@ const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, statu
 /// for OID 25 (text).
 const STATUSES: &[&str] = &["paid", "open", "closed", "pending", ""];
 
-fn build_catalog() -> Arc<ParserDB> {
-    Arc::new(ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap())
+fn build_catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap()
 }
 
 fn orders_table_id(catalog: &ParserDB) -> TableId {
@@ -172,12 +172,12 @@ proptest! {
         let parser = PgOutputParser::new();
 
         let frames = bridge
-            .encode_event(&input, &*catalog)
+            .encode_event(&input, &catalog)
             .expect("encode_event must succeed for catalog-resident table");
         let mut decoded: Vec<WalEvent> = Vec::new();
         for frame in frames {
             let events = parser
-                .parse_wal_message(&frame, &*catalog)
+                .parse_wal_message(&frame, &catalog)
                 .expect("parser must accept bridge-encoded frames");
             decoded.extend(events);
         }

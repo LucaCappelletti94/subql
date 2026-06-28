@@ -534,7 +534,7 @@ mod tests {
     type TestEngine = ReExecEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
 
     fn engine() -> TestEngine {
-        let inner = SubscriptionEngine::new(Arc::new(catalog()), PostgreSqlDialect {});
+        let inner = SubscriptionEngine::new(catalog(), PostgreSqlDialect {});
         ReExecEngine::new(inner)
     }
 
@@ -634,7 +634,7 @@ mod tests {
                    ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
         let rls_catalog = ParserDB::parse::<PostgreSqlDialect>(ddl).unwrap();
         let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            Arc::new(rls_catalog),
+            rls_catalog,
             PostgreSqlDialect {},
         );
         let mut e = ReExecEngine::new(inner);

@@ -35,8 +35,6 @@
     clippy::cast_possible_truncation
 )]
 
-use std::sync::Arc;
-
 use proptest::collection::vec;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
@@ -51,7 +49,7 @@ const CATALOG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, 
 type Engine = SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
 
 fn fresh(cap: Option<usize>, policy: Option<EvictionPolicy>) -> Engine {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap();
     let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     if let (Some(cap), Some(policy)) = (cap, policy) {
         engine = engine.with_max_subscriptions(cap, policy);
@@ -60,7 +58,7 @@ fn fresh(cap: Option<usize>, policy: Option<EvictionPolicy>) -> Engine {
 }
 
 fn fresh_custom(cap: usize) -> Engine {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap();
     SubscriptionEngine::new(catalog, PostgreSqlDialect {})
         .with_custom_eviction(cap, lowest_consumer_evictor)
 }

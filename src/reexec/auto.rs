@@ -518,7 +518,7 @@ mod tests {
         values: alloc::vec::Vec<Cell>,
     ) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, MockConnector> {
         let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            Arc::new(catalog()),
+            catalog(),
             PostgreSqlDialect {},
         );
         AutoResolvingEngine::new(ReExecEngine::new(inner), MockConnector::new(values))

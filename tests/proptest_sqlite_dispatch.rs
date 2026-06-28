@@ -23,7 +23,6 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use diesel::{sql_query, Connection, RunQueryDsl, SqliteConnection};
 use proptest::prelude::*;
@@ -185,7 +184,7 @@ fn oracle(subs: &[Subscription], old_row: Option<&Row>, new_row: Option<&Row>) -
 }
 
 fn build_engine() -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
     let mut engine = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
         catalog,
         PostgreSqlDialect {},
@@ -199,7 +198,7 @@ fn build_engine() -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>
 }
 
 fn build_source() -> SqliteCdcSource {
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap());
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     sql_query(SQLITE_DDL).execute(&mut conn).unwrap();
     SqliteCdcSource::new(conn, catalog, SqliteCdcConfig::default()).unwrap()
@@ -325,7 +324,7 @@ proptest! {
         let subs = subscriptions();
         let mut source = build_source();
         let mut engine = build_engine();
-        let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap());
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).unwrap();
         let mut bridge = PgOutputBridge::new();
         let parser = PgOutputParser::new();
         let mut model: BTreeMap<i64, Row> = BTreeMap::new();
@@ -383,12 +382,12 @@ proptest! {
             // result. Bridge state survives across loop iterations so a
             // Relation message is emitted once per table.
             let frames = bridge
-                .encode_event(&dispatch_event, &*catalog)
+                .encode_event(&dispatch_event, &catalog)
                 .expect("bridge encodes catalog-resident event");
             let mut decoded: Vec<_> = Vec::new();
             for frame in frames {
                 let events = parser
-                    .parse_wal_message(&frame, &*catalog)
+                    .parse_wal_message(&frame, &catalog)
                     .expect("parser accepts bridge-encoded frames");
                 decoded.extend(events);
             }

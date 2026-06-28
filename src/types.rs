@@ -1178,7 +1178,6 @@ impl<I: IdTypes> SubscriptionRequest<I> {
 /// instead of this enum.
 ///
 /// ```
-/// use std::sync::Arc;
 ///
 /// use sql_traits::structs::ParserDB;
 /// use sqlparser::dialect::PostgreSqlDialect;
@@ -1187,11 +1186,9 @@ impl<I: IdTypes> SubscriptionRequest<I> {
 ///     SubscriptionRequest,
 /// };
 ///
-/// let database = Arc::new(
-///     ParserDB::parse::<PostgreSqlDialect>(
-///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-///     )?,
-/// );
+/// let database = ParserDB::parse::<PostgreSqlDialect>(
+///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+/// )?;
 ///
 /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
 ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
@@ -1218,7 +1215,6 @@ pub enum EvictionPolicy {
     /// Hard cap: reject the registration when the registry is full.
     ///
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -1227,11 +1223,9 @@ pub enum EvictionPolicy {
     ///     SubscriptionRequest,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(1, EvictionPolicy::Reject);
@@ -1278,12 +1272,10 @@ pub enum EvictionPolicy {
     ///     PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
-    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     /// let clock = Arc::new(ManualClock::new(0));
     /// let handle: ClockHandle = clock.clone();
     ///
@@ -1346,12 +1338,10 @@ pub enum EvictionPolicy {
     ///     SubscriptionEngine, SubscriptionRequest, WalEvent,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
-    /// let orders_id = catalog_helpers::table_id(&*database, "orders").unwrap();
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     ///
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
@@ -1389,7 +1379,6 @@ pub enum EvictionPolicy {
     /// [`EvictOldest`](Self::EvictOldest).
     ///
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -1398,11 +1387,9 @@ pub enum EvictionPolicy {
     ///     SubscriptionScope,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(2, EvictionPolicy::EvictBySession);
@@ -1430,7 +1417,6 @@ pub enum EvictionPolicy {
     /// Ties between consumers (same count) resolve by lowest consumer id.
     ///
     /// ```
-    /// use std::sync::Arc;
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
@@ -1438,11 +1424,9 @@ pub enum EvictionPolicy {
     ///     DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
-    /// let database = Arc::new(
-    ///     ParserDB::parse::<PostgreSqlDialect>(
-    ///         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
-    ///     )?,
-    /// );
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
+    /// )?;
     /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(3, EvictionPolicy::EvictByConsumer);

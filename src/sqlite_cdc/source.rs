@@ -78,8 +78,8 @@ struct TableMeta {
 
 /// In-process SQLite-backed CDC source.
 ///
-/// Constructed from an owned [`SqliteConnection`] plus an
-/// [`Arc<ParserDB>`]. At construction time the source installs a unified
+/// Constructed from an owned [`SqliteConnection`] plus an owned
+/// [`ParserDB`]. At construction time the source installs a unified
 /// shadow-log table (`_subql_cdc_event_log`) and per-table triggers that
 /// record each mutation's row image. From that point on, every
 /// `INSERT` / `UPDATE` / `DELETE` executed against the wrapped
@@ -113,7 +113,7 @@ struct TableMeta {
 /// ```
 pub struct SqliteCdcSource {
     connection: SqliteConnection,
-    catalog: Arc<ParserDB>,
+    catalog: ParserDB,
     config: SqliteCdcConfig,
     tables: HashMap<String, TableMeta>,
 }
@@ -134,15 +134,14 @@ impl SqliteCdcSource {
     /// # Examples
     ///
     /// ```
-    /// use std::sync::Arc;
     /// use diesel::{sql_query, Connection, RunQueryDsl, SqliteConnection};
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::{SqliteCdcConfig, SqliteCdcSource};
     ///
-    /// let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(
+    /// let catalog = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
-    /// )?);
+    /// )?;
     ///
     /// let mut conn = SqliteConnection::establish(":memory:")?;
     /// sql_query("CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT)")
@@ -154,7 +153,7 @@ impl SqliteCdcSource {
     /// ```
     pub fn new(
         mut connection: SqliteConnection,
-        catalog: Arc<ParserDB>,
+        catalog: ParserDB,
         config: SqliteCdcConfig,
     ) -> Result<Self, SqliteCdcError> {
         let tables = build_table_index(&catalog);
@@ -218,7 +217,7 @@ impl SqliteCdcSource {
         catalog::apply_pg_ddl(&mut connection, pg_ddl)?;
         let parser_db = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
             .map_err(|e| SqliteCdcError::ParseDdl(format!("{e}")))?;
-        Self::new(connection, Arc::new(parser_db), config)
+        Self::new(connection, parser_db, config)
     }
 
     /// Execute a raw SQL statement against the wrapped SQLite connection.
@@ -286,7 +285,7 @@ impl SqliteCdcSource {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[must_use]
-    pub fn catalog(&self) -> &ParserDB {
+    pub const fn catalog(&self) -> &ParserDB {
         &self.catalog
     }
 

@@ -29,7 +29,6 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::{sql_query, RunQueryDsl};
@@ -171,7 +170,7 @@ fn push_and_poll_observe_identical_event_streams() {
     common::create_pgoutput_slot(&mut setup, push_slot);
     common::create_pgoutput_slot(&mut setup, poll_slot);
 
-    let catalog = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"));
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let push_config =
         PgStreamingConfig::new(common::pg_replication_url(port), push_slot, publication);
     let poll_config = PollingPgCdcConfig::new(common::pg_url(port), poll_slot, publication)
@@ -186,12 +185,15 @@ fn push_and_poll_observe_identical_event_streams() {
     const N_TOTAL: usize = (N_INSERTS + N_UPDATES + N_DELETES) as usize;
 
     current_thread_rt().block_on(async move {
-        let mut push_source = PgStreamingCdcSource::connect(push_config, Arc::clone(&catalog))
+        let mut push_source = PgStreamingCdcSource::connect(push_config, catalog)
             .await
             .expect("connect push source");
-        let mut poll_source = PollingPgCdcSource::connect(poll_config, Arc::clone(&catalog))
-            .await
-            .expect("connect poll source");
+        let mut poll_source = PollingPgCdcSource::connect(
+            poll_config,
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+        )
+        .await
+        .expect("connect poll source");
 
         // Drive deterministic DML. All commits happen BEFORE either
         // source begins draining; this is a correctness test, not a
