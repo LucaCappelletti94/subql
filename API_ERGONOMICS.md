@@ -9,7 +9,7 @@ references are into `subql-demo/src/` at the time of writing.
 
 Status legend: `[ ]` open, `[~]` in progress, `[x]` done.
 
-## [~] E1 - unified dispatch (in progress on `feat/engine-dispatch`)
+## [x] E1 - unified dispatch
 
 Dispatching one event takes two calls plus a hand-rolled merge of the notified
 consumer set.
@@ -37,7 +37,7 @@ for (cid, delta) in out.aggregate_deltas() { /* ... */ }
 let notified = out.notified();   // deduped union, computed in the library
 ```
 
-## [ ] E2 - aggregate accumulator
+## [x] E2 - aggregate accumulator
 
 The engine returns signed `AggDelta`s and makes every caller hold the running
 value. The demo hand-writes ~50 lines of accumulator (`state.rs:54-106`).

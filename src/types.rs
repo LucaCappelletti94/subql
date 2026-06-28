@@ -1788,6 +1788,152 @@ pub enum AggDelta {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AggKind {
+    Count,
+    Sum,
+    Avg,
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
+}
+
+/// Current value of an [`AggAccumulator`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AggValue {
+    /// `COUNT(*)` or `COUNT(col)`.
+    Count(i64),
+    /// `SUM(col)`.
+    Sum(f64),
+    /// A real-valued aggregate (AVG, variance, stddev). `None` when undefined
+    /// for the current row count.
+    Real(Option<f64>),
+}
+
+/// Running value of an aggregate subscription, folded from [`AggDelta`]s and
+/// seeded from the registration's [`AggSpec`](crate::AggSpec).
+///
+/// ```
+/// use subql::{AggAccumulator, AggDelta, AggSpec, AggValue};
+///
+/// let mut count = AggAccumulator::from_spec(&AggSpec::CountStar);
+/// count.apply(&AggDelta::Count(3));
+/// count.apply(&AggDelta::Count(-1));
+/// assert_eq!(count.value(), AggValue::Count(2));
+/// assert_eq!(count.to_string(), "2");
+///
+/// let mut avg = AggAccumulator::from_spec(&AggSpec::Avg { column: 1 });
+/// avg.apply(&AggDelta::Avg { sum_delta: 10.0, count_delta: 4 });
+/// assert_eq!(avg.value(), AggValue::Real(Some(2.5)));
+/// ```
+#[derive(Clone, Debug)]
+pub struct AggAccumulator {
+    kind: AggKind,
+    count: i64,
+    sum: f64,
+    sum_sq: f64,
+}
+
+impl AggAccumulator {
+    /// Seed an accumulator for the aggregate described by `spec`.
+    #[must_use]
+    pub const fn from_spec(spec: &crate::AggSpec) -> Self {
+        use crate::AggSpec as S;
+        let kind = match spec {
+            S::CountStar | S::CountColumn { .. } => AggKind::Count,
+            S::Sum { .. } => AggKind::Sum,
+            S::Avg { .. } => AggKind::Avg,
+            S::VarPop { .. } => AggKind::VarPop,
+            S::VarSamp { .. } => AggKind::VarSamp,
+            S::StddevPop { .. } => AggKind::StddevPop,
+            S::StddevSamp { .. } => AggKind::StddevSamp,
+        };
+        Self {
+            kind,
+            count: 0,
+            sum: 0.0,
+            sum_sq: 0.0,
+        }
+    }
+
+    /// Fold one delta into the running value.
+    pub fn apply(&mut self, delta: &AggDelta) {
+        match delta {
+            AggDelta::Count(d) => self.count += d,
+            AggDelta::Sum(d) => self.sum += d,
+            AggDelta::Avg {
+                sum_delta,
+                count_delta,
+            } => {
+                self.sum += sum_delta;
+                self.count += count_delta;
+            }
+            AggDelta::Stats {
+                sum_delta,
+                sum_sq_delta,
+                count_delta,
+            } => {
+                self.sum += sum_delta;
+                self.sum_sq += sum_sq_delta;
+                self.count += count_delta;
+            }
+        }
+    }
+
+    /// Rows currently contributing to the aggregate.
+    #[must_use]
+    pub const fn count(&self) -> i64 {
+        self.count
+    }
+
+    /// Current aggregate value.
+    #[must_use]
+    pub fn value(&self) -> AggValue {
+        match self.kind {
+            AggKind::Count => AggValue::Count(self.count),
+            AggKind::Sum => AggValue::Sum(self.sum),
+            AggKind::Avg => AggValue::Real(self.mean()),
+            AggKind::VarPop => AggValue::Real(self.var_pop()),
+            AggKind::VarSamp => AggValue::Real(self.var_samp()),
+            AggKind::StddevPop => AggValue::Real(self.var_pop().map(f64::sqrt)),
+            AggKind::StddevSamp => AggValue::Real(self.var_samp().map(f64::sqrt)),
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn mean(&self) -> Option<f64> {
+        (self.count > 0).then(|| self.sum / self.count as f64)
+    }
+
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    fn var_pop(&self) -> Option<f64> {
+        (self.count > 0).then(|| {
+            let n = self.count as f64;
+            self.sum_sq / n - (self.sum / n).powi(2)
+        })
+    }
+
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    fn var_samp(&self) -> Option<f64> {
+        (self.count >= 2).then(|| {
+            let n = self.count as f64;
+            (self.sum_sq - self.sum.powi(2) / n) / (n - 1.0)
+        })
+    }
+}
+
+impl core::fmt::Display for AggAccumulator {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.value() {
+            AggValue::Count(c) => write!(f, "{c}"),
+            AggValue::Sum(s) => write!(f, "{s}"),
+            AggValue::Real(Some(v)) => write!(f, "{v}"),
+            AggValue::Real(None) => write!(f, "-"),
+        }
+    }
+}
+
 /// Per-consumer notification classification from `consumers()`.
 ///
 /// Each consumer sees events **relative to their own result set** (view-relative

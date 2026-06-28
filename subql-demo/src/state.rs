@@ -12,7 +12,7 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
 use subql::{
-    AggDelta, AggSpec, DefaultIds, QueryProjection, RegisterError, SubscriptionEngine,
+    AggAccumulator, DefaultIds, QueryProjection, RegisterError, SubscriptionEngine,
     SubscriptionRequest, WalEvent,
 };
 
@@ -44,65 +44,12 @@ pub struct ConsumerCounters {
 }
 
 #[derive(Clone, Debug)]
-pub enum AggState {
-    None,
-    Count(i64),
-    Sum(f64),
-    Avg { sum: f64, count: i64 },
-}
-
-impl AggState {
-    fn for_spec(spec: &AggSpec) -> Self {
-        match spec {
-            AggSpec::CountStar | AggSpec::CountColumn { .. } => Self::Count(0),
-            AggSpec::Sum { .. } => Self::Sum(0.0),
-            AggSpec::Avg { .. } => Self::Avg { sum: 0.0, count: 0 },
-            _ => Self::None,
-        }
-    }
-
-    fn apply(&mut self, delta: &AggDelta) {
-        match (self, delta) {
-            (Self::Count(c), AggDelta::Count(d)) => *c += d,
-            (Self::Sum(s), AggDelta::Sum(d)) => *s += d,
-            (
-                Self::Avg { sum, count },
-                AggDelta::Avg {
-                    sum_delta,
-                    count_delta,
-                },
-            ) => {
-                *sum += sum_delta;
-                *count += count_delta;
-            }
-            _ => {}
-        }
-    }
-
-    #[must_use]
-    pub fn display(&self) -> String {
-        match self {
-            Self::None => String::new(),
-            Self::Count(c) => format!("count={c}"),
-            Self::Sum(s) => format!("sum={s:.3}"),
-            Self::Avg { sum, count } => {
-                if *count > 0 {
-                    let avg = *sum / *count as f64;
-                    format!("avg={avg:.3} (n={count})")
-                } else {
-                    "avg=- (n=0)".into()
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct ConsumerEntry {
     pub consumer_id: u64,
     pub sql: String,
     pub counters: ConsumerCounters,
-    pub agg: AggState,
+    /// `Some` for aggregate subscriptions, holding the running value.
+    pub agg: Option<AggAccumulator>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,8 +138,8 @@ impl DemoState {
         let result = self.engine.register(req)?;
 
         let agg = match &result.projection {
-            QueryProjection::Aggregate(spec) => AggState::for_spec(spec),
-            _ => AggState::None,
+            QueryProjection::Aggregate(spec) => Some(AggAccumulator::from_spec(spec)),
+            _ => None,
         };
 
         self.consumers.push(ConsumerEntry {
@@ -236,7 +183,9 @@ impl DemoState {
         }
         for (cid, delta) in out.aggregate_deltas() {
             if let Some(c) = self.find_consumer_mut(*cid) {
-                c.agg.apply(delta);
+                if let Some(acc) = c.agg.as_mut() {
+                    acc.apply(delta);
+                }
             }
         }
 
