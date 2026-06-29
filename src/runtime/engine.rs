@@ -1559,6 +1559,20 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         &mut self,
         event: &WalEvent<C>,
     ) -> Result<crate::ConsumerNotifications<I, C>, DispatchError> {
+        // A table owns a partition only once a subscription targets it. An
+        // event for a table that is in the catalog but has no subscription
+        // affects nobody: report empty rather than erroring. Reserve
+        // `UnknownTableId` for ids that are not in the schema at all (genuine
+        // drift or a caller bug).
+        if !self.partitions.contains_key(&event.table_id()) {
+            return if self.table_in_catalog(event.table_id()) {
+                Ok(crate::ConsumerNotifications::empty()
+                    .with_checkpoint(event.checkpoint().cloned()))
+            } else {
+                Err(DispatchError::UnknownTableId(event.table_id()))
+            };
+        }
+
         // Activity-aware policies stamp matched subscriptions through the
         // `_with_stamps` dispatch variant. Default (no activity tracking)
         // takes the cheaper path that allocates no stamp vector.
@@ -1684,6 +1698,16 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         &mut self,
         event: &WalEvent<C>,
     ) -> Result<Vec<(I::ConsumerId, crate::AggDelta)>, DispatchError> {
+        // See `consumers`: a cataloged table with no subscription contributes
+        // no aggregate deltas; only a truly unknown table id errors.
+        if !self.partitions.contains_key(&event.table_id()) {
+            return if self.table_in_catalog(event.table_id()) {
+                Ok(Vec::new())
+            } else {
+                Err(DispatchError::UnknownTableId(event.table_id()))
+            };
+        }
+
         let (partition, consumer_dict) = table_context(
             &self.partitions,
             &self.consumer_dictionaries,
@@ -1887,6 +1911,14 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             removed_predicates,
             removed_consumers,
         })
+    }
+
+    /// Whether `table_id` resolves in the schema catalog, regardless of
+    /// whether any subscription currently targets it. Used to tell a known
+    /// table with no subscription (dispatch is a no-op) from a genuinely
+    /// unknown table id (dispatch errors).
+    fn table_in_catalog(&self, table_id: TableId) -> bool {
+        catalog_helpers::table_arity(&self.database, table_id).is_some()
     }
 
     /// Validate that a row image has the expected arity for its table.
@@ -2641,6 +2673,80 @@ mod tests {
             .old_row(old_row)
             .build()
             .expect("delete event builder should be valid")
+    }
+
+    /// A single-column insert for `z_other`, the catalog's second known table.
+    fn z_other_event(table_id: TableId) -> WalEvent {
+        build_insert_event(
+            table_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(1)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(1)]),
+            },
+        )
+    }
+
+    #[test]
+    fn dispatch_to_cataloged_unsubscribed_table_is_empty_not_error() {
+        let catalog = make_catalog();
+        let z_other = catalog_helpers::table_id(&catalog, "z_other").expect("z_other id");
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        // Subscribe only to `orders`. `z_other` is in the schema but has no
+        // subscription, so it owns no partition.
+        engine
+            .register_select(1u64, "SELECT * FROM orders WHERE amount > 100")
+            .expect("register orders");
+
+        // An event for the unsubscribed-but-cataloged table reports "nobody
+        // affected", it does not error.
+        let event = z_other_event(z_other);
+        let out = engine
+            .dispatch(&event)
+            .expect("dispatch to a cataloged table must not error");
+        assert!(out.notified().is_empty());
+        assert!(out.aggregate_deltas().is_empty());
+
+        // The two leaf paths agree with `dispatch`.
+        let notifs = engine.consumers(&event).expect("consumers ok");
+        assert!(notifs.inserted().is_empty());
+        assert!(notifs.updated().is_empty());
+        assert!(notifs.deleted().is_empty());
+        assert!(engine
+            .aggregate_deltas(&event)
+            .expect("aggregate_deltas ok")
+            .is_empty());
+    }
+
+    #[test]
+    fn dispatch_to_uncataloged_table_still_errors() {
+        let catalog = make_catalog();
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+        engine
+            .register_select(1u64, "SELECT * FROM orders WHERE amount > 100")
+            .expect("register orders");
+
+        // 999 is not in the catalog at all: a genuine unknown table id must
+        // still surface as an error, not be silently swallowed.
+        let bogus: TableId = 999;
+        let event = z_other_event(bogus);
+        assert!(matches!(
+            engine.dispatch(&event),
+            Err(DispatchError::UnknownTableId(t)) if t == bogus
+        ));
+        assert!(matches!(
+            engine.consumers(&event),
+            Err(DispatchError::UnknownTableId(t)) if t == bogus
+        ));
+        assert!(matches!(
+            engine.aggregate_deltas(&event),
+            Err(DispatchError::UnknownTableId(t)) if t == bogus
+        ));
     }
 
     #[cfg(unix)]
