@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use diesel::{Connection, PgConnection, RunQueryDsl};
+use diesel::{Connection, MysqlConnection, PgConnection, RunQueryDsl};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
@@ -198,6 +198,50 @@ pub fn create_pgoutput_slot(conn: &mut PgConnection, name: &str) {
     ))
     .execute(conn)
     .expect("create pgoutput slot");
+}
+
+// ---------------------------------------------------------------------------
+// MySQL helpers (used by reexec_mysql.rs)
+// ---------------------------------------------------------------------------
+
+/// Spin up a MySQL 8.0 container with binary logging enabled (ROW format,
+/// FULL row images), waiting until the server is accepting connections.
+///
+/// MySQL 8.0 prints "ready for connections" twice during startup (once for
+/// the bootstrap temp server, once for the real one). We wait for the
+/// "port: 3306" line, which only appears in the final ready message. Binary
+/// logging is required for `SHOW MASTER STATUS` (the binlog coordinate the
+/// `MysqlDieselConnector` reports).
+pub fn mysql_8() -> Container<GenericImage> {
+    GenericImage::new("mysql", "8.0")
+        .with_wait_for(WaitFor::message_on_stderr("port: 3306"))
+        .with_exposed_port(3306.tcp())
+        .with_env_var("MYSQL_ROOT_PASSWORD", "subql_test")
+        .with_env_var("MYSQL_DATABASE", "testdb")
+        .with_cmd([
+            "--server-id=1",
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-image=FULL",
+        ])
+        .with_startup_timeout(Duration::from_secs(120))
+        .start()
+        .expect("start mysql")
+}
+
+/// Build the diesel URL for a MySQL container at the given mapped port.
+pub fn mysql_url(port: u16) -> String {
+    format!("mysql://root:subql_test@127.0.0.1:{port}/testdb")
+}
+
+/// Establish a diesel [`MysqlConnection`] against the container at `port`.
+pub fn mysql_connect(port: u16) -> MysqlConnection {
+    MysqlConnection::establish(&mysql_url(port)).expect("MySQL connection")
+}
+
+/// Mapped host port for a started MySQL container.
+pub fn mysql_port(c: &Container<GenericImage>) -> u16 {
+    c.get_host_port_ipv4(3306.tcp()).expect("mysql port")
 }
 
 /// Drain every queued WAL change from a `pgoutput` slot as raw binary

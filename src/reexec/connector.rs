@@ -386,6 +386,143 @@ impl Connector for PgDieselConnector {
 }
 
 // ---------------------------------------------------------------------------
+// MysqlDieselConnector: binlog-position-aware sync impl behind
+// `executor-diesel-mysql`.
+// ---------------------------------------------------------------------------
+
+/// Sync [`Connector`] backed by a diesel `MysqlConnection` that anchors every
+/// read to a MySQL binary-log position.
+///
+/// On each `execute_scalar` call the connector runs the user's SQL and then
+/// reads `performance_schema.log_status` inside one transaction, returning the
+/// resulting [`Cell`] together with the parsed [`crate::MysqlBinlogPos`] (the
+/// binlog file's numeric suffix + byte offset).
+///
+/// `log_status` is used rather than `SHOW MASTER STATUS` because diesel's
+/// prepared-statement protocol cannot read result-set metadata for `SHOW`
+/// commands ("No metadata exists"). `log_status` is a regular table, so the
+/// metadata is present.
+///
+/// Unlike PostgreSQL's `pg_current_wal_lsn()`, this reports the server's
+/// *current* binlog coordinate rather than one tied to the transaction's
+/// snapshot, so the anchor is a best-effort "at or after the read" marker -
+/// adequate for chaining binlog events onto the snapshot, but not a strict
+/// MVCC-consistent position. Returns `None` for the checkpoint when binary
+/// logging is disabled (no `log_status` row).
+///
+/// Holds the connection in a [`RefCell`]; not `Send`/`Sync`. Requires MySQL
+/// 8.0.22+ binary logging (`--log-bin`) and `BACKUP_ADMIN` to read
+/// `performance_schema.log_status`.
+///
+/// # Errors
+///
+/// Returns [`diesel::result::Error`] for any underlying database failure.
+#[cfg(feature = "executor-diesel-mysql")]
+pub struct MysqlDieselConnector {
+    conn: RefCell<diesel::MysqlConnection>,
+}
+
+#[cfg(feature = "executor-diesel-mysql")]
+impl MysqlDieselConnector {
+    /// Wrap an owned [`MysqlConnection`](diesel::MysqlConnection). The connector
+    /// takes exclusive ownership and serializes access through interior
+    /// mutability.
+    #[must_use]
+    pub const fn new(conn: diesel::MysqlConnection) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+        }
+    }
+}
+
+#[cfg(feature = "executor-diesel-mysql")]
+#[derive(diesel::QueryableByName)]
+struct LogStatusRow {
+    #[diesel(sql_type = Nullable<Text>, column_name = "file")]
+    file: Option<String>,
+    #[diesel(
+        sql_type = Nullable<diesel::sql_types::Unsigned<BigInt>>,
+        column_name = "position"
+    )]
+    position: Option<u64>,
+}
+
+/// Read the current binlog coordinate from `performance_schema.log_status`.
+///
+/// `SHOW MASTER STATUS` returns no result-set metadata over diesel's
+/// prepared-statement protocol ("No metadata exists"), so the same `(file,
+/// position)` is read from `performance_schema.log_status` (MySQL 8.0.22+,
+/// requires the `BACKUP_ADMIN` privilege). Returns `None` when binary logging is
+/// off, the table/privilege is unavailable, or the coordinate doesn't fit the
+/// compact [`crate::MysqlBinlogPos`]. Best-effort: the checkpoint is
+/// informational (subql does not gate on it), so any failure degrades to `None`
+/// rather than failing the re-execution.
+#[cfg(feature = "executor-diesel-mysql")]
+fn read_binlog_pos(conn: &mut diesel::MysqlConnection) -> Option<crate::MysqlBinlogPos> {
+    use diesel::result::OptionalExtension;
+    const SQL: &str = "SELECT \
+        JSON_UNQUOTE(JSON_EXTRACT(LOCAL, '$.binary_log_file')) AS file, \
+        CAST(JSON_EXTRACT(LOCAL, '$.binary_log_position') AS UNSIGNED) AS position \
+        FROM performance_schema.log_status";
+    // Best-effort: degrade to no checkpoint on any read failure (missing
+    // privilege, binary logging off, unsupported server version).
+    let LogStatusRow {
+        file: Some(file),
+        position: Some(position),
+    } = sql_query(SQL)
+        .get_result::<LogStatusRow>(conn)
+        .optional()
+        .unwrap_or(None)?
+    else {
+        return None;
+    };
+    // Binlog file like "mysql-bin.000003" -> numeric suffix 3.
+    let file = file.rsplit('.').next().and_then(|s| s.parse::<u32>().ok());
+    let pos = u32::try_from(position).ok();
+    match (file, pos) {
+        (Some(file), Some(pos)) => Some(crate::MysqlBinlogPos { file, pos }),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "executor-diesel-mysql")]
+impl Connector for MysqlDieselConnector {
+    type AuthContext = ();
+    type Error = diesel::result::Error;
+    type Checkpoint = crate::MysqlBinlogPos;
+
+    fn execute_scalar(
+        &self,
+        sql: &str,
+        column_type: ColumnType,
+        _auth: &(),
+    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
+        let mut conn = self.conn.borrow_mut();
+        diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            let cell = load_cell(conn, sql, column_type)?;
+            let pos = read_binlog_pos(conn);
+            Ok((cell, pos))
+        })
+    }
+
+    fn execute_rows(
+        &self,
+        _sql: &str,
+        _auth: &(),
+    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
+        // Same restriction as the other diesel connectors: generic row decoding
+        // is deferred to the total row reexec feature.
+        #[allow(clippy::unimplemented)]
+        {
+            unimplemented!(
+                "MysqlDieselConnector::execute_rows is reserved for total row reexec; \
+                 use the scalar path or supply a custom Connector impl"
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PgR2D2DieselConnector: pool-backed PG impl behind `executor-diesel-postgres-r2d2`.
 // ---------------------------------------------------------------------------
 
