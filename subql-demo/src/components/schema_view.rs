@@ -1,61 +1,97 @@
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fa_solid_icons::FaTable, Icon};
 
-use subql::Cell;
+use subql::{Cell, RowImage};
 
-use super::{SharedState, TickSignal};
+use super::{bump, SharedState, TickSignal};
+
+const MAX_VISIBLE: usize = 12;
+
+struct TableSnapshot {
+    name: String,
+    columns: Vec<(String, String)>,
+    rows: Vec<RowImage>,
+    row_count: usize,
+}
 
 #[component]
 pub fn SchemaView() -> Element {
     let state = use_context::<SharedState>();
-    let tick = use_context::<TickSignal>();
+    let mut tick = use_context::<TickSignal>();
     let _ = tick.read();
 
     let s = state.borrow();
-    let table_name = s.preset.table_name;
-    let columns: Vec<(&'static str, &'static str)> = s
-        .preset
-        .columns
+    let selected = s.selected;
+    let tables: Vec<TableSnapshot> = s
+        .tables
         .iter()
-        .zip(s.preset.column_types.iter())
-        .map(|(c, t)| (*c, *t))
+        .map(|t| TableSnapshot {
+            name: t.table_name.clone(),
+            columns: t
+                .columns
+                .iter()
+                .cloned()
+                .zip(t.column_types.iter().cloned())
+                .collect(),
+            rows: t.rows.iter().take(MAX_VISIBLE).cloned().collect(),
+            row_count: t.rows.len(),
+        })
         .collect();
-    let rows: Vec<subql::RowImage> = s.rows.clone();
-    let row_count = rows.len();
     drop(s);
-
-    let max_visible = 20;
-    let visible_rows: Vec<_> = rows.into_iter().take(max_visible).collect();
 
     rsx! {
         h2 {
             Icon { width: 16, height: 16, icon: FaTable, class: "h-icon".to_string() }
-            " Table "
-            code { "{table_name}" }
+            " Tables"
         }
-        p { class: "muted",
-            "{row_count} row(s) materialized from the CDC stream. ",
-            if row_count > max_visible {
-                "Showing first {max_visible}."
-            }
-        }
-        table { class: "schema-table",
-            thead {
-                tr {
-                    for (col, ty) in columns.iter() {
-                        th {
-                            "{col}"
-                            br {}
-                            span { class: "muted", "{ty}" }
+        for (ti, t) in tables.into_iter().enumerate() {
+            {
+                let state = state.clone();
+                let is_selected = ti == selected;
+                let select = move |_| {
+                    state.borrow_mut().selected = ti;
+                    bump(&mut tick);
+                };
+                rsx! {
+                    div { class: "table-block",
+                        h3 {
+                            button {
+                                r#type: "button",
+                                class: if is_selected { "table-tab selected" } else { "table-tab" },
+                                onclick: select,
+                                code { "{t.name}" }
+                                if is_selected {
+                                    span { class: "muted", " (sim target)" }
+                                }
+                            }
                         }
-                    }
-                }
-            }
-            tbody {
-                for image in &visible_rows {
-                    tr {
-                        for cell in image.iter() {
-                            td { "{cell_display(cell)}" }
+                        p { class: "muted",
+                            "{t.row_count} row(s) materialized from the CDC stream. ",
+                            if t.row_count > MAX_VISIBLE {
+                                "Showing first {MAX_VISIBLE}."
+                            }
+                        }
+                        table { class: "schema-table",
+                            thead {
+                                tr {
+                                    for (col, ty) in t.columns.iter() {
+                                        th {
+                                            "{col}"
+                                            br {}
+                                            span { class: "muted", "{ty}" }
+                                        }
+                                    }
+                                }
+                            }
+                            tbody {
+                                for image in t.rows.iter() {
+                                    tr {
+                                        for cell in image.iter() {
+                                            td { "{cell_display(cell)}" }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

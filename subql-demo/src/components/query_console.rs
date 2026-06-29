@@ -15,12 +15,12 @@ pub fn QueryConsole() -> Element {
     let _ = tick.read();
 
     let mut current = use_signal(String::new);
+    // Gather starter queries from every table in the active schema.
     let starter_queries: Vec<String> = state
         .borrow()
-        .preset
-        .starter_queries
+        .tables
         .iter()
-        .map(|s| (*s).to_string())
+        .flat_map(|t| t.starter_queries.iter().cloned())
         .collect();
 
     let on_register = {

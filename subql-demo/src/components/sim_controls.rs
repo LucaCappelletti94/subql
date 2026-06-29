@@ -18,6 +18,7 @@ pub fn SimControls() -> Element {
 
     let running = state.borrow().auto_running;
     let rate = state.borrow().auto_rate_per_sec;
+    let target = state.borrow().selected_table().table_name.clone();
 
     let on_insert = {
         let state = state.clone();
@@ -122,7 +123,11 @@ pub fn SimControls() -> Element {
                 }
             }
         }
-        h3 { "Manual" }
+        h3 {
+            "Manual on "
+            code { "{target}" }
+            span { class: "muted", " (pick a table in the Tables panel)" }
+        }
         div {
             button { onclick: on_insert,
                 Icon { width: 12, height: 12, icon: FaPlus, class: "btn-icon".to_string() }
