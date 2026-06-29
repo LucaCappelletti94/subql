@@ -125,15 +125,22 @@ row.cell(col)   // Option<Cell>, by ColumnId, no cast
 row.iter()      // impl Iterator<Item = &Cell>
 ```
 
-## [ ] E6 - two catalogs from one DDL (structural)
+## [ ] E6 - two catalogs from one DDL (demo wiring only)
 
 The engine parses one `ParserDB` and `SqliteCdcSource::with_pg_ddl` parses another
-from the same DDL; a comment asserts they "line up deterministically"
-(`state.rs:151-178`). Removing the catalog `Arc` made the single-owner case clean
-but made this two-owner case (source + engine) require two parses, since
-`ParserDB` is not `Clone` and the engine owns its catalog.
+from the same DDL; a comment asserts they "line up deterministically".
 
-Options to decide:
-- engine borrows / shares the source's catalog,
-- a paired `build(pg_ddl) -> (SqliteCdcSource, SubscriptionEngine)` constructor,
-- accept the double parse but wrap it so callers do not hand-write it.
+NOT a subql API gap and NOT a sql-traits gap. `ParserDB` IS `Clone` (verified by
+compiling - the old handoff's "not Clone" claim was wrong). Both
+`SqliteCdcSource::new` and `SubscriptionEngine::new` already take an owned
+catalog. So the fix is just demo wiring: parse once, clone for the second owner.
+
+```rust
+let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)?;
+let source  = SqliteCdcSource::new(conn, catalog.clone(), cfg)?; // clone, not re-parse
+let engine  = SubscriptionEngine::new(catalog, dialect);         // move
+```
+
+One parse, one cheap clone of the same parsed schema - the two catalogs cannot
+drift. Lands on the demo (the `SqliteCdcSource` path lives on `feat/website`), not
+in subql's API.
