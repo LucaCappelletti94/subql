@@ -2,8 +2,6 @@ use dioxus::prelude::*;
 use dioxus_code::{Code, Language, SourceCode, Theme};
 use dioxus_free_icons::{icons::fa_solid_icons::FaUsers, Icon};
 
-use crate::state::AggState;
-
 use super::{SharedState, TickSignal};
 
 #[component]
@@ -49,10 +47,10 @@ pub fn ConsumerPanel() -> Element {
                             td { "{c.counters.updated}" }
                             td { "{c.counters.deleted}" }
                             td {
-                                match &c.agg {
-                                    AggState::None => rsx! { span { class: "muted", "-" } },
-                                    _ => rsx! { "{c.agg.display()}" },
-                                }
+                                {c.agg.as_ref().map_or_else(
+                                    || rsx! { span { class: "muted", "-" } },
+                                    |acc| rsx! { "{acc}" },
+                                )}
                             }
                         }
                     }

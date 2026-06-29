@@ -28,10 +28,8 @@ pub enum HarnessError {
     Translate(String),
     #[error("sql-traits parse: {0}")]
     ParserDb(String),
-    #[error("table `{0}` not found in parsed schema")]
+    #[error("table or column `{0}` not found in parsed schema")]
     UnknownTable(String),
-    #[error("column `{0}` not found in parsed schema")]
-    UnknownColumn(String),
 }
 
 pub struct SqliteHarness {
@@ -61,17 +59,10 @@ impl SqliteHarness {
         let database = ParserDB::parse::<PostgreSqlDialect>(preset.pg_ddl)
             .map_err(|e| HarnessError::ParserDb(format!("{e}")))?;
 
-        let table_id = catalog_helpers::table_id(&database, preset.table_name)
+        let resolved = catalog_helpers::resolve_table(&database, preset.table_name, preset.columns)
             .ok_or_else(|| HarnessError::UnknownTable(preset.table_name.into()))?;
-
-        let column_ids = preset
-            .columns
-            .iter()
-            .map(|col| {
-                catalog_helpers::column_id(&database, table_id, col)
-                    .ok_or_else(|| HarnessError::UnknownColumn((*col).into()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let table_id = resolved.table_id;
+        let column_ids = resolved.column_ids;
 
         let mut harness = Self {
             conn,

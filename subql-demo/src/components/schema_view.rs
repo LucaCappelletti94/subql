@@ -56,7 +56,7 @@ pub fn SchemaView() -> Element {
                 for (rowid, image) in visible_rows {
                     tr {
                         td { class: "muted", "{rowid}" }
-                        for cell in image.cells.iter() {
+                        for cell in image.iter() {
                             td { "{cell_display(cell)}" }
                         }
                     }

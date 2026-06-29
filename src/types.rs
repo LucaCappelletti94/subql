@@ -400,6 +400,26 @@ impl RowImage {
         self.cells.get(col_id as usize)
     }
 
+    /// Owned copy of the cell at `col_id`, if present.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use subql::{Cell, RowImage};
+    ///
+    /// let row = RowImage { cells: Arc::from([Cell::Int(7), Cell::String("paid".into())]) };
+    /// assert_eq!(row.cell(0), Some(Cell::Int(7)));
+    /// assert_eq!(row.iter().count(), 2);
+    /// ```
+    #[must_use]
+    pub fn cell(&self, col_id: ColumnId) -> Option<Cell> {
+        self.get(col_id).cloned()
+    }
+
+    /// Iterate the cells in column order.
+    pub fn iter(&self) -> core::slice::Iter<'_, Cell> {
+        self.cells.iter()
+    }
+
     /// Number of columns in this image
     #[must_use]
     pub fn len(&self) -> usize {
@@ -410,6 +430,15 @@ impl RowImage {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.cells.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a RowImage {
+    type Item = &'a Cell;
+    type IntoIter = core::slice::Iter<'a, Cell>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.cells.iter()
     }
 }
 
@@ -1591,6 +1620,18 @@ pub struct RegisterResult {
     pub evicted: Vec<SubscriptionId>,
 }
 
+impl RegisterResult {
+    /// The aggregate spec when the registered query is an aggregate, else
+    /// `None` for a row-set (`SELECT *`) query.
+    #[must_use]
+    pub const fn aggregate_spec(&self) -> Option<&crate::AggSpec> {
+        match &self.projection {
+            crate::QueryProjection::Aggregate(spec) => Some(spec),
+            crate::QueryProjection::Rows => None,
+        }
+    }
+}
+
 /// Durability policy for registration writes when storage is enabled.
 #[cfg(feature = "std")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1788,6 +1829,152 @@ pub enum AggDelta {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AggKind {
+    Count,
+    Sum,
+    Avg,
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
+}
+
+/// Current value of an [`AggAccumulator`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AggValue {
+    /// `COUNT(*)` or `COUNT(col)`.
+    Count(i64),
+    /// `SUM(col)`.
+    Sum(f64),
+    /// A real-valued aggregate (AVG, variance, stddev). `None` when undefined
+    /// for the current row count.
+    Real(Option<f64>),
+}
+
+/// Running value of an aggregate subscription, folded from [`AggDelta`]s and
+/// seeded from the registration's [`AggSpec`](crate::AggSpec).
+///
+/// ```
+/// use subql::{AggAccumulator, AggDelta, AggSpec, AggValue};
+///
+/// let mut count = AggAccumulator::from_spec(&AggSpec::CountStar);
+/// count.apply(&AggDelta::Count(3));
+/// count.apply(&AggDelta::Count(-1));
+/// assert_eq!(count.value(), AggValue::Count(2));
+/// assert_eq!(count.to_string(), "2");
+///
+/// let mut avg = AggAccumulator::from_spec(&AggSpec::Avg { column: 1 });
+/// avg.apply(&AggDelta::Avg { sum_delta: 10.0, count_delta: 4 });
+/// assert_eq!(avg.value(), AggValue::Real(Some(2.5)));
+/// ```
+#[derive(Clone, Debug)]
+pub struct AggAccumulator {
+    kind: AggKind,
+    count: i64,
+    sum: f64,
+    sum_sq: f64,
+}
+
+impl AggAccumulator {
+    /// Seed an accumulator for the aggregate described by `spec`.
+    #[must_use]
+    pub const fn from_spec(spec: &crate::AggSpec) -> Self {
+        use crate::AggSpec as S;
+        let kind = match spec {
+            S::CountStar | S::CountColumn { .. } => AggKind::Count,
+            S::Sum { .. } => AggKind::Sum,
+            S::Avg { .. } => AggKind::Avg,
+            S::VarPop { .. } => AggKind::VarPop,
+            S::VarSamp { .. } => AggKind::VarSamp,
+            S::StddevPop { .. } => AggKind::StddevPop,
+            S::StddevSamp { .. } => AggKind::StddevSamp,
+        };
+        Self {
+            kind,
+            count: 0,
+            sum: 0.0,
+            sum_sq: 0.0,
+        }
+    }
+
+    /// Fold one delta into the running value.
+    pub fn apply(&mut self, delta: &AggDelta) {
+        match delta {
+            AggDelta::Count(d) => self.count += d,
+            AggDelta::Sum(d) => self.sum += d,
+            AggDelta::Avg {
+                sum_delta,
+                count_delta,
+            } => {
+                self.sum += sum_delta;
+                self.count += count_delta;
+            }
+            AggDelta::Stats {
+                sum_delta,
+                sum_sq_delta,
+                count_delta,
+            } => {
+                self.sum += sum_delta;
+                self.sum_sq += sum_sq_delta;
+                self.count += count_delta;
+            }
+        }
+    }
+
+    /// Rows currently contributing to the aggregate.
+    #[must_use]
+    pub const fn count(&self) -> i64 {
+        self.count
+    }
+
+    /// Current aggregate value.
+    #[must_use]
+    pub fn value(&self) -> AggValue {
+        match self.kind {
+            AggKind::Count => AggValue::Count(self.count),
+            AggKind::Sum => AggValue::Sum(self.sum),
+            AggKind::Avg => AggValue::Real(self.mean()),
+            AggKind::VarPop => AggValue::Real(self.var_pop()),
+            AggKind::VarSamp => AggValue::Real(self.var_samp()),
+            AggKind::StddevPop => AggValue::Real(self.var_pop().map(f64::sqrt)),
+            AggKind::StddevSamp => AggValue::Real(self.var_samp().map(f64::sqrt)),
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn mean(&self) -> Option<f64> {
+        (self.count > 0).then(|| self.sum / self.count as f64)
+    }
+
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    fn var_pop(&self) -> Option<f64> {
+        (self.count > 0).then(|| {
+            let n = self.count as f64;
+            self.sum_sq / n - (self.sum / n).powi(2)
+        })
+    }
+
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    fn var_samp(&self) -> Option<f64> {
+        (self.count >= 2).then(|| {
+            let n = self.count as f64;
+            (self.sum_sq - self.sum.powi(2) / n) / (n - 1.0)
+        })
+    }
+}
+
+impl core::fmt::Display for AggAccumulator {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.value() {
+            AggValue::Count(c) => write!(f, "{c}"),
+            AggValue::Sum(s) => write!(f, "{s}"),
+            AggValue::Real(Some(v)) => write!(f, "{v}"),
+            AggValue::Real(None) => write!(f, "-"),
+        }
+    }
+}
+
 /// Per-consumer notification classification from `consumers()`.
 ///
 /// Each consumer sees events **relative to their own result set** (view-relative
@@ -1888,6 +2075,64 @@ impl<I: IdTypes, C: Checkpoint> core::fmt::Debug for ConsumerNotifications<I, C>
             .field("updated", &self.updated)
             .field("checkpoint", &self.checkpoint)
             .finish()
+    }
+}
+
+/// Combined output of [`dispatch`](crate::SubscriptionEngine::dispatch): row-set
+/// notifications plus aggregate deltas for one event.
+pub struct DispatchOutput<I: IdTypes, C: Checkpoint = NoCheckpoint> {
+    notifications: ConsumerNotifications<I, C>,
+    aggregate_deltas: Vec<(I::ConsumerId, AggDelta)>,
+}
+
+impl<I: IdTypes, C: Checkpoint> DispatchOutput<I, C> {
+    pub(crate) const fn from_parts(
+        notifications: ConsumerNotifications<I, C>,
+        aggregate_deltas: Vec<(I::ConsumerId, AggDelta)>,
+    ) -> Self {
+        Self {
+            notifications,
+            aggregate_deltas,
+        }
+    }
+
+    /// Per-consumer, view-relative row notifications (insert/delete/update).
+    #[must_use]
+    pub const fn notifications(&self) -> &ConsumerNotifications<I, C> {
+        &self.notifications
+    }
+
+    /// Signed aggregate deltas, one entry per `(consumer, aggregate kind)`.
+    #[must_use]
+    pub fn aggregate_deltas(&self) -> &[(I::ConsumerId, AggDelta)] {
+        &self.aggregate_deltas
+    }
+
+    /// Every consumer affected by this event, from either path, sorted and
+    /// deduplicated.
+    #[must_use]
+    pub fn notified(&self) -> Vec<I::ConsumerId> {
+        let mut ids: Vec<I::ConsumerId> = self
+            .notifications
+            .inserted()
+            .iter()
+            .chain(self.notifications.updated())
+            .chain(self.notifications.deleted())
+            .copied()
+            .collect();
+        ids.extend(self.aggregate_deltas.iter().map(|(cid, _)| *cid));
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// `true` when no consumer was affected by this event.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.aggregate_deltas.is_empty()
+            && self.notifications.inserted().is_empty()
+            && self.notifications.updated().is_empty()
+            && self.notifications.deleted().is_empty()
     }
 }
 

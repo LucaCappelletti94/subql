@@ -11,10 +11,7 @@ use rand::SeedableRng;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use subql::{
-    AggDelta, AggSpec, ConsumerNotifications, DefaultIds, QueryProjection, RegisterError,
-    SubscriptionEngine, SubscriptionRequest, WalEvent,
-};
+use subql::{AggAccumulator, DefaultIds, RegisterError, SubscriptionEngine, WalEvent};
 
 use crate::presets::{self, PresetSchema};
 use crate::sqlite::capture::{CapturedHook, EventCapture};
@@ -44,65 +41,12 @@ pub struct ConsumerCounters {
 }
 
 #[derive(Clone, Debug)]
-pub enum AggState {
-    None,
-    Count(i64),
-    Sum(f64),
-    Avg { sum: f64, count: i64 },
-}
-
-impl AggState {
-    fn for_spec(spec: &AggSpec) -> Self {
-        match spec {
-            AggSpec::CountStar | AggSpec::CountColumn { .. } => Self::Count(0),
-            AggSpec::Sum { .. } => Self::Sum(0.0),
-            AggSpec::Avg { .. } => Self::Avg { sum: 0.0, count: 0 },
-            _ => Self::None,
-        }
-    }
-
-    fn apply(&mut self, delta: &AggDelta) {
-        match (self, delta) {
-            (Self::Count(c), AggDelta::Count(d)) => *c += d,
-            (Self::Sum(s), AggDelta::Sum(d)) => *s += d,
-            (
-                Self::Avg { sum, count },
-                AggDelta::Avg {
-                    sum_delta,
-                    count_delta,
-                },
-            ) => {
-                *sum += sum_delta;
-                *count += count_delta;
-            }
-            _ => {}
-        }
-    }
-
-    #[must_use]
-    pub fn display(&self) -> String {
-        match self {
-            Self::None => String::new(),
-            Self::Count(c) => format!("count={c}"),
-            Self::Sum(s) => format!("sum={s:.3}"),
-            Self::Avg { sum, count } => {
-                if *count > 0 {
-                    let avg = *sum / *count as f64;
-                    format!("avg={avg:.3} (n={count})")
-                } else {
-                    "avg=- (n=0)".into()
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct ConsumerEntry {
     pub consumer_id: u64,
     pub sql: String,
     pub counters: ConsumerCounters,
-    pub agg: AggState,
+    /// `Some` for aggregate subscriptions, holding the running value.
+    pub agg: Option<AggAccumulator>,
 }
 
 #[derive(Clone, Debug)]
@@ -187,13 +131,8 @@ impl DemoState {
         let consumer_id = self.next_consumer_id;
         self.next_consumer_id += 1;
         let sql = sql.into();
-        let req = SubscriptionRequest::<DefaultIds>::new(consumer_id, sql.clone());
-        let result = self.engine.register(req)?;
-
-        let agg = match &result.projection {
-            QueryProjection::Aggregate(spec) => AggState::for_spec(spec),
-            _ => AggState::None,
-        };
+        let result = self.engine.register_select(consumer_id, sql.clone())?;
+        let agg = result.aggregate_spec().map(AggAccumulator::from_spec);
 
         self.consumers.push(ConsumerEntry {
             consumer_id,
@@ -216,7 +155,9 @@ impl DemoState {
     }
 
     fn dispatch_one(&mut self, event: &WalEvent) -> Result<(), DemoError> {
-        let notifications: ConsumerNotifications<DefaultIds> = self.engine.consumers(event)?;
+        let out = self.engine.dispatch(event)?;
+
+        let notifications = out.notifications();
         for &cid in notifications.inserted() {
             if let Some(c) = self.find_consumer_mut(cid) {
                 c.counters.inserted += 1;
@@ -232,31 +173,18 @@ impl DemoState {
                 c.counters.updated += 1;
             }
         }
-
-        let agg_deltas = self.engine.aggregate_deltas(event)?;
-        for (cid, delta) in &agg_deltas {
+        for (cid, delta) in out.aggregate_deltas() {
             if let Some(c) = self.find_consumer_mut(*cid) {
-                c.agg.apply(delta);
+                if let Some(acc) = c.agg.as_mut() {
+                    acc.apply(delta);
+                }
             }
         }
 
-        let kind = event_kind_label(event);
-        let summary = summarize_event(event);
-        let mut notified: Vec<u64> = notifications
-            .inserted()
-            .iter()
-            .chain(notifications.updated())
-            .chain(notifications.deleted())
-            .copied()
-            .collect();
-        notified.extend(agg_deltas.iter().map(|(cid, _)| *cid));
-        notified.sort_unstable();
-        notified.dedup();
-
         self.push_log(LogEntry::Event {
-            kind,
-            summary,
-            notified,
+            kind: event_kind_label(event),
+            summary: summarize_event(event),
+            notified: out.notified(),
         });
         Ok(())
     }
