@@ -79,6 +79,8 @@ pub use async_connector::AsyncConnector;
 pub use auto::{AutoResolvingEngine, SnapshotResult};
 #[cfg(feature = "executor-diesel")]
 pub use connector::DieselConnector;
+#[cfg(feature = "executor-diesel-mysql")]
+pub use connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
 pub use connector::PgDieselConnector;
 pub use connector::{Connector, ReExecError, Snapshot};

@@ -124,6 +124,13 @@ required-features = ["executor-diesel-postgres"]
 name = "reexec_postgres_r2d2"
 required-features = ["executor-diesel-postgres-r2d2"]
 
+# Docker-backed integration test for MysqlDieselConnector against a real MySQL
+# with binary logging. Tests are #[ignore]d; run via:
+#   cargo test --test reexec_mysql --features executor-diesel-mysql -- --ignored --nocapture
+[[test]]
+name = "reexec_mysql"
+required-features = ["executor-diesel-mysql"]
+
 # Docker-backed integration test for PgStreamingCdcSource (push-based PG
 # CDC source using START_REPLICATION via pg_walstream). Run with:
 #   cargo test --test pg_streaming_e2e \
@@ -327,6 +334,11 @@ executor-diesel-postgres-r2d2 = [
     "dep:r2d2",
     "diesel?/r2d2",
 ]
+# Opt-in: ship `MysqlDieselConnector`, a binlog-position-aware sync connector
+# built on `executor-diesel` + diesel's `mysql` feature. Snapshots taken through
+# it carry a `MysqlBinlogPos` read from `SHOW MASTER STATUS` inside the same
+# transaction as the user query. Requires `libmysqlclient` at build time.
+executor-diesel-mysql = ["executor-diesel", "diesel?/mysql"]
 # Opt-in: ship the push-based PG CDC source. Activates `pg_walstream`'s
 # `rustls-tls` native backend (pure-Rust, no libpq, no C deps beyond
 # `cmake` for `aws-lc-rs`) and a `tokio` runtime surface for channels +
