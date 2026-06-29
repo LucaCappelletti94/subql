@@ -454,4 +454,48 @@ proptest! {
             );
         }
     }
+
+    /// An event for a table that is in the catalog but has no subscription
+    /// must never error and must report nobody affected, no matter how many
+    /// subscriptions exist on other tables. This is the multi-table CDC
+    /// firehose case: change events arrive for tables nobody is watching yet.
+    ///
+    /// Earlier dispatch proptests always registered on `items` and then
+    /// dispatched to `items`, so this branch was never explored. `_items_pad`
+    /// (table id 0) is in the catalog but is never subscribed to.
+    #[test]
+    fn dispatch_to_unsubscribed_cataloged_table_is_empty(
+        predicates in proptest::collection::vec(predicate_strategy(), 0..12),
+        ids in proptest::collection::vec(any::<i64>(), 1..8),
+    ) {
+        let catalog = proptest_catalog();
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, dialect);
+
+        // Every subscription targets `items` (table id 1).
+        for (i, pred) in predicates.iter().enumerate() {
+            let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
+            let _ = engine.register(SubscriptionRequest::new((i as u64) + 1, sql));
+        }
+
+        for id in &ids {
+            let event = WalEvent::builder(0)
+                .insert()
+                .pk_cell(0, Cell::Int(*id))
+                .new_row(RowImage { cells: Arc::from([Cell::Int(*id)]) })
+                .build()
+                .expect("pad insert event builds");
+
+            let notifs = engine.consumers(&event).expect("cataloged table never errors");
+            prop_assert!(
+                notifs.inserted().is_empty()
+                    && notifs.updated().is_empty()
+                    && notifs.deleted().is_empty(),
+                "unsubscribed table should notify nobody",
+            );
+            prop_assert!(engine.aggregate_deltas(&event).expect("no agg path").is_empty());
+            prop_assert!(engine.dispatch(&event).expect("dispatch ok").notified().is_empty());
+        }
+    }
 }
