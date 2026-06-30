@@ -18,7 +18,13 @@ pub fn SimControls() -> Element {
 
     let running = state.borrow().auto_running;
     let rate = state.borrow().auto_rate_per_sec;
-    let target = state.borrow().selected_table().table_name.clone();
+    let selected = state.borrow().selected;
+    let table_names: Vec<String> = state
+        .borrow()
+        .tables
+        .iter()
+        .map(|t| t.table_name.clone())
+        .collect();
 
     let on_insert = {
         let state = state.clone();
@@ -93,6 +99,17 @@ pub fn SimControls() -> Element {
             bump(&mut tick);
         }
     };
+    let on_select_table = {
+        let state = state.clone();
+        move |evt: FormEvent| {
+            if let Ok(idx) = evt.value().parse::<usize>() {
+                if idx < state.borrow().tables.len() {
+                    state.borrow_mut().selected = idx;
+                }
+            }
+            bump(&mut tick);
+        }
+    };
 
     rsx! {
         h2 {
@@ -123,10 +140,14 @@ pub fn SimControls() -> Element {
                 }
             }
         }
-        h3 {
-            "Manual on "
-            code { "{target}" }
-            span { class: "muted", " (pick a table in the Tables panel)" }
+        h3 { "Manual actions" }
+        label { class: "muted",
+            "on table "
+            select { value: "{selected}", onchange: on_select_table,
+                for (i, name) in table_names.iter().enumerate() {
+                    option { value: "{i}", selected: i == selected, "{name}" }
+                }
+            }
         }
         div {
             button { onclick: on_insert,
@@ -137,11 +158,11 @@ pub fn SimControls() -> Element {
                 Icon { width: 12, height: 12, icon: FaPenToSquare, class: "btn-icon".to_string() }
                 " UPDATE random"
             }
-            button { onclick: on_delete,
+            button { class: "danger", onclick: on_delete,
                 Icon { width: 12, height: 12, icon: FaTrash, class: "btn-icon".to_string() }
                 " DELETE random"
             }
-            button { onclick: on_truncate,
+            button { class: "danger", onclick: on_truncate,
                 Icon { width: 12, height: 12, icon: FaBroom, class: "btn-icon".to_string() }
                 " TRUNCATE"
             }

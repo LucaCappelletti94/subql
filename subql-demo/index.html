@@ -3,41 +3,594 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>SubQL demo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+    />
     <style>
-      body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 1rem auto; padding: 0 1rem; line-height: 1.45; }
-      h1, h2 { margin: 0 0 .4rem 0; }
-      section { border: 1px solid #ddd; border-radius: 6px; padding: .8rem 1rem; margin-bottom: 1rem; }
-      table { width: 100%; border-collapse: collapse; font-size: .92rem; }
-      th, td { text-align: left; padding: .25rem .4rem; border-bottom: 1px solid #eee; }
-      button { padding: .35rem .7rem; margin-right: .35rem; }
-      input, select, textarea { font: inherit; padding: .25rem .4rem; }
-      .layout { display: grid; grid-template-columns: 320px 1fr; gap: 1rem; }
-      .log { font-family: ui-monospace, monospace; font-size: .82rem; max-height: 240px; overflow: auto; }
-      .muted { color: #777; }
-      .badges { display: flex; flex-wrap: wrap; gap: .35rem; margin: .35rem 0 .6rem 0; }
-      .badge {
-        display: inline-block;
-        font-family: ui-monospace, monospace;
-        font-size: .78rem;
-        line-height: 1;
-        padding: .35rem .55rem;
-        border-radius: 999px;
-        background: #eef2ff;
-        color: #1e3a8a;
-        border: 1px solid #c7d2fe;
+      /* subql.luca.phd. Monochrome, Inter, light + OS-preference dark. Tokens
+         mirror tsne.luca.phd (~/github/dioxus-decompositions). Color appears in
+         exactly one place: red on destructive actions (delete / truncate). Code
+         blocks keep their own dark (Tokyo Night) theme as a deliberate accent. */
+      :root {
+        --bg: #ffffff;
+        --ink: #0a0a0a;
+        --muted: rgba(10, 10, 10, 0.55);
+        --line: rgba(10, 10, 10, 0.16);
+        --panel: rgba(255, 255, 255, 0.92);
+        --glass: rgba(255, 255, 255, 0.72);
+        --hover: rgba(10, 10, 10, 0.06);
+        --danger: #dc2626;
+        --radius: 10px;
+        --radius-sm: 8px;
+        --pill: 999px;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0a0a0a;
+          --ink: #f4f4f4;
+          --muted: rgba(244, 244, 244, 0.6);
+          --line: rgba(244, 244, 244, 0.2);
+          --panel: rgba(18, 18, 18, 0.92);
+          --glass: rgba(12, 12, 12, 0.72);
+          --hover: rgba(244, 244, 244, 0.08);
+        }
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        font-family:
+          "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: var(--bg);
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      h1,
+      h2,
+      h3 {
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        line-height: 1.15;
+        margin: 0 0 0.5rem 0;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      code,
+      .mono {
+        font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      /* Centered envelope. Wider than tsne (a plot app, full-bleed); this is a
+         reading page, so a generous fixed column. */
+      .page {
+        max-width: 1240px;
+        margin: 0 auto;
+        padding: 0 1.5rem;
+      }
+
+      /* ---- Floating header: brand left, icon links right ---- */
+      .sq-topbar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        backdrop-filter: saturate(1.4) blur(10px);
+        background: var(--glass);
+        border-bottom: 1px solid transparent;
+        transition: border-color 0.2s ease;
+      }
+
+      .sq-topbar--scrolled {
+        border-bottom-color: var(--line);
+      }
+
+      /* Full-bleed: brand pinned to the far left, icon links to the far right,
+         not aligned to the centered content envelope (tsne topbar pattern). */
+      .sq-topbar-inner {
+        padding: 0.7rem 1.5rem;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .sq-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.55rem;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        font-size: 1.05rem;
+        color: inherit;
+        text-decoration: none;
+      }
+
+      .sq-logo {
+        height: 1.7rem;
+        width: 1.7rem;
+        display: block;
+        color: var(--ink);
+      }
+
+      .sq-topbar-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.1rem;
+      }
+
+      /* Chromeless icon links: no border, dim on hover (tsne topbar pattern). */
+      .sq-iconbtn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.2rem;
+        height: 2.2rem;
+        border: none;
+        background: transparent;
+        color: var(--ink);
+        text-decoration: none;
+        border-radius: 50%;
         cursor: pointer;
+        transition:
+          opacity 0.15s ease,
+          color 0.15s ease;
+      }
+
+      .sq-iconbtn:hover {
+        opacity: 0.6;
+      }
+
+      /* Sponsor heart goes red on hover instead of dimming. */
+      .sq-heartbtn:hover {
+        opacity: 1;
+        color: var(--danger);
+      }
+
+      /* ---- Hero ---- */
+      .sq-hero {
+        padding: 5.5rem 0 3rem 0;
+        text-align: center;
+        max-width: 50rem;
+        margin: 0 auto;
+      }
+
+      .sq-hero h1 {
+        font-size: clamp(2.2rem, 6vw, 3.6rem);
+        margin-bottom: 1rem;
+      }
+
+      .sq-hero-sub {
+        font-size: clamp(1.05rem, 2.4vw, 1.3rem);
+        color: var(--muted);
+        margin: 0 auto;
+        max-width: 42rem;
+      }
+
+      .sq-hero-cta {
+        margin-top: 2rem;
+        display: inline-flex;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+
+      /* ---- Section scaffolding ---- */
+      .sq-section {
+        padding: 3.5rem 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .sq-eyebrow {
+        font-size: 0.74rem;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--muted);
+        margin: 0 0 0.6rem 0;
+      }
+
+      .sq-section h2 {
+        font-size: clamp(1.6rem, 3.5vw, 2.2rem);
+      }
+
+      .sq-lead {
+        font-size: 1.15rem;
+        color: var(--muted);
+        max-width: 44rem;
+      }
+
+      .sq-prose {
+        max-width: 44rem;
+      }
+
+      .sq-prose p {
+        margin: 0 0 1rem 0;
+      }
+
+      .sq-prose strong {
+        color: var(--ink);
+        font-weight: 600;
+      }
+
+      /* ---- Features grid ---- */
+      .sq-features {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+        gap: 1rem;
+        margin-top: 2rem;
+      }
+
+      .sq-feature {
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 1.3rem 1.4rem;
+        background: var(--panel);
+      }
+
+      .sq-feature-icon {
+        color: var(--ink);
+        opacity: 0.85;
+        margin-bottom: 0.7rem;
+      }
+
+      .sq-feature h3 {
+        font-size: 1.05rem;
+        margin-bottom: 0.35rem;
+      }
+
+      .sq-feature p {
+        margin: 0;
+        font-size: 0.93rem;
+        color: var(--muted);
+      }
+
+      /* ---- How it works: pipeline + fan-out diagram ---- */
+      .sq-how-block {
+        margin-top: 2rem;
+      }
+
+      .sq-how-block h3 {
+        font-size: 1.15rem;
+        margin-bottom: 0.4rem;
+      }
+
+      .sq-how-block p {
+        max-width: 44rem;
+        color: var(--muted);
+        margin: 0 0 1rem 0;
+      }
+
+      /* Horizontal pipeline of pills with connectors. */
+      .sq-pipeline {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin: 1.2rem 0;
+      }
+
+      .sq-stage {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.4rem 0.85rem;
+        border: 1px solid var(--line);
+        border-radius: var(--pill);
+        font-size: 0.85rem;
+        font-family: ui-monospace, monospace;
+        white-space: nowrap;
+        background: var(--panel);
+      }
+
+      .sq-arrow {
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      /* Fan-out diagram: one base change to many consumer verdicts. */
+      .sq-fanout {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 1rem 1.5rem;
+        align-items: center;
+        margin: 1.2rem 0;
+        max-width: 40rem;
+      }
+
+      .sq-fanout-source {
+        padding: 0.5rem 0.9rem;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        font-family: ui-monospace, monospace;
+        font-size: 0.82rem;
+        background: var(--panel);
+        text-align: center;
+      }
+
+      .sq-fanout-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+
+      .sq-fanout-row {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        font-size: 0.85rem;
+      }
+
+      .sq-verdict {
+        flex: none;
+        min-width: 4.2rem;
+        text-align: center;
+        padding: 0.18rem 0.5rem;
+        border-radius: var(--pill);
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        border: 1px solid var(--line);
+        color: var(--muted);
+      }
+
+      .sq-verdict--in {
+        color: var(--ink);
+        border-color: var(--ink);
+      }
+
+      .sq-verdict--out {
+        color: var(--danger);
+        border-color: var(--danger);
+      }
+
+      .sq-fanout-q {
+        font-family: ui-monospace, monospace;
+        color: var(--muted);
+      }
+
+      /* ---- Demo region ---- */
+      .demo {
+        scroll-margin-top: 4rem;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 340px 1fr;
+        gap: 1rem;
+      }
+
+      @media (max-width: 860px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      section.panel {
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 1rem 1.1rem;
+        margin-bottom: 1rem;
+        background: var(--panel);
+      }
+
+      section.panel h2 {
+        font-size: 1rem;
+        display: flex;
+        align-items: center;
+      }
+
+      section.panel h3 {
+        font-size: 0.9rem;
+        margin-top: 1rem;
+      }
+
+      /* ---- Tables ---- */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+      }
+
+      th,
+      td {
+        text-align: left;
+        padding: 0.3rem 0.45rem;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      .schema-table th,
+      .schema-table td {
+        font-family: ui-monospace, monospace;
+        font-size: 0.8rem;
+      }
+
+      .schema-table th {
+        vertical-align: top;
+      }
+
+      /* ---- Buttons ---- */
+      button {
+        font: inherit;
+        font-size: 0.88rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
+        padding: 0.4rem 0.85rem;
+        margin: 0 0.4rem 0.4rem 0;
+        color: var(--ink);
+        background: transparent;
+        border: 1px solid var(--line);
+        border-radius: var(--pill);
+        cursor: pointer;
+        transition:
+          background 0.15s ease,
+          border-color 0.15s ease,
+          color 0.15s ease;
+      }
+
+      button:hover:not(:disabled) {
+        background: var(--hover);
+      }
+
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+
+      /* Destructive actions (delete / truncate) are the only colored chrome. */
+      button.danger {
+        color: var(--danger);
+        border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+      }
+
+      button.danger:hover:not(:disabled) {
+        background: color-mix(in srgb, var(--danger) 12%, transparent);
+        border-color: var(--danger);
+      }
+
+      /* Button-styled anchors for the hero call to action. */
+      .sq-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.6rem 1.2rem;
+        font-size: 0.95rem;
+        font-weight: 500;
+        text-decoration: none;
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: var(--pill);
+        cursor: pointer;
+        transition:
+          background 0.15s ease,
+          border-color 0.15s ease,
+          opacity 0.15s ease;
+      }
+
+      .sq-btn:hover {
+        background: var(--hover);
+      }
+
+      .sq-btn--primary {
+        background: var(--ink);
+        color: var(--bg);
+        border-color: var(--ink);
+      }
+
+      .sq-btn--primary:hover {
+        background: var(--ink);
+        opacity: 0.85;
+      }
+
+      /* Click-to-select table tabs in the Tables panel. */
+      button.table-tab {
+        border: 1px solid var(--line);
+        border-radius: var(--pill);
+        padding: 0.3rem 0.8rem;
+      }
+
+      button.table-tab.selected {
+        background: var(--ink);
+        color: var(--bg);
+        border-color: var(--ink);
+      }
+
+      button.table-tab.selected .muted {
+        color: color-mix(in srgb, var(--bg) 65%, transparent);
+      }
+
+      /* ---- Inputs ---- */
+      input,
+      select,
+      textarea {
+        font: inherit;
+        color: var(--ink);
+        background: transparent;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        padding: 0.3rem 0.45rem;
+      }
+
+      input[type="range"] {
+        border: none;
+        padding: 0;
+        accent-color: var(--ink);
+        vertical-align: middle;
+        margin-left: 0.4rem;
+      }
+
+      /* ---- Starter-query pills ---- */
+      .badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+        margin: 0.4rem 0 0.7rem 0;
+      }
+
+      .badge {
+        font-family: ui-monospace, monospace;
+        font-size: 0.76rem;
+        line-height: 1;
+        padding: 0.4rem 0.6rem;
+        margin: 0;
+        border-radius: var(--pill);
         max-width: 100%;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      .badge:hover { background: #dbeafe; }
-      .schema-table th, .schema-table td { font-family: ui-monospace, monospace; font-size: .82rem; }
-      .schema-table th { vertical-align: top; }
-      .h-icon { vertical-align: -2px; margin-right: .35rem; color: #555; }
-      .btn-icon { vertical-align: -1px; margin-right: .25rem; }
-      h1 .h-icon { color: #b45309; }
+
+      /* ---- Event log ---- */
+      .log {
+        font-family: ui-monospace, monospace;
+        font-size: 0.8rem;
+        max-height: 260px;
+        overflow: auto;
+        line-height: 1.5;
+      }
+
+      /* ---- Heading icons ---- */
+      .h-icon {
+        vertical-align: -2px;
+        margin-right: 0.4rem;
+        color: var(--muted);
+      }
+
+      .btn-icon {
+        vertical-align: -1px;
+      }
+
+      footer.sq-footer {
+        border-top: 1px solid var(--line);
+        padding: 2rem 0 3rem 0;
+        color: var(--muted);
+        font-size: 0.85rem;
+        text-align: center;
+      }
     </style>
   </head>
   <body>

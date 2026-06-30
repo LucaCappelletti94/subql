@@ -7,6 +7,8 @@ use crate::state::DemoState;
 
 pub mod consumer_panel;
 pub mod event_log;
+pub mod header;
+pub mod presentation;
 pub mod query_console;
 pub mod schema_picker;
 pub mod schema_view;

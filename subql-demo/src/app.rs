@@ -2,12 +2,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use dioxus_free_icons::{icons::fa_solid_icons::FaBolt, Icon};
 
 use crate::components::{
-    consumer_panel::ConsumerPanel, event_log::EventLog, query_console::QueryConsole,
-    schema_picker::SchemaPicker, schema_view::SchemaView, sim_controls::SimControls, SharedState,
-    TickSignal,
+    consumer_panel::ConsumerPanel,
+    event_log::EventLog,
+    header::Header,
+    presentation::{Features, Hero, HowItWorks, Problem},
+    query_console::QueryConsole,
+    schema_picker::SchemaPicker,
+    schema_view::SchemaView,
+    sim_controls::SimControls,
+    SharedState, TickSignal,
 };
 use crate::state::DemoState;
 
@@ -25,23 +30,44 @@ pub fn App() -> Element {
     use_context_provider(|| tick);
 
     rsx! {
-        h1 {
-            Icon { width: 22, height: 22, icon: FaBolt, class: "h-icon".to_string() }
-            " SubQL demo"
+        span { id: "top" }
+        Header {}
+        main { class: "page",
+            Hero {}
+            Problem {}
+            Features {}
+            HowItWorks {}
+            Demo {}
         }
-        p { class: "muted",
-            "PG schema -> pg2sqlite -> SQLite -> SqliteCdcSource -> SubQL dispatch."
+        footer { class: "sq-footer",
+            "SubQL - the general engine for real-time SQL subscriptions."
         }
-        div { class: "layout",
-            div {
-                section { SchemaPicker {} }
-                section { SimControls {} }
-                section { QueryConsole {} }
+    }
+}
+
+/// The live demo: the whole CDC path running in the browser.
+#[component]
+fn Demo() -> Element {
+    rsx! {
+        section { class: "sq-section demo", id: "demo",
+            p { class: "sq-eyebrow", "Live demo" }
+            h2 { "Try it in the browser" }
+            p { class: "sq-lead",
+                "Postgres DDL is translated to SQLite, captured through "
+                "SqliteCdcSource, and dispatched by SubQL, all in this tab. "
+                "Register queries, mutate any table, watch the deltas."
             }
-            div {
-                section { SchemaView {} }
-                section { ConsumerPanel {} }
-                section { EventLog {} }
+            div { class: "layout",
+                div {
+                    section { class: "panel", SchemaPicker {} }
+                    section { class: "panel", SimControls {} }
+                    section { class: "panel", QueryConsole {} }
+                }
+                div {
+                    section { class: "panel", SchemaView {} }
+                    section { class: "panel", ConsumerPanel {} }
+                    section { class: "panel", EventLog {} }
+                }
             }
         }
     }

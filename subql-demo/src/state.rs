@@ -176,11 +176,6 @@ impl DemoState {
         Ok(())
     }
 
-    #[must_use]
-    pub fn selected_table(&self) -> &TableView {
-        &self.tables[self.selected]
-    }
-
     /// Resolve a SELECT and register a consumer for it. Returns its id.
     pub fn register_consumer(&mut self, sql: impl Into<String>) -> Result<u64, DemoError> {
         let consumer_id = self.next_consumer_id;
