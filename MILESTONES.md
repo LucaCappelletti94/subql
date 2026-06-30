@@ -62,6 +62,18 @@ Deferred. The `AsyncConnector` trait and `AsyncAutoResolvingEngine` shipped and 
 
 ---
 
+## In-process MySQL CDC source
+
+### Status
+
+Deferred. Dispatch is already backend-agnostic (the engine consumes normalized `WalEvent`s), so MySQL works today via `MaxwellParser` fed by an external Maxwell process's JSONL output, exercised live by `tests/cdc_mysql_e2e.rs` and `tests/cdc_cross_db.rs` (both Docker-gated). The `MysqlBinlogPos` checkpoint type exists. What is missing is an in-process source struct analogous to `PgStreamingCdcSource`, so MySQL is parser-only where Postgres is turn-key. Mixing PG and MySQL feeds into one engine is supported, bounded by one `D: Dialect` per engine, one shared catalog namespace, and single-table subscriptions (no cross-backend joins).
+
+### Resume path
+
+MySQL's streaming substrate is the binary log over the replica protocol (`COM_BINLOG_DUMP_GTID`), the same feed Maxwell and Debezium sit on. A v1 source would drive that stream, map ROW events to `WalEvent`, persist the GTID set into `MysqlBinlogPos`, and resume from it. Crate options: `mysql-binlog-connector-rust` (apecloud) is the purpose-built async client (live dump plus ROW parsing, GTID, MySQL 8.0, TLS, decodes JSON/temporal/DECIMAL) and the fastest route, with `mysql_async` + `mysql_common` (binlog feature) as the more conservative, longer-lived foundation that needs hand-rolled event mapping. `mysql_cdc` (rusuly) is stale and has no TLS, so it is out for managed MySQL. Complexity is medium (roughly one to two weeks for a tested v1): the protocol is solved by the crates, the real work is positional/typed row decoding against the catalog (binlog rows carry no column names, only a `TableMapEvent`), bridging the async stream into the sync `CdcSource::poll_next_event`, GTID resume, detecting purged-binlog gaps (MySQL drops binlogs on a timer rather than pinning them like a PG slot), and requiring `binlog_format=ROW` with `binlog_row_image=FULL` for complete before-images.
+
+---
+
 ## Other deferred items
 
 Track future deferred work here as it gets pushed past v1.
