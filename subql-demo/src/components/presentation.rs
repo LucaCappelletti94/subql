@@ -9,6 +9,8 @@ use dioxus_free_icons::{
     Icon,
 };
 
+use crate::components::anim::SystemFlowScene;
+
 const REPO_URL: &str = "https://github.com/LucaCappelletti94/subql";
 
 #[component]
@@ -129,6 +131,10 @@ pub fn HowItWorks() -> Element {
                 "A change enters as a CDC event. SubQL matches it against every "
                 "standing subscription and emits, per consumer, only what their "
                 "view needs."
+            }
+
+            div { class: "sq-how-block sq-anim-block",
+                SystemFlowScene {}
             }
 
             div { class: "sq-how-block",

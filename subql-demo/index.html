@@ -23,6 +23,9 @@
         --glass: rgba(255, 255, 255, 0.72);
         --hover: rgba(10, 10, 10, 0.06);
         --danger: #dc2626;
+        /* PostgreSQL brand blue, scoped to the backend cluster in the topology
+           animation (the one non-monochrome accent besides --danger). */
+        --pg: #336791;
         --radius: 10px;
         --radius-sm: 8px;
         --pill: 999px;
@@ -37,6 +40,8 @@
           --panel: rgba(18, 18, 18, 0.92);
           --glass: rgba(12, 12, 12, 0.72);
           --hover: rgba(244, 244, 244, 0.08);
+          /* Lightened so the cluster reads against the dark background. */
+          --pg: #6f9fd8;
         }
       }
 
@@ -590,6 +595,207 @@
         color: var(--muted);
         font-size: 0.85rem;
         text-align: center;
+      }
+
+      /* ---- Animated topology scenes (sq-anim) ----
+         Scripted, monochrome, decoupled from the live engine. All colors come
+         from tokens; --danger is reserved for the OUT verdict only. Motion is
+         CSS, disabled under prefers-reduced-motion (static legend fallback). */
+      .sq-anim-block {
+        margin-top: 1.5rem;
+      }
+
+      .sq-anim {
+        color: var(--ink);
+        width: 100%;
+        max-width: 760px;
+      }
+
+      .sq-anim-svg {
+        width: 100%;
+        height: auto;
+        display: block;
+        overflow: visible;
+      }
+
+      .sq-visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+
+      .sq-edge {
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.4;
+        opacity: 0.16;
+      }
+
+      .sq-node {
+        color: var(--muted);
+        opacity: 0.55;
+        transition:
+          opacity 0.35s ease,
+          color 0.35s ease;
+      }
+
+      .sq-node.is-active {
+        color: var(--ink);
+        opacity: 1;
+      }
+
+      .sq-node svg {
+        color: inherit;
+      }
+
+      /* PostgreSQL cluster: brand blue, regardless of active state (only the
+         opacity changes when active). */
+      .sq-pg {
+        color: var(--pg);
+      }
+
+      .sq-pg.is-active {
+        color: var(--pg);
+      }
+
+      /* Dashed replication mesh between the Postgres instances. */
+      .sq-mesh {
+        fill: none;
+        stroke: var(--pg);
+        stroke-width: 1.4;
+        stroke-dasharray: 5 5;
+        opacity: 0.55;
+      }
+
+      /* Payloads flowing continuously along the mesh lines. */
+      .sq-pg-payload {
+        fill: var(--pg);
+        offset-rotate: 0deg;
+        opacity: 0;
+      }
+
+      @supports (offset-path: path("M0,0 L1,1")) {
+        .sq-pg-payload.is-flying {
+          opacity: 0.9;
+          animation:
+            sq-glide 850ms ease-out forwards,
+            sq-fade-in 220ms ease-out;
+        }
+      }
+
+      .sq-node-label {
+        fill: currentColor;
+        font-family: "Inter", system-ui, sans-serif;
+        font-size: 11px;
+        text-anchor: middle;
+      }
+
+      /* Tokens ride an SVG path via offset-path; hidden until their phase. */
+      .sq-token {
+        opacity: 0;
+        offset-rotate: 0deg;
+      }
+
+      .sq-token circle {
+        fill: currentColor;
+      }
+
+      .sq-token-label {
+        fill: currentColor;
+        font-family: "Inter", system-ui, sans-serif;
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-anchor: middle;
+      }
+
+      @supports (offset-path: path("M0,0 L1,1")) {
+        .sq-token.is-flying {
+          animation:
+            sq-glide 1000ms ease-in-out forwards,
+            sq-fade-in 220ms ease-out forwards;
+        }
+      }
+
+      @keyframes sq-glide {
+        from {
+          offset-distance: 0%;
+        }
+        to {
+          offset-distance: 100%;
+        }
+      }
+
+      @keyframes sq-fade-in {
+        from {
+          opacity: 0;
+        }
+        to {
+          opacity: 1;
+        }
+      }
+
+      /* Verdict badges. Positioned by the SVG transform attribute, so only
+         opacity is animated (a CSS transform would override that attribute). */
+      .sq-vl {
+        opacity: 0;
+      }
+
+      .sq-vl-bg {
+        fill: var(--bg);
+        stroke: currentColor;
+        stroke-width: 1;
+      }
+
+      .sq-vl-text {
+        fill: currentColor;
+        font-family: "Inter", system-ui, sans-serif;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-anchor: middle;
+      }
+
+      .sq-vl--in {
+        color: var(--ink);
+      }
+
+      .sq-vl--update {
+        color: var(--muted);
+      }
+
+      .sq-vl--out {
+        color: var(--danger);
+      }
+
+      .sq-vl.is-shown {
+        animation: sq-fade-in 380ms ease-out forwards;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .sq-anim *,
+        .sq-anim *::before,
+        .sq-anim *::after {
+          animation: none !important;
+          transition: none !important;
+        }
+        .sq-anim .sq-edge {
+          opacity: 0.4;
+        }
+        .sq-anim .sq-node {
+          color: var(--ink);
+          opacity: 1;
+        }
+        .sq-anim .sq-token,
+        .sq-anim .sq-pg-payload {
+          opacity: 0;
+        }
+        .sq-anim .sq-vl.is-shown {
+          opacity: 1;
+        }
       }
     </style>
   </head>

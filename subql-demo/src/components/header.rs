@@ -54,6 +54,16 @@ pub fn Header() -> Element {
     }
 }
 
+/// The SubQL mark path. Shared so the animation scenes can render the real logo
+/// as the core node (see `anim::primitives`).
+pub const SUBQL_LOGO_PATH: &str = "M916.0,216.0 L920.0,690.0 L865.0,737.0 L743.0,326.0 Z M705.0,297.0 L855.0,749.0 L831.0,814.0 L576.0,442.0 Z M829.0,899.0 L462.0,616.0 L530.0,440.0 L813.0,820.0 Z M434.0,632.0 L823.0,918.0 L870.0,990.0 L400.0,801.0 Z M1638.0,1233.0 L1625.0,1430.0 L1210.0,1103.0 L1154.0,1026.0 Z M1201.0,1121.0 L1576.0,1433.0 L1482.0,1627.0 L1215.0,1211.0 Z M1169.0,1287.0 L1209.0,1231.0 L1437.0,1612.0 L1279.0,1774.0 Z M1156.0,1300.0 L1239.0,1754.0 L1044.0,1832.0 L1101.0,1331.0 Z";
+
+/// Tight bounding box of [`SUBQL_LOGO_PATH`] (`min-x min-y width height`). The
+/// raw path sits at roughly 79% height / 60% width inside the original
+/// `0 0 2048 2048` canvas, so rendering with this viewBox makes the mark fill
+/// its square instead of floating small inside it.
+pub const SUBQL_LOGO_VIEWBOX: &str = "400 216 1238 1616";
+
 /// The SubQL mark, inlined so `fill="currentColor"` tracks the text color and
 /// flips with dark mode without a `filter: invert` hack.
 #[component]
@@ -61,10 +71,10 @@ fn Logo() -> Element {
     rsx! {
         svg {
             class: "sq-logo",
-            view_box: "0 0 2048 2048",
+            view_box: SUBQL_LOGO_VIEWBOX,
             fill: "currentColor",
             "aria-hidden": "true",
-            path { d: "M916.0,216.0 L920.0,690.0 L865.0,737.0 L743.0,326.0 Z M705.0,297.0 L855.0,749.0 L831.0,814.0 L576.0,442.0 Z M829.0,899.0 L462.0,616.0 L530.0,440.0 L813.0,820.0 Z M434.0,632.0 L823.0,918.0 L870.0,990.0 L400.0,801.0 Z M1638.0,1233.0 L1625.0,1430.0 L1210.0,1103.0 L1154.0,1026.0 Z M1201.0,1121.0 L1576.0,1433.0 L1482.0,1627.0 L1215.0,1211.0 Z M1169.0,1287.0 L1209.0,1231.0 L1437.0,1612.0 L1279.0,1774.0 Z M1156.0,1300.0 L1239.0,1754.0 L1044.0,1832.0 L1101.0,1331.0 Z" }
+            path { d: SUBQL_LOGO_PATH }
         }
     }
 }

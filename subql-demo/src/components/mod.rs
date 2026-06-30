@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 
 use crate::state::DemoState;
 
+pub mod anim;
 pub mod consumer_panel;
 pub mod event_log;
 pub mod header;
