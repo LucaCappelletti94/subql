@@ -14,9 +14,12 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use diesel::backend::Backend;
-use diesel::pg::{Pg, PgMetadataLookup, PgTypeMetadata};
+use diesel::connection::{DefaultLoadingMode, LoadConnection};
+use diesel::expression::QueryMetadata;
+use diesel::pg::{Pg, PgMetadataLookup, PgTypeMetadata, PgValue};
 use diesel::query_builder::bind_collector::RawBytesBindCollector;
-use diesel::query_builder::{QueryBuilder, QueryFragment};
+use diesel::query_builder::{Query, QueryBuilder, QueryFragment, QueryId};
+use diesel::row::{Field, Row};
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::dialect::Dialect;
 
@@ -143,6 +146,42 @@ fn format_uuid(b: [u8; 16]) -> String {
     s
 }
 
+/// Decode a column value returned by an executed query into a [`Cell`], per
+/// backend.
+///
+/// Lets an `INSERT ... RETURNING` row be read without a compile-time row struct.
+/// Implemented for `Pg` now; other backends slot in later without changing
+/// [`SubscriptionEngine::register_follow_insert`]'s signature.
+pub trait FollowRowDecode: Backend {
+    /// Decode one field's raw value (or SQL NULL) into a `Cell`.
+    ///
+    /// # Errors
+    /// [`RegisterError::UnsupportedSql`] for a column type outside the supported
+    /// scalar set.
+    fn field_to_cell(value: Option<Self::RawValue<'_>>) -> Result<Cell, RegisterError>;
+}
+
+impl FollowRowDecode for Pg {
+    fn field_to_cell(value: Option<PgValue<'_>>) -> Result<Cell, RegisterError> {
+        value.map_or(Ok(Cell::Null), |v| {
+            decode_pg_bind(Some(v.as_bytes()), v.get_oid().get())
+        })
+    }
+}
+
+/// Error from [`SubscriptionEngine::register_follow_insert`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FollowInsertError {
+    /// Executing or reading the `INSERT ... RETURNING` failed.
+    #[error("insert execution failed: {0}")]
+    Load(#[from] diesel::result::Error),
+    /// Building or registering the follow failed (unknown table, no primary key,
+    /// key-arity mismatch, or an unsupported returned column type).
+    #[error("follow registration failed: {0}")]
+    Register(#[from] RegisterError),
+}
+
 /// Diesel-typed registration methods on the engine.
 impl<D, I, DB> SubscriptionEngine<D, I, DB>
 where
@@ -193,6 +232,72 @@ where
     {
         let (sql, binds) = render_typed(update)?;
         self.register_follow_update_with_binds(consumer_id, sql, binds)
+    }
+
+    /// Execute a typed diesel `INSERT ... RETURNING <pk>` and follow the inserted
+    /// row(s) by their (possibly DB-minted) primary key.
+    ///
+    /// This is the one method that writes to the database (via the caller's
+    /// connection). It holds `&mut self` across both executing the insert and
+    /// registering the follow, so the insert's own CDC event cannot be dispatched
+    /// until the follow exists: the follow is guaranteed to observe it (no loss),
+    /// by the engine's single-threaded `&mut self` ordering. Nothing is
+    /// fabricated, so there is nothing to de-duplicate.
+    ///
+    /// The insert must `RETURNING` its primary-key column(s); only the key is
+    /// read. A multi-row insert yields one follow per returned row.
+    ///
+    /// `RETURNING` is Postgres/SQLite/MariaDB; on stock MySQL (no `RETURNING`)
+    /// fetch the id yourself and use [`SubscriptionEngine::follow_row`].
+    ///
+    /// # Errors
+    /// [`FollowInsertError::Load`] if the insert fails to execute or its rows fail
+    /// to read; [`FollowInsertError::Register`] if a follow cannot be built or
+    /// registered.
+    pub fn register_follow_insert<Q, C>(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        table: &str,
+        insert: Q,
+        conn: &mut C,
+    ) -> Result<alloc::vec::Vec<RegisterResult>, FollowInsertError>
+    where
+        C: LoadConnection<DefaultLoadingMode>,
+        C::Backend: FollowRowDecode + QueryMetadata<Q::SqlType>,
+        Q: Query + QueryFragment<C::Backend> + QueryId,
+    {
+        // Execute the insert and read each RETURNING row's columns as Cells.
+        let rows: alloc::vec::Vec<alloc::vec::Vec<Cell>> = {
+            let cursor = conn.load(insert)?;
+            let mut out = alloc::vec::Vec::new();
+            for row in cursor {
+                let row = row?;
+                let n = row.field_count();
+                let mut cells = alloc::vec::Vec::with_capacity(n);
+                for i in 0..n {
+                    let cell = match row.get(i) {
+                        Some(field) => {
+                            <C::Backend as FollowRowDecode>::field_to_cell(field.value())
+                                .map_err(FollowInsertError::Register)?
+                        }
+                        None => Cell::Null,
+                    };
+                    cells.push(cell);
+                }
+                out.push(cells);
+            }
+            out
+        };
+
+        // Register one follow per returned row (still within this `&mut self`).
+        let mut results = alloc::vec::Vec::with_capacity(rows.len());
+        for pk in rows {
+            results.push(
+                self.follow_row(consumer_id, table, pk)
+                    .map_err(FollowInsertError::Register)?,
+            );
+        }
+        Ok(results)
     }
 }
 
