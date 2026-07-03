@@ -58,6 +58,18 @@ pub fn db_node(x: i32, y: i32, state: &str) -> Element {
     }
 }
 
+/// A payload glyph whose shape encodes the operation: `"add"` is an up-triangle,
+/// `"remove"` a down-triangle, anything else (modify) a diamond. Centered at the
+/// origin; it inherits its fill (content) and stroke (sender) from the token's
+/// `.sq-token` styling.
+pub fn payload_shape(kind: &str) -> Element {
+    match kind {
+        "add" => rsx! { polygon { points: "0,-8 7,5 -7,5" } },
+        "remove" => rsx! { polygon { points: "0,8 7,-5 -7,-5" } },
+        _ => rsx! { polygon { points: "0,-8 8,0 0,8 -8,0" } },
+    }
+}
+
 /// A faint static connector path drawn in the topology skeleton.
 pub fn edge(d: &str) -> Element {
     rsx! {

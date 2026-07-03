@@ -17,10 +17,14 @@ const REPO_URL: &str = "https://github.com/LucaCappelletti94/subql";
 pub fn Hero() -> Element {
     rsx! {
         section { class: "sq-hero",
-            h1 { "SQL subscriptions, without the plumbing" }
+            h1 { "Get more out of your SELECTs" }
             p { class: "sq-hero-sub",
-                "A general engine that tracks who's affected by every change, "
-                "instead of the code you'd hand-write per query."
+                "The SQL SELECT behind an API endpoint doubles as a live "
+                "subscription, a standing statement of interest. Register it "
+                "once, and every INSERT or UPDATE that changes its result comes "
+                "back as a precise, per-consumer delta, so the subscription "
+                "handler you'd otherwise build per endpoint never gets written. "
+                "Transport stays yours."
             }
             div { class: "sq-hero-cta",
                 a { class: "sq-btn sq-btn--primary", href: "#demo", "Try the live demo" }
@@ -41,23 +45,28 @@ pub fn Problem() -> Element {
     rsx! {
         section { class: "sq-section",
             p { class: "sq-eyebrow", "What it is" }
-            div { class: "sq-prose",
-                p {
-                    strong { "The problem. " }
-                    "Anything that needs to stay current on a slice of your data, "
-                    "a live dashboard, a service, an LLM agent watching a topic, "
-                    "needs the same backend: when data changes, work out who cares "
-                    "and how their view changed. Today you hand-write that, per app "
-                    "and per query."
+            div { class: "sq-split",
+                div { class: "sq-prose",
+                    p {
+                        strong { "The problem. " }
+                        "Anything that needs to stay current on a slice of your data, "
+                        "a live dashboard, a service, an LLM agent watching a topic, "
+                        "needs the same backend: when data changes, work out who cares "
+                        "and how their view changed. Today you hand-write that, per app "
+                        "and per query."
+                    }
+                    p {
+                        strong { "SubQL. " }
+                        "The general engine for it. A consumer registers a SQL SELECT, "
+                        "a standing interest, and on every change SubQL says, per "
+                        "consumer, exactly how their result changed: rows in/out, "
+                        "aggregate deltas. A browser, a service, or a bot kept up to "
+                        "date automatically. Bring your own transport (WebSocket, SSE). "
+                        "SubQL is the \"what to push, to whom\" core. One setup, any schema."
+                    }
                 }
-                p {
-                    strong { "SubQL. " }
-                    "The general engine for it. A consumer registers a SQL SELECT, "
-                    "a standing interest, and on every change SubQL says, per "
-                    "consumer, exactly how their result changed: rows in/out, "
-                    "aggregate deltas. A browser, a service, or a bot kept up to "
-                    "date automatically. Bring your own transport (WebSocket, SSE). "
-                    "SubQL is the \"what to push, to whom\" core. One setup, any schema."
+                div { class: "sq-anim-block",
+                    SystemFlowScene {}
                 }
             }
         }
@@ -131,10 +140,6 @@ pub fn HowItWorks() -> Element {
                 "A change enters as a CDC event. SubQL matches it against every "
                 "standing subscription and emits, per consumer, only what their "
                 "view needs."
-            }
-
-            div { class: "sq-how-block sq-anim-block",
-                SystemFlowScene {}
             }
 
             div { class: "sq-how-block",

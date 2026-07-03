@@ -19,9 +19,8 @@ pub struct Phase {
     /// Motion phase: `"idle" | "write" | "commit" | "cdc" | "fanout" |
     /// "verdict"`, surfaced as `data-phase`.
     pub phase: &'static str,
-    /// Dwell time in milliseconds before advancing to the next step. Only read
-    /// by the wasm driving loop; the native build is check-only.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    /// Dwell time in milliseconds before advancing to the next step (also the
+    /// caption's fade duration, so it tracks the phase length).
     pub ms: u32,
 }
 

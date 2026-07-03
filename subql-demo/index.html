@@ -22,10 +22,19 @@
         --panel: rgba(255, 255, 255, 0.92);
         --glass: rgba(255, 255, 255, 0.72);
         --hover: rgba(10, 10, 10, 0.06);
-        --danger: #dc2626;
-        /* PostgreSQL brand blue, scoped to the backend cluster in the topology
-           animation (the one non-monochrome accent besides --danger). */
-        --pg: #336791;
+        --danger: #cb5a4d;
+        /* The SQL-database color: used on the DB icon, its label, the "database"
+           caption word, and the CDC payload's border. */
+        --db: #336791;
+        /* Per-client identity colors (the sender/recipient of a payload, drawn as
+           the payload's border). Chosen away from the operation hues below. */
+        --c-user: #db2777;
+        --c-service: #7c3aed;
+        --c-agent: #d97706;
+        /* Operation / verdict colors (the payload's content, drawn as its fill):
+           insert/IN = green, delete/OUT = red (--danger), update = blue. */
+        --op-in: #419f68;
+        --op-upd: #5e80c9;
         --radius: 10px;
         --radius-sm: 8px;
         --pill: 999px;
@@ -40,8 +49,13 @@
           --panel: rgba(18, 18, 18, 0.92);
           --glass: rgba(12, 12, 12, 0.72);
           --hover: rgba(244, 244, 244, 0.08);
-          /* Lightened so the cluster reads against the dark background. */
-          --pg: #6f9fd8;
+          /* Lightened so the colors read against the dark background. */
+          --db: #6f9fd8;
+          --c-user: #f472b6;
+          --c-service: #a78bfa;
+          --c-agent: #f59e0b;
+          --op-in: #72ca97;
+          --op-upd: #88aedd;
         }
       }
 
@@ -222,6 +236,8 @@
         font-size: 1.15rem;
         color: var(--muted);
         max-width: 44rem;
+        text-align: justify;
+        hyphens: auto;
       }
 
       .sq-prose {
@@ -230,11 +246,33 @@
 
       .sq-prose p {
         margin: 0 0 1rem 0;
+        text-align: justify;
+        hyphens: auto;
       }
 
       .sq-prose strong {
         color: var(--ink);
         font-weight: 600;
+      }
+
+      /* "What it is": prose on the left, the animation on the right. Stacks on
+         narrow viewports. */
+      .sq-split {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+        gap: 2.5rem;
+        align-items: center;
+      }
+
+      .sq-split .sq-prose {
+        max-width: none;
+      }
+
+      @media (max-width: 900px) {
+        .sq-split {
+          grid-template-columns: 1fr;
+          gap: 1.5rem;
+        }
       }
 
       /* ---- Features grid ---- */
@@ -267,6 +305,8 @@
         margin: 0;
         font-size: 0.93rem;
         color: var(--muted);
+        text-align: justify;
+        hyphens: auto;
       }
 
       /* ---- How it works: pipeline + fan-out diagram ---- */
@@ -283,6 +323,8 @@
         max-width: 44rem;
         color: var(--muted);
         margin: 0 0 1rem 0;
+        text-align: justify;
+        hyphens: auto;
       }
 
       /* Horizontal pipeline of pills with connectors. */
@@ -602,13 +644,18 @@
          from tokens; --danger is reserved for the OUT verdict only. Motion is
          CSS, disabled under prefers-reduced-motion (static legend fallback). */
       .sq-anim-block {
-        margin-top: 1.5rem;
+        margin: 0;
       }
 
       .sq-anim {
         color: var(--ink);
         width: 100%;
         max-width: 760px;
+        /* Center the diagram (and its caption) in the section rather than
+           left-aligning it, so SubQL sits at the page's horizontal center. */
+        margin: 0 auto;
+        /* DEBUG: container bounds (red). */
+        background: rgba(220, 38, 38, 0.07);
       }
 
       .sq-anim-svg {
@@ -616,6 +663,51 @@
         height: auto;
         display: block;
         overflow: visible;
+        /* DEBUG: svg bounds (blue). */
+        background: rgba(37, 99, 235, 0.1);
+      }
+
+      /* Per-phase caption overlaid in the empty band at the bottom of the
+         diagram (inside the animation box) rather than a strip below it. The
+         fade duration is set inline to the phase length so it eases in, holds,
+         then eases out before the next step (no abrupt swap). */
+      /* Per-phase caption: SVG text at the bottom of the diagram (font-size is in
+         viewBox user units). Centered via text-anchor; faded via sq-caption. */
+      .sq-anim-caption-text {
+        fill: var(--muted);
+        font-family: "Inter", system-ui, sans-serif;
+        font-size: 13px;
+        font-weight: 400;
+        text-anchor: middle;
+        animation: sq-caption 2000ms ease both;
+      }
+
+      /* Highlighted caption words: fill from the accent class's color (the
+         sq-c-*, sq-db, sq-vl--* classes set `color`), slightly bolder. */
+      .sq-cap-hl {
+        fill: currentColor;
+        font-weight: 600;
+      }
+
+      /* The SubQL name in captions: bold and ink (the strong text color). */
+      .sq-cap-subql {
+        fill: var(--ink);
+        font-weight: 700;
+      }
+
+      @keyframes sq-caption {
+        0% {
+          opacity: 0;
+        }
+        15% {
+          opacity: 1;
+        }
+        82% {
+          opacity: 1;
+        }
+        100% {
+          opacity: 0;
+        }
       }
 
       .sq-visually-hidden {
@@ -651,39 +743,31 @@
         color: inherit;
       }
 
-      /* PostgreSQL cluster: brand blue, regardless of active state (only the
+      /* SQL database cluster: accent color, regardless of active state (only the
          opacity changes when active). */
-      .sq-pg {
-        color: var(--pg);
+      .sq-db {
+        color: var(--db);
       }
 
-      .sq-pg.is-active {
-        color: var(--pg);
+      .sq-db.is-active {
+        color: var(--db);
       }
 
-      /* Dashed replication mesh between the Postgres instances. */
-      .sq-mesh {
-        fill: none;
-        stroke: var(--pg);
-        stroke-width: 1.4;
-        stroke-dasharray: 5 5;
-        opacity: 0.55;
+      /* Per-client identity colors. Defined after .sq-node so they win on color;
+         is-active still controls brightness via .sq-node.is-active's opacity. */
+      .sq-c-user,
+      .sq-c-user.is-active {
+        color: var(--c-user);
       }
 
-      /* Payloads flowing continuously along the mesh lines. */
-      .sq-pg-payload {
-        fill: var(--pg);
-        offset-rotate: 0deg;
-        opacity: 0;
+      .sq-c-service,
+      .sq-c-service.is-active {
+        color: var(--c-service);
       }
 
-      @supports (offset-path: path("M0,0 L1,1")) {
-        .sq-pg-payload.is-flying {
-          opacity: 0.9;
-          animation:
-            sq-glide 850ms ease-out forwards,
-            sq-fade-in 220ms ease-out;
-        }
+      .sq-c-agent,
+      .sq-c-agent.is-active {
+        color: var(--c-agent);
       }
 
       .sq-node-label {
@@ -699,8 +783,16 @@
         offset-rotate: 0deg;
       }
 
+      /* The payload's shape encodes the operation; it is filled by its content
+         (currentColor = the operation/verdict color) and bordered by its
+         sender/recipient (--stroke: an identity color), with a thick border. */
+      .sq-token polygon,
       .sq-token circle {
         fill: currentColor;
+        stroke: var(--stroke, none);
+        stroke-width: 3.5;
+        stroke-linejoin: round;
+        paint-order: stroke;
       }
 
       .sq-token-label {
@@ -715,8 +807,27 @@
       @supports (offset-path: path("M0,0 L1,1")) {
         .sq-token.is-flying {
           animation:
-            sq-glide 1000ms ease-in-out forwards,
-            sq-fade-in 220ms ease-out forwards;
+            sq-glide 2200ms ease-in-out forwards,
+            sq-fade-in 300ms ease-out forwards;
+        }
+        /* The write payload rides its full client -> SubQL -> database path in
+           one continuous glide spanning the write and commit phases (2800 +
+           2400ms), so it crosses the hub smoothly instead of jumping. */
+        .sq-token.is-writing {
+          animation:
+            sq-glide 5200ms ease-in-out forwards,
+            sq-fade-in 300ms ease-out forwards;
+        }
+        /* Same path, traversed end-to-start (return directions: CDC, deltas). */
+        .sq-token.is-flying-rev {
+          animation:
+            sq-glide 2200ms ease-in-out reverse forwards,
+            sq-fade-in 300ms ease-out forwards;
+        }
+        /* A delta that has arrived stays visible at the spoke's client end
+           (offset-distance defaults to 0%) through the verdict phase. */
+        .sq-token.is-landed {
+          opacity: 1;
         }
       }
 
@@ -738,41 +849,34 @@
         }
       }
 
-      /* Verdict badges. Positioned by the SVG transform attribute, so only
-         opacity is animated (a CSS transform would override that attribute). */
-      .sq-vl {
+      /* The verdict label that fades in beside a landed delta (replaces the old
+         pill badge). Colored by the verdict (inherits the token's color). */
+      .sq-dl-label {
+        fill: currentColor;
+        font-family: "Inter", system-ui, sans-serif;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-anchor: start;
         opacity: 0;
       }
 
-      .sq-vl-bg {
-        fill: var(--bg);
-        stroke: currentColor;
-        stroke-width: 1;
+      .sq-dl-label.is-shown {
+        opacity: 1;
+        animation: sq-fade-in 380ms ease-out forwards;
       }
 
-      .sq-vl-text {
-        fill: currentColor;
-        font-family: "Inter", system-ui, sans-serif;
-        font-size: 10px;
-        font-weight: 600;
-        letter-spacing: 0.04em;
-        text-anchor: middle;
-      }
-
+      /* Verdict accent colors, still used by the caption highlight words. */
       .sq-vl--in {
-        color: var(--ink);
+        color: var(--op-in);
       }
 
       .sq-vl--update {
-        color: var(--muted);
+        color: var(--op-upd);
       }
 
       .sq-vl--out {
         color: var(--danger);
-      }
-
-      .sq-vl.is-shown {
-        animation: sq-fade-in 380ms ease-out forwards;
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -789,11 +893,14 @@
           color: var(--ink);
           opacity: 1;
         }
-        .sq-anim .sq-token,
-        .sq-anim .sq-pg-payload {
+        .sq-anim .sq-token {
           opacity: 0;
         }
-        .sq-anim .sq-vl.is-shown {
+        /* Keep the landed deltas + their verdict labels as the static payoff. */
+        .sq-anim .sq-token.is-landed {
+          opacity: 1;
+        }
+        .sq-anim .sq-dl-label.is-shown {
           opacity: 1;
         }
       }
