@@ -842,6 +842,54 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         self.register(SubscriptionRequest::new(consumer_id, select_sql).binds(binds))
     }
 
+    /// Follow a specific row by its primary-key value(s).
+    ///
+    /// Registers `SELECT * FROM <table> WHERE <pk> = <value>` (an `AND` of
+    /// equalities for a composite key), so the consumer receives every future
+    /// change to that row. This is the building block for following an inserted
+    /// row once its (possibly auto-generated) key is known.
+    ///
+    /// `pk` must supply one value per primary-key column, in declaration order.
+    ///
+    /// # Errors
+    /// [`RegisterError::UnknownTable`] if `table` is unknown,
+    /// [`RegisterError::NoPrimaryKey`] if it has no primary key,
+    /// [`RegisterError::UnsupportedSql`] on a key-arity mismatch, plus any error
+    /// from registering the derived SELECT.
+    pub fn follow_row(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        table: &str,
+        pk: Vec<crate::Cell>,
+    ) -> Result<RegisterResult, RegisterError> {
+        let table_id = catalog_helpers::table_id(&self.database, table)
+            .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
+        let pk_cols = catalog_helpers::primary_key_columns(&self.database, table_id)
+            .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
+        if pk_cols.is_empty() {
+            return Err(RegisterError::NoPrimaryKey { table_id });
+        }
+        if pk.len() != pk_cols.len() {
+            return Err(RegisterError::UnsupportedSql(format!(
+                "follow_row: table {table:?} has {} primary-key column(s) but {} value(s) were supplied",
+                pk_cols.len(),
+                pk.len()
+            )));
+        }
+        let mut clauses = Vec::with_capacity(pk_cols.len());
+        for (i, col_id) in pk_cols.iter().enumerate() {
+            let name = catalog_helpers::column_name(&self.database, table_id, *col_id).ok_or_else(
+                || RegisterError::UnknownColumn {
+                    table_id,
+                    column: format!("<primary-key ordinal {col_id}>"),
+                },
+            )?;
+            clauses.push(format!("\"{name}\" = ${}", i + 1));
+        }
+        let sql = format!("SELECT * FROM \"{table}\" WHERE {}", clauses.join(" AND "));
+        self.register(SubscriptionRequest::new(consumer_id, sql).binds(pk))
+    }
+
     /// Register multiple subscriptions in a single batch.
     ///
     /// Significantly more efficient than calling `register()` in a loop:
@@ -2942,6 +2990,51 @@ mod tests {
         assert!(matches!(
             engine.register_follow_update(1, "UPDATE orders SET amount = 30"),
             Err(RegisterError::UnsupportedUpdateShape(_))
+        ));
+    }
+
+    #[test]
+    fn follow_row_is_deterministic_and_pk_specific() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        // Following the same PK twice dedups to one subscription (also proves the
+        // quoted `SELECT * FROM "orders" WHERE "id" = $1` round-trips and resolves).
+        let a = engine
+            .follow_row(1, "orders", alloc::vec![crate::Cell::Int(5)])
+            .expect("follow row 5");
+        let b = engine
+            .follow_row(1, "orders", alloc::vec![crate::Cell::Int(5)])
+            .expect("follow row 5 again");
+        assert_eq!(a.subscription_id, b.subscription_id);
+        // A different PK is a different subscription.
+        let c = engine
+            .follow_row(1, "orders", alloc::vec![crate::Cell::Int(6)])
+            .expect("follow row 6");
+        assert_ne!(a.subscription_id, c.subscription_id);
+    }
+
+    #[test]
+    fn follow_row_rejects_no_primary_key() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        // `_engine_pad (id INT)` has no PRIMARY KEY.
+        assert!(matches!(
+            engine.follow_row(1, "_engine_pad", alloc::vec![crate::Cell::Int(1)]),
+            Err(RegisterError::NoPrimaryKey { .. })
+        ));
+    }
+
+    #[test]
+    fn follow_row_rejects_key_arity_mismatch() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        assert!(matches!(
+            engine.follow_row(
+                1,
+                "orders",
+                alloc::vec![crate::Cell::Int(5), crate::Cell::Int(6)]
+            ),
+            Err(RegisterError::UnsupportedSql(_))
         ));
     }
 

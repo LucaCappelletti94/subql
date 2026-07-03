@@ -114,6 +114,14 @@ pub enum RegisterError {
     /// subscription (multi-table FROM, joins, ORDER BY / LIMIT, or no WHERE).
     #[error("Unsupported UPDATE for follow: {0}")]
     UnsupportedUpdateShape(String),
+
+    /// A row follow was requested on a table with no declared primary key, so
+    /// there is no key to follow the row by.
+    #[error("Table {table_id} has no primary key to follow by")]
+    NoPrimaryKey {
+        /// The table lacking a primary key.
+        table_id: TableId,
+    },
 }
 
 /// Errors during event dispatch

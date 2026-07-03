@@ -139,6 +139,24 @@ pub fn primary_key_columns<DB: DatabaseLike>(
     )
 }
 
+/// Resolve a column's stored name from its compact [`ColumnId`].
+///
+/// The inverse of [`column_id`]. Returns `None` when the table or column id is
+/// unknown. O(n) over the table's columns.
+#[must_use]
+pub fn column_name<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Option<alloc::string::String> {
+    use alloc::string::ToString;
+    let table = database.table_by_id(table_id as usize)?;
+    table
+        .columns(database)
+        .find(|col| col.column_id(database) == Some(column_id as usize))
+        .map(|col| col.column_name().to_string())
+}
+
 /// A table resolved to subql's compact ids, returned by [`resolve_table`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedTable {
