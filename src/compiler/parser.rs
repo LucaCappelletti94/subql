@@ -1551,6 +1551,50 @@ mod tests {
         assert!(matches!(result, Err(RegisterError::BindResolution(_))));
     }
 
+    // ---- Complete column-list projection == SELECT * (diesel renders these) ---
+
+    fn projection_of(sql: &str) -> Result<QueryProjection, RegisterError> {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        parse_compile_normalize_and_prefilter(sql, &dialect, &catalog).map(|t| t.4)
+    }
+
+    #[test]
+    fn complete_column_list_is_rows() {
+        assert_eq!(
+            projection_of("SELECT id, age, email, name, joined FROM users").unwrap(),
+            QueryProjection::Rows,
+        );
+    }
+
+    #[test]
+    fn qualified_complete_column_list_is_rows() {
+        // How diesel renders a row query: fully qualified, all columns.
+        assert_eq!(
+            projection_of(
+                "SELECT users.id, users.age, users.email, users.name, users.joined FROM users"
+            )
+            .unwrap(),
+            QueryProjection::Rows,
+        );
+    }
+
+    #[test]
+    fn partial_column_list_unsupported() {
+        assert!(matches!(
+            projection_of("SELECT id, age FROM users"),
+            Err(RegisterError::UnsupportedSql(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_column_list_unsupported() {
+        assert!(matches!(
+            projection_of("SELECT id, id, age, email, name, joined FROM users"),
+            Err(RegisterError::UnsupportedSql(_))
+        ));
+    }
+
     #[test]
     fn test_error_set_operations() {
         let catalog = make_catalog();

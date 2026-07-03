@@ -250,4 +250,31 @@ mod render_tests {
             alloc::vec![Cell::Int(5), Cell::String("ann".into()), Cell::Bool(true)]
         );
     }
+
+    #[test]
+    fn register_typed_row_query_via_engine() {
+        use crate::SubscriptionEngine;
+        use sql_traits::structs::ParserDB;
+        use sqlparser::dialect::PostgreSqlDialect;
+
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);",
+        )
+        .expect("catalog");
+        let mut engine =
+            SubscriptionEngine::<_, crate::DefaultIds, _>::new(catalog, PostgreSqlDialect {});
+
+        // Diesel renders a row query as a fully-qualified all-columns list plus a
+        // parameterized WHERE; the typed path must accept it (complete column
+        // list == SELECT *) and resolve the bind.
+        let query = users::table.filter(users::id.eq(5));
+        let a = engine
+            .register_select_typed(1, &query)
+            .expect("typed register");
+        // Deterministic: registering the same typed query dedups to the same id.
+        let b = engine
+            .register_select_typed(1, &query)
+            .expect("typed register again");
+        assert_eq!(a.subscription_id, b.subscription_id);
+    }
 }
