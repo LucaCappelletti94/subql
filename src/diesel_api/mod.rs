@@ -171,6 +171,29 @@ where
         let (sql, binds) = render_typed(query)?;
         self.register(SubscriptionRequest::new(consumer_id, sql).binds(binds))
     }
+
+    /// Register a follow subscription from a typed diesel Postgres UPDATE.
+    ///
+    /// The UPDATE is rendered to SQL + binds (see [`render_typed`]) and its
+    /// target rows become a standing `SELECT * ... WHERE <the UPDATE's WHERE>`
+    /// subscription. Nothing is executed. See
+    /// [`SubscriptionEngine::register_follow_update`].
+    ///
+    /// # Errors
+    /// Propagates rendering errors from [`render_typed`] and the follow-shape /
+    /// registration errors from
+    /// [`SubscriptionEngine::register_follow_update_with_binds`].
+    pub fn register_follow_update_typed<Q>(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        update: &Q,
+    ) -> Result<RegisterResult, RegisterError>
+    where
+        Q: QueryFragment<Pg>,
+    {
+        let (sql, binds) = render_typed(update)?;
+        self.register_follow_update_with_binds(consumer_id, sql, binds)
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +298,31 @@ mod render_tests {
         let b = engine
             .register_select_typed(1, &query)
             .expect("typed register again");
+        assert_eq!(a.subscription_id, b.subscription_id);
+    }
+
+    #[test]
+    fn register_typed_update_follow_via_engine() {
+        use crate::SubscriptionEngine;
+        use sql_traits::structs::ParserDB;
+        use sqlparser::dialect::PostgreSqlDialect;
+
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);",
+        )
+        .expect("catalog");
+        let mut engine =
+            SubscriptionEngine::<_, crate::DefaultIds, _>::new(catalog, PostgreSqlDialect {});
+
+        // A typed diesel UPDATE registers as a follow on its target rows.
+        let update = diesel::update(users::table.filter(users::id.eq(5))).set(users::name.eq("x"));
+        let a = engine
+            .register_follow_update_typed(1, &update)
+            .expect("typed update follow");
+        // Deterministic: the same typed UPDATE dedups to the same subscription.
+        let b = engine
+            .register_follow_update_typed(1, &update)
+            .expect("typed update follow again");
         assert_eq!(a.subscription_id, b.subscription_id);
     }
 }

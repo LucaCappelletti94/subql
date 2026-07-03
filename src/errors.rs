@@ -104,6 +104,16 @@ pub enum RegisterError {
     /// provided bind values (index out of range, malformed, or count mismatch).
     #[error("Bind resolution error: {0}")]
     BindResolution(String),
+
+    /// A statement given to a follow-registration API was neither INSERT nor
+    /// UPDATE (e.g. a SELECT, DELETE, or DDL statement).
+    #[error("Unsupported follow statement: {0}")]
+    FollowUnsupportedStatement(String),
+
+    /// An UPDATE-follow statement had a shape SubQL cannot turn into a standing
+    /// subscription (multi-table FROM, joins, ORDER BY / LIMIT, or no WHERE).
+    #[error("Unsupported UPDATE for follow: {0}")]
+    UnsupportedUpdateShape(String),
 }
 
 /// Errors during event dispatch

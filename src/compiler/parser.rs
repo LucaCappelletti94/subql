@@ -421,6 +421,20 @@ pub fn parse_and_resolve_hash<D: Dialect, DB: DatabaseLike>(
     Ok((pq.table_id, hash))
 }
 
+/// Derive the follow-subscription SELECT for an UPDATE statement.
+///
+/// Parses `sql` and returns `SELECT * FROM t WHERE <the UPDATE's WHERE>` (see
+/// [`sql_shape::derive_update_follow_sql`]), so the caller can register it as a
+/// standing subscription. Any `$N`/`?` placeholders in the WHERE are preserved
+/// and resolved later against the request's binds.
+pub fn derive_update_follow_select<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+) -> Result<String, RegisterError> {
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+    sql_shape::derive_update_follow_sql(&stmt)
+}
+
 /// Compile SQL expression to bytecode
 ///
 /// Recursively compiles an SQL expression into a sequence of VM instructions.

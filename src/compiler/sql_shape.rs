@@ -606,6 +606,44 @@ pub(super) fn extract_single_table_and_where(
     }
 }
 
+/// Derive the follow-subscription SELECT from an UPDATE statement:
+/// `SELECT * FROM <table> WHERE <the UPDATE's WHERE>`. The consumer follows the
+/// rows the UPDATE targets, as a standing predicate (a moving set).
+///
+/// Rejects a non-UPDATE statement, a multi-table / joined / `ORDER BY` / `LIMIT`
+/// UPDATE, and an UPDATE with no WHERE (a whole-table follow is better expressed
+/// as an explicit SELECT).
+pub(super) fn derive_update_follow_sql(stmt: &Statement) -> Result<String, RegisterError> {
+    let Statement::Update(update) = stmt else {
+        return Err(RegisterError::FollowUnsupportedStatement(
+            "expected an UPDATE statement".to_string(),
+        ));
+    };
+    if update.from.is_some() || !update.order_by.is_empty() || update.limit.is_some() {
+        return Err(RegisterError::UnsupportedUpdateShape(
+            "UPDATE with FROM, ORDER BY, or LIMIT is not supported for a follow".to_string(),
+        ));
+    }
+    if !update.table.joins.is_empty() {
+        return Err(RegisterError::UnsupportedUpdateShape(
+            "UPDATE with joins is not supported for a follow".to_string(),
+        ));
+    }
+    let TableFactor::Table { name, .. } = &update.table.relation else {
+        return Err(RegisterError::UnsupportedUpdateShape(
+            "UPDATE target must be a plain table".to_string(),
+        ));
+    };
+    let selection = update.selection.as_ref().ok_or_else(|| {
+        RegisterError::UnsupportedUpdateShape(
+            "UPDATE without a WHERE clause would follow the whole table; \
+             add a WHERE or register an explicit SELECT"
+                .to_string(),
+        )
+    })?;
+    Ok(alloc::format!("SELECT * FROM {name} WHERE {selection}"))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod sanity_tests {

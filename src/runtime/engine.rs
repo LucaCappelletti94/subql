@@ -805,6 +805,43 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         self.register(SubscriptionRequest::new(consumer_id, sql))
     }
 
+    /// Register a follow subscription derived from an UPDATE statement.
+    ///
+    /// The UPDATE's target table and WHERE clause become a standing
+    /// `SELECT * FROM t WHERE <where>` subscription: the consumer follows every
+    /// row the UPDATE matches, now and going forward (a moving set). SubQL does
+    /// not execute the UPDATE, it only reads its shape.
+    ///
+    /// # Errors
+    /// [`RegisterError::FollowUnsupportedStatement`] if `update_sql` is not an
+    /// UPDATE, [`RegisterError::UnsupportedUpdateShape`] for an unsupported
+    /// UPDATE (joins, FROM, ORDER BY/LIMIT, or no WHERE), plus any error from
+    /// registering the derived SELECT.
+    pub fn register_follow_update(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        update_sql: impl Into<String>,
+    ) -> Result<RegisterResult, RegisterError> {
+        self.register_follow_update_with_binds(consumer_id, update_sql, Vec::new())
+    }
+
+    /// Like [`Self::register_follow_update`], but with bind values for the
+    /// `$N`/`?` placeholders in the UPDATE's WHERE (the typed diesel path
+    /// supplies these).
+    ///
+    /// # Errors
+    /// See [`Self::register_follow_update`].
+    pub fn register_follow_update_with_binds(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        update_sql: impl Into<String>,
+        binds: Vec<crate::Cell>,
+    ) -> Result<RegisterResult, RegisterError> {
+        let update_sql = update_sql.into();
+        let select_sql = crate::compiler::derive_update_follow_select(&update_sql, &self.dialect)?;
+        self.register(SubscriptionRequest::new(consumer_id, select_sql).binds(binds))
+    }
+
     /// Register multiple subscriptions in a single batch.
     ///
     /// Significantly more efficient than calling `register()` in a loop:
@@ -2850,6 +2887,62 @@ mod tests {
             SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         assert_eq!(engine.subscription_count(), 0);
+    }
+
+    #[test]
+    fn register_follow_update_matches_equivalent_select() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+
+        // Following an UPDATE registers its target as a standing SELECT.
+        let follow = engine
+            .register_follow_update(1, "UPDATE orders SET amount = 30 WHERE id = 5")
+            .expect("follow update");
+        // The equivalent explicit SELECT dedups to the same subscription.
+        let select = engine
+            .register_select(1, "SELECT * FROM orders WHERE id = 5")
+            .expect("select");
+        assert_eq!(follow.subscription_id, select.subscription_id);
+    }
+
+    #[test]
+    fn register_follow_update_with_binds_follows_where_row() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+
+        // SET binds precede WHERE binds; the derived follow keeps `$2` and the
+        // full bind list, so `$2` resolves to the WHERE value (5) by index.
+        let follow = engine
+            .register_follow_update_with_binds(
+                1,
+                "UPDATE orders SET amount = $1 WHERE id = $2",
+                alloc::vec![crate::Cell::Int(30), crate::Cell::Int(5)],
+            )
+            .expect("follow update with binds");
+        let select = engine
+            .register_select(1, "SELECT * FROM orders WHERE id = 5")
+            .expect("select");
+        assert_eq!(follow.subscription_id, select.subscription_id);
+    }
+
+    #[test]
+    fn register_follow_update_rejects_non_update() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        assert!(matches!(
+            engine.register_follow_update(1, "SELECT * FROM orders WHERE id = 5"),
+            Err(RegisterError::FollowUnsupportedStatement(_))
+        ));
+    }
+
+    #[test]
+    fn register_follow_update_rejects_no_where() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        assert!(matches!(
+            engine.register_follow_update(1, "UPDATE orders SET amount = 30"),
+            Err(RegisterError::UnsupportedUpdateShape(_))
+        ));
     }
 
     #[test]
