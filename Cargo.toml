@@ -116,6 +116,10 @@ required-features = ["sqlite-cdc"]
 name = "reexec_postgres"
 required-features = ["executor-diesel-postgres"]
 
+[[test]]
+name = "follow_insert_postgres"
+required-features = ["diesel-typed"]
+
 # Docker-backed integration test for PgR2D2DieselConnector (pool-backed
 # PG connector). Run with:
 #   cargo test --test reexec_postgres_r2d2 \
