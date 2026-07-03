@@ -1155,7 +1155,10 @@ impl<C: Checkpoint> WalEvent<C> {
 // ============================================================================
 
 /// Subscription request provided by caller
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Eq` is not derived: `binds` holds [`Cell`]s, which carry `f64` and are only
+/// `PartialEq`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SubscriptionRequest<I: IdTypes> {
     /// Consumer who owns this subscription
     pub(crate) consumer_id: I::ConsumerId,
@@ -1165,6 +1168,10 @@ pub struct SubscriptionRequest<I: IdTypes> {
     pub(crate) sql: String,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
     pub(crate) updated_at_unix_ms: u64,
+    /// Resolved bind values for `$N`/`?` placeholders in `sql`, in placeholder
+    /// order. Empty for plain literal SQL (the default). Populated by the typed
+    /// diesel API, which renders parameterized SQL plus these values.
+    pub(crate) binds: Vec<Cell>,
 }
 
 impl<I: IdTypes> SubscriptionRequest<I> {
@@ -1175,6 +1182,7 @@ impl<I: IdTypes> SubscriptionRequest<I> {
             scope: SubscriptionScope::Durable,
             sql: sql.into(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         }
     }
 
@@ -1189,6 +1197,14 @@ impl<I: IdTypes> SubscriptionRequest<I> {
     #[must_use]
     pub const fn updated_at_unix_ms(mut self, ts: u64) -> Self {
         self.updated_at_unix_ms = ts;
+        self
+    }
+
+    /// Attach resolved bind values for `$N`/`?` placeholders in the SQL, in
+    /// placeholder order (default: none). Used by the typed diesel API.
+    #[must_use]
+    pub fn binds(mut self, binds: Vec<Cell>) -> Self {
+        self.binds = binds;
         self
     }
 }

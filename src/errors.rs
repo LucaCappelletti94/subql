@@ -99,6 +99,11 @@ pub enum RegisterError {
     /// Storage/persistence error during registration
     #[error("Storage error during registration: {0}")]
     Storage(String),
+
+    /// A SQL bind placeholder (`$N` or `?`) could not be resolved against the
+    /// provided bind values (index out of range, malformed, or count mismatch).
+    #[error("Bind resolution error: {0}")]
+    BindResolution(String),
 }
 
 /// Errors during event dispatch
