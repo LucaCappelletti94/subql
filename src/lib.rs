@@ -51,6 +51,8 @@ pub mod clock;
 pub mod compiler;
 #[cfg(feature = "std")]
 pub mod config;
+#[cfg(feature = "diesel-typed")]
+pub mod diesel_api;
 #[cfg(feature = "dhat-heap")]
 pub mod memory_profile_workload;
 #[cfg(feature = "std")]

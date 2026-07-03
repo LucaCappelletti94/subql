@@ -317,6 +317,18 @@ observability = ["dep:tracing", "tracing/std"]
 # bindings. Implies `std` (diesel needs std). The user activates their
 # backend on their own diesel dep.
 executor-diesel = ["std", "dep:diesel"]
+# Opt-in: the diesel-typed subscription/follow API. Renders a typed diesel
+# query to placeholder SQL + a list of bind `Cell`s (byte-decoded from Pg's
+# binary wire format) and registers it via the string+binds core. Uses
+# `postgres_backend` (pure Rust, no libpq) and the opt-in-unstable collector
+# fields to read the serialized binds. Pg-first.
+diesel-typed = [
+    "std",
+    "dep:diesel",
+    "diesel?/postgres_backend",
+    "diesel?/uuid",
+    "diesel?/i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+]
 # Opt-in: ship `PgDieselConnector`, an LSN-aware sync connector built on
 # top of `executor-diesel` + diesel's `postgres` feature. Snapshots taken
 # through this connector carry a `PgLsn` checkpoint read from
