@@ -237,6 +237,13 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     /// per-subscription unregister paths so cursors never outlive
     /// their owning subscription.
     resume_cursors: HashMap<(I::SessionId, SubscriptionId), crate::OpaqueCheckpoint>,
+    /// Single-row ("pk") follow subscriptions: `subscription_id -> (table, key)`.
+    /// Populated by [`follow_row`](Self::follow_row); when the tracked row is
+    /// deleted, the follow self-unregisters (its `WHERE pk = <value>` predicate
+    /// can never match again). In-memory only (not persisted): across a restart a
+    /// pk-follow loses its auto-close marker and degrades to an ordinary inert
+    /// subscription.
+    pk_follows: HashMap<SubscriptionId, (TableId, crate::PrimaryKey)>,
 }
 
 /// Look up the partition and consumer dictionary for a table, or return
@@ -492,6 +499,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             #[cfg(feature = "std")]
             durability_mode: DurabilityMode::Required,
             resume_cursors: HashMap::new(),
+            pk_follows: HashMap::new(),
         }
     }
 
@@ -887,7 +895,14 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             clauses.push(format!("\"{name}\" = ${}", i + 1));
         }
         let sql = format!("SELECT * FROM \"{table}\" WHERE {}", clauses.join(" AND "));
-        self.register(SubscriptionRequest::new(consumer_id, sql).binds(pk))
+        // Build the tracked key before `pk` is moved into the request binds.
+        let key = crate::PrimaryKey::new(Arc::from(pk_cols.as_slice()), Arc::from(pk.as_slice()))
+            .map_err(|e| RegisterError::UnsupportedSql(format!("follow_row: {e}")))?;
+        let result = self.register(SubscriptionRequest::new(consumer_id, sql).binds(pk))?;
+        // Mark as a single-row follow so it self-closes when its row is deleted.
+        self.pk_follows
+            .insert(result.subscription_id, (table_id, key));
+        Ok(result)
     }
 
     /// Register multiple subscriptions in a single batch.
@@ -1532,6 +1547,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         &mut self,
         subscription_id: SubscriptionId,
     ) -> Option<bool> {
+        self.pk_follows.remove(&subscription_id);
         // Capture dedup key from binding before removing it.
         let dedup_key = self.dedup_key_for_subscription(subscription_id);
 
@@ -1856,10 +1872,29 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ) -> Result<crate::DispatchOutput<I, C>, DispatchError> {
         let notifications = self.consumers(event)?;
         let aggregate_deltas = self.aggregate_deltas(event)?;
-        Ok(crate::DispatchOutput::from_parts(
-            notifications,
-            aggregate_deltas,
-        ))
+        let output = crate::DispatchOutput::from_parts(notifications, aggregate_deltas);
+        // A single-row (pk) follow self-closes once its row is deleted. The delete
+        // delta is already captured in `output`, so we unregister afterwards.
+        if event.kind() == EventKind::Delete && !self.pk_follows.is_empty() {
+            self.close_deleted_pk_follows(event.table_id(), event.pk());
+        }
+        Ok(output)
+    }
+
+    /// Unregister any pk-follow whose tracked row matches the just-deleted
+    /// `(table_id, pk)`. Called at the tail of `dispatch` on DELETE events.
+    fn close_deleted_pk_follows(&mut self, table_id: TableId, pk: &crate::PrimaryKey) {
+        let to_close: Vec<SubscriptionId> = self
+            .pk_follows
+            .iter()
+            .filter(|(_, (t, key))| {
+                *t == table_id && key.columns == pk.columns && key.values == pk.values
+            })
+            .map(|(&sid, _)| sid)
+            .collect();
+        for sid in to_close {
+            self.unregister_subscription(sid);
+        }
     }
 
     /// Unregister all subscriptions for a session
@@ -3036,6 +3071,74 @@ mod tests {
             ),
             Err(RegisterError::UnsupportedSql(_))
         ));
+    }
+
+    #[test]
+    fn pk_follow_auto_closes_on_its_row_delete() {
+        let catalog = make_catalog();
+        let table_id = catalog_helpers::table_id(&catalog, "orders").expect("orders id");
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .follow_row(1, "orders", alloc::vec![Cell::Int(5)])
+            .expect("follow row 5");
+        assert_eq!(engine.subscription_count(), 1);
+
+        // Deleting a different row leaves the follow in place.
+        let other = build_delete_event(
+            table_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(9)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(9), Cell::Int(0), Cell::String("x".into())]),
+            },
+        );
+        engine.dispatch(&other).expect("dispatch other delete");
+        assert_eq!(engine.subscription_count(), 1);
+
+        // Deleting the followed row self-closes the follow.
+        let del = build_delete_event(
+            table_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(5)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(5), Cell::Int(0), Cell::String("x".into())]),
+            },
+        );
+        engine.dispatch(&del).expect("dispatch followed delete");
+        assert_eq!(engine.subscription_count(), 0);
+    }
+
+    #[test]
+    fn predicate_follow_persists_through_delete() {
+        // An UPDATE-derived (predicate) follow is not a pk-follow, so a delete of
+        // a matching row does not close it.
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        let table_id = catalog_helpers::table_id(&engine.database, "orders").expect("orders id");
+
+        engine
+            .register_follow_update(1, "UPDATE orders SET amount = 1 WHERE status = 'open'")
+            .expect("update follow");
+        assert_eq!(engine.subscription_count(), 1);
+
+        let del = build_delete_event(
+            table_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(5)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(5), Cell::Int(0), Cell::String("open".into())]),
+            },
+        );
+        engine.dispatch(&del).expect("dispatch delete");
+        assert_eq!(engine.subscription_count(), 1);
     }
 
     #[test]
