@@ -65,3 +65,14 @@ Deferred. The `AsyncConnector` trait and `AsyncAutoResolvingEngine` shipped and 
 ## Other deferred items
 
 Track future deferred work here as it gets pushed past v1.
+
+### MySQL follow-on-insert: replace raw `LAST_INSERT_ID()` with diesel sugar
+
+MySQL has no `RETURNING`, so the Pg/MariaDB `register_follow_insert` path does not
+apply. The MySQL "follow the inserted row" story (`tests/follow_insert_mysql.rs`)
+executes the insert, reads the DB-minted auto-increment key with a **raw**
+`SELECT LAST_INSERT_ID()` query, then calls `follow_row`. It is raw SQL because
+diesel exposes no sugar for it on MySQL (contrast SQLite's
+`SqliteConnection::last_insert_rowid()`, `sqlite/connection/mod.rs`). Once diesel
+grows a typed `last_insert_id` accessor (planned by the maintainer), swap the raw
+`sql_query` in that test (and any docs) for the typed call.
