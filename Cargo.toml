@@ -120,6 +120,10 @@ required-features = ["executor-diesel-postgres"]
 name = "follow_insert_postgres"
 required-features = ["diesel-typed"]
 
+[[test]]
+name = "follow_insert_sqlite"
+required-features = ["diesel-typed-sqlite"]
+
 # Docker-backed integration test for PgR2D2DieselConnector (pool-backed
 # PG connector). Run with:
 #   cargo test --test reexec_postgres_r2d2 \
@@ -332,6 +336,15 @@ diesel-typed = [
     "diesel?/postgres_backend",
     "diesel?/uuid",
     "diesel?/i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+]
+# Opt-in: extend the diesel-typed follow API to SQLite. Adds `FollowRowDecode for
+# Sqlite` plus SQLite RETURNING support. Unlike `diesel-typed` (pure-Rust
+# `postgres_backend`), the SQLite backend pulls `libsqlite3-sys` (a C dependency),
+# so it is a separate opt-in.
+diesel-typed-sqlite = [
+    "diesel-typed",
+    "diesel?/sqlite",
+    "diesel?/returning_clauses_for_sqlite_3_35",
 ]
 # Opt-in: ship `PgDieselConnector`, an LSN-aware sync connector built on
 # top of `executor-diesel` + diesel's `postgres` feature. Snapshots taken

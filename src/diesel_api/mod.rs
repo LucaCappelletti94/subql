@@ -169,6 +169,31 @@ impl FollowRowDecode for Pg {
     }
 }
 
+#[cfg(feature = "diesel-typed-sqlite")]
+impl FollowRowDecode for diesel::sqlite::Sqlite {
+    fn field_to_cell(value: Option<Self::RawValue<'_>>) -> Result<Cell, RegisterError> {
+        use diesel::sqlite::SqliteType;
+        // SQLite hands back typed values (`read_*` take `&mut self`), so no wire
+        // decode is needed.
+        let Some(mut v) = value else {
+            return Ok(Cell::Null);
+        };
+        Ok(match v.value_type() {
+            None => Cell::Null,
+            Some(SqliteType::SmallInt | SqliteType::Integer | SqliteType::Long) => {
+                Cell::Int(v.read_long())
+            }
+            Some(SqliteType::Float | SqliteType::Double) => Cell::Float(v.read_double()),
+            Some(SqliteType::Text) => Cell::String(v.read_text().into()),
+            Some(SqliteType::Binary) => {
+                return Err(RegisterError::UnsupportedSql(
+                    "unsupported SQLite BLOB in a followed row".to_string(),
+                ))
+            }
+        })
+    }
+}
+
 /// Error from [`SubscriptionEngine::register_follow_insert`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -302,6 +327,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -353,6 +379,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod render_tests {
     use super::{render_typed, Cell};
     use diesel::prelude::*;
