@@ -124,6 +124,10 @@ required-features = ["diesel-typed"]
 name = "follow_insert_sqlite"
 required-features = ["diesel-typed-sqlite"]
 
+[[test]]
+name = "follow_cdc_sqlite"
+required-features = ["sqlite-cdc", "diesel-typed-sqlite"]
+
 # Docker-backed integration test for PgR2D2DieselConnector (pool-backed
 # PG connector). Run with:
 #   cargo test --test reexec_postgres_r2d2 \
