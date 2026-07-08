@@ -52,10 +52,7 @@ fn follow_insert_then_receive_cdc_delta() {
     let follow = engine
         .register_follow_insert(
             1,
-            "users",
-            diesel::insert_into(users::table)
-                .values(users::name.eq("ann"))
-                .returning(users::id),
+            diesel::insert_into(users::table).values(users::name.eq("ann")),
             &mut writer,
         )
         .unwrap();

@@ -38,10 +38,7 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
     let ann = engine
         .register_follow_insert(
             1,
-            "users",
-            diesel::insert_into(users::table)
-                .values(users::name.eq("ann"))
-                .returning(users::id),
+            diesel::insert_into(users::table).values(users::name.eq("ann")),
             &mut conn,
         )
         .expect("follow insert ann");
@@ -52,10 +49,7 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
     let bob = engine
         .register_follow_insert(
             1,
-            "users",
-            diesel::insert_into(users::table)
-                .values(users::name.eq("bob"))
-                .returning(users::id),
+            diesel::insert_into(users::table).values(users::name.eq("bob")),
             &mut conn,
         )
         .expect("follow insert bob");

@@ -18,8 +18,16 @@ use diesel::connection::{DefaultLoadingMode, LoadConnection};
 use diesel::expression::QueryMetadata;
 use diesel::pg::{Pg, PgMetadataLookup, PgTypeMetadata, PgValue};
 use diesel::query_builder::bind_collector::RawBytesBindCollector;
-use diesel::query_builder::{Query, QueryBuilder, QueryFragment, QueryId};
+use diesel::query_builder::returning::ReturningClause;
+use diesel::query_builder::{InsertStatement, Query, QueryBuilder, QueryFragment, QueryId};
 use diesel::row::{Field, Row};
+use diesel::Table;
+
+/// A follow-insert query: the caller's insert with a `RETURNING <primary key>`
+/// clause that we derive from the table type, so the returned columns are always
+/// the table's primary key, in its order (never restated by the caller).
+type PkReturningInsert<T, U, Op> =
+    InsertStatement<T, U, Op, ReturningClause<<T as Table>::PrimaryKey>>;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::dialect::Dialect;
 
@@ -55,45 +63,133 @@ impl PgMetadataLookup for NoLookup {
     }
 }
 
-/// Render a typed diesel Postgres query to placeholder SQL (`$1..`) plus its
-/// bind values decoded to [`Cell`]s, in placeholder order.
+/// Render a typed diesel query to placeholder SQL plus its bind values decoded
+/// to [`Cell`]s, in placeholder order.
+///
+/// Generic over the backend that decodes its own binds ([`BindDecode`]):
+/// `Pg` yields `$N` placeholders and decodes the Postgres binary wire format by
+/// type OID, `Sqlite` yields `?` placeholders and reads its typed bind values
+/// directly.
 ///
 /// # Errors
 /// Returns [`RegisterError::UnsupportedSql`] if diesel fails to render the query
 /// or a bind uses a type outside the supported scalar set (bool, integer, float,
 /// text, uuid).
-pub fn render_typed<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+pub fn render_typed<B, Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
 where
-    Q: QueryFragment<Pg>,
+    B: BindDecode,
+    Q: QueryFragment<B>,
 {
-    let backend = Pg;
+    B::render_sql_and_binds(query)
+}
 
-    // 1. SQL skeleton with `$N` placeholders (needs only the backend type).
-    let mut qb = <Pg as Backend>::QueryBuilder::default();
-    query.to_sql(&mut qb, &backend).map_err(|e| {
+/// Render only the placeholder SQL skeleton for a backend, no binds. Needs just
+/// the backend type, no connection.
+fn render_sql<B, Q>(query: &Q) -> Result<String, RegisterError>
+where
+    B: Backend + Default,
+    <B as Backend>::QueryBuilder: Default,
+    Q: QueryFragment<B>,
+{
+    let mut qb = <B as Backend>::QueryBuilder::default();
+    query.to_sql(&mut qb, &B::default()).map_err(|e| {
         RegisterError::UnsupportedSql(format!("diesel query rendering failed: {e}"))
     })?;
-    let sql = qb.finish();
+    Ok(qb.finish())
+}
 
-    // 2. Binds as serialized wire bytes + type OIDs.
-    let mut collector = RawBytesBindCollector::<Pg>::new();
-    let mut lookup = NoLookup;
-    query
-        .collect_binds(&mut collector, &mut lookup, &backend)
-        .map_err(|e| {
-            RegisterError::UnsupportedSql(format!("diesel bind collection failed: {e}"))
-        })?;
+/// Render a typed diesel query to placeholder SQL plus its bind [`Cell`]s, for
+/// one backend.
+///
+/// The bind side is backend-specific: Postgres decodes the binary wire format by
+/// OID, SQLite reads its typed bind values. This is the input-side counterpart to
+/// [`FollowRowDecode`], which decodes the values an executed query hands *back*.
+pub trait BindDecode: Backend {
+    /// Render `query` to `(placeholder SQL, ordered bind cells)`.
+    ///
+    /// # Errors
+    /// [`RegisterError::UnsupportedSql`] if rendering fails or a bind uses a type
+    /// outside the supported scalar set.
+    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+    where
+        Q: QueryFragment<Self>;
+}
 
-    // 3. Decode each bind to a Cell (placeholder order).
-    let mut cells = Vec::with_capacity(collector.binds.len());
-    for (bytes, meta) in collector.binds.iter().zip(collector.metadata.iter()) {
-        let type_oid = meta.oid().map_err(|_| {
-            RegisterError::UnsupportedSql("diesel bind has an unresolved type OID".to_string())
-        })?;
-        cells.push(decode_pg_bind(bytes.as_deref(), type_oid)?);
+impl BindDecode for Pg {
+    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+    where
+        Q: QueryFragment<Self>,
+    {
+        let sql = render_sql::<Self, _>(query)?;
+
+        // Binds as serialized wire bytes + type OIDs, decoded per OID.
+        let mut collector = RawBytesBindCollector::<Self>::new();
+        let mut lookup = NoLookup;
+        query
+            .collect_binds(&mut collector, &mut lookup, &Self)
+            .map_err(|e| {
+                RegisterError::UnsupportedSql(format!("diesel bind collection failed: {e}"))
+            })?;
+        let mut cells = Vec::with_capacity(collector.binds.len());
+        for (bytes, meta) in collector.binds.iter().zip(collector.metadata.iter()) {
+            let type_oid = meta.oid().map_err(|_| {
+                RegisterError::UnsupportedSql("diesel bind has an unresolved type OID".to_string())
+            })?;
+            cells.push(decode_pg_bind(bytes.as_deref(), type_oid)?);
+        }
+        Ok((sql, cells))
     }
+}
 
-    Ok((sql, cells))
+#[cfg(feature = "diesel-typed-sqlite")]
+impl BindDecode for diesel::sqlite::Sqlite {
+    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+    where
+        Q: QueryFragment<Self>,
+    {
+        use diesel::query_builder::MoveableBindCollector;
+        use diesel::sqlite::SqliteBindCollector;
+
+        let sql = render_sql::<Self, _>(query)?;
+
+        // SQLite keeps binds as typed values, not wire bytes. Collect, then move
+        // the borrowed values out to owned ones we can read (`moveable`).
+        let mut collector = SqliteBindCollector::default();
+        query
+            .collect_binds(&mut collector, &mut (), &Self)
+            .map_err(|e| {
+                RegisterError::UnsupportedSql(format!("diesel bind collection failed: {e}"))
+            })?;
+        let data = collector.moveable();
+        let mut cells = Vec::with_capacity(data.binds.len());
+        for (value, _ty) in &data.binds {
+            cells.push(owned_sqlite_to_cell(value)?);
+        }
+        Ok((sql, cells))
+    }
+}
+
+/// Map an owned SQLite bind value to a [`Cell`]. SQLite has no boolean or uuid
+/// storage class (they arrive as integer or text), and a BLOB has no `Cell`
+/// representation, so it is rejected.
+#[cfg(feature = "diesel-typed-sqlite")]
+fn owned_sqlite_to_cell(
+    value: &diesel::sqlite::OwnedSqliteBindValue,
+) -> Result<Cell, RegisterError> {
+    use diesel::sqlite::OwnedSqliteBindValue as V;
+    Ok(match value {
+        V::I32(i) => Cell::Int(i64::from(*i)),
+        V::I64(i) => Cell::Int(*i),
+        V::F64(f) => Cell::Float(*f),
+        V::String(s) => Cell::String(s.as_ref().into()),
+        V::Null => Cell::Null,
+        V::Binary(_) => {
+            return Err(RegisterError::UnsupportedSql(
+                "unsupported SQLite BLOB bind (only integer, float and text are supported)"
+                    .to_string(),
+            ))
+        }
+    })
 }
 
 /// Decode one Postgres binary-format bind value into a [`Cell`]. `None` bytes
@@ -123,6 +219,38 @@ fn decode_pg_bind(bytes: Option<&[u8]>, type_oid: u32) -> Result<Cell, RegisterE
         }
     };
     Ok(cell)
+}
+
+/// Recover the bare table name an insert targets straight from its diesel table
+/// type, so a follow never restates (and so cannot mistype) the table it writes.
+///
+/// Renders the table's identifier with the backend's own quoting (`"t"` on
+/// Postgres/SQLite, `` `t` `` on MySQL), strips that quoting, and takes the final
+/// dotted segment so a schema-qualified table (`"public"."users"`) resolves to
+/// its bare catalog name (`users`).
+fn insert_target_table_name<T, DB>() -> Result<String, RegisterError>
+where
+    T: Table + QueryFragment<DB> + Default,
+    DB: Backend + Default,
+    <DB as Backend>::QueryBuilder: Default,
+{
+    let mut qb = <DB as Backend>::QueryBuilder::default();
+    QueryFragment::<DB>::to_sql(&T::default(), &mut qb, &DB::default()).map_err(|e| {
+        RegisterError::UnsupportedSql(format!("diesel table rendering failed: {e}"))
+    })?;
+    let rendered = qb.finish();
+    let bare = rendered
+        .rsplit('.')
+        .next()
+        .unwrap_or(rendered.as_str())
+        .trim_matches(|c| c == '"' || c == '`')
+        .to_string();
+    if bare.is_empty() {
+        return Err(RegisterError::UnsupportedSql(format!(
+            "could not determine the target table name from the diesel insert (rendered {rendered:?})"
+        )));
+    }
+    Ok(bare)
 }
 
 fn bad_len(ty: &str, got: usize) -> RegisterError {
@@ -214,48 +342,58 @@ where
     I: IdTypes,
     DB: DatabaseLike + 'static,
 {
-    /// Register a subscription from a typed diesel Postgres query.
+    /// Register a subscription from a typed diesel query.
     ///
     /// The query is rendered to SQL plus bind values (see [`render_typed`]) and
     /// registered like any other subscription, so it is checked against your
     /// diesel `table!` schema at compile time. Projection rules match
     /// [`SubscriptionEngine::register_select`].
     ///
+    /// Generic over the backend `B` (`Pg`, or `Sqlite` under
+    /// `diesel-typed-sqlite`); the rendered SQL is that backend's flavor, so the
+    /// engine's `Dialect` must match it.
+    ///
     /// # Errors
     /// Propagates rendering errors from [`render_typed`] (e.g. an unsupported
     /// bind type) and registration errors from [`SubscriptionEngine::register`].
-    pub fn register_select_typed<Q>(
+    pub fn register_select_typed<B, Q>(
         &mut self,
         consumer_id: I::ConsumerId,
         query: &Q,
     ) -> Result<RegisterResult, RegisterError>
     where
-        Q: QueryFragment<Pg>,
+        B: BindDecode,
+        Q: QueryFragment<B>,
     {
-        let (sql, binds) = render_typed(query)?;
+        let (sql, binds) = render_typed::<B, _>(query)?;
         self.register(SubscriptionRequest::new(consumer_id, sql).binds(binds))
     }
 
-    /// Register a follow subscription from a typed diesel Postgres UPDATE.
+    /// Register a follow subscription from a typed diesel UPDATE.
     ///
     /// The UPDATE is rendered to SQL + binds (see [`render_typed`]) and its
     /// target rows become a standing `SELECT * ... WHERE <the UPDATE's WHERE>`
     /// subscription. Nothing is executed. See
     /// [`SubscriptionEngine::register_follow_update`].
     ///
+    /// Generic over the backend `B` (`Pg`, or `Sqlite` under
+    /// `diesel-typed-sqlite`); the rendered SQL is that backend's flavor, so the
+    /// engine's `Dialect` must match it.
+    ///
     /// # Errors
     /// Propagates rendering errors from [`render_typed`] and the follow-shape /
     /// registration errors from
     /// [`SubscriptionEngine::register_follow_update_with_binds`].
-    pub fn register_follow_update_typed<Q>(
+    pub fn register_follow_update_typed<B, Q>(
         &mut self,
         consumer_id: I::ConsumerId,
         update: &Q,
     ) -> Result<RegisterResult, RegisterError>
     where
-        Q: QueryFragment<Pg>,
+        B: BindDecode,
+        Q: QueryFragment<B>,
     {
-        let (sql, binds) = render_typed(update)?;
+        let (sql, binds) = render_typed::<B, _>(update)?;
         self.register_follow_update_with_binds(consumer_id, sql, binds)
     }
 
@@ -269,8 +407,14 @@ where
     /// by the engine's single-threaded `&mut self` ordering. Nothing is
     /// fabricated, so there is nothing to de-duplicate.
     ///
-    /// The insert must `RETURNING` its primary-key column(s); only the key is
-    /// read. A multi-row insert yields one follow per returned row.
+    /// Pass the insert **without** a `RETURNING` clause: this method appends
+    /// `RETURNING <primary key>` derived from the table type, so only the key is
+    /// read and it always matches the table's primary key, in order. A multi-row
+    /// insert yields one follow per returned row.
+    ///
+    /// Both the followed table and the returned key columns are taken from the
+    /// insert's own diesel table type, so neither can disagree with the statement
+    /// being executed.
     ///
     /// `RETURNING` is Postgres/SQLite/MariaDB; on stock MySQL (no `RETURNING`)
     /// fetch the id yourself and use [`SubscriptionEngine::follow_row`].
@@ -279,18 +423,29 @@ where
     /// [`FollowInsertError::Load`] if the insert fails to execute or its rows fail
     /// to read; [`FollowInsertError::Register`] if a follow cannot be built or
     /// registered.
-    pub fn register_follow_insert<Q, C>(
+    pub fn register_follow_insert<T, U, Op, C>(
         &mut self,
         consumer_id: I::ConsumerId,
-        table: &str,
-        insert: Q,
+        insert: InsertStatement<T, U, Op>,
         conn: &mut C,
     ) -> Result<alloc::vec::Vec<RegisterResult>, FollowInsertError>
     where
         C: LoadConnection<DefaultLoadingMode>,
-        C::Backend: FollowRowDecode + QueryMetadata<Q::SqlType>,
-        Q: Query + QueryFragment<C::Backend> + QueryId,
+        C::Backend: FollowRowDecode
+            + Default
+            + QueryMetadata<<PkReturningInsert<T, U, Op> as Query>::SqlType>,
+        <C::Backend as Backend>::QueryBuilder: Default,
+        T: Table + QueryFragment<C::Backend> + Default,
+        PkReturningInsert<T, U, Op>: Query + QueryFragment<C::Backend> + QueryId,
     {
+        // The table comes from the insert's diesel type, never a restated string.
+        let table =
+            insert_target_table_name::<T, C::Backend>().map_err(FollowInsertError::Register)?;
+
+        // Return the table's primary key, derived from the type: the caller does
+        // not (and cannot) restate which columns identify the row.
+        let insert = insert.returning(T::default().primary_key());
+
         // Execute the insert and read each RETURNING row's columns as Cells.
         let rows: alloc::vec::Vec<alloc::vec::Vec<Cell>> = {
             let cursor = conn.load(insert)?;
@@ -318,7 +473,7 @@ where
         let mut results = alloc::vec::Vec::with_capacity(rows.len());
         for pk in rows {
             results.push(
-                self.follow_row(consumer_id, table, pk)
+                self.follow_row(consumer_id, &table, pk)
                     .map_err(FollowInsertError::Register)?,
             );
         }
@@ -382,6 +537,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod render_tests {
     use super::{render_typed, Cell};
+    use diesel::pg::Pg;
     use diesel::prelude::*;
 
     diesel::table! {
@@ -398,7 +554,7 @@ mod render_tests {
             .filter(users::id.eq(5))
             .filter(users::name.eq("ann"))
             .filter(users::active.eq(true));
-        let (sql, binds) = render_typed(&query).expect("render");
+        let (sql, binds) = render_typed::<Pg, _>(&query).expect("render");
         assert!(sql.contains("$1"), "sql: {sql}");
         assert_eq!(
             binds,
@@ -424,11 +580,11 @@ mod render_tests {
         // list == SELECT *) and resolve the bind.
         let query = users::table.filter(users::id.eq(5));
         let a = engine
-            .register_select_typed(1, &query)
+            .register_select_typed::<Pg, _>(1, &query)
             .expect("typed register");
         // Deterministic: registering the same typed query dedups to the same id.
         let b = engine
-            .register_select_typed(1, &query)
+            .register_select_typed::<Pg, _>(1, &query)
             .expect("typed register again");
         assert_eq!(a.subscription_id, b.subscription_id);
     }
@@ -449,12 +605,59 @@ mod render_tests {
         // A typed diesel UPDATE registers as a follow on its target rows.
         let update = diesel::update(users::table.filter(users::id.eq(5))).set(users::name.eq("x"));
         let a = engine
-            .register_follow_update_typed(1, &update)
+            .register_follow_update_typed::<Pg, _>(1, &update)
             .expect("typed update follow");
         // Deterministic: the same typed UPDATE dedups to the same subscription.
         let b = engine
-            .register_follow_update_typed(1, &update)
+            .register_follow_update_typed::<Pg, _>(1, &update)
             .expect("typed update follow again");
+        assert_eq!(a.subscription_id, b.subscription_id);
+    }
+
+    #[cfg(feature = "diesel-typed-sqlite")]
+    #[test]
+    fn render_select_with_binds_sqlite() {
+        use diesel::sqlite::Sqlite;
+
+        let query = users::table
+            .filter(users::id.eq(5))
+            .filter(users::name.eq("ann"))
+            .filter(users::active.eq(true));
+        let (sql, binds) = render_typed::<Sqlite, _>(&query).expect("render sqlite");
+        // SQLite renders positional `?` placeholders, not `$N`.
+        assert!(sql.contains('?'), "sql: {sql}");
+        // SQLite has no boolean storage class: `true` binds as an integer, so it
+        // decodes to `Cell::Int(1)` rather than `Cell::Bool(true)` (contrast Pg).
+        assert_eq!(
+            binds,
+            alloc::vec![Cell::Int(5), Cell::String("ann".into()), Cell::Int(1)]
+        );
+    }
+
+    #[cfg(feature = "diesel-typed-sqlite")]
+    #[test]
+    fn register_typed_select_sqlite_via_engine() {
+        use crate::SubscriptionEngine;
+        use diesel::sqlite::Sqlite;
+        use sql_traits::structs::ParserDB;
+        use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);",
+        )
+        .expect("catalog");
+        // The rendered SQL is SQLite-flavored (`?` placeholders, `"..."` idents),
+        // so the engine must parse it with the matching dialect.
+        let mut engine =
+            SubscriptionEngine::<_, crate::DefaultIds, _>::new(catalog, SQLiteDialect {});
+
+        let query = users::table.filter(users::id.eq(5));
+        let a = engine
+            .register_select_typed::<Sqlite, _>(1, &query)
+            .expect("typed register sqlite");
+        let b = engine
+            .register_select_typed::<Sqlite, _>(1, &query)
+            .expect("typed register sqlite again");
         assert_eq!(a.subscription_id, b.subscription_id);
     }
 }
