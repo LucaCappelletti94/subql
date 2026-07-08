@@ -1099,7 +1099,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.10"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=sqlite3_update_hook#a9f0398ca2d02fc4a75c7480c82e0dd68c6bf56b"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -1121,7 +1121,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=sqlite3_update_hook#a9f0398ca2d02fc4a75c7480c82e0dd68c6bf56b"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
 dependencies = [
  "diesel_table_macro_syntax",
  "dsl_auto_type",
@@ -1133,7 +1133,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=sqlite3_update_hook#a9f0398ca2d02fc4a75c7480c82e0dd68c6bf56b"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
 dependencies = [
  "syn",
 ]
@@ -1697,7 +1697,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=sqlite3_update_hook#a9f0398ca2d02fc4a75c7480c82e0dd68c6bf56b"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
 dependencies = [
  "darling 0.23.0",
  "either",

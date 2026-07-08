@@ -13,8 +13,10 @@ members = ["subql-demo"]
 exclude = ["fuzz"]
 
 [patch.crates-io]
-# Diesel sqlite hooks (PR #4969). Drop once the PR lands in a diesel release.
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "sqlite3_update_hook" }
+# Diesel `future` branch: bundles the merged sqlite update-hook, the
+# sqlite-expose-collected-binds accessor, and the mysql execute-returning-id
+# work. Drop once these land in a diesel release.
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 # sqlparser pinned to the `pathological-combined` branch of the
 # LucaCappelletti94 fork. This branch bundles every unmerged
 # sqlparser-rs fix surfaced by subql's fuzz harness so far, on top of
