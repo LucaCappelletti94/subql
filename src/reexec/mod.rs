@@ -26,7 +26,7 @@
 //!   [`Connector`] impl and converts triggers into [`ScalarUpdate`]s
 //!   inline. Pick this when you want subql to drive the loop end to end:
 //!   pass a `Connector` over your DB handle and receive `ScalarUpdate`s
-//!   directly. The opt-in [`DieselConnector`] (feature `executor-diesel`)
+//!   directly. The opt-in `DieselConnector` (feature `executor-diesel`)
 //!   ships a sync impl for any diesel [`Connection`](diesel::Connection).
 //!
 //! # v1 scope

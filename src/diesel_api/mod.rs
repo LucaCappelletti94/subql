@@ -1,12 +1,35 @@
-//! Diesel-typed subscription API (Postgres).
+//! Diesel-typed subscription API.
 //!
 //! Renders a typed diesel query to placeholder SQL plus a list of resolved bind
 //! [`Cell`]s, so callers get compile-time-checked queries from their diesel
 //! `table!` schema while the engine keeps consuming SQL + binds (see
-//! [`crate::SubscriptionRequest::binds`]). Diesel fixes the bind collector per
-//! backend (`Pg::BindCollector = RawBytesBindCollector<Pg>`), so values come out
-//! only as serialized wire bytes; we byte-decode Postgres's binary format into
-//! `Cell`. Postgres-first; other backends would need their own decoders.
+//! [`crate::SubscriptionRequest::binds`]).
+//!
+//! # Backends
+//!
+//! Diesel fixes the bind collector per backend, so binds come out in a
+//! backend-specific form that each [`BindDecode`] impl turns into `Cell`s:
+//!
+//! - Postgres (`diesel-typed`): serialized binary wire bytes plus a type OID,
+//!   decoded big-endian by OID. Pure Rust (`postgres_backend`, no libpq).
+//! - SQLite (`diesel-typed-sqlite`): already-typed bind values, read directly.
+//! - MySQL (`diesel-typed-mysql`): native-endian client buffers tagged with a
+//!   `MysqlType`, read by their byte length. Pure Rust (`mysql_backend`, no
+//!   libmysqlclient).
+//!
+//! Typed SELECT and UPDATE-follow work on all three. Follow-insert
+//! (`register_follow_insert`) covers Postgres and SQLite through `RETURNING`.
+//! MySQL has no `RETURNING`, so it takes the DB-minted key from diesel's
+//! `execute_returning_id` and follows it with `follow_row`.
+//!
+//! # Caveats
+//!
+//! - The rendered SQL is the backend's own flavor: `$N` vs `?` placeholders, and
+//!   double-quoted vs backtick-quoted identifiers. So the engine's sqlparser
+//!   `Dialect` must match the backend the query was rendered for.
+//! - SQLite and MySQL have no boolean storage class, so a `bool` bind decodes to
+//!   `Cell::Int(0)` or `Cell::Int(1)`, not `Cell::Bool` (Postgres yields
+//!   `Cell::Bool`).
 
 use alloc::format;
 use alloc::string::{String, ToString};
