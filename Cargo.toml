@@ -352,6 +352,15 @@ diesel-typed-sqlite = [
     "diesel?/sqlite",
     "diesel?/returning_clauses_for_sqlite_3_35",
 ]
+# Opt-in: extend the diesel-typed subscription API to MySQL. Adds `BindDecode for
+# Mysql`, which decodes MySQL's native-endian client bind buffers by `MysqlType`.
+# Uses `mysql_backend` (pure Rust, no libmysqlclient), like `diesel-typed`'s
+# `postgres_backend`. MySQL has no RETURNING, so this covers typed SELECT/UPDATE
+# subscriptions only; the follow-insert path uses `execute_returning_id`.
+diesel-typed-mysql = [
+    "diesel-typed",
+    "diesel?/mysql_backend",
+]
 # Opt-in: ship `PgDieselConnector`, an LSN-aware sync connector built on
 # top of `executor-diesel` + diesel's `postgres` feature. Snapshots taken
 # through this connector carry a `PgLsn` checkpoint read from

@@ -192,6 +192,87 @@ fn owned_sqlite_to_cell(
     })
 }
 
+#[cfg(feature = "diesel-typed-mysql")]
+impl BindDecode for diesel::mysql::Mysql {
+    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+    where
+        Q: QueryFragment<Self>,
+    {
+        let sql = render_sql::<Self, _>(query)?;
+
+        // MySQL binds are serialized wire bytes (host-native endian, these are
+        // libmysqlclient bind buffers) tagged with a `MysqlType`.
+        let mut collector = RawBytesBindCollector::<Self>::new();
+        query
+            .collect_binds(&mut collector, &mut (), &Self)
+            .map_err(|e| {
+                RegisterError::UnsupportedSql(format!("diesel bind collection failed: {e}"))
+            })?;
+        let mut cells = Vec::with_capacity(collector.binds.len());
+        for (bytes, meta) in collector.binds.iter().zip(collector.metadata.iter()) {
+            cells.push(decode_mysql_bind(bytes.as_deref(), *meta)?);
+        }
+        Ok((sql, cells))
+    }
+}
+
+/// Decode one MySQL bind (native-endian client buffer) into a [`Cell`] by its
+/// `MysqlType`. `None` bytes are a SQL NULL. Integers read by their actual byte
+/// length, which also handles `bool` (serialized as a 4-byte `i32`).
+#[cfg(feature = "diesel-typed-mysql")]
+fn decode_mysql_bind(
+    bytes: Option<&[u8]>,
+    ty: diesel::mysql::MysqlType,
+) -> Result<Cell, RegisterError> {
+    use diesel::mysql::MysqlType as T;
+    let Some(b) = bytes else {
+        return Ok(Cell::Null);
+    };
+    let cell = match ty {
+        T::Tiny | T::Short | T::Long | T::LongLong => Cell::Int(mysql_int_ne(b, true)?),
+        T::UnsignedTiny | T::UnsignedShort | T::UnsignedLong | T::UnsignedLongLong => {
+            Cell::Int(mysql_int_ne(b, false)?)
+        }
+        T::Float => Cell::Float(f64::from(f32::from_ne_bytes(fixed(b, "mysql float")?))),
+        T::Double => Cell::Float(f64::from_ne_bytes(fixed(b, "mysql double")?)),
+        T::String | T::Enum | T::Set => {
+            let s = core::str::from_utf8(b).map_err(|_| {
+                RegisterError::UnsupportedSql("diesel MySQL text bind is not valid UTF-8".to_string())
+            })?;
+            Cell::String(s.into())
+        }
+        other => {
+            return Err(RegisterError::UnsupportedSql(format!(
+                "unsupported diesel MySQL bind type ({other:?}); only integer, float, text and enum/set are supported"
+            )))
+        }
+    };
+    Ok(cell)
+}
+
+/// Read a native-endian MySQL integer bind of 1/2/4/8 bytes into an `i64`,
+/// interpreting the bytes as signed or unsigned per the `MysqlType`.
+#[cfg(feature = "diesel-typed-mysql")]
+fn mysql_int_ne(b: &[u8], signed: bool) -> Result<i64, RegisterError> {
+    Ok(match (b.len(), signed) {
+        (1, true) => i64::from(i8::from_ne_bytes(fixed(b, "mysql tiny")?)),
+        (1, false) => i64::from(u8::from_ne_bytes(fixed(b, "mysql utiny")?)),
+        (2, true) => i64::from(i16::from_ne_bytes(fixed(b, "mysql short")?)),
+        (2, false) => i64::from(u16::from_ne_bytes(fixed(b, "mysql ushort")?)),
+        (4, true) => i64::from(i32::from_ne_bytes(fixed(b, "mysql long")?)),
+        (4, false) => i64::from(u32::from_ne_bytes(fixed(b, "mysql ulong")?)),
+        (8, true) => i64::from_ne_bytes(fixed(b, "mysql longlong")?),
+        (8, false) => {
+            i64::try_from(u64::from_ne_bytes(fixed(b, "mysql ulonglong")?)).map_err(|_| {
+                RegisterError::UnsupportedSql(
+                    "diesel MySQL unsigned bind exceeds i64 range".to_string(),
+                )
+            })?
+        }
+        (n, _) => return Err(bad_len("mysql integer", n)),
+    })
+}
+
 /// Decode one Postgres binary-format bind value into a [`Cell`]. `None` bytes
 /// are a SQL NULL.
 fn decode_pg_bind(bytes: Option<&[u8]>, type_oid: u32) -> Result<Cell, RegisterError> {
@@ -658,6 +739,80 @@ mod render_tests {
         let b = engine
             .register_select_typed::<Sqlite, _>(1, &query)
             .expect("typed register sqlite again");
+        assert_eq!(a.subscription_id, b.subscription_id);
+    }
+
+    #[cfg(feature = "diesel-typed-mysql")]
+    #[test]
+    fn render_select_with_binds_mysql() {
+        use diesel::mysql::Mysql;
+
+        let query = users::table
+            .filter(users::id.eq(5))
+            .filter(users::name.eq("ann"))
+            .filter(users::active.eq(true));
+        let (sql, binds) = render_typed::<Mysql, _>(&query).expect("render mysql");
+        // MySQL renders positional `?` placeholders.
+        assert!(sql.contains('?'), "sql: {sql}");
+        // Like SQLite, MySQL has no boolean type: `true` binds as an integer.
+        assert_eq!(
+            binds,
+            alloc::vec![Cell::Int(5), Cell::String("ann".into()), Cell::Int(1)]
+        );
+    }
+
+    #[cfg(feature = "diesel-typed-mysql")]
+    #[test]
+    fn register_typed_select_mysql_via_engine() {
+        use crate::SubscriptionEngine;
+        use diesel::mysql::Mysql;
+        use sql_traits::structs::ParserDB;
+        use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
+
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);",
+        )
+        .expect("catalog");
+        // MySQL renders `?` placeholders and backtick idents, so parse with the
+        // matching dialect.
+        let mut engine =
+            SubscriptionEngine::<_, crate::DefaultIds, _>::new(catalog, MySqlDialect {});
+
+        let query = users::table.filter(users::id.eq(5));
+        let a = engine
+            .register_select_typed::<Mysql, _>(1, &query)
+            .expect("typed register mysql");
+        let b = engine
+            .register_select_typed::<Mysql, _>(1, &query)
+            .expect("typed register mysql again");
+        assert_eq!(a.subscription_id, b.subscription_id);
+    }
+
+    #[cfg(feature = "diesel-typed-mysql")]
+    #[test]
+    fn register_typed_update_follow_mysql_via_engine() {
+        use crate::SubscriptionEngine;
+        use diesel::mysql::Mysql;
+        use sql_traits::structs::ParserDB;
+        use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
+
+        let catalog = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL);",
+        )
+        .expect("catalog");
+        let mut engine =
+            SubscriptionEngine::<_, crate::DefaultIds, _>::new(catalog, MySqlDialect {});
+
+        // A typed diesel UPDATE follows its target rows: the rendered MySQL UPDATE
+        // (backtick idents, `?` binds) must parse under MySqlDialect and derive the
+        // follow SELECT.
+        let update = diesel::update(users::table.filter(users::id.eq(5))).set(users::name.eq("x"));
+        let a = engine
+            .register_follow_update_typed::<Mysql, _>(1, &update)
+            .expect("mysql update follow");
+        let b = engine
+            .register_follow_update_typed::<Mysql, _>(1, &update)
+            .expect("mysql update follow again");
         assert_eq!(a.subscription_id, b.subscription_id);
     }
 }
