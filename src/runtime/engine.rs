@@ -12,7 +12,7 @@ use super::{
 use crate::{
     catalog_helpers,
     compiler::{
-        canonicalize, parse_and_resolve_hash, parse_compile_normalize_and_prefilter,
+        canonicalize, parse_and_resolve_hash, parse_compile_normalize_and_prefilter_with_binds,
         sql_shape::{AggSpec, QueryProjection},
         BytecodeProgram, PrefilterPlan, Vm,
     },
@@ -237,6 +237,13 @@ pub struct SubscriptionEngine<D: Dialect, I: IdTypes, DB: DatabaseLike> {
     /// per-subscription unregister paths so cursors never outlive
     /// their owning subscription.
     resume_cursors: HashMap<(I::SessionId, SubscriptionId), crate::OpaqueCheckpoint>,
+    /// Single-row ("pk") follow subscriptions: `subscription_id -> (table, key)`.
+    /// Populated by [`follow_row`](Self::follow_row); when the tracked row is
+    /// deleted, the follow self-unregisters (its `WHERE pk = <value>` predicate
+    /// can never match again). In-memory only (not persisted): across a restart a
+    /// pk-follow loses its auto-close marker and degrades to an ordinary inert
+    /// subscription.
+    pk_follows: HashMap<SubscriptionId, (TableId, crate::PrimaryKey)>,
 }
 
 /// Look up the partition and consumer dictionary for a table, or return
@@ -287,7 +294,12 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
 
     fn compile_spec(&self, spec: SubscriptionRequest<I>) -> Result<CompiledSpec<I>, RegisterError> {
         let (table_id, bytecode, normalized, prefilter_plan, projection) =
-            parse_compile_normalize_and_prefilter(&spec.sql, &self.dialect, &self.database)?;
+            parse_compile_normalize_and_prefilter_with_binds(
+                &spec.sql,
+                &self.dialect,
+                &self.database,
+                &spec.binds,
+            )?;
 
         // Disambiguate hash: same WHERE clause with different projection kind must map to
         // distinct predicates.
@@ -487,6 +499,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
             #[cfg(feature = "std")]
             durability_mode: DurabilityMode::Required,
             resume_cursors: HashMap::new(),
+            pk_follows: HashMap::new(),
         }
     }
 
@@ -798,6 +811,98 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         sql: impl Into<String>,
     ) -> Result<RegisterResult, RegisterError> {
         self.register(SubscriptionRequest::new(consumer_id, sql))
+    }
+
+    /// Register a follow subscription derived from an UPDATE statement.
+    ///
+    /// The UPDATE's target table and WHERE clause become a standing
+    /// `SELECT * FROM t WHERE <where>` subscription: the consumer follows every
+    /// row the UPDATE matches, now and going forward (a moving set). SubQL does
+    /// not execute the UPDATE, it only reads its shape.
+    ///
+    /// # Errors
+    /// [`RegisterError::FollowUnsupportedStatement`] if `update_sql` is not an
+    /// UPDATE, [`RegisterError::UnsupportedUpdateShape`] for an unsupported
+    /// UPDATE (joins, FROM, ORDER BY/LIMIT, or no WHERE), plus any error from
+    /// registering the derived SELECT.
+    pub fn register_follow_update(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        update_sql: impl Into<String>,
+    ) -> Result<RegisterResult, RegisterError> {
+        self.register_follow_update_with_binds(consumer_id, update_sql, Vec::new())
+    }
+
+    /// Like [`Self::register_follow_update`], but with bind values for the
+    /// `$N`/`?` placeholders in the UPDATE's WHERE (the typed diesel path
+    /// supplies these).
+    ///
+    /// # Errors
+    /// See [`Self::register_follow_update`].
+    pub fn register_follow_update_with_binds(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        update_sql: impl Into<String>,
+        binds: Vec<crate::Cell>,
+    ) -> Result<RegisterResult, RegisterError> {
+        let update_sql = update_sql.into();
+        let select_sql = crate::compiler::derive_update_follow_select(&update_sql, &self.dialect)?;
+        self.register(SubscriptionRequest::new(consumer_id, select_sql).binds(binds))
+    }
+
+    /// Follow a specific row by its primary-key value(s).
+    ///
+    /// Registers `SELECT * FROM <table> WHERE <pk> = <value>` (an `AND` of
+    /// equalities for a composite key), so the consumer receives every future
+    /// change to that row. This is the building block for following an inserted
+    /// row once its (possibly auto-generated) key is known.
+    ///
+    /// `pk` must supply one value per primary-key column, in declaration order.
+    ///
+    /// # Errors
+    /// [`RegisterError::UnknownTable`] if `table` is unknown,
+    /// [`RegisterError::NoPrimaryKey`] if it has no primary key,
+    /// [`RegisterError::UnsupportedSql`] on a key-arity mismatch, plus any error
+    /// from registering the derived SELECT.
+    pub fn follow_row(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        table: &str,
+        pk: Vec<crate::Cell>,
+    ) -> Result<RegisterResult, RegisterError> {
+        let table_id = catalog_helpers::table_id(&self.database, table)
+            .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
+        let pk_cols = catalog_helpers::primary_key_columns(&self.database, table_id)
+            .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
+        if pk_cols.is_empty() {
+            return Err(RegisterError::NoPrimaryKey { table_id });
+        }
+        if pk.len() != pk_cols.len() {
+            return Err(RegisterError::UnsupportedSql(format!(
+                "follow_row: table {table:?} has {} primary-key column(s) but {} value(s) were supplied",
+                pk_cols.len(),
+                pk.len()
+            )));
+        }
+        let mut clauses = Vec::with_capacity(pk_cols.len());
+        for (i, col_id) in pk_cols.iter().enumerate() {
+            let name = catalog_helpers::column_name(&self.database, table_id, *col_id).ok_or_else(
+                || RegisterError::UnknownColumn {
+                    table_id,
+                    column: format!("<primary-key ordinal {col_id}>"),
+                },
+            )?;
+            clauses.push(format!("\"{name}\" = ${}", i + 1));
+        }
+        let sql = format!("SELECT * FROM \"{table}\" WHERE {}", clauses.join(" AND "));
+        // Build the tracked key before `pk` is moved into the request binds.
+        let key = crate::PrimaryKey::new(Arc::from(pk_cols.as_slice()), Arc::from(pk.as_slice()))
+            .map_err(|e| RegisterError::UnsupportedSql(format!("follow_row: {e}")))?;
+        let result = self.register(SubscriptionRequest::new(consumer_id, sql).binds(pk))?;
+        // Mark as a single-row follow so it self-closes when its row is deleted.
+        self.pk_follows
+            .insert(result.subscription_id, (table_id, key));
+        Ok(result)
     }
 
     /// Register multiple subscriptions in a single batch.
@@ -1442,6 +1547,7 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
         &mut self,
         subscription_id: SubscriptionId,
     ) -> Option<bool> {
+        self.pk_follows.remove(&subscription_id);
         // Capture dedup key from binding before removing it.
         let dedup_key = self.dedup_key_for_subscription(subscription_id);
 
@@ -1766,10 +1872,29 @@ impl<D: Dialect, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<D, I
     ) -> Result<crate::DispatchOutput<I, C>, DispatchError> {
         let notifications = self.consumers(event)?;
         let aggregate_deltas = self.aggregate_deltas(event)?;
-        Ok(crate::DispatchOutput::from_parts(
-            notifications,
-            aggregate_deltas,
-        ))
+        let output = crate::DispatchOutput::from_parts(notifications, aggregate_deltas);
+        // A single-row (pk) follow self-closes once its row is deleted. The delete
+        // delta is already captured in `output`, so we unregister afterwards.
+        if event.kind() == EventKind::Delete && !self.pk_follows.is_empty() {
+            self.close_deleted_pk_follows(event.table_id(), event.pk());
+        }
+        Ok(output)
+    }
+
+    /// Unregister any pk-follow whose tracked row matches the just-deleted
+    /// `(table_id, pk)`. Called at the tail of `dispatch` on DELETE events.
+    fn close_deleted_pk_follows(&mut self, table_id: TableId, pk: &crate::PrimaryKey) {
+        let to_close: Vec<SubscriptionId> = self
+            .pk_follows
+            .iter()
+            .filter(|(_, (t, key))| {
+                *t == table_id && key.columns == pk.columns && key.values == pk.values
+            })
+            .map(|(&sid, _)| sid)
+            .collect();
+        for sid in to_close {
+            self.unregister_subscription(sid);
+        }
     }
 
     /// Unregister all subscriptions for a session
@@ -2848,6 +2973,175 @@ mod tests {
     }
 
     #[test]
+    fn register_follow_update_matches_equivalent_select() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+
+        // Following an UPDATE registers its target as a standing SELECT.
+        let follow = engine
+            .register_follow_update(1, "UPDATE orders SET amount = 30 WHERE id = 5")
+            .expect("follow update");
+        // The equivalent explicit SELECT dedups to the same subscription.
+        let select = engine
+            .register_select(1, "SELECT * FROM orders WHERE id = 5")
+            .expect("select");
+        assert_eq!(follow.subscription_id, select.subscription_id);
+    }
+
+    #[test]
+    fn register_follow_update_with_binds_follows_where_row() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+
+        // SET binds precede WHERE binds; the derived follow keeps `$2` and the
+        // full bind list, so `$2` resolves to the WHERE value (5) by index.
+        let follow = engine
+            .register_follow_update_with_binds(
+                1,
+                "UPDATE orders SET amount = $1 WHERE id = $2",
+                alloc::vec![crate::Cell::Int(30), crate::Cell::Int(5)],
+            )
+            .expect("follow update with binds");
+        let select = engine
+            .register_select(1, "SELECT * FROM orders WHERE id = 5")
+            .expect("select");
+        assert_eq!(follow.subscription_id, select.subscription_id);
+    }
+
+    #[test]
+    fn register_follow_update_rejects_non_update() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        assert!(matches!(
+            engine.register_follow_update(1, "SELECT * FROM orders WHERE id = 5"),
+            Err(RegisterError::FollowUnsupportedStatement(_))
+        ));
+    }
+
+    #[test]
+    fn register_follow_update_rejects_no_where() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        assert!(matches!(
+            engine.register_follow_update(1, "UPDATE orders SET amount = 30"),
+            Err(RegisterError::UnsupportedUpdateShape(_))
+        ));
+    }
+
+    #[test]
+    fn follow_row_is_deterministic_and_pk_specific() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        // Following the same PK twice dedups to one subscription (also proves the
+        // quoted `SELECT * FROM "orders" WHERE "id" = $1` round-trips and resolves).
+        let a = engine
+            .follow_row(1, "orders", alloc::vec![crate::Cell::Int(5)])
+            .expect("follow row 5");
+        let b = engine
+            .follow_row(1, "orders", alloc::vec![crate::Cell::Int(5)])
+            .expect("follow row 5 again");
+        assert_eq!(a.subscription_id, b.subscription_id);
+        // A different PK is a different subscription.
+        let c = engine
+            .follow_row(1, "orders", alloc::vec![crate::Cell::Int(6)])
+            .expect("follow row 6");
+        assert_ne!(a.subscription_id, c.subscription_id);
+    }
+
+    #[test]
+    fn follow_row_rejects_no_primary_key() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        // `_engine_pad (id INT)` has no PRIMARY KEY.
+        assert!(matches!(
+            engine.follow_row(1, "_engine_pad", alloc::vec![crate::Cell::Int(1)]),
+            Err(RegisterError::NoPrimaryKey { .. })
+        ));
+    }
+
+    #[test]
+    fn follow_row_rejects_key_arity_mismatch() {
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        assert!(matches!(
+            engine.follow_row(
+                1,
+                "orders",
+                alloc::vec![crate::Cell::Int(5), crate::Cell::Int(6)]
+            ),
+            Err(RegisterError::UnsupportedSql(_))
+        ));
+    }
+
+    #[test]
+    fn pk_follow_auto_closes_on_its_row_delete() {
+        let catalog = make_catalog();
+        let table_id = catalog_helpers::table_id(&catalog, "orders").expect("orders id");
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+
+        engine
+            .follow_row(1, "orders", alloc::vec![Cell::Int(5)])
+            .expect("follow row 5");
+        assert_eq!(engine.subscription_count(), 1);
+
+        // Deleting a different row leaves the follow in place.
+        let other = build_delete_event(
+            table_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(9)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(9), Cell::Int(0), Cell::String("x".into())]),
+            },
+        );
+        engine.dispatch(&other).expect("dispatch other delete");
+        assert_eq!(engine.subscription_count(), 1);
+
+        // Deleting the followed row self-closes the follow.
+        let del = build_delete_event(
+            table_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(5)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(5), Cell::Int(0), Cell::String("x".into())]),
+            },
+        );
+        engine.dispatch(&del).expect("dispatch followed delete");
+        assert_eq!(engine.subscription_count(), 0);
+    }
+
+    #[test]
+    fn predicate_follow_persists_through_delete() {
+        // An UPDATE-derived (predicate) follow is not a pk-follow, so a delete of
+        // a matching row does not close it.
+        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
+        let table_id = catalog_helpers::table_id(&engine.database, "orders").expect("orders id");
+
+        engine
+            .register_follow_update(1, "UPDATE orders SET amount = 1 WHERE status = 'open'")
+            .expect("update follow");
+        assert_eq!(engine.subscription_count(), 1);
+
+        let del = build_delete_event(
+            table_id,
+            PrimaryKey {
+                columns: Arc::from([0u16]),
+                values: Arc::from([Cell::Int(5)]),
+            },
+            RowImage {
+                cells: Arc::from([Cell::Int(5), Cell::Int(0), Cell::String("open".into())]),
+            },
+        );
+        engine.dispatch(&del).expect("dispatch delete");
+        assert_eq!(engine.subscription_count(), 1);
+    }
+
+    #[test]
     fn test_register_subscription() {
         let catalog = make_catalog();
         let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
@@ -2858,6 +3152,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         let result = engine.register(spec);
@@ -3441,6 +3736,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         let spec2 = SubscriptionRequest {
@@ -3448,6 +3744,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         let result1 = engine.register(spec1).unwrap();
@@ -3471,6 +3768,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         engine.register(spec).unwrap();
@@ -3509,6 +3807,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
         engine.register(spec).unwrap();
 
@@ -3539,6 +3838,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         let result = engine.register(spec).unwrap();
@@ -3567,6 +3867,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         let result = engine.register(spec).unwrap();
@@ -3601,6 +3902,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             })
             .unwrap();
         // Use a different scope so the dedup key differs and a second binding is created.
@@ -3610,6 +3912,7 @@ mod tests {
                 scope: SubscriptionScope::Session(99),
                 sql,
                 updated_at_unix_ms: 2,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -3646,6 +3949,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -3656,6 +3960,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 0".to_string(),
                 updated_at_unix_ms: 2,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -3669,6 +3974,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount = 7".to_string(),
                 updated_at_unix_ms: 3,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -3706,6 +4012,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount = 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         // Register second predicate
@@ -3714,6 +4021,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount = 200".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         engine.register(spec1).unwrap();
@@ -3756,6 +4064,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1000,
+            binds: Vec::new(),
         };
 
         engine.register(spec).unwrap();
@@ -3849,6 +4158,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1000,
+            binds: Vec::new(),
         };
 
         let spec2 = SubscriptionRequest {
@@ -3856,6 +4166,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1000,
+            binds: Vec::new(),
         };
 
         engine.register(spec1).unwrap();
@@ -3902,6 +4213,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: format!("SELECT * FROM orders WHERE amount > {}", i * 10),
                 updated_at_unix_ms: 1000,
+                binds: Vec::new(),
             };
             engine.register(spec).unwrap();
         }
@@ -3961,6 +4273,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         engine.register(spec).unwrap();
@@ -3980,6 +4293,7 @@ mod tests {
             scope: SubscriptionScope::Session(999),
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         let spec2 = SubscriptionRequest {
@@ -3987,6 +4301,7 @@ mod tests {
             scope: SubscriptionScope::Session(999),
             sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         engine.register(spec1).unwrap();
@@ -4026,6 +4341,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         engine.register(spec).unwrap();
@@ -4108,6 +4424,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 31,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4151,6 +4468,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 32,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4194,6 +4512,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 33,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4232,6 +4551,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 34,
+                binds: Vec::new(),
             })
             .unwrap();
         engine
@@ -4240,6 +4560,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE status = 'pending'".to_string(),
                 updated_at_unix_ms: 35,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4278,6 +4599,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1000,
+            binds: Vec::new(),
         };
 
         engine.register(spec).unwrap();
@@ -4288,6 +4610,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
             updated_at_unix_ms: 1000,
+            binds: Vec::new(),
         };
 
         engine.register(spec2).unwrap();
@@ -4321,6 +4644,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1,
+            binds: Vec::new(),
         });
 
         set_dir_mode(temp_dir.path(), 0o700);
@@ -4354,6 +4678,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             })
             .unwrap();
         assert_eq!(engine.subscription_count(), 1);
@@ -4368,6 +4693,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 200".to_string(),
             updated_at_unix_ms: 2,
+            binds: Vec::new(),
         });
 
         set_dir_mode(temp_dir.path(), 0o700);
@@ -4432,6 +4758,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 1,
+            binds: Vec::new(),
         });
 
         assert!(
@@ -4482,12 +4809,14 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 11,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 20".to_string(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             },
         ]);
 
@@ -4543,12 +4872,14 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 11,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 20".to_string(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             },
         ]);
 
@@ -4594,6 +4925,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 1".to_string(),
             updated_at_unix_ms: 1,
+            binds: Vec::new(),
         });
 
         set_dir_mode(temp_dir.path(), 0o700);
@@ -4626,6 +4958,7 @@ mod tests {
                 scope: SubscriptionScope::Session(42),
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 10,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4635,6 +4968,7 @@ mod tests {
                 scope: SubscriptionScope::Session(42),
                 sql: "SELECT * FROM orders WHERE amount < 10".to_string(),
                 updated_at_unix_ms: 11,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4660,6 +4994,7 @@ mod tests {
                 scope: SubscriptionScope::Session(43),
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 20,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4670,6 +5005,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 21,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4692,6 +5028,7 @@ mod tests {
                 scope: SubscriptionScope::Session(44),
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 30,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4702,6 +5039,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 10".to_string(),
                 updated_at_unix_ms: 31,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -4996,12 +5334,14 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 200,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
         ];
 
@@ -5021,6 +5361,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
 
         let mut single_engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
@@ -5033,6 +5374,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
         let mut batch_engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
             SubscriptionEngine::new(make_catalog(), PostgreSqlDialect {});
@@ -5084,12 +5426,14 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 200,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
         ];
 
@@ -5134,12 +5478,14 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 99,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
         ];
 
@@ -5205,18 +5551,21 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 200,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM nonexistent WHERE id = 1".to_string(), // bad table
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 300,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount = 42".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
         ];
 
@@ -5256,6 +5605,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             }])
         }));
 
@@ -5284,12 +5634,14 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 99,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
         ];
 
@@ -5327,6 +5679,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5336,6 +5689,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: sql.clone(),
             updated_at_unix_ms: 2,
+            binds: Vec::new(),
         }]);
 
         assert!(results[0].is_ok());
@@ -5373,6 +5727,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5383,12 +5738,14 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(), // dedup with existing
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
             SubscriptionRequest {
                 consumer_id: 300,
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount < 50".to_string(), // new
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             },
         ];
 
@@ -5414,6 +5771,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5424,6 +5782,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 2,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5461,6 +5820,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5658,6 +6018,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 1,
+                binds: Vec::new(),
             })
             .unwrap();
         assert!(engine.unregister_subscription(1));
@@ -5705,6 +6066,7 @@ mod tests {
             scope: SubscriptionScope::Durable,
             sql: "SELECT * FROM orders WHERE amount > 0".to_string(),
             updated_at_unix_ms: 0,
+            binds: Vec::new(),
         };
         let result = engine.register(spec).unwrap();
 
@@ -5839,6 +6201,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5859,6 +6222,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5881,6 +6245,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5908,6 +6273,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5950,6 +6316,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -5997,6 +6364,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6033,6 +6401,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6042,6 +6411,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6072,6 +6442,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6082,6 +6453,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6110,6 +6482,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6139,6 +6512,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6169,6 +6543,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6199,6 +6574,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6235,6 +6611,7 @@ mod tests {
                 // WHERE amount > 0 with NULL amount -> WHERE doesn't match -> no delta
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6265,6 +6642,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT COUNT(*) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6274,6 +6652,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6301,6 +6680,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6310,6 +6690,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(id) FROM orders WHERE amount > 0".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6334,6 +6715,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE amount > 10".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6360,6 +6742,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT SUM(amount) FROM orders WHERE status = 'active'".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6405,6 +6788,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6436,6 +6820,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6445,6 +6830,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6475,6 +6861,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6502,6 +6889,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: "SELECT * FROM orders WHERE amount > 100 AND status = 'paid'".to_string(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6533,6 +6921,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: format!("SELECT * FROM orders {where_clause}"),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6543,6 +6932,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: format!("SELECT COUNT(*) FROM orders {where_clause}"),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6577,6 +6967,7 @@ mod tests {
                 scope: SubscriptionScope::Durable,
                 sql: sql.clone(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 
@@ -6586,6 +6977,7 @@ mod tests {
                 scope: SubscriptionScope::Session(1),
                 sql: sql.clone(),
                 updated_at_unix_ms: 0,
+                binds: Vec::new(),
             })
             .unwrap();
 

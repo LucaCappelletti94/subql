@@ -13,8 +13,10 @@ members = ["subql-demo"]
 exclude = ["fuzz"]
 
 [patch.crates-io]
-# Diesel sqlite hooks (PR #4969). Drop once the PR lands in a diesel release.
-diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "sqlite3_update_hook" }
+# Diesel `future` branch: bundles the merged sqlite update-hook, the
+# sqlite-expose-collected-binds accessor, and the mysql execute-returning-id
+# work. Drop once these land in a diesel release.
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 # sqlparser pinned to the `pathological-combined` branch of the
 # LucaCappelletti94 fork. This branch bundles every unmerged
 # sqlparser-rs fix surfaced by subql's fuzz harness so far, on top of
@@ -115,6 +117,18 @@ required-features = ["sqlite-cdc"]
 [[test]]
 name = "reexec_postgres"
 required-features = ["executor-diesel-postgres"]
+
+[[test]]
+name = "follow_insert_postgres"
+required-features = ["diesel-typed"]
+
+[[test]]
+name = "follow_insert_sqlite"
+required-features = ["diesel-typed-sqlite"]
+
+[[test]]
+name = "follow_cdc_sqlite"
+required-features = ["sqlite-cdc", "diesel-typed-sqlite"]
 
 # Docker-backed integration test for PgR2D2DieselConnector (pool-backed
 # PG connector). Run with:
@@ -317,6 +331,36 @@ observability = ["dep:tracing", "tracing/std"]
 # bindings. Implies `std` (diesel needs std). The user activates their
 # backend on their own diesel dep.
 executor-diesel = ["std", "dep:diesel"]
+# Opt-in: the diesel-typed subscription/follow API. Renders a typed diesel
+# query to placeholder SQL + a list of bind `Cell`s and registers it via the
+# string+binds core. This base feature is the Postgres backend (byte-decoded
+# from Pg's binary wire format via `postgres_backend`, pure Rust, no libpq, plus
+# the opt-in-unstable collector fields to read the serialized binds). SQLite and
+# MySQL extend it via `diesel-typed-sqlite` / `diesel-typed-mysql`.
+diesel-typed = [
+    "dep:diesel",
+    "diesel?/postgres_backend",
+    "diesel?/uuid",
+    "diesel?/i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+]
+# Opt-in: extend the diesel-typed follow API to SQLite. Adds `FollowRowDecode for
+# Sqlite` plus SQLite RETURNING support. Unlike `diesel-typed` (pure-Rust
+# `postgres_backend`), the SQLite backend pulls `libsqlite3-sys` (a C dependency),
+# so it is a separate opt-in.
+diesel-typed-sqlite = [
+    "diesel-typed",
+    "diesel?/sqlite",
+    "diesel?/returning_clauses_for_sqlite_3_35",
+]
+# Opt-in: extend the diesel-typed subscription API to MySQL. Adds `BindDecode for
+# Mysql`, which decodes MySQL's native-endian client bind buffers by `MysqlType`.
+# Uses `mysql_backend` (pure Rust, no libmysqlclient), like `diesel-typed`'s
+# `postgres_backend`. MySQL has no RETURNING, so this covers typed SELECT/UPDATE
+# subscriptions only; the follow-insert path uses `execute_returning_id`.
+diesel-typed-mysql = [
+    "diesel-typed",
+    "diesel?/mysql_backend",
+]
 # Opt-in: ship `PgDieselConnector`, an LSN-aware sync connector built on
 # top of `executor-diesel` + diesel's `postgres` feature. Snapshots taken
 # through this connector carry a `PgLsn` checkpoint read from

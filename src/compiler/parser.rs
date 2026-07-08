@@ -15,7 +15,7 @@ use alloc::borrow::ToOwned;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{Expr, ObjectName, Statement};
+use sqlparser::ast::{Expr, ObjectName, Statement, Value};
 use sqlparser::dialect::Dialect;
 
 struct SqlTableName {
@@ -95,9 +95,11 @@ fn parse_query_front_half<D: Dialect, DB: DatabaseLike>(
     sql: &str,
     dialect: &D,
     database: &DB,
+    binds: &[Cell],
 ) -> Result<ParsedQuery, RegisterError> {
     let stmt = sql_shape::parse_single_statement(sql, dialect)?;
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
+    let where_clause = resolve_where_placeholders(where_clause, binds)?;
     let table_id = resolve_table_id(&table_name, database)?;
     let projection = sql_shape::extract_projection(&stmt, table_id, database)?;
     let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
@@ -125,7 +127,31 @@ pub fn parse_compile_normalize_and_prefilter<D: Dialect, DB: DatabaseLike>(
     ),
     RegisterError,
 > {
-    let pq = parse_query_front_half(sql, dialect, database)?;
+    parse_compile_normalize_and_prefilter_with_binds(sql, dialect, database, &[])
+}
+
+/// Like [`parse_compile_normalize_and_prefilter`], but first resolves `$N`/`?`
+/// placeholders in the WHERE clause against `binds` (in placeholder order).
+///
+/// Used by the typed diesel API, which renders parameterized SQL plus a list of
+/// bind values. With an empty `binds` slice this is identical to the plain
+/// entry point.
+pub fn parse_compile_normalize_and_prefilter_with_binds<D: Dialect, DB: DatabaseLike>(
+    sql: &str,
+    dialect: &D,
+    database: &DB,
+    binds: &[Cell],
+) -> Result<
+    (
+        TableId,
+        BytecodeProgram,
+        String,
+        PrefilterPlan,
+        QueryProjection,
+    ),
+    RegisterError,
+> {
+    let pq = parse_query_front_half(sql, dialect, database, binds)?;
 
     // Compile WHERE clause to bytecode
     let program = if let Some(expr) = pq.where_clause.as_ref() {
@@ -227,6 +253,123 @@ fn extract_table_and_where(
     Ok((SqlTableName::from_object_name(&table_name)?, where_clause))
 }
 
+/// Convert a resolved bind [`Cell`] into a sqlparser literal [`Value`],
+/// preserving the int/float distinction. Floats are formatted with a decimal
+/// point (via `{:?}`) so they round-trip through [`sql_value_to_cell_strict`]
+/// back to [`Cell::Float`] rather than collapsing to an integer.
+fn cell_to_value(cell: &Cell) -> Result<Value, RegisterError> {
+    Ok(match cell {
+        Cell::Null => Value::Null,
+        Cell::Bool(b) => Value::Boolean(*b),
+        Cell::Int(i) => Value::Number(i.to_string(), false),
+        Cell::Float(f) => Value::Number(format!("{f:?}"), false),
+        Cell::String(s) => Value::SingleQuotedString(s.to_string()),
+        Cell::Missing => {
+            return Err(RegisterError::BindResolution(
+                "bind value is Missing (not a concrete value)".to_string(),
+            ))
+        }
+    })
+}
+
+/// Map a placeholder token to a bind index: `$N` (1-based) by number, `?` by
+/// position (consuming `next_positional`).
+fn placeholder_index(
+    token: &str,
+    binds_len: usize,
+    next_positional: &mut usize,
+) -> Result<usize, RegisterError> {
+    let idx = if token == "?" {
+        let i = *next_positional;
+        *next_positional += 1;
+        i
+    } else if let Some(n) = token.strip_prefix('$') {
+        n.parse::<usize>()
+            .map_err(|_| RegisterError::BindResolution(format!("malformed placeholder {token:?}")))?
+            .checked_sub(1)
+            .ok_or_else(|| RegisterError::BindResolution("placeholder $0 is invalid".to_string()))?
+    } else {
+        return Err(RegisterError::BindResolution(format!(
+            "unsupported placeholder {token:?}"
+        )));
+    };
+    if idx >= binds_len {
+        return Err(RegisterError::BindResolution(format!(
+            "placeholder {token:?} has no bind value ({binds_len} provided)"
+        )));
+    }
+    Ok(idx)
+}
+
+/// Recursively replace `Value::Placeholder` leaves with their literal bind
+/// values, in placeholder order. Walks only the expression shapes the compiler
+/// supports; a placeholder in an unsupported position is left untouched and
+/// rejected later by the compiler.
+fn resolve_expr_placeholders(
+    expr: &mut Expr,
+    binds: &[Cell],
+    next_positional: &mut usize,
+) -> Result<(), RegisterError> {
+    match expr {
+        Expr::Value(val) => {
+            if let Value::Placeholder(token) = &val.value {
+                let idx = placeholder_index(token, binds.len(), next_positional)?;
+                val.value = cell_to_value(&binds[idx])?;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            resolve_expr_placeholders(left, binds, next_positional)?;
+            resolve_expr_placeholders(right, binds, next_positional)?;
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Nested(expr) => {
+            resolve_expr_placeholders(expr, binds, next_positional)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            resolve_expr_placeholders(expr, binds, next_positional)?;
+            for item in list.iter_mut() {
+                resolve_expr_placeholders(item, binds, next_positional)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            resolve_expr_placeholders(expr, binds, next_positional)?;
+            resolve_expr_placeholders(low, binds, next_positional)?;
+            resolve_expr_placeholders(high, binds, next_positional)?;
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            resolve_expr_placeholders(expr, binds, next_positional)?;
+            resolve_expr_placeholders(pattern, binds, next_positional)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Resolve `$N`/`?` placeholders in the optional WHERE clause against `binds`.
+///
+/// A no-op when `binds` is empty, so plain literal SQL (and the existing
+/// rejection of stray placeholders at compile time) is byte-for-byte unchanged.
+fn resolve_where_placeholders(
+    where_clause: Option<Expr>,
+    binds: &[Cell],
+) -> Result<Option<Expr>, RegisterError> {
+    if binds.is_empty() {
+        return Ok(where_clause);
+    }
+    match where_clause {
+        Some(mut expr) => {
+            let mut next_positional = 0usize;
+            resolve_expr_placeholders(&mut expr, binds, &mut next_positional)?;
+            Ok(Some(expr))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Build the projection-disambiguated hash input from a normalized WHERE clause
 /// and a projection kind.
 ///
@@ -271,11 +414,25 @@ pub fn parse_and_resolve_hash<D: Dialect, DB: DatabaseLike>(
     dialect: &D,
     database: &DB,
 ) -> Result<(TableId, PredicateHash), RegisterError> {
-    let pq = parse_query_front_half(sql, dialect, database)?;
+    let pq = parse_query_front_half(sql, dialect, database, &[])?;
     let hash_input = projection_hash_input(&pq.normalized, &pq.projection);
     let hash = canonicalize::hash_sql(&hash_input);
 
     Ok((pq.table_id, hash))
+}
+
+/// Derive the follow-subscription SELECT for an UPDATE statement.
+///
+/// Parses `sql` and returns `SELECT * FROM t WHERE <the UPDATE's WHERE>` (see
+/// `sql_shape::derive_update_follow_sql`), so the caller can register it as a
+/// standing subscription. Any `$N`/`?` placeholders in the WHERE are preserved
+/// and resolved later against the request's binds.
+pub fn derive_update_follow_select<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+) -> Result<String, RegisterError> {
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+    sql_shape::derive_update_follow_sql(&stmt)
 }
 
 /// Compile SQL expression to bytecode
@@ -1300,10 +1457,156 @@ mod tests {
         let catalog = make_catalog();
         let dialect = PostgreSqlDialect {};
 
-        // Placeholder values not supported
+        // Placeholder values not supported without binds (typed API supplies binds).
         let sql = "SELECT * FROM users WHERE id = $1";
         let result = parse_and_compile(sql, &dialect, &catalog);
         assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
+    }
+
+    // ---- Bind placeholder resolution (typed diesel API path) -------------
+
+    fn normalized_with_binds(sql: &str, binds: &[Cell]) -> String {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        parse_compile_normalize_and_prefilter_with_binds(sql, &dialect, &catalog, binds)
+            .expect("binds should resolve")
+            .2
+    }
+
+    fn normalized_literal(sql: &str) -> String {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        parse_compile_normalize_and_prefilter(sql, &dialect, &catalog)
+            .expect("literal SQL should compile")
+            .2
+    }
+
+    #[test]
+    fn bind_int_matches_literal() {
+        assert_eq!(
+            normalized_with_binds("SELECT * FROM users WHERE id = $1", &[Cell::Int(5)]),
+            normalized_literal("SELECT * FROM users WHERE id = 5"),
+        );
+    }
+
+    #[test]
+    fn bind_string_matches_literal() {
+        assert_eq!(
+            normalized_with_binds(
+                "SELECT * FROM users WHERE name = $1",
+                &[Cell::String("ann".into())]
+            ),
+            normalized_literal("SELECT * FROM users WHERE name = 'ann'"),
+        );
+    }
+
+    #[test]
+    fn bind_float_preserves_float() {
+        // A float bind must round-trip as a float literal (decimal point kept),
+        // matching the equivalent literal SQL rather than collapsing to an int.
+        assert_eq!(
+            normalized_with_binds("SELECT * FROM orders WHERE price = $1", &[Cell::Float(3.0)]),
+            normalized_literal("SELECT * FROM orders WHERE price = 3.0"),
+        );
+    }
+
+    #[test]
+    fn bind_in_list_resolves() {
+        assert_eq!(
+            normalized_with_binds(
+                "SELECT * FROM users WHERE id IN ($1, $2, $3)",
+                &[Cell::Int(1), Cell::Int(2), Cell::Int(3)]
+            ),
+            normalized_literal("SELECT * FROM users WHERE id IN (1, 2, 3)"),
+        );
+    }
+
+    #[test]
+    fn bind_positional_question_marks() {
+        let catalog = make_catalog();
+        let dialect = MySqlDialect {};
+        let out = parse_compile_normalize_and_prefilter_with_binds(
+            "SELECT * FROM users WHERE id = ? AND age = ?",
+            &dialect,
+            &catalog,
+            &[Cell::Int(1), Cell::Int(2)],
+        )
+        .expect("positional binds resolve")
+        .2;
+        let lit = parse_compile_normalize_and_prefilter(
+            "SELECT * FROM users WHERE id = 1 AND age = 2",
+            &dialect,
+            &catalog,
+        )
+        .unwrap()
+        .2;
+        assert_eq!(out, lit);
+    }
+
+    #[test]
+    fn bind_distinct_values_distinct_normalized() {
+        // Same skeleton, different binds must produce different normalized forms
+        // so they hash to distinct predicates and do not dedup.
+        let a = normalized_with_binds("SELECT * FROM users WHERE id = $1", &[Cell::Int(1)]);
+        let b = normalized_with_binds("SELECT * FROM users WHERE id = $1", &[Cell::Int(2)]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn bind_index_out_of_range_errors() {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        let result = parse_compile_normalize_and_prefilter_with_binds(
+            "SELECT * FROM users WHERE id = $2",
+            &dialect,
+            &catalog,
+            &[Cell::Int(1)],
+        );
+        assert!(matches!(result, Err(RegisterError::BindResolution(_))));
+    }
+
+    // ---- Complete column-list projection == SELECT * (diesel renders these) ---
+
+    fn projection_of(sql: &str) -> Result<QueryProjection, RegisterError> {
+        let catalog = make_catalog();
+        let dialect = PostgreSqlDialect {};
+        parse_compile_normalize_and_prefilter(sql, &dialect, &catalog).map(|t| t.4)
+    }
+
+    #[test]
+    fn complete_column_list_is_rows() {
+        assert_eq!(
+            projection_of("SELECT id, age, email, name, joined FROM users").unwrap(),
+            QueryProjection::Rows,
+        );
+    }
+
+    #[test]
+    fn qualified_complete_column_list_is_rows() {
+        // How diesel renders a row query: fully qualified, all columns.
+        assert_eq!(
+            projection_of(
+                "SELECT users.id, users.age, users.email, users.name, users.joined FROM users"
+            )
+            .unwrap(),
+            QueryProjection::Rows,
+        );
+    }
+
+    #[test]
+    fn partial_column_list_unsupported() {
+        assert!(matches!(
+            projection_of("SELECT id, age FROM users"),
+            Err(RegisterError::UnsupportedSql(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_column_list_unsupported() {
+        assert!(matches!(
+            projection_of("SELECT id, id, age, email, name, joined FROM users"),
+            Err(RegisterError::UnsupportedSql(_))
+        ));
     }
 
     #[test]

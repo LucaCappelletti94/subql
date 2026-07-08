@@ -1,5 +1,6 @@
 use crate::{catalog_helpers, RegisterError};
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{
     DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
@@ -179,6 +180,43 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
 /// Returns `Err(UnsupportedSql)` when `SUM`/`AVG`/`VAR_*`/`STDDEV_*` is used on a
 /// non-numeric column type (only when the catalog exposes type information via
 /// [`catalog_helpers::column_type`]).
+/// Whether `items` is a complete, duplicate-free list of the table's columns,
+/// each projected as a bare or table-qualified column reference. Such a
+/// projection is equivalent to `SELECT *` for subql (which delivers full row
+/// images). Returns false for partial lists, duplicates, aliases, expressions,
+/// wildcards, or when the catalog cannot report the table's arity.
+fn is_complete_column_list<DB: DatabaseLike>(
+    items: &[SelectItem],
+    table_id: crate::TableId,
+    database: &DB,
+) -> bool {
+    let Some(arity) = catalog_helpers::table_arity(database, table_id) else {
+        return false;
+    };
+    if items.is_empty() {
+        return false;
+    }
+    let mut seen: Vec<crate::ColumnId> = Vec::with_capacity(items.len());
+    for item in items {
+        let SelectItem::UnnamedExpr(expr) = item else {
+            return false;
+        };
+        let name = match expr {
+            Expr::Identifier(ident) => ident.value.as_str(),
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => parts[1].value.as_str(),
+            _ => return false,
+        };
+        let Some(col) = catalog_helpers::column_id(database, table_id, name) else {
+            return false;
+        };
+        if seen.contains(&col) {
+            return false;
+        }
+        seen.push(col);
+    }
+    seen.len() == arity
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn extract_projection<DB: DatabaseLike>(
     stmt: &Statement,
@@ -202,6 +240,14 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
         if let SelectItem::Wildcard(_) = &items[0] {
             return Ok(QueryProjection::Rows);
         }
+    }
+
+    // A complete, duplicate-free list of the table's columns is equivalent to
+    // `SELECT *`: subql delivers full row images regardless of the projection,
+    // and diesel renders row queries as an explicit all-columns list. Partial
+    // lists, aliases, or expressions fall through to the aggregate checks below.
+    if is_complete_column_list(items, table_id, database) {
+        return Ok(QueryProjection::Rows);
     }
 
     // Single expression (with or without alias)
@@ -558,6 +604,44 @@ pub(super) fn extract_single_table_and_where(
                 .to_string(),
         )),
     }
+}
+
+/// Derive the follow-subscription SELECT from an UPDATE statement:
+/// `SELECT * FROM <table> WHERE <the UPDATE's WHERE>`. The consumer follows the
+/// rows the UPDATE targets, as a standing predicate (a moving set).
+///
+/// Rejects a non-UPDATE statement, a multi-table / joined / `ORDER BY` / `LIMIT`
+/// UPDATE, and an UPDATE with no WHERE (a whole-table follow is better expressed
+/// as an explicit SELECT).
+pub(super) fn derive_update_follow_sql(stmt: &Statement) -> Result<String, RegisterError> {
+    let Statement::Update(update) = stmt else {
+        return Err(RegisterError::FollowUnsupportedStatement(
+            "expected an UPDATE statement".to_string(),
+        ));
+    };
+    if update.from.is_some() || !update.order_by.is_empty() || update.limit.is_some() {
+        return Err(RegisterError::UnsupportedUpdateShape(
+            "UPDATE with FROM, ORDER BY, or LIMIT is not supported for a follow".to_string(),
+        ));
+    }
+    if !update.table.joins.is_empty() {
+        return Err(RegisterError::UnsupportedUpdateShape(
+            "UPDATE with joins is not supported for a follow".to_string(),
+        ));
+    }
+    let TableFactor::Table { name, .. } = &update.table.relation else {
+        return Err(RegisterError::UnsupportedUpdateShape(
+            "UPDATE target must be a plain table".to_string(),
+        ));
+    };
+    let selection = update.selection.as_ref().ok_or_else(|| {
+        RegisterError::UnsupportedUpdateShape(
+            "UPDATE without a WHERE clause would follow the whole table; \
+             add a WHERE or register an explicit SELECT"
+                .to_string(),
+        )
+    })?;
+    Ok(alloc::format!("SELECT * FROM {name} WHERE {selection}"))
 }
 
 #[cfg(test)]

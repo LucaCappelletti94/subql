@@ -99,6 +99,29 @@ pub enum RegisterError {
     /// Storage/persistence error during registration
     #[error("Storage error during registration: {0}")]
     Storage(String),
+
+    /// A SQL bind placeholder (`$N` or `?`) could not be resolved against the
+    /// provided bind values (index out of range, malformed, or count mismatch).
+    #[error("Bind resolution error: {0}")]
+    BindResolution(String),
+
+    /// A statement given to a follow-registration API was neither INSERT nor
+    /// UPDATE (e.g. a SELECT, DELETE, or DDL statement).
+    #[error("Unsupported follow statement: {0}")]
+    FollowUnsupportedStatement(String),
+
+    /// An UPDATE-follow statement had a shape SubQL cannot turn into a standing
+    /// subscription (multi-table FROM, joins, ORDER BY / LIMIT, or no WHERE).
+    #[error("Unsupported UPDATE for follow: {0}")]
+    UnsupportedUpdateShape(String),
+
+    /// A row follow was requested on a table with no declared primary key, so
+    /// there is no key to follow the row by.
+    #[error("Table {table_id} has no primary key to follow by")]
+    NoPrimaryKey {
+        /// The table lacking a primary key.
+        table_id: TableId,
+    },
 }
 
 /// Errors during event dispatch
