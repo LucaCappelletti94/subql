@@ -2,9 +2,10 @@
 //!
 //! Architecture (v1 first draft):
 //!
-//! The diesel sqlite hooks PR (`diesel-rs/diesel#4969`) exposes
-//! `sqlite3_update_hook` as `on_change(SqliteChangeOps, FnMut(SqliteChangeEvent))`.
-//! The callback receives `(op, table_name, rowid)` only - **not the row data**,
+//! Diesel's sqlite update hook exposes `sqlite3_update_hook` as
+//! `on_update(SqliteUpdateRouter)`, where a route (here `on_any`) takes an
+//! `FnMut(SqliteChangeEvent)`. The callback receives `(op, table_name, rowid)`
+//! only - **not the row data**,
 //! and per the sqlite C contract the callback **cannot use the connection**.
 //! Recovering full row images for dynamic table schemas would require either
 //! `diesel_dynamic_schema` plumbing per preset or raw libsqlite3-sys queries.
@@ -25,7 +26,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use diesel::sqlite::{SqliteChangeEvent, SqliteChangeOp, SqliteChangeOps};
+use diesel::sqlite::{SqliteChangeEvent, SqliteChangeOp, SqliteChangeOps, SqliteUpdateRouter};
 
 use subql::{Cell, ColumnId, PrimaryKey, RowImage, TableId, WalEvent};
 
@@ -70,9 +71,9 @@ impl EventCapture {
 
         let table_name = cap.table_name.clone();
         let inner_for_hook = Arc::clone(&cap.inner);
-        harness
-            .conn
-            .on_change(SqliteChangeOps::ALL, move |ev: SqliteChangeEvent<'_>| {
+        harness.conn.on_update(SqliteUpdateRouter::new().on_any(
+            SqliteChangeOps::ALL,
+            move |ev: SqliteChangeEvent<'_>| {
                 if ev.table_name == table_name {
                     if let Ok(mut g) = inner_for_hook.lock() {
                         g.hook_log.push_back(CapturedHook {
@@ -82,7 +83,8 @@ impl EventCapture {
                         });
                     }
                 }
-            });
+            },
+        ));
 
         cap
     }
