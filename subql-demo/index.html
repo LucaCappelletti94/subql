@@ -38,6 +38,8 @@
         --radius: 10px;
         --radius-sm: 8px;
         --pill: 999px;
+        /* Rust brand orange, used on the Rust badge. */
+        --rust: #f74c00;
       }
 
       @media (prefers-color-scheme: dark) {
@@ -54,6 +56,7 @@
           --c-user: #f472b6;
           --c-service: #a78bfa;
           --c-agent: #f59e0b;
+          --rust: #ff6a33;
           --op-in: #72ca97;
           --op-upd: #88aedd;
         }
@@ -115,14 +118,28 @@
         position: sticky;
         top: 0;
         z-index: 20;
-        backdrop-filter: saturate(1.4) blur(10px);
-        background: var(--glass);
+        background: var(--panel);
         border-bottom: 1px solid transparent;
         transition: border-color 0.2s ease;
       }
 
       .sq-topbar--scrolled {
         border-bottom-color: var(--line);
+      }
+
+      /* Alpha-status tag next to the brand wordmark. */
+      .sq-alpha {
+        margin-left: 0.4rem;
+        font-size: 0.58rem;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--rust);
+        border: 1px solid var(--rust);
+        border-radius: 4px;
+        padding: 0.08rem 0.32rem;
+        line-height: 1;
+        vertical-align: middle;
       }
 
       /* Full-bleed: brand pinned to the far left, icon links to the far right,
@@ -206,12 +223,40 @@
         max-width: 42rem;
       }
 
-      .sq-hero-cta {
+      /* Hero pills: the demo CTA and the attribution badges live in one flex
+         row so a single gap applies uniformly between every pill (including
+         Demo and the first badge). */
+      .sq-hero-pills {
         margin-top: 2rem;
-        display: inline-flex;
-        gap: 0.6rem;
+        display: flex;
         flex-wrap: wrap;
         justify-content: center;
+        align-items: center;
+        gap: 0.6rem;
+        font-size: 0.85rem;
+      }
+
+      .sq-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        color: var(--muted);
+        border: 1px solid var(--line);
+        border-radius: var(--pill);
+        padding: 0.45rem 1rem;
+        background: var(--panel);
+      }
+
+      /* Rust badge: orange text and border so it catches the eye. */
+      .sq-pill.sq-badge-rust {
+        color: var(--rust);
+        border-color: var(--rust);
+      }
+
+      /* Match the demo CTA to the badge pills' size. */
+      .sq-hero-pills .sq-btn {
+        font-size: 0.85rem;
+        padding: 0.45rem 1rem;
       }
 
       /* ---- Section scaffolding ---- */

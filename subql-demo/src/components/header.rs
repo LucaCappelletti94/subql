@@ -16,9 +16,10 @@ pub fn Header() -> Element {
     rsx! {
         header { class: "sq-topbar",
             div { class: "sq-topbar-inner",
-                a { class: "sq-brand", href: "#top", aria_label: "SubQL home",
+                a { class: "sq-brand", href: "#top", aria_label: "SubQL home (alpha software)",
                     Logo {}
                     "SubQL"
+                    span { class: "sq-alpha", "ALPHA" }
                 }
                 nav { class: "sq-topbar-actions",
                     a {

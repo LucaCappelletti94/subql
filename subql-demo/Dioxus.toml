@@ -6,4 +6,4 @@ default_platform = "web"
 title = "SubQL - SQL subscriptions, without the plumbing"
 
 [web.watcher]
-watch_path = ["src"]
+watch_path = ["src", "index.html"]

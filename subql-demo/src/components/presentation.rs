@@ -5,35 +5,44 @@
 
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaCalculator, FaGears, FaShareNodes, FaTableList},
+    icons::{
+        fa_brands_icons::FaRust,
+        fa_solid_icons::{
+            FaBolt, FaCalculator, FaCode, FaCodeBranch, FaGears, FaPlay, FaScaleBalanced,
+            FaShareNodes, FaTableList,
+        },
+    },
     Icon,
 };
 
 use crate::components::anim::SystemFlowScene;
 
-const REPO_URL: &str = "https://github.com/LucaCappelletti94/subql";
-
 #[component]
 pub fn Hero() -> Element {
     rsx! {
         section { class: "sq-hero",
-            h1 { "Get more out of your SELECTs" }
+            h1 { "Subscribe via SQL" }
             p { class: "sq-hero-sub",
-                "The SQL SELECT behind an API endpoint doubles as a live "
-                "subscription, a standing statement of interest. Register it "
-                "once, and every INSERT or UPDATE that changes its result comes "
-                "back as a precise, per-consumer delta, so the subscription "
-                "handler you'd otherwise build per endpoint never gets written. "
-                "Transport stays yours."
+                "Most APIs are SQL queries, describing clients' interests"
+                br {}
+                "Use them to build your fan-out"
             }
-            div { class: "sq-hero-cta",
-                a { class: "sq-btn sq-btn--primary", href: "#demo", "Try the live demo" }
-                a {
-                    class: "sq-btn",
-                    href: REPO_URL,
-                    target: "_blank",
-                    rel: "noopener",
-                    "View on GitHub"
+            div { class: "sq-hero-pills",
+                a { class: "sq-btn sq-btn--primary", href: "#demo",
+                    Icon { width: 14, height: 14, icon: FaPlay }
+                    "Demo"
+                }
+                span { class: "sq-pill",
+                    Icon { width: 14, height: 14, icon: FaCodeBranch }
+                    "Open source"
+                }
+                span { class: "sq-pill",
+                    Icon { width: 14, height: 14, icon: FaScaleBalanced }
+                    "MIT licensed"
+                }
+                span { class: "sq-pill sq-badge-rust",
+                    Icon { width: 14, height: 14, icon: FaRust }
+                    "Rust"
                 }
             }
         }
@@ -110,6 +119,26 @@ pub fn Features() -> Element {
             body: "Durable shards, automatic eviction, and multiple SQL dialects, \
                    handled inside the engine. The per-app plumbing you would \
                    otherwise rewrite every time, done once.",
+        },
+        Feature {
+            icon: rsx! { Icon { width: 22, height: 22, icon: FaBolt } },
+            title: "Push, not polling",
+            body: "Polling makes your database answer a constant stream of \
+                   \"anything new?\" queries that mostly return nothing. On \
+                   Postgres and MySQL, SubQL streams changes straight from the WAL \
+                   and binlog only when data actually changes: no wasted queries \
+                   (around 6 to 7x fewer transactions at high fan-out), and events \
+                   arrive at the wire-RTT floor, single-digit milliseconds, instead \
+                   of after your next poll interval.",
+        },
+        Feature {
+            icon: rsx! { Icon { width: 22, height: 22, icon: FaCode } },
+            title: "First-class Diesel",
+            body: "Write a Diesel query and it doubles as a compile-time-checked \
+                   subscription. Insert a row and follow it by its DB-minted key, \
+                   so an INSERT or UPDATE becomes a statement of interest with no \
+                   hand-written SELECT restating the write. Works on Postgres, \
+                   SQLite, and MySQL.",
         },
     ];
 
