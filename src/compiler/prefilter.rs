@@ -3,7 +3,7 @@
 //! This planner is intentionally conservative: it may return false positives,
 //! but it must not return false negatives.
 
-use super::{literals::sql_value_to_cell_lossy, Tri};
+use super::Tri;
 use crate::{Cell, ColumnId, RowImage, TableId};
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -245,10 +245,26 @@ fn eval_equality(cell: &Cell, value: &PlannerValue) -> Tri {
         return Tri::Unknown;
     }
     let rhs = value.to_cell();
-    if super::cell_cmp::cells_equal(cell, &rhs) {
+    if planner_cells_equal(cell, &rhs) {
         Tri::True
     } else {
         Tri::False
+    }
+}
+
+/// Same-scalar structural equality for the four PlannerValue-tracked
+/// variants (`Bool`, `Int`, `Float`, `String`). Matches the semantics of
+/// the retired `super::cell_cmp::cells_equal` for the subset of scalars
+/// the prefilter reasons about. `Null` / `Missing` operands and every
+/// other `Cell` variant collapse to `false`; the caller lifts that to
+/// `Tri::False` or short-circuits to `Tri::Unknown` upstream.
+fn planner_cells_equal(a: &Cell, b: &Cell) -> bool {
+    match (a, b) {
+        (Cell::Bool(x), Cell::Bool(y)) => x == y,
+        (Cell::Int(x), Cell::Int(y)) => x == y,
+        (Cell::Float(x), Cell::Float(y)) => x == y,
+        (Cell::String(x), Cell::String(y)) => x == y,
+        _ => false,
     }
 }
 
@@ -708,7 +724,20 @@ const fn literal_int_cell(cell: &Cell) -> Option<i64> {
 }
 
 fn literal_cell_from_sql_value(val: &Value) -> Option<Cell> {
-    sql_value_to_cell_lossy(val)
+    match val {
+        Value::Null => Some(Cell::Null),
+        Value::Boolean(b) => Some(Cell::Bool(*b)),
+        Value::Number(n, _) => n
+            .parse::<i64>()
+            .map(Cell::Int)
+            .ok()
+            .or_else(|| n.parse::<f64>().map(Cell::Float).ok()),
+        Value::SingleQuotedString(s)
+        | Value::DoubleQuotedString(s)
+        | Value::NationalStringLiteral(s)
+        | Value::HexStringLiteral(s) => Some(Cell::String(s.as_str().into())),
+        _ => None,
+    }
 }
 
 fn planner_value_from_sql_value(val: &Value) -> Option<PlannerValue> {
