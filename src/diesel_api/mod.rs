@@ -34,7 +34,6 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::fmt::Write as _;
 
 use diesel::backend::Backend;
 use diesel::connection::{DefaultLoadingMode, LoadConnection};
@@ -52,11 +51,10 @@ use diesel::Table;
 type PkReturningInsert<T, U, Op> =
     InsertStatement<T, U, Op, ReturningClause<<T as Table>::PrimaryKey>>;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::dialect::Dialect;
 
-use crate::{
-    Cell, IdTypes, RegisterError, RegisterResult, SubscriptionEngine, SubscriptionRequest,
-};
+use crate::backend::{CdcEvent, Postgres, Value};
+use crate::compiler::literals::SqlLiteralParse;
+use crate::{IdTypes, RegisterError, RegisterResult, SubscriptionEngine, SubscriptionRequest};
 
 /// Postgres built-in scalar type OIDs (stable constants).
 mod oid {
@@ -86,24 +84,25 @@ impl PgMetadataLookup for NoLookup {
     }
 }
 
-/// Render a typed diesel query to placeholder SQL plus its bind values decoded
-/// to [`Cell`]s, in placeholder order.
+/// Render a typed diesel query to placeholder SQL plus its bind values
+/// decoded to [`Value<B>`]s, in placeholder order, where `B` is the
+/// subql [`crate::backend::Backend`] the diesel backend corresponds to.
 ///
-/// Generic over the backend that decodes its own binds ([`BindDecode`]):
-/// `Pg` yields `$N` placeholders and decodes the Postgres binary wire format by
-/// type OID, `Sqlite` yields `?` placeholders and reads its typed bind values
-/// directly.
+/// Generic over the diesel backend `D` that decodes its own binds
+/// ([`BindDecode`]): `Pg` yields `$N` placeholders and decodes the
+/// Postgres binary wire format by type OID, `Sqlite` yields `?`
+/// placeholders and reads its typed bind values directly.
 ///
 /// # Errors
-/// Returns [`RegisterError::UnsupportedSql`] if diesel fails to render the query
-/// or a bind uses a type outside the supported scalar set (bool, integer, float,
-/// text, uuid).
-pub fn render_typed<B, Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+/// Returns [`RegisterError::UnsupportedSql`] if diesel fails to render
+/// the query or a bind uses a type outside the supported scalar set
+/// (bool, integer, float, text, uuid).
+pub fn render_typed<D, Q>(query: &Q) -> Result<(String, Vec<Value<D::SubqlBackend>>), RegisterError>
 where
-    B: BindDecode,
-    Q: QueryFragment<B>,
+    D: BindDecode,
+    Q: QueryFragment<D>,
 {
-    B::render_sql_and_binds(query)
+    D::render_sql_and_binds(query)
 }
 
 /// Render only the placeholder SQL skeleton for a backend, no binds. Needs just
@@ -121,25 +120,36 @@ where
     Ok(qb.finish())
 }
 
-/// Render a typed diesel query to placeholder SQL plus its bind [`Cell`]s, for
-/// one backend.
+/// Render a typed diesel query to placeholder SQL plus its bind
+/// [`Value<B>`]s, for one diesel backend `D` whose associated
+/// [`SubqlBackend`](BindDecode::SubqlBackend) picks the subql
+/// [`crate::backend::Backend`] to type the values against.
 ///
-/// The bind side is backend-specific: Postgres decodes the binary wire format by
-/// OID, SQLite reads its typed bind values. This is the input-side counterpart to
-/// [`FollowRowDecode`], which decodes the values an executed query hands *back*.
+/// The bind side is backend-specific: Postgres decodes the binary wire
+/// format by OID, SQLite reads its typed bind values. This is the
+/// input-side counterpart to [`FollowRowDecode`], which decodes the
+/// values an executed query hands back.
 pub trait BindDecode: Backend {
-    /// Render `query` to `(placeholder SQL, ordered bind cells)`.
+    /// The subql [`crate::backend::Backend`] whose [`Value`] shape this
+    /// diesel backend's binds decode to.
+    type SubqlBackend: crate::backend::Backend;
+
+    /// Render `query` to `(placeholder SQL, ordered bind values)`.
     ///
     /// # Errors
-    /// [`RegisterError::UnsupportedSql`] if rendering fails or a bind uses a type
-    /// outside the supported scalar set.
-    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+    /// [`RegisterError::UnsupportedSql`] if rendering fails or a bind
+    /// uses a type outside the supported scalar set.
+    fn render_sql_and_binds<Q>(
+        query: &Q,
+    ) -> Result<(String, Vec<Value<Self::SubqlBackend>>), RegisterError>
     where
         Q: QueryFragment<Self>;
 }
 
 impl BindDecode for Pg {
-    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+    type SubqlBackend = Postgres;
+
+    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Value<Postgres>>), RegisterError>
     where
         Q: QueryFragment<Self>,
     {
@@ -153,20 +163,24 @@ impl BindDecode for Pg {
             .map_err(|e| {
                 RegisterError::UnsupportedSql(format!("diesel bind collection failed: {e}"))
             })?;
-        let mut cells = Vec::with_capacity(collector.binds.len());
+        let mut values = Vec::with_capacity(collector.binds.len());
         for (bytes, meta) in collector.binds.iter().zip(collector.metadata.iter()) {
             let type_oid = meta.oid().map_err(|_| {
                 RegisterError::UnsupportedSql("diesel bind has an unresolved type OID".to_string())
             })?;
-            cells.push(decode_pg_bind(bytes.as_deref(), type_oid)?);
+            values.push(decode_pg_bind(bytes.as_deref(), type_oid)?);
         }
-        Ok((sql, cells))
+        Ok((sql, values))
     }
 }
 
 #[cfg(feature = "diesel-typed-sqlite")]
 impl BindDecode for diesel::sqlite::Sqlite {
-    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+    type SubqlBackend = crate::backend::SQLite;
+
+    fn render_sql_and_binds<Q>(
+        query: &Q,
+    ) -> Result<(String, Vec<Value<crate::backend::SQLite>>), RegisterError>
     where
         Q: QueryFragment<Self>,
     {
@@ -175,8 +189,6 @@ impl BindDecode for diesel::sqlite::Sqlite {
 
         let sql = render_sql::<Self, _>(query)?;
 
-        // SQLite keeps binds as typed values, not wire bytes. Collect, then move
-        // the borrowed values out to owned ones we can read (`moveable`).
         let mut collector = SqliteBindCollector::default();
         query
             .collect_binds(&mut collector, &mut (), &Self)
@@ -184,28 +196,29 @@ impl BindDecode for diesel::sqlite::Sqlite {
                 RegisterError::UnsupportedSql(format!("diesel bind collection failed: {e}"))
             })?;
         let data = collector.moveable();
-        let mut cells = Vec::with_capacity(data.binds.len());
+        let mut values = Vec::with_capacity(data.binds.len());
         for (value, _ty) in &data.binds {
-            cells.push(owned_sqlite_to_cell(value)?);
+            values.push(owned_sqlite_to_value(value)?);
         }
-        Ok((sql, cells))
+        Ok((sql, values))
     }
 }
 
-/// Map an owned SQLite bind value to a [`Cell`]. SQLite has no boolean or uuid
-/// storage class (they arrive as integer or text), and a BLOB has no `Cell`
-/// representation, so it is rejected.
+/// Map an owned SQLite bind value to a `Value<SQLite>`. SQLite has no
+/// boolean or uuid storage class (they arrive as integer or text), and
+/// a BLOB has no direct scalar representation in the supported subset,
+/// so it is rejected.
 #[cfg(feature = "diesel-typed-sqlite")]
-fn owned_sqlite_to_cell(
+fn owned_sqlite_to_value(
     value: &diesel::sqlite::OwnedSqliteBindValue,
-) -> Result<Cell, RegisterError> {
+) -> Result<Value<crate::backend::SQLite>, RegisterError> {
     use diesel::sqlite::OwnedSqliteBindValue as V;
     Ok(match value {
-        V::I32(i) => Cell::Int(i64::from(*i)),
-        V::I64(i) => Cell::Int(*i),
-        V::F64(f) => Cell::Float(*f),
-        V::String(s) => Cell::String(s.as_ref().into()),
-        V::Null => Cell::Null,
+        V::I32(i) => Value::Int(i64::from(*i)),
+        V::I64(i) => Value::Int(*i),
+        V::F64(f) => Value::Float(*f),
+        V::String(s) => Value::String(s.as_ref().to_string()),
+        V::Null => Value::Null,
         V::Binary(_) => {
             return Err(RegisterError::UnsupportedSql(
                 "unsupported SQLite BLOB bind (only integer, float and text are supported)"
@@ -217,52 +230,57 @@ fn owned_sqlite_to_cell(
 
 #[cfg(feature = "diesel-typed-mysql")]
 impl BindDecode for diesel::mysql::Mysql {
-    fn render_sql_and_binds<Q>(query: &Q) -> Result<(String, Vec<Cell>), RegisterError>
+    type SubqlBackend = crate::backend::MySql;
+
+    fn render_sql_and_binds<Q>(
+        query: &Q,
+    ) -> Result<(String, Vec<Value<crate::backend::MySql>>), RegisterError>
     where
         Q: QueryFragment<Self>,
     {
         let sql = render_sql::<Self, _>(query)?;
 
-        // MySQL binds are serialized wire bytes (host-native endian, these are
-        // libmysqlclient bind buffers) tagged with a `MysqlType`.
         let mut collector = RawBytesBindCollector::<Self>::new();
         query
             .collect_binds(&mut collector, &mut (), &Self)
             .map_err(|e| {
                 RegisterError::UnsupportedSql(format!("diesel bind collection failed: {e}"))
             })?;
-        let mut cells = Vec::with_capacity(collector.binds.len());
+        let mut values = Vec::with_capacity(collector.binds.len());
         for (bytes, meta) in collector.binds.iter().zip(collector.metadata.iter()) {
-            cells.push(decode_mysql_bind(bytes.as_deref(), *meta)?);
+            values.push(decode_mysql_bind(bytes.as_deref(), *meta)?);
         }
-        Ok((sql, cells))
+        Ok((sql, values))
     }
 }
 
-/// Decode one MySQL bind (native-endian client buffer) into a [`Cell`] by its
-/// `MysqlType`. `None` bytes are a SQL NULL. Integers read by their actual byte
-/// length, which also handles `bool` (serialized as a 4-byte `i32`).
+/// Decode one MySQL bind (native-endian client buffer) into a
+/// `Value<MySql>` by its `MysqlType`. `None` bytes are a SQL NULL.
+/// Integers read by their actual byte length, which also handles `bool`
+/// (serialized as a 4-byte `i32`).
 #[cfg(feature = "diesel-typed-mysql")]
 fn decode_mysql_bind(
     bytes: Option<&[u8]>,
     ty: diesel::mysql::MysqlType,
-) -> Result<Cell, RegisterError> {
+) -> Result<Value<crate::backend::MySql>, RegisterError> {
     use diesel::mysql::MysqlType as T;
     let Some(b) = bytes else {
-        return Ok(Cell::Null);
+        return Ok(Value::Null);
     };
-    let cell = match ty {
-        T::Tiny | T::Short | T::Long | T::LongLong => Cell::Int(mysql_int_ne(b, true)?),
+    let value = match ty {
+        T::Tiny | T::Short | T::Long | T::LongLong => Value::Int(mysql_int_ne(b, true)?),
         T::UnsignedTiny | T::UnsignedShort | T::UnsignedLong | T::UnsignedLongLong => {
-            Cell::Int(mysql_int_ne(b, false)?)
+            Value::Int(mysql_int_ne(b, false)?)
         }
-        T::Float => Cell::Float(f64::from(f32::from_ne_bytes(fixed(b, "mysql float")?))),
-        T::Double => Cell::Float(f64::from_ne_bytes(fixed(b, "mysql double")?)),
+        T::Float => Value::Float(f64::from(f32::from_ne_bytes(fixed(b, "mysql float")?))),
+        T::Double => Value::Float(f64::from_ne_bytes(fixed(b, "mysql double")?)),
         T::String | T::Enum | T::Set => {
             let s = core::str::from_utf8(b).map_err(|_| {
-                RegisterError::UnsupportedSql("diesel MySQL text bind is not valid UTF-8".to_string())
+                RegisterError::UnsupportedSql(
+                    "diesel MySQL text bind is not valid UTF-8".to_string(),
+                )
             })?;
-            Cell::String(s.into())
+            Value::String(s.to_string())
         }
         other => {
             return Err(RegisterError::UnsupportedSql(format!(
@@ -270,7 +288,7 @@ fn decode_mysql_bind(
             )))
         }
     };
-    Ok(cell)
+    Ok(value)
 }
 
 /// Read a native-endian MySQL integer bind of 1/2/4/8 bytes into an `i64`,
@@ -296,33 +314,33 @@ fn mysql_int_ne(b: &[u8], signed: bool) -> Result<i64, RegisterError> {
     })
 }
 
-/// Decode one Postgres binary-format bind value into a [`Cell`]. `None` bytes
-/// are a SQL NULL.
-fn decode_pg_bind(bytes: Option<&[u8]>, type_oid: u32) -> Result<Cell, RegisterError> {
+/// Decode one Postgres binary-format bind value into a `Value<Postgres>`.
+/// `None` bytes are a SQL NULL.
+fn decode_pg_bind(bytes: Option<&[u8]>, type_oid: u32) -> Result<Value<Postgres>, RegisterError> {
     let Some(b) = bytes else {
-        return Ok(Cell::Null);
+        return Ok(Value::Null);
     };
-    let cell = match type_oid {
-        oid::BOOL => Cell::Bool(*b.first().ok_or_else(|| bad_len("bool", b.len()))? != 0),
-        oid::INT2 => Cell::Int(i64::from(i16::from_be_bytes(fixed(b, "int2")?))),
-        oid::INT4 => Cell::Int(i64::from(i32::from_be_bytes(fixed(b, "int4")?))),
-        oid::INT8 => Cell::Int(i64::from_be_bytes(fixed(b, "int8")?)),
-        oid::FLOAT4 => Cell::Float(f64::from(f32::from_be_bytes(fixed(b, "float4")?))),
-        oid::FLOAT8 => Cell::Float(f64::from_be_bytes(fixed(b, "float8")?)),
+    let value = match type_oid {
+        oid::BOOL => Value::Bool(*b.first().ok_or_else(|| bad_len("bool", b.len()))? != 0),
+        oid::INT2 => Value::Int(i64::from(i16::from_be_bytes(fixed(b, "int2")?))),
+        oid::INT4 => Value::Int(i64::from(i32::from_be_bytes(fixed(b, "int4")?))),
+        oid::INT8 => Value::Int(i64::from_be_bytes(fixed(b, "int8")?)),
+        oid::FLOAT4 => Value::Float(f64::from(f32::from_be_bytes(fixed(b, "float4")?))),
+        oid::FLOAT8 => Value::Float(f64::from_be_bytes(fixed(b, "float8")?)),
         oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME => {
             let s = core::str::from_utf8(b).map_err(|_| {
                 RegisterError::UnsupportedSql("diesel text bind is not valid UTF-8".to_string())
             })?;
-            Cell::String(s.into())
+            Value::String(s.to_string())
         }
-        oid::UUID => Cell::String(format_uuid(fixed(b, "uuid")?).into()),
+        oid::UUID => Value::Uuid(uuid::Uuid::from_bytes(fixed(b, "uuid")?)),
         other => {
             return Err(RegisterError::UnsupportedSql(format!(
                 "unsupported diesel bind type (Postgres OID {other}); only bool, integer, float, text and uuid are supported"
             )))
         }
     };
-    Ok(cell)
+    Ok(value)
 }
 
 /// Recover the bare table name an insert targets straight from its diesel table
@@ -365,37 +383,32 @@ fn fixed<const N: usize>(b: &[u8], ty: &str) -> Result<[u8; N], RegisterError> {
     b.try_into().map_err(|_| bad_len(ty, b.len()))
 }
 
-/// Canonical lowercase-hyphenated uuid string, matching how CDC ingests uuids
-/// (`Cell::String`), so bind-side and CDC-side uuid values compare equal.
-fn format_uuid(b: [u8; 16]) -> String {
-    let mut s = String::with_capacity(36);
-    for (i, byte) in b.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            s.push('-');
-        }
-        let _ = write!(s, "{byte:02x}");
-    }
-    s
-}
-
-/// Decode a column value returned by an executed query into a [`Cell`], per
-/// backend.
+/// Decode a column value returned by an executed query into a
+/// `Value<B>`, per backend.
 ///
-/// Lets an `INSERT ... RETURNING` row be read without a compile-time row struct.
-/// Implemented for `Pg` now; other backends slot in later without changing
-/// [`SubscriptionEngine::register_follow_insert`]'s signature.
+/// Lets an `INSERT ... RETURNING` row be read without a compile-time row
+/// struct.
 pub trait FollowRowDecode: Backend {
-    /// Decode one field's raw value (or SQL NULL) into a `Cell`.
+    /// The subql [`crate::backend::Backend`] whose [`Value`] shape this
+    /// diesel backend's returned fields decode to.
+    type SubqlBackend: crate::backend::Backend;
+
+    /// Decode one field's raw value (or SQL NULL) into a
+    /// `Value<Self::SubqlBackend>`.
     ///
     /// # Errors
-    /// [`RegisterError::UnsupportedSql`] for a column type outside the supported
-    /// scalar set.
-    fn field_to_cell(value: Option<Self::RawValue<'_>>) -> Result<Cell, RegisterError>;
+    /// [`RegisterError::UnsupportedSql`] for a column type outside the
+    /// supported scalar set.
+    fn field_to_value(
+        value: Option<Self::RawValue<'_>>,
+    ) -> Result<Value<Self::SubqlBackend>, RegisterError>;
 }
 
 impl FollowRowDecode for Pg {
-    fn field_to_cell(value: Option<PgValue<'_>>) -> Result<Cell, RegisterError> {
-        value.map_or(Ok(Cell::Null), |v| {
+    type SubqlBackend = Postgres;
+
+    fn field_to_value(value: Option<PgValue<'_>>) -> Result<Value<Postgres>, RegisterError> {
+        value.map_or(Ok(Value::Null), |v| {
             decode_pg_bind(Some(v.as_bytes()), v.get_oid().get())
         })
     }
@@ -403,20 +416,22 @@ impl FollowRowDecode for Pg {
 
 #[cfg(feature = "diesel-typed-sqlite")]
 impl FollowRowDecode for diesel::sqlite::Sqlite {
-    fn field_to_cell(value: Option<Self::RawValue<'_>>) -> Result<Cell, RegisterError> {
+    type SubqlBackend = crate::backend::SQLite;
+
+    fn field_to_value(
+        value: Option<Self::RawValue<'_>>,
+    ) -> Result<Value<crate::backend::SQLite>, RegisterError> {
         use diesel::sqlite::SqliteType;
-        // SQLite hands back typed values (`read_*` take `&mut self`), so no wire
-        // decode is needed.
         let Some(mut v) = value else {
-            return Ok(Cell::Null);
+            return Ok(Value::Null);
         };
         Ok(match v.value_type() {
-            None => Cell::Null,
+            None => Value::Null,
             Some(SqliteType::SmallInt | SqliteType::Integer | SqliteType::Long) => {
-                Cell::Int(v.read_long())
+                Value::Int(v.read_long())
             }
-            Some(SqliteType::Float | SqliteType::Double) => Cell::Float(v.read_double()),
-            Some(SqliteType::Text) => Cell::String(v.read_text().into()),
+            Some(SqliteType::Float | SqliteType::Double) => Value::Float(v.read_double()),
+            Some(SqliteType::Text) => Value::String(v.read_text().to_string()),
             Some(SqliteType::Binary) => {
                 return Err(RegisterError::UnsupportedSql(
                     "unsupported SQLite BLOB in a followed row".to_string(),
@@ -440,93 +455,43 @@ pub enum FollowInsertError {
 }
 
 /// Diesel-typed registration methods on the engine.
-impl<D, I, DB> SubscriptionEngine<D, I, DB>
+impl<E, I, DB> SubscriptionEngine<E, I, DB>
 where
-    D: Dialect,
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
     I: IdTypes,
     DB: DatabaseLike + 'static,
 {
     /// Register a subscription from a typed diesel query.
-    ///
-    /// The query is rendered to SQL plus bind values (see [`render_typed`]) and
-    /// registered like any other subscription, so it is checked against your
-    /// diesel `table!` schema at compile time. Projection rules match
-    /// [`SubscriptionEngine::register_select`].
-    ///
-    /// Generic over the backend `B` (`Pg`, or `Sqlite` under
-    /// `diesel-typed-sqlite`); the rendered SQL is that backend's flavor, so the
-    /// engine's `Dialect` must match it.
-    ///
-    /// # Errors
-    /// Propagates rendering errors from [`render_typed`] (e.g. an unsupported
-    /// bind type) and registration errors from [`SubscriptionEngine::register`].
-    pub fn register_select_typed<B, Q>(
+    pub fn register_select_typed<D, Q>(
         &mut self,
         consumer_id: I::ConsumerId,
         query: &Q,
     ) -> Result<RegisterResult, RegisterError>
     where
-        B: BindDecode,
-        Q: QueryFragment<B>,
+        D: BindDecode<SubqlBackend = E::Backend>,
+        Q: QueryFragment<D>,
     {
-        let (sql, binds) = render_typed::<B, _>(query)?;
+        let (sql, binds) = render_typed::<D, _>(query)?;
         self.register(SubscriptionRequest::new(consumer_id, sql).binds(binds))
     }
 
     /// Register a follow subscription from a typed diesel UPDATE.
-    ///
-    /// The UPDATE is rendered to SQL + binds (see [`render_typed`]) and its
-    /// target rows become a standing `SELECT * ... WHERE <the UPDATE's WHERE>`
-    /// subscription. Nothing is executed. See
-    /// [`SubscriptionEngine::register_follow_update`].
-    ///
-    /// Generic over the backend `B` (`Pg`, or `Sqlite` under
-    /// `diesel-typed-sqlite`); the rendered SQL is that backend's flavor, so the
-    /// engine's `Dialect` must match it.
-    ///
-    /// # Errors
-    /// Propagates rendering errors from [`render_typed`] and the follow-shape /
-    /// registration errors from
-    /// [`SubscriptionEngine::register_follow_update_with_binds`].
-    pub fn register_follow_update_typed<B, Q>(
+    pub fn register_follow_update_typed<D, Q>(
         &mut self,
         consumer_id: I::ConsumerId,
         update: &Q,
     ) -> Result<RegisterResult, RegisterError>
     where
-        B: BindDecode,
-        Q: QueryFragment<B>,
+        D: BindDecode<SubqlBackend = E::Backend>,
+        Q: QueryFragment<D>,
     {
-        let (sql, binds) = render_typed::<B, _>(update)?;
+        let (sql, binds) = render_typed::<D, _>(update)?;
         self.register_follow_update_with_binds(consumer_id, sql, binds)
     }
 
-    /// Execute a typed diesel `INSERT ... RETURNING <pk>` and follow the inserted
-    /// row(s) by their (possibly DB-minted) primary key.
-    ///
-    /// This is the one method that writes to the database (via the caller's
-    /// connection). It holds `&mut self` across both executing the insert and
-    /// registering the follow, so the insert's own CDC event cannot be dispatched
-    /// until the follow exists: the follow is guaranteed to observe it (no loss),
-    /// by the engine's single-threaded `&mut self` ordering. Nothing is
-    /// fabricated, so there is nothing to de-duplicate.
-    ///
-    /// Pass the insert **without** a `RETURNING` clause: this method appends
-    /// `RETURNING <primary key>` derived from the table type, so only the key is
-    /// read and it always matches the table's primary key, in order. A multi-row
-    /// insert yields one follow per returned row.
-    ///
-    /// Both the followed table and the returned key columns are taken from the
-    /// insert's own diesel table type, so neither can disagree with the statement
-    /// being executed.
-    ///
-    /// `RETURNING` is Postgres/SQLite/MariaDB; on stock MySQL (no `RETURNING`)
-    /// fetch the id yourself and use [`SubscriptionEngine::follow_row`].
-    ///
-    /// # Errors
-    /// [`FollowInsertError::Load`] if the insert fails to execute or its rows fail
-    /// to read; [`FollowInsertError::Register`] if a follow cannot be built or
-    /// registered.
+    /// Execute a typed diesel `INSERT ... RETURNING <pk>` and follow the
+    /// inserted row(s) by their (possibly DB-minted) primary key.
     pub fn register_follow_insert<T, U, Op, C>(
         &mut self,
         consumer_id: I::ConsumerId,
@@ -535,45 +500,40 @@ where
     ) -> Result<alloc::vec::Vec<RegisterResult>, FollowInsertError>
     where
         C: LoadConnection<DefaultLoadingMode>,
-        C::Backend: FollowRowDecode
+        C::Backend: FollowRowDecode<SubqlBackend = E::Backend>
             + Default
             + QueryMetadata<<PkReturningInsert<T, U, Op> as Query>::SqlType>,
         <C::Backend as Backend>::QueryBuilder: Default,
         T: Table + QueryFragment<C::Backend> + Default,
         PkReturningInsert<T, U, Op>: Query + QueryFragment<C::Backend> + QueryId,
     {
-        // The table comes from the insert's diesel type, never a restated string.
         let table =
             insert_target_table_name::<T, C::Backend>().map_err(FollowInsertError::Register)?;
 
-        // Return the table's primary key, derived from the type: the caller does
-        // not (and cannot) restate which columns identify the row.
         let insert = insert.returning(T::default().primary_key());
 
-        // Execute the insert and read each RETURNING row's columns as Cells.
-        let rows: alloc::vec::Vec<alloc::vec::Vec<Cell>> = {
+        let rows: alloc::vec::Vec<alloc::vec::Vec<Value<E::Backend>>> = {
             let cursor = conn.load(insert)?;
             let mut out = alloc::vec::Vec::new();
             for row in cursor {
                 let row = row?;
                 let n = row.field_count();
-                let mut cells = alloc::vec::Vec::with_capacity(n);
+                let mut values = alloc::vec::Vec::with_capacity(n);
                 for i in 0..n {
-                    let cell = match row.get(i) {
+                    let value = match row.get(i) {
                         Some(field) => {
-                            <C::Backend as FollowRowDecode>::field_to_cell(field.value())
+                            <C::Backend as FollowRowDecode>::field_to_value(field.value())
                                 .map_err(FollowInsertError::Register)?
                         }
-                        None => Cell::Null,
+                        None => Value::Null,
                     };
-                    cells.push(cell);
+                    values.push(value);
                 }
-                out.push(cells);
+                out.push(values);
             }
             out
         };
 
-        // Register one follow per returned row (still within this `&mut self`).
         let mut results = alloc::vec::Vec::with_capacity(rows.len());
         for pk in rows {
             results.push(

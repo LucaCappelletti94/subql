@@ -54,7 +54,10 @@ pub mod compiler;
 pub mod config;
 #[cfg(feature = "diesel-typed")]
 pub mod diesel_api;
-#[cfg(feature = "dhat-heap")]
+// Benchmark harness still speaks retired `Cell` / `RowImage` / `WalEvent`;
+// Phase 10 rewrites it against a typed `CdcEvent` fixture. Excluded from
+// Phase 6 baseline compilation.
+#[cfg(any())]
 pub mod memory_profile_workload;
 #[cfg(feature = "std")]
 pub mod persistence;
