@@ -746,7 +746,7 @@ where
             )));
         }
 
-        ref col_expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
+        col_expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
             let col_id = resolve_column_ref(col_expr, table_id, database).ok_or_else(|| {
                 let col_name = match col_expr {
                     Expr::Identifier(ident) => ident.value.clone(),

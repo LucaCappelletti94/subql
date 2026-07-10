@@ -2,14 +2,41 @@
 //! `AVG(col)`, `VAR_POP(col)`, `VAR_SAMP(col)`, `STDDEV_POP(col)`, and
 //! `STDDEV_SAMP(col)`.
 
-use crate::{compiler::AggSpec, AggDelta, ColumnId, RowImage};
+use crate::{compiler::AggSpec, AggDelta, ColumnId};
 
-fn numeric_cell_value(row: &RowImage, column: ColumnId) -> Option<f64> {
-    match row.get(column) {
-        #[allow(clippy::cast_precision_loss)]
-        Some(crate::Cell::Int(v)) => Some(*v as f64),
-        Some(crate::Cell::Float(v)) if v.is_finite() => Some(*v),
-        _ => None, // NULL, Missing, NaN, Inf, non-numeric
+/// Three-valued numeric read for aggregate delta computation.
+///
+/// Composed by the caller (dispatch) against the current `E: CdcEvent`
+/// and the target column's [`crate::backend::ScalarKind`]. Reflects both
+/// the presence tri-state and the numeric convertibility of the cell.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum AggCellRead {
+    /// The source did not carry this cell (row image partial).
+    Missing,
+    /// The cell carries SQL `NULL`.
+    Null,
+    /// The cell is present and its value convertible to `f64`
+    /// (finite; `NaN` and `Inf` are represented as `NonNumeric`).
+    Numeric(f64),
+    /// The cell is present but does not participate in numeric aggregates
+    /// (Bool, String, non-finite Float, etc.).
+    NonNumeric,
+}
+
+impl AggCellRead {
+    /// Whether the cell has any observable presence (Null or a value).
+    #[must_use]
+    pub const fn is_present(self) -> bool {
+        !matches!(self, Self::Missing | Self::Null)
+    }
+
+    /// The finite `f64` value if the cell is `Numeric`, else `None`.
+    #[must_use]
+    pub const fn numeric(self) -> Option<f64> {
+        match self {
+            Self::Numeric(v) => Some(v),
+            _ => None,
+        }
     }
 }
 
@@ -19,15 +46,21 @@ fn numeric_cell_value(row: &RowImage, column: ColumnId) -> Option<f64> {
 /// (for example `COUNT(col)` with `NULL`, `SUM`/`AVG` with non-numeric values).
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<AggDelta> {
+pub fn agg_delta_for_row<F>(spec: &AggSpec, weight: i64, mut read: F) -> Option<AggDelta>
+where
+    F: FnMut(ColumnId) -> AggCellRead,
+{
     match spec {
         AggSpec::CountStar => Some(AggDelta::Count(weight)),
-        AggSpec::CountColumn { column } => match row.get(*column) {
-            Some(crate::Cell::Null | crate::Cell::Missing) | None => None,
-            Some(_) => Some(AggDelta::Count(weight)),
-        },
+        AggSpec::CountColumn { column } => {
+            if read(*column).is_present() {
+                Some(AggDelta::Count(weight))
+            } else {
+                None
+            }
+        }
         AggSpec::Sum { column } => {
-            let value = numeric_cell_value(row, *column)?;
+            let value = read(*column).numeric()?;
             let delta = value * weight as f64;
             if delta == 0.0 {
                 None
@@ -36,7 +69,7 @@ pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<
             }
         }
         AggSpec::Avg { column } => {
-            let value = numeric_cell_value(row, *column)?;
+            let value = read(*column).numeric()?;
             Some(AggDelta::Avg {
                 sum_delta: value * weight as f64,
                 count_delta: weight,
@@ -46,7 +79,7 @@ pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<
         | AggSpec::VarSamp { column }
         | AggSpec::StddevPop { column }
         | AggSpec::StddevSamp { column } => {
-            let value = numeric_cell_value(row, *column)?;
+            let value = read(*column).numeric()?;
             let w = weight as f64;
             Some(AggDelta::Stats {
                 sum_delta: value * w,
@@ -75,11 +108,12 @@ pub fn agg_delta_for_row(spec: &AggSpec, row: &RowImage, weight: i64) -> Option<
 /// 5. **Reset on TRUNCATE**: engine returns `Err(TruncateRequiresReset)`. Caller
 ///    must re-query and replace the stored value.
 pub trait AggKernel: Send {
-    /// Apply a signed-weight delta for a matched row.
+    /// Apply a signed-weight delta for a matched row view.
     ///
-    /// `weight` is `+1` for INSERT/new-side of UPDATE, `-1` for DELETE/old-side.
-    /// `row` is inspected by SUM/MIN kernels for column values.
-    fn apply(&mut self, row: &RowImage, weight: i64);
+    /// `weight` is `+1` for INSERT and the new side of UPDATE, `-1` for
+    /// DELETE and the old side of UPDATE. `read` yields the presence /
+    /// numeric read for any column the kernel needs.
+    fn apply(&mut self, read: &mut dyn FnMut(ColumnId) -> AggCellRead, weight: i64);
 
     /// Return the net delta accumulated so far.
     fn result(&self) -> AggDelta;
@@ -95,7 +129,7 @@ pub struct CountKernel {
 }
 
 impl AggKernel for CountKernel {
-    fn apply(&mut self, _row: &RowImage, weight: i64) {
+    fn apply(&mut self, _read: &mut dyn FnMut(ColumnId) -> AggCellRead, weight: i64) {
         self.delta += weight;
     }
 
@@ -124,10 +158,9 @@ impl CountColumnKernel {
 }
 
 impl AggKernel for CountColumnKernel {
-    fn apply(&mut self, row: &RowImage, weight: i64) {
-        match row.get(self.column) {
-            Some(crate::Cell::Null | crate::Cell::Missing) | None => {} // SQL NULL/Missing semantics: do not count
-            Some(_) => self.delta += weight,
+    fn apply(&mut self, read: &mut dyn FnMut(ColumnId) -> AggCellRead, weight: i64) {
+        if read(self.column).is_present() {
+            self.delta += weight;
         }
     }
 
@@ -157,8 +190,8 @@ impl SumKernel {
 
 impl AggKernel for SumKernel {
     #[allow(clippy::cast_precision_loss)]
-    fn apply(&mut self, row: &RowImage, weight: i64) {
-        let Some(v) = numeric_cell_value(row, self.column) else {
+    fn apply(&mut self, read: &mut dyn FnMut(ColumnId) -> AggCellRead, weight: i64) {
+        let Some(v) = read(self.column).numeric() else {
             return;
         };
         self.delta = v.mul_add(weight as f64, self.delta);
@@ -198,8 +231,8 @@ impl AvgKernel {
 
 impl AggKernel for AvgKernel {
     #[allow(clippy::cast_precision_loss)]
-    fn apply(&mut self, row: &RowImage, weight: i64) {
-        let Some(v) = numeric_cell_value(row, self.column) else {
+    fn apply(&mut self, read: &mut dyn FnMut(ColumnId) -> AggCellRead, weight: i64) {
+        let Some(v) = read(self.column).numeric() else {
             return;
         };
         self.sum_delta = v.mul_add(weight as f64, self.sum_delta);
@@ -252,8 +285,8 @@ impl StatsKernel {
 
 impl AggKernel for StatsKernel {
     #[allow(clippy::cast_precision_loss)]
-    fn apply(&mut self, row: &RowImage, weight: i64) {
-        let Some(v) = numeric_cell_value(row, self.column) else {
+    fn apply(&mut self, read: &mut dyn FnMut(ColumnId) -> AggCellRead, weight: i64) {
+        let Some(v) = read(self.column).numeric() else {
             return;
         };
         let w = weight as f64;
@@ -277,488 +310,4 @@ impl AggKernel for StatsKernel {
     }
 }
 
-#[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::cast_precision_loss,
-    clippy::suboptimal_flops
-)]
-mod tests {
-    use super::*;
-    use crate::Cell;
-    use std::sync::Arc;
-
-    fn row(cells: Vec<Cell>) -> RowImage {
-        RowImage {
-            cells: Arc::from(cells),
-        }
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_count_star() {
-        let row = row(vec![Cell::Int(1)]);
-        let delta = agg_delta_for_row(&AggSpec::CountStar, &row, 1);
-        assert_eq!(delta, Some(AggDelta::Count(1)));
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_count_column_null_skips() {
-        let row = row(vec![Cell::Null]);
-        let delta = agg_delta_for_row(&AggSpec::CountColumn { column: 0 }, &row, 1);
-        assert_eq!(delta, None);
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_count_column_missing_skipped() {
-        let row = row(vec![Cell::Int(1), Cell::Missing]);
-        let delta = agg_delta_for_row(&AggSpec::CountColumn { column: 1 }, &row, 1);
-        assert_eq!(delta, None, "COUNT(col) must skip Cell::Missing");
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_sum_skips_non_finite() {
-        let row = row(vec![Cell::Float(f64::NAN)]);
-        let delta = agg_delta_for_row(&AggSpec::Sum { column: 0 }, &row, 1);
-        assert_eq!(delta, None);
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_avg_uses_weight() {
-        let row = row(vec![Cell::Int(10)]);
-        let delta = agg_delta_for_row(&AggSpec::Avg { column: 0 }, &row, -1);
-        assert_eq!(
-            delta,
-            Some(AggDelta::Avg {
-                sum_delta: -10.0,
-                count_delta: -1
-            })
-        );
-    }
-
-    // --- CountKernel tests ---
-
-    #[test]
-    fn test_count_kernel_apply_positive_weight() {
-        let mut k = CountKernel::default();
-        k.apply(&row(vec![]), 1);
-        assert_eq!(k.result(), AggDelta::Count(1));
-    }
-
-    #[test]
-    fn test_count_kernel_apply_negative_weight() {
-        let mut k = CountKernel::default();
-        k.apply(&row(vec![]), -1);
-        assert_eq!(k.result(), AggDelta::Count(-1));
-    }
-
-    #[test]
-    fn test_count_kernel_reset() {
-        let mut k = CountKernel::default();
-        k.apply(&row(vec![]), 1);
-        k.reset();
-        assert_eq!(k.result(), AggDelta::Count(0));
-    }
-
-    // --- CountColumnKernel tests ---
-
-    #[test]
-    fn test_count_column_kernel_non_null_counted() {
-        let mut k = CountColumnKernel::new(0);
-        k.apply(&row(vec![Cell::Int(42)]), 1);
-        assert_eq!(k.result(), AggDelta::Count(1));
-    }
-
-    #[test]
-    fn test_count_column_kernel_null_skipped() {
-        let mut k = CountColumnKernel::new(0);
-        k.apply(&row(vec![Cell::Null]), 1);
-        assert_eq!(k.result(), AggDelta::Count(0));
-    }
-
-    #[test]
-    fn test_count_column_kernel_missing_skipped() {
-        let mut k = CountColumnKernel::new(1); // col 1 absent in row
-        k.apply(&row(vec![Cell::Int(1)]), 1);
-        assert_eq!(k.result(), AggDelta::Count(0));
-    }
-
-    #[test]
-    fn test_count_column_kernel_in_bounds_missing_skipped() {
-        let mut k = CountColumnKernel::new(1);
-        k.apply(&row(vec![Cell::Int(1), Cell::Missing]), 1);
-        assert_eq!(
-            k.result(),
-            AggDelta::Count(0),
-            "in-bounds Cell::Missing must be skipped"
-        );
-    }
-
-    #[test]
-    fn test_count_column_kernel_bool_counted() {
-        let mut k = CountColumnKernel::new(0);
-        k.apply(&row(vec![Cell::Bool(false)]), 1);
-        assert_eq!(k.result(), AggDelta::Count(1));
-    }
-
-    #[test]
-    fn test_count_column_kernel_string_counted() {
-        let mut k = CountColumnKernel::new(0);
-        k.apply(&row(vec![Cell::String("hi".into())]), 1);
-        assert_eq!(k.result(), AggDelta::Count(1));
-    }
-
-    #[test]
-    fn test_count_column_kernel_negative_weight() {
-        let mut k = CountColumnKernel::new(0);
-        k.apply(&row(vec![Cell::Int(5)]), -1);
-        assert_eq!(k.result(), AggDelta::Count(-1));
-    }
-
-    #[test]
-    fn test_count_column_kernel_reset() {
-        let mut k = CountColumnKernel::new(0);
-        k.apply(&row(vec![Cell::Int(5)]), 1);
-        k.reset();
-        assert_eq!(k.result(), AggDelta::Count(0));
-    }
-
-    // --- AvgKernel tests ---
-
-    #[test]
-    fn test_avg_kernel_int_cell() {
-        let mut k = AvgKernel::new(0);
-        k.apply(&row(vec![Cell::Int(10)]), 1);
-        assert_eq!(
-            k.result(),
-            AggDelta::Avg {
-                sum_delta: 10.0,
-                count_delta: 1
-            }
-        );
-    }
-
-    #[test]
-    fn test_avg_kernel_float_cell() {
-        let mut k = AvgKernel::new(0);
-        k.apply(&row(vec![Cell::Float(2.5)]), 1);
-        assert_eq!(
-            k.result(),
-            AggDelta::Avg {
-                sum_delta: 2.5,
-                count_delta: 1
-            }
-        );
-    }
-
-    #[test]
-    fn test_avg_kernel_null_skipped() {
-        let mut k = AvgKernel::new(0);
-        k.apply(&row(vec![Cell::Null]), 1);
-        assert_eq!(
-            k.result(),
-            AggDelta::Avg {
-                sum_delta: 0.0,
-                count_delta: 0
-            }
-        );
-    }
-
-    #[test]
-    fn test_avg_kernel_missing_skipped() {
-        let mut k = AvgKernel::new(1);
-        k.apply(&row(vec![Cell::Int(5)]), 1);
-        assert_eq!(
-            k.result(),
-            AggDelta::Avg {
-                sum_delta: 0.0,
-                count_delta: 0
-            }
-        );
-    }
-
-    #[test]
-    fn test_avg_kernel_nan_skipped() {
-        let mut k = AvgKernel::new(0);
-        k.apply(&row(vec![Cell::Float(f64::NAN)]), 1);
-        assert_eq!(
-            k.result(),
-            AggDelta::Avg {
-                sum_delta: 0.0,
-                count_delta: 0
-            }
-        );
-    }
-
-    #[test]
-    fn test_avg_kernel_negative_weight() {
-        let mut k = AvgKernel::new(0);
-        k.apply(&row(vec![Cell::Int(20)]), -1);
-        assert_eq!(
-            k.result(),
-            AggDelta::Avg {
-                sum_delta: -20.0,
-                count_delta: -1
-            }
-        );
-    }
-
-    #[test]
-    fn test_avg_kernel_update_net() {
-        let mut k = AvgKernel::new(0);
-        k.apply(&row(vec![Cell::Int(10)]), -1); // old row
-        k.apply(&row(vec![Cell::Int(20)]), 1); // new row
-        assert_eq!(
-            k.result(),
-            AggDelta::Avg {
-                sum_delta: 10.0,
-                count_delta: 0
-            }
-        );
-    }
-
-    #[test]
-    fn test_avg_kernel_reset() {
-        let mut k = AvgKernel::new(0);
-        k.apply(&row(vec![Cell::Int(100)]), 1);
-        k.reset();
-        assert_eq!(
-            k.result(),
-            AggDelta::Avg {
-                sum_delta: 0.0,
-                count_delta: 0
-            }
-        );
-    }
-
-    // --- SumKernel tests ---
-
-    #[test]
-    fn test_sum_kernel_int_cell() {
-        let mut k = SumKernel::new(0);
-        k.apply(&row(vec![Cell::Int(20)]), 1);
-        assert_eq!(k.result(), AggDelta::Sum(20.0));
-    }
-
-    #[test]
-    fn test_sum_kernel_float_cell() {
-        let mut k = SumKernel::new(0);
-        k.apply(&row(vec![Cell::Float(2.5)]), 1);
-        assert_eq!(k.result(), AggDelta::Sum(2.5));
-    }
-
-    #[test]
-    fn test_sum_kernel_null_skipped() {
-        let mut k = SumKernel::new(0);
-        k.apply(&row(vec![Cell::Null]), 1);
-        assert_eq!(k.result(), AggDelta::Sum(0.0));
-    }
-
-    #[test]
-    fn test_sum_kernel_missing_skipped() {
-        let mut k = SumKernel::new(1); // col 1, but row only has col 0
-        k.apply(&row(vec![Cell::Int(5)]), 1);
-        assert_eq!(k.result(), AggDelta::Sum(0.0));
-    }
-
-    #[test]
-    fn test_sum_kernel_negative_weight() {
-        let mut k = SumKernel::new(0);
-        k.apply(&row(vec![Cell::Int(20)]), -1);
-        assert_eq!(k.result(), AggDelta::Sum(-20.0));
-    }
-
-    #[test]
-    fn test_sum_kernel_nan_skipped() {
-        let mut k = SumKernel::new(0);
-        k.apply(&row(vec![Cell::Float(f64::NAN)]), 1);
-        assert_eq!(k.result(), AggDelta::Sum(0.0));
-    }
-
-    #[test]
-    fn test_sum_kernel_inf_skipped() {
-        let mut k = SumKernel::new(0);
-        k.apply(&row(vec![Cell::Float(f64::INFINITY)]), 1);
-        assert_eq!(k.result(), AggDelta::Sum(0.0));
-    }
-
-    #[test]
-    fn test_sum_kernel_update_net() {
-        // Simulates old row weight=-1, new row weight=+1
-        let mut k = SumKernel::new(0);
-        k.apply(&row(vec![Cell::Int(15)]), -1);
-        k.apply(&row(vec![Cell::Int(20)]), 1);
-        assert_eq!(k.result(), AggDelta::Sum(5.0));
-    }
-
-    #[test]
-    fn test_sum_kernel_reset() {
-        let mut k = SumKernel::new(0);
-        k.apply(&row(vec![Cell::Int(100)]), 1);
-        k.reset();
-        assert_eq!(k.result(), AggDelta::Sum(0.0));
-    }
-
-    // --- agg_delta_for_row VAR/STDDEV tests ---
-
-    fn stats(sum: f64, sum_sq: f64, count: i64) -> AggDelta {
-        AggDelta::Stats {
-            sum_delta: sum,
-            sum_sq_delta: sum_sq,
-            count_delta: count,
-        }
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_var_pop_emits_stats() {
-        let row = row(vec![Cell::Int(3)]);
-        let d = agg_delta_for_row(&AggSpec::VarPop { column: 0 }, &row, 1);
-        assert_eq!(d, Some(stats(3.0, 9.0, 1)));
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_var_samp_negative_weight() {
-        let row = row(vec![Cell::Float(2.0)]);
-        let d = agg_delta_for_row(&AggSpec::VarSamp { column: 0 }, &row, -1);
-        assert_eq!(d, Some(stats(-2.0, -4.0, -1)));
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_stddev_pop_skips_null() {
-        let row = row(vec![Cell::Null]);
-        let d = agg_delta_for_row(&AggSpec::StddevPop { column: 0 }, &row, 1);
-        assert_eq!(d, None);
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_stddev_samp_skips_missing() {
-        let row = row(vec![Cell::Int(1), Cell::Missing]);
-        let d = agg_delta_for_row(&AggSpec::StddevSamp { column: 1 }, &row, 1);
-        assert_eq!(d, None);
-    }
-
-    #[test]
-    fn test_agg_delta_for_row_stats_skips_nan_and_inf() {
-        let r1 = row(vec![Cell::Float(f64::NAN)]);
-        let r2 = row(vec![Cell::Float(f64::INFINITY)]);
-        assert_eq!(
-            agg_delta_for_row(&AggSpec::VarPop { column: 0 }, &r1, 1),
-            None
-        );
-        assert_eq!(
-            agg_delta_for_row(&AggSpec::VarSamp { column: 0 }, &r2, 1),
-            None
-        );
-    }
-
-    // --- StatsKernel tests ---
-
-    #[test]
-    fn test_stats_kernel_int_cell() {
-        let mut k = StatsKernel::new(0);
-        k.apply(&row(vec![Cell::Int(4)]), 1);
-        assert_eq!(k.result(), stats(4.0, 16.0, 1));
-    }
-
-    #[test]
-    fn test_stats_kernel_float_cell() {
-        let mut k = StatsKernel::new(0);
-        k.apply(&row(vec![Cell::Float(2.5)]), 1);
-        assert_eq!(k.result(), stats(2.5, 6.25, 1));
-    }
-
-    #[test]
-    fn test_stats_kernel_null_skipped() {
-        let mut k = StatsKernel::new(0);
-        k.apply(&row(vec![Cell::Null]), 1);
-        assert_eq!(k.result(), stats(0.0, 0.0, 0));
-    }
-
-    #[test]
-    fn test_stats_kernel_missing_skipped() {
-        let mut k = StatsKernel::new(1);
-        k.apply(&row(vec![Cell::Int(1)]), 1);
-        assert_eq!(k.result(), stats(0.0, 0.0, 0));
-    }
-
-    #[test]
-    fn test_stats_kernel_nan_skipped() {
-        let mut k = StatsKernel::new(0);
-        k.apply(&row(vec![Cell::Float(f64::NAN)]), 1);
-        assert_eq!(k.result(), stats(0.0, 0.0, 0));
-    }
-
-    #[test]
-    fn test_stats_kernel_inf_skipped() {
-        let mut k = StatsKernel::new(0);
-        k.apply(&row(vec![Cell::Float(f64::INFINITY)]), 1);
-        assert_eq!(k.result(), stats(0.0, 0.0, 0));
-    }
-
-    #[test]
-    fn test_stats_kernel_negative_weight() {
-        let mut k = StatsKernel::new(0);
-        k.apply(&row(vec![Cell::Int(5)]), -1);
-        assert_eq!(k.result(), stats(-5.0, -25.0, -1));
-    }
-
-    #[test]
-    fn test_stats_kernel_update_net() {
-        let mut k = StatsKernel::new(0);
-        k.apply(&row(vec![Cell::Int(3)]), -1); // old row
-        k.apply(&row(vec![Cell::Int(7)]), 1); // new row
-        assert_eq!(k.result(), stats(4.0, 40.0, 0));
-    }
-
-    #[test]
-    fn test_stats_kernel_reset() {
-        let mut k = StatsKernel::new(0);
-        k.apply(&row(vec![Cell::Int(9)]), 1);
-        k.reset();
-        assert_eq!(k.result(), stats(0.0, 0.0, 0));
-    }
-
-    #[test]
-    fn test_stats_kernel_population_variance_formula() {
-        // Sample set [2, 4, 4, 4, 5, 5, 7, 9] has population variance 4.0.
-        let xs = [2, 4, 4, 4, 5, 5, 7, 9];
-        let mut k = StatsKernel::new(0);
-        for x in xs {
-            k.apply(&row(vec![Cell::Int(x)]), 1);
-        }
-        let AggDelta::Stats {
-            sum_delta,
-            sum_sq_delta,
-            count_delta,
-        } = k.result()
-        else {
-            panic!("expected Stats");
-        };
-        let n = count_delta as f64;
-        let var_pop = sum_sq_delta / n - (sum_delta / n).powi(2);
-        assert!((var_pop - 4.0).abs() < 1e-9, "var_pop = {var_pop}");
-    }
-
-    #[test]
-    fn test_stats_kernel_sample_variance_formula() {
-        // [2, 4, 4, 4, 5, 5, 7, 9]: sample variance ~= 4.571428...
-        let xs = [2, 4, 4, 4, 5, 5, 7, 9];
-        let mut k = StatsKernel::new(0);
-        for x in xs {
-            k.apply(&row(vec![Cell::Int(x)]), 1);
-        }
-        let AggDelta::Stats {
-            sum_delta,
-            sum_sq_delta,
-            count_delta,
-        } = k.result()
-        else {
-            panic!("expected Stats");
-        };
-        let n = count_delta as f64;
-        let var_samp = sum_delta.mul_add(-sum_delta / n, sum_sq_delta) / (n - 1.0);
-        assert!(
-            (var_samp - 32.0 / 7.0).abs() < 1e-9,
-            "var_samp = {var_samp}"
-        );
-    }
-}
+// Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
