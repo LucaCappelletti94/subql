@@ -22,6 +22,7 @@ use sql_traits::{
     },
 };
 
+use crate::backend::ScalarKind;
 use crate::types::{ColumnId, ColumnType, TableId};
 
 /// Resolve a table name (unquoted or quoted form) to subql's compact
@@ -224,6 +225,77 @@ pub fn column_type<DB: DatabaseLike>(
     ))
 }
 
+/// Resolve a column's declared SQL type into a backend-neutral
+/// [`ScalarKind`].
+///
+/// Unlike [`column_type`] (which uses subql's coarse 5-variant
+/// `ColumnType` for aggregate validation), this reads the raw
+/// `data_type()` string and disambiguates cases sql-traits' canonical
+/// tokens fold together:
+///
+/// * `TIMESTAMP` -> [`ScalarKind::Timestamp`], `TIMESTAMPTZ` /
+///   `TIMESTAMP WITH TIME ZONE` -> [`ScalarKind::TimestampTz`].
+/// * `JSON` -> [`ScalarKind::Json`], `JSONB` -> [`ScalarKind::Jsonb`].
+///
+/// Falls back to the canonical-token mapping for every other scalar so
+/// callers get a single-source-of-truth resolver.
+///
+/// Returns `None` when the table / column id is unknown or when the
+/// declared type doesn't match any supported scalar (compiler surfaces
+/// this as [`crate::RegisterError::UnsupportedSql`]).
+#[must_use]
+pub fn column_scalar_kind<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Option<ScalarKind> {
+    let table = database.table_by_id(table_id as usize)?;
+    let column = table.column_by_id(column_id as usize, database)?;
+    scalar_kind_from_raw(column.data_type(database))
+}
+
+/// Case-insensitive prefix match against the trimmed raw type.
+fn raw_starts_with(raw: &str, needle: &str) -> bool {
+    let trimmed = raw.trim_start();
+    trimmed.len() >= needle.len() && trimmed[..needle.len()].eq_ignore_ascii_case(needle)
+}
+
+/// Map a raw SQL declared type string to its [`ScalarKind`].
+///
+/// Handles the two families where sql-traits' canonical token collapses
+/// two backend scalars into one (`TIMESTAMP` / `TIMESTAMPTZ` and `JSON` /
+/// `JSONB`), then falls back to
+/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token)
+/// for the rest.
+fn scalar_kind_from_raw(raw: &str) -> Option<ScalarKind> {
+    // Order matters: more specific patterns first so JSONB doesn't match
+    // the JSON prefix and TIMESTAMPTZ doesn't match TIMESTAMP.
+    if raw_starts_with(raw, "TIMESTAMPTZ") || raw_starts_with(raw, "TIMESTAMP WITH TIME ZONE") {
+        return Some(ScalarKind::TimestampTz);
+    }
+    if raw_starts_with(raw, "TIMESTAMP") {
+        return Some(ScalarKind::Timestamp);
+    }
+    if raw_starts_with(raw, "JSONB") {
+        return Some(ScalarKind::Jsonb);
+    }
+    if raw_starts_with(raw, "JSON") {
+        return Some(ScalarKind::Json);
+    }
+    match canonical_type_token(raw).as_str() {
+        "INT" => Some(ScalarKind::Int),
+        "FLOAT" => Some(ScalarKind::Float),
+        "DECIMAL" => Some(ScalarKind::Decimal),
+        "BOOL" => Some(ScalarKind::Bool),
+        "STRING" => Some(ScalarKind::String),
+        "BYTES" => Some(ScalarKind::Bytes),
+        "UUID" => Some(ScalarKind::Uuid),
+        "DATE" => Some(ScalarKind::Date),
+        "TIME" => Some(ScalarKind::Time),
+        _ => None,
+    }
+}
+
 /// Whether the table has row-level security enabled (per
 /// [`TableLike::has_row_level_security`]).
 ///
@@ -364,5 +436,59 @@ mod tests {
     fn schema_fingerprint_none_for_unknown_table() {
         let db = make_db();
         assert!(schema_fingerprint(&db, 9_999).unwrap().is_none());
+    }
+    #[test]
+    fn scalar_kind_from_raw_distinguishes_timestamp_variants() {
+        assert_eq!(
+            scalar_kind_from_raw("TIMESTAMP"),
+            Some(ScalarKind::Timestamp)
+        );
+        assert_eq!(
+            scalar_kind_from_raw("TIMESTAMPTZ"),
+            Some(ScalarKind::TimestampTz)
+        );
+        assert_eq!(
+            scalar_kind_from_raw("TIMESTAMP WITH TIME ZONE"),
+            Some(ScalarKind::TimestampTz)
+        );
+        // Case-insensitive.
+        assert_eq!(
+            scalar_kind_from_raw("timestamptz"),
+            Some(ScalarKind::TimestampTz)
+        );
+    }
+
+    #[test]
+    fn scalar_kind_from_raw_distinguishes_json_variants() {
+        assert_eq!(scalar_kind_from_raw("JSON"), Some(ScalarKind::Json));
+        assert_eq!(scalar_kind_from_raw("JSONB"), Some(ScalarKind::Jsonb));
+        assert_eq!(scalar_kind_from_raw("jsonb"), Some(ScalarKind::Jsonb));
+    }
+
+    #[test]
+    fn scalar_kind_from_raw_maps_canonical_tokens() {
+        assert_eq!(scalar_kind_from_raw("BIGINT"), Some(ScalarKind::Int));
+        assert_eq!(
+            scalar_kind_from_raw("DOUBLE PRECISION"),
+            Some(ScalarKind::Float)
+        );
+        assert_eq!(
+            scalar_kind_from_raw("NUMERIC(10, 2)"),
+            Some(ScalarKind::Decimal)
+        );
+        assert_eq!(scalar_kind_from_raw("BOOLEAN"), Some(ScalarKind::Bool));
+        assert_eq!(
+            scalar_kind_from_raw("VARCHAR(255)"),
+            Some(ScalarKind::String)
+        );
+        assert_eq!(scalar_kind_from_raw("BYTEA"), Some(ScalarKind::Bytes));
+        assert_eq!(scalar_kind_from_raw("UUID"), Some(ScalarKind::Uuid));
+        assert_eq!(scalar_kind_from_raw("DATE"), Some(ScalarKind::Date));
+        assert_eq!(scalar_kind_from_raw("TIME"), Some(ScalarKind::Time));
+    }
+
+    #[test]
+    fn scalar_kind_from_raw_returns_none_for_unknown() {
+        assert_eq!(scalar_kind_from_raw("SOME_UNKNOWN_TYPE"), None);
     }
 }
