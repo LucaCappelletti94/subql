@@ -2,12 +2,12 @@
 
 pub mod bytecode;
 pub mod canonicalize;
-pub(crate) mod cell_cmp;
 mod literals;
 pub mod parser;
 pub mod prefilter;
 pub mod sql_shape;
 pub mod tristate;
+pub(crate) mod value_cmp;
 pub mod vm;
 
 pub use bytecode::{BytecodeProgram, Instruction};

@@ -168,7 +168,8 @@ pub enum ScalarKind {
 /// not need to keep the event alive. LoadColumn instructions clone the
 /// scalar out of the event when they push. String, Bytes, Decimal, Json,
 /// and Jsonb pay for that clone; primitive scalars are cheap.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub enum Value<B: Backend> {
     /// Cell not carried by the source's row image.
     Missing,
@@ -241,6 +242,80 @@ impl<B: Backend> Value<B> {
     #[inline]
     pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
+    }
+}
+
+// `Clone`, `Debug`, and `PartialEq` on `Value<B>` are hand-implemented so
+// their bounds fall on the scalar payloads (all of which are `ScalarCore`
+// and therefore `Clone + Debug + PartialEq`) rather than on `B` itself.
+// `#[derive(...)]` would defensively add `B: Clone` / `B: Debug` / etc.
+// which is not implied by `Backend` and would prevent `Vm<B: Backend>`,
+// `Instruction<B: Backend>` etc. from being usable in generic contexts.
+
+impl<B: Backend> Clone for Value<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Missing => Self::Missing,
+            Self::Null => Self::Null,
+            Self::Bool(x) => Self::Bool(x.clone()),
+            Self::Int(x) => Self::Int(x.clone()),
+            Self::Float(x) => Self::Float(x.clone()),
+            Self::String(x) => Self::String(x.clone()),
+            Self::Bytes(x) => Self::Bytes(x.clone()),
+            Self::Uuid(x) => Self::Uuid(x.clone()),
+            Self::Timestamp(x) => Self::Timestamp(x.clone()),
+            Self::TimestampTz(x) => Self::TimestampTz(x.clone()),
+            Self::Date(x) => Self::Date(x.clone()),
+            Self::Time(x) => Self::Time(x.clone()),
+            Self::Decimal(x) => Self::Decimal(x.clone()),
+            Self::Json(x) => Self::Json(x.clone()),
+            Self::Jsonb(x) => Self::Jsonb(x.clone()),
+        }
+    }
+}
+
+impl<B: Backend> core::fmt::Debug for Value<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("Missing"),
+            Self::Null => f.write_str("Null"),
+            Self::Bool(x) => f.debug_tuple("Bool").field(x).finish(),
+            Self::Int(x) => f.debug_tuple("Int").field(x).finish(),
+            Self::Float(x) => f.debug_tuple("Float").field(x).finish(),
+            Self::String(x) => f.debug_tuple("String").field(x).finish(),
+            Self::Bytes(x) => f.debug_tuple("Bytes").field(x).finish(),
+            Self::Uuid(x) => f.debug_tuple("Uuid").field(x).finish(),
+            Self::Timestamp(x) => f.debug_tuple("Timestamp").field(x).finish(),
+            Self::TimestampTz(x) => f.debug_tuple("TimestampTz").field(x).finish(),
+            Self::Date(x) => f.debug_tuple("Date").field(x).finish(),
+            Self::Time(x) => f.debug_tuple("Time").field(x).finish(),
+            Self::Decimal(x) => f.debug_tuple("Decimal").field(x).finish(),
+            Self::Json(x) => f.debug_tuple("Json").field(x).finish(),
+            Self::Jsonb(x) => f.debug_tuple("Jsonb").field(x).finish(),
+        }
+    }
+}
+
+impl<B: Backend> PartialEq for Value<B> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Missing, Self::Missing) => true,
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) => a == b,
+            (Self::Uuid(a), Self::Uuid(b)) => a == b,
+            (Self::Timestamp(a), Self::Timestamp(b)) => a == b,
+            (Self::TimestampTz(a), Self::TimestampTz(b)) => a == b,
+            (Self::Date(a), Self::Date(b)) => a == b,
+            (Self::Time(a), Self::Time(b)) => a == b,
+            (Self::Decimal(a), Self::Decimal(b)) => a == b,
+            (Self::Json(a), Self::Json(b)) => a == b,
+            (Self::Jsonb(a), Self::Jsonb(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
