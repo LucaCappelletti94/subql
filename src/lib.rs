@@ -45,6 +45,7 @@ mod errors;
 mod table_resolution;
 mod types;
 
+pub mod backend;
 pub mod catalog_helpers;
 pub mod checkpoint;
 pub mod clock;
