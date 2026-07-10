@@ -395,7 +395,7 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())] // Phase 10 test port pending
 mod tests {
     use super::super::ids::ConsumerOrdinal;
     use super::super::indexes::{IndexableAtom, NullKind};

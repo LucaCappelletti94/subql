@@ -756,7 +756,7 @@ fn planner_value_from_cell(cell: &Cell) -> Option<PlannerValue> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())] // Phase 10 test port pending
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

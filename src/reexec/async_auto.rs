@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 6: retargeting to Value<B>; disabled until diesel connector impls migrate.
+
 //! Async parallel of [`AutoResolvingEngine`](super::AutoResolvingEngine).
 //!
 //! Same surface (`register`, `install`, `snapshot`, `consumers`,

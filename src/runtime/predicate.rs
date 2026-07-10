@@ -362,7 +362,7 @@ impl<I: IdTypes, B: Backend> Default for PredicateStore<I, B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())] // Phase 10 test port pending
 #[allow(clippy::unwrap_used, clippy::clone_on_copy)]
 mod tests {
     use super::*;

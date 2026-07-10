@@ -3,7 +3,7 @@
 use super::{
     agg::{agg_delta_for_row, AggCellRead},
     ids::{ConsumerOrdinal, PredicateId},
-    partition::{CellPresence, ColumnProbe, TablePartition},
+    partition::{ColumnProbe, TablePartition},
     predicate::{Predicate, PredicateStore},
 };
 use crate::backend::{Backend, CdcEvent, Presence, RowKind, ScalarKind, Value};
@@ -148,22 +148,6 @@ impl<I: IdTypes> Iterator for MatchedConsumers<'_, I> {
             }
         }
         None
-    }
-}
-
-/// Select the row image used for view-relative dispatch based on event kind.
-///
-/// Returns the [`RowKind`] the compiler / VM should evaluate against.
-/// `Truncate` has no row image and is reported as `MissingRequiredRowImage`
-/// so callers route it to the truncate-only path.
-pub(crate) fn select_event_row_kind<E: CdcEvent>(event: &E) -> Result<RowKind, DispatchError> {
-    match event.kind() {
-        EventKind::Insert => Ok(RowKind::New),
-        EventKind::Update => Ok(RowKind::New),
-        EventKind::Delete => Ok(RowKind::Old),
-        EventKind::Truncate => Err(DispatchError::MissingRequiredRowImage(
-            "TRUNCATE has no row image",
-        )),
     }
 }
 

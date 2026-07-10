@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 6: retargeting to Value<B>; disabled until diesel connector impls migrate.
+
 //! Async parallel of [`Connector`](super::Connector).
 //!
 //! Mirrors the sync trait one-for-one, but returns `Send` futures so it

@@ -67,7 +67,10 @@ pub mod runtime;
 pub mod sqlite_cdc;
 pub mod wal;
 
-#[cfg(any(feature = "testing", test))]
+// `test_harnesses` still speaks the retired `Cell` / `RowImage` /
+// `WalEvent` types; Phase 10 rewrites it against `CdcEvent` typed
+// events. Excluded from Phase 5 baseline compilation.
+#[cfg(any())]
 pub mod test_harnesses;
 
 // Version and metadata

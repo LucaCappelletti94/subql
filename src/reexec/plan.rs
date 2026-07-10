@@ -41,6 +41,9 @@ pub(super) struct MinMaxPlan<B: Backend> {
     pub kind: ScalarAggKind,
     /// The aggregated column.
     pub agg_column: ColumnId,
+    /// [`ScalarKind`](crate::backend::ScalarKind) of the aggregated
+    /// column, used by maintenance to route event scalar accessors.
+    pub agg_kind: crate::backend::ScalarKind,
     /// Type of the aggregated column (`Unknown` when the catalog is silent).
     /// Returned to the materializer so it can decode the re-executed scalar.
     pub column_type: ColumnType,
@@ -86,6 +89,13 @@ where
 
     let column_type = crate::catalog_helpers::column_type(database, parsed.table_id, agg_column)
         .unwrap_or(ColumnType::Unknown);
+    let agg_kind = crate::catalog_helpers::column_scalar_kind(database, parsed.table_id, agg_column)
+        .ok_or_else(|| {
+            RegisterError::UnsupportedSql(format!(
+                "aggregated column {agg_column} of table {table_id} has an unsupported SQL type for the maintenance layer",
+                table_id = parsed.table_id,
+            ))
+        })?;
 
     let mut dependency_columns = parsed.where_dependency_columns.clone();
     if !dependency_columns.contains(&agg_column) {
@@ -102,6 +112,7 @@ where
         agg_column,
         column_type,
         dependency_columns,
+        agg_kind,
         where_program: Arc::new(parsed.where_program),
         reexec_sql,
     }))

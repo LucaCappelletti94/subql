@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 6: retargeting to Value<B>; disabled until diesel connector impls migrate.
+
 //! Auto-resolving re-execution engine: wraps [`ReExecEngine`] with a
 //! [`Connector`] and converts in-flight [`ReExecutionTrigger`]s into
 //! [`ScalarUpdate`]s inline.

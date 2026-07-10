@@ -502,6 +502,7 @@ where
             partitions: HashMap::new(),
             column_kinds: HashMap::new(),
             consumer_dictionaries: HashMap::new(),
+            subscription_to_table: HashMap::new(),
             next_subscription_id: 1,
             binding_dedup: HashMap::new(),
             vm: Vm::new(),
@@ -704,7 +705,7 @@ where
     #[allow(clippy::needless_pass_by_value)]
     pub fn register(
         &mut self,
-        spec: SubscriptionRequest<I>,
+        spec: SubscriptionRequest<I, E::Backend>,
     ) -> Result<RegisterResult, RegisterError> {
         // 1. Parse, compile, and canonicalize in one pass.
         let compiled = self.compile_spec(spec)?;
@@ -864,7 +865,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         update_sql: impl Into<String>,
-        binds: Vec<crate::Cell>,
+        binds: Vec<crate::backend::Value<E::Backend>>,
     ) -> Result<RegisterResult, RegisterError> {
         let update_sql = update_sql.into();
         let select_sql = crate::compiler::derive_update_follow_select(&update_sql, &self.dialect)?;
@@ -889,7 +890,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         table: &str,
-        pk: Vec<crate::Cell>,
+        pk: Vec<crate::backend::Value<E::Backend>>,
     ) -> Result<RegisterResult, RegisterError> {
         let table_id = catalog_helpers::table_id(&self.database, table)
             .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
@@ -917,8 +918,7 @@ where
         }
         let sql = format!("SELECT * FROM \"{table}\" WHERE {}", clauses.join(" AND "));
         // Build the tracked key before `pk` is moved into the request binds.
-        let key = crate::PrimaryKey::new(Arc::from(pk_cols.as_slice()), Arc::from(pk.as_slice()))
-            .map_err(|e| RegisterError::UnsupportedSql(format!("follow_row: {e}")))?;
+        let key = pk.clone();
         let result = self.register(SubscriptionRequest::new(consumer_id, sql).binds(pk))?;
         // Mark as a single-row follow so it self-closes when its row is deleted.
         self.pk_follows
@@ -986,7 +986,7 @@ where
     #[allow(clippy::too_many_lines)]
     pub fn register_batch(
         &mut self,
-        specs: Vec<SubscriptionRequest<I>>,
+        specs: Vec<SubscriptionRequest<I, E::Backend>>,
     ) -> Vec<Result<RegisterResult, RegisterError>> {
         // Eviction-aware fallback: when an active-eviction policy is
         // configured, within-batch eviction would have to consider
@@ -1010,7 +1010,8 @@ where
 
         // Phase 1: Parse and compile all specs (can fail individually).
         // Idempotent duplicates are short-circuited before binding creation.
-        let mut compiled: Vec<Option<CompiledSpec<I>>> = Vec::with_capacity(specs.len());
+        let mut compiled: Vec<Option<CompiledSpec<I, E::Backend>>> =
+            Vec::with_capacity(specs.len());
         let mut results: Vec<Result<RegisterResult, RegisterError>> =
             Vec::with_capacity(specs.len());
         // Within-batch natural-key dedup. Maps the natural key of a
@@ -1975,7 +1976,8 @@ where
         consumer_id: I::ConsumerId,
         sql: &str,
     ) -> Result<UnregisterReport, RegisterError> {
-        let (table_id, hash) = parse_and_resolve_hash(sql, &self.dialect, &self.database)?;
+        let (table_id, hash) =
+            parse_and_resolve_hash::<E::Backend, DB>(sql, &self.dialect, &self.database)?;
 
         let empty = UnregisterReport {
             removed_bindings: 0,
@@ -2338,14 +2340,14 @@ where
         let mut chosen_predicates: Vec<PredicateData> = pred_hash_to_data.into_values().collect();
         chosen_predicates.sort_unstable_by_key(|pred_data| pred_data.hash);
 
-        let mut entries: BatchEntries<I> = Vec::new();
+        let mut entries: BatchEntries<I, E::Backend> = Vec::new();
         for pred_data in chosen_predicates {
             let Some(bindings) = bindings_by_hash.remove(&pred_data.hash) else {
                 continue;
             };
 
-            let bytecode: BytecodeProgram = codec::deserialize(&pred_data.bytecode_instructions)
-                .map_err(|e| {
+            let bytecode: BytecodeProgram<E::Backend> =
+                codec::deserialize(&pred_data.bytecode_instructions).map_err(|e| {
                     RebuildPayloadError::Codec(format!("Bytecode deserialize error: {e}"))
                 })?;
 
@@ -2663,6 +2665,7 @@ impl<E, I, DB> SubscriptionRegistration<I, E::Backend> for SubscriptionEngine<E,
 where
     E: CdcEvent + Send + Sync,
     E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {
@@ -2682,6 +2685,7 @@ impl<E, I, DB> SubscriptionDispatch<I, E> for SubscriptionEngine<E, I, DB>
 where
     E: CdcEvent + Send + Sync,
     E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {
@@ -2697,6 +2701,7 @@ impl<E, I, DB> SubscriptionUnregistration<I> for SubscriptionEngine<E, I, DB>
 where
     E: CdcEvent + Send + Sync,
     E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {
@@ -2717,6 +2722,7 @@ impl<E, I, DB> crate::AggregateDispatch<I, E> for SubscriptionEngine<E, I, DB>
 where
     E: CdcEvent + Send + Sync,
     E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {
@@ -2733,6 +2739,7 @@ impl<E, I, DB> DurableShardStore for SubscriptionEngine<E, I, DB>
 where
     E: CdcEvent + Send + Sync,
     E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {
@@ -2746,6 +2753,7 @@ impl<E, I, DB> DurableShardMerge for SubscriptionEngine<E, I, DB>
 where
     E: CdcEvent + Send + Sync,
     E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {

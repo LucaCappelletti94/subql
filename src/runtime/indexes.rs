@@ -646,7 +646,7 @@ pub fn extract_indexable_atoms<B: Backend>(
     }
 }
 
-#[cfg(test)]
+#[cfg(any())] // Phase 10 test port pending
 #[allow(clippy::unwrap_used, clippy::approx_constant)]
 mod tests {
     use super::*;

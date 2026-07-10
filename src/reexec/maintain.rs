@@ -273,7 +273,6 @@ fn read_column<E>(event: &E, row: RowKind, col: ColumnId, kind: ScalarKind) -> V
 where
     E: CdcEvent,
 {
-    use crate::backend::Presence;
     match kind {
         ScalarKind::Bool => lift(event.bool_at(row, col), Value::Bool),
         ScalarKind::Int => lift(event.int_at(row, col), Value::Int),

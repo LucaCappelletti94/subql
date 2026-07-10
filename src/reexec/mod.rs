@@ -66,26 +66,24 @@
 //!   [`AsyncAutoResolvingEngine`] ship, but no concrete async backend
 //!   (sqlx, diesel-async) is bundled yet. See `MILESTONES.md`.
 
-mod async_auto;
-mod async_connector;
-mod auto;
-mod connector;
+// Phase 5 baseline: only `ReExecEngine` + its plan/maintain/connector
+// surface participate. The auto-resolving wrappers (`AutoResolvingEngine`,
+// `AsyncAutoResolvingEngine`) and the diesel-backed connector impls
+// interact with `Cell`-based `Connector` results and their diesel
+// query-building; migrating them to `Value<B>` is a Phase 6 undertaking
+// tracked in `docs/refactor-cdc-event-handoff.md`. Their sources remain
+// on disk with `#![cfg(any())]` at the top so they compile only when
+// explicitly re-enabled.
 mod engine;
 mod maintain;
 mod plan;
 
-pub use async_auto::AsyncAutoResolvingEngine;
-pub use async_connector::AsyncConnector;
-pub use auto::{AutoResolvingEngine, SnapshotResult};
-#[cfg(feature = "executor-diesel")]
-pub use connector::DieselConnector;
-#[cfg(feature = "executor-diesel-mysql")]
-pub use connector::MysqlDieselConnector;
-#[cfg(feature = "executor-diesel-postgres")]
-pub use connector::PgDieselConnector;
+// Connector trait shell (no diesel impls) so `ReExecEngine` and downstream
+// crates that reference `ReExecError` still link. The diesel-backed
+// impls are gated inside the file.
+mod connector;
+
 pub use connector::{Connector, ReExecError, Snapshot};
-#[cfg(feature = "executor-diesel-postgres-r2d2")]
-pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
 pub use engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     ReExecutionTrigger, Registered, ScalarUpdate,
