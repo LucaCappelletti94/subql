@@ -5,23 +5,82 @@ use super::{
     indexes::{HybridIndexes, IndexableAtom, IndexableCell},
     predicate::{Predicate, PredicateStore, SubscriptionBinding},
 };
+use crate::backend::Backend;
 use crate::{
-    compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, RowImage, SubscriptionId,
-    TableId,
+    compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, SubscriptionId, TableId,
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
 
+/// Three-valued presence flag reported by [`TablePartition::select_candidates`]'s
+/// column-probe closure. Mirrors the shape of [`crate::backend::Presence`] but
+/// without a payload: the caller conveys the payload via the paired
+/// [`ColumnProbe::value`] field.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CellPresence {
+    /// The source's row image did not carry this cell.
+    Missing,
+    /// The cell carries SQL `NULL`.
+    Null,
+    /// The cell carries a value (see [`ColumnProbe::value`]).
+    Present,
+}
+
+/// Column probe result yielded by [`TablePartition::select_candidates`]'s
+/// caller-supplied closure. Combines a presence flag with an optional
+/// indexable payload; only cells whose scalar payload downcasts to one of
+/// the four indexable primitives (`bool` / `i64` / `f64` / `String`) carry
+/// a `value`.
+#[derive(Clone, Debug)]
+pub struct ColumnProbe {
+    /// Whether the cell was `Missing`, `Null`, or `Present`.
+    pub presence: CellPresence,
+    /// The indexable payload if the cell is present and downcasts to a
+    /// primitive supported by the equality / range indexes.
+    pub value: Option<IndexableCell>,
+}
+
+impl ColumnProbe {
+    /// Convenience: a `Missing` cell with no value.
+    #[must_use]
+    pub const fn missing() -> Self {
+        Self {
+            presence: CellPresence::Missing,
+            value: None,
+        }
+    }
+
+    /// Convenience: a `Null` cell with no value.
+    #[must_use]
+    pub const fn null() -> Self {
+        Self {
+            presence: CellPresence::Null,
+            value: None,
+        }
+    }
+
+    /// Convenience: a `Present` cell. `value` may still be `None` when
+    /// the scalar payload does not downcast to an indexable primitive
+    /// (e.g. a UUID or JSONB cell on Postgres).
+    #[must_use]
+    pub const fn present(value: Option<IndexableCell>) -> Self {
+        Self {
+            presence: CellPresence::Present,
+            value,
+        }
+    }
+}
+
 /// Immutable snapshot of table partition
 ///
 /// Used for lock-free reads during dispatch.
 #[derive(Clone)]
-pub struct TablePartitionSnapshot<I: IdTypes> {
+pub struct TablePartitionSnapshot<I: IdTypes, B: Backend> {
     pub table_id: TableId,
     pub indexes: HybridIndexes,
-    pub predicates: Arc<PredicateStore<I>>,
+    pub predicates: Arc<PredicateStore<I, B>>,
 }
 
 pub(super) struct BindingRemoval<I: IdTypes> {
@@ -35,19 +94,19 @@ pub(super) struct BindingRemoval<I: IdTypes> {
 /// Uses ArcSwap for lock-free snapshot reads during event dispatch.
 /// The `mutable_predicates` field uses copy-on-write via `Arc::make_mut`,
 /// so snapshots share the store until a mutation occurs.
-pub struct TablePartition<I: IdTypes> {
+pub struct TablePartition<I: IdTypes, B: Backend> {
     table_id: TableId,
-    snapshot: ArcSwap<TablePartitionSnapshot<I>>,
-    /// COW predicate store: `Arc::clone` for cheap snapshots, `Arc::make_mut` for mutations
-    mutable_predicates: Arc<PredicateStore<I>>,
+    snapshot: ArcSwap<TablePartitionSnapshot<I, B>>,
+    /// COW predicate store: `Arc::clone` for cheap snapshots, `Arc::make_mut` for mutations.
+    mutable_predicates: Arc<PredicateStore<I, B>>,
 }
 
-impl<I: IdTypes> TablePartition<I> {
+impl<I: IdTypes, B: Backend> TablePartition<I, B> {
     /// Create new table partition
     #[must_use]
     pub fn new(table_id: TableId) -> Self {
-        let predicates = Arc::new(PredicateStore::<I>::new());
-        let snapshot = TablePartitionSnapshot::<I> {
+        let predicates = Arc::new(PredicateStore::<I, B>::new());
+        let snapshot = TablePartitionSnapshot::<I, B> {
             table_id,
             indexes: HybridIndexes::new(),
             predicates: Arc::clone(&predicates),
@@ -62,7 +121,7 @@ impl<I: IdTypes> TablePartition<I> {
 
     /// Load current snapshot (lock-free)
     #[must_use]
-    pub fn load_snapshot(&self) -> Arc<TablePartitionSnapshot<I>> {
+    pub fn load_snapshot(&self) -> Arc<TablePartitionSnapshot<I, B>> {
         self.snapshot.load_full()
     }
 
@@ -72,7 +131,7 @@ impl<I: IdTypes> TablePartition<I> {
     #[allow(clippy::needless_pass_by_value)]
     pub fn add_predicate(
         &mut self,
-        predicate: Predicate,
+        predicate: Predicate<B>,
         atoms: Vec<IndexableAtom>,
     ) -> PredicateId {
         let deps = predicate.dependency_columns.to_vec();
@@ -194,26 +253,35 @@ impl<I: IdTypes> TablePartition<I> {
         self.store_snapshot_with_indexes(new_indexes);
     }
 
-    /// Select candidate predicates for a row
+    /// Select candidate predicates for a row.
     ///
-    /// Returns union of all index lookups + fallback.
-    /// Guaranteed to include all matches (no false negatives).
+    /// The `read_col` closure yields the current column value as an
+    /// [`IndexableCell`] (or `None` for `Null` / `Missing`), together
+    /// with the null flag. Callers derived from a
+    /// [`crate::backend::CdcEvent`] compose this closure by iterating
+    /// column ids and dispatching on their pre-cached
+    /// [`crate::backend::ScalarKind`]. Returns the union of all index
+    /// lookups plus the fallback set (predicates that can't be indexed).
+    ///
+    /// Guaranteed no false negatives: every predicate that could match
+    /// the row is in the returned bitmap.
     #[must_use]
     pub fn select_candidates(
         &self,
-        row: &RowImage,
+        arity: usize,
+        mut read_col: impl FnMut(ColumnId) -> ColumnProbe,
         kind: EventKind,
         changed_cols: &[ColumnId],
     ) -> RoaringBitmap {
         let snapshot = self.load_snapshot();
 
-        // For Update events with a non-empty changed_cols list, return exactly the
-        // set of predicates that depend on at least one changed column. We cannot
-        // restrict further using the index (which reflects only the *new* row's
-        // values): a predicate might have matched the *old* value (e.g. an IS NULL
-        // predicate when the column transitions NULL to non-NULL) and still needs
-        // re-evaluation. Returning the full dependency set is always safe because
-        // the VM evaluates every candidate.
+        // For Update events with a non-empty changed_cols list, return
+        // exactly the set of predicates that depend on at least one
+        // changed column. The index reflects the *new* row values only:
+        // a predicate may have matched the *old* value (e.g. IS NULL
+        // when a column transitions NULL -> non-NULL) and still needs
+        // re-evaluation. Returning the full dependency set is always
+        // safe because the VM re-evaluates every candidate.
         if kind == EventKind::Update && !changed_cols.is_empty() {
             return HybridIndexes::select_update_deps(
                 &snapshot.indexes.dependency_free,
@@ -224,43 +292,43 @@ impl<I: IdTypes> TablePartition<I> {
 
         let mut candidates = RoaringBitmap::new();
 
-        // Always include fallback (unindexable predicates)
+        // Always include fallback (unindexable predicates).
         candidates |= &snapshot.indexes.fallback;
 
-        // Query indexes based on row values
-        for (col_idx, cell) in row.cells.iter().enumerate() {
+        for col_idx in 0..arity {
             #[allow(clippy::cast_possible_truncation)]
             let col_id = col_idx as ColumnId;
+            let probe = read_col(col_id);
 
-            if let Some(indexable) = IndexableCell::from_cell(cell) {
-                // Equality index
-                if let Some(bitmap) = snapshot.indexes.query_equality(col_id, &indexable) {
+            if let Some(indexable) = probe.value.as_ref() {
+                if let Some(bitmap) = snapshot.indexes.query_equality(col_id, indexable) {
                     candidates |= bitmap;
                 }
-
-                // Range index
                 snapshot
                     .indexes
-                    .query_range_into(col_id, &indexable, &mut candidates);
+                    .query_range_into(col_id, indexable, &mut candidates);
             }
 
-            // NULL index
-            if cell.is_null() {
-                if let Some(bitmap) = snapshot
-                    .indexes
-                    .null_checks
-                    .get(&(col_id, super::indexes::NullKind::IsNull))
-                {
-                    candidates |= bitmap;
+            match probe.presence {
+                CellPresence::Null => {
+                    if let Some(bitmap) = snapshot
+                        .indexes
+                        .null_checks
+                        .get(&(col_id, super::indexes::NullKind::IsNull))
+                    {
+                        candidates |= bitmap;
+                    }
                 }
-            } else if !cell.is_missing() {
-                if let Some(bitmap) = snapshot
-                    .indexes
-                    .null_checks
-                    .get(&(col_id, super::indexes::NullKind::IsNotNull))
-                {
-                    candidates |= bitmap;
+                CellPresence::Present => {
+                    if let Some(bitmap) = snapshot
+                        .indexes
+                        .null_checks
+                        .get(&(col_id, super::indexes::NullKind::IsNotNull))
+                    {
+                        candidates |= bitmap;
+                    }
                 }
+                CellPresence::Missing => {}
             }
         }
 
@@ -275,7 +343,11 @@ impl<I: IdTypes> TablePartition<I> {
     #[allow(clippy::type_complexity)]
     pub fn add_batch(
         &mut self,
-        entries: &[(Predicate, Vec<IndexableAtom>, Vec<SubscriptionBinding<I>>)],
+        entries: &[(
+            Predicate<B>,
+            Vec<IndexableAtom>,
+            Vec<SubscriptionBinding<I>>,
+        )],
     ) {
         if entries.is_empty() {
             return;
