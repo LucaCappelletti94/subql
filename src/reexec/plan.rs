@@ -10,7 +10,7 @@ use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::parser;
 use crate::compiler::sql_shape::{extract_scalar_aggregate, ScalarAggKind};
 use crate::compiler::BytecodeProgram;
-use crate::{ColumnId, ColumnType, RegisterError, TableId};
+use crate::{ColumnId, RegisterError, TableId};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -42,11 +42,9 @@ pub(super) struct MinMaxPlan<B: Backend> {
     /// The aggregated column.
     pub agg_column: ColumnId,
     /// [`ScalarKind`](crate::backend::ScalarKind) of the aggregated
-    /// column, used by maintenance to route event scalar accessors.
+    /// column, used by maintenance to route event scalar accessors and
+    /// as the decode hint returned to the materializer.
     pub agg_kind: crate::backend::ScalarKind,
-    /// Type of the aggregated column (`Unknown` when the catalog is silent).
-    /// Returned to the materializer so it can decode the re-executed scalar.
-    pub column_type: ColumnType,
     /// Columns whose change can alter the result: the aggregated column
     /// plus every column the WHERE clause reads (UPDATE routing
     /// optimization).
@@ -87,8 +85,6 @@ where
         ));
     };
 
-    let column_type = crate::catalog_helpers::column_type(database, parsed.table_id, agg_column)
-        .unwrap_or(ColumnType::Unknown);
     let agg_kind = crate::catalog_helpers::column_scalar_kind(database, parsed.table_id, agg_column)
         .ok_or_else(|| {
             RegisterError::UnsupportedSql(format!(
@@ -110,7 +106,6 @@ where
         table_id: parsed.table_id,
         kind,
         agg_column,
-        column_type,
         dependency_columns,
         agg_kind,
         where_program: Arc::new(parsed.where_program),

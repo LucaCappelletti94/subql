@@ -16,9 +16,8 @@ use crate::catalog_helpers::table_has_rls;
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::Vm;
 use crate::{
-    ColumnType, ConsumerNotifications, DispatchError, EventKind, IdTypes, RegisterError,
-    RegisterResult, SubscriptionEngine, SubscriptionRequest, SubscriptionScope, TableId,
-    UnregisterReport,
+    ConsumerNotifications, DispatchError, EventKind, IdTypes, RegisterError, RegisterResult,
+    SubscriptionEngine, SubscriptionRequest, SubscriptionScope, TableId, UnregisterReport,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -49,7 +48,7 @@ pub enum Registered {
     /// aggregate).
     Engine(RegisterResult),
     /// The query was captured for re-execution. The materializer must
-    /// bootstrap (run `sql`, decode the scalar as `column_type`) and call
+    /// bootstrap (run `sql`, decode the scalar as `column_kind`) and call
     /// [`ReExecEngine::install`] with the initial value. Until that
     /// happens the wrapper holds `Value::Null` for this query.
     ReExec {
@@ -57,8 +56,8 @@ pub enum Registered {
         query_id: ReExecQueryId,
         /// SQL to run for the initial value and for any later trigger.
         sql: String,
-        /// Decode type for the scalar result.
-        column_type: ColumnType,
+        /// Decode hint for the scalar result.
+        column_kind: crate::backend::ScalarKind,
     },
 }
 
@@ -264,7 +263,6 @@ where
             kind,
             agg_column,
             agg_kind,
-            column_type,
             dependency_columns,
             where_program,
             reexec_sql,
@@ -305,7 +303,7 @@ where
         Registered::ReExec {
             query_id,
             sql: reexec_sql,
-            column_type,
+            column_kind: agg_kind,
         }
     }
 

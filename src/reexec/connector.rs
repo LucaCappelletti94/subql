@@ -32,7 +32,8 @@
 //! expected to retry the batch. Retry policy lives in the Connector impl
 //! (or above the engine), never inside subql.
 
-use crate::{Cell, Checkpoint, ColumnType, DispatchError, RowImage};
+use crate::backend::{Backend, ScalarKind, Value};
+use crate::{Checkpoint, DispatchError};
 use thiserror::Error;
 
 /// A captured-state snapshot of a query's value, together with the
@@ -44,13 +45,11 @@ use thiserror::Error;
 /// snapshot to a position in the source stream. The `checkpoint` is
 /// `None` when the backend has no native notion of position (e.g.
 /// in-memory SQLite).
-// PartialEq only: callers that need to compare Snapshots get it for Cell
-// scalars (Cell is not Eq because of f64). Deriving Eq would forbid the
-// Cell parameterization.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub struct Snapshot<T, C: Checkpoint> {
-    /// The snapshot value (a scalar `Cell` or a `Vec<RowImage>`).
+    /// The snapshot value (a scalar [`Value`] or a `Vec<Vec<Value<_>>>`,
+    /// one inner `Vec` per row).
     pub value: T,
     /// The position at which the snapshot was read, when known.
     pub checkpoint: Option<C>,
@@ -58,8 +57,6 @@ pub struct Snapshot<T, C: Checkpoint> {
 
 #[cfg(feature = "executor-diesel")]
 use alloc::string::String;
-#[cfg(feature = "executor-diesel")]
-use alloc::sync::Arc;
 #[cfg(feature = "executor-diesel")]
 use core::cell::RefCell;
 #[cfg(feature = "executor-diesel")]
@@ -76,7 +73,8 @@ use diesel::{
 /// Implementors own the database connection and any retry, pooling, or
 /// per-viewer auth policy that the execution requires. Subql calls
 /// [`execute_scalar`](Self::execute_scalar) whenever the in-process state
-/// machine emits `NeedsReexecution`, then installs the returned [`Cell`].
+/// machine emits `NeedsReexecution`, then installs the returned
+/// [`Value`].
 ///
 /// # Auth context
 ///
@@ -106,41 +104,48 @@ pub trait Connector {
     /// Backends with no native position (in-memory SQLite, MySQL absent of
     /// binlog tracking) choose [`crate::NoCheckpoint`] and return `None`.
     type Checkpoint: Checkpoint;
+    /// Subql backend whose [`Value`] shape this connector produces.
+    type Backend: Backend;
 
     /// Run the re-execution SQL and decode a single scalar value with the
-    /// expected [`ColumnType`], optionally reporting the position at which
+    /// expected [`ScalarKind`], optionally reporting the position at which
     /// the read was taken.
     ///
     /// `sql` is exactly the string the plan rendered for re-execution and
     /// returned via [`Registered::ReExec`](super::Registered::ReExec) at
-    /// registration, with its projection already aliased. `column_type`
-    /// is the plan's decode hint. Impls may use it to pick the right diesel
+    /// registration, with its projection already aliased. `kind` is the
+    /// plan's decode hint. Impls may use it to pick the right diesel
     /// `QueryableByName` row, sqlx `Row::try_get` slot, etc., or ignore it
     /// and inspect the runtime row shape.
     ///
     /// The returned tuple is `(value, Option<checkpoint>)`. The checkpoint
     /// is informational for downstream replay layers. Subql does not gate
-    /// on it. An empty result set must return [`Cell::Null`] as the value
-    /// (matches the "set went empty" semantics of MIN/MAX).
+    /// on it. An empty result set must return [`Value::Null`] as the
+    /// value (matches the "set went empty" semantics of MIN/MAX).
     fn execute_scalar(
         &self,
         sql: &str,
-        column_type: ColumnType,
+        kind: ScalarKind,
         auth: &Self::AuthContext,
-    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error>;
+    ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>;
 
-    /// Run `sql` as a row-returning query and decode every row.
+    /// Run `sql` as a row-returning query and decode every row into a
+    /// column-ordered `Vec<Value<Self::Backend>>`.
     ///
     /// Used by the auto-resolving engine's `snapshot` method to bootstrap
-    /// a subscription, and by total single-table row re-execution once that
-    /// lands (see `MILESTONES.md`). Impls should open a read-only repeatable-read
-    /// transaction so the rows and the returned [`Snapshot::checkpoint`]
-    /// agree on a single point in the source stream.
+    /// a subscription, and by total single-table row re-execution once
+    /// that lands (see `MILESTONES.md`). Impls should open a read-only
+    /// repeatable-read transaction so the rows and the returned
+    /// [`Snapshot::checkpoint`] agree on a single point in the source
+    /// stream.
     fn execute_rows(
         &self,
         sql: &str,
         auth: &Self::AuthContext,
-    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error>;
+    ) -> Result<
+        Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
+        Self::Error,
+    >;
 }
 
 /// Error returned by [`AutoResolvingEngine::consumers`].
@@ -160,40 +165,111 @@ pub enum ReExecError<E> {
 }
 
 // ---------------------------------------------------------------------------
+// DieselBackend: subql-backend selector for the diesel connectors.
+// ---------------------------------------------------------------------------
+
+/// Bridge trait: names the subql [`Backend`] a diesel-backed connector
+/// produces [`Value`]s for, and constructs those [`Value`]s from the
+/// scalar wire shapes diesel's `sql_query` hands back.
+///
+/// Implemented for the three shipped backends ([`crate::backend::Postgres`],
+/// [`crate::backend::MySql`], [`crate::backend::SQLite`]), each of which
+/// spells [`Backend::Int`] / [`Backend::Float`] / [`Backend::String`] as
+/// `i64` / `f64` / `String` respectively; the constructors are trivial and
+/// let the generic [`DieselConnector<C, B>`] stay backend-agnostic at the
+/// type level while producing correctly typed [`Value<B>`]s.
+#[cfg(feature = "executor-diesel")]
+pub trait DieselBackend: crate::backend::Backend + Sized {
+    /// Wrap an `i64` decoded via `Nullable<BigInt>` as [`Value::Int`].
+    fn value_from_i64(x: i64) -> Value<Self>;
+    /// Wrap an `f64` decoded via `Nullable<Double>` as [`Value::Float`].
+    fn value_from_f64(x: f64) -> Value<Self>;
+    /// Wrap a `String` decoded via `Nullable<Text>` as [`Value::String`].
+    fn value_from_string(s: String) -> Value<Self>;
+}
+
+#[cfg(feature = "executor-diesel")]
+impl DieselBackend for crate::backend::Postgres {
+    fn value_from_i64(x: i64) -> Value<Self> {
+        Value::Int(x)
+    }
+    fn value_from_f64(x: f64) -> Value<Self> {
+        Value::Float(x)
+    }
+    fn value_from_string(s: String) -> Value<Self> {
+        Value::String(s)
+    }
+}
+
+#[cfg(feature = "executor-diesel")]
+impl DieselBackend for crate::backend::MySql {
+    fn value_from_i64(x: i64) -> Value<Self> {
+        Value::Int(x)
+    }
+    fn value_from_f64(x: f64) -> Value<Self> {
+        Value::Float(x)
+    }
+    fn value_from_string(s: String) -> Value<Self> {
+        Value::String(s)
+    }
+}
+
+#[cfg(feature = "executor-diesel")]
+impl DieselBackend for crate::backend::SQLite {
+    fn value_from_i64(x: i64) -> Value<Self> {
+        Value::Int(x)
+    }
+    fn value_from_f64(x: f64) -> Value<Self> {
+        Value::Float(x)
+    }
+    fn value_from_string(s: String) -> Value<Self> {
+        Value::String(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DieselConnector: opt-in sync impl shipped behind `executor-diesel`.
 // ---------------------------------------------------------------------------
 
 /// Sync [`Connector`] backed by a single diesel [`Connection`].
 ///
 /// Holds the connection in a [`RefCell`] for the interior-mutability the
-/// trait's `&self` requires. Not `Send`/`Sync` (diesel connections are not
-/// `Send`). For multi-threaded use, either keep the connector thread-local
-/// or implement [`Connector`] yourself over a connection pool
-/// (`r2d2::Pool<ConnectionManager<C>>`, `deadpool`, `bb8`).
+/// trait's `&self` requires. Not `Send`/`Sync` (diesel connections are
+/// not `Send`). For multi-threaded use, either keep the connector
+/// thread-local or implement [`Connector`] yourself over a connection
+/// pool (`r2d2::Pool<ConnectionManager<C>>`, `deadpool`, `bb8`).
 ///
-/// Bounds:
+/// Type parameters:
 /// * `C: Connection` - any diesel connection.
-/// * For each backend the HRTB on the [`Connector`] impl ensures
-///   [`sql_query`] can decode the nullable scalar rows
-///   (`Nullable<BigInt>`, `Nullable<Double>`, `Nullable<Text>`).
-///   PostgreSQL, MySQL, and SQLite all satisfy these.
+/// * `B: DieselBackend` - the subql [`Backend`] whose [`Value`] shape the
+///   connector produces. Pick to match the diesel connection's backend
+///   ([`crate::backend::Postgres`] for `PgConnection`,
+///   [`crate::backend::SQLite`] for `SqliteConnection`,
+///   [`crate::backend::MySql`] for `MysqlConnection`).
+///
+/// Bounds on the [`Connector`] impl: an HRTB on [`sql_query`] so the
+/// nullable scalar rows (`Nullable<BigInt>`, `Nullable<Double>`,
+/// `Nullable<Text>`) decode. PostgreSQL, MySQL, and SQLite all satisfy
+/// these.
 ///
 /// # Errors
 ///
 /// Returns [`diesel::result::Error`] for any underlying database failure
 /// (network drop, statement error, decoding mismatch).
 #[cfg(feature = "executor-diesel")]
-pub struct DieselConnector<C: Connection> {
+pub struct DieselConnector<C: Connection, B: DieselBackend> {
     conn: RefCell<C>,
+    _backend: core::marker::PhantomData<fn() -> B>,
 }
 
 #[cfg(feature = "executor-diesel")]
-impl<C: Connection> DieselConnector<C> {
+impl<C: Connection, B: DieselBackend> DieselConnector<C, B> {
     /// Wrap an owned connection. The connector takes exclusive ownership
     /// and serializes access through interior mutability.
     pub const fn new(conn: C) -> Self {
         Self {
             conn: RefCell::new(conn),
+            _backend: core::marker::PhantomData,
         }
     }
 }
@@ -219,33 +295,52 @@ struct TextRow {
     v: Option<String>,
 }
 
+/// Route the projected column through the `Nullable<BigInt|Double|Text>`
+/// row shape that matches `kind`, then lift into [`Value<B>`].
+///
+/// Aggregate-only column kinds ([`ScalarKind::Int`] / [`ScalarKind::Float`])
+/// map to the numeric rows; every other kind reads through the `Text`
+/// row. Decimals are carried as text through this path so precision is
+/// not lost through `f64`.
 #[cfg(feature = "executor-diesel")]
-fn load_cell<C>(conn: &mut C, sql: &str, column_type: ColumnType) -> QueryResult<Cell>
+fn load_scalar<C, B>(conn: &mut C, sql: &str, kind: ScalarKind) -> QueryResult<Value<B>>
 where
+    B: DieselBackend,
     for<'q> SqlQuery:
         LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
 {
-    let cell = match column_type {
-        ColumnType::Int => sql_query(sql)
+    let value = match kind {
+        ScalarKind::Int => sql_query(sql)
             .get_result::<IntRow>(conn)?
             .v
-            .map_or(Cell::Null, Cell::Int),
-        ColumnType::Float => sql_query(sql)
+            .map_or(Value::Null, B::value_from_i64),
+        ScalarKind::Float => sql_query(sql)
             .get_result::<FloatRow>(conn)?
             .v
-            .map_or(Cell::Null, Cell::Float),
-        ColumnType::Bool | ColumnType::String | ColumnType::Unknown => sql_query(sql)
+            .map_or(Value::Null, B::value_from_f64),
+        ScalarKind::Bool
+        | ScalarKind::String
+        | ScalarKind::Bytes
+        | ScalarKind::Uuid
+        | ScalarKind::Timestamp
+        | ScalarKind::TimestampTz
+        | ScalarKind::Date
+        | ScalarKind::Time
+        | ScalarKind::Decimal
+        | ScalarKind::Json
+        | ScalarKind::Jsonb => sql_query(sql)
             .get_result::<TextRow>(conn)?
             .v
-            .map_or(Cell::Null, |s| Cell::String(Arc::from(s))),
+            .map_or(Value::Null, B::value_from_string),
     };
-    Ok(cell)
+    Ok(value)
 }
 
 #[cfg(feature = "executor-diesel")]
-impl<C> Connector for DieselConnector<C>
+impl<C, B> Connector for DieselConnector<C, B>
 where
     C: Connection,
+    B: DieselBackend,
     for<'q> SqlQuery:
         LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
 {
@@ -256,30 +351,31 @@ where
     /// (`PgDieselConnector`) override this to `PgLsn` and read
     /// `pg_current_wal_lsn()` inside the snapshot transaction.
     type Checkpoint = crate::NoCheckpoint;
+    type Backend = B;
 
     fn execute_scalar(
         &self,
         sql: &str,
-        column_type: ColumnType,
+        kind: ScalarKind,
         _auth: &(),
-    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
-        let cell = load_cell(&mut self.conn.borrow_mut(), sql, column_type)?;
-        Ok((cell, None))
+    ) -> Result<(Value<B>, Option<Self::Checkpoint>), Self::Error> {
+        let value = load_scalar::<_, B>(&mut self.conn.borrow_mut(), sql, kind)?;
+        Ok((value, None))
     }
 
     fn execute_rows(
         &self,
         _sql: &str,
         _auth: &(),
-    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
+    ) -> Result<Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<B>>>, Self::Checkpoint>, Self::Error>
+    {
         // Row-set decoding through diesel's `sql_query` requires the
         // caller to know the schema at compile time (each column wants
-        // its own typed accessor). The
-        // generic row-decoding path lands with the total reexec feature
-        // (tracked in MILESTONES.md). For now this method is
-        // wired up as a panic so any caller that opts into it gets a
-        // clear signal that it is not yet implemented for the generic
-        // DieselConnector.
+        // its own typed accessor). The generic row-decoding path lands
+        // with the total reexec feature (tracked in `MILESTONES.md`).
+        // For now this method is wired up as a panic so any caller that
+        // opts into it gets a clear signal that it is not yet
+        // implemented for the generic `DieselConnector`.
         #[allow(clippy::unimplemented)]
         {
             unimplemented!(
@@ -300,7 +396,8 @@ where
 /// On each `execute_scalar` (and future `execute_rows`) call the connector
 /// opens a `READ ONLY REPEATABLE READ` transaction, queries
 /// `pg_current_wal_lsn()` alongside the user's SQL, and returns the
-/// resulting [`Cell`] together with the parsed [`crate::PgLsn`]. The user
+/// resulting [`Value<crate::backend::Postgres>`] together with the
+/// parsed [`crate::PgLsn`]. The user
 /// query and the LSN observe the same MVCC snapshot, so downstream replay
 /// layers (an oplog, a client cursor) can chain WAL events onto the
 /// snapshot at exactly the position the snapshot was taken.
@@ -350,21 +447,22 @@ impl Connector for PgDieselConnector {
     type AuthContext = ();
     type Error = diesel::result::Error;
     type Checkpoint = crate::PgLsn;
+    type Backend = crate::backend::Postgres;
 
     fn execute_scalar(
         &self,
         sql: &str,
-        column_type: ColumnType,
+        kind: ScalarKind,
         _auth: &(),
-    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
+    ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
-            // Pin the transaction's MVCC snapshot so the user query and the
-            // LSN agree on a single point in the WAL.
+            // Pin the transaction's MVCC snapshot so the user query and
+            // the LSN agree on a single point in the WAL.
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
-            let cell = load_cell(conn, sql, column_type)?;
+            let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
             let lsn = read_current_lsn(conn)?;
-            Ok((cell, lsn))
+            Ok((value, lsn))
         })
     }
 
@@ -372,7 +470,10 @@ impl Connector for PgDieselConnector {
         &self,
         _sql: &str,
         _auth: &(),
-    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
+    ) -> Result<
+        Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
+        Self::Error,
+    > {
         // Same restriction as DieselConnector: generic row decoding is
         // deferred to the total row reexec feature.
         #[allow(clippy::unimplemented)]
@@ -395,7 +496,8 @@ impl Connector for PgDieselConnector {
 ///
 /// On each `execute_scalar` call the connector runs the user's SQL and then
 /// reads `performance_schema.log_status` inside one transaction, returning the
-/// resulting [`Cell`] together with the parsed [`crate::MysqlBinlogPos`] (the
+/// resulting [`Value<crate::backend::MySql>`] together with the parsed
+/// [`crate::MysqlBinlogPos`] (the
 /// binlog file's numeric suffix + byte offset).
 ///
 /// `log_status` is used rather than `SHOW MASTER STATUS` because diesel's
@@ -490,18 +592,19 @@ impl Connector for MysqlDieselConnector {
     type AuthContext = ();
     type Error = diesel::result::Error;
     type Checkpoint = crate::MysqlBinlogPos;
+    type Backend = crate::backend::MySql;
 
     fn execute_scalar(
         &self,
         sql: &str,
-        column_type: ColumnType,
+        kind: ScalarKind,
         _auth: &(),
-    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
+    ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
-            let cell = load_cell(conn, sql, column_type)?;
+            let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
             let pos = read_binlog_pos(conn);
-            Ok((cell, pos))
+            Ok((value, pos))
         })
     }
 
@@ -509,9 +612,12 @@ impl Connector for MysqlDieselConnector {
         &self,
         _sql: &str,
         _auth: &(),
-    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
-        // Same restriction as the other diesel connectors: generic row decoding
-        // is deferred to the total row reexec feature.
+    ) -> Result<
+        Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
+        Self::Error,
+    > {
+        // Same restriction as the other diesel connectors: generic row
+        // decoding is deferred to the total row reexec feature.
         #[allow(clippy::unimplemented)]
         {
             unimplemented!(
@@ -597,21 +703,22 @@ impl Connector for PgR2D2DieselConnector {
     type AuthContext = ();
     type Error = PgR2D2Error;
     type Checkpoint = crate::PgLsn;
+    type Backend = crate::backend::Postgres;
 
     fn execute_scalar(
         &self,
         sql: &str,
-        column_type: ColumnType,
+        kind: ScalarKind,
         _auth: &(),
-    ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
+    ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.pool.get()?;
-        let result: Result<(Cell, Option<crate::PgLsn>), diesel::result::Error> =
+        let result: Result<(Value<Self::Backend>, Option<crate::PgLsn>), diesel::result::Error> =
             diesel::connection::Connection::transaction(&mut *conn, |conn| {
                 sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                     .execute(conn)?;
-                let cell = load_cell(conn, sql, column_type)?;
+                let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
                 let lsn = read_current_lsn(conn)?;
-                Ok((cell, lsn))
+                Ok((value, lsn))
             });
         Ok(result?)
     }
@@ -620,7 +727,10 @@ impl Connector for PgR2D2DieselConnector {
         &self,
         _sql: &str,
         _auth: &(),
-    ) -> Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error> {
+    ) -> Result<
+        Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
+        Self::Error,
+    > {
         #[allow(clippy::unimplemented)]
         {
             unimplemented!(
