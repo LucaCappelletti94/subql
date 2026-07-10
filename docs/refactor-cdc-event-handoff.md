@@ -2,7 +2,9 @@
 
 **Branch**: `refactor/cdc-event-trait`
 **Baseline commit**: `2a68599 Introduce Backend and CdcEvent trait system for typed CDC events`
-**Status**: design layer landed and compiling; downstream migration not started.
+**Status**: Phases 3-6 landed; Phase 7 (parser `impl CdcEvent`) is the next entry point.
+**Current HEAD**: `02047f3 Phase 6: expose DieselBackend and connector types; update reexec/mod.rs notes`.
+**Verified compile / test bar**: `cargo +1.88 check --lib --all-features` clean with zero warnings; `cargo +1.88 test --lib --release` = 399 passing (down from 987 baseline because ~600 legacy tests are gated behind `#![cfg(any())]` until Phase 10). Clippy and rustdoc lints not yet run; those are Phase 11.
 
 ## Why the refactor exists
 
@@ -40,13 +42,60 @@ subql today funnels every CDC source (wal2json v1/v2, pgoutput, Debezium, Maxwel
 - Cargo deps: `chrono`, `bigdecimal`, `uuid` (moved from dev-dep to regular).
 - `src/lib.rs`: `pub mod backend;`.
 
-## What is not yet done
+## Progress so far
 
-The whole downstream. Nothing in the crate uses the new trait system — every file still speaks `Cell` / `RowImage` / `PrimaryKey` / `WalEvent<C>`.
+`cargo +1.88 test --lib --release` = 399 passing on `refactor/cdc-event-trait` at `02047f3`. Feature configs exercised in this session and known clean: default (`--lib`), `executor-diesel`, `executor-diesel-postgres`, `executor-diesel-mysql`, `executor-diesel-postgres-r2d2`, `diesel-typed`, `diesel-typed-sqlite`, `diesel-typed-mysql`, `pg-streaming`, `sqlite-cdc`, and the combined `std,pg-streaming,executor-diesel,executor-diesel-postgres,executor-diesel-mysql,executor-diesel-postgres-r2d2,diesel-typed,dhat-heap,sqlite-cdc,testing`. `--all-features` also clean.
 
-### File-by-file scope estimate
+~600 legacy tests are gated behind `#![cfg(any())]` at file level or gated `mod tests` blocks (7 in the runtime cluster) so the crate compiles cleanly while their `WalEvent::builder` / `Cell::` bodies wait for Phase 10 rewrite.
 
-Count of legacy-type references per file (baseline):
+Currently gated (Phase 10 rewrite pending):
+
+- `src/memory_profile_workload.rs` (gated in `src/lib.rs`; benchmark harness against typed `CdcEvent` fixture).
+- `src/reexec/auto.rs`, `src/reexec/async_auto.rs`, `src/reexec/async_connector.rs` (file-level `#![cfg(any())]`). `async_connector.rs` was retargeted to the `Value<B>` shape in Phase 6 so it lines up when it un-gates; `auto.rs` / `async_auto.rs` bodies still speak `Cell` / `WalEvent` / `SubscriptionEngine<D: Dialect, ...>` from before Phase 5, and get a full rewrite when they un-gate.
+- 7 `mod tests` blocks throughout the runtime cluster carrying `WalEvent::builder(...)` fixtures.
+- Integration tests under `tests/`: `reexec_diesel.rs`, `reexec_postgres.rs`, `reexec_mysql.rs`, `reexec_postgres_r2d2.rs`, `follow_insert_*`, `follow_cdc_sqlite` all break at the module surface (they still spell `SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>` and construct `Cell::Float(5.0)`). They are `#[ignore]`d on the Docker path so they do not block `cargo test`, but they will not compile until Phase 10.
+
+### Commit graph on `refactor/cdc-event-trait`
+
+```
+02047f3 Phase 6: expose DieselBackend and connector types; update reexec/mod.rs notes
+729ed09 Phase 6: Connector trait produces Value<B>; retire Cell/ColumnType from reexec
+aa61929 Phase 6 progress: diesel_api Backend-generic; gate memory_profile_workload
+a642ac5 Phase 5 complete: workspace compiles clean; 399 tests pass
+c0701e3 Phase 5 progress: Backend-generic reexec/plan + reexec/maintain
+057da9f Phase 5 progress: SubscriptionEngine<E: CdcEvent, I, DB>; typed traits
+c94b66f Phase 5 progress: Backend-generic dispatch.rs + agg.rs (E: CdcEvent, closure-driven kernels)
+1e18a8d Phase 5 progress: Backend-generic predicate/indexes/partition runtime storage
+2b8baf6 Phase 4: parser + prefilter emit Instruction<B>, target-typed literals
+0812982 sql-traits upstream: JSONB and TIMESTAMPTZ canonical tokens; simplify column_scalar_kind
+4faa5ba Phase 4 groundwork: SqlLiteralParse companion + column_scalar_kind helper
+149c7bf Phase 3: Instruction<B>, BytecodeProgram<B>, Vm<B>, value_cmp.rs
+2a68599 Introduce Backend and CdcEvent trait system for typed CDC events   <- baseline
+```
+
+`sql-traits` dependency pinned to `git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main` at revision `fe18e67` (updated during Phase 4). `column_scalar_kind` upstream simplification landed in the same revision.
+
+## Migration plan (status-annotated)
+
+**Phase 3 — DONE (`149c7bf`)**: interpreter core. `src/compiler/bytecode.rs` carries `Instruction<B>` (variants `PushLiteral(Value<B>)`, `LoadColumn(ColumnId, ScalarKind)`, `In(Vec<Value<B>>)` — others unchanged) and `BytecodeProgram<B>`. `src/compiler/vm.rs` holds `Vm<B>` with `Vec<StackValue<B>>` where `StackValue<B> = Value(Value<B>) | Tri(Tri)`, and `Vm::eval<E: CdcEvent<Backend = B>>(&mut self, prog: &BytecodeProgram<B>, event: &E, row: RowKind)`. `src/compiler/cell_cmp.rs` was replaced by `src/compiler/value_cmp.rs` (same-scalar comparison only; no runtime Int/Float coercion). `Clone` / `Debug` / `PartialEq` on `Value<B>`, `Instruction<B>`, `BytecodeProgram<B>`, `StackValue<B>` are hand-implemented so their bounds fall on the payloads, not on `B` itself (deriving would defensively add `B: Clone` / `B: Debug` / `B: PartialEq` and prevent `Vm<B: Backend>` from being usable). 11 smoke tests + a private `TestEvent<B>` scaffold in `vm.rs` back the phase.
+
+**Phase 4 — DONE (`4faa5ba`, `0812982`, `2b8baf6`)**: compiler stages. `SqlLiteralParse: Backend + Sized` (in `src/compiler/literals.rs`) is a companion trait to `Backend`, not an extension of it, so CDC-runtime paths that only read events do not inherit a sqlparser dependency. Implemented for `Postgres`, `MySql`, `SQLite` (13 scalars each). `catalog_helpers::column_scalar_kind` returns the finer-grained `ScalarKind` (replaces the coarse `ColumnType` in typed contexts). `src/compiler/parser.rs` became Backend-generic (`<B: Backend + SqlLiteralParse, DB: DatabaseLike>`); target-typed literal inference is in place; a private `wrap_bare_value_as_tri` helper preserves the "bool literal wrapped as `Tri`" surface. `src/compiler/prefilter.rs` swept to the same shape. `value_to_sql_value` handles the reverse direction for the diesel-typed binds.
+
+**Phase 5 — DONE (`1e18a8d`, `c94b66f`, `057da9f`, `c0701e3`, `a642ac5`)**: runtime. `SubscriptionEngine<E: CdcEvent, I: IdTypes, DB: DatabaseLike>` — the `D: Dialect` slot was dropped (it collapses into `E::Backend::Dialect`). The runtime cluster (`src/runtime/{dispatch, agg, indexes, partition, predicate}.rs`) is rewritten: every `Cell` match is a typed accessor call, every `&WalEvent<C>` is `&E`, every `RowImage` disappeared (readers go through `E`'s scalar accessors). `Predicate<B>`, `PredicateStore<I, B>`, `TablePartition<I, B>` with `ColumnProbe` / `CellPresence`, `IndexableCell::from_value<B>` via `Any::downcast_ref`, `AggCellRead` / closure-driven `AggKernel`, `column_kinds: HashMap<TableId, Arc<[ScalarKind]>>` cache. `SubscriptionRequest<I, B: Backend = Postgres>` uses the default backend for source compatibility. Four registration / dispatch traits are parameterized: `SubscriptionRegistration<I, B>`, `SubscriptionDispatch<I, E>`, `AsyncSubscriptionDispatch<I, E>`, `AggregateDispatch<I, E>`. `src/reexec/{plan, maintain, engine}.rs` are also Phase 5 — `ReExecEngine<E: CdcEvent, I, DB>` where `E::Backend: SqlLiteralParse`. All 6 trait impls on `SubscriptionEngine` require `<E::Backend as Backend>::Dialect: Send + Sync`.
+
+**Phase 6 — DONE (`aa61929`, `729ed09`, `02047f3`)**: reexec + auxiliary Connector cascade + diesel-typed API.
+  - `src/diesel_api/mod.rs`: `BindDecode` and `FollowRowDecode` traits both carry `type SubqlBackend: crate::backend::Backend` (`Pg -> Postgres`, `Sqlite -> SQLite`, `Mysql -> MySql`). `render_typed` returns `(String, Vec<Value<D::SubqlBackend>>)`. `SubscriptionEngine::register_select_typed` / `register_follow_update_typed` / `register_follow_insert` take a diesel backend `D: BindDecode<SubqlBackend = E::Backend>` (respectively `FollowRowDecode` for the insert path) so the diesel query's rendered flavor matches the engine event's backend. Postgres emits `Value::Uuid(uuid::Uuid)` for `OID::UUID`; SQLite / MySQL emit `Value::String` (canonical hyphenated form). BLOB / bytea binds are rejected as unsupported.
+  - `src/reexec/plan.rs`: `MinMaxPlan.column_type: ColumnType` retired; `agg_kind: ScalarKind` is now the sole decode hint field on the plan.
+  - `src/reexec/engine.rs`: `Registered::ReExec { column_type: ColumnType }` becomes `Registered::ReExec { column_kind: ScalarKind }`.
+  - `src/reexec/connector.rs`: `Connector` trait gains `type Backend: Backend`. `execute_scalar(&self, sql: &str, kind: ScalarKind, auth: &Self::AuthContext) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>`. `execute_rows` returns `Snapshot<Vec<Vec<Value<Self::Backend>>>, Self::Checkpoint>`. New bridge trait `DieselBackend: Backend + Sized` in the same file has `value_from_i64` / `value_from_f64` / `value_from_string` and is impl'd for `Postgres`, `MySql`, `SQLite` (all three carry `Int=i64`, `Float=f64`, `String=String`). Generic `DieselConnector<C: Connection, B: DieselBackend>` gains a `PhantomData<fn() -> B>`; construction is `DieselConnector::<PgConnection, Postgres>::new(conn)` etc. `PgDieselConnector`, `MysqlDieselConnector`, `PgR2D2DieselConnector` hardcode `type Backend = Postgres` / `MySql` / `Postgres`. `load_scalar<C, B: DieselBackend>` routes `ScalarKind::{Int, Float}` through `IntRow`/`FloatRow`, and the ten non-numeric kinds through `TextRow` (decimals as text through this path so precision is not lost through `f64`).
+  - `src/reexec/async_connector.rs` (gated): `AsyncConnector` retargeted to the same shape (`type Backend`, `ScalarKind` hint, `Value<Self::Backend>` return).
+  - `src/reexec/mod.rs`: re-exports `Connector`, `Snapshot`, `ReExecError`, and the diesel connectors + `DieselBackend` + `PgR2D2Error` behind their feature gates. Phase note refreshed.
+  - `src/persistence/*` and `src/polling/mod.rs` already compiled clean under Phase 5 and needed no further work in Phase 6; `src/memory_profile_workload.rs` is gated (Phase 10 rewrite).
+  - `src/reexec/auto.rs` and `src/reexec/async_auto.rs` stay file-level gated. Their bodies still spell `Cell` / `WalEvent` / `SubscriptionEngine<D: Dialect, ...>` and would need a broad rewrite to consume Phase 5's `SubscriptionEngine<E: CdcEvent, ...>`. Doing that rewrite blind (without compile feedback under `#![cfg(any())]`) tends to leave subtle bugs — the pragmatic call is to un-gate as a discrete step in the Phase 6 continuation (see "Next up" below) and let the compiler drive.
+
+### Legacy-type reference counts (baseline snapshot, unchanged since baseline)
+
+The table below is the original scope estimate against the baseline `2a68599`. It has NOT been re-tallied since — Phases 3-6 rewrote or gated the top rows already, so per-file numbers no longer reflect current state. Kept for scope orientation only.
 
 | File | `Cell::` | `WalEvent` | `RowImage` | `PrimaryKey` |
 |---|---:|---:|---:|---:|
@@ -63,49 +112,73 @@ Count of legacy-type references per file (baseline):
 | `src/diesel_api/mod.rs` | 41 | | | |
 | `src/wal/pgoutput.rs` | 35 | | | |
 | `src/wal/wal2json.rs` | | | 5 | 2 |
-| `src/wal/debezium.rs` | | | | |
-| `src/wal/maxwell.rs` | | | | |
 | `src/wal/mod.rs` | | 17 | 13 | 3 |
 | `src/wal/streaming.rs` | | 7 | | |
 | `src/wal/row_build.rs` | | | 6 | 1 |
-| `src/wal/pg_streaming.rs` | | | | |
 | `src/sqlite_cdc/source.rs` | | 8 | | 2 |
 | `src/sqlite_cdc/pgoutput_bridge.rs` | | 11 | | |
-| `src/sqlite_cdc/mod.rs` | | | | |
 | `src/reexec/engine.rs` | | 11 | | |
 | `src/reexec/auto.rs` | | 10 | 6 | |
 | `src/reexec/async_auto.rs` | | 9 | | |
 | `src/reexec/connector.rs` | | | 7 | |
 | `src/row_set.rs` | | | 15 | |
 | `src/test_harnesses.rs` | | 14 | | 6 |
-| `src/memory_profile_workload.rs` | | | | |
-| `src/polling/mod.rs` | | | | |
-| `src/checkpoint.rs` | | | | |
-| `src/errors.rs` | | | | |
 
-Plus doctests scattered across `runtime/engine.rs` (~50+ event constructors), `sqlite_cdc/source.rs`, `wal/*.rs`, `catalog_helpers.rs`, `types.rs`.
+Total original scope: ~40 files, ~35k LOC to touch, ~5-8k LOC net new. Phase-3-through-6 covered the runtime + compiler + reexec + diesel-typed + connector clusters; the wal parser cluster (Phase 7), `sqlite_cdc` (Phase 8), and the `types.rs` cleanup (Phase 9) remain.
 
-Total: ~40 files, ~35k LOC to touch, ~5-8k LOC net new.
+## Migration plan (remaining phases)
 
-## Migration plan (in order)
+**Phase 7 — NEXT ENTRY POINT**: parser `impl CdcEvent`. `src/wal/wal2json.rs`, `src/wal/pgoutput.rs`, `src/wal/debezium.rs`, `src/wal/maxwell.rs` currently define private `struct Wal2JsonV{1,2}Message`, `struct DebeziumEnvelope`, `struct MaxwellMessage` (all `Deserialize`-only) and a `PgOutputMessage` in the pgoutput binary wire path. Each parser today builds a `WalEvent<C>` from the parsed shape. Phase 7 makes the parsed shape itself `impl CdcEvent` — `type Backend = Postgres` for the PG-native flavors (wal2json, pgoutput), `type Backend = MySql` for Maxwell, `type Backend` decided per-config for Debezium (Debezium fronts multiple sources; the simplest cut is one impl per backend). Each impl provides the typed scalar accessors (`bool_at`, `int_at`, ...) by reading the parser's already-typed fields (wal2json JSON values decoded per column type, pgoutput binary wire types, Debezium/Maxwell JSON envelopes). The parser's `WalParser` trait output changes from `Result<Vec<WalEvent<C>>, WalParseError>` to `Result<Vec<Self::Event>, WalParseError>` (or similar); consumers upstream (which are the streaming source glue in `src/wal/{mod, streaming, pg_streaming}.rs`) then feed events straight to `SubscriptionEngine::consumers`.
 
-**Phase 3: interpreter core rewrite**. Rewrite `src/compiler/bytecode.rs`, `src/compiler/cell_cmp.rs` → `value_cmp.rs`, `src/compiler/vm.rs` to be Backend-generic. `Instruction<B>` variants: `PushLiteral(Value<B>)`, `LoadColumn(ColumnId, ScalarKind)` (gains `ScalarKind`), `In(Vec<Value<B>>)`; other variants unchanged. `BytecodeProgram<B>`. `Vm<B>` holding `Vec<StackValue<B>>` where `StackValue<B>` is `Value(Value<B>) | Tri(Tri)`. `Vm::eval<E: CdcEvent<Backend = B>>(&mut self, prog: &BytecodeProgram<B>, event: &E, row: RowKind)`. Arithmetic helpers stay same-type-only for MVP (no runtime Int/Float coercion); if a future need surfaces, add explicit `Cast` instructions in the compiler.
+**Phase 8**: `SqliteCdc`. `src/sqlite_cdc/source.rs` currently produces `WalEvent<C>`. Under the new shape it needs a native event type (probably `struct SqliteCdcEvent { table_id, kind, pk_columns, changed_columns, row_new, row_old }` where `row_*` are `Vec<Value<SQLite>>` decoded from the shadow log) with `impl CdcEvent for SqliteCdcEvent { type Backend = SQLite; }`. Or: drop the SqliteCdc translation entirely and drive an `impl CdcEvent for sqlite_diff_rs::PatchsetOp<'_, ...>` under a `patchset` feature.
 
-**Phase 4: compiler stages**. Rewrite `src/compiler/parser.rs`, `prefilter.rs`, `canonicalize.rs`, `sql_shape.rs`, `literals.rs` to emit `Instruction<B>` and consume `Value<B>` literals. The compiler needs to know the Backend at compile time — `parse_and_compile::<B: Backend>(...)` etc. SQL AST → typed literal now goes through backend-aware routing (a `Value::Bool(true)` literal for a `WHERE bool_col = true` query on Postgres, for example).
+**Phase 9**: retire legacy types. Remove `Cell`, `RowImage`, `PrimaryKey`, `WalEvent<C>`, `WalEventBuilderStart`, `WalEventBuildError` from `src/types.rs`. Fix every remaining reference. `ColumnType` also retires once Phase 7 lands (all remaining users go through `ScalarKind`).
 
-**Phase 5: runtime**. `SubscriptionEngine<E: CdcEvent, I: IdTypes, DB: DatabaseLike>` (drop the `D: Dialect` slot — it collapses into `E::Backend::Dialect`). Rewrite `src/runtime/{dispatch, agg, indexes, partition, predicate}.rs` — every `Cell` match becomes a typed accessor call, every `&WalEvent<C>` becomes `&E`, every `RowImage` disappears (readers go through `E`'s scalar accessors).
+**Phase 10**: tests + doctests + fixture harnesses. `src/test_harnesses.rs` un-gates and switches from `WalEvent::builder(...)` to a test-only concrete `CdcEvent` (probably `TestEvent<B>`, an evolution of the private `TestEvent<B>` fixture already sitting in `src/compiler/vm.rs`). Every `mod tests` block gated behind `#[cfg(any())]` in the runtime + reexec clusters un-gates and rewrites its event constructors. Every doctest in `runtime/engine.rs`, `sqlite_cdc/source.rs`, `wal/*.rs`, `catalog_helpers.rs`, `types.rs` migrates. The gated `src/reexec/auto.rs` and `src/reexec/async_auto.rs` bodies un-gate (this is where the "blind rewrite" trap from Phase 6 pays off — with the tests speaking `TestEvent<B>`, the compiler drives the migration). `src/reexec/async_connector.rs` un-gates (it is already at the correct shape). The Docker integration tests (`tests/reexec_*.rs`, `tests/follow_*.rs`) also migrate here.
 
-**Phase 6: reexec + auxiliary**. `src/reexec/*.rs`, `src/persistence/`, `src/polling/`, `src/diesel_api/`, `src/memory_profile_workload.rs` follow the same rewrite.
+**Phase 11**: verification. `cargo +1.88 fmt --check`, `cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings` (matches subql's CI), `cargo +1.88 test --lib --release`, `cargo +1.88 test --all-features --release`, `RUSTDOCFLAGS=-D warnings cargo +1.88 doc --all-features --no-deps`. Clippy and rustdoc gates have not been run since baseline — first pass under `-D warnings` is likely to surface a small backlog of missing docs on Phase-3-through-6 additions.
 
-**Phase 7: parser impls**. `impl CdcEvent for Wal2JsonV2Message`, `impl CdcEvent for PgOutputMessage`, `impl CdcEvent for DebeziumEnvelope`, `impl CdcEvent for MaxwellMessage`, `impl CdcEvent for Wal2JsonV1Message` (row-iter view). Each impl declares `type Backend = Postgres` (or `MySql`) and provides the typed scalar accessors, reading from the parser's already-typed fields (wal2json JSON values, pgoutput binary wire types, Debezium/Maxwell JSON envelopes).
+## Phase 7 entry-point guide
 
-**Phase 8: SqliteCdc**. `src/sqlite_cdc/source.rs` currently produces `WalEvent<C>`. Under the new shape it needs a native event type (probably `struct SqliteCdcEvent { table_id, kind, pk_columns, changed_columns, row_new, row_old }` where `row_*` are `Vec<Value<SQLite>>` decoded from the shadow log) with `impl CdcEvent for SqliteCdcEvent { type Backend = SQLite; }`. Or: drop the SqliteCdc translation entirely and drive an `impl CdcEvent for sqlite_diff_rs::PatchsetOp<'_, ...>` under a `patchset` feature (the previously-attempted outbound path, but coming from the source side rather than the sink side).
+Start Phase 7 by reading these files in order:
 
-**Phase 9: retire legacy types**. Remove `Cell`, `RowImage`, `PrimaryKey`, `WalEvent<C>`, `WalEventBuilderStart`, `WalEventBuildError` from `src/types.rs`. Fix every remaining reference.
+1. `src/backend.rs` (`CdcEvent` trait) — the surface each parser impl must satisfy.
+2. `src/wal/wal2json.rs` lines 1-330 — the simplest of the four parsers; a good pilot. `Wal2JsonV2Message` already carries `pub columns: Option<Vec<Wal2JsonV2Column>>` where each `Wal2JsonV2Column` is `{name: String, type_name: String, value: serde_json::Value}`. The scalar accessors decode `value` per `type_name` on demand — no eager conversion needed.
+3. `src/wal/pg_type.rs` — the pg-type decoding helpers wal2json and pgoutput already use; the typed scalar accessors on `impl CdcEvent for Wal2JsonV2Message` should route through the SAME per-type decoders so the wire → typed contract is single-sourced.
+4. `src/wal/pgoutput.rs` — the binary wire path (Postgres logical replication). Bigger and more state-heavy than wal2json but has strong existing type routing.
+5. `src/wal/debezium.rs` and `src/wal/maxwell.rs` — the smaller two, JSON-envelope-shaped like wal2json v1/v2.
+6. `src/wal/mod.rs` — the `WalParser` trait everyone implements. Its `parse_wal_message` return type moves from `Result<Vec<WalEvent<Self::Checkpoint>>, WalParseError>` to a Backend-tagged event iterator.
 
-**Phase 10: tests + doctests + fixture harnesses**. `src/test_harnesses.rs` currently builds `WalEvent` via a fluent builder. Every doctest in `runtime/engine.rs`, `sqlite_cdc/source.rs`, and elsewhere constructs `WalEvent::builder(...)`. All migrate to constructing typed CDC events (probably via a test-only concrete impl of `CdcEvent`, e.g. `TestEvent<B: Backend>`).
+A pragmatic Phase 7 cut order:
 
-**Phase 11: verification**. `cargo +1.88 fmt --check`, `cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings` (matches subql's CI), `cargo +1.88 test --lib --release`, `cargo +1.88 test --all-features --release`, `RUSTDOCFLAGS=-D warnings cargo +1.88 doc --all-features --no-deps`.
+1. Start with `Wal2JsonV2Message` — smallest surface, per-message shape (one row per message, no batch iteration).
+2. Once wal2json v2 compiles + a smoke test dispatches through the engine, do `Wal2JsonV1Message` (batched — the impl needs to expose a "row-iter view" over the message's `change: Vec<Wal2JsonV1Change>`; each `Change` is one event).
+3. `MaxwellMessage` next — MySQL-native, one row per message.
+4. `DebeziumEnvelope` — one row per message.
+5. `PgOutputMessage` last — binary wire, largest surface.
+6. Then update `WalParser` and its consumers in `src/wal/{mod, streaming, pg_streaming}.rs`.
+
+### Design gotchas specific to Phase 7
+
+- **The `type Checkpoint` associated type stays.** Each parser already knows its checkpoint flavor (`PgLsn` for pgoutput / wal2json-v2-with-`include-lsn`, `NoCheckpoint` for wal2json v1 and Maxwell / Debezium in most configs). Keep it as-is.
+- **Composite PKs are first-class.** Every impl's `pk_columns()` returns the whole PK column set; the scalar accessors read PK cells through `RowKind::Pk` when the caller asks for them. Do not shortcut a "single-column PK" specialization.
+- **`RowKind::Pk` with a non-PK column returns `Presence::Missing`.** Repeated across every impl. If the parser only stores the PK columns' names, checking membership before decoding is the natural implementation.
+- **`Presence::Missing` vs `Presence::Null` distinction lives in the wire.** wal2json v2 marks omitted columns by their absence from the `columns` / `identity` array; pgoutput uses a `TupleData::Null` marker (SQL NULL) vs `TupleData::UnchangedToast` (missing). Preserve the distinction; the engine's three-valued logic depends on it.
+- **Scalar accessors that observe a value NOT of the expected scalar return `Presence::Missing`, not a panic.** If the caller asks for `bool_at(RowKind::New, col)` but the underlying value is `serde_json::Number(...)`, the accessor treats that as "the requested scalar shape is not carried here" and returns `Missing`. This mirrors the wal-side's own "column type mismatch → skip / re-execute" semantics.
+- **Decode on demand, do not eagerly materialize.** wal2json stores JSON on the wire; each accessor call decodes the one JSON value it needs, does not build the full `Vec<Value<B>>` up front. The engine reads only the cells its predicates and aggregates touch, so eager materialization is pure overhead.
+
+### After Phase 7, when un-gating `auto.rs` / `async_auto.rs`
+
+These modules were left in Phase-5-old shape because a blind rewrite under `#![cfg(any())]` without compile feedback is dangerous. The reshape they need:
+
+- Struct-level type parameters go from `<D: Dialect, I: IdTypes, DB: DatabaseLike, X: Connector>` to `<E: CdcEvent, I: IdTypes, DB: DatabaseLike, X: Connector<Backend = E::Backend>>` (plus `E::Backend: SqlLiteralParse` where the inner engine requires it).
+- `AutoResolvingEngine::consumers(&mut self, event: &WalEvent<C>)` becomes `AutoResolvingEngine::consumers(&mut self, event: &E)`; the `C: Checkpoint` slot is now `E::Checkpoint`.
+- `Registered::ReExec { sql, column_type }` destructuring changes to `Registered::ReExec { sql, column_kind }`; each `execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)` call becomes `execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)`; the returned `Cell` becomes `Value<E::Backend>` (installed via `self.inner.install(query_id, value)` on `ReExecEngine<E, ..>`).
+- `SnapshotResult::Scalar(Cell, Option<C>)` becomes `SnapshotResult::Scalar(Value<E::Backend>, Option<E::Checkpoint>)`; the `Rows` variant follows the same pattern.
+- `impl SubscriptionDispatch<I> for AutoResolvingEngine<D, I, DB, X>` changes to `impl<E, I, DB, X> SubscriptionDispatch<I, E> for AutoResolvingEngine<E, I, DB, X>` (matches how `ReExecEngine` was rewritten in Phase 5).
+- The `mod tests` block at the bottom is Phase-10 test rewrite territory; drop it into `#[cfg(any())]` on un-gate and pick it up with the rest of the tests.
+
+`src/reexec/async_connector.rs` is already at the correct shape (Phase 6 retargeted it), so un-gating it is a one-line change.
 
 ## Design gotchas the next session will hit
 
