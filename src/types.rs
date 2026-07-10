@@ -1159,51 +1159,59 @@ impl<C: Checkpoint> WalEvent<C> {
 /// `Eq` is not derived: `binds` holds [`Cell`]s, which carry `f64` and are only
 /// `PartialEq`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SubscriptionRequest<I: IdTypes> {
-    /// Consumer who owns this subscription
+pub struct SubscriptionRequest<I: IdTypes, B: crate::backend::Backend = crate::backend::Postgres> {
+    /// Consumer who owns this subscription.
     pub(crate) consumer_id: I::ConsumerId,
-    /// Lifetime scope: durable or session-bound
+    /// Lifetime scope: durable or session-bound.
     pub(crate) scope: SubscriptionScope<I>,
-    /// SQL SELECT statement with WHERE clause
+    /// SQL SELECT statement with WHERE clause.
     pub(crate) sql: String,
-    /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
+    /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch).
     pub(crate) updated_at_unix_ms: u64,
-    /// Resolved bind values for `$N`/`?` placeholders in `sql`, in placeholder
-    /// order. Empty for plain literal SQL (the default). Populated by the typed
-    /// diesel API, which renders parameterized SQL plus these values.
-    pub(crate) binds: Vec<Cell>,
+    /// Resolved bind values for `$N` / `?` placeholders in `sql`, in
+    /// placeholder order. Empty for plain literal SQL (the default);
+    /// populated by the typed diesel API, which renders parameterised
+    /// SQL plus these values.
+    ///
+    /// Binds are typed to the observed [`crate::backend::Backend`]. When
+    /// binds are empty the `B` parameter is inferred from context; the
+    /// default `B = Postgres` covers the common Postgres-backed use.
+    pub(crate) binds: alloc::vec::Vec<crate::backend::Value<B>>,
 }
 
-impl<I: IdTypes> SubscriptionRequest<I> {
-    /// Create a new subscription request with default scope (`Durable`) and timestamp (`0`).
+impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
+    /// Create a new subscription request with default scope (`Durable`)
+    /// and timestamp (`0`).
     pub fn new(consumer_id: I::ConsumerId, sql: impl Into<String>) -> Self {
         Self {
             consumer_id,
             scope: SubscriptionScope::Durable,
             sql: sql.into(),
             updated_at_unix_ms: 0,
-            binds: Vec::new(),
+            binds: alloc::vec::Vec::new(),
         }
     }
 
-    /// Set the subscription scope (default: `SubscriptionScope::Durable`).
+    /// Set the subscription scope (default: [`SubscriptionScope::Durable`]).
     #[must_use]
     pub const fn scope(mut self, scope: SubscriptionScope<I>) -> Self {
         self.scope = scope;
         self
     }
 
-    /// Set the conflict-resolution timestamp in milliseconds since Unix epoch (default: `0`).
+    /// Set the conflict-resolution timestamp in milliseconds since Unix
+    /// epoch (default: `0`).
     #[must_use]
     pub const fn updated_at_unix_ms(mut self, ts: u64) -> Self {
         self.updated_at_unix_ms = ts;
         self
     }
 
-    /// Attach resolved bind values for `$N`/`?` placeholders in the SQL, in
-    /// placeholder order (default: none). Used by the typed diesel API.
+    /// Attach resolved bind values for `$N` / `?` placeholders in the
+    /// SQL, in placeholder order (default: none). Used by the typed
+    /// diesel API.
     #[must_use]
-    pub fn binds(mut self, binds: Vec<Cell>) -> Self {
+    pub fn binds(mut self, binds: alloc::vec::Vec<crate::backend::Value<B>>) -> Self {
         self.binds = binds;
         self
     }
@@ -1690,65 +1698,65 @@ pub struct MergeReport {
 // Trait Definitions
 // ============================================================================
 
-/// Subscription registration operations
-pub trait SubscriptionRegistration<I: IdTypes>: Send {
-    /// Register a new subscription
+/// Subscription registration operations.
+///
+/// Parameterised on the observed [`crate::backend::Backend`] so
+/// `register` accepts a typed [`SubscriptionRequest`] whose bind values
+/// are `Value<B>`.
+pub trait SubscriptionRegistration<I: IdTypes, B: crate::backend::Backend>: Send {
+    /// Register a new subscription.
     ///
-    /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds consumer.
-    /// Returns error if SQL is unparseable or unsupported.
+    /// Parses SQL, compiles to bytecode, deduplicates predicates, and
+    /// binds consumer. Returns error if SQL is unparseable or unsupported.
     fn register(
         &mut self,
-        spec: SubscriptionRequest<I>,
+        spec: SubscriptionRequest<I, B>,
     ) -> Result<RegisterResult, crate::RegisterError>;
 
-    /// Unregister a subscription by ID
+    /// Unregister a subscription by ID.
     ///
-    /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
-    /// Returns true if subscription existed and was removed.
+    /// Decrements predicate refcount. If refcount reaches 0, predicate
+    /// is removed. Returns true if subscription existed and was removed.
     fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool;
 }
 
 /// Event dispatch operations.
 ///
-/// The associated [`Notifications`](Self::Notifications) type lets each engine
-/// layer return its own notification shape: the base engine yields
-/// [`ConsumerNotifications`], while the re-execution wrappers yield their richer
-/// `ReExecNotifications`. See [`AsyncSubscriptionDispatch`] for the async engine.
-pub trait SubscriptionDispatch<I: IdTypes>: Send {
-    /// Notifications produced for a dispatched event, parameterized by the
-    /// event's checkpoint type.
-    type Notifications<C: Checkpoint>;
+/// Parameterised on the observed `E: CdcEvent` so `consumers` accepts a
+/// backend-typed event and returns notifications carrying `E::Checkpoint`.
+/// Each engine layer chooses its own [`Notifications`](Self::Notifications)
+/// shape: the base engine yields [`ConsumerNotifications`], while the
+/// re-execution wrappers yield their richer `ReExecNotifications`.
+pub trait SubscriptionDispatch<I: IdTypes, E: crate::backend::CdcEvent>: Send {
+    /// Notifications produced for a dispatched event.
+    type Notifications;
     /// Error returned when dispatch fails.
     type Error;
 
-    /// Get interested consumers for a WAL event.
+    /// Get interested consumers for a CDC event.
     ///
-    /// Returns view-relative notifications: each consumer sees INSERT/DELETE/UPDATE
-    /// relative to their own result set.
-    fn consumers<C: Checkpoint>(
-        &mut self,
-        event: &WalEvent<C>,
-    ) -> Result<Self::Notifications<C>, Self::Error>;
+    /// Returns view-relative notifications: each consumer sees
+    /// INSERT / DELETE / UPDATE relative to their own result set.
+    fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error>;
 }
 
 /// Async counterpart of [`SubscriptionDispatch`].
 ///
-/// Separate trait because the async engine's `consumers` returns a future. The
-/// `+ Send` bound on that future is the point of spelling it out as
-/// return-position `impl Future` rather than `async fn` (same idiom as
-/// [`crate::reexec::AsyncConnector`]).
-pub trait AsyncSubscriptionDispatch<I: IdTypes>: Send {
-    /// Notifications produced for a dispatched event, parameterized by the
-    /// event's checkpoint type.
-    type Notifications<C: Checkpoint>;
+/// Separate trait because the async engine's `consumers` returns a
+/// future. The `+ Send` bound on that future is the point of spelling it
+/// out as return-position `impl Future` rather than `async fn` (same
+/// idiom as [`crate::reexec::AsyncConnector`]).
+pub trait AsyncSubscriptionDispatch<I: IdTypes, E: crate::backend::CdcEvent>: Send {
+    /// Notifications produced for a dispatched event.
+    type Notifications;
     /// Error returned when dispatch fails.
     type Error;
 
-    /// Get interested consumers for a WAL event.
-    fn consumers<C: Checkpoint>(
+    /// Get interested consumers for a CDC event.
+    fn consumers(
         &mut self,
-        event: &WalEvent<C>,
-    ) -> impl core::future::Future<Output = Result<Self::Notifications<C>, Self::Error>> + Send;
+        event: &E,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications, Self::Error>> + Send;
 }
 
 /// Session lifecycle operations
@@ -2200,15 +2208,17 @@ impl<I: IdTypes, C: Checkpoint> IntoIterator for ConsumerNotifications<I, C> {
 ///    Re-query the DB and replace the stored value.
 /// 4. **Reset on TRUNCATE**: engine returns `Err(TruncateRequiresReset)`.
 ///    Re-query and replace the stored value.
-pub trait AggregateDispatch<I: IdTypes>: Send {
-    /// Compute typed signed deltas for all matching aggregate subscriptions.
+pub trait AggregateDispatch<I: IdTypes, E: crate::backend::CdcEvent>: Send {
+    /// Compute typed signed deltas for all matching aggregate
+    /// subscriptions.
     ///
-    /// Returns `Vec<(ConsumerId, AggDelta)>` where each entry is the signed change
-    /// for that consumer's subscription. Zero-net entries are omitted.
-    /// The same consumer may appear multiple times (once per aggregate kind).
+    /// Returns `Vec<(ConsumerId, AggDelta)>` where each entry is the
+    /// signed change for that consumer's subscription. Zero-net entries
+    /// are omitted. The same consumer may appear multiple times (once
+    /// per aggregate kind).
     fn aggregate_deltas(
         &mut self,
-        event: &WalEvent,
+        event: &E,
     ) -> Result<Vec<(I::ConsumerId, AggDelta)>, crate::DispatchError>;
 }
 
