@@ -1,4 +1,4 @@
-#![cfg(any())] // Phase 6: retargeting to Value<B>; disabled until diesel connector impls migrate.
+#![cfg(any())] // Phase 6: retargeted to Value<B>; disabled until diesel async impls migrate.
 
 //! Async parallel of [`Connector`](super::Connector).
 //!
@@ -12,7 +12,8 @@
 //! additively without a trait-shape change.
 
 use super::connector::Snapshot;
-use crate::{Cell, Checkpoint, ColumnType, RowImage};
+use crate::backend::{Backend, ScalarKind, Value};
+use crate::Checkpoint;
 
 /// Async [`Connector`](super::Connector). Returned futures are `Send` so
 /// the connector can be driven from a multi-threaded runtime.
@@ -47,10 +48,12 @@ pub trait AsyncConnector: Send + Sync {
     /// [`Connector::Checkpoint`](super::Connector::Checkpoint) for the
     /// sync analogue.
     type Checkpoint: Checkpoint;
+    /// Subql backend whose [`Value`] shape this connector produces.
+    type Backend: Backend;
 
     /// Run the re-execution SQL and decode a single scalar value with the
-    /// expected [`ColumnType`], optionally reporting the position at which
-    /// the read was taken.
+    /// expected [`ScalarKind`], optionally reporting the position at
+    /// which the read was taken.
     ///
     /// See [`Connector::execute_scalar`](super::Connector::execute_scalar)
     /// for the contract. The async surface is identical other than
@@ -58,11 +61,14 @@ pub trait AsyncConnector: Send + Sync {
     fn execute_scalar(
         &self,
         sql: &str,
-        column_type: ColumnType,
+        kind: ScalarKind,
         auth: &Self::AuthContext,
-    ) -> impl core::future::Future<Output = Result<(Cell, Option<Self::Checkpoint>), Self::Error>> + Send;
+    ) -> impl core::future::Future<
+        Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>,
+    > + Send;
 
-    /// Run `sql` as a row-returning query and decode every row.
+    /// Run `sql` as a row-returning query and decode every row into a
+    /// column-ordered `Vec<Value<Self::Backend>>`.
     ///
     /// See [`Connector::execute_rows`](super::Connector::execute_rows) for
     /// the contract. Impls should open a read-only repeatable-read
@@ -72,6 +78,9 @@ pub trait AsyncConnector: Send + Sync {
         sql: &str,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
-        Output = Result<Snapshot<alloc::vec::Vec<RowImage>, Self::Checkpoint>, Self::Error>,
+        Output = Result<
+            Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
+            Self::Error,
+        >,
     > + Send;
 }

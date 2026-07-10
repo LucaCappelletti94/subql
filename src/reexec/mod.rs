@@ -66,14 +66,16 @@
 //!   [`AsyncAutoResolvingEngine`] ship, but no concrete async backend
 //!   (sqlx, diesel-async) is bundled yet. See `MILESTONES.md`.
 
-// Phase 5 baseline: only `ReExecEngine` + its plan/maintain/connector
-// surface participate. The auto-resolving wrappers (`AutoResolvingEngine`,
-// `AsyncAutoResolvingEngine`) and the diesel-backed connector impls
-// interact with `Cell`-based `Connector` results and their diesel
-// query-building; migrating them to `Value<B>` is a Phase 6 undertaking
-// tracked in `docs/refactor-cdc-event-handoff.md`. Their sources remain
-// on disk with `#![cfg(any())]` at the top so they compile only when
-// explicitly re-enabled.
+// Phase 6 baseline: `ReExecEngine`, its plan/maintain layers, and the
+// `Connector` trait + diesel-backed connectors compile against
+// `Value<B>`. The auto-resolving wrappers (`AutoResolvingEngine`,
+// `AsyncAutoResolvingEngine`) still spell their bodies in `Cell`/`WalEvent`
+// terms and drive a `SubscriptionEngine<D: Dialect, ...>` shape from before
+// the Phase 5 event-typing sweep. Migrating them to `E: CdcEvent` +
+// `Value<E::Backend>` is scoped to the Phase 6 continuation tracked in
+// `docs/refactor-cdc-event-handoff.md`. Their sources remain on disk with
+// `#![cfg(any())]` at the top so they compile only when explicitly
+// re-enabled.
 mod engine;
 mod maintain;
 mod plan;
@@ -83,7 +85,15 @@ mod plan;
 // impls are gated inside the file.
 mod connector;
 
+#[cfg(feature = "executor-diesel-mysql")]
+pub use connector::MysqlDieselConnector;
+#[cfg(feature = "executor-diesel-postgres")]
+pub use connector::PgDieselConnector;
 pub use connector::{Connector, ReExecError, Snapshot};
+#[cfg(feature = "executor-diesel")]
+pub use connector::{DieselBackend, DieselConnector};
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
 pub use engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     ReExecutionTrigger, Registered, ScalarUpdate,
