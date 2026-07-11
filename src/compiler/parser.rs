@@ -185,13 +185,15 @@ where
     let program: BytecodeProgram<B> = if let Some(expr) = pq.where_clause.as_ref() {
         compile_expression::<B, DB>(expr, pq.table_id, database)?
     } else {
-        // No WHERE clause = always match. Construct a `Value::Bool(true)`
-        // via SqlLiteralParse so SQLite (Bool = i64) gets `1_i64` and
-        // Postgres / MySql (Bool = bool) get `true`.
-        BytecodeProgram::new(vec![Instruction::PushLiteral(B::parse_literal(
+        // No WHERE clause matches every row. Feed the bare `true` literal
+        // through the same wrapper that trailing bare-value predicates use
+        // so the VM sees a Tri-typed result at TOS.
+        let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
             &SqlValue::Boolean(true),
             ScalarKind::Bool,
-        )?)])
+        )?)];
+        wrap_bare_value_as_tri::<B>(&mut instructions)?;
+        BytecodeProgram::new(instructions)
     };
 
     let prefilter_plan = build_prefilter_plan(pq.where_clause.as_ref(), pq.table_id, database);
@@ -244,11 +246,17 @@ where
     let table_id = resolve_table_id(&table_name, database)?;
     let where_program: BytecodeProgram<B> = match where_clause.as_ref() {
         Some(expr) => compile_expression::<B, DB>(expr, table_id, database)?,
-        // No WHERE clause matches every row.
-        None => BytecodeProgram::new(vec![Instruction::PushLiteral(B::parse_literal(
-            &SqlValue::Boolean(true),
-            ScalarKind::Bool,
-        )?)]),
+        // No WHERE clause matches every row. Feed the bare `true` literal
+        // through the same wrapper that trailing bare-value predicates use
+        // so the VM sees a Tri-typed result at TOS.
+        None => {
+            let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
+                &SqlValue::Boolean(true),
+                ScalarKind::Bool,
+            )?)];
+            wrap_bare_value_as_tri::<B>(&mut instructions)?;
+            BytecodeProgram::new(instructions)
+        }
     };
     let where_dependency_columns = where_program.dependency_columns.clone();
     Ok(TableAndWhereDeps {

@@ -189,7 +189,7 @@ impl<B: Backend> MinMaxQuery<B> {
         }
         let value = self.agg_value(event, row);
         if !value.is_absent() && values_equal(&value, &self.current) {
-            // The current extreme (or a tie of it) was removed; the next
+            // The current extreme (or a tie of it) was removed, the next
             // extreme is unknown without a scan.
             Maintenance::NeedsReexecution
         } else {
