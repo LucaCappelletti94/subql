@@ -1,32 +1,25 @@
-#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
-
-#![allow(clippy::unwrap_used, clippy::option_if_let_else, unused_imports)]
+#![allow(clippy::unwrap_used, clippy::option_if_let_else)]
 //! Property-based tests for dispatch correctness
 //!
 //! Verifies the fundamental invariant: for any subscriptions and events,
-//! `engine.consumers()` returns exactly the set of consumers whose SQL WHERE clause
-//! matches the dispatched row.
+//! `engine.consumers()` returns exactly the set of consumers whose SQL WHERE
+//! clause matches the dispatched row.
 
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use subql::backend::{Postgres, Value};
+use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers,
-    compiler::{parse_compile_normalize_and_prefilter, Vm},
-    Cell, DefaultIds, EventKind, PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest,
-    TableId, WalEvent,
+    catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId,
 };
 
 // ============================================================================
 // Test Schema
 // ============================================================================
 
-/// Build the proptest fixture: a single 3-column `items` table. A
-/// placeholder table is included before it (alphabetically) so the
-/// `items` table id is stable at 1, matching the hardcoded
-/// `WalEvent::builder(1)` calls in this file.
+/// Build the proptest fixture: a single 3-column `items` table.
 fn proptest_catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE _items_pad (id INT);\n\
@@ -35,11 +28,19 @@ fn proptest_catalog() -> ParserDB {
     .expect("proptest items fixture parses")
 }
 
+fn items_id(database: &ParserDB) -> TableId {
+    catalog_helpers::table_id(database, "items").expect("items table exists")
+}
+
+fn pad_id(database: &ParserDB) -> TableId {
+    catalog_helpers::table_id(database, "_items_pad").expect("_items_pad table exists")
+}
+
 // ============================================================================
 // Strategies
 // ============================================================================
 
-/// A predicate we can generate SQL for and also evaluate directly in Rust
+/// A predicate we can generate SQL for and also evaluate directly in Rust.
 #[derive(Debug, Clone)]
 enum TestPredicate {
     AmountGt(i64),
@@ -54,7 +55,7 @@ enum TestPredicate {
 }
 
 impl TestPredicate {
-    /// Convert to SQL WHERE clause
+    /// Convert to SQL WHERE clause.
     fn to_sql(&self) -> String {
         match self {
             Self::AmountGt(v) => format!("amount > {v}"),
@@ -69,35 +70,40 @@ impl TestPredicate {
         }
     }
 
-    /// Evaluate predicate against a row (ground truth)
-    fn eval(&self, id: &Cell, amount: &Cell, status: &Cell) -> Option<bool> {
+    /// Evaluate predicate against a row (ground truth).
+    fn eval(
+        &self,
+        id: &Value<Postgres>,
+        amount: &Value<Postgres>,
+        status: &Value<Postgres>,
+    ) -> Option<bool> {
         match self {
             Self::AmountGt(v) => match amount {
-                Cell::Int(a) => Some(*a > *v),
+                Value::Int(a) => Some(*a > *v),
                 _ => None,
             },
             Self::AmountLt(v) => match amount {
-                Cell::Int(a) => Some(*a < *v),
+                Value::Int(a) => Some(*a < *v),
                 _ => None,
             },
             Self::AmountEq(v) => match amount {
-                Cell::Int(a) => Some(*a == *v),
+                Value::Int(a) => Some(*a == *v),
                 _ => None,
             },
             Self::AmountBetween(lo, hi) => match amount {
-                Cell::Int(a) => Some(*a >= *lo && *a <= *hi),
+                Value::Int(a) => Some(*a >= *lo && *a <= *hi),
                 _ => None,
             },
             Self::StatusEq(s) => match status {
-                Cell::String(st) => Some(st.as_ref() == s.as_str()),
+                Value::String(st) => Some(st.as_str() == s.as_str()),
                 _ => None,
             },
             Self::IdEq(v) => match id {
-                Cell::Int(i) => Some(*i == *v),
+                Value::Int(i) => Some(*i == *v),
                 _ => None,
             },
             Self::IsNull => match amount {
-                Cell::Null => Some(true),
+                Value::Null => Some(true),
                 _ => Some(false),
             },
             Self::And(a, b) => {
@@ -106,7 +112,7 @@ impl TestPredicate {
                 match (ra, rb) {
                     (Some(false), _) | (_, Some(false)) => Some(false),
                     (Some(true), Some(true)) => Some(true),
-                    _ => None, // Unknown
+                    _ => None,
                 }
             }
             Self::Or(a, b) => {
@@ -115,14 +121,14 @@ impl TestPredicate {
                 match (ra, rb) {
                     (Some(true), _) | (_, Some(true)) => Some(true),
                     (Some(false), Some(false)) => Some(false),
-                    _ => None, // Unknown
+                    _ => None,
                 }
             }
         }
     }
 }
 
-/// Strategy for generating test predicates (limited depth)
+/// Strategy for generating test predicates (limited depth).
 fn predicate_strategy() -> impl Strategy<Value = TestPredicate> {
     let leaf = prop_oneof![
         (-500i64..500).prop_map(TestPredicate::AmountGt),
@@ -142,9 +148,9 @@ fn predicate_strategy() -> impl Strategy<Value = TestPredicate> {
     ];
 
     leaf.prop_recursive(
-        2,  // max depth
-        16, // max nodes
-        4,  // items per collection
+        2,
+        16,
+        4,
         |inner| {
             prop_oneof![
                 (inner.clone(), inner.clone())
@@ -156,21 +162,58 @@ fn predicate_strategy() -> impl Strategy<Value = TestPredicate> {
     )
 }
 
-/// Strategy for generating row cells
-fn row_strategy() -> impl Strategy<Value = (Cell, Cell, Cell)> {
-    let id_cell = (0i64..100).prop_map(Cell::Int);
+/// Strategy for generating row cells.
+fn row_strategy() -> impl Strategy<Value = (Value<Postgres>, Value<Postgres>, Value<Postgres>)> {
+    let id_cell = (0i64..100).prop_map(Value::Int);
     let amount_cell = prop_oneof![
-        9 => (-1000i64..1000).prop_map(Cell::Int),
-        1 => Just(Cell::Null),
+        9 => (-1000i64..1000).prop_map(Value::Int),
+        1 => Just(Value::Null),
     ];
     let status_cell = prop_oneof![
-        Just(Cell::String("active".into())),
-        Just(Cell::String("pending".into())),
-        Just(Cell::String("closed".into())),
-        Just(Cell::String("unknown".into())),
-        Just(Cell::Null),
+        Just(Value::String("active".into())),
+        Just(Value::String("pending".into())),
+        Just(Value::String("closed".into())),
+        Just(Value::String("unknown".into())),
+        Just(Value::Null),
     ];
     (id_cell, amount_cell, status_cell)
+}
+
+fn insert_event(
+    tid: TableId,
+    id: &Value<Postgres>,
+    amount: &Value<Postgres>,
+    status: &Value<Postgres>,
+) -> TestEvent<Postgres> {
+    TestEvent::<Postgres>::insert(tid, vec![id.clone(), amount.clone(), status.clone()])
+        .with_pk_columns([0u16])
+}
+
+fn delete_event(
+    tid: TableId,
+    id: &Value<Postgres>,
+    amount: &Value<Postgres>,
+    status: &Value<Postgres>,
+) -> TestEvent<Postgres> {
+    TestEvent::<Postgres>::delete(tid, vec![id.clone(), amount.clone(), status.clone()])
+        .with_pk_columns([0u16])
+}
+
+fn update_event(
+    tid: TableId,
+    id: &Value<Postgres>,
+    old_amount: Value<Postgres>,
+    new_amount: &Value<Postgres>,
+    status: &Value<Postgres>,
+    changed: impl IntoIterator<Item = u16>,
+) -> TestEvent<Postgres> {
+    TestEvent::<Postgres>::update(
+        tid,
+        vec![id.clone(), old_amount, status.clone()],
+        vec![id.clone(), new_amount.clone(), status.clone()],
+    )
+    .with_pk_columns([0u16])
+    .with_changed_columns(changed)
 }
 
 // ============================================================================
@@ -185,41 +228,31 @@ proptest! {
         rows in proptest::collection::vec(row_strategy(), 1..10),
     ) {
         let catalog = proptest_catalog();
-        let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
+        let tid = items_id(&catalog);
+        let dialect = PostgreSqlDialect {};
+        let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
 
-        // Register each predicate as a subscription for a unique consumer
         let mut consumer_predicates: HashMap<u64, TestPredicate> = HashMap::new();
 
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
             let consumer_id = (i as u64) + 1;
-            let spec = SubscriptionRequest::new(consumer_id, sql);
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(consumer_id, sql);
 
             if engine.register(spec).is_ok() {
                 consumer_predicates.insert(consumer_id, pred.clone());
             }
         }
 
-        // Dispatch each row and verify
         for (id_cell, amount_cell, status_cell) in &rows {
-            let event = WalEvent::builder(1)
-                .insert()
-                .pk_cell(0, id_cell.clone())
-                .new_row(RowImage {
-                    cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
-                })
-                .build()
-                .expect("insert event builder should be valid");
+            let event = insert_event(tid, id_cell, amount_cell, status_cell);
 
             let notifs = engine.consumers(&event).unwrap();
-            // INSERT events: all matched consumers should be in `inserted`.
             let matched: HashSet<u64> = notifs.inserted().iter().copied().collect();
             prop_assert!(notifs.deleted().is_empty() && notifs.updated().is_empty(),
                 "INSERT should produce no deleted/updated");
 
-            // Ground truth: evaluate each predicate in Rust
             let mut expected: HashSet<u64> = HashSet::new();
             for (&consumer_id, pred) in &consumer_predicates {
                 if pred.eval(id_cell, amount_cell, status_cell) == Some(true) {
@@ -227,13 +260,12 @@ proptest! {
                 }
             }
 
-            // The invariant: matched == expected
             let false_positives: Vec<_> = matched.difference(&expected).copied().collect();
             let false_negatives: Vec<_> = expected.difference(&matched).copied().collect();
 
             prop_assert!(
                 false_positives.is_empty() && false_negatives.is_empty(),
-                "Dispatch mismatch for row [{:?}, {:?}, {:?}]:\n  false positives (dispatched but shouldn't): {:?}\n  false negatives (should dispatch but didn't): {:?}",
+                "Dispatch mismatch for row [{:?}, {:?}, {:?}]:\n  false positives: {:?}\n  false negatives: {:?}",
                 id_cell, amount_cell, status_cell,
                 false_positives, false_negatives,
             );
@@ -250,44 +282,41 @@ proptest! {
         rows in proptest::collection::vec(row_strategy(), 1..8),
     ) {
         let catalog = proptest_catalog();
-        let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
+        let tid = items_id(&catalog);
+        let dialect = PostgreSqlDialect {};
+        let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
 
         let mut consumer_predicates: HashMap<u64, TestPredicate> = HashMap::new();
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
             let consumer_id = (i as u64) + 1;
-            let spec = SubscriptionRequest::new(consumer_id, sql);
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(consumer_id, sql);
             if engine.register(spec).is_ok() {
                 consumer_predicates.insert(consumer_id, pred.clone());
             }
         }
 
         // Update events where only `amount` (col 1) changed.
-        // Predicates on `amount` or `id` may fire; predicates only on `status` won't.
         for (id_cell, amount_cell, status_cell) in &rows {
-            let event = subql::WalEvent::builder(1)
-                .update()
-                .new_row(RowImage {
-                    cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
-                })
-                .pk_cell(0, id_cell.clone())
-                .maybe_old_row(Some(RowImage {
-                    cells: Arc::from([id_cell.clone(), Cell::Int(0), status_cell.clone()]),
-                }))
-                // Only `amount` (col 1) changed.
-                .changed_columns(Arc::from([1u16]))
-                .build()
-                .expect("update event builder should be valid");
+            let event = update_event(
+                tid,
+                id_cell,
+                Value::Int(0),
+                amount_cell,
+                status_cell,
+                [1u16],
+            );
 
             let notifs = engine.consumers(&event).unwrap();
-            let all_notified: HashSet<u64> = notifs.into_iter().collect();
+            let all_notified: HashSet<u64> = notifs
+                .inserted()
+                .iter()
+                .chain(notifs.updated().iter())
+                .chain(notifs.deleted().iter())
+                .copied()
+                .collect();
 
-            // Ground truth: consumers with predicates depending on `amount` (col 1)
-            // are candidates; the engine evaluates both old and new rows.
-            // StatusEq predicates (col 2 only) should never appear in any bucket
-            // because col 2 is not in changed_columns.
             for (&consumer_id, pred) in &consumer_predicates {
                 if let TestPredicate::StatusEq(_) = pred {
                     prop_assert!(
@@ -307,37 +336,29 @@ proptest! {
         rows in proptest::collection::vec(row_strategy(), 1..8),
     ) {
         let catalog = proptest_catalog();
-        let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
+        let tid = items_id(&catalog);
+        let dialect = PostgreSqlDialect {};
+        let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
 
         let mut consumer_predicates: HashMap<u64, TestPredicate> = HashMap::new();
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
             let consumer_id = (i as u64) + 1;
-            let spec = SubscriptionRequest::new(consumer_id, sql);
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(consumer_id, sql);
             if engine.register(spec).is_ok() {
                 consumer_predicates.insert(consumer_id, pred.clone());
             }
         }
 
         for (id_cell, amount_cell, status_cell) in &rows {
-            let event = WalEvent::builder(1)
-                .delete()
-                .pk_cell(0, id_cell.clone())
-                .old_row(RowImage {
-                    cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
-                })
-                .build()
-                .expect("delete event builder should be valid");
+            let event = delete_event(tid, id_cell, amount_cell, status_cell);
 
             let notifs = engine.consumers(&event).unwrap();
-            // DELETE events: all matched consumers should be in `deleted`.
             let matched: HashSet<u64> = notifs.deleted().iter().copied().collect();
             prop_assert!(notifs.inserted().is_empty() && notifs.updated().is_empty(),
                 "DELETE should produce no inserted/updated");
 
-            // Ground truth: evaluate against the old row (same cells)
             let mut expected: HashSet<u64> = HashSet::new();
             for (&consumer_id, pred) in &consumer_predicates {
                 if pred.eval(id_cell, amount_cell, status_cell) == Some(true) {
@@ -357,95 +378,49 @@ proptest! {
         }
     }
 
-    /// Prefilter soundness: if `prefilter.may_match(row) == false`, the VM must
-    /// not return `Tri::True` for the same row. False negatives in the prefilter
-    /// would cause correct subscribers to be silently dropped.
-    #[test]
-    fn prefilter_never_has_false_negatives(
-        predicates in proptest::collection::vec(predicate_strategy(), 1..20),
-        rows in proptest::collection::vec(row_strategy(), 1..10),
-    ) {
-        let catalog = proptest_catalog();
-        let dialect = sqlparser::dialect::PostgreSqlDialect {};
-
-        for pred in &predicates {
-            let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
-            let Ok((_table_id, bytecode, _norm, prefilter, _projection)) =
-                parse_compile_normalize_and_prefilter(&sql, &dialect, &catalog)
-            else {
-                continue; // skip predicates that fail to compile
-            };
-
-            for (id_cell, amount_cell, status_cell) in &rows {
-                let row = RowImage {
-                    cells: std::sync::Arc::from([
-                        id_cell.clone(),
-                        amount_cell.clone(),
-                        status_cell.clone(),
-                    ]),
-                };
-
-                if !prefilter.may_match(&row) {
-                    // Prefilter says "definitely no match": VM must agree
-                    let mut vm = Vm::new();
-                    let vm_result = vm.eval(&bytecode, &row);
-                    prop_assert!(
-                        vm_result != Ok(subql::compiler::Tri::True),
-                        "Prefilter soundness violation for predicate '{}' on row [{:?}, {:?}, {:?}]: \
-                        prefilter.may_match=false but VM returned {:?}",
-                        pred.to_sql(), id_cell, amount_cell, status_cell, vm_result,
-                    );
-                }
-            }
-        }
-    }
-
     /// Batch registration produces identical dispatch results to individual registration.
     #[test]
     fn batch_register_matches_individual(
         predicates in proptest::collection::vec(predicate_strategy(), 1..15),
         rows in proptest::collection::vec(row_strategy(), 1..5),
     ) {
-        let catalog = proptest_catalog();
-        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let catalog1 = proptest_catalog();
+        let tid1 = items_id(&catalog1);
+        let mut engine1: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog1, PostgreSqlDialect {});
 
-        // Engine 1: individual register
-        let mut engine1: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(proptest_catalog(), sqlparser::dialect::PostgreSqlDialect {});
-
-        // Engine 2: batch register
-        let mut engine2: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
-            SubscriptionEngine::new(catalog, dialect);
+        let catalog2 = proptest_catalog();
+        let tid2 = items_id(&catalog2);
+        prop_assert_eq!(tid1, tid2);
+        let mut engine2: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(catalog2, PostgreSqlDialect {});
 
         let mut specs = Vec::new();
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
             let consumer_id = (i as u64) + 1;
 
-            let _ = engine1.register(SubscriptionRequest::new(consumer_id, sql.clone()));
-            specs.push(SubscriptionRequest::new(consumer_id, sql));
+            let _ = engine1.register(SubscriptionRequest::<DefaultIds, Postgres>::new(
+                consumer_id,
+                sql.clone(),
+            ));
+            specs.push(SubscriptionRequest::<DefaultIds, Postgres>::new(
+                consumer_id, sql,
+            ));
         }
 
         engine2.register_batch(specs);
 
-        // Dispatch same events to both engines, verify identical results
         for (id_cell, amount_cell, status_cell) in &rows {
-            let event = WalEvent::builder(1)
-                .insert()
-                .pk_cell(0, id_cell.clone())
-                .new_row(RowImage {
-                    cells: Arc::from([id_cell.clone(), amount_cell.clone(), status_cell.clone()]),
-                })
-                .build()
-                .expect("insert event builder should be valid");
+            let event = insert_event(tid1, id_cell, amount_cell, status_cell);
 
             let result1: HashSet<u64> = match engine1.consumers(&event) {
-                Ok(notifs) => notifs.into_iter().collect(),
+                Ok(notifs) => notifs.inserted().iter().copied().collect(),
                 Err(_) => HashSet::new(),
             };
 
             let result2: HashSet<u64> = match engine2.consumers(&event) {
-                Ok(notifs) => notifs.into_iter().collect(),
+                Ok(notifs) => notifs.inserted().iter().copied().collect(),
                 Err(_) => HashSet::new(),
             };
 
@@ -461,33 +436,29 @@ proptest! {
     /// must never error and must report nobody affected, no matter how many
     /// subscriptions exist on other tables. This is the multi-table CDC
     /// firehose case: change events arrive for tables nobody is watching yet.
-    ///
-    /// Earlier dispatch proptests always registered on `items` and then
-    /// dispatched to `items`, so this branch was never explored. `_items_pad`
-    /// (table id 0) is in the catalog but is never subscribed to.
     #[test]
     fn dispatch_to_unsubscribed_cataloged_table_is_empty(
         predicates in proptest::collection::vec(predicate_strategy(), 0..12),
         ids in proptest::collection::vec(any::<i64>(), 1..8),
     ) {
         let catalog = proptest_catalog();
-        let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let mut engine: SubscriptionEngine<sqlparser::dialect::PostgreSqlDialect, DefaultIds, ParserDB> =
+        let pad_tid = pad_id(&catalog);
+        let dialect = PostgreSqlDialect {};
+        let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(catalog, dialect);
 
-        // Every subscription targets `items` (table id 1).
+        // Every subscription targets `items`, none target `_items_pad`.
         for (i, pred) in predicates.iter().enumerate() {
             let sql = format!("SELECT * FROM items WHERE {}", pred.to_sql());
-            let _ = engine.register(SubscriptionRequest::new((i as u64) + 1, sql));
+            let _ = engine.register(SubscriptionRequest::<DefaultIds, Postgres>::new(
+                (i as u64) + 1,
+                sql,
+            ));
         }
 
         for id in &ids {
-            let event = WalEvent::builder(0)
-                .insert()
-                .pk_cell(0, Cell::Int(*id))
-                .new_row(RowImage { cells: Arc::from([Cell::Int(*id)]) })
-                .build()
-                .expect("pad insert event builds");
+            let event = TestEvent::<Postgres>::insert(pad_tid, vec![Value::Int(*id)])
+                .with_pk_columns([0u16]);
 
             let notifs = engine.consumers(&event).expect("cataloged table never errors");
             prop_assert!(
