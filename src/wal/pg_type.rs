@@ -16,7 +16,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use uuid::Uuid;
 
 use super::WalParseError;
-use crate::backend::{Postgres, Value};
+use crate::backend::{MySql, Postgres, Value};
 use crate::Cell;
 
 /// Test-only lossy converter retained for unit tests.
@@ -294,6 +294,37 @@ pub(super) fn infer_pg_value_from_json_strict(
     value: &serde_json::Value,
     field: &str,
 ) -> Result<Value<Postgres>, WalParseError> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
+        #[allow(clippy::option_if_let_else)]
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Int(i))
+            } else if let Some(u) = n.as_u64() {
+                let i = i64::try_from(u).map_err(|_| WalParseError::NumericOverflow {
+                    field: field.to_string(),
+                    value: u.to_string(),
+                    target: "i64",
+                })?;
+                Ok(Value::Int(i))
+            } else {
+                Ok(n.as_f64().map_or(Value::Null, Value::Float))
+            }
+        }
+        serde_json::Value::String(s) => Ok(Value::String(s.clone())),
+        other => Ok(Value::String(other.to_string())),
+    }
+}
+
+/// MySQL variant of [`infer_pg_value_from_json_strict`].
+///
+/// Same shape-inference logic but produces [`Value<MySql>`]. Used by wire
+/// formats without column type metadata (Maxwell).
+pub(super) fn infer_mysql_value_from_json_strict(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Value<MySql>, WalParseError> {
     match value {
         serde_json::Value::Null => Ok(Value::Null),
         serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),

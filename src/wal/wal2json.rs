@@ -845,9 +845,374 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
     })
 }
 
-
 // ============================================================================
-// Tests
+// Wal2JsonV1Event: typed [`CdcEvent`] output of the v1 parser
+// ============================================================================
+
+/// Typed CDC event surfaced by [`Wal2JsonV1Parser::parse_wal_message_typed`].
+///
+/// Owns the wal2json v1 wire payload for one row change plus lazily
+/// populated caches of decoded [`Value<Postgres>`] cells. Scalar accessors
+/// on the [`CdcEvent`] impl decode each cell on first access through
+/// [`json_value_to_pg_value`] and return references into the cache.
+///
+/// Backed by the Postgres [`Backend`](crate::backend::Backend). V1 does not
+/// carry an LSN, so [`Checkpoint`] is [`crate::NoCheckpoint`].
+pub struct Wal2JsonV1Event {
+    kind: EventKind,
+    table_id: TableId,
+    pk_columns: alloc::sync::Arc<[ColumnId]>,
+    changed_columns: alloc::sync::Arc<[ColumnId]>,
+    checkpoint: Option<crate::NoCheckpoint>,
+    new_image: Option<V1RowImage>,
+    old_image: Option<V1RowImage>,
+}
+
+/// One row image (new or old) inside a [`Wal2JsonV1Event`].
+struct V1RowImage {
+    entries: alloc::boxed::Box<[V1WireCell]>,
+    by_col: alloc::boxed::Box<[Option<u16>]>,
+    cache: alloc::boxed::Box<[Once<Value<Postgres>>]>,
+}
+
+/// One decoded wire cell inside a [`V1RowImage`].
+struct V1WireCell {
+    #[allow(dead_code)]
+    col_id: ColumnId,
+    pg_type: alloc::sync::Arc<str>,
+    value: serde_json::Value,
+}
+
+impl V1RowImage {
+    fn from_parallel_arrays(
+        names: &[String],
+        types: &[String],
+        values: Vec<serde_json::Value>,
+        table_id: TableId,
+        arity: usize,
+        database: &impl DatabaseLike,
+        context: &'static str,
+    ) -> Result<Self, WalParseError> {
+        if names.len() != types.len() || names.len() != values.len() {
+            return Err(WalParseError::MalformedPayload(format!(
+                "{context} parallel arrays have mismatched lengths: {} names, {} types, {} values",
+                names.len(),
+                types.len(),
+                values.len()
+            )));
+        }
+
+        let mut entries = Vec::with_capacity(names.len());
+        let mut by_col = alloc::vec![None; arity].into_boxed_slice();
+        let mut seen = hashbrown::HashSet::with_capacity(names.len());
+
+        for ((name, pg_type), value) in names.iter().zip(types.iter()).zip(values) {
+            let col_id =
+                catalog_helpers::column_id(database, table_id, name.as_str()).ok_or_else(|| {
+                    WalParseError::UnknownColumn {
+                        table_id,
+                        column: name.clone(),
+                    }
+                })?;
+            if !seen.insert(col_id) {
+                return Err(WalParseError::MalformedPayload(format!(
+                    "{context} contains duplicate column '{name}' (id {col_id})"
+                )));
+            }
+            if (col_id as usize) >= arity {
+                return Err(WalParseError::MalformedPayload(format!(
+                    "{context} column '{name}' resolved to out-of-range id {col_id} for table {table_id} (arity {arity})"
+                )));
+            }
+            let idx = u16::try_from(entries.len()).map_err(|_| {
+                WalParseError::MalformedPayload(format!(
+                    "{context} has more than {} entries",
+                    u16::MAX
+                ))
+            })?;
+            by_col[col_id as usize] = Some(idx);
+            entries.push(V1WireCell {
+                col_id,
+                pg_type: alloc::sync::Arc::from(pg_type.as_str()),
+                value,
+            });
+        }
+
+        let cache = (0..arity)
+            .map(|_| Once::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        Ok(Self {
+            entries: entries.into_boxed_slice(),
+            by_col,
+            cache,
+        })
+    }
+
+    fn value_at(&self, col: ColumnId) -> Option<&Value<Postgres>> {
+        let idx = usize::from(col);
+        let wire_idx = usize::from((*self.by_col.get(idx)?)?);
+        let entry = self.entries.get(wire_idx)?;
+        let cache_slot = self.cache.get(idx)?;
+        Some(cache_slot.call_once(|| {
+            json_value_to_pg_value(
+                &entry.value,
+                entry.pg_type.as_ref(),
+                entry.col_id_field_name(),
+            )
+            .unwrap_or(Value::Missing)
+        }))
+    }
+}
+
+impl V1WireCell {
+    fn col_id_field_name(&self) -> &str {
+        "wal2json.v1.column"
+    }
+}
+
+impl Wal2JsonV1Event {
+    fn kind_matches_pk_source(&self, row: RowKind) -> Option<&V1RowImage> {
+        match (self.kind, row) {
+            (EventKind::Truncate, _) => None,
+            (EventKind::Insert, RowKind::New | RowKind::Pk) => self.new_image.as_ref(),
+            (EventKind::Delete, RowKind::Old | RowKind::Pk) => self.old_image.as_ref(),
+            (EventKind::Update, RowKind::New) => self.new_image.as_ref(),
+            (EventKind::Update, RowKind::Old | RowKind::Pk) => self.old_image.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn value_at(&self, row: RowKind, col: ColumnId) -> Option<&Value<Postgres>> {
+        if row == RowKind::Pk && !self.pk_columns.contains(&col) {
+            return None;
+        }
+        self.kind_matches_pk_source(row)
+            .and_then(|image| image.value_at(col))
+    }
+}
+
+macro_rules! v1_scalar_accessor {
+    ($self:ident, $row:ident, $col:ident, $variant:ident) => {{
+        let Some(v) = $self.value_at($row, $col) else {
+            return Presence::Missing;
+        };
+        match v {
+            Value::$variant(x) => Presence::Present(x),
+            Value::Null => Presence::Null,
+            _ => Presence::Missing,
+        }
+    }};
+}
+
+impl CdcEvent for Wal2JsonV1Event {
+    type Backend = Postgres;
+    type Checkpoint = crate::NoCheckpoint;
+
+    fn kind(&self) -> EventKind {
+        self.kind
+    }
+
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn checkpoint(&self) -> Option<&Self::Checkpoint> {
+        self.checkpoint.as_ref()
+    }
+
+    fn pk_columns(&self) -> &[ColumnId] {
+        &self.pk_columns
+    }
+
+    fn changed_columns(&self) -> &[ColumnId] {
+        &self.changed_columns
+    }
+
+    fn bool_at(&self, row: RowKind, col: ColumnId) -> Presence<&bool> {
+        v1_scalar_accessor!(self, row, col, Bool)
+    }
+
+    fn int_at(&self, row: RowKind, col: ColumnId) -> Presence<&i64> {
+        v1_scalar_accessor!(self, row, col, Int)
+    }
+
+    fn float_at(&self, row: RowKind, col: ColumnId) -> Presence<&f64> {
+        v1_scalar_accessor!(self, row, col, Float)
+    }
+
+    fn string_at(&self, row: RowKind, col: ColumnId) -> Presence<&alloc::string::String> {
+        v1_scalar_accessor!(self, row, col, String)
+    }
+
+    fn bytes_at(&self, row: RowKind, col: ColumnId) -> Presence<&alloc::vec::Vec<u8>> {
+        v1_scalar_accessor!(self, row, col, Bytes)
+    }
+
+    fn uuid_at(&self, row: RowKind, col: ColumnId) -> Presence<&uuid::Uuid> {
+        v1_scalar_accessor!(self, row, col, Uuid)
+    }
+
+    fn timestamp_at(&self, row: RowKind, col: ColumnId) -> Presence<&chrono::NaiveDateTime> {
+        v1_scalar_accessor!(self, row, col, Timestamp)
+    }
+
+    fn timestamp_tz_at(
+        &self,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Presence<&chrono::DateTime<chrono::Utc>> {
+        v1_scalar_accessor!(self, row, col, TimestampTz)
+    }
+
+    fn date_at(&self, row: RowKind, col: ColumnId) -> Presence<&chrono::NaiveDate> {
+        v1_scalar_accessor!(self, row, col, Date)
+    }
+
+    fn time_at(&self, row: RowKind, col: ColumnId) -> Presence<&chrono::NaiveTime> {
+        v1_scalar_accessor!(self, row, col, Time)
+    }
+
+    fn decimal_at(&self, row: RowKind, col: ColumnId) -> Presence<&bigdecimal::BigDecimal> {
+        v1_scalar_accessor!(self, row, col, Decimal)
+    }
+
+    fn json_at(&self, row: RowKind, col: ColumnId) -> Presence<&serde_json::Value> {
+        v1_scalar_accessor!(self, row, col, Json)
+    }
+
+    fn jsonb_at(&self, row: RowKind, col: ColumnId) -> Presence<&serde_json::Value> {
+        v1_scalar_accessor!(self, row, col, Jsonb)
+    }
+}
+
+impl Wal2JsonV1Parser {
+    pub fn parse_wal_message_typed<DB: DatabaseLike>(
+        &self,
+        data: &[u8],
+        database: &DB,
+    ) -> Result<Vec<Wal2JsonV1Event>, WalParseError> {
+        let Some(msg): Option<Wal2JsonV1Message> =
+            super::parse_json_message_or_tombstone(data)?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut events = Vec::with_capacity(msg.change.len());
+        for change in &msg.change {
+            match convert_v1_change_typed(change, database) {
+                Ok(event) => events.push(event),
+                Err(WalParseError::UnknownEventKind(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(events)
+    }
+}
+
+fn convert_v1_change_typed<DB: DatabaseLike>(
+    change: &Wal2JsonV1Change,
+    database: &DB,
+) -> Result<Wal2JsonV1Event, WalParseError> {
+    let kind = parse_v1_kind(&change.kind)?;
+    let table_id = resolve_table(&change.schema, &change.table, database)?;
+    let arity = catalog_helpers::table_arity(database, table_id).ok_or_else(|| {
+        WalParseError::UnknownTable {
+            schema: change.schema.clone(),
+            table: change.table.clone(),
+        }
+    })?;
+
+    if kind == EventKind::Truncate {
+        return Ok(Wal2JsonV1Event {
+            kind,
+            table_id,
+            pk_columns: alloc::sync::Arc::from(Vec::<ColumnId>::new()),
+            changed_columns: alloc::sync::Arc::from(Vec::<ColumnId>::new()),
+            checkpoint: None,
+            new_image: None,
+            old_image: None,
+        });
+    }
+
+    if matches!(kind, EventKind::Insert | EventKind::Update)
+        && change.columnnames.is_empty()
+        && change.columntypes.is_empty()
+        && change.columnvalues.is_empty()
+    {
+        return Err(WalParseError::MissingField(
+            "columnnames/columntypes/columnvalues".to_string(),
+        ));
+    }
+
+    if kind == EventKind::Delete && change.oldkeys.is_none() {
+        return Err(WalParseError::MissingField("oldkeys".to_string()));
+    }
+
+    let new_image = match kind {
+        EventKind::Insert | EventKind::Update => Some(V1RowImage::from_parallel_arrays(
+            &change.columnnames,
+            &change.columntypes,
+            change.columnvalues.clone(),
+            table_id,
+            arity,
+            database,
+            "v1 columns",
+        )?),
+        EventKind::Delete | EventKind::Truncate => None,
+    };
+
+    let old_image = match &change.oldkeys {
+        Some(oldkeys) => Some(V1RowImage::from_parallel_arrays(
+            &oldkeys.keynames,
+            &oldkeys.keytypes,
+            oldkeys.keyvalues.clone(),
+            table_id,
+            arity,
+            database,
+            "v1 oldkeys",
+        )?),
+        None => None,
+    };
+
+    let pk_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Truncate {
+        alloc::sync::Arc::from(Vec::<ColumnId>::new())
+    } else if let Some(ref oldkeys) = change.oldkeys {
+        let mut ids = Vec::with_capacity(oldkeys.keynames.len());
+        let mut seen = hashbrown::HashSet::with_capacity(oldkeys.keynames.len());
+        for name in &oldkeys.keynames {
+            let col_id = catalog_helpers::column_id(database, table_id, name.as_str())
+                .ok_or_else(|| WalParseError::UnknownColumn {
+                    table_id,
+                    column: name.clone(),
+                })?;
+            if !seen.insert(col_id) {
+                return Err(WalParseError::MalformedPayload(format!(
+                    "v1 oldkeys contains duplicate column '{name}' (id {col_id})"
+                )));
+            }
+            ids.push(col_id);
+        }
+        alloc::sync::Arc::from(ids)
+    } else {
+        catalog_helpers::primary_key_columns(database, table_id)
+            .map(alloc::sync::Arc::from)
+            .unwrap_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()))
+    };
+
+    let changed_columns: alloc::sync::Arc<[ColumnId]> =
+        alloc::sync::Arc::from(Vec::<ColumnId>::new());
+
+    Ok(Wal2JsonV1Event {
+        kind,
+        table_id,
+        pk_columns,
+        changed_columns,
+        checkpoint: None,
+        new_image,
+        old_image,
+    })
+}
 // ============================================================================
 
 #[cfg(test)]
@@ -2237,5 +2602,232 @@ mod tests {
             .parse_wal_message_typed(b"null", &database)
             .expect("tombstone");
         assert!(events.is_empty());
+    }
+    // ------------------------------------------------------------------
+    // Phase 7B: Wal2JsonV1Event typed CdcEvent smoke tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn typed_v1_event_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Wal2JsonV1Event>();
+    }
+
+    #[test]
+    fn typed_v1_event_dispatches_through_engine() {
+        let database = orders_catalog();
+        let mut engine: crate::SubscriptionEngine<
+            Wal2JsonV1Event,
+            crate::DefaultIds,
+            sql_traits::structs::ParserDB,
+        > = crate::SubscriptionEngine::new(database, sqlparser::dialect::PostgreSqlDialect {});
+
+        engine
+            .register(
+                crate::SubscriptionRequest::new(42u64, "SELECT * FROM orders WHERE amount > 100")
+                    .updated_at_unix_ms(1_704_067_200_000),
+            )
+            .expect("register subscription");
+
+        let msg = r#"{
+            "xid": 100,
+            "change": [{
+                "kind": "insert",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer", "amount", "status"],
+                "columntypes": ["integer", "integer", "integer", "text"],
+                "columnvalues": [7, 3, 250, "paid"]
+            }]
+        }"#;
+
+        let events = Wal2JsonV1Parser
+            .parse_wal_message_typed(msg.as_bytes(), engine.database())
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Insert);
+        assert_eq!(event.pk_columns(), &[0u16]);
+
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 2),
+            crate::backend::Presence::Present(&250)
+        );
+        assert_eq!(
+            event.string_at(crate::backend::RowKind::New, 3),
+            crate::backend::Presence::Present(&alloc::string::String::from("paid"))
+        );
+        assert_eq!(
+            event.bool_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 2),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&7)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Missing
+        );
+
+        let notifs = engine.consumers(event).expect("dispatch");
+        assert_eq!(notifs.inserted(), alloc::vec![42u64]);
+        assert!(notifs.updated().is_empty());
+        assert!(notifs.deleted().is_empty());
+    }
+
+    #[test]
+    fn typed_v1_pk_via_rowkind_pk_returns_missing_for_non_pk_column() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 100,
+            "change": [{
+                "kind": "insert",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer", "amount", "status"],
+                "columntypes": ["integer", "integer", "integer", "text"],
+                "columnvalues": [1, 2, 3, "ok"]
+            }]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let event = &events[0];
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 1),
+            crate::backend::Presence::Missing
+        );
+    }
+
+    #[test]
+    fn typed_v1_pk_via_rowkind_pk_returns_present_for_pk_column() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 100,
+            "change": [{
+                "kind": "insert",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer", "amount", "status"],
+                "columntypes": ["integer", "integer", "integer", "text"],
+                "columnvalues": [1, 2, 3, "ok"]
+            }]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let event = &events[0];
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&1)
+        );
+    }
+
+    #[test]
+    fn typed_v1_null_vs_missing_are_distinct() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 100,
+            "change": [{
+                "kind": "insert",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "amount"],
+                "columntypes": ["integer", "integer"],
+                "columnvalues": [11, null]
+            }]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let event = &events[0];
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 2),
+            crate::backend::Presence::Null
+        );
+        assert_eq!(
+            event.string_at(crate::backend::RowKind::New, 3),
+            crate::backend::Presence::Missing
+        );
+    }
+
+    #[test]
+    fn typed_v1_tombstone_is_empty() {
+        let database = orders_catalog();
+        let events = Wal2JsonV1Parser
+            .parse_wal_message_typed(b"null", &database)
+            .expect("tombstone");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn typed_v1_delete_oldkeys_provides_pk_and_old_image() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 102,
+            "change": [{
+                "kind": "delete",
+                "schema": "public",
+                "table": "orders",
+                "oldkeys": {
+                    "keynames": ["id"],
+                    "keytypes": ["integer"],
+                    "keyvalues": [42]
+                }
+            }]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Delete);
+        assert_eq!(event.pk_columns(), &[0u16]);
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Present(&42)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&42)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Missing
+        );
+    }
+
+    #[test]
+    fn typed_v1_truncate_has_no_images() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 103,
+            "change": [{
+                "kind": "truncate",
+                "schema": "public",
+                "table": "orders"
+            }]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Truncate);
+        assert!(event.pk_columns().is_empty());
+        assert!(event.changed_columns().is_empty());
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Missing
+        );
     }
 }

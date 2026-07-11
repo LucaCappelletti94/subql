@@ -16,8 +16,8 @@ use serde::Deserialize;
 use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig, MapCdcEnvelope};
 use super::{resolve_table, WalParseError, WalParser};
 #[cfg(test)]
-use crate::{Cell, ColumnId};
-use crate::{EventKind, TableId, WalEvent};
+use crate::Cell;
+use crate::{ColumnId, EventKind, TableId, WalEvent};
 use sql_traits::prelude::DatabaseLike;
 
 // ============================================================================
@@ -124,13 +124,304 @@ impl MapCdcEnvelope for DebeziumEnvelope {
 }
 
 // ============================================================================
-// Tests
+// DebeziumEvent: typed [`CdcEvent`] output of the typed parser
 // ============================================================================
 
+use crate::backend::{Postgres, Value};
+use crate::catalog_helpers;
+use spin::Once;
+
+/// Typed CDC event surfaced by [`DebeziumParser::parse_wal_message_typed`].
+pub struct DebeziumEvent {
+    kind: EventKind,
+    table_id: TableId,
+    pk_columns: alloc::sync::Arc<[ColumnId]>,
+    changed_columns: alloc::sync::Arc<[ColumnId]>,
+    new_image: Option<DebeziumRowImage>,
+    old_image: Option<DebeziumRowImage>,
+}
+
+struct DebeziumRowImage {
+    entries: alloc::boxed::Box<[DebeziumWireCell]>,
+    by_col: alloc::boxed::Box<[Option<u16>]>,
+    cache: alloc::boxed::Box<[Once<Value<Postgres>>]>,
+}
+
+#[allow(dead_code)]
+struct DebeziumWireCell {
+    col_id: ColumnId,
+    field_name: alloc::sync::Arc<str>,
+    value: serde_json::Value,
+}
+
+impl DebeziumRowImage {
+    fn from_hashmap(
+        map: &HashMap<String, serde_json::Value>,
+        table_id: TableId,
+        arity: usize,
+        database: &impl DatabaseLike,
+        context: &'static str,
+    ) -> Result<Self, WalParseError> {
+        let mut entries = Vec::with_capacity(map.len());
+        let mut by_col = alloc::vec![None; arity].into_boxed_slice();
+        let mut seen = hashbrown::HashSet::with_capacity(map.len());
+
+        for (field_name, value) in map {
+            let col_id = catalog_helpers::column_id(database, table_id, field_name.as_str()).ok_or_else(|| {
+                WalParseError::UnknownColumn {
+                    table_id,
+                    column: field_name.clone(),
+                }
+            })?;
+            if !seen.insert(col_id) {
+                return Err(WalParseError::MalformedPayload(format!(
+                    "{context} contains duplicate column '{}' (id {col_id})",
+                    field_name
+                )));
+            }
+            if (col_id as usize) >= arity {
+                return Err(WalParseError::MalformedPayload(format!(
+                    "{context} column '{}' resolved to out-of-range id {col_id} for table {table_id} (arity {arity})",
+                    field_name
+                )));
+            }
+            let idx = u16::try_from(entries.len()).map_err(|_| {
+                WalParseError::MalformedPayload(format!(
+                    "{context} has more than {} entries",
+                    u16::MAX
+                ))
+            })?;
+            by_col[col_id as usize] = Some(idx);
+            entries.push(DebeziumWireCell {
+                col_id,
+                field_name: alloc::sync::Arc::from(field_name.as_str()),
+                value: value.clone(),
+            });
+        }
+
+        let cache = (0..arity)
+            .map(|_| Once::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        Ok(Self {
+            entries: entries.into_boxed_slice(),
+            by_col,
+            cache,
+        })
+    }
+
+    fn value_at(&self, col: ColumnId) -> Option<&Value<Postgres>> {
+        let idx = usize::from(col);
+        let wire_idx = usize::from((*self.by_col.get(idx)?)?);
+        let entry = self.entries.get(wire_idx)?;
+        let cache_slot = self.cache.get(idx)?;
+        Some(cache_slot.call_once(|| {
+            super::pg_type::infer_pg_value_from_json_strict(
+                &entry.value,
+                entry.field_name.as_ref(),
+            )
+            .unwrap_or(Value::Missing)
+        }))
+    }
+}
+
+impl DebeziumEvent {
+    const fn kind_matches_pk_source(&self, row: crate::backend::RowKind) -> Option<&DebeziumRowImage> {
+        match (self.kind, row) {
+            (EventKind::Truncate, _) => None,
+            (EventKind::Insert, crate::backend::RowKind::New | crate::backend::RowKind::Pk) => self.new_image.as_ref(),
+            (EventKind::Delete, crate::backend::RowKind::Old | crate::backend::RowKind::Pk) => self.old_image.as_ref(),
+            (EventKind::Update, crate::backend::RowKind::New) => self.new_image.as_ref(),
+            (EventKind::Update, crate::backend::RowKind::Old | crate::backend::RowKind::Pk) => self.old_image.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn value_at(&self, row: crate::backend::RowKind, col: ColumnId) -> Option<&Value<Postgres>> {
+        if row == crate::backend::RowKind::Pk && !self.pk_columns.contains(&col) {
+            return None;
+        }
+        self.kind_matches_pk_source(row)
+            .and_then(|image| image.value_at(col))
+    }
+}
+
+macro_rules! debezium_scalar_accessor {
+    ($self:ident, $row:ident, $col:ident, $variant:ident) => {{
+        let Some(v) = $self.value_at($row, $col) else {
+            return crate::backend::Presence::Missing;
+        };
+        match v {
+            Value::$variant(x) => crate::backend::Presence::Present(x),
+            Value::Null => crate::backend::Presence::Null,
+            _ => crate::backend::Presence::Missing,
+        }
+    }};
+}
+
+impl crate::backend::CdcEvent for DebeziumEvent {
+    type Backend = Postgres;
+    type Checkpoint = crate::NoCheckpoint;
+
+    fn kind(&self) -> EventKind {
+        self.kind
+    }
+
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn checkpoint(&self) -> Option<&Self::Checkpoint> {
+        None
+    }
+
+    fn pk_columns(&self) -> &[ColumnId] {
+        &self.pk_columns
+    }
+
+    fn changed_columns(&self) -> &[ColumnId] {
+        &self.changed_columns
+    }
+
+    fn bool_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&bool> {
+        debezium_scalar_accessor!(self, row, col, Bool)
+    }
+
+    fn int_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&i64> {
+        debezium_scalar_accessor!(self, row, col, Int)
+    }
+
+    fn float_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&f64> {
+        debezium_scalar_accessor!(self, row, col, Float)
+    }
+
+    fn string_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&alloc::string::String> {
+        debezium_scalar_accessor!(self, row, col, String)
+    }
+
+    fn bytes_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&alloc::vec::Vec<u8>> {
+        debezium_scalar_accessor!(self, row, col, Bytes)
+    }
+
+    fn uuid_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&uuid::Uuid> {
+        debezium_scalar_accessor!(self, row, col, Uuid)
+    }
+
+    fn timestamp_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&chrono::NaiveDateTime> {
+        debezium_scalar_accessor!(self, row, col, Timestamp)
+    }
+
+    fn timestamp_tz_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&chrono::DateTime<chrono::Utc>> {
+        debezium_scalar_accessor!(self, row, col, TimestampTz)
+    }
+
+    fn date_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&chrono::NaiveDate> {
+        debezium_scalar_accessor!(self, row, col, Date)
+    }
+
+    fn time_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&chrono::NaiveTime> {
+        debezium_scalar_accessor!(self, row, col, Time)
+    }
+
+    fn decimal_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&bigdecimal::BigDecimal> {
+        debezium_scalar_accessor!(self, row, col, Decimal)
+    }
+
+    fn json_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&serde_json::Value> {
+        debezium_scalar_accessor!(self, row, col, Json)
+    }
+
+    fn jsonb_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&serde_json::Value> {
+        debezium_scalar_accessor!(self, row, col, Jsonb)
+    }
+}
+
+impl DebeziumParser {
+    pub fn parse_wal_message_typed<DB: DatabaseLike>(
+        &self,
+        data: &[u8],
+        database: &DB,
+    ) -> Result<Vec<DebeziumEvent>, WalParseError> {
+        let Some(msg): Option<DebeziumEnvelope> = super::parse_json_message_or_tombstone(data)?
+        else {
+            return Ok(Vec::new());
+        };
+        if msg.op == "m" {
+            return Ok(Vec::new());
+        }
+        match convert_debezium_message_typed(msg, database) {
+            Ok(event) => Ok(alloc::vec![event]),
+            Err(WalParseError::UnknownEventKind(_)) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+fn convert_debezium_message_typed<DB: DatabaseLike>(
+    msg: DebeziumEnvelope,
+    database: &DB,
+) -> Result<DebeziumEvent, WalParseError> {
+    let kind = parse_debezium_op(&msg.op)?;
+
+    let table_id = resolve_table(&msg.source.schema, &msg.source.table, database)
+        .or_else(|e| {
+            if matches!(e, WalParseError::UnknownTable { .. }) {
+                resolve_table(&msg.source.db, &msg.source.table, database)
+            } else {
+                Err(e)
+            }
+        })?;
+    let arity = catalog_helpers::table_arity(database, table_id).ok_or_else(|| {
+        WalParseError::UnknownTable {
+            schema: msg.source.schema.clone(),
+            table: msg.source.table.clone(),
+        }
+    })?;
+
+    let pk_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Truncate {
+        alloc::sync::Arc::from(Vec::<ColumnId>::new())
+    } else {
+        catalog_helpers::primary_key_columns(database, table_id)
+            .map(alloc::sync::Arc::from)
+            .unwrap_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()))
+    };
+
+    let new_image = if matches!(kind, EventKind::Insert | EventKind::Update) {
+        msg.after.as_ref().map(|m| {
+            DebeziumRowImage::from_hashmap(m, table_id, arity, database, "debezium after")
+        }).transpose()?
+    } else {
+        None
+    };
+    let old_image = if matches!(kind, EventKind::Update | EventKind::Delete) {
+        msg.before.as_ref().map(|m| {
+            DebeziumRowImage::from_hashmap(m, table_id, arity, database, "debezium before")
+        }).transpose()?
+    } else {
+        None
+    };
+
+    let changed_columns: alloc::sync::Arc<[ColumnId]> =
+        alloc::sync::Arc::from(Vec::<ColumnId>::new());
+
+    Ok(DebeziumEvent {
+        kind,
+        table_id,
+        pk_columns,
+        changed_columns,
+        new_image,
+        old_image,
+    })
+}
+// ============================================================================
+// Tests
+// ============================================================================
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{orders_catalog, orders_no_pk_catalog};
     use super::*;
+    use crate::backend::CdcEvent;
 
     // -- INSERT tests -------------------------------------------------------
 
@@ -596,5 +887,238 @@ mod tests {
         // PK must come from the pre-update (before) row: id = 1
         assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
         assert_eq!(ev.pk().columns.as_ref(), &[0u16]);
+    }
+
+    // -- Phase 7D: DebeziumEvent typed CdcEvent smoke tests -----------------
+
+    #[test]
+    fn typed_debezium_event_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DebeziumEvent>();
+    }
+
+    #[test]
+    fn typed_debezium_event_dispatches_through_engine() {
+        let database = orders_catalog();
+        let mut engine: crate::SubscriptionEngine<
+            DebeziumEvent,
+            crate::DefaultIds,
+            sql_traits::structs::ParserDB,
+        > = crate::SubscriptionEngine::new(database, sqlparser::dialect::PostgreSqlDialect {});
+
+        engine
+            .register(
+                crate::SubscriptionRequest::new(66u64, "SELECT * FROM orders WHERE amount > 100")
+                    .updated_at_unix_ms(1_704_067_200_000),
+            )
+            .expect("register subscription");
+
+        let msg = r#"{
+            "before": null,
+            "after": {"id": 7, "amount": 250, "status": "paid", "comment": "test"},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "c",
+            "ts_ms": 1234567890
+        }"#;
+
+        let events = DebeziumParser
+            .parse_wal_message_typed(msg.as_bytes(), engine.database())
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Insert);
+        assert_eq!(event.pk_columns(), &[0u16]);
+
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&7)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 1),
+            crate::backend::Presence::Present(&250)
+        );
+        assert_eq!(
+            event.string_at(crate::backend::RowKind::New, 2),
+            crate::backend::Presence::Present(&alloc::string::String::from("paid"))
+        );
+        assert_eq!(
+            event.bool_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 1),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&7)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Missing
+        );
+
+        let notifs = engine.consumers(event).expect("dispatch");
+        assert_eq!(notifs.inserted(), alloc::vec![66u64]);
+        assert!(notifs.updated().is_empty());
+        assert!(notifs.deleted().is_empty());
+    }
+
+    #[test]
+    fn typed_debezium_pk_non_pk_distinction() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "before": null,
+            "after": {"id": 5, "amount": 50, "status": "new", "comment": "ok"},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "c",
+            "ts_ms": 1234567890
+        }"#;
+        let events = DebeziumParser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let event = &events[0];
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 1),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&5)
+        );
+    }
+
+    #[test]
+    fn typed_debezium_null_vs_missing_are_distinct() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "before": null,
+            "after": {"id": 1, "amount": null},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "c",
+            "ts_ms": 1234567890
+        }"#;
+        let events = DebeziumParser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let event = &events[0];
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 1),
+            crate::backend::Presence::Null
+        );
+        assert_eq!(
+            event.string_at(crate::backend::RowKind::New, 2),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.string_at(crate::backend::RowKind::New, 3),
+            crate::backend::Presence::Missing
+        );
+    }
+
+    #[test]
+    fn typed_debezium_tombstone_is_empty() {
+        let database = orders_catalog();
+        let events = DebeziumParser
+            .parse_wal_message_typed(b"null", &database)
+            .expect("tombstone");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn typed_debezium_message_op_is_skipped() {
+        let database = orders_catalog();
+        let msg = r#"{"before":null,"after":null,"source":{"db":"testdb","schema":"public","table":"orders"},"op":"m","ts_ms":1000}"#;
+        let events = DebeziumParser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("message op should be skipped");
+        assert!(events.is_empty(), "Message ops should produce no output");
+    }
+
+    #[test]
+    fn typed_debezium_delete_pk_from_before() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "before": {"id": 9, "amount": 100, "status": "old", "comment": "gone"},
+            "after": null,
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "d",
+            "ts_ms": 1234567890
+        }"#;
+        let events = DebeziumParser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Delete);
+        assert_eq!(event.pk_columns(), &[0u16]);
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Present(&9)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&9)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Missing
+        );
+    }
+
+    #[test]
+    fn typed_debezium_update_pk_uses_before() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "before": {"id": 1, "amount": 100, "status": "old", "comment": "before"},
+            "after":  {"id": 2, "amount": 200, "status": "new", "comment": "after"},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "u",
+            "ts_ms": 1234567890
+        }"#;
+        let events = DebeziumParser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Update);
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&1)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&2)
+        );
+    }
+
+    #[test]
+    fn typed_debezium_truncate_no_images() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "before": null,
+            "after": null,
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "t",
+            "ts_ms": 1234567890
+        }"#;
+        let events = DebeziumParser
+            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Truncate);
+        assert!(event.pk_columns().is_empty());
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Missing
+        );
     }
 }

@@ -21,8 +21,8 @@ pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
 pub use wal::{
-    DebeziumParser, MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Event,
-    Wal2JsonV2Parser, WalParseError, WalParser,
+    DebeziumEvent, DebeziumParser, MaxwellEvent, MaxwellParser, PgOutputParser, Wal2JsonV1Event,
+    Wal2JsonV1Parser, Wal2JsonV2Event, Wal2JsonV2Parser, WalParseError, WalParser,
 };
 #[cfg(feature = "pg-streaming")]
 pub use wal::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
