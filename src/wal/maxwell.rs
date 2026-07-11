@@ -97,7 +97,7 @@ fn parse_maxwell_kind(event_type: &str) -> Result<EventKind, WalParseError> {
 /// Owns the Maxwell wire payload for one row change plus lazily populated
 /// caches of decoded [`Value<MySql>`] cells. Scalar accessors on the
 /// [`CdcEvent`] impl decode each cell on first access through
-/// [`super::pg_type::infer_mysql_value_from_json_strict`] and return
+/// `super::pg_type::infer_mysql_value_from_json_strict` and return
 /// references into the cache.
 ///
 /// Backed by the MySQL [`Backend`](crate::backend::MySql).

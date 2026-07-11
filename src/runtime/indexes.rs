@@ -34,7 +34,7 @@ impl IndexableCell {
     /// `f64`, `String`). Returns `None` for `Missing` / `Null` and for
     /// scalars whose payload type does not match one of those four.
     ///
-    /// Uses [`core::any::Any::downcast_ref`], which is safe under
+    /// Uses [`Any::downcast_ref`](core::any::Any), which is safe under
     /// `Backend`'s `'static` bound on every scalar. For the three
     /// shipped backends (Postgres, MySql, SQLite) this matches
     /// `Value::Bool` (Postgres / MySql `bool`, SQLite `i64` also routes

@@ -368,7 +368,7 @@ use super::pg_type::text_to_pg_value;
 /// Owns the pgoutput wire payload for one row change plus lazily
 /// populated caches of decoded [`Value<Postgres>`] cells. Scalar
 /// accessors on the [`CdcEvent`] impl decode each cell on first access
-/// through [`text_to_pg_value`] (routed by the declared type OID) and
+/// through `text_to_pg_value` (routed by the declared type OID) and
 /// return references into the cache.
 ///
 /// Backed by the Postgres [`Backend`](crate::backend::Backend). The

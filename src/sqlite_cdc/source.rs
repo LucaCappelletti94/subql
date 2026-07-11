@@ -43,7 +43,7 @@ pub enum SqliteCdcError {
     Diesel(#[from] diesel::result::Error),
 }
 
-/// Live SQLite CDC source. See the [module docs](self) for the lifecycle
+/// Live SQLite CDC source. See the [module docs](super) for the lifecycle
 /// contract.
 pub struct SqliteCdcSource<DB: DatabaseLike> {
     connection: SqliteConnection,

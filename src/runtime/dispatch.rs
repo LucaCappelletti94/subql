@@ -205,7 +205,7 @@ fn resolve_ordinals<I: IdTypes>(
 /// * `Truncate` -> all row subscribers to `deleted`.
 ///
 /// `column_kinds` names the [`ScalarKind`] for each column of the target
-/// table, index-aligned with [`ColumnId`]. The dispatcher uses it to
+/// table, index-aligned with [`crate::ColumnId`]. The dispatcher uses it to
 /// route event scalar accessors correctly. Callers cache this per table
 /// (via [`crate::catalog_helpers::column_scalar_kind`]).
 pub fn dispatch_consumers<I, E>(

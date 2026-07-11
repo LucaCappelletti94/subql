@@ -20,7 +20,7 @@ use crate::backend::CdcEvent;
 ///
 /// Implementations transparently handle non-event protocol frames
 /// (keepalives, relation metadata, transaction boundaries) and surface
-/// only the consumer-visible [`WalEvent`]s through [`Self::next_event`].
+/// only the consumer-visible [`Self::Event`]s through [`Self::next_event`].
 /// Progress is reported via [`Self::ack`], which the source forwards to
 /// the upstream server (e.g. Postgres `StandbyStatusUpdate`) so that
 /// WAL can be recycled.
@@ -43,11 +43,10 @@ use crate::backend::CdcEvent;
 ///
 /// # Examples
 ///
-/// The canonical consume-and-ack loop:
-///
-/// ```ignore
-/// // Doctest gated pending Phase 10 rewrite against typed CdcEvent.
-/// ```
+/// The canonical consume-and-ack loop is exercised end to end by
+/// `tests/pgoutput_e2e.rs` (push, via [`crate::PgStreamingCdcSource`]) and
+/// `tests/polling_smoke.rs` (poll, via
+/// [`crate::PollingPgCdcSource`]).
 pub trait CdcSource: Send {
     /// The typed CDC event this source surfaces.
     ///

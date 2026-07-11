@@ -1,4 +1,4 @@
-//! WAL stream parsing: convert raw CDC bytes into typed [`CdcEvent`]s.
+//! WAL stream parsing: convert raw CDC bytes into typed [`crate::backend::CdcEvent`]s.
 //!
 //! The [`WalParser`] trait abstracts over format-specific encodings
 //! (wal2json, Maxwell, Debezium, pgoutput) so callers can feed raw

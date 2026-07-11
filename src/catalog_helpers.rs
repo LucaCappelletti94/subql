@@ -213,7 +213,7 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
 ///
 /// Distinguishes every scalar subql cares about (`JSONB` vs `JSON`,
 /// `TIMESTAMPTZ` vs `TIMESTAMP`, and so on) via
-/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token).
+/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token).
 /// The compiler tags every
 /// [`crate::compiler::Instruction::LoadColumn`] instruction with the
 /// result.

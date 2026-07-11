@@ -177,7 +177,7 @@ fn parse_v2_kind(action: &str) -> Result<EventKind, WalParseError> {
 /// Owns the wal2json v2 wire payload for one row change plus lazily
 /// populated caches of decoded [`Value<Postgres>`] cells. Scalar accessors
 /// on the [`CdcEvent`] impl decode each cell on first access through
-/// [`json_value_to_pg_value`] and return references into the cache.
+/// `json_value_to_pg_value` and return references into the cache.
 ///
 /// Backed by the Postgres [`Backend`](crate::backend::Backend). Anchored on
 /// [`PgLsn`](crate::PgLsn) when `wal2json` was invoked with
@@ -612,10 +612,10 @@ fn v2_derive_changed_columns(
 /// Owns the wal2json v1 wire payload for one row change plus lazily
 /// populated caches of decoded [`Value<Postgres>`] cells. Scalar accessors
 /// on the [`CdcEvent`] impl decode each cell on first access through
-/// [`json_value_to_pg_value`] and return references into the cache.
+/// `json_value_to_pg_value` and return references into the cache.
 ///
 /// Backed by the Postgres [`Backend`](crate::backend::Backend). V1 does not
-/// carry an LSN, so [`Checkpoint`] is [`crate::NoCheckpoint`].
+/// carry an LSN, so [`crate::Checkpoint`] is [`crate::NoCheckpoint`].
 pub struct Wal2JsonV1Event {
     kind: EventKind,
     table_id: TableId,

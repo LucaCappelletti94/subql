@@ -3,7 +3,7 @@
 //! # Type shape
 //!
 //! [`Vm`] is parameterised on the observed [`Backend`] `B`; the stack holds
-//! `Value<B>` and `Tri` slots via [`StackValue`]. Evaluation is generic over
+//! `Value<B>` and `Tri` slots via `StackValue`. Evaluation is generic over
 //! the concrete event: [`Vm::eval`] takes any `E: CdcEvent<Backend = B>`
 //! and a [`RowKind`] selecting which row view to read column loads from.
 //!
@@ -12,8 +12,8 @@
 //! * A compiled program is Backend-scoped and reusable across every
 //!   `E: CdcEvent<Backend = B>`.
 //! * The final instruction of a well-formed program leaves exactly one
-//!   [`StackValue::Tri`] on the stack, or exactly one
-//!   [`StackValue::Value`] carrying `Value::Null` / `Value::Missing` (both
+//!   `StackValue::Tri` on the stack, or exactly one
+//!   `StackValue::Value` carrying `Value::Null` / `Value::Missing` (both
 //!   lift to `Tri::Unknown`). Any other final shape is a compiler bug and
 //!   surfaces as [`VmError::MalformedProgram`].
 //! * Same-scalar arithmetic only. Cross-scalar operands, or `Missing` /
