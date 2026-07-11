@@ -25,7 +25,7 @@ pub use pg_streaming::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError
 pub use pgoutput::PgOutputParser;
 #[cfg(feature = "std")]
 pub use streaming::CdcSource;
-pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Parser};
+pub use wal2json::{Wal2JsonV1Parser, Wal2JsonV2Event, Wal2JsonV2Parser};
 
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{
