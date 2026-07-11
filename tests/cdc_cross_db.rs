@@ -1,5 +1,3 @@
-#![cfg(any())] // Blocked on SubscriptionEngine now being <E: CdcEvent>; dispatching Wal2JsonV2Event AND MaxwellEvent through one engine requires either a unifying enum or two parallel engines with cross-dispatch tallying. Post-Phase 11 follow-up.
-
 //! Cross-database CDC parity test.
 //!
 //! Proves that identical DML applied to PostgreSQL and MySQL produces identical
@@ -15,14 +13,16 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use diesel::prelude::*;
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use sql_traits::structs::ParserDB;
+use subql::backend::{MySql, Postgres};
 use subql::{
-    DefaultIds, MaxwellParser, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Parser, WalParser,
+    DefaultIds, MaxwellEvent, MaxwellParser, SubscriptionEngine, SubscriptionRequest,
+    Wal2JsonV2Event, Wal2JsonV2Parser, WalParser,
 };
 
 // ============================================================================
@@ -372,34 +372,34 @@ fn maxwell_read_changes(output_dir: &str, expected_count: usize) -> Vec<String> 
 // Engine setup
 // ============================================================================
 
-fn setup_engine(catalog: ParserDB) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
+const SUBSCRIPTIONS: &[(u64, &str)] = &[
+    (1, "SELECT * FROM readings WHERE temperature > 30"),
+    (2, "SELECT * FROM readings WHERE location = 'warehouse-A'"),
+    (3, "SELECT * FROM readings WHERE humidity < 40 AND temperature > 25"),
+    (4, "SELECT * FROM readings WHERE sensor_id = 1"),
+];
+
+fn setup_pg_engine(
+    catalog: ParserDB,
+) -> SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> {
     let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
-
-    let subscriptions = [
-        (
-            1_u64,
-            1_u64,
-            "SELECT * FROM readings WHERE temperature > 30",
-        ),
-        (
-            2,
-            2,
-            "SELECT * FROM readings WHERE location = 'warehouse-A'",
-        ),
-        (
-            3,
-            3,
-            "SELECT * FROM readings WHERE humidity < 40 AND temperature > 25",
-        ),
-        (4, 4, "SELECT * FROM readings WHERE sensor_id = 1"),
-    ];
-
-    for (sub_id, consumer_id, sql) in &subscriptions {
+    for (consumer_id, sql) in SUBSCRIPTIONS {
         engine
-            .register(SubscriptionRequest::new(*consumer_id, *sql))
-            .unwrap_or_else(|e| panic!("Failed to register subscription {sub_id}: {e}"));
+            .register(SubscriptionRequest::<DefaultIds, Postgres>::new(*consumer_id, *sql))
+            .unwrap_or_else(|e| panic!("register PG subscription {consumer_id}: {e}"));
     }
+    engine
+}
 
+fn setup_mysql_engine(
+    catalog: ParserDB,
+) -> SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> {
+    let mut engine = SubscriptionEngine::new(catalog, MySqlDialect {});
+    for (consumer_id, sql) in SUBSCRIPTIONS {
+        engine
+            .register(SubscriptionRequest::<DefaultIds, MySql>::new(*consumer_id, *sql))
+            .unwrap_or_else(|e| panic!("register MySQL subscription {consumer_id}: {e}"));
+    }
     engine
 }
 
@@ -407,12 +407,17 @@ fn setup_engine(catalog: ParserDB) -> SubscriptionEngine<PostgreSqlDialect, Defa
 // Dispatch and collect matched consumers
 // ============================================================================
 
-fn dispatch_events<C: subql::Checkpoint>(
-    engine: &mut SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
-    parser: &dyn WalParser<ParserDB, Checkpoint = C>,
+fn dispatch_events<P>(
+    engine: &mut SubscriptionEngine<P::Event, DefaultIds, ParserDB>,
+    parser: &P,
     messages: &[String],
     catalog: &ParserDB,
-) -> Vec<BTreeSet<u64>> {
+) -> Vec<BTreeSet<u64>>
+where
+    P: WalParser<ParserDB>,
+    <P::Event as subql::backend::CdcEvent>::Backend:
+        subql::compiler::literals::SqlLiteralParse,
+{
     let mut results = Vec::with_capacity(messages.len());
 
     for (i, msg) in messages.iter().enumerate() {
@@ -424,10 +429,6 @@ fn dispatch_events<C: subql::Checkpoint>(
             let notifs = engine
                 .consumers(event)
                 .unwrap_or_else(|e| panic!("Dispatch failed for event {i}: {e}"));
-            // Collect every bucket. The view-relative consumers API splits
-            // matches across inserted/deleted/updated. A DELETE's matches
-            // live in `deleted`, which `into_iter()` (yielding only
-            // inserted plus updated) would silently drop.
             let consumers: BTreeSet<u64> = notifs
                 .inserted()
                 .iter()
@@ -513,8 +514,8 @@ fn cross_db_cdc_parity() {
 
     // Set up engines, one per CDC source
     let catalog = iot_catalog();
-    let mut pg_engine = setup_engine(iot_catalog());
-    let mut mx_engine = setup_engine(iot_catalog());
+    let mut pg_engine = setup_pg_engine(iot_catalog());
+    let mut mx_engine = setup_mysql_engine(iot_catalog());
 
     // Dispatch and collect results
     let pg_results = dispatch_events(&mut pg_engine, &Wal2JsonV2Parser, &pg_messages, &catalog);
