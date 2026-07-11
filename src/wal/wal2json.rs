@@ -542,13 +542,20 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
         alloc::sync::Arc::from(Vec::<ColumnId>::new())
     };
 
-    // `changed_columns` derivation is deferred to a follow-up: it requires
-    // decoding paired old / new cells, which conflicts with decode-on-
-    // demand. Consumers treat the slice as a hint, not an authoritative
-    // diff, so an empty slice is safe (over-notification, never under-
-    // notification).
-    let changed_columns: alloc::sync::Arc<[ColumnId]> =
-        alloc::sync::Arc::from(Vec::<ColumnId>::new());
+    // Derive changed_columns by wire-level comparison of new vs old when
+    // both images cover every column. That signals REPLICA IDENTITY FULL;
+    // sparse identity (PK-only) leaves the slice empty (safe: consumers
+    // treat empty as "no hint, re-evaluate everything"). No decode-cache
+    // slots are touched by the comparison.
+    let changed_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Update {
+        alloc::sync::Arc::from(v2_derive_changed_columns(
+            new_image.as_ref(),
+            old_image.as_ref(),
+            arity,
+        ))
+    } else {
+        alloc::sync::Arc::from(Vec::<ColumnId>::new())
+    };
 
     Ok(Wal2JsonV2Event {
         kind,
@@ -559,6 +566,37 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
         new_image,
         old_image,
     })
+}
+
+/// Wire-level `changed_columns` derivation for wal2json v2 Update events.
+///
+/// Runs only when both images cover the table's arity (source is running
+/// with `REPLICA IDENTITY FULL`). Returns an empty vector otherwise, per
+/// the [`CdcEvent`] contract's "hint, not authoritative diff" clause.
+fn v2_derive_changed_columns(
+    new_image: Option<&V2RowImage>,
+    old_image: Option<&V2RowImage>,
+    arity: usize,
+) -> Vec<ColumnId> {
+    let (Some(new), Some(old)) = (new_image, old_image) else {
+        return Vec::new();
+    };
+    if new.entries.len() != arity || old.entries.len() != arity {
+        return Vec::new();
+    }
+    let mut changed = Vec::new();
+    for col in 0..arity {
+        let (Some(new_idx), Some(old_idx)) = (new.by_col[col], old.by_col[col]) else {
+            continue;
+        };
+        let new_val = &new.entries[new_idx as usize].value;
+        let old_val = &old.entries[old_idx as usize].value;
+        if new_val != old_val {
+            #[allow(clippy::cast_possible_truncation)]
+            changed.push(col as ColumnId);
+        }
+    }
+    changed
 }
 
 // ============================================================================
@@ -894,8 +932,15 @@ fn convert_v1_change_typed<DB: DatabaseLike>(
             .unwrap_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()))
     };
 
-    let changed_columns: alloc::sync::Arc<[ColumnId]> =
-        alloc::sync::Arc::from(Vec::<ColumnId>::new());
+    let changed_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Update {
+        alloc::sync::Arc::from(v1_derive_changed_columns(
+            new_image.as_ref(),
+            old_image.as_ref(),
+            arity,
+        ))
+    } else {
+        alloc::sync::Arc::from(Vec::<ColumnId>::new())
+    };
 
     Ok(Wal2JsonV1Event {
         kind,
@@ -906,6 +951,38 @@ fn convert_v1_change_typed<DB: DatabaseLike>(
         new_image,
         old_image,
     })
+}
+
+/// Wire-level `changed_columns` derivation for wal2json v1 Update events.
+///
+/// wal2json v1's `oldkeys` is almost always sparse (PK columns only), so
+/// this returns an empty vector in the common case. It fires only when
+/// the source is running with `REPLICA IDENTITY FULL`, where `oldkeys`
+/// covers the arity.
+fn v1_derive_changed_columns(
+    new_image: Option<&V1RowImage>,
+    old_image: Option<&V1RowImage>,
+    arity: usize,
+) -> Vec<ColumnId> {
+    let (Some(new), Some(old)) = (new_image, old_image) else {
+        return Vec::new();
+    };
+    if new.entries.len() != arity || old.entries.len() != arity {
+        return Vec::new();
+    }
+    let mut changed = Vec::new();
+    for col in 0..arity {
+        let (Some(new_idx), Some(old_idx)) = (new.by_col[col], old.by_col[col]) else {
+            continue;
+        };
+        let new_val = &new.entries[new_idx as usize].value;
+        let old_val = &old.entries[old_idx as usize].value;
+        if new_val != old_val {
+            #[allow(clippy::cast_possible_truncation)]
+            changed.push(col as ColumnId);
+        }
+    }
+    changed
 }
 // ============================================================================
 
@@ -2270,6 +2347,67 @@ mod tests {
     }
 
     #[test]
+    fn typed_v2_full_identity_derives_changed_columns() {
+        // Update with `identity` covering every column (REPLICA IDENTITY FULL).
+        // amount and status change; id and customer stay the same.
+        let database = orders_catalog();
+        let msg = r#"{
+            "action": "U",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "id", "type": "integer", "value": 7},
+                {"name": "customer", "type": "integer", "value": 3},
+                {"name": "amount", "type": "integer", "value": 250},
+                {"name": "status", "type": "text", "value": "paid"}
+            ],
+            "identity": [
+                {"name": "id", "type": "integer", "value": 7},
+                {"name": "customer", "type": "integer", "value": 3},
+                {"name": "amount", "type": "integer", "value": 100},
+                {"name": "status", "type": "text", "value": "pending"}
+            ],
+            "pk": [{"name": "id", "type": "integer"}]
+        }"#;
+        let events = Wal2JsonV2Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind(), EventKind::Update);
+        let mut changed = ev.changed_columns().to_vec();
+        changed.sort_unstable();
+        assert_eq!(changed, alloc::vec![2u16, 3u16]);
+    }
+
+    #[test]
+    fn typed_v2_sparse_identity_leaves_changed_columns_empty() {
+        // Update with `identity` covering only PK (REPLICA IDENTITY DEFAULT):
+        // derivation is unsafe, so changed_columns() must be empty.
+        let database = orders_catalog();
+        let msg = r#"{
+            "action": "U",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "id", "type": "integer", "value": 7},
+                {"name": "customer", "type": "integer", "value": 3},
+                {"name": "amount", "type": "integer", "value": 250},
+                {"name": "status", "type": "text", "value": "paid"}
+            ],
+            "identity": [
+                {"name": "id", "type": "integer", "value": 7}
+            ],
+            "pk": [{"name": "id", "type": "integer"}]
+        }"#;
+        let events = Wal2JsonV2Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let ev = &events[0];
+        assert!(ev.changed_columns().is_empty());
+    }
+
+    #[test]
     fn typed_v2_null_vs_missing_are_distinct() {
         let database = orders_catalog();
         let msg = r#"{
@@ -2501,6 +2639,61 @@ mod tests {
             .parse_wal_message(b"null", &database)
             .expect("tombstone");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn typed_v1_full_oldkeys_derives_changed_columns() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 200,
+            "change": [{
+                "kind": "update",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer", "amount", "status"],
+                "columntypes": ["integer", "integer", "integer", "text"],
+                "columnvalues": [7, 3, 250, "paid"],
+                "oldkeys": {
+                    "keynames": ["id", "customer", "amount", "status"],
+                    "keytypes": ["integer", "integer", "integer", "text"],
+                    "keyvalues": [7, 3, 100, "pending"]
+                }
+            }]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind(), EventKind::Update);
+        let mut changed = ev.changed_columns().to_vec();
+        changed.sort_unstable();
+        assert_eq!(changed, alloc::vec![2u16, 3u16]);
+    }
+
+    #[test]
+    fn typed_v1_sparse_oldkeys_leaves_changed_columns_empty() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 201,
+            "change": [{
+                "kind": "update",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer", "amount", "status"],
+                "columntypes": ["integer", "integer", "integer", "text"],
+                "columnvalues": [7, 3, 250, "paid"],
+                "oldkeys": {
+                    "keynames": ["id"],
+                    "keytypes": ["integer"],
+                    "keyvalues": [7]
+                }
+            }]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert!(events[0].changed_columns().is_empty());
     }
 
     #[test]

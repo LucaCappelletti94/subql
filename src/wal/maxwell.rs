@@ -444,9 +444,16 @@ fn convert_maxwell_typed<DB: DatabaseLike>(
         EventKind::Truncate => (None, None),
     };
 
-    // changed_columns: empty for MVP
-    let changed_columns: alloc::sync::Arc<[ColumnId]> =
-        alloc::sync::Arc::from(Vec::<ColumnId>::new());
+    // Maxwell's `old` field is by-convention only the columns whose
+    // value changed on this update. Every column present in the old
+    // image is therefore in `changed_columns`, and the derivation is
+    // authoritative (not a hint). See [`MapCdcConfig::old_is_changed_columns_only`]
+    // in the legacy convert path for the same statement of intent.
+    let changed_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Update {
+        alloc::sync::Arc::from(maxwell_derive_changed_columns(old_image.as_ref()))
+    } else {
+        alloc::sync::Arc::from(Vec::<ColumnId>::new())
+    };
 
     Ok(Some(MaxwellEvent {
         kind,
@@ -457,6 +464,26 @@ fn convert_maxwell_typed<DB: DatabaseLike>(
         new_image,
         old_image,
     }))
+}
+
+/// Wire-level `changed_columns` for a Maxwell Update event.
+///
+/// Maxwell's `old` field only carries columns whose value differed on
+/// the update, so every column present in the old image belongs in
+/// `changed_columns`. Authoritative (not a hint) for a well-behaved
+/// Maxwell producer.
+fn maxwell_derive_changed_columns(old_image: Option<&MaxwellRowImage>) -> Vec<ColumnId> {
+    let Some(old) = old_image else {
+        return Vec::new();
+    };
+    let mut changed = Vec::new();
+    for (col, slot) in old.by_col.iter().enumerate() {
+        if slot.is_some() {
+            #[allow(clippy::cast_possible_truncation)]
+            changed.push(col as ColumnId);
+        }
+    }
+    changed
 }
 
 // ============================================================================
@@ -1139,6 +1166,39 @@ mod tests {
             event.string_at(crate::backend::RowKind::New, 2),
             crate::backend::Presence::Missing
         );
+    }
+
+    #[test]
+    fn typed_maxwell_old_field_populates_changed_columns() {
+        let database = typed_maxwell_catalog();
+        // Maxwell puts every changed column into `old`. amount and status
+        // are the two columns that changed here.
+        let msg = r#"{
+            "database":"test","table":"orders","type":"update",
+            "data":{"id":7,"amount":250,"status":"paid"},
+            "old":{"amount":100,"status":"pending"}
+        }"#;
+        let events = MaxwellParser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Update);
+        let mut changed = event.changed_columns().to_vec();
+        changed.sort_unstable();
+        assert_eq!(changed, alloc::vec![1u16, 2u16]);
+    }
+
+    #[test]
+    fn typed_maxwell_insert_leaves_changed_columns_empty() {
+        let database = typed_maxwell_catalog();
+        let msg = r#"{
+            "database":"test","table":"orders","type":"insert",
+            "data":{"id":9,"amount":10,"status":"new"}
+        }"#;
+        let events = MaxwellParser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert!(events[0].changed_columns().is_empty());
     }
 
     /// 6. Tombstone (null JSON) parses to empty Vec.

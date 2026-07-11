@@ -178,7 +178,11 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                     kind: EventKind::Update,
                     table_id: rel.table_id,
                     pk_columns,
-                    changed_columns: Arc::from(Vec::<ColumnId>::new()),
+                    changed_columns: pgout_derive_changed_columns(
+                        Some(&new_image),
+                        old_image.as_ref(),
+                        rel.arity,
+                    ),
                     checkpoint: None,
                     new_image: Some(new_image),
                     old_image,
@@ -401,6 +405,7 @@ struct PgOutWireCell {
     payload: PgOutWirePayload,
 }
 
+#[derive(PartialEq)]
 enum PgOutWirePayload {
     /// Wire carried the SQL NULL marker for this cell (`ColumnData::Null`).
     Null,
@@ -485,6 +490,38 @@ impl PgOutRowImage {
             }
         }))
     }
+}
+
+/// Wire-level `changed_columns` derivation for a pgoutput Update event.
+///
+/// Runs only when the old image covers every column (key_type = 'O',
+/// i.e. REPLICA IDENTITY FULL upstream). Compares the wire `payload`
+/// per column without touching the [`Value<Postgres>`] decode cache;
+/// wire-difference implies semantic-difference for Postgres canonical
+/// text output. Sparser old images ('K' key tuples) leave the returned
+/// slice empty (safe: over-notification).
+fn pgout_derive_changed_columns(
+    new_image: Option<&PgOutRowImage>,
+    old_image: Option<&PgOutRowImage>,
+    arity: usize,
+) -> Arc<[ColumnId]> {
+    let (Some(new), Some(old)) = (new_image, old_image) else {
+        return Arc::from(Vec::<ColumnId>::new());
+    };
+    if new.entries.len() != arity || old.entries.len() != arity {
+        return Arc::from(Vec::<ColumnId>::new());
+    }
+    let mut changed = Vec::new();
+    for col in 0..arity {
+        let (Some(new_idx), Some(old_idx)) = (new.by_col[col], old.by_col[col]) else {
+            continue;
+        };
+        if new.entries[new_idx as usize].payload != old.entries[old_idx as usize].payload {
+            #[allow(clippy::cast_possible_truncation)]
+            changed.push(col as ColumnId);
+        }
+    }
+    Arc::from(changed)
 }
 
 fn wire_cell_from_column_data(
@@ -2387,6 +2424,70 @@ mod tests {
         assert_eq!(notifs.inserted(), alloc::vec![88u64]);
         assert!(notifs.updated().is_empty());
         assert!(notifs.deleted().is_empty());
+    }
+
+    #[test]
+    fn typed_pgoutput_full_old_tuple_derives_changed_columns() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let rel_msg = build_relation_msg(60_000, "public", "orders", &typed_orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation parses");
+
+        // Update with old_tag='O' (all columns). id unchanged, customer
+        // unchanged, amount changed, status changed.
+        let update_msg = build_update_msg_with_old(
+            60_000,
+            b'O',
+            &[
+                TupleCol::Text("7".into()),
+                TupleCol::Text("3".into()),
+                TupleCol::Text("100".into()),
+                TupleCol::Text("pending".into()),
+            ],
+            &[
+                TupleCol::Text("7".into()),
+                TupleCol::Text("3".into()),
+                TupleCol::Text("250".into()),
+                TupleCol::Text("paid".into()),
+            ],
+        );
+        let events = parser
+            .parse_wal_message(&update_msg, &catalog)
+            .expect("update parses");
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Update);
+        let mut changed = event.changed_columns().to_vec();
+        changed.sort_unstable();
+        assert_eq!(changed, alloc::vec![2u16, 3u16]);
+    }
+
+    #[test]
+    fn typed_pgoutput_key_tuple_update_leaves_changed_columns_empty() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let rel_msg = build_relation_msg(61_000, "public", "orders", &typed_orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation parses");
+
+        // Update with key tuple 'K' (identity column only in old).
+        let update_msg = build_update_msg_with_old(
+            61_000,
+            b'K',
+            &[TupleCol::Text("7".into())],
+            &[
+                TupleCol::Text("7".into()),
+                TupleCol::Text("3".into()),
+                TupleCol::Text("250".into()),
+                TupleCol::Text("paid".into()),
+            ],
+        );
+        let events = parser
+            .parse_wal_message(&update_msg, &catalog)
+            .expect("update parses");
+        assert!(events[0].changed_columns().is_empty());
     }
 
     #[test]

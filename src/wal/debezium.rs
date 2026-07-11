@@ -341,8 +341,19 @@ fn convert_debezium_message_typed<DB: DatabaseLike>(
         None
     };
 
-    let changed_columns: alloc::sync::Arc<[ColumnId]> =
-        alloc::sync::Arc::from(Vec::<ColumnId>::new());
+    // Derive changed_columns by wire-level comparison of `after` vs
+    // `before` when both cover the arity (source is running under
+    // REPLICA IDENTITY FULL). Sparser identities leave the slice empty,
+    // which is safe (over-notification).
+    let changed_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Update {
+        alloc::sync::Arc::from(debezium_derive_changed_columns(
+            new_image.as_ref(),
+            old_image.as_ref(),
+            arity,
+        ))
+    } else {
+        alloc::sync::Arc::from(Vec::<ColumnId>::new())
+    };
 
     Ok(DebeziumEvent {
         kind,
@@ -352,6 +363,37 @@ fn convert_debezium_message_typed<DB: DatabaseLike>(
         new_image,
         old_image,
     })
+}
+
+/// Wire-level `changed_columns` derivation for a Debezium Update event.
+///
+/// Runs only when both images cover every column (`REPLICA IDENTITY
+/// FULL` upstream). Sparser replica identity settings leave the slice
+/// empty (safe: over-notification, per the [`CdcEvent`] contract).
+fn debezium_derive_changed_columns(
+    new_image: Option<&DebeziumRowImage>,
+    old_image: Option<&DebeziumRowImage>,
+    arity: usize,
+) -> Vec<ColumnId> {
+    let (Some(new), Some(old)) = (new_image, old_image) else {
+        return Vec::new();
+    };
+    if new.entries.len() != arity || old.entries.len() != arity {
+        return Vec::new();
+    }
+    let mut changed = Vec::new();
+    for col in 0..arity {
+        let (Some(new_idx), Some(old_idx)) = (new.by_col[col], old.by_col[col]) else {
+            continue;
+        };
+        let new_val = &new.entries[new_idx as usize].value;
+        let old_val = &old.entries[old_idx as usize].value;
+        if new_val != old_val {
+            #[allow(clippy::cast_possible_truncation)]
+            changed.push(col as ColumnId);
+        }
+    }
+    changed
 }
 // ============================================================================
 // Tests
@@ -1049,6 +1091,44 @@ mod tests {
             event.int_at(crate::backend::RowKind::New, 0),
             crate::backend::Presence::Present(&2)
         );
+    }
+
+    #[test]
+    fn typed_debezium_full_before_derives_changed_columns() {
+        let database = orders_catalog();
+        // Full REPLICA IDENTITY (before covers every column). id stays,
+        // amount and status differ, comment stays.
+        let msg = r#"{
+            "before": {"id": 1, "amount": 100, "status": "old", "comment": "same"},
+            "after":  {"id": 1, "amount": 200, "status": "new", "comment": "same"},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "u",
+            "ts_ms": 1234567890
+        }"#;
+        let events = DebeziumParser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        let event = &events[0];
+        let mut changed = event.changed_columns().to_vec();
+        changed.sort_unstable();
+        assert_eq!(changed, alloc::vec![1u16, 2u16]);
+    }
+
+    #[test]
+    fn typed_debezium_sparse_before_leaves_changed_columns_empty() {
+        let database = orders_catalog();
+        // Sparse before (PK-only replica identity).
+        let msg = r#"{
+            "before": {"id": 1},
+            "after":  {"id": 1, "amount": 200, "status": "new", "comment": "same"},
+            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
+            "op": "u",
+            "ts_ms": 1234567890
+        }"#;
+        let events = DebeziumParser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert!(events[0].changed_columns().is_empty());
     }
 
     #[test]
