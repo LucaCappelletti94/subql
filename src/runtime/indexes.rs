@@ -646,25 +646,32 @@ pub fn extract_indexable_atoms<B: Backend>(
     }
 }
 
-#[cfg(any())] // Phase 10 test port pending
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::approx_constant)]
 mod tests {
     use super::*;
+    use crate::backend::{Postgres, ScalarKind, Value};
 
     #[test]
-    fn test_indexable_cell_from_cell() {
+    fn test_indexable_cell_from_value() {
         assert_eq!(
-            IndexableCell::from_cell(&Cell::Int(42)),
+            IndexableCell::from_value(&Value::<Postgres>::Int(42)),
             Some(IndexableCell::Int(42))
         );
 
         assert_eq!(
-            IndexableCell::from_cell(&Cell::Bool(true)),
+            IndexableCell::from_value(&Value::<Postgres>::Bool(true)),
             Some(IndexableCell::Bool(true))
         );
 
-        assert_eq!(IndexableCell::from_cell(&Cell::Null), None);
-        assert_eq!(IndexableCell::from_cell(&Cell::Missing), None);
+        assert_eq!(IndexableCell::from_value(&Value::<Postgres>::Null), None);
+        assert_eq!(IndexableCell::from_value(&Value::<Postgres>::Missing), None);
+
+        let float = IndexableCell::from_value(&Value::<Postgres>::Float(3.14));
+        assert!(matches!(float, Some(IndexableCell::Float(_))));
+
+        let string = IndexableCell::from_value(&Value::<Postgres>::String("test".into()));
+        assert_eq!(string, Some(IndexableCell::String("test".into())));
     }
 
     #[test]
@@ -831,8 +838,8 @@ mod tests {
 
         // Bytecode for: age = 42
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::LoadColumn(1, ScalarKind::Int),
+            Instruction::PushLiteral(Value::<Postgres>::Int(42)),
             Instruction::Equal,
         ]);
 
@@ -854,8 +861,8 @@ mod tests {
 
         // Bytecode for: age > 18
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
+            Instruction::LoadColumn(1, ScalarKind::Int),
+            Instruction::PushLiteral(Value::<Postgres>::Int(18)),
             Instruction::GreaterThan,
         ]);
 
@@ -878,9 +885,9 @@ mod tests {
 
         // Bytecode for: age BETWEEN 18 AND 65
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::PushLiteral(Cell::Int(65)),
+            Instruction::LoadColumn(1, ScalarKind::Int),
+            Instruction::PushLiteral(Value::<Postgres>::Int(18)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(65)),
             Instruction::Between,
         ]);
 
@@ -902,7 +909,7 @@ mod tests {
         use crate::compiler::{BytecodeProgram, Instruction};
 
         // Bytecode for: status IS NULL
-        let bytecode = BytecodeProgram::new(vec![Instruction::LoadColumn(2), Instruction::IsNull]);
+        let bytecode = BytecodeProgram::<Postgres>::new(vec![Instruction::LoadColumn(2, ScalarKind::Int), Instruction::IsNull]);
 
         let atoms = extract_indexable_atoms(&bytecode, &[2]);
 
@@ -922,10 +929,10 @@ mod tests {
 
         // Bytecode for: status IN ('active', 'pending')
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(2),
+            Instruction::LoadColumn(2, ScalarKind::String),
             Instruction::In(vec![
-                Cell::String("active".into()),
-                Cell::String("pending".into()),
+                Value::<Postgres>::String("active".into()),
+                Value::<Postgres>::String("pending".into()),
             ]),
         ]);
 
@@ -954,8 +961,8 @@ mod tests {
 
         // Bytecode for: name LIKE '%test%' (complex, not easily indexable)
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0),
-            Instruction::PushLiteral(Cell::String("%test%".into())),
+            Instruction::LoadColumn(0, ScalarKind::String),
+            Instruction::PushLiteral(Value::<Postgres>::String("%test%".into())),
             Instruction::Like {
                 case_sensitive: true,
             },
@@ -967,20 +974,6 @@ mod tests {
         assert!(matches!(atoms[0], IndexableAtom::Fallback));
     }
 
-    #[test]
-    fn test_indexable_cell_from_float() {
-        let float_cell = Cell::Float(3.14);
-        let indexable = IndexableCell::from_cell(&float_cell);
-        assert!(indexable.is_some());
-        assert!(matches!(indexable, Some(IndexableCell::Float(_))));
-    }
-
-    #[test]
-    fn test_indexable_cell_from_string() {
-        let string_cell = Cell::String("test".into());
-        let indexable = IndexableCell::from_cell(&string_cell);
-        assert_eq!(indexable, Some(IndexableCell::String("test".into())));
-    }
 
     #[test]
     fn test_hybrid_indexes_default() {
@@ -1155,8 +1148,8 @@ mod tests {
 
         // Bytecode for: age != 42 (not indexable, skipped)
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::LoadColumn(1, ScalarKind::Int),
+            Instruction::PushLiteral(Value::<Postgres>::Int(42)),
             Instruction::NotEqual,
         ]);
 
@@ -1173,8 +1166,8 @@ mod tests {
 
         // Bytecode for: age >= 18
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
+            Instruction::LoadColumn(1, ScalarKind::Int),
+            Instruction::PushLiteral(Value::<Postgres>::Int(18)),
             Instruction::GreaterThanOrEqual,
         ]);
 
@@ -1197,8 +1190,8 @@ mod tests {
 
         // Bytecode for: age < 30
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(30)),
+            Instruction::LoadColumn(1, ScalarKind::Int),
+            Instruction::PushLiteral(Value::<Postgres>::Int(30)),
             Instruction::LessThan,
         ]);
 
@@ -1221,8 +1214,8 @@ mod tests {
 
         // Bytecode for: age <= 65
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(65)),
+            Instruction::LoadColumn(1, ScalarKind::Int),
+            Instruction::PushLiteral(Value::<Postgres>::Int(65)),
             Instruction::LessThanOrEqual,
         ]);
 
@@ -1244,8 +1237,10 @@ mod tests {
         use crate::compiler::{BytecodeProgram, Instruction};
 
         // Bytecode for: status IS NOT NULL
-        let bytecode =
-            BytecodeProgram::new(vec![Instruction::LoadColumn(2), Instruction::IsNotNull]);
+        let bytecode = BytecodeProgram::<Postgres>::new(vec![
+            Instruction::LoadColumn(2, ScalarKind::Int),
+            Instruction::IsNotNull,
+        ]);
 
         let atoms = extract_indexable_atoms(&bytecode, &[2]);
 
@@ -1265,8 +1260,8 @@ mod tests {
 
         // Bytecode for: price >= 9.99 (Float - range only works with Int)
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Float(9.99)),
+            Instruction::LoadColumn(1, ScalarKind::Float),
+            Instruction::PushLiteral(Value::<Postgres>::Float(9.99)),
             Instruction::GreaterThanOrEqual,
         ]);
 
@@ -1283,8 +1278,8 @@ mod tests {
 
         // Bytecode for: price < 100.0 (Float - range only works with Int)
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Float(100.0)),
+            Instruction::LoadColumn(1, ScalarKind::Float),
+            Instruction::PushLiteral(Value::<Postgres>::Float(100.0)),
             Instruction::LessThan,
         ]);
 
@@ -1300,8 +1295,8 @@ mod tests {
 
         // Bytecode for: price <= 50.0 (Float - range only works with Int)
         let bytecode = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Float(50.0)),
+            Instruction::LoadColumn(1, ScalarKind::Float),
+            Instruction::PushLiteral(Value::<Postgres>::Float(50.0)),
             Instruction::LessThanOrEqual,
         ]);
 
