@@ -68,6 +68,12 @@ pub mod runtime;
 pub mod wal;
 pub mod sqlite_cdc;
 
+// Diesel-typed subscription and follow API. Only compiles when the
+// `diesel-typed` family of features pulls in `diesel` with the third-party
+// backend hooks its `BindDecode` impls need.
+#[cfg(feature = "diesel-typed")]
+pub mod diesel_api;
+
 // `test_harnesses` still speaks the retired `Cell` / `RowImage` /
 // `WalEvent` types. Phase 10 rewrites it against `CdcEvent` typed
 // events. Excluded from the current lib build.

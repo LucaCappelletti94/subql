@@ -316,11 +316,12 @@ observability = ["dep:tracing", "tracing/std"]
 # backend on their own diesel dep.
 executor-diesel = ["std", "dep:diesel"]
 # Opt-in: the diesel-typed subscription/follow API. Renders a typed diesel
-# query to placeholder SQL + a list of bind `Cell`s and registers it via the
-# string+binds core. This base feature is the Postgres backend (byte-decoded
-# from Pg's binary wire format via `postgres_backend`, pure Rust, no libpq, plus
-# the opt-in-unstable collector fields to read the serialized binds). SQLite and
-# MySQL extend it via `diesel-typed-sqlite` / `diesel-typed-mysql`.
+# query to placeholder SQL plus a list of bind `Value<B>`s and registers it
+# via the string+binds core. This base feature covers the Postgres backend
+# (byte-decoded from Pg's binary wire format via `postgres_backend`, pure Rust,
+# no libpq, plus the opt-in-unstable collector fields to read the serialized
+# binds). SQLite and MySQL extend it via `diesel-typed-sqlite` /
+# `diesel-typed-mysql`.
 diesel-typed = [
     "dep:diesel",
     "diesel?/postgres_backend",
