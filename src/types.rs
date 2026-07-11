@@ -219,16 +219,15 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
 ///
 /// use sql_traits::structs::ParserDB;
 /// use sqlparser::dialect::PostgreSqlDialect;
-/// use subql::{
-///     DefaultIds, EvictionPolicy, RegisterError, SubscriptionEngine,
-///     SubscriptionRequest,
-/// };
+/// use subql::backend::{Postgres, Value};
+/// use subql::testing::TestEvent;
+/// use subql::{DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest};
 ///
 /// let database = ParserDB::parse::<PostgreSqlDialect>(
 ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
 /// )?;
 ///
-/// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+/// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
 ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
 ///         .with_max_subscriptions(1, EvictionPolicy::EvictOldest);
 ///
@@ -256,6 +255,8 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     DefaultIds, EvictionPolicy, RegisterError, SubscriptionEngine,
     ///     SubscriptionRequest,
@@ -264,7 +265,7 @@ pub enum EvictionPolicy {
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(1, EvictionPolicy::Reject);
     ///
@@ -305,9 +306,11 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
-    ///     catalog_helpers, Cell, ClockHandle, DefaultIds, EvictionPolicy, ManualClock,
-    ///     PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
+    ///     catalog_helpers, ClockHandle, DefaultIds, EvictionPolicy, ManualClock,
+    ///     SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
@@ -317,19 +320,17 @@ pub enum EvictionPolicy {
     /// let clock = Arc::new(ManualClock::new(0));
     /// let handle: ClockHandle = clock.clone();
     ///
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive)
     ///         .with_activity_clock(handle);
     ///
-    /// let make_event = |id: i64, amount: i64| -> Result<_, Box<dyn std::error::Error>> {
-    ///     Ok(WalEvent::builder(orders_id)
-    ///         .insert()
-    ///         .pk(PrimaryKey::new(Arc::from([0u16]), Arc::from([Cell::Int(id)]))?)
-    ///         .new_row(RowImage {
-    ///             cells: Arc::from([Cell::Int(id), Cell::Int(amount)]),
-    ///         })
-    ///         .build()?)
+    /// let make_event = |id: i64, amount: i64| -> TestEvent<Postgres> {
+    ///     TestEvent::<Postgres>::insert(
+    ///         orders_id,
+    ///         vec![Value::Int(id), Value::Int(amount)],
+    ///     )
+    ///     .with_pk_columns([0u16])
     /// };
     ///
     /// // Register and stamp `first` early. Predicate matches amount = 5.
@@ -338,7 +339,7 @@ pub enum EvictionPolicy {
     ///     "SELECT * FROM orders WHERE amount = 5",
     /// ))?;
     /// clock.advance(Duration::from_micros(10));
-    /// engine.consumers(&make_event(1, 5)?)?;
+    /// engine.consumers(&make_event(1, 5))?;
     ///
     /// // Register `second` and stamp it later. Predicate matches amount = 10
     /// // exclusively, so `first` is not re-stamped.
@@ -347,7 +348,7 @@ pub enum EvictionPolicy {
     ///     "SELECT * FROM orders WHERE amount = 10",
     /// ))?;
     /// clock.advance(Duration::from_micros(20));
-    /// engine.consumers(&make_event(2, 10)?)?;
+    /// engine.consumers(&make_event(2, 10))?;
     ///
     /// // Third registration hits the cap. `first` was stamped at t=10
     /// // and `_second` at t=30. `first` is the least active and is
@@ -371,9 +372,11 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
-    ///     catalog_helpers, Cell, DefaultIds, EvictionPolicy, PrimaryKey, RowImage,
-    ///     SubscriptionEngine, SubscriptionRequest, WalEvent,
+    ///     catalog_helpers, DefaultIds, EvictionPolicy,
+    ///     SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
@@ -381,7 +384,7 @@ pub enum EvictionPolicy {
     /// )?;
     /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     ///
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(2, EvictionPolicy::EvictColdest);
     ///
@@ -394,13 +397,11 @@ pub enum EvictionPolicy {
     ///     "SELECT * FROM orders WHERE amount = 9999",
     /// ))?;
     /// for i in 0..3 {
-    ///     let event = WalEvent::builder(orders_id)
-    ///         .insert()
-    ///         .pk(PrimaryKey::new(Arc::from([0u16]), Arc::from([Cell::Int(i)]))?)
-    ///         .new_row(RowImage {
-    ///             cells: Arc::from([Cell::Int(i), Cell::Int(5)]),
-    ///         })
-    ///         .build()?;
+    ///     let event = TestEvent::<Postgres>::insert(
+    ///         orders_id,
+    ///         vec![Value::Int(i), Value::Int(5)],
+    ///     )
+    ///     .with_pk_columns([0u16]);
     ///     engine.consumers(&event)?;
     /// }
     /// let third = engine.register(SubscriptionRequest::new(
@@ -420,6 +421,8 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest,
     ///     SubscriptionScope,
@@ -428,7 +431,7 @@ pub enum EvictionPolicy {
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(2, EvictionPolicy::EvictBySession);
     ///
@@ -458,6 +461,8 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest,
     /// };
@@ -465,7 +470,7 @@ pub enum EvictionPolicy {
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(3, EvictionPolicy::EvictByConsumer);
     ///

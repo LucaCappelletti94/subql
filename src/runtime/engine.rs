@@ -484,12 +484,14 @@ where
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{DefaultIds, SubscriptionEngine};
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE orders (id INT);")
     ///     .expect("DDL parses");
     ///
-    /// let engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// assert_eq!(engine.subscription_count(), 0);
@@ -602,6 +604,8 @@ where
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest,
     ///     SubscriptionsView,
@@ -611,7 +615,7 @@ where
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
     /// // Evict the subscription belonging to the lowest consumer id.
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {}).with_custom_eviction(
     ///         2,
     ///         |view: &SubscriptionsView<'_, DefaultIds>| {
@@ -699,6 +703,8 @@ where
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest,
     /// };
@@ -707,7 +713,7 @@ where
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
     /// )?;
     /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// let first = engine.register(
@@ -843,12 +849,14 @@ where
     /// ```
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{DefaultIds, SubscriptionEngine};
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// let rows = engine.register_select(1, "SELECT * FROM orders WHERE amount > 100")?;
@@ -983,6 +991,8 @@ where
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest,
     /// };
@@ -991,7 +1001,7 @@ where
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
     /// )?;
     /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// let results = engine.register_batch(vec![
@@ -1689,16 +1699,18 @@ where
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
-    ///     catalog_helpers, Cell, DefaultIds, RowImage, SubscriptionEngine,
-    ///     SubscriptionRequest, WalEvent,
+    ///     catalog_helpers, DefaultIds, SubscriptionEngine,
+    ///     SubscriptionRequest,
     /// };
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
     /// )?;
     /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// engine.register(
@@ -1706,12 +1718,11 @@ where
     ///         .updated_at_unix_ms(1_704_067_200_000),
     /// )?;
     ///
-    /// let event = WalEvent::builder(orders_id)
-    ///     .insert()
-    ///     .new_row(RowImage {
-    ///         cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("paid".into())]),
-    ///     })
-    ///     .build()?;
+    /// let event = TestEvent::<Postgres>::insert(
+    ///     orders_id,
+    ///     vec![Value::Int(1), Value::Int(250), Value::String("paid".into())],
+    /// )
+    /// .with_pk_columns([0u16]);
     ///
     /// let notifs = engine.consumers(&event)?;
     /// assert_eq!(notifs.inserted(), vec![42]);
@@ -1807,16 +1818,18 @@ where
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
-    ///     catalog_helpers, AggDelta, Cell, DefaultIds, RowImage, SubscriptionEngine,
-    ///     SubscriptionRequest, WalEvent,
+    ///     catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine,
+    ///     SubscriptionRequest,
     /// };
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
     /// )?;
     /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// engine.register(
@@ -1824,12 +1837,11 @@ where
     ///         .updated_at_unix_ms(1_704_067_200_000),
     /// )?;
     ///
-    /// let event = WalEvent::builder(orders_id)
-    ///     .insert()
-    ///     .new_row(RowImage {
-    ///         cells: Arc::from([Cell::Int(1), Cell::String("paid".into())]),
-    ///     })
-    ///     .build()?;
+    /// let event = TestEvent::<Postgres>::insert(
+    ///     orders_id,
+    ///     vec![Value::Int(1), Value::String("paid".into())],
+    /// )
+    /// .with_pk_columns([0u16]);
     ///
     /// let deltas = engine.aggregate_deltas(&event)?;
     /// assert_eq!(deltas, vec![(99, AggDelta::Count(1))]);
@@ -1882,27 +1894,28 @@ where
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
-    ///     catalog_helpers, AggDelta, Cell, DefaultIds, RowImage, SubscriptionEngine,
-    ///     SubscriptionRequest, WalEvent,
+    ///     catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine,
+    ///     SubscriptionRequest,
     /// };
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
     /// )?;
     /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
     /// engine.register(SubscriptionRequest::new(7, "SELECT * FROM orders WHERE amount > 100"))?;
     /// engine.register(SubscriptionRequest::new(9, "SELECT COUNT(*) FROM orders WHERE status = 'paid'"))?;
     ///
-    /// let event = WalEvent::builder(orders_id)
-    ///     .insert()
-    ///     .new_row(RowImage {
-    ///         cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("paid".into())]),
-    ///     })
-    ///     .build()?;
+    /// let event = TestEvent::<Postgres>::insert(
+    ///     orders_id,
+    ///     vec![Value::Int(1), Value::Int(250), Value::String("paid".into())],
+    /// )
+    /// .with_pk_columns([0u16]);
     ///
     /// let out = engine.dispatch(&event)?;
     /// assert_eq!(out.notifications().inserted(), vec![7]);
