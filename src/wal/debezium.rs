@@ -1,3 +1,4 @@
+#![allow(clippy::match_same_arms)]
 //! Debezium CDC parser.
 //!
 //! [Debezium](https://debezium.io/) captures row-level changes from databases
@@ -295,6 +296,7 @@ impl crate::backend::CdcEvent for DebeziumEvent {
 }
 
 
+#[allow(clippy::needless_pass_by_value)]
 fn convert_debezium_message_typed<DB: DatabaseLike>(
     msg: DebeziumEnvelope,
     database: &DB,

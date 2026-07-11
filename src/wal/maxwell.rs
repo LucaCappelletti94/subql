@@ -1,3 +1,4 @@
+#![allow(clippy::match_same_arms)]
 //! Maxwell's Daemon CDC parser.
 //!
 //! [Maxwell](https://maxwells-daemon.io/) reads MySQL binlogs and emits
@@ -320,6 +321,7 @@ impl CdcEvent for MaxwellEvent {
 }
 
 
+#[allow(clippy::too_many_lines)]
 fn convert_maxwell_typed<DB: DatabaseLike>(
     msg: MaxwellMessage,
     database: &DB,

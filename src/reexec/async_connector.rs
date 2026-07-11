@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 
 //! Async parallel of [`Connector`](super::Connector).
 //!

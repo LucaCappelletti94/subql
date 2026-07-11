@@ -1,3 +1,4 @@
+#![allow(clippy::match_same_arms)]
 //! PostgreSQL wire encoding to typed [`Value<Postgres>`] and
 //! [`Value<MySql>`] conversion.
 //!

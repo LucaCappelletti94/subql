@@ -33,7 +33,6 @@
 //!
 //! [`CdcSource`]: crate::CdcSource
 
-#![cfg(feature = "pg-streaming")]
 
 use alloc::format;
 use alloc::string::String;

@@ -61,6 +61,7 @@ impl<DB: DatabaseLike> WalParser<DB> for SqlitePatchsetParser {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn convert_parse_error(err: ParseError) -> WalParseError {
     match err {
         ParseError::UnexpectedEof(pos) => WalParseError::TruncatedMessage {
@@ -74,6 +75,7 @@ fn convert_parse_error(err: ParseError) -> WalParseError {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn op_to_event<DB: DatabaseLike>(
     op: PatchsetOp<'_, TableSchema<alloc::string::String>, alloc::string::String, Vec<u8>>,
     database: &DB,

@@ -1,3 +1,4 @@
+#![allow(clippy::match_same_arms)]
 //! Test-only fixtures shared across unit tests, doctests, and
 //! integration tests.
 //!

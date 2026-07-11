@@ -13,7 +13,6 @@
 //! pulls no async runtime dependency. Concrete impls bring whatever
 //! runtime they need behind their own feature flag.
 
-#![cfg(feature = "std")]
 
 use crate::backend::CdcEvent;
 

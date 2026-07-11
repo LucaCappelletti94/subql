@@ -14,9 +14,11 @@ use alloc::vec::Vec;
 use arc_swap::ArcSwap;
 use roaring::RoaringBitmap;
 
-/// Three-valued presence flag reported by [`TablePartition::select_candidates`]'s
-/// column-probe closure. Mirrors the shape of [`crate::backend::Presence`] but
-/// without a payload: the caller conveys the payload via the paired
+/// Three-valued presence flag reported by
+/// [`TablePartition::select_candidates`]'s column-probe closure.
+///
+/// Mirrors the shape of [`crate::backend::Presence`] but without a
+/// payload: the caller conveys the payload via the paired
 /// [`ColumnProbe::value`] field.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CellPresence {
@@ -28,11 +30,12 @@ pub enum CellPresence {
     Present,
 }
 
-/// Column probe result yielded by [`TablePartition::select_candidates`]'s
-/// caller-supplied closure. Combines a presence flag with an optional
-/// indexable payload; only cells whose scalar payload downcasts to one of
-/// the four indexable primitives (`bool` / `i64` / `f64` / `String`) carry
-/// a `value`.
+/// Column probe result yielded by
+/// [`TablePartition::select_candidates`]'s caller-supplied closure.
+///
+/// Combines a presence flag with an optional indexable payload. Only
+/// cells whose scalar payload downcasts to one of the four indexable
+/// primitives (`bool` / `i64` / `f64` / `String`) carry a `value`.
 #[derive(Clone, Debug)]
 pub struct ColumnProbe {
     /// Whether the cell was `Missing`, `Null`, or `Present`.

@@ -244,19 +244,18 @@ where
     let stmt = sql_shape::parse_single_statement(sql, dialect as &dyn Dialect)?;
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
     let table_id = resolve_table_id(&table_name, database)?;
-    let where_program: BytecodeProgram<B> = match where_clause.as_ref() {
-        Some(expr) => compile_expression::<B, DB>(expr, table_id, database)?,
+    let where_program: BytecodeProgram<B> = if let Some(expr) = where_clause.as_ref() {
+        compile_expression::<B, DB>(expr, table_id, database)?
+    } else {
         // No WHERE clause matches every row. Feed the bare `true` literal
         // through the same wrapper that trailing bare-value predicates use
         // so the VM sees a Tri-typed result at TOS.
-        None => {
-            let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
-                &SqlValue::Boolean(true),
-                ScalarKind::Bool,
-            )?)];
-            wrap_bare_value_as_tri::<B>(&mut instructions)?;
-            BytecodeProgram::new(instructions)
-        }
+        let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
+            &SqlValue::Boolean(true),
+            ScalarKind::Bool,
+        )?)];
+        wrap_bare_value_as_tri::<B>(&mut instructions)?;
+        BytecodeProgram::new(instructions)
     };
     let where_dependency_columns = where_program.dependency_columns.clone();
     Ok(TableAndWhereDeps {

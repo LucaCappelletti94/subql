@@ -210,6 +210,7 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
 
 /// Resolve a column's declared SQL type into a backend-neutral
 /// [`ScalarKind`].
+///
 /// Distinguishes every scalar subql cares about (`JSONB` vs `JSON`,
 /// `TIMESTAMPTZ` vs `TIMESTAMP`, and so on) via
 /// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token).

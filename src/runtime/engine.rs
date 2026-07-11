@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! Subscription engine - main public API
 
 use super::indexes::IndexableAtom;
@@ -1024,7 +1025,7 @@ where
     /// assert_eq!(engine.subscription_count(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     pub fn register_batch(
         &mut self,
         specs: Vec<SubscriptionRequest<I, E::Backend>>,
@@ -2092,21 +2093,6 @@ where
     /// unknown table id (dispatch errors).
     fn table_in_catalog(&self, table_id: TableId) -> bool {
         catalog_helpers::table_arity(&self.database, table_id).is_some()
-    }
-
-    /// Validate row image arity against the expected arity for its table.
-    ///
-    /// Under Phase 5's typed-accessor model, arity validation would
-    /// require probing every column via its correct scalar accessor and
-    /// per-column [`ScalarKind`]. The dispatch layer already reports
-    /// `Presence::Missing` for out-of-range columns via the event's
-    /// accessors, so this check is retired on the direct dispatch path.
-    /// Kept as a stub for API compatibility; callers that still want
-    /// arity validation should implement it against `event.int_at(...)`
-    /// etc.
-    #[allow(dead_code, clippy::unused_self, clippy::needless_pass_by_value)]
-    const fn validate_row_arity(&self, _table_id: TableId) -> Result<(), DispatchError> {
-        Ok(())
     }
 
     /// Get number of registered predicates for a table

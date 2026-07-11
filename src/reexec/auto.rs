@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! Auto-resolving re-execution engine: wraps [`ReExecEngine`] with a
 //! [`Connector`] and converts in-flight [`ReExecutionTrigger`]s into
 //! [`ScalarUpdate`]s inline.

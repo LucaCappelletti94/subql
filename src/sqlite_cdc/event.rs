@@ -1,3 +1,4 @@
+#![allow(clippy::match_same_arms)]
 //! Typed CDC event surfaced by the SQLite patchset parser.
 
 use alloc::boxed::Box;

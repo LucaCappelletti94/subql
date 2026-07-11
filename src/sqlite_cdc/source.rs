@@ -15,7 +15,6 @@
 //! rides on the upstream `unsafe impl Send for Session` added in
 //! `diesel-sqlite-session`.
 
-#![cfg(feature = "sqlite-cdc")]
 
 use alloc::collections::VecDeque;
 

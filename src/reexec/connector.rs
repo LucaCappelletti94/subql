@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! Opt-in connector abstraction for auto-resolving re-execution.
 //!
 //! The bare [`ReExecEngine`](super::ReExecEngine) emits

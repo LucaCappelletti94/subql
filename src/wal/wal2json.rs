@@ -1,3 +1,4 @@
+#![allow(clippy::match_same_arms)]
 //! wal2json v1 and v2 WAL parsers.
 //!
 //! [wal2json](https://github.com/eulerto/wal2json) is a PostgreSQL logical
@@ -292,6 +293,7 @@ impl V2RowImage {
 }
 
 impl V2WireCell {
+    #[allow(clippy::unused_self)]
     const fn col_id_field_name(&self) -> &'static str {
         "wal2json.v2.column"
     }
@@ -421,6 +423,7 @@ impl CdcEvent for Wal2JsonV2Event {
 }
 
 
+#[allow(clippy::too_many_lines)]
 fn convert_v2_message_typed<DB: DatabaseLike>(
     msg: Wal2JsonV2Message,
     database: &DB,
@@ -527,9 +530,8 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
                 .collect::<Vec<_>>(),
         )
     } else if let Some(image) = new_image.as_ref() {
-        catalog_helpers::primary_key_columns(database, table_id)
-            .map(alloc::sync::Arc::from)
-            .unwrap_or_else(|| {
+        catalog_helpers::primary_key_columns(database, table_id).map_or_else(
+            || {
                 alloc::sync::Arc::from(
                     image
                         .entries
@@ -537,7 +539,9 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
                         .map(|e| e.col_id)
                         .collect::<Vec<_>>(),
                 )
-            })
+            },
+            alloc::sync::Arc::from,
+        )
     } else {
         alloc::sync::Arc::from(Vec::<ColumnId>::new())
     };
@@ -721,6 +725,7 @@ impl V1RowImage {
 }
 
 impl V1WireCell {
+    #[allow(clippy::unused_self)]
     const fn col_id_field_name(&self) -> &'static str {
         "wal2json.v1.column"
     }

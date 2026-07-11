@@ -1,3 +1,4 @@
+#![allow(clippy::match_same_arms)]
 //! pgoutput adapter: parses `pg_walstream::LogicalReplicationMessage` into typed [`PgOutputEvent`]s.
 
 use alloc::collections::VecDeque;
@@ -110,6 +111,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
     type Checkpoint = crate::PgLsn;
     type Event = PgOutputEvent;
 
+    #[allow(clippy::too_many_lines)]
     fn parse_wal_message(
         &self,
         data: &[u8],
@@ -153,7 +155,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
             LogicalReplicationMessage::Insert { relation_id, tuple } => {
                 let rel = self.get_relation(relation_id)?;
                 let new_image = tuple_wire_full(&rel, &tuple, true)?;
-                let pk_columns = pk_columns_for_new(&rel, database)?;
+                let pk_columns = pk_columns_for_new(&rel, database);
                 Ok(vec![PgOutputEvent {
                     kind: EventKind::Insert,
                     table_id: rel.table_id,
@@ -173,7 +175,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                 let rel = self.get_relation(relation_id)?;
                 let new_image = tuple_wire_full(&rel, &new_tuple, true)?;
                 let old_image = parse_update_old_wire(&rel, old_tuple, key_type)?;
-                let pk_columns = pk_columns_from_identity_or_catalog(&rel, database)?;
+                let pk_columns = pk_columns_from_identity_or_catalog(&rel, database);
                 Ok(vec![PgOutputEvent {
                     kind: EventKind::Update,
                     table_id: rel.table_id,
@@ -204,7 +206,7 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                         )));
                     }
                 };
-                let pk_columns = pk_columns_from_identity_or_catalog(&rel, database)?;
+                let pk_columns = pk_columns_from_identity_or_catalog(&rel, database);
                 Ok(vec![PgOutputEvent {
                     kind: EventKind::Delete,
                     table_id: rel.table_id,
@@ -736,11 +738,9 @@ fn parse_update_old_wire(
 
 /// PK column IDs for an Insert event: the catalog's declared PK, or empty
 /// if the catalog carries none.
-fn pk_columns_for_new<DB: DatabaseLike>(
-    rel: &CachedRelation,
-    database: &DB,
-) -> Result<Arc<[ColumnId]>, WalParseError> {
-    Ok(catalog_helpers::primary_key_columns(database, rel.table_id).map_or_else(|| Arc::from(Vec::<ColumnId>::new()), Arc::from))
+fn pk_columns_for_new<DB: DatabaseLike>(rel: &CachedRelation, database: &DB) -> Arc<[ColumnId]> {
+    catalog_helpers::primary_key_columns(database, rel.table_id)
+        .map_or_else(|| Arc::from(Vec::<ColumnId>::new()), Arc::from)
 }
 
 /// PK column IDs for Update / Delete: prefer the relation's identity
@@ -749,14 +749,14 @@ fn pk_columns_for_new<DB: DatabaseLike>(
 fn pk_columns_from_identity_or_catalog<DB: DatabaseLike>(
     rel: &CachedRelation,
     database: &DB,
-) -> Result<Arc<[ColumnId]>, WalParseError> {
+) -> Arc<[ColumnId]> {
     if !rel.identity_columns.is_empty() {
         let ids: Vec<ColumnId> = rel
             .identity_columns
             .iter()
             .map(|&i| rel.column_ids[i])
             .collect();
-        return Ok(Arc::from(ids));
+        return Arc::from(ids);
     }
     pk_columns_for_new(rel, database)
 }

@@ -1,3 +1,4 @@
+#![allow(clippy::match_same_arms)]
 //! Backend abstractions and the generic CDC event surface the subscription
 //! engine consumes.
 //!

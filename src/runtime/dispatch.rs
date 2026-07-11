@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! Event dispatch pipeline
 
 use super::{
