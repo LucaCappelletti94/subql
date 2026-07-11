@@ -511,6 +511,20 @@ pub fn derive_update_follow_select<D: Dialect>(
     sql_shape::derive_update_follow_sql(&stmt)
 }
 
+/// Like [`derive_update_follow_select`], but additionally reports the number
+/// of bind placeholders (`$N` / `?`) that the discarded SET clause consumed.
+///
+/// The caller uses that count to trim SET binds from a diesel-collected bind
+/// list before compiling the follow SELECT. `$N` placeholders in the returned
+/// SELECT are already renumbered so the first surviving one is `$1`.
+pub fn derive_update_follow_select_with_set_binds<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+) -> Result<(String, usize), RegisterError> {
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+    sql_shape::derive_update_follow_sql_and_set_binds(&stmt)
+}
+
 // ============================================================================
 // Compilation helpers
 // ============================================================================

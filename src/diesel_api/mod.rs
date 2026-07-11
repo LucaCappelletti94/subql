@@ -497,7 +497,18 @@ where
         Q: QueryFragment<D>,
     {
         let (sql, binds) = render_typed::<D, _>(update)?;
-        self.register_follow_update_with_binds(consumer_id, sql, binds)
+        // Diesel emits binds in placeholder order (SET first, then WHERE).
+        // The follow SELECT drops the SET clause, so its `?` positional
+        // placeholders bind against the wrong end of the collected list
+        // and its `$N` numbered placeholders reference indices that no
+        // longer exist after trimming. Ask the derive helper to also report
+        // how many SET binds it discarded and to renumber surviving `$N`s
+        // so the caller's slice + engine round-trip line up.
+        let (select_sql, set_bind_count) =
+            crate::compiler::derive_update_follow_select_with_set_binds(&sql, self.dialect())?;
+        let where_binds: Vec<Value<E::Backend>> =
+            binds.into_iter().skip(set_bind_count).collect();
+        self.register(SubscriptionRequest::new(consumer_id, select_sql).binds(where_binds))
     }
 
     /// Execute a typed diesel `INSERT ... RETURNING <pk>` and follow the
@@ -801,19 +812,7 @@ mod render_tests {
         assert_eq!(a.subscription_id, b.subscription_id);
     }
 
-    // FIXME(phase-15): under MySQL, diesel renders `SET name = ?` before
-    // `WHERE id = ?`, so `collect_binds` yields `[String("x"), Int(5)]`.
-    // The follow SELECT is `SELECT * FROM users WHERE id = ?` (SET dropped
-    // by `derive_update_follow_sql`), but the full bind list is still handed
-    // to it. MySQL uses positional `?` placeholders, so the sole `?` maps
-    // to `binds[0] = String("x")` and the compiler rejects
-    // `String vs Int` at compile-time. Postgres survives because its
-    // placeholders are numbered `$N`: the follow SELECT keeps `$2` and the
-    // compiler indexes into `binds` correctly. Real fix requires the typed
-    // rendering path to hand `register_follow_update_with_binds` only the
-    // WHERE-clause binds. Tracked separately from Phase 12.
     #[cfg(feature = "diesel-typed-mysql")]
-    #[ignore = "FIXME: MySQL positional binds collide with SET clause; see comment above"]
     #[test]
     fn register_typed_update_follow_mysql_via_engine() {
         use crate::backend::MySql;

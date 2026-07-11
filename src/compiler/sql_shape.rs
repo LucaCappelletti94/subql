@@ -620,6 +620,19 @@ pub(super) fn extract_single_table_and_where(
 /// UPDATE, and an UPDATE with no WHERE (a whole-table follow is better expressed
 /// as an explicit SELECT).
 pub(super) fn derive_update_follow_sql(stmt: &Statement) -> Result<String, RegisterError> {
+    Ok(derive_update_follow_sql_and_set_binds(stmt)?.0)
+}
+
+/// Derive the follow-subscription SELECT AND report how many positional /
+/// numbered bind placeholders belonged to the UPDATE's SET clause.
+///
+/// The caller uses that count to slice the diesel-collected bind list to
+/// WHERE-only binds before compiling. Positional (`?`) placeholders are
+/// consumed left-to-right so trimming from the front is sufficient. Numbered
+/// (`$N`) placeholders are renumbered so the surviving SELECT begins at `$1`.
+pub(super) fn derive_update_follow_sql_and_set_binds(
+    stmt: &Statement,
+) -> Result<(String, usize), RegisterError> {
     let Statement::Update(update) = stmt else {
         return Err(RegisterError::FollowUnsupportedStatement(
             "expected an UPDATE statement".to_string(),
@@ -647,7 +660,110 @@ pub(super) fn derive_update_follow_sql(stmt: &Statement) -> Result<String, Regis
                 .to_string(),
         )
     })?;
-    Ok(alloc::format!("SELECT * FROM {name} WHERE {selection}"))
+
+    let set_bind_count = update
+        .assignments
+        .iter()
+        .map(|a| count_placeholders_in_expr(&a.value))
+        .sum::<usize>();
+
+    let mut selection = selection.clone();
+    renumber_placeholders(&mut selection, set_bind_count);
+
+    Ok((
+        alloc::format!("SELECT * FROM {name} WHERE {selection}"),
+        set_bind_count,
+    ))
+}
+
+/// Walk `expr` and count every `SqlValue::Placeholder` leaf (positional `?`
+/// and numbered `$N` alike). Recurses through the same expression shapes the
+/// compiler already supports.
+fn count_placeholders_in_expr(expr: &Expr) -> usize {
+    use sqlparser::ast::Value as SqlValue;
+    match expr {
+        Expr::Value(v) => usize::from(matches!(&v.value, SqlValue::Placeholder(_))),
+        Expr::BinaryOp { left, right, .. } => {
+            count_placeholders_in_expr(left) + count_placeholders_in_expr(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::Nested(expr) => count_placeholders_in_expr(expr),
+        Expr::InList { expr, list, .. } => {
+            count_placeholders_in_expr(expr)
+                + list.iter().map(count_placeholders_in_expr).sum::<usize>()
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            count_placeholders_in_expr(expr)
+                + count_placeholders_in_expr(low)
+                + count_placeholders_in_expr(high)
+        }
+        Expr::Like {
+            expr, pattern, ..
+        }
+        | Expr::ILike {
+            expr, pattern, ..
+        } => count_placeholders_in_expr(expr) + count_placeholders_in_expr(pattern),
+        _ => 0,
+    }
+}
+
+/// Renumber numbered (`$N`) placeholders in `expr` so the smallest surviving
+/// index is `$1`, subtracting `set_bind_count`. Positional (`?`) placeholders
+/// are left untouched; the compiler consumes them left-to-right and the
+/// caller trims the bind vector from the front to match.
+fn renumber_placeholders(expr: &mut Expr, set_bind_count: usize) {
+    use sqlparser::ast::Value as SqlValue;
+    match expr {
+        Expr::Value(v) => {
+            if let SqlValue::Placeholder(token) = &mut v.value {
+                if let Some(rest) = token.strip_prefix('$') {
+                    if let Ok(idx) = rest.parse::<usize>() {
+                        let new_idx = idx.saturating_sub(set_bind_count);
+                        *token = alloc::format!("${new_idx}");
+                    }
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            renumber_placeholders(left, set_bind_count);
+            renumber_placeholders(right, set_bind_count);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::Nested(expr) => renumber_placeholders(expr, set_bind_count),
+        Expr::InList { expr, list, .. } => {
+            renumber_placeholders(expr, set_bind_count);
+            for item in list {
+                renumber_placeholders(item, set_bind_count);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            renumber_placeholders(expr, set_bind_count);
+            renumber_placeholders(low, set_bind_count);
+            renumber_placeholders(high, set_bind_count);
+        }
+        Expr::Like {
+            expr, pattern, ..
+        }
+        | Expr::ILike {
+            expr, pattern, ..
+        } => {
+            renumber_placeholders(expr, set_bind_count);
+            renumber_placeholders(pattern, set_bind_count);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
