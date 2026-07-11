@@ -281,21 +281,9 @@ mod tests {
     fn make_test_event_is_deterministic_for_seed() {
         let event_a = make_test_event(1234);
         let event_b = make_test_event(1234);
-        assert_eq!(event_a.kind(), EventKind::Insert);
-        assert_eq!(event_a.table_id(), 1);
-        assert_eq!(event_a.pk().columns.as_ref(), event_b.pk().columns.as_ref());
-        assert_eq!(event_a.pk().values.as_ref(), event_b.pk().values.as_ref());
-        assert_eq!(
-            event_a
-                .new_row()
-                .as_ref()
-                .expect("event should have new row")
-                .cells,
-            event_b
-                .new_row()
-                .as_ref()
-                .expect("event should have new row")
-                .cells
-        );
+        assert_eq!(event_a.kind, EventKind::Insert);
+        assert_eq!(event_a.table_id, 1);
+        assert_eq!(event_a.pk_columns, event_b.pk_columns);
+        assert_eq!(event_a.new_row, event_b.new_row);
     }
 }
