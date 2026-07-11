@@ -20,6 +20,10 @@
 
 mod event;
 mod parser;
+#[cfg(feature = "sqlite-cdc")]
+mod source;
 
 pub use event::SqlitePatchsetEvent;
 pub use parser::SqlitePatchsetParser;
+#[cfg(feature = "sqlite-cdc")]
+pub use source::{SqliteCdcError, SqliteCdcSource};

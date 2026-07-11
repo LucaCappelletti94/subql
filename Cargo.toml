@@ -27,6 +27,12 @@ diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 
+# diesel-sqlite-session depends on diesel via git (not crates.io), so
+# `[patch.crates-io]` above does not reach that graph. Route the git
+# dep to the same LucaCappelletti94 fork used by the crates-io patch.
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+
 [package]
 name = "subql"
 version = "0.1.0"
@@ -224,14 +230,13 @@ r2d2 = { version = "0.8", optional = true }
 # posture; no C deps. `default-features = false` drops the reverse
 # adapters (`wal2json`/`debezium`/`maxwell`/`pg-walstream` build SQLite
 # patchsets from PG CDC) which subql does not consume.
-sqlite-diff-rs = { version = "0.1", default-features = false }
+sqlite-diff-rs = { version = "0.1.1", default-features = false }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
-# `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables to
-# a session, and calls `.patchset()` to surface the accumulated change
-# bytes for `SqlitePatchsetParser` to decode. Requires the Diesel
-# `future` branch already pinned in the top-level `[patch.crates-io]`
-# block (upstream diesel PR #4966).
+# `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables
+# to a session, and calls `.changeset()` to surface accumulated change
+# bytes for `SqlitePatchsetParser` to decode. Requires the diesel
+# `future` branch already pinned via the top-level `[patch]` blocks.
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session", optional = true }
 
 # Future-combinator helpers (FuturesUnordered + StreamExt) used by the

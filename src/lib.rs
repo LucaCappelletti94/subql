@@ -16,6 +16,8 @@ pub use runtime::{
     SumKernel,
 };
 pub use sqlite_cdc::{SqlitePatchsetEvent, SqlitePatchsetParser};
+#[cfg(feature = "sqlite-cdc")]
+pub use sqlite_cdc::{SqliteCdcError, SqliteCdcSource};
 pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
