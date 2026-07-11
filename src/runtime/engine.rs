@@ -2479,6 +2479,12 @@ where
                 RebuildPayloadError::Corrupt(msg) => StorageError::Corrupt(msg),
             })?;
 
+        // Dispatch routes typed scalar accessors via the per-table
+        // `ScalarKind` cache. `ensure_column_kinds_cached` normally fills
+        // it on the first `register()` for a table; on restore we bypass
+        // that path, so populate it here for every restored shard.
+        self.ensure_column_kinds_cached(table_id);
+
         Ok(())
     }
 

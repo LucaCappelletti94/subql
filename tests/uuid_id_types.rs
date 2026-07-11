@@ -116,7 +116,6 @@ fn uuid_session_scope_unregister() {
 /// to support.
 #[cfg(feature = "std")]
 #[test]
-#[ignore = "Phase 11 FIXME: snapshot/restore over UUID id types returns empty binding, needs persistence-path investigation"]
 fn uuid_consumer_ids_survive_snapshot_restore() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
