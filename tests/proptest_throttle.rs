@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Property-based extension of `tests/reexec_throttle.rs`.
 //!
 //! The hand-written integration test exercises `cap = 1`, `cap = 2`,

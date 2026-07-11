@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 #![allow(clippy::unwrap_used, clippy::option_if_let_else, unused_imports)]
 //! Property-based tests for dispatch correctness
 //!

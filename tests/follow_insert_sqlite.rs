@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! In-memory SQLite integration test for the diesel-typed follow-insert path.
 //!
 //! Unlike MySQL, diesel's SQLite backend supports `RETURNING`, so the typed

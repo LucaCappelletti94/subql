@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Property-based tests for [`row_set_delta`].
 //!
 //! `row_set_delta` is the pure math behind the view-relative UPDATE

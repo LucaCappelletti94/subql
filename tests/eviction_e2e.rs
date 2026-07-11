@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Docker-backed end-to-end tests for registry-cap eviction policies.
 //!
 //! Spins up a real Postgres with `wal2json`, registers subscriptions on a

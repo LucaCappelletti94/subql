@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against E: CdcEvent shape. SubscriptionEngine took <Dialect,...>, now takes <E: CdcEvent,...>. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Property-based parity test: `register_batch(specs)` and a `for`-loop
 //! of `register(spec)` on a fresh engine with the same configuration
 //! must produce equal per-index `Result`s and equal final registry

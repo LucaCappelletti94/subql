@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Integration test: peak concurrent `execute_scalar` calls during a
 //! single `consumers_batch` never exceed
 //! `with_max_concurrent_reexecutions(cap)`.

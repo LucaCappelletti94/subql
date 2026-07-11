@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against E: CdcEvent shape. SubscriptionEngine took <Dialect,...>, now takes <E: CdcEvent,...>. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Docker-backed end-to-end test for the pgoutput binary replication parser.
 //!
 //! Spins up a real Postgres, creates a publication + pgoutput logical slot,

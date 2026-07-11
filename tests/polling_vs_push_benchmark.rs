@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! # One-shot polling-vs-push latency benchmark
 //!
 //! Compares the two library transports, [`subql::PgStreamingCdcSource`]

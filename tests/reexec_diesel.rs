@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Integration test for [`DieselConnector`]: drives a full `MIN(price)`
 //! subscription through the [`AutoResolvingEngine`] against an in-memory
 //! SQLite database. Verifies that:

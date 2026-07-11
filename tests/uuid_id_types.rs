@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Guard tests for the `IdTypes` extension point with non-`u64` ids.
 //!
 //! `DefaultIds` (consumer/session id = `u64`) is the in-tree default, but

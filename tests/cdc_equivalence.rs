@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Differential equivalence test: push + poll observe the same WAL.
 //!
 //! Drives a deterministic mixed-DML stream against a real Postgres

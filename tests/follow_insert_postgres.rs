@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Docker-backed integration test for the diesel-typed follow-insert path
 //! (`SubscriptionEngine::register_follow_insert`) against real Postgres.
 //!

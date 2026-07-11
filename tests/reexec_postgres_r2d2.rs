@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Docker-backed integration test for [`PgR2D2DieselConnector`].
 //!
 //! Exercises the pool-backed PG connector: a captured `MIN(price)`

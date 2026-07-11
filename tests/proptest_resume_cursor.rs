@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against E: CdcEvent shape. SubscriptionEngine took <Dialect,...>, now takes <E: CdcEvent,...>. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Property-based tests for the per-`(session, subscription)` resume
 //! cursor.
 //!

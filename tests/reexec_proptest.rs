@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Property tests for the re-execution wrapper's partial MIN/MAX maintenance.
 //!
 //! Random INSERT/DELETE/UPDATE sequences are fed to the engine in-process

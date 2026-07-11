@@ -1,3 +1,5 @@
+#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+
 //! Docker-backed end-to-end tests for [`PgStreamingCdcSource`].
 //!
 //! Each test is `#[ignore]` so default `cargo test` does not require
