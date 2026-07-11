@@ -4605,6 +4605,7 @@ dependencies = [
  "futures-util",
  "hashbrown 0.16.1",
  "lz4",
+ "parking_lot",
  "pg_walstream",
  "postcard",
  "proptest",

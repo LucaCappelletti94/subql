@@ -73,8 +73,10 @@ mod plan;
 // Connector trait shell (no diesel impls) so `ReExecEngine` and downstream
 // crates that reference `ReExecError` still link. The diesel-backed
 // impls are gated inside the file.
-mod connector;
+mod async_auto;
+mod async_connector;
 mod auto;
+mod connector;
 
 #[cfg(feature = "executor-diesel-mysql")]
 pub use connector::MysqlDieselConnector;
@@ -86,6 +88,8 @@ pub use connector::{DieselBackend, DieselConnector};
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
 pub use auto::{AutoResolvingEngine, SnapshotResult};
+pub use async_auto::AsyncAutoResolvingEngine;
+pub use async_connector::AsyncConnector;
 pub use engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     ReExecutionTrigger, Registered, ScalarUpdate,

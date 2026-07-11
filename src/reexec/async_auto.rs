@@ -1,5 +1,3 @@
-#![cfg(any())] // Phase 6: retargeting to Value<B>; disabled until diesel connector impls migrate.
-
 //! Async parallel of [`AutoResolvingEngine`](super::AutoResolvingEngine).
 //!
 //! Same surface (`register`, `install`, `snapshot`, `consumers`,
@@ -16,11 +14,10 @@ use super::engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     Registered, ScalarUpdate,
 };
+use crate::backend::{Backend, CdcEvent, Value};
 use crate::clock::{duration_between, ClockHandle};
-use crate::{
-    Cell, IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport,
-    WalEvent,
-};
+use crate::compiler::literals::SqlLiteralParse;
+use crate::{IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use async_lock::{Semaphore, SemaphoreGuardArc};
@@ -28,7 +25,6 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::dialect::Dialect;
 
 /// Internal state for the persistent re-execution concurrency cap.
 ///
@@ -97,14 +93,15 @@ async fn acquire_permit(
 /// The struct itself is `Send + Sync` whenever `X: AsyncConnector` and
 /// `X::AuthContext: Send + Sync` (the trait bound already requires this),
 /// so the engine can be moved between async tasks freely.
-pub struct AsyncAutoResolvingEngine<D, I, DB, X>
+pub struct AsyncAutoResolvingEngine<E, I, DB, X>
 where
-    D: Dialect,
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
     I: IdTypes,
     DB: DatabaseLike,
-    X: AsyncConnector,
+    X: AsyncConnector<Backend = E::Backend>,
 {
-    inner: ReExecEngine<D, I, DB>,
+    inner: ReExecEngine<E, I, DB>,
     connector: X,
     contexts: HashMap<ReExecQueryId, ResolveContext<I, X::AuthContext>>,
     /// Optional [`Clock`](crate::Clock) used for per-query debounce.
@@ -123,15 +120,16 @@ where
     permits: Option<ThrottleState>,
 }
 
-impl<D, I, DB, X> AsyncAutoResolvingEngine<D, I, DB, X>
+impl<E, I, DB, X> AsyncAutoResolvingEngine<E, I, DB, X>
 where
-    D: Dialect,
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
     I: IdTypes,
     DB: DatabaseLike + 'static,
-    X: AsyncConnector,
+    X: AsyncConnector<Backend = E::Backend>,
 {
     /// Wrap an existing [`ReExecEngine`] with the given [`AsyncConnector`].
-    pub fn new(inner: ReExecEngine<D, I, DB>, connector: X) -> Self {
+    pub fn new(inner: ReExecEngine<E, I, DB>, connector: X) -> Self {
         Self {
             inner,
             connector,
@@ -153,11 +151,6 @@ where
     /// `N`, no more than `N` SQL queries are in flight at any moment,
     /// regardless of whether triggers arrive one per event or in batched
     /// bursts.
-    ///
-    /// **Behavior change.** Prior to this version, the cap applied
-    /// per-batch only (consumed by `buffer_unordered` inside
-    /// `consumers_batch` and ignored by per-event `consumers`). It now
-    /// applies globally and is honored by both flows.
     ///
     /// Default `None`: every deduplicated trigger is dispatched
     /// concurrently. The connector's own pool may still throttle.
@@ -227,7 +220,7 @@ where
     }
 
     /// The wrapped trigger-emitting engine.
-    pub const fn inner(&self) -> &ReExecEngine<D, I, DB> {
+    pub const fn inner(&self) -> &ReExecEngine<E, I, DB> {
         &self.inner
     }
 
@@ -245,7 +238,7 @@ where
     /// in-memory engine state. The connector is not called.
     pub fn register(
         &mut self,
-        spec: SubscriptionRequest<I>,
+        spec: SubscriptionRequest<I, E::Backend>,
         auth: X::AuthContext,
     ) -> Result<Registered, RegisterError> {
         let session = match &spec.scope {
@@ -256,14 +249,14 @@ where
         if let Registered::ReExec {
             query_id,
             sql,
-            column_type,
+            column_kind,
         } = &result
         {
             self.contexts.insert(
                 *query_id,
                 ResolveContext {
                     sql: sql.clone(),
-                    column_type: *column_type,
+                    column_kind: *column_kind,
                     session,
                     auth,
                 },
@@ -273,7 +266,7 @@ where
     }
 
     /// Install a value directly, bypassing the connector.
-    pub fn install(&mut self, query_id: ReExecQueryId, value: Cell) -> bool {
+    pub fn install(&mut self, query_id: ReExecQueryId, value: Value<E::Backend>) -> bool {
         self.inner.install(query_id, value)
     }
 
@@ -288,13 +281,13 @@ where
     pub async fn snapshot(
         &mut self,
         query_id: ReExecQueryId,
-    ) -> Result<Option<SnapshotResult<X::Checkpoint>>, ReExecError<X::Error>> {
+    ) -> Result<Option<SnapshotResult<E::Backend, X::Checkpoint>>, ReExecError<X::Error>> {
         let Some(ctx) = self.contexts.get(&query_id) else {
             return Ok(None);
         };
         let (value, checkpoint) = self
             .connector
-            .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
+            .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
             .await
             .map_err(ReExecError::Connector)?;
         self.inner.install(query_id, value.clone());
@@ -303,26 +296,24 @@ where
 
     /// Dispatch a CDC event.
     ///
-    /// Method-generic on `C: Checkpoint` so the same engine can handle
-    /// events from sources with different position types. For every
-    /// [`ReExecutionTrigger`] the inner engine emits, this method looks
-    /// up the auth context, awaits the connector's `execute_scalar`,
-    /// installs the result, and replaces the trigger with a
-    /// [`ScalarUpdate`]. The first connector failure aborts the rest of
-    /// the batch and is surfaced as [`ReExecError::Connector`].
+    /// For every [`ReExecutionTrigger`] the inner engine emits, this
+    /// method looks up the auth context, awaits the connector's
+    /// `execute_scalar`, installs the result, and replaces the trigger
+    /// with a [`ScalarUpdate`]. The first connector failure aborts the
+    /// rest of the batch and is surfaced as [`ReExecError::Connector`].
     ///
     /// [`ReExecutionTrigger`]: super::ReExecutionTrigger
-    pub async fn consumers<C: crate::Checkpoint>(
+    pub async fn consumers(
         &mut self,
-        event: &WalEvent<C>,
-    ) -> Result<ReExecNotifications<I, C>, ReExecError<X::Error>> {
+        event: &E,
+    ) -> Result<ReExecNotifications<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
         use futures_util::stream::{StreamExt, TryStreamExt};
 
         let ReExecNotifications {
             engine,
             mut scalar_updates,
             triggers,
-        } = self.inner.consumers(event)?;
+        } = self.inner.consumers(event).map_err(ReExecError::Dispatch)?;
 
         // Pre-filter debounced triggers.
         let actionable: Vec<_> = triggers
@@ -338,7 +329,7 @@ where
             });
         }
 
-        // Borrow the immutable fields the futures need; `inner` and
+        // Borrow the immutable fields the futures need. `inner` and
         // `last_reexec_at` stay free for the post-resolution mutation.
         let connector = &self.connector;
         let contexts = &self.contexts;
@@ -350,20 +341,20 @@ where
 
         #[allow(clippy::type_complexity)]
         let resolved: Vec<(
-            super::ReExecutionTrigger<I, C>,
-            (Cell, Option<X::Checkpoint>),
+            super::ReExecutionTrigger<I, E::Checkpoint>,
+            (Value<E::Backend>, Option<X::Checkpoint>),
         )> = futures_util::stream::iter(actionable.into_iter().map(|trigger| {
             let ctx = contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time; \
+                "every captured query stores its resolve context at register time, \
                  trigger.query_id must exist in `contexts`",
             );
             let sql = ctx.sql.clone();
-            let column_type = ctx.column_type;
+            let column_kind = ctx.column_kind;
             let auth = &ctx.auth;
             let throttle = throttle.clone();
             async move {
                 let _guard = acquire_permit(throttle.as_ref(), trigger.query_id).await;
-                let result = connector.execute_scalar(&sql, column_type, auth).await;
+                let result = connector.execute_scalar(&sql, column_kind, auth).await;
                 result.map(|r| (trigger, r))
             }
         }))
@@ -372,7 +363,7 @@ where
         .await
         .map_err(ReExecError::Connector)?;
 
-        // All borrows released; apply the resolutions.
+        // All borrows released. Apply the resolutions.
         for (trigger, (value, _db_checkpoint)) in resolved {
             self.inner.install(trigger.query_id, value.clone());
             self.stamp_reexec(trigger.query_id);
@@ -395,10 +386,8 @@ where
     ///
     /// Runs each event through the inner trigger-emitting engine in input
     /// order, then awaits the connector for each **deduplicated** trigger.
-    /// Dispatches the deduplicated triggers concurrently via
-    /// [`FuturesUnordered`](futures_util::stream::FuturesUnordered),
-    /// keeping at most
-    /// [`max_concurrent_reexecutions`](Self::with_max_concurrent_reexecutions)
+    /// Dispatches the deduplicated triggers concurrently, keeping at most
+    /// [`with_max_concurrent_reexecutions`](Self::with_max_concurrent_reexecutions)
     /// in flight at any time (unbounded when not configured). Per-event
     /// engine notifications stay in input order. The returned
     /// [`BatchOutcome::triggers`] is always empty after resolution.
@@ -406,17 +395,20 @@ where
     /// The first connector failure aborts the whole batch (remaining
     /// in-flight futures are dropped). Partial notifications are
     /// discarded. The caller retries.
-    pub async fn consumers_batch<C: crate::Checkpoint>(
+    pub async fn consumers_batch(
         &mut self,
-        events: &[WalEvent<C>],
-    ) -> Result<BatchOutcome<I, C>, ReExecError<X::Error>> {
+        events: &[E],
+    ) -> Result<BatchOutcome<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
         use futures_util::stream::{StreamExt, TryStreamExt};
 
         let BatchOutcome {
             per_event,
             mut scalar_updates,
             triggers,
-        } = self.inner.consumers_batch(events)?;
+        } = self
+            .inner
+            .consumers_batch(events)
+            .map_err(ReExecError::Dispatch)?;
 
         // Pre-filter debounced triggers.
         let actionable: alloc::vec::Vec<_> = triggers
@@ -432,13 +424,8 @@ where
             });
         }
 
-        // Borrow the immutable fields the futures need; `inner`,
-        // `last_reexec_at` etc. stay free for the mutation pass below.
-        // Each future captures the connector + the trigger's resolve
-        // context by reference; the stream is consumed before any
-        // mutable self access. The persistent throttle (if configured)
-        // is the only concurrency cap; `buffer_unordered` polls every
-        // future and the semaphore gates real connector concurrency.
+        // Borrow the immutable fields the futures need. `inner` and
+        // `last_reexec_at` stay free for the mutation pass below.
         let connector = &self.connector;
         let contexts = &self.contexts;
         let throttle = self
@@ -449,20 +436,20 @@ where
 
         #[allow(clippy::type_complexity)]
         let resolved: alloc::vec::Vec<(
-            super::ReExecutionTrigger<I, C>,
-            (Cell, Option<X::Checkpoint>),
+            super::ReExecutionTrigger<I, E::Checkpoint>,
+            (Value<E::Backend>, Option<X::Checkpoint>),
         )> = futures_util::stream::iter(actionable.into_iter().map(|trigger| {
             let ctx = contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time; \
+                "every captured query stores its resolve context at register time, \
                  trigger.query_id must exist in `contexts`",
             );
             let sql = ctx.sql.clone();
-            let column_type = ctx.column_type;
+            let column_kind = ctx.column_kind;
             let auth = &ctx.auth;
             let throttle = throttle.clone();
             async move {
                 let _guard = acquire_permit(throttle.as_ref(), trigger.query_id).await;
-                let result = connector.execute_scalar(&sql, column_type, auth).await;
+                let result = connector.execute_scalar(&sql, column_kind, auth).await;
                 result.map(|r| (trigger, r))
             }
         }))
@@ -471,7 +458,7 @@ where
         .await
         .map_err(ReExecError::Connector)?;
 
-        // All borrows released; apply the resolutions.
+        // All borrows released. Apply the resolutions.
         for (trigger, (value, _db_checkpoint)) in resolved {
             self.inner.install(trigger.query_id, value.clone());
             self.stamp_reexec(trigger.query_id);
@@ -518,22 +505,27 @@ where
     }
 }
 
-impl<D, I, DB, X> crate::AsyncSubscriptionDispatch<I> for AsyncAutoResolvingEngine<D, I, DB, X>
+impl<E, I, DB, X> crate::AsyncSubscriptionDispatch<I, E> for AsyncAutoResolvingEngine<E, I, DB, X>
 where
-    D: Dialect + Send + Sync,
+    E: CdcEvent + Send + Sync,
+    E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
+    E::Checkpoint: Send + Sync,
     I: IdTypes,
-    DB: DatabaseLike + 'static,
-    X: AsyncConnector,
+    I::ConsumerId: Send,
+    I::SessionId: Send,
+    DB: DatabaseLike + Send + Sync + 'static,
+    X: AsyncConnector<Backend = E::Backend>,
+    X::AuthContext: Send + Sync,
 {
-    type Notifications<C: crate::Checkpoint> = ReExecNotifications<I, C>;
+    type Notifications = ReExecNotifications<I, E::Backend, E::Checkpoint>;
     type Error = ReExecError<X::Error>;
 
     #[allow(clippy::manual_async_fn)]
-    fn consumers<C: crate::Checkpoint>(
+    fn consumers(
         &mut self,
-        event: &WalEvent<C>,
-    ) -> impl core::future::Future<Output = Result<Self::Notifications<C>, Self::Error>> + Send
-    {
+        event: &E,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications, Self::Error>> + Send {
         async move { Self::consumers(self, event).await }
     }
 }
@@ -543,17 +535,15 @@ where
 mod tests {
     use super::super::connector::Snapshot;
     use super::*;
-    use crate::{
-        ColumnId, ColumnType, DefaultIds, NoCheckpoint, RowImage, SubscriptionEngine,
-        SubscriptionRequest,
-    };
-    use alloc::sync::Arc;
+    use crate::backend::{Postgres, ScalarKind};
+    use crate::testing::TestEvent;
+    use crate::{DefaultIds, NoCheckpoint, SubscriptionEngine, SubscriptionRequest, TableId};
     use core::future::Future;
     use core::pin::pin;
     use core::task::{Context, Poll};
+    use parking_lot::Mutex;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
-    use std::sync::Mutex;
     use std::task::Wake;
 
     /// No-op `Wake` implementation: the `MockAsyncConnector` futures
@@ -589,21 +579,21 @@ mod tests {
         .unwrap()
     }
 
-    /// `Mutex`-backed mock so the futures are `Send`.
+    /// `parking_lot::Mutex`-backed mock so the futures are `Send`.
     struct MockAsyncConnector {
-        values: Mutex<Vec<Cell>>,
+        values: Mutex<Vec<Value<Postgres>>>,
         call_count: Mutex<usize>,
     }
 
     impl MockAsyncConnector {
-        fn new(values: Vec<Cell>) -> Self {
+        fn new(values: Vec<Value<Postgres>>) -> Self {
             Self {
                 values: Mutex::new(values),
                 call_count: Mutex::new(0),
             }
         }
         fn call_count(&self) -> usize {
-            *self.call_count.lock().unwrap()
+            *self.call_count.lock()
         }
     }
 
@@ -617,29 +607,29 @@ mod tests {
     }
 
     // The `+ Send` bound on the returned futures is the whole point of
-    // the trait shape; `async fn in trait` cannot express it directly.
+    // the trait shape. `async fn in trait` cannot express it directly.
     #[allow(clippy::manual_async_fn)]
     impl AsyncConnector for MockAsyncConnector {
         type AuthContext = ();
         type Error = MockError;
         type Checkpoint = NoCheckpoint;
+        type Backend = Postgres;
 
         fn execute_scalar(
             &self,
             _sql: &str,
-            _column_type: ColumnType,
+            _kind: ScalarKind,
             _auth: &(),
-        ) -> impl Future<Output = Result<(Cell, Option<Self::Checkpoint>), Self::Error>> + Send
-        {
+        ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>>
+               + Send {
             async move {
-                *self.call_count.lock().unwrap() += 1;
-                let cell = self
+                *self.call_count.lock() += 1;
+                let value = self
                     .values
                     .lock()
-                    .unwrap()
                     .pop()
                     .ok_or(MockError("queue empty"))?;
-                Ok((cell, None))
+                Ok((value, None))
             }
         }
 
@@ -647,49 +637,59 @@ mod tests {
             &self,
             _sql: &str,
             _auth: &(),
-        ) -> impl Future<Output = Result<Snapshot<Vec<RowImage>, Self::Checkpoint>, Self::Error>> + Send
-        {
+        ) -> impl Future<
+            Output = Result<
+                Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>,
+                Self::Error,
+            >,
+        > + Send {
             async move { Err(MockError("execute_rows not exercised in v1 tests")) }
         }
     }
 
-    fn row(price: f64) -> RowImage {
-        RowImage {
-            cells: Arc::from([
-                Cell::Int(0),
-                Cell::Float(price),
-                Cell::Int(1),
-                Cell::String(Arc::from("paid")),
-            ]),
-        }
+    fn row(id: i64, price: f64) -> Vec<Value<Postgres>> {
+        alloc::vec![
+            Value::Int(id),
+            Value::Float(price),
+            Value::Int(1),
+            Value::String("paid".into()),
+        ]
     }
 
-    fn insert_event(id: i64, price: f64) -> WalEvent {
-        WalEvent::builder(0)
-            .insert()
-            .pk_cell(0, Cell::Int(id))
-            .new_row(row(price))
-            .build()
-            .unwrap()
+    fn insert_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::insert(table_id, row(id, price)).with_pk_columns([0u16])
     }
 
-    fn delete_event(id: i64, price: f64) -> WalEvent {
-        WalEvent::builder(0)
-            .delete()
-            .pk_cell(0, Cell::Int(id))
-            .old_row(row(price))
-            .build()
-            .unwrap()
+    fn delete_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::delete(table_id, row(id, price)).with_pk_columns([0u16])
+    }
+
+    fn update_status_only(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::update(table_id, row(id, price), row(id, price))
+            .with_pk_columns([0u16])
+            .with_changed_columns([3u16])
     }
 
     fn engine_with_values(
-        values: Vec<Cell>,
-    ) -> AsyncAutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, MockAsyncConnector> {
-        let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            catalog(),
+        values: Vec<Value<Postgres>>,
+    ) -> (
+        AsyncAutoResolvingEngine<TestEvent<Postgres>, DefaultIds, ParserDB, MockAsyncConnector>,
+        TableId,
+    ) {
+        let database = catalog();
+        let orders_id =
+            crate::catalog_helpers::table_id(&database, "orders").expect("orders table exists");
+        let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+            database,
             PostgreSqlDialect {},
         );
-        AsyncAutoResolvingEngine::new(ReExecEngine::new(inner), MockAsyncConnector::new(values))
+        (
+            AsyncAutoResolvingEngine::new(
+                ReExecEngine::new(inner),
+                MockAsyncConnector::new(values),
+            ),
+            orders_id,
+        )
     }
 
     /// Full path through the async engine: register, snapshot (which
@@ -699,7 +699,7 @@ mod tests {
     fn async_engine_dispatch_round_trip() {
         // Two values for: snapshot bootstrap (5.0), delete re-execution (9.0).
         // Mock pops from the back so push in reverse order.
-        let mut e = engine_with_values(vec![Cell::Float(9.0), Cell::Float(5.0)]);
+        let (mut e, tid) = engine_with_values(vec![Value::Float(9.0), Value::Float(5.0)]);
 
         let qid = match e
             .register(
@@ -715,21 +715,23 @@ mod tests {
         // Snapshot bootstraps. Future is Send-bound and ready immediately.
         let snap = block_on(e.snapshot(qid)).unwrap().expect("query_id exists");
         match snap {
-            SnapshotResult::Scalar(Cell::Float(v), None) => assert!((v - 5.0).abs() < f64::EPSILON),
+            SnapshotResult::Scalar(Value::Float(v), None) => {
+                assert!((v - 5.0).abs() < f64::EPSILON);
+            }
             other => panic!("expected Scalar(5.0, None), got {other:?}"),
         }
         assert_eq!(e.connector().call_count(), 1);
 
         // Insert above the extreme: in-process Unchanged, no connector call.
-        let n = block_on(e.consumers(&insert_event(2, 9.0))).unwrap();
+        let n = block_on(e.consumers(&insert_event(tid, 2, 9.0))).unwrap();
         assert!(n.scalar_updates.is_empty());
         assert_eq!(e.connector().call_count(), 1);
 
         // Delete the extreme: trigger -> connector -> ScalarUpdate.
-        let n = block_on(e.consumers(&delete_event(1, 5.0))).unwrap();
+        let n = block_on(e.consumers(&delete_event(tid, 1, 5.0))).unwrap();
         assert_eq!(n.scalar_updates.len(), 1);
         assert_eq!(n.scalar_updates[0].query_id, qid);
-        assert_eq!(n.scalar_updates[0].value, Cell::Float(9.0));
+        assert_eq!(n.scalar_updates[0].value, Value::Float(9.0));
         assert!(n.triggers.is_empty(), "async engine drains triggers");
         assert_eq!(e.connector().call_count(), 2);
     }
@@ -738,7 +740,7 @@ mod tests {
     /// the async engine.
     #[test]
     fn async_engine_unrelated_column_update_skips_connector() {
-        let mut e = engine_with_values(vec![]);
+        let (mut e, tid) = engine_with_values(vec![]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MAX(price) FROM orders"),
@@ -749,16 +751,9 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec"),
         };
-        assert!(e.install(qid, Cell::Float(10.0)));
+        assert!(e.install(qid, Value::Float(10.0)));
 
-        let event = WalEvent::builder(0)
-            .update()
-            .new_row(row(10.0))
-            .pk_cell(0, Cell::Int(1))
-            .maybe_old_row(Some(row(10.0)))
-            .changed_columns(Arc::from([3 as ColumnId]))
-            .build()
-            .unwrap();
+        let event = update_status_only(tid, 1, 10.0);
 
         let n = block_on(e.consumers(&event)).unwrap();
         assert!(n.scalar_updates.is_empty());
@@ -769,7 +764,7 @@ mod tests {
     /// `snapshot` on an unknown id returns `Ok(None)`.
     #[test]
     fn async_engine_snapshot_unknown_query_returns_none() {
-        let mut e = engine_with_values(vec![]);
+        let (mut e, _tid) = engine_with_values(vec![]);
         assert!(block_on(e.snapshot(99999)).unwrap().is_none());
         assert_eq!(e.connector().call_count(), 0);
     }
@@ -777,7 +772,7 @@ mod tests {
     /// Connector failure aborts the batch with `ReExecError::Connector`.
     #[test]
     fn async_engine_connector_error_aborts_batch() {
-        let mut e = engine_with_values(vec![]);
+        let (mut e, tid) = engine_with_values(vec![]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -788,9 +783,9 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec"),
         };
-        assert!(e.install(qid, Cell::Float(5.0)));
+        assert!(e.install(qid, Value::Float(5.0)));
 
-        match block_on(e.consumers(&delete_event(1, 5.0))) {
+        match block_on(e.consumers(&delete_event(tid, 1, 5.0))) {
             Ok(_) => panic!("expected Connector error, got Ok"),
             Err(ReExecError::Connector(MockError(msg))) => assert_eq!(msg, "queue empty"),
             Err(other) => panic!("expected Connector error, got {other:?}"),
@@ -801,7 +796,7 @@ mod tests {
     /// single connector call. Mirrors the sync engine's T4.1 assertion.
     #[test]
     fn async_engine_consumers_batch_coalesces_repeated_triggers() {
-        let mut e = engine_with_values(vec![Cell::Float(99.0)]);
+        let (mut e, tid) = engine_with_values(vec![Value::Float(99.0)]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -812,12 +807,12 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec"),
         };
-        assert!(e.install(qid, Cell::Float(5.0)));
+        assert!(e.install(qid, Value::Float(5.0)));
 
         let events = vec![
-            delete_event(1, 5.0),
-            delete_event(2, 5.0),
-            delete_event(3, 5.0),
+            delete_event(tid, 1, 5.0),
+            delete_event(tid, 2, 5.0),
+            delete_event(tid, 3, 5.0),
         ];
 
         let outcome = block_on(e.consumers_batch(&events)).unwrap();
@@ -828,20 +823,20 @@ mod tests {
             "three displacing events collapse to one connector call"
         );
         assert_eq!(outcome.scalar_updates.len(), 1);
-        assert_eq!(outcome.scalar_updates[0].value, Cell::Float(99.0));
+        assert_eq!(outcome.scalar_updates[0].value, Value::Float(99.0));
         assert!(outcome.triggers.is_empty());
     }
 
     /// `with_max_concurrent_reexecutions` does not change the result of
-    /// `consumers_batch` (correctness is preserved). The cap is a
+    /// `consumers_batch`. Correctness is preserved. The cap is a
     /// throughput / fairness knob, not a semantic one.
     #[test]
     #[allow(clippy::similar_names)]
     fn async_engine_consumers_batch_respects_max_concurrent_cap() {
         // Two distinct captured queries, each displaced once in the
         // batch. Both must resolve regardless of the cap.
-        let mut e = engine_with_values(vec![Cell::Float(22.0), Cell::Float(11.0)])
-            .with_max_concurrent_reexecutions(1);
+        let (e0, tid) = engine_with_values(vec![Value::Float(22.0), Value::Float(11.0)]);
+        let mut e = e0.with_max_concurrent_reexecutions(1);
         let qid1 = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -862,10 +857,10 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec for MAX"),
         };
-        assert!(e.install(qid1, Cell::Float(7.0)));
-        assert!(e.install(qid2, Cell::Float(7.0)));
+        assert!(e.install(qid1, Value::Float(7.0)));
+        assert!(e.install(qid2, Value::Float(7.0)));
 
-        let events = vec![delete_event(1, 7.0)];
+        let events = vec![delete_event(tid, 1, 7.0)];
         let outcome = block_on(e.consumers_batch(&events)).unwrap();
         assert_eq!(e.connector().call_count(), 2);
         assert_eq!(outcome.scalar_updates.len(), 2);
@@ -878,7 +873,7 @@ mod tests {
     /// `unregister_reexec_query` drops the stored auth context.
     #[test]
     fn async_engine_unregister_drops_context() {
-        let mut e = engine_with_values(vec![]);
+        let (mut e, _tid) = engine_with_values(vec![]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -900,7 +895,7 @@ mod tests {
     //
     // The `MockAsyncConnector` futures complete in one poll, so the
     // tests here cannot observe the *peak* inflight count during a
-    // batch (that needs a real multi-tasking runtime; integration
+    // batch (that needs a real multi-tasking runtime, integration
     // tests exercise it). Unit tests validate the invariants that DO
     // hold under `block_on`: the accessors, the post-batch invariant
     // (`inflight == 0`), the zero-cap normalisation, and the
@@ -909,7 +904,7 @@ mod tests {
     /// No cap by default: `inflight()` is 0, `concurrency_cap()` is `None`.
     #[test]
     fn throttle_disabled_by_default() {
-        let e = engine_with_values(vec![]);
+        let (e, _tid) = engine_with_values(vec![]);
         assert_eq!(e.inflight(), 0);
         assert_eq!(e.concurrency_cap(), None);
     }
@@ -918,7 +913,8 @@ mod tests {
     /// starts with `inflight() == 0`.
     #[test]
     fn throttle_set_cap_observable_via_accessors() {
-        let e = engine_with_values(vec![]).with_max_concurrent_reexecutions(4);
+        let (e0, _tid) = engine_with_values(vec![]);
+        let e = e0.with_max_concurrent_reexecutions(4);
         assert_eq!(e.concurrency_cap(), Some(4));
         assert_eq!(e.inflight(), 0);
     }
@@ -927,7 +923,8 @@ mod tests {
     /// `acquire`.
     #[test]
     fn throttle_zero_cap_normalised_to_one() {
-        let e = engine_with_values(vec![]).with_max_concurrent_reexecutions(0);
+        let (e0, _tid) = engine_with_values(vec![]);
+        let e = e0.with_max_concurrent_reexecutions(0);
         assert_eq!(e.concurrency_cap(), Some(1));
     }
 
@@ -936,8 +933,8 @@ mod tests {
     /// drop path actually fires when futures complete.
     #[test]
     fn throttle_inflight_returns_to_zero_after_batch() {
-        let mut e = engine_with_values(vec![Cell::Float(22.0), Cell::Float(11.0)])
-            .with_max_concurrent_reexecutions(1);
+        let (e0, tid) = engine_with_values(vec![Value::Float(22.0), Value::Float(11.0)]);
+        let mut e = e0.with_max_concurrent_reexecutions(1);
         let qid1 = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -958,10 +955,10 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec"),
         };
-        assert!(e.install(qid1, Cell::Float(7.0)));
-        assert!(e.install(qid2, Cell::Float(7.0)));
+        assert!(e.install(qid1, Value::Float(7.0)));
+        assert!(e.install(qid2, Value::Float(7.0)));
 
-        let _ = block_on(e.consumers_batch(&[delete_event(1, 7.0)])).unwrap();
+        let _ = block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).unwrap();
         assert_eq!(
             e.inflight(),
             0,
@@ -973,9 +970,10 @@ mod tests {
     /// mid-batch, every permit must still be released.
     #[test]
     fn throttle_inflight_returns_to_zero_after_connector_error() {
-        // Two captured queries, only one cell in the queue: the second
+        // Two captured queries, only one value in the queue: the second
         // connector call hits "queue empty" and the batch aborts.
-        let mut e = engine_with_values(vec![Cell::Float(22.0)]).with_max_concurrent_reexecutions(2);
+        let (e0, tid) = engine_with_values(vec![Value::Float(22.0)]);
+        let mut e = e0.with_max_concurrent_reexecutions(2);
         let qid1 = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -996,10 +994,10 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec"),
         };
-        assert!(e.install(qid1, Cell::Float(7.0)));
-        assert!(e.install(qid2, Cell::Float(7.0)));
+        assert!(e.install(qid1, Value::Float(7.0)));
+        assert!(e.install(qid2, Value::Float(7.0)));
 
-        assert!(block_on(e.consumers_batch(&[delete_event(1, 7.0)])).is_err());
+        assert!(block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).is_err());
         assert_eq!(
             e.inflight(),
             0,
@@ -1009,13 +1007,12 @@ mod tests {
 
     /// The throttle preserves correctness: total connector call count
     /// equals the number of deduplicated triggers regardless of cap.
-    /// Mirrors `respects_max_concurrent_cap` above but is explicit
-    /// about the throttle.
     #[test]
     fn throttle_total_call_count_unchanged_with_cap() {
         // Three queries, one trigger each, cap = 1.
-        let values = vec![Cell::Float(30.0), Cell::Float(20.0), Cell::Float(10.0)];
-        let mut e = engine_with_values(values).with_max_concurrent_reexecutions(1);
+        let values = vec![Value::Float(30.0), Value::Float(20.0), Value::Float(10.0)];
+        let (e0, tid) = engine_with_values(values);
+        let mut e = e0.with_max_concurrent_reexecutions(1);
         let qids: Vec<_> = (1u64..=3)
             .map(|c| {
                 match e
@@ -1034,9 +1031,9 @@ mod tests {
             })
             .collect();
         for q in &qids {
-            assert!(e.install(*q, Cell::Float(7.0)));
+            assert!(e.install(*q, Value::Float(7.0)));
         }
-        let outcome = block_on(e.consumers_batch(&[delete_event(1, 7.0)])).unwrap();
+        let outcome = block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).unwrap();
         assert_eq!(
             e.connector().call_count(),
             3,

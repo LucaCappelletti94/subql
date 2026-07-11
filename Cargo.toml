@@ -286,6 +286,10 @@ proptest = "1"
 # calls during a batch). Just enough features to spawn tasks and sleep.
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 
+# Non-poisoning locks in test fixtures. Matches the workspace rs-parking-lot
+# rule that bans `std::sync::Mutex/RwLock` where the guard is unwrapped.
+parking_lot = "0.12"
+
 
 [features]
 default = ["std"]
