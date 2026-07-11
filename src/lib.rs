@@ -15,6 +15,7 @@ pub use runtime::{
     agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SubscriptionEngine,
     SumKernel,
 };
+pub use sqlite_cdc::{SqlitePatchsetEvent, SqlitePatchsetParser};
 pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
@@ -65,6 +66,7 @@ pub mod reexec;
 pub mod row_set;
 pub mod runtime;
 pub mod wal;
+pub mod sqlite_cdc;
 
 // `test_harnesses` still speaks the retired `Cell` / `RowImage` /
 // `WalEvent` types; Phase 10 rewrites it against `CdcEvent` typed

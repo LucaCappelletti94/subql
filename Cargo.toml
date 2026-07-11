@@ -218,14 +218,13 @@ diesel = { version = "2", optional = true }
 r2d2 = { version = "0.8", optional = true }
 
 
-# SQLite session-extension binary formats (changeset / patchset). Backs
-# the Phase 8 `SqlitePatchsetParser`: parses patchset bytes into typed
-# `CdcEvent` instances. `no_std + alloc` posture; no C deps. Default
-# features off so subql's feature surface picks exactly what it needs
-# (the `wal2json`/`debezium`/`maxwell`/`pg-walstream` adapters ship
-# patchset-*builders* for reverse-direction PG-to-SQLite sync and are
-# not needed for subql's inbound parser).
-sqlite-diff-rs = { version = "0.1", default-features = false, optional = true }
+# SQLite session-extension binary formats (changeset / patchset).
+# Backs the `SqlitePatchsetParser` (bytes -> typed events) that ships
+# unconditionally alongside the wal-format parsers. `no_std + alloc`
+# posture; no C deps. `default-features = false` drops the reverse
+# adapters (`wal2json`/`debezium`/`maxwell`/`pg-walstream` build SQLite
+# patchsets from PG CDC) which subql does not consume.
+sqlite-diff-rs = { version = "0.1", default-features = false }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables to
@@ -385,7 +384,6 @@ sqlite-cdc = [
     "std",
     "dep:diesel",
     "diesel?/sqlite",
-    "dep:sqlite-diff-rs",
     "dep:diesel-sqlite-session",
 ]
 
