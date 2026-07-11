@@ -30,10 +30,9 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
         .execute(&mut conn)
         .expect("CREATE TABLE users");
 
-    let catalog = ParserDB::parse::<SQLiteDialect>(
-        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);",
-    )
-    .expect("catalog");
+    let catalog =
+        ParserDB::parse::<SQLiteDialect>("CREATE TABLE users (id INT PRIMARY KEY, name TEXT);")
+            .expect("catalog");
     let mut engine =
         SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, _>::new(catalog, SQLiteDialect {});
 
@@ -47,9 +46,7 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
         )
         .expect("follow insert ann");
     assert_eq!(ann.len(), 1);
-    let ann_pk = engine
-        .follow_row(1, "users", vec![Value::Int(1)])
-        .unwrap();
+    let ann_pk = engine.follow_row(1, "users", vec![Value::Int(1)]).unwrap();
     assert_eq!(ann[0].subscription_id, ann_pk.subscription_id);
 
     let bob = engine
@@ -60,9 +57,7 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
         )
         .expect("follow insert bob");
     assert_eq!(bob.len(), 1);
-    let bob_pk = engine
-        .follow_row(1, "users", vec![Value::Int(2)])
-        .unwrap();
+    let bob_pk = engine.follow_row(1, "users", vec![Value::Int(2)]).unwrap();
     assert_eq!(bob[0].subscription_id, bob_pk.subscription_id);
 
     assert_ne!(ann[0].subscription_id, bob[0].subscription_id);

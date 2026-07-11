@@ -134,7 +134,6 @@ pub enum EventKind {
     Truncate,
 }
 
-
 // ============================================================================
 // Subscription Types
 // ============================================================================
@@ -781,7 +780,6 @@ pub trait DurableShardStore: Send {
     fn snapshot_table(&self, table_id: TableId) -> Result<(), crate::StorageError>;
 }
 
-
 /// Typed signed delta from an aggregate subscription.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1241,8 +1239,7 @@ mod tests {
         assert_eq!(view.len(), 2);
         assert!(!view.is_empty());
 
-        let collected: alloc::vec::Vec<u64> =
-            view.iter().map(|m| m.subscription_id).collect();
+        let collected: alloc::vec::Vec<u64> = view.iter().map(|m| m.subscription_id).collect();
         assert_eq!(collected, alloc::vec![1, 2]);
 
         let coldest = view

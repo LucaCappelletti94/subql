@@ -620,15 +620,11 @@ mod tests {
             _sql: &str,
             _kind: ScalarKind,
             _auth: &(),
-        ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>>
-               + Send {
+        ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
+        {
             async move {
                 *self.call_count.lock() += 1;
-                let value = self
-                    .values
-                    .lock()
-                    .pop()
-                    .ok_or(MockError("queue empty"))?;
+                let value = self.values.lock().pop().ok_or(MockError("queue empty"))?;
                 Ok((value, None))
             }
         }
@@ -638,10 +634,7 @@ mod tests {
             _sql: &str,
             _auth: &(),
         ) -> impl Future<
-            Output = Result<
-                Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>,
-                Self::Error,
-            >,
+            Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>,
         > + Send {
             async move { Err(MockError("execute_rows not exercised in v1 tests")) }
         }

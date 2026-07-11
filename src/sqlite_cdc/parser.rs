@@ -25,7 +25,7 @@ use sql_traits::prelude::DatabaseLike;
 use sqlite_diff_rs::{ParseError, ParsedDiffSet, PatchsetOp, TableSchema, Value as WireValue};
 
 use super::event::SqlitePatchsetEvent;
-use crate::backend::{ScalarKind, Value, SQLite};
+use crate::backend::{SQLite, ScalarKind, Value};
 use crate::wal::{resolve_table, WalParseError, WalParser};
 use crate::{catalog_helpers, ColumnId, EventKind, TableId};
 
@@ -83,11 +83,12 @@ fn op_to_event<DB: DatabaseLike>(
     let schema = op.table();
     let table_name = schema.name();
     let table_id = resolve_table("", table_name.as_str(), database)?;
-    let arity =
-        catalog_helpers::table_arity(database, table_id).ok_or_else(|| WalParseError::UnknownTable {
+    let arity = catalog_helpers::table_arity(database, table_id).ok_or_else(|| {
+        WalParseError::UnknownTable {
             schema: alloc::string::String::new(),
             table: table_name.clone(),
-        })?;
+        }
+    })?;
     if schema.pk_flags().len() != arity {
         return Err(WalParseError::ArityMismatch {
             table_id,
@@ -109,7 +110,10 @@ fn op_to_event<DB: DatabaseLike>(
             }
             let mut row: Vec<Value<SQLite>> = Vec::with_capacity(arity);
             for (col, wire) in values.iter().enumerate() {
-                row.push(decode_wire_value(wire.clone(), scalar_kind_for(&scalar_kinds, col)));
+                row.push(decode_wire_value(
+                    wire.clone(),
+                    scalar_kind_for(&scalar_kinds, col),
+                ));
             }
             (
                 EventKind::Insert,
@@ -250,17 +254,21 @@ fn decode_wire_value(
         WireValue::Text(s) => match kind {
             Some(ScalarKind::String) | None => Value::String(s),
             Some(ScalarKind::Uuid) => Value::Uuid(s),
-            Some(ScalarKind::Timestamp) => parse_naive_datetime(&s)
-                .map_or(Value::Missing, Value::Timestamp),
-            Some(ScalarKind::TimestampTz) => parse_datetime_utc(&s)
-                .map_or(Value::Missing, Value::TimestampTz),
+            Some(ScalarKind::Timestamp) => {
+                parse_naive_datetime(&s).map_or(Value::Missing, Value::Timestamp)
+            }
+            Some(ScalarKind::TimestampTz) => {
+                parse_datetime_utc(&s).map_or(Value::Missing, Value::TimestampTz)
+            }
             Some(ScalarKind::Date) => chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
                 .ok()
                 .map_or(Value::Missing, Value::Date),
             Some(ScalarKind::Time) => parse_naive_time(&s).map_or(Value::Missing, Value::Time),
-            Some(ScalarKind::Decimal) => <bigdecimal::BigDecimal as core::str::FromStr>::from_str(&s)
-                .ok()
-                .map_or(Value::Missing, Value::Decimal),
+            Some(ScalarKind::Decimal) => {
+                <bigdecimal::BigDecimal as core::str::FromStr>::from_str(&s)
+                    .ok()
+                    .map_or(Value::Missing, Value::Decimal)
+            }
             Some(ScalarKind::Json) => serde_json::from_str(&s)
                 .ok()
                 .map_or(Value::Missing, Value::Json),
@@ -363,11 +371,13 @@ mod tests {
         // and col 2 (status) to its new value; col 1 (amount) stays
         // Undefined.
         let patchset = PatchSet::<_, alloc::string::String, Vec<u8>>::new().update(
-            Update::<_, sqlite_diff_rs::PatchsetFormat, alloc::string::String, Vec<u8>>::from(orders)
-                .set(0, 7_i64)
-                .unwrap()
-                .set(2, "shipped")
-                .unwrap(),
+            Update::<_, sqlite_diff_rs::PatchsetFormat, alloc::string::String, Vec<u8>>::from(
+                orders,
+            )
+            .set(0, 7_i64)
+            .unwrap()
+            .set(2, "shipped")
+            .unwrap(),
         );
         let bytes: Vec<u8> = patchset.into();
         let events = SqlitePatchsetParser

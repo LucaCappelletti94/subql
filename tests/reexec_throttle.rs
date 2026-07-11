@@ -122,8 +122,9 @@ impl AsyncConnector for ConcurrencyProbingConnector {
         &self,
         _sql: &str,
         _auth: &(),
-    ) -> impl Future<Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>>
-           + Send {
+    ) -> impl Future<
+        Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>,
+    > + Send {
         async move { Err(ProbeError("execute_rows not exercised in this test")) }
     }
 }

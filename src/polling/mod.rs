@@ -33,7 +33,6 @@
 //!
 //! [`CdcSource`]: crate::CdcSource
 
-
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;

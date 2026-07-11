@@ -185,8 +185,7 @@ where
             if ev.kind() != EventKind::Insert {
                 continue;
             }
-            let subql::backend::Presence::Present(id) =
-                ev.int_at(subql::backend::RowKind::New, 0)
+            let subql::backend::Presence::Present(id) = ev.int_at(subql::backend::RowKind::New, 0)
             else {
                 continue;
             };

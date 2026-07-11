@@ -17,7 +17,6 @@ use uuid::Uuid;
 use super::WalParseError;
 use crate::backend::{MySql, Postgres, Value};
 
-
 // ============================================================================
 // Typed decoders producing `Value<Postgres>` (Phase 7)
 // ============================================================================
@@ -51,9 +50,7 @@ pub(super) fn json_value_to_pg_value(
     match ty.as_str() {
         "integer" | "int" | "int2" | "int4" | "int8" | "smallint" | "bigint" | "serial"
         | "bigserial" | "smallserial" | "oid" => pg_int_value(value, field),
-        "real" | "float4" | "double precision" | "float8" | "money" => {
-            pg_float_value(value, field)
-        }
+        "real" | "float4" | "double precision" | "float8" | "money" => pg_float_value(value, field),
         "numeric" | "decimal" => pg_decimal_value(value, field),
         "boolean" | "bool" => pg_bool_value(value, field),
         "uuid" => pg_uuid_value(value, field),
@@ -178,17 +175,21 @@ pub(super) fn text_to_pg_value(
             ))
         }),
         // timestamp
-        1114 => parse_pg_timestamp(text).map(Value::Timestamp).ok_or_else(|| {
-            WalParseError::MalformedPayload(format!(
-                "invalid timestamp text value for type oid {type_oid}: {text}"
-            ))
-        }),
+        1114 => parse_pg_timestamp(text)
+            .map(Value::Timestamp)
+            .ok_or_else(|| {
+                WalParseError::MalformedPayload(format!(
+                    "invalid timestamp text value for type oid {type_oid}: {text}"
+                ))
+            }),
         // timestamptz
-        1184 => parse_pg_timestamptz(text).map(Value::TimestampTz).ok_or_else(|| {
-            WalParseError::MalformedPayload(format!(
-                "invalid timestamptz text value for type oid {type_oid}: {text}"
-            ))
-        }),
+        1184 => parse_pg_timestamptz(text)
+            .map(Value::TimestampTz)
+            .ok_or_else(|| {
+                WalParseError::MalformedPayload(format!(
+                    "invalid timestamptz text value for type oid {type_oid}: {text}"
+                ))
+            }),
         // date
         1082 => NaiveDate::parse_from_str(text, "%Y-%m-%d")
             .map(Value::Date)
@@ -299,11 +300,13 @@ fn pg_decimal_value(
             )));
         }
     };
-    BigDecimal::from_str(&text).map(Value::Decimal).map_err(|_| {
-        WalParseError::MalformedPayload(format!(
-            "invalid decimal value in field '{field}': {text}"
-        ))
-    })
+    BigDecimal::from_str(&text)
+        .map(Value::Decimal)
+        .map_err(|_| {
+            WalParseError::MalformedPayload(format!(
+                "invalid decimal value in field '{field}': {text}"
+            ))
+        })
 }
 
 fn pg_bool_value(value: &serde_json::Value, field: &str) -> Result<Value<Postgres>, WalParseError> {
@@ -343,9 +346,7 @@ fn pg_timestamp_value(
         )));
     };
     parse_pg_timestamp(s).map(Value::Timestamp).ok_or_else(|| {
-        WalParseError::MalformedPayload(format!(
-            "invalid timestamp value in field '{field}': {s}"
-        ))
+        WalParseError::MalformedPayload(format!("invalid timestamp value in field '{field}': {s}"))
     })
 }
 
@@ -358,11 +359,13 @@ fn pg_timestamptz_value(
             "invalid timestamptz value in field '{field}': {value}"
         )));
     };
-    parse_pg_timestamptz(s).map(Value::TimestampTz).ok_or_else(|| {
-        WalParseError::MalformedPayload(format!(
-            "invalid timestamptz value in field '{field}': {s}"
-        ))
-    })
+    parse_pg_timestamptz(s)
+        .map(Value::TimestampTz)
+        .ok_or_else(|| {
+            WalParseError::MalformedPayload(format!(
+                "invalid timestamptz value in field '{field}': {s}"
+            ))
+        })
 }
 
 fn pg_date_value(value: &serde_json::Value, field: &str) -> Result<Value<Postgres>, WalParseError> {
@@ -389,15 +392,10 @@ fn pg_time_value(value: &serde_json::Value, field: &str) -> Result<Value<Postgre
     })
 }
 
-fn pg_json_value(
-    value: &serde_json::Value,
-    field: &str,
-) -> Result<Value<Postgres>, WalParseError> {
+fn pg_json_value(value: &serde_json::Value, field: &str) -> Result<Value<Postgres>, WalParseError> {
     if let serde_json::Value::String(s) = value {
         return serde_json::from_str(s).map(Value::Json).map_err(|_| {
-            WalParseError::MalformedPayload(format!(
-                "invalid json value in field '{field}': {s}"
-            ))
+            WalParseError::MalformedPayload(format!("invalid json value in field '{field}': {s}"))
         });
     }
     Ok(Value::Json(value.clone()))
@@ -409,9 +407,7 @@ fn pg_jsonb_value(
 ) -> Result<Value<Postgres>, WalParseError> {
     if let serde_json::Value::String(s) = value {
         return serde_json::from_str(s).map(Value::Jsonb).map_err(|_| {
-            WalParseError::MalformedPayload(format!(
-                "invalid jsonb value in field '{field}': {s}"
-            ))
+            WalParseError::MalformedPayload(format!("invalid jsonb value in field '{field}': {s}"))
         });
     }
     Ok(Value::Jsonb(value.clone()))

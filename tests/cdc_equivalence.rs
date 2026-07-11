@@ -22,8 +22,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, Presence, RowKind, Value};
 use subql::{
-    CdcSource, ColumnId, EventKind, PgStreamingCdcSource, PgStreamingConfig,
-    PollingPgCdcConfig, PollingPgCdcSource, TableId,
+    CdcSource, ColumnId, EventKind, PgStreamingCdcSource, PgStreamingConfig, PollingPgCdcConfig,
+    PollingPgCdcSource, TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";

@@ -15,8 +15,8 @@ use super::pg_type::json_value_to_pg_value;
 use super::{parse_event_kind, resolve_table, WalParseError, WalParser};
 use crate::backend::{CdcEvent, Postgres, Presence, RowKind, Value};
 use crate::{catalog_helpers, ColumnId, EventKind, TableId};
-use sql_traits::prelude::DatabaseLike;
 use spin::Once;
+use sql_traits::prelude::DatabaseLike;
 
 // ============================================================================
 // Serde structs: v1
@@ -166,7 +166,6 @@ fn parse_v1_kind(kind: &str) -> Result<EventKind, WalParseError> {
 fn parse_v2_kind(action: &str) -> Result<EventKind, WalParseError> {
     parse_event_kind(action, &["I"], &["U"], &["D"], &["T"])
 }
-
 
 // ============================================================================
 // Wal2JsonV2Event: typed [`CdcEvent`] output of the v2 parser
@@ -422,7 +421,6 @@ impl CdcEvent for Wal2JsonV2Event {
     }
 }
 
-
 #[allow(clippy::too_many_lines)]
 fn convert_v2_message_typed<DB: DatabaseLike>(
     msg: Wal2JsonV2Message,
@@ -485,13 +483,7 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
         EventKind::Update => identity
             .filter(|identity| !identity.is_empty())
             .map(|identity| {
-                V2RowImage::from_wire_columns(
-                    identity,
-                    table_id,
-                    arity,
-                    database,
-                    "v2 identity",
-                )
+                V2RowImage::from_wire_columns(identity, table_id, arity, database, "v2 identity")
             })
             .transpose()?,
         EventKind::Insert | EventKind::Truncate => None,
@@ -503,15 +495,16 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
     let pk_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Truncate {
         alloc::sync::Arc::from(Vec::<ColumnId>::new())
     } else if let Some(pk_meta) = pk.as_ref() {
-        let names: Vec<alloc::string::String> =
-            pk_meta.iter().map(|c| c.name.clone()).collect();
+        let names: Vec<alloc::string::String> = pk_meta.iter().map(|c| c.name.clone()).collect();
         let mut ids = Vec::with_capacity(names.len());
         let mut seen = hashbrown::HashSet::with_capacity(names.len());
         for name in &names {
-            let col_id = catalog_helpers::column_id(database, table_id, name.as_str())
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
+            let col_id =
+                catalog_helpers::column_id(database, table_id, name.as_str()).ok_or_else(|| {
+                    WalParseError::UnknownColumn {
+                        table_id,
+                        column: name.clone(),
+                    }
                 })?;
             if !seen.insert(col_id) {
                 return Err(WalParseError::MalformedPayload(format!(
@@ -522,24 +515,10 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
         }
         alloc::sync::Arc::from(ids)
     } else if let Some(image) = old_image.as_ref() {
-        alloc::sync::Arc::from(
-            image
-                .entries
-                .iter()
-                .map(|e| e.col_id)
-                .collect::<Vec<_>>(),
-        )
+        alloc::sync::Arc::from(image.entries.iter().map(|e| e.col_id).collect::<Vec<_>>())
     } else if let Some(image) = new_image.as_ref() {
         catalog_helpers::primary_key_columns(database, table_id).map_or_else(
-            || {
-                alloc::sync::Arc::from(
-                    image
-                        .entries
-                        .iter()
-                        .map(|e| e.col_id)
-                        .collect::<Vec<_>>(),
-                )
-            },
+            || alloc::sync::Arc::from(image.entries.iter().map(|e| e.col_id).collect::<Vec<_>>()),
             alloc::sync::Arc::from,
         )
     } else {
@@ -846,7 +825,6 @@ impl CdcEvent for Wal2JsonV1Event {
     }
 }
 
-
 fn convert_v1_change_typed<DB: DatabaseLike>(
     change: &Wal2JsonV1Change,
     database: &DB,
@@ -912,28 +890,32 @@ fn convert_v1_change_typed<DB: DatabaseLike>(
         None => None,
     };
 
-    let pk_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Truncate {
-        alloc::sync::Arc::from(Vec::<ColumnId>::new())
-    } else if let Some(ref oldkeys) = change.oldkeys {
-        let mut ids = Vec::with_capacity(oldkeys.keynames.len());
-        let mut seen = hashbrown::HashSet::with_capacity(oldkeys.keynames.len());
-        for name in &oldkeys.keynames {
-            let col_id = catalog_helpers::column_id(database, table_id, name.as_str())
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
-                })?;
-            if !seen.insert(col_id) {
-                return Err(WalParseError::MalformedPayload(format!(
-                    "v1 oldkeys contains duplicate column '{name}' (id {col_id})"
-                )));
+    let pk_columns: alloc::sync::Arc<[ColumnId]> =
+        if kind == EventKind::Truncate {
+            alloc::sync::Arc::from(Vec::<ColumnId>::new())
+        } else if let Some(ref oldkeys) = change.oldkeys {
+            let mut ids = Vec::with_capacity(oldkeys.keynames.len());
+            let mut seen = hashbrown::HashSet::with_capacity(oldkeys.keynames.len());
+            for name in &oldkeys.keynames {
+                let col_id = catalog_helpers::column_id(database, table_id, name.as_str())
+                    .ok_or_else(|| WalParseError::UnknownColumn {
+                        table_id,
+                        column: name.clone(),
+                    })?;
+                if !seen.insert(col_id) {
+                    return Err(WalParseError::MalformedPayload(format!(
+                        "v1 oldkeys contains duplicate column '{name}' (id {col_id})"
+                    )));
+                }
+                ids.push(col_id);
             }
-            ids.push(col_id);
-        }
-        alloc::sync::Arc::from(ids)
-    } else {
-        catalog_helpers::primary_key_columns(database, table_id).map_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()), alloc::sync::Arc::from)
-    };
+            alloc::sync::Arc::from(ids)
+        } else {
+            catalog_helpers::primary_key_columns(database, table_id).map_or_else(
+                || alloc::sync::Arc::from(Vec::<ColumnId>::new()),
+                alloc::sync::Arc::from,
+            )
+        };
 
     let changed_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Update {
         alloc::sync::Arc::from(v1_derive_changed_columns(
@@ -1012,94 +994,50 @@ mod tests {
 
     // -- v1 INSERT -----------------------------------------------------------
 
-    
     // -- v1 UPDATE -----------------------------------------------------------
 
-    
     // -- v1 DELETE -----------------------------------------------------------
 
-    
     // -- v1 multi-change transaction -----------------------------------------
 
-    
     // -- v2 INSERT -----------------------------------------------------------
 
-    
-    
     // -- v2 UPDATE -----------------------------------------------------------
 
-    
     // -- v2 DELETE -----------------------------------------------------------
 
-    
     // -- Error paths ---------------------------------------------------------
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     // -- B1: v1 unknown kind is skipped -------------------------------------
 
-    
     // -- v1 unknown kind in multi-change transaction is isolated skip --------
 
-    
     // -- B2: v2 missing table on data action ---------------------------------
 
-    
     // -- Trait object safety --------------------------------------------------
 
-    
     // -- v1 UPDATE with full old row (REPLICA IDENTITY FULL) ----------------
 
-    
     // -- v1 UPDATE without oldkeys (changed_columns branch: None old_row) ----
 
-    
-    
     // -- v1 INSERT without catalog PK columns --------------------------------
 
-    
     // -- v2 UPDATE with identity but no pk metadata --------------------------
 
-    
     // -- v2 INSERT without pk metadata AND without catalog PK ----------------
 
-    
     // -- v2 UPDATE without identity (changed_columns branch: None old_row) ---
 
-    
     // -- v2 unknown column error ---------------------------------------------
 
-    
     // -- Null handling -------------------------------------------------------
 
-    
     // -- INSERT without PK metadata (catalog fallback) -----------------------
 
-    
     // -- Error: unknown column in oldkeys ------------------------------------
 
-    
-    
-    
-    
-    
-    
-    
-    
     // -- Direct test: build_pk_from_key_arrays with unknown column -----------
 
-    
-    
-    
-    
     // ------------------------------------------------------------------
     // Phase 7A: Wal2JsonV2Event typed CdcEvent smoke tests
     // ------------------------------------------------------------------
@@ -1336,10 +1274,7 @@ mod tests {
             let events = Wal2JsonV2Parser
                 .parse_wal_message(msg.as_bytes(), &database)
                 .expect("parse succeeds");
-            assert!(
-                events.is_empty(),
-                "tag {tag} should produce no events"
-            );
+            assert!(events.is_empty(), "tag {tag} should produce no events");
         }
     }
 

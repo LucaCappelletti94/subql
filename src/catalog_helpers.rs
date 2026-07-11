@@ -207,7 +207,6 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
     })
 }
 
-
 /// Resolve a column's declared SQL type into a backend-neutral
 /// [`ScalarKind`].
 ///
@@ -266,7 +265,6 @@ pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Opti
     let table = database.table_by_id(table_id as usize)?;
     Some(table.has_row_level_security(database))
 }
-
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -332,7 +330,6 @@ mod tests {
         let tid = table_id(&db, "t").unwrap();
         assert_eq!(primary_key_columns(&db, tid), Some(vec![]));
     }
-
 
     #[test]
     fn schema_fingerprint_round_trips_for_same_schema() {

@@ -28,16 +28,9 @@ use subql::reexec::{
     AutoResolvingEngine, Connector, MysqlDieselConnector, ReExecEngine, Registered, SnapshotResult,
 };
 use subql::testing::TestEvent;
-use subql::{
-    catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId,
-};
+use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
 
-type Engine = AutoResolvingEngine<
-    TestEvent<MySql>,
-    DefaultIds,
-    ParserDB,
-    MysqlDieselConnector,
->;
+type Engine = AutoResolvingEngine<TestEvent<MySql>, DefaultIds, ParserDB, MysqlDieselConnector>;
 
 /// Catalog DDL shared by the engine + planner. `FLOAT` maps to subql's
 /// `Float` scalar kind under the MySQL parser.
@@ -70,10 +63,8 @@ fn catalog() -> ParserDB {
 }
 
 fn build_engine(catalog: ParserDB, conn_exec: MysqlConnection) -> Engine {
-    let inner = SubscriptionEngine::<TestEvent<MySql>, DefaultIds, ParserDB>::new(
-        catalog,
-        MySqlDialect {},
-    );
+    let inner =
+        SubscriptionEngine::<TestEvent<MySql>, DefaultIds, ParserDB>::new(catalog, MySqlDialect {});
     AutoResolvingEngine::new(
         ReExecEngine::new(inner),
         MysqlDieselConnector::new(conn_exec),
@@ -195,8 +186,7 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
     setup_mysql(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
 
     let cat = catalog();
-    let table_id: TableId =
-        catalog_helpers::table_id(&cat, "orders").expect("resolve orders");
+    let table_id: TableId = catalog_helpers::table_id(&cat, "orders").expect("resolve orders");
 
     let mut engine = build_engine(cat, conn_exec);
 

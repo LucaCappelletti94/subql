@@ -486,10 +486,7 @@ mod tests {
             _sql: &str,
             _auth: &(),
         ) -> Result<
-            super::super::connector::Snapshot<
-                Vec<Vec<Value<Postgres>>>,
-                Self::Checkpoint,
-            >,
+            super::super::connector::Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>,
             Self::Error,
         > {
             #[allow(clippy::unimplemented)]
@@ -530,8 +527,8 @@ mod tests {
         TableId,
     ) {
         let database = catalog();
-        let orders_id = crate::catalog_helpers::table_id(&database, "orders")
-            .expect("orders table exists");
+        let orders_id =
+            crate::catalog_helpers::table_id(&database, "orders").expect("orders table exists");
         let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
             database,
             PostgreSqlDialect {},

@@ -15,9 +15,9 @@ pub use runtime::{
     agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SubscriptionEngine,
     SumKernel,
 };
-pub use sqlite_cdc::{SqlitePatchsetEvent, SqlitePatchsetParser};
 #[cfg(feature = "sqlite-cdc")]
 pub use sqlite_cdc::{SqliteCdcError, SqliteCdcSource};
+pub use sqlite_cdc::{SqlitePatchsetEvent, SqlitePatchsetParser};
 pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
@@ -48,12 +48,12 @@ mod types;
 
 pub mod backend;
 pub mod catalog_helpers;
-pub mod testing;
 pub mod checkpoint;
 pub mod clock;
 pub mod compiler;
 #[cfg(feature = "std")]
 pub mod config;
+pub mod testing;
 // Memory profiling harness driven by the `dhat-heap` feature. Not part of
 // the shipping API surface.
 #[cfg(feature = "dhat-heap")]
@@ -65,8 +65,8 @@ pub mod polling;
 pub mod reexec;
 pub mod row_set;
 pub mod runtime;
-pub mod wal;
 pub mod sqlite_cdc;
+pub mod wal;
 
 // Diesel-typed subscription and follow API. Only compiles when the
 // `diesel-typed` family of features pulls in `diesel` with the third-party

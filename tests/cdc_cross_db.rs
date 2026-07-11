@@ -375,29 +375,34 @@ fn maxwell_read_changes(output_dir: &str, expected_count: usize) -> Vec<String> 
 const SUBSCRIPTIONS: &[(u64, &str)] = &[
     (1, "SELECT * FROM readings WHERE temperature > 30"),
     (2, "SELECT * FROM readings WHERE location = 'warehouse-A'"),
-    (3, "SELECT * FROM readings WHERE humidity < 40 AND temperature > 25"),
+    (
+        3,
+        "SELECT * FROM readings WHERE humidity < 40 AND temperature > 25",
+    ),
     (4, "SELECT * FROM readings WHERE sensor_id = 1"),
 ];
 
-fn setup_pg_engine(
-    catalog: ParserDB,
-) -> SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> {
+fn setup_pg_engine(catalog: ParserDB) -> SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> {
     let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     for (consumer_id, sql) in SUBSCRIPTIONS {
         engine
-            .register(SubscriptionRequest::<DefaultIds, Postgres>::new(*consumer_id, *sql))
+            .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
+                *consumer_id,
+                *sql,
+            ))
             .unwrap_or_else(|e| panic!("register PG subscription {consumer_id}: {e}"));
     }
     engine
 }
 
-fn setup_mysql_engine(
-    catalog: ParserDB,
-) -> SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> {
+fn setup_mysql_engine(catalog: ParserDB) -> SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> {
     let mut engine = SubscriptionEngine::new(catalog, MySqlDialect {});
     for (consumer_id, sql) in SUBSCRIPTIONS {
         engine
-            .register(SubscriptionRequest::<DefaultIds, MySql>::new(*consumer_id, *sql))
+            .register(SubscriptionRequest::<DefaultIds, MySql>::new(
+                *consumer_id,
+                *sql,
+            ))
             .unwrap_or_else(|e| panic!("register MySQL subscription {consumer_id}: {e}"));
     }
     engine
@@ -415,8 +420,7 @@ fn dispatch_events<P>(
 ) -> Vec<BTreeSet<u64>>
 where
     P: WalParser<ParserDB>,
-    <P::Event as subql::backend::CdcEvent>::Backend:
-        subql::compiler::literals::SqlLiteralParse,
+    <P::Event as subql::backend::CdcEvent>::Backend: subql::compiler::literals::SqlLiteralParse,
 {
     let mut results = Vec::with_capacity(messages.len());
 

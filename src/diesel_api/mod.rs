@@ -506,8 +506,7 @@ where
         // so the caller's slice + engine round-trip line up.
         let (select_sql, set_bind_count) =
             crate::compiler::derive_update_follow_select_with_set_binds(&sql, self.dialect())?;
-        let where_binds: Vec<Value<E::Backend>> =
-            binds.into_iter().skip(set_bind_count).collect();
+        let where_binds: Vec<Value<E::Backend>> = binds.into_iter().skip(set_bind_count).collect();
         self.register(SubscriptionRequest::new(consumer_id, select_sql).binds(where_binds))
     }
 
@@ -645,7 +644,11 @@ mod render_tests {
         assert!(sql.contains("$1"), "sql: {sql}");
         assert_eq!(
             binds,
-            alloc::vec![Value::Int(5), Value::String("ann".into()), Value::Bool(true)]
+            alloc::vec![
+                Value::Int(5),
+                Value::String("ann".into()),
+                Value::Bool(true)
+            ]
         );
     }
 

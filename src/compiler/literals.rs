@@ -280,9 +280,7 @@ impl SqlLiteralParse for SQLite {
         match (target, sql) {
             // SQLite has no native BOOL; the column contract stores 0 / 1
             // as INTEGER. Coerce the sqlparser Boolean to that.
-            (ScalarKind::Bool, SqlValue::Boolean(b)) => {
-                Ok(Value::Bool(i64::from(*b)))
-            }
+            (ScalarKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(i64::from(*b))),
             (ScalarKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
             (ScalarKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
             (ScalarKind::String, _) => quoted_string(sql)

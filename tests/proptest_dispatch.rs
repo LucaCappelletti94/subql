@@ -11,9 +11,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::{HashMap, HashSet};
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
-use subql::{
-    catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId,
-};
+use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
 
 // ============================================================================
 // Test Schema
@@ -147,19 +145,13 @@ fn predicate_strategy() -> impl Strategy<Value = TestPredicate> {
         Just(TestPredicate::IsNull),
     ];
 
-    leaf.prop_recursive(
-        2,
-        16,
-        4,
-        |inner| {
-            prop_oneof![
-                (inner.clone(), inner.clone())
-                    .prop_map(|(a, b)| TestPredicate::And(Box::new(a), Box::new(b))),
-                (inner.clone(), inner)
-                    .prop_map(|(a, b)| TestPredicate::Or(Box::new(a), Box::new(b))),
-            ]
-        },
-    )
+    leaf.prop_recursive(2, 16, 4, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone())
+                .prop_map(|(a, b)| TestPredicate::And(Box::new(a), Box::new(b))),
+            (inner.clone(), inner).prop_map(|(a, b)| TestPredicate::Or(Box::new(a), Box::new(b))),
+        ]
+    })
 }
 
 /// Strategy for generating row cells.

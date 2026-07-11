@@ -15,7 +15,6 @@
 //! rides on the upstream `unsafe impl Send for Session` added in
 //! `diesel-sqlite-session`.
 
-
 use alloc::collections::VecDeque;
 
 use diesel::SqliteConnection;
@@ -229,7 +228,10 @@ mod tests {
             .execute(source.connection())
             .expect("insert");
         let _ = source.poll_next_event().expect("insert poll");
-        assert!(source.poll_next_event().expect("post-insert poll").is_none());
+        assert!(source
+            .poll_next_event()
+            .expect("post-insert poll")
+            .is_none());
 
         sql_query("UPDATE orders SET status = 'shipped' WHERE id = 5")
             .execute(source.connection())
@@ -296,10 +298,8 @@ mod tests {
         assert_eq!(event.kind(), crate::EventKind::Insert);
         assert_eq!(event.int_at(RowKind::New, 0), Presence::Present(&1));
 
-        let ack = <SqliteCdcSource<ParserDB> as crate::CdcSource>::ack(
-            &mut source,
-            crate::NoCheckpoint,
-        );
+        let ack =
+            <SqliteCdcSource<ParserDB> as crate::CdcSource>::ack(&mut source, crate::NoCheckpoint);
         block_on(ack).expect("ack succeeds");
     }
 }

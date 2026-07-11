@@ -1,4 +1,3 @@
-
 //! Property-based tests for the subscription-registry cap and the
 //! `EvictionPolicy` semantics that landed alongside the activity-aware
 //! eviction work.

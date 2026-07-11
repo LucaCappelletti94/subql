@@ -78,6 +78,9 @@ mod async_connector;
 mod auto;
 mod connector;
 
+pub use async_auto::AsyncAutoResolvingEngine;
+pub use async_connector::AsyncConnector;
+pub use auto::{AutoResolvingEngine, SnapshotResult};
 #[cfg(feature = "executor-diesel-mysql")]
 pub use connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
@@ -87,9 +90,6 @@ pub use connector::{Connector, ReExecError, Snapshot};
 pub use connector::{DieselBackend, DieselConnector};
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
-pub use auto::{AutoResolvingEngine, SnapshotResult};
-pub use async_auto::AsyncAutoResolvingEngine;
-pub use async_connector::AsyncConnector;
 pub use engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     ReExecutionTrigger, Registered, ScalarUpdate,

@@ -466,11 +466,11 @@ const fn planner_value_as_int(value: &PlannerValue) -> Option<i64> {
 fn planner_value_from_sql_value(val: &Value) -> Option<PlannerValue> {
     match val {
         Value::Boolean(b) => Some(PlannerValue::Bool(*b)),
-        Value::Number(n, _) => n
-            .parse::<i64>()
-            .map(PlannerValue::Int)
-            .ok()
-            .or_else(|| n.parse::<f64>().map(|f| PlannerValue::Float(f.to_bits())).ok()),
+        Value::Number(n, _) => n.parse::<i64>().map(PlannerValue::Int).ok().or_else(|| {
+            n.parse::<f64>()
+                .map(|f| PlannerValue::Float(f.to_bits()))
+                .ok()
+        }),
         Value::SingleQuotedString(s)
         | Value::DoubleQuotedString(s)
         | Value::NationalStringLiteral(s)

@@ -703,12 +703,9 @@ fn count_placeholders_in_expr(expr: &Expr) -> usize {
                 + count_placeholders_in_expr(low)
                 + count_placeholders_in_expr(high)
         }
-        Expr::Like {
-            expr, pattern, ..
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            count_placeholders_in_expr(expr) + count_placeholders_in_expr(pattern)
         }
-        | Expr::ILike {
-            expr, pattern, ..
-        } => count_placeholders_in_expr(expr) + count_placeholders_in_expr(pattern),
         _ => 0,
     }
 }
@@ -753,12 +750,7 @@ fn renumber_placeholders(expr: &mut Expr, set_bind_count: usize) {
             renumber_placeholders(low, set_bind_count);
             renumber_placeholders(high, set_bind_count);
         }
-        Expr::Like {
-            expr, pattern, ..
-        }
-        | Expr::ILike {
-            expr, pattern, ..
-        } => {
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
             renumber_placeholders(expr, set_bind_count);
             renumber_placeholders(pattern, set_bind_count);
         }

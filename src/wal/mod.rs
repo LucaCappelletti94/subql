@@ -53,9 +53,7 @@ pub trait WalParser<DB: DatabaseLike>: Send + Sync {
     /// The typed CDC event this parser emits. Implements
     /// [`CdcEvent`](crate::backend::CdcEvent) so the engine consumes parser
     /// output through the same trait every other event surface uses.
-    type Event: crate::backend::CdcEvent<Checkpoint = Self::Checkpoint>
-        + Send
-        + Sync;
+    type Event: crate::backend::CdcEvent<Checkpoint = Self::Checkpoint> + Send + Sync;
 
     /// Parse a raw WAL message into zero or more typed events.
     ///
@@ -87,7 +85,6 @@ where
 {
     parse_json_message(data)
 }
-
 
 /// Errors that can occur during WAL message parsing.
 #[derive(Error, Clone, Debug)]
@@ -196,8 +193,6 @@ pub(crate) fn resolve_table<DB: DatabaseLike>(
         },
     })
 }
-
-
 
 /// Parse a wire event kind token by matching it against the allowed
 /// tokens for each [`EventKind`]. Returns
@@ -343,5 +338,4 @@ mod tests {
             parse_json_message_or_tombstone(br#"{"x":1}"#).expect("object should parse");
         assert!(parsed.is_some());
     }
-
 }

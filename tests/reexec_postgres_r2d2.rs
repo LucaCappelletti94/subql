@@ -25,10 +25,10 @@ use diesel::r2d2::ConnectionManager;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{CdcEvent, Postgres, Value};
 use subql::reexec::{
     AutoResolvingEngine, PgR2D2DieselConnector, ReExecEngine, Registered, SnapshotResult,
 };
-use subql::backend::{CdcEvent, Postgres, Value};
 use subql::{
     DefaultIds, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Event, Wal2JsonV2Parser,
     WalParser,
@@ -86,11 +86,7 @@ fn build_engine(
     AutoResolvingEngine::new(ReExecEngine::new(inner), PgR2D2DieselConnector::new(pool))
 }
 
-fn parse_message(
-    parser: &Wal2JsonV2Parser,
-    catalog: &ParserDB,
-    msg: &str,
-) -> Vec<Wal2JsonV2Event> {
+fn parse_message(parser: &Wal2JsonV2Parser, catalog: &ParserDB, msg: &str) -> Vec<Wal2JsonV2Event> {
     parser
         .parse_wal_message(msg.as_bytes(), catalog)
         .expect("wal2json parse")

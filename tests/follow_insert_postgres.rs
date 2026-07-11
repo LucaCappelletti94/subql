@@ -44,12 +44,13 @@ fn register_follow_insert_decodes_minted_pk() {
         .expect("CREATE TABLE users");
 
     // subql's catalog mirrors the schema (declared PK on `id`).
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);",
-    )
-    .expect("catalog");
-    let mut engine =
-        SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, _>::new(catalog, PostgreSqlDialect {});
+    let catalog =
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE users (id INT PRIMARY KEY, name TEXT);")
+            .expect("catalog");
+    let mut engine = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, _>::new(
+        catalog,
+        PostgreSqlDialect {},
+    );
 
     // Execute `INSERT INTO users (name) VALUES ('ann') RETURNING id` on real PG.
     // The DB mints id=1; subql reads the RETURNING row, decodes the minted key,
@@ -64,9 +65,7 @@ fn register_follow_insert_decodes_minted_pk() {
     assert_eq!(ann.len(), 1);
     // The minted key was decoded as 1: this follow dedups with an explicit
     // follow on id = 1 (same predicate -> same subscription).
-    let ann_pk = engine
-        .follow_row(1, "users", vec![Value::Int(1)])
-        .unwrap();
+    let ann_pk = engine.follow_row(1, "users", vec![Value::Int(1)]).unwrap();
     assert_eq!(ann[0].subscription_id, ann_pk.subscription_id);
 
     // Second insert mints id=2 and follows a distinct row.
@@ -78,9 +77,7 @@ fn register_follow_insert_decodes_minted_pk() {
         )
         .expect("follow insert bob");
     assert_eq!(bob.len(), 1);
-    let bob_pk = engine
-        .follow_row(1, "users", vec![Value::Int(2)])
-        .unwrap();
+    let bob_pk = engine.follow_row(1, "users", vec![Value::Int(2)]).unwrap();
     assert_eq!(bob[0].subscription_id, bob_pk.subscription_id);
 
     assert_ne!(ann[0].subscription_id, bob[0].subscription_id);

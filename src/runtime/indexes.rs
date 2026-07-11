@@ -909,7 +909,10 @@ mod tests {
         use crate::compiler::{BytecodeProgram, Instruction};
 
         // Bytecode for: status IS NULL
-        let bytecode = BytecodeProgram::<Postgres>::new(vec![Instruction::LoadColumn(2, ScalarKind::Int), Instruction::IsNull]);
+        let bytecode = BytecodeProgram::<Postgres>::new(vec![
+            Instruction::LoadColumn(2, ScalarKind::Int),
+            Instruction::IsNull,
+        ]);
 
         let atoms = extract_indexable_atoms(&bytecode, &[2]);
 
@@ -973,7 +976,6 @@ mod tests {
         assert_eq!(atoms.len(), 1);
         assert!(matches!(atoms[0], IndexableAtom::Fallback));
     }
-
 
     #[test]
     fn test_hybrid_indexes_default() {

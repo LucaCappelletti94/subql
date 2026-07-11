@@ -31,8 +31,8 @@ use std::collections::HashSet;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::reexec::{ReExecEngine, Registered};
 use subql::backend::{Postgres, ScalarKind};
+use subql::reexec::{ReExecEngine, Registered};
 use subql::testing::TestEvent;
 use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 

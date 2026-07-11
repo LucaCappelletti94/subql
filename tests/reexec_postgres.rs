@@ -29,10 +29,10 @@ mod common;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{CdcEvent, Postgres, Value};
 use subql::reexec::{
     AutoResolvingEngine, Connector, PgDieselConnector, ReExecEngine, Registered, SnapshotResult,
 };
-use subql::backend::{CdcEvent, Postgres, Value};
 use subql::{
     DefaultIds, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Event, Wal2JsonV2Parser,
     WalParser,
@@ -92,11 +92,7 @@ fn build_engine(
 /// emits 0 events for relation-only messages (begin/commit/relation), which
 /// the test must tolerate.
 #[allow(dead_code)] // used by the step-3 / step-4 tests
-fn parse_message(
-    parser: &Wal2JsonV2Parser,
-    catalog: &ParserDB,
-    msg: &str,
-) -> Vec<Wal2JsonV2Event> {
+fn parse_message(parser: &Wal2JsonV2Parser, catalog: &ParserDB, msg: &str) -> Vec<Wal2JsonV2Event> {
     parser
         .parse_wal_message(msg.as_bytes(), catalog)
         .expect("wal2json parse")
@@ -123,7 +119,10 @@ fn scaffold_registers_both_subscription_kinds() {
 
     let engine_reg = engine
         .register(
-            SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, "SELECT * FROM orders WHERE price > 8.0"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT * FROM orders WHERE price > 8.0",
+            ),
             (),
         )
         .expect("engine-supported registration");
@@ -187,7 +186,10 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     let engine_consumer: u64 = 1;
     let engine_reg = engine
         .register(
-            SubscriptionRequest::<DefaultIds, Postgres>::new(engine_consumer, "SELECT * FROM orders WHERE price > 8.0"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                engine_consumer,
+                "SELECT * FROM orders WHERE price > 8.0",
+            ),
             (),
         )
         .expect("engine registration");

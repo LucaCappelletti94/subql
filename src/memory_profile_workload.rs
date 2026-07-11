@@ -204,8 +204,10 @@ pub fn run_memory_profile(show_progress: bool) {
     println!("======================");
     println!();
 
-    let mut engine =
-        SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(bench_catalog(), PostgreSqlDialect {});
+    let mut engine = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+        bench_catalog(),
+        PostgreSqlDialect {},
+    );
 
     println!("Registering 100,000 predicates with realistic tree shapes...");
     if !show_progress {

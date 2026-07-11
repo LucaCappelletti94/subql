@@ -27,7 +27,6 @@ const MAX_CACHED_RELATIONS: usize = 65_536;
 const MAX_CACHED_RELATIONS: usize = 32;
 const PROTOCOL_VERSION: u32 = 1;
 
-
 #[derive(Clone, Debug)]
 struct CachedRelation {
     table_id: TableId,
@@ -304,7 +303,6 @@ fn build_cached_relation<DB: DatabaseLike>(
     })
 }
 
-
 fn translate_error(err: ReplicationError) -> WalParseError {
     match err {
         ReplicationError::Buffer(msg) => {
@@ -545,8 +543,8 @@ fn wire_cell_from_column_data(
         return Err(WalParseError::UnknownTupleTag(b'b'));
     } else {
         let bytes = col.as_bytes();
-        let text = core::str::from_utf8(bytes)
-            .map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
+        let text =
+            core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
         PgOutWirePayload::Text(text.to_string())
     };
     Ok(PgOutWireCell {
@@ -681,7 +679,6 @@ impl CdcEvent for PgOutputEvent {
     }
 }
 
-
 fn tuple_wire_full(
     rel: &CachedRelation,
     tuple: &TupleData,
@@ -764,7 +761,6 @@ fn pk_columns_from_identity_or_catalog<DB: DatabaseLike>(
 // Keep the NoCheckpoint import referenced (avoid unused-import lints when
 // the streaming stamping wiring lands in Phase 7F).
 const _: fn() -> NoCheckpoint = || NoCheckpoint;
-
 
 // Tests
 // ============================================================================
@@ -919,105 +915,62 @@ mod tests {
 
     // -- Test 1: Relation caching + Insert (happy path) ----------------------
 
-    
     // Removed `relation_with_out_of_range_catalog_column_id_errors` and
     // `relation_with_duplicate_catalog_column_id_errors`: both injected
     // out-of-range or duplicate column ordinals into a `MockCatalog`.
     // ParserDB always assigns unique, in-range ordinals to columns, so the
     // failure modes are unreachable through the public API.
 
-    
     // -- Test 2: Update with 'K' old key (DEFAULT replica identity) ----------
 
-    
-    
-    
     // -- Test 3: Update with 'O' full old row (FULL replica identity) --------
 
-    
     // -- Test 4: Update without old tuple ------------------------------------
 
-    
     // -- Test 5: Delete with 'K' key ----------------------------------------
 
-    
-    
     // -- Test 6: Delete with 'O' full old row --------------------------------
 
-    
     // -- Test 7: Metadata messages return empty vec --------------------------
 
-    
-    
-    
     // -- Test 8: Empty input returns empty vec --------------------------------
 
-    
     // -- Test 9: Unknown message type -> skip --------------------------------
 
-    
     // -- Test 10: Insert without preceding Relation -> UnknownRelationOid ----
 
-    
     // -- Test 11: Truncated messages -> TruncatedMessage ---------------------
 
-    
-    
     // -- Test 12: NULL columns ('n' tag) -> Cell::Null -----------------------
 
-    
     // -- Test 13: Unchanged TOAST ('u' tag) -> Cell::Missing in OLD tuple ----
 
-    
     // -- Test 14: Type conversion for various OIDs ---------------------------
 
-    
-    
     // -- Test 15: changed_columns computed correctly for FULL update ----------
 
-    
     // -- Test 16: Trait object safety ----------------------------------------
 
-    
     // -- Test 17: Thread safety (compile-time Send + Sync check) -------------
 
-    
     // -- Test: Insert without catalog PK -> empty PK -------------------------
 
-    
     // -- Test: Truncated relation message ------------------------------------
 
-    
     // -- Test: Delete without identity columns -> use all columns as PK ------
 
-    
-    
-    
-    
-    
-    
-    
-    
-        // -- B3: skip 2PC/keepalive/replication protocol messages ----------------
+    // -- B3: skip 2PC/keepalive/replication protocol messages ----------------
 
-    
     // -- B4: under-arity normal tuples are rejected --------------------------
 
-    
     // -- B5: LRU eviction boundary -------------------------------------------
 
-    
     // -- B6: TRUNCATE edge cases: zero relations, unknown OID ----------------
 
-    
-    
-    
     // -- B7: UnknownTupleTag error path --------------------------------------
 
     // -- A2: unchanged-TOAST tag 'u' must be rejected in new-image tuples ----
 
-    
-    
     // ------------------------------------------------------------------
     // Phase 7E: PgOutputEvent typed CdcEvent smoke tests
     // ------------------------------------------------------------------
@@ -1295,9 +1248,7 @@ mod tests {
     fn typed_pgoutput_empty_data_returns_empty_events() {
         let catalog = orders_catalog();
         let parser = PgOutputParser::new();
-        let events = parser
-            .parse_wal_message(b"", &catalog)
-            .expect("empty msg");
+        let events = parser.parse_wal_message(b"", &catalog).expect("empty msg");
         assert!(events.is_empty());
     }
 
@@ -1342,6 +1293,9 @@ mod tests {
             ],
         );
         let result = parser.parse_wal_message(&insert_msg, &catalog);
-        assert!(matches!(result, Err(WalParseError::UnknownRelationOid(77_777))));
+        assert!(matches!(
+            result,
+            Err(WalParseError::UnknownRelationOid(77_777))
+        ));
     }
 }

@@ -87,7 +87,6 @@ fn parse_maxwell_kind(event_type: &str) -> Result<EventKind, WalParseError> {
     )
 }
 
-
 // ============================================================================
 // MaxwellEvent: typed [`CdcEvent`] output of the Maxwell parser
 // ============================================================================
@@ -144,10 +143,12 @@ impl MaxwellRowImage {
         let mut seen = hashbrown::HashSet::with_capacity(map.len());
 
         for (name, value) in map {
-            let col_id = catalog_helpers::column_id(database, table_id, name.as_str())
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
+            let col_id =
+                catalog_helpers::column_id(database, table_id, name.as_str()).ok_or_else(|| {
+                    WalParseError::UnknownColumn {
+                        table_id,
+                        column: name.clone(),
+                    }
                 })?;
             if !seen.insert(col_id) {
                 return Err(WalParseError::MalformedPayload(format!(
@@ -320,7 +321,6 @@ impl CdcEvent for MaxwellEvent {
     }
 }
 
-
 #[allow(clippy::too_many_lines)]
 fn convert_maxwell_typed<DB: DatabaseLike>(
     msg: MaxwellMessage,
@@ -357,26 +357,30 @@ fn convert_maxwell_typed<DB: DatabaseLike>(
     })?;
 
     // PK column ids
-    let pk_columns: alloc::sync::Arc<[ColumnId]> = if let Some(pk_names) = &msg.primary_key_columns {
-        let mut ids = Vec::with_capacity(pk_names.len());
-        let mut seen = hashbrown::HashSet::with_capacity(pk_names.len());
-        for name in pk_names {
-            let col_id = catalog_helpers::column_id(database, table_id, name.as_str())
-                .ok_or_else(|| WalParseError::UnknownColumn {
-                    table_id,
-                    column: name.clone(),
-                })?;
-            if !seen.insert(col_id) {
-                return Err(WalParseError::MalformedPayload(format!(
-                    "primary_key_columns contains duplicate column '{name}' (id {col_id})"
-                )));
+    let pk_columns: alloc::sync::Arc<[ColumnId]> =
+        if let Some(pk_names) = &msg.primary_key_columns {
+            let mut ids = Vec::with_capacity(pk_names.len());
+            let mut seen = hashbrown::HashSet::with_capacity(pk_names.len());
+            for name in pk_names {
+                let col_id = catalog_helpers::column_id(database, table_id, name.as_str())
+                    .ok_or_else(|| WalParseError::UnknownColumn {
+                        table_id,
+                        column: name.clone(),
+                    })?;
+                if !seen.insert(col_id) {
+                    return Err(WalParseError::MalformedPayload(format!(
+                        "primary_key_columns contains duplicate column '{name}' (id {col_id})"
+                    )));
+                }
+                ids.push(col_id);
             }
-            ids.push(col_id);
-        }
-        alloc::sync::Arc::from(ids)
-    } else {
-        catalog_helpers::primary_key_columns(database, table_id).map_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()), alloc::sync::Arc::from)
-    };
+            alloc::sync::Arc::from(ids)
+        } else {
+            catalog_helpers::primary_key_columns(database, table_id).map_or_else(
+                || alloc::sync::Arc::from(Vec::<ColumnId>::new()),
+                alloc::sync::Arc::from,
+            )
+        };
 
     // Extract data maps before matching on kind (from_hashmap takes ownership).
     let data_map = msg.data;
@@ -388,9 +392,7 @@ fn convert_maxwell_typed<DB: DatabaseLike>(
     // Delete: old from data (Maxwell puts deleted row in data), new None.
     let (new_image, old_image): (Option<MaxwellRowImage>, Option<MaxwellRowImage>) = match kind {
         EventKind::Insert => {
-            let data = data_map.ok_or_else(|| {
-                WalParseError::MissingField("data".to_string())
-            })?;
+            let data = data_map.ok_or_else(|| WalParseError::MissingField("data".to_string()))?;
             (
                 Some(MaxwellRowImage::from_hashmap(
                     data,
@@ -403,32 +405,19 @@ fn convert_maxwell_typed<DB: DatabaseLike>(
             )
         }
         EventKind::Update => {
-            let data = data_map.ok_or_else(|| {
-                WalParseError::MissingField("data".to_string())
-            })?;
-            let new = MaxwellRowImage::from_hashmap(
-                data,
-                table_id,
-                arity,
-                database,
-                "maxwell data",
-            )?;
-            let old = old_map.map(|old| {
-                MaxwellRowImage::from_hashmap(
-                    old,
-                    table_id,
-                    arity,
-                    database,
-                    "maxwell old",
-                )
-            }).transpose()?;
+            let data = data_map.ok_or_else(|| WalParseError::MissingField("data".to_string()))?;
+            let new =
+                MaxwellRowImage::from_hashmap(data, table_id, arity, database, "maxwell data")?;
+            let old = old_map
+                .map(|old| {
+                    MaxwellRowImage::from_hashmap(old, table_id, arity, database, "maxwell old")
+                })
+                .transpose()?;
             (Some(new), old)
         }
         EventKind::Delete => {
             // Maxwell puts the deleted row in `data` for a delete event.
-            let data = data_map.ok_or_else(|| {
-                WalParseError::MissingField("data".to_string())
-            })?;
+            let data = data_map.ok_or_else(|| WalParseError::MissingField("data".to_string()))?;
             (
                 None,
                 Some(MaxwellRowImage::from_hashmap(
@@ -529,46 +518,23 @@ mod tests {
 
     // -- INSERT tests -------------------------------------------------------
 
-    
-    
     // -- UPDATE tests -------------------------------------------------------
 
-    
-    
     // -- DELETE tests -------------------------------------------------------
 
-    
-    
     // -- Edge cases ----------------------------------------------------------
 
-    
-    
     // -- Error paths ---------------------------------------------------------
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     // -- Trait checks -------------------------------------------------------
 
-    
-        // -- B8: Maxwell DDL events are skipped ---------------------------------
+    // -- B8: Maxwell DDL events are skipped ---------------------------------
 
-    
-    
     // -- A3: UPDATE PK change must use pre-update PK -------------------------
 
-    
     // -- A4: bootstrap-insert events must be treated as normal inserts -------
 
-    
-        // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
     // Phase 7C: MaxwellEvent typed CdcEvent smoke tests
     // ------------------------------------------------------------------
 
@@ -593,11 +559,8 @@ mod tests {
     #[test]
     fn typed_maxwell_dispatches_through_engine() {
         let database = typed_maxwell_catalog();
-        let mut engine: crate::SubscriptionEngine<
-            MaxwellEvent,
-            crate::DefaultIds,
-            ParserDB,
-        > = crate::SubscriptionEngine::new(database, MySqlDialect {});
+        let mut engine: crate::SubscriptionEngine<MaxwellEvent, crate::DefaultIds, ParserDB> =
+            crate::SubscriptionEngine::new(database, MySqlDialect {});
 
         engine
             .register(
@@ -752,7 +715,12 @@ mod tests {
     #[test]
     fn typed_maxwell_skips_control_events() {
         let database = typed_maxwell_catalog();
-        for event_type in &["ddl", "table-create", "bootstrap-start", "bootstrap-complete"] {
+        for event_type in &[
+            "ddl",
+            "table-create",
+            "bootstrap-start",
+            "bootstrap-complete",
+        ] {
             let msg = format!(r#"{{"database":"test","table":"orders","type":"{event_type}"}}"#);
             let events = MaxwellParser
                 .parse_wal_message(msg.as_bytes(), &database)

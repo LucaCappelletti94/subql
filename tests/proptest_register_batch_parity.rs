@@ -103,7 +103,9 @@ fn arb_scoped_spec_triples() -> impl Strategy<Value = Vec<(u64, u32, ScopeChoice
     )
 }
 
-fn materialise_scoped(triples: &[(u64, u32, ScopeChoice)]) -> Vec<SubscriptionRequest<DefaultIds, Postgres>> {
+fn materialise_scoped(
+    triples: &[(u64, u32, ScopeChoice)],
+) -> Vec<SubscriptionRequest<DefaultIds, Postgres>> {
     triples
         .iter()
         .map(|(c, t, scope)| {

@@ -82,7 +82,6 @@ fn parse_debezium_op(op: &str) -> Result<EventKind, WalParseError> {
     parse_event_kind(op, &["c", "r"], &["u"], &["d"], &["t"])
 }
 
-
 // ============================================================================
 // DebeziumEvent: typed [`CdcEvent`] output of the typed parser
 // ============================================================================
@@ -127,12 +126,11 @@ impl DebeziumRowImage {
         let mut seen = hashbrown::HashSet::with_capacity(map.len());
 
         for (field_name, value) in map {
-            let col_id = catalog_helpers::column_id(database, table_id, field_name.as_str()).ok_or_else(|| {
-                WalParseError::UnknownColumn {
+            let col_id = catalog_helpers::column_id(database, table_id, field_name.as_str())
+                .ok_or_else(|| WalParseError::UnknownColumn {
                     table_id,
                     column: field_name.clone(),
-                }
-            })?;
+                })?;
             if !seen.insert(col_id) {
                 return Err(WalParseError::MalformedPayload(format!(
                     "{context} contains duplicate column '{field_name}' (id {col_id})"
@@ -175,23 +173,29 @@ impl DebeziumRowImage {
         let entry = self.entries.get(wire_idx)?;
         let cache_slot = self.cache.get(idx)?;
         Some(cache_slot.call_once(|| {
-            super::pg_type::infer_pg_value_from_json_strict(
-                &entry.value,
-                entry.field_name.as_ref(),
-            )
-            .unwrap_or(Value::Missing)
+            super::pg_type::infer_pg_value_from_json_strict(&entry.value, entry.field_name.as_ref())
+                .unwrap_or(Value::Missing)
         }))
     }
 }
 
 impl DebeziumEvent {
-    const fn kind_matches_pk_source(&self, row: crate::backend::RowKind) -> Option<&DebeziumRowImage> {
+    const fn kind_matches_pk_source(
+        &self,
+        row: crate::backend::RowKind,
+    ) -> Option<&DebeziumRowImage> {
         match (self.kind, row) {
             (EventKind::Truncate, _) => None,
-            (EventKind::Insert, crate::backend::RowKind::New | crate::backend::RowKind::Pk) => self.new_image.as_ref(),
-            (EventKind::Delete, crate::backend::RowKind::Old | crate::backend::RowKind::Pk) => self.old_image.as_ref(),
+            (EventKind::Insert, crate::backend::RowKind::New | crate::backend::RowKind::Pk) => {
+                self.new_image.as_ref()
+            }
+            (EventKind::Delete, crate::backend::RowKind::Old | crate::backend::RowKind::Pk) => {
+                self.old_image.as_ref()
+            }
             (EventKind::Update, crate::backend::RowKind::New) => self.new_image.as_ref(),
-            (EventKind::Update, crate::backend::RowKind::Old | crate::backend::RowKind::Pk) => self.old_image.as_ref(),
+            (EventKind::Update, crate::backend::RowKind::Old | crate::backend::RowKind::Pk) => {
+                self.old_image.as_ref()
+            }
             _ => None,
         }
     }
@@ -242,59 +246,110 @@ impl crate::backend::CdcEvent for DebeziumEvent {
         &self.changed_columns
     }
 
-    fn bool_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&bool> {
+    fn bool_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&bool> {
         debezium_scalar_accessor!(self, row, col, Bool)
     }
 
-    fn int_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&i64> {
+    fn int_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&i64> {
         debezium_scalar_accessor!(self, row, col, Int)
     }
 
-    fn float_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&f64> {
+    fn float_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&f64> {
         debezium_scalar_accessor!(self, row, col, Float)
     }
 
-    fn string_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&alloc::string::String> {
+    fn string_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&alloc::string::String> {
         debezium_scalar_accessor!(self, row, col, String)
     }
 
-    fn bytes_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&alloc::vec::Vec<u8>> {
+    fn bytes_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&alloc::vec::Vec<u8>> {
         debezium_scalar_accessor!(self, row, col, Bytes)
     }
 
-    fn uuid_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&uuid::Uuid> {
+    fn uuid_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&uuid::Uuid> {
         debezium_scalar_accessor!(self, row, col, Uuid)
     }
 
-    fn timestamp_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&chrono::NaiveDateTime> {
+    fn timestamp_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&chrono::NaiveDateTime> {
         debezium_scalar_accessor!(self, row, col, Timestamp)
     }
 
-    fn timestamp_tz_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&chrono::DateTime<chrono::Utc>> {
+    fn timestamp_tz_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&chrono::DateTime<chrono::Utc>> {
         debezium_scalar_accessor!(self, row, col, TimestampTz)
     }
 
-    fn date_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&chrono::NaiveDate> {
+    fn date_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&chrono::NaiveDate> {
         debezium_scalar_accessor!(self, row, col, Date)
     }
 
-    fn time_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&chrono::NaiveTime> {
+    fn time_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&chrono::NaiveTime> {
         debezium_scalar_accessor!(self, row, col, Time)
     }
 
-    fn decimal_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&bigdecimal::BigDecimal> {
+    fn decimal_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&bigdecimal::BigDecimal> {
         debezium_scalar_accessor!(self, row, col, Decimal)
     }
 
-    fn json_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&serde_json::Value> {
+    fn json_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&serde_json::Value> {
         debezium_scalar_accessor!(self, row, col, Json)
     }
 
-    fn jsonb_at(&self, row: crate::backend::RowKind, col: ColumnId) -> crate::backend::Presence<&serde_json::Value> {
+    fn jsonb_at(
+        &self,
+        row: crate::backend::RowKind,
+        col: ColumnId,
+    ) -> crate::backend::Presence<&serde_json::Value> {
         debezium_scalar_accessor!(self, row, col, Jsonb)
     }
 }
-
 
 #[allow(clippy::needless_pass_by_value)]
 fn convert_debezium_message_typed<DB: DatabaseLike>(
@@ -303,14 +358,13 @@ fn convert_debezium_message_typed<DB: DatabaseLike>(
 ) -> Result<DebeziumEvent, WalParseError> {
     let kind = parse_debezium_op(&msg.op)?;
 
-    let table_id = resolve_table(&msg.source.schema, &msg.source.table, database)
-        .or_else(|e| {
-            if matches!(e, WalParseError::UnknownTable { .. }) {
-                resolve_table(&msg.source.db, &msg.source.table, database)
-            } else {
-                Err(e)
-            }
-        })?;
+    let table_id = resolve_table(&msg.source.schema, &msg.source.table, database).or_else(|e| {
+        if matches!(e, WalParseError::UnknownTable { .. }) {
+            resolve_table(&msg.source.db, &msg.source.table, database)
+        } else {
+            Err(e)
+        }
+    })?;
     let arity = catalog_helpers::table_arity(database, table_id).ok_or_else(|| {
         WalParseError::UnknownTable {
             schema: msg.source.schema.clone(),
@@ -321,20 +375,27 @@ fn convert_debezium_message_typed<DB: DatabaseLike>(
     let pk_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Truncate {
         alloc::sync::Arc::from(Vec::<ColumnId>::new())
     } else {
-        catalog_helpers::primary_key_columns(database, table_id).map_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()), alloc::sync::Arc::from)
+        catalog_helpers::primary_key_columns(database, table_id).map_or_else(
+            || alloc::sync::Arc::from(Vec::<ColumnId>::new()),
+            alloc::sync::Arc::from,
+        )
     };
 
     let new_image = if matches!(kind, EventKind::Insert | EventKind::Update) {
-        msg.after.as_ref().map(|m| {
-            DebeziumRowImage::from_hashmap(m, table_id, arity, database, "debezium after")
-        }).transpose()?
+        msg.after
+            .as_ref()
+            .map(|m| DebeziumRowImage::from_hashmap(m, table_id, arity, database, "debezium after"))
+            .transpose()?
     } else {
         None
     };
     let old_image = if matches!(kind, EventKind::Update | EventKind::Delete) {
-        msg.before.as_ref().map(|m| {
-            DebeziumRowImage::from_hashmap(m, table_id, arity, database, "debezium before")
-        }).transpose()?
+        msg.before
+            .as_ref()
+            .map(|m| {
+                DebeziumRowImage::from_hashmap(m, table_id, arity, database, "debezium before")
+            })
+            .transpose()?
     } else {
         None
     };
@@ -412,26 +473,14 @@ mod tests {
 
     // -- INSERT tests -------------------------------------------------------
 
-    
-    
     // -- UPDATE tests -------------------------------------------------------
 
-    
-    
     // -- DELETE tests -------------------------------------------------------
 
-    
-    
     // -- Edge cases ----------------------------------------------------------
 
-    
-    
     // -- Error paths ---------------------------------------------------------
 
-    
-    
-    
-    
     // Removed `error_ambiguous_table_does_not_fallback_to_db_name`: this
     // test relied on a `MockCatalog` holding both `orders` and
     // `public.orders` as distinct table entries. `ParserDB` rejects this
@@ -440,20 +489,12 @@ mod tests {
     // reachable from a single `ParserDB`. Coverage for `AmbiguousTable`
     // is provided by `src/wal/mod.rs::test_resolve_table_conflicting_matches_errors`.
 
-    
-    
-    
-    
-    
     // -- Trait checks -------------------------------------------------------
 
-    
-        // -- B8: Debezium message op is skipped ----------------------------------
+    // -- B8: Debezium message op is skipped ----------------------------------
 
-    
     // -- A3: UPDATE PK change must use pre-update PK -------------------------
 
-    
     // -- Phase 7D: DebeziumEvent typed CdcEvent smoke tests -----------------
 
     #[test]

@@ -61,14 +61,8 @@ fn follow_inserted_row_via_execute_returning_id() {
     // same id (same predicate -> same subscription), proving the key threaded
     // through correctly.
     let follow = engine
-        .follow_row(
-            1,
-            "users",
-            vec![Value::Int(i64::try_from(minted).unwrap())],
-        )
+        .follow_row(1, "users", vec![Value::Int(i64::try_from(minted).unwrap())])
         .expect("follow row");
-    let explicit = engine
-        .follow_row(1, "users", vec![Value::Int(1)])
-        .unwrap();
+    let explicit = engine.follow_row(1, "users", vec![Value::Int(1)]).unwrap();
     assert_eq!(follow.subscription_id, explicit.subscription_id);
 }

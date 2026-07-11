@@ -122,8 +122,9 @@ impl AsyncConnector for ConcurrencyProbingConnector {
         &self,
         _sql: &str,
         _auth: &(),
-    ) -> impl Future<Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>>
-           + Send {
+    ) -> impl Future<
+        Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>,
+    > + Send {
         async move { Err(ProbeError("execute_rows not exercised in this test")) }
     }
 }
@@ -162,11 +163,7 @@ const QUERIES: &[(&str, fn() -> Value<Postgres>)] = &[
     ("SELECT MAX(quantity) FROM orders", || Value::Int(1)),
 ];
 
-fn engine_with_first_n_queries(
-    n: usize,
-    cap: usize,
-    delay: Duration,
-) -> (Engine, TableId) {
+fn engine_with_first_n_queries(n: usize, cap: usize, delay: Duration) -> (Engine, TableId) {
     let seeded_values: Vec<Value<Postgres>> =
         (0..n).map(|i| Value::Float(100.0 + i as f64)).collect();
     let connector = ConcurrencyProbingConnector::new(seeded_values, delay);

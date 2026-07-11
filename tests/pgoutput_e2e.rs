@@ -156,7 +156,8 @@ fn pgoutput_stream_handles_truncate() {
         .count();
     assert!(
         truncate_count >= 1,
-        "expected at least one TRUNCATE event, got kinds: {:?}", events.iter().map(|e| e.kind()).collect::<Vec<_>>(),
+        "expected at least one TRUNCATE event, got kinds: {:?}",
+        events.iter().map(|e| e.kind()).collect::<Vec<_>>(),
     );
 
     sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))

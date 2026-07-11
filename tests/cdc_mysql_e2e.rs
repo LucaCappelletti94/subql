@@ -27,7 +27,9 @@ use testcontainers::{GenericImage, ImageExt};
 
 use sql_traits::structs::ParserDB;
 use subql::backend::MySql;
-use subql::{DefaultIds, MaxwellEvent, MaxwellParser, SubscriptionEngine, SubscriptionRequest, WalParser};
+use subql::{
+    DefaultIds, MaxwellEvent, MaxwellParser, SubscriptionEngine, SubscriptionRequest, WalParser,
+};
 
 const MAXWELL_IMAGE: &str = "zendesk/maxwell";
 const MAXWELL_TAG: &str = "v1.44.0";
