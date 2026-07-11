@@ -35,6 +35,7 @@ pub use checkpoint::{Checkpoint, MysqlBinlogPos, NoCheckpoint, OpaqueCheckpoint,
 #[cfg(feature = "std")]
 pub use clock::StdClock;
 pub use clock::{Clock, ClockHandle, ManualClock};
+pub use row_set::{row_set_delta, Row, RowSetDelta};
 pub use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{AlgorithmId, FingerprintError, ParserDB, SchemaFingerprint},
@@ -53,19 +54,15 @@ pub mod clock;
 pub mod compiler;
 #[cfg(feature = "std")]
 pub mod config;
-#[cfg(feature = "diesel-typed")]
-pub mod diesel_api;
-// Benchmark harness still speaks the retired `Cell` / `RowImage` /
-// `WalEvent` types. Phase 10 rewrites it against a typed `CdcEvent`
-// fixture. Excluded from the current lib build.
-#[cfg(any())]
+// Memory profiling harness driven by the `dhat-heap` feature. Not part of
+// the shipping API surface.
+#[cfg(feature = "dhat-heap")]
 pub mod memory_profile_workload;
 #[cfg(feature = "std")]
 pub mod persistence;
 #[cfg(feature = "pg-streaming")]
 pub mod polling;
 pub mod reexec;
-#[cfg(any())]
 pub mod row_set;
 pub mod runtime;
 pub mod wal;

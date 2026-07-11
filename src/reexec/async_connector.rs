@@ -1,4 +1,3 @@
-#![cfg(any())] // Phase 6: retargeted to Value<B>; disabled until diesel async impls migrate.
 
 //! Async parallel of [`Connector`](super::Connector).
 //!
