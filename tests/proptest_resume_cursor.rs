@@ -1,5 +1,3 @@
-#![cfg(any())] // Phase 11: rewrite against E: CdcEvent shape. SubscriptionEngine took <Dialect,...>, now takes <E: CdcEvent,...>. Tracked in docs/refactor-cdc-event-handoff.md.
-
 //! Property-based tests for the per-`(session, subscription)` resume
 //! cursor.
 //!
@@ -29,6 +27,8 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::Postgres;
+use subql::testing::TestEvent;
 use subql::{AdvanceCursorError, DefaultIds, OpaqueCheckpoint, SubscriptionEngine, SubscriptionId};
 
 const MAX_SESSIONS: u64 = 4;
@@ -36,7 +36,7 @@ const MAX_SUBS: u64 = 4;
 const MAX_CHECKPOINT_LEN: usize = 4;
 
 type SessionId = u64;
-type Engine = SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
+type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 type Model = HashMap<(SessionId, SubscriptionId), OpaqueCheckpoint>;
 
 fn fresh_engine() -> Engine {

@@ -1,4 +1,3 @@
-#![cfg(any())] // Phase 11: rewrite against E: CdcEvent shape. SubscriptionEngine took <Dialect,...>, now takes <E: CdcEvent,...>. Tracked in docs/refactor-cdc-event-handoff.md.
 
 //! Property-based tests for the subscription-registry cap and the
 //! `EvictionPolicy` semantics that landed alongside the activity-aware
@@ -32,6 +31,8 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::Postgres;
+use subql::testing::TestEvent;
 use subql::{
     DefaultIds, EvictionPolicy, RegisterError, SubscriptionEngine, SubscriptionId,
     SubscriptionRequest,
@@ -39,7 +40,7 @@ use subql::{
 
 const CATALOG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
 
-type Engine = SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
+type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn fresh_engine(cap: usize, policy: EvictionPolicy) -> Engine {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap();
@@ -122,7 +123,7 @@ proptest! {
                         continue;
                     }
                     let sql = predicate_sql(consumer, tag);
-                    let spec = SubscriptionRequest::new(consumer, sql);
+                    let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(consumer, sql);
                     if let Ok(result) = engine.register(spec) {
                         for evicted in &result.evicted {
                             live.remove(*evicted);
@@ -174,7 +175,7 @@ proptest! {
                 break;
             }
             let sql = predicate_sql(consumer, tag);
-            let spec = SubscriptionRequest::new(consumer, sql);
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(consumer, sql);
             if engine.register(spec).is_ok() {
                 accepted += 1;
             }
@@ -183,7 +184,7 @@ proptest! {
         if let Some((consumer, tag)) = overflow_seed {
             prop_assert_eq!(engine.subscription_count(), cap);
             let sql = predicate_sql(consumer, tag);
-            let spec = SubscriptionRequest::new(consumer, sql);
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(consumer, sql);
             match engine.register(spec) {
                 Err(RegisterError::RegistryFull { cap: reported }) => {
                     prop_assert_eq!(reported, cap, "RegistryFull.cap should match the configured cap");
@@ -224,7 +225,7 @@ proptest! {
                 continue;
             }
             let sql = predicate_sql(consumer, tag);
-            let spec = SubscriptionRequest::new(consumer, sql);
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(consumer, sql);
             let pre_count = engine.subscription_count();
             let expected_victim = if pre_count == cap { live.min_id() } else { None };
 
