@@ -226,8 +226,9 @@ impl PgStreamingCdcSource {
         self.status_updates_sent.load(Ordering::Relaxed)
     }
 
-    /// Cumulative number of `WalEvent`s the inner task has pushed onto
-    /// the consumer-facing channel since `connect`. Symmetric with
+    /// Cumulative number of typed [`PgOutputEvent`]s the inner task has
+    /// pushed onto the consumer-facing channel since `connect`.
+    /// Symmetric with
     /// [`crate::polling::PollingPgCdcSource::events_received`].
     #[must_use]
     pub fn events_received(&self) -> u64 {

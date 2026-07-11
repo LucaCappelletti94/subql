@@ -1,4 +1,4 @@
-//! pgoutput adapter: maps `pg_walstream::LogicalReplicationMessage` to `WalEvent`.
+//! pgoutput adapter: parses `pg_walstream::LogicalReplicationMessage` into typed [`PgOutputEvent`]s.
 
 use alloc::collections::VecDeque;
 use alloc::format;

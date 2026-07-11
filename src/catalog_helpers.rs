@@ -9,7 +9,7 @@
 //! identifier-resolution rules so call sites never reinvent them.
 //!
 //! Functions: [`table_id`], [`column_id`], [`resolve_table`], [`table_arity`],
-//! [`schema_fingerprint`], [`primary_key_columns`], [`column_type`],
+//! [`schema_fingerprint`], [`primary_key_columns`], [`column_scalar_kind`],
 //! [`table_has_rls`].
 
 use alloc::vec::Vec;
@@ -23,7 +23,7 @@ use sql_traits::{
 };
 
 use crate::backend::ScalarKind;
-use crate::types::{ColumnId, ColumnType, TableId};
+use crate::types::{ColumnId, TableId};
 
 /// Resolve a table name (unquoted or quoted form) to subql's compact
 /// [`TableId`].
@@ -207,34 +207,15 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
     })
 }
 
-/// Resolve a column's type into subql's [`ColumnType`] enum.
-///
-/// Maps the canonical sql-traits type token onto subql's coarse type
-/// taxonomy (`Int`/`Float`/`Bool`/`String`/`Unknown`). Returns `None`
-/// when the table or column id is unknown.
-#[must_use]
-pub fn column_type<DB: DatabaseLike>(
-    database: &DB,
-    table_id: TableId,
-    column_id: ColumnId,
-) -> Option<ColumnType> {
-    let table = database.table_by_id(table_id as usize)?;
-    let column = table.column_by_id(column_id as usize, database)?;
-    Some(column_type_from_token(
-        canonical_type_token(column.data_type(database)).as_str(),
-    ))
-}
 
 /// Resolve a column's declared SQL type into a backend-neutral
 /// [`ScalarKind`].
-///
-/// Unlike [`column_type`] (which uses subql's coarse 5-variant
-/// `ColumnType` for aggregate validation), this resolves the full
-/// 13-variant [`ScalarKind`] the compiler tags [`crate::compiler::Instruction::LoadColumn`]
-/// instructions with. Sourced entirely from
-/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token),
-/// which distinguishes every scalar subql cares about (including
-/// `JSONB` vs `JSON` and `TIMESTAMPTZ` vs `TIMESTAMP`).
+/// Distinguishes every scalar subql cares about (`JSONB` vs `JSON`,
+/// `TIMESTAMPTZ` vs `TIMESTAMP`, and so on) via
+/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token).
+/// The compiler tags every
+/// [`crate::compiler::Instruction::LoadColumn`] instruction with the
+/// result.
 ///
 /// Returns `None` when the table / column id is unknown or when the
 /// declared type doesn't match any supported scalar (compiler surfaces
@@ -285,22 +266,6 @@ pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Opti
     Some(table.has_row_level_security(database))
 }
 
-/// Map a canonical sql-traits type token onto subql's [`ColumnType`].
-///
-/// `INT` -> `Int`, `FLOAT`/`DECIMAL` -> `Float` (both numeric for
-/// SUM/AVG validation), `BOOL` -> `Bool`, `STRING` -> `String`. Everything
-/// else (`BYTES`, `DATE`, `TIME`, `TIMESTAMP`, `UUID`, `JSON`, `OTHER:*`)
-/// maps to `Unknown` so SUM/AVG over such columns is permitted without
-/// the engine asserting a numeric type.
-fn column_type_from_token(token: &str) -> ColumnType {
-    match token {
-        "INT" => ColumnType::Int,
-        "FLOAT" | "DECIMAL" => ColumnType::Float,
-        "BOOL" => ColumnType::Bool,
-        "STRING" => ColumnType::String,
-        _ => ColumnType::Unknown,
-    }
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -367,20 +332,6 @@ mod tests {
         assert_eq!(primary_key_columns(&db, tid), Some(vec![]));
     }
 
-    #[test]
-    fn column_type_maps_known_tokens() {
-        let db = ParserDB::parse::<GenericDialect>(
-            "CREATE TABLE t (i INT, f REAL, d DECIMAL, b BOOLEAN, s TEXT, j JSON);",
-        )
-        .expect("DDL parses");
-        let tid = table_id(&db, "t").unwrap();
-        assert_eq!(column_type(&db, tid, 0), Some(ColumnType::Int));
-        assert_eq!(column_type(&db, tid, 1), Some(ColumnType::Float));
-        assert_eq!(column_type(&db, tid, 2), Some(ColumnType::Float)); // DECIMAL -> Float
-        assert_eq!(column_type(&db, tid, 3), Some(ColumnType::Bool));
-        assert_eq!(column_type(&db, tid, 4), Some(ColumnType::String));
-        assert_eq!(column_type(&db, tid, 5), Some(ColumnType::Unknown)); // JSON
-    }
 
     #[test]
     fn schema_fingerprint_round_trips_for_same_schema() {

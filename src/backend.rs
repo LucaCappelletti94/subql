@@ -159,10 +159,10 @@ pub enum ScalarKind {
 /// A scalar value carried in the VM's evaluation stack, or as a literal
 /// operand in the compiled bytecode.
 ///
-/// Mirrors the shape of the retired `Cell` enum but each payload variant is
-/// typed to a specific [`Backend`]'s scalar. `Missing` and `Null` correspond
-/// to the [`Presence`] variants of the same name and let the VM lift a
-/// `Presence<&B::T>` returned by a scalar accessor into a stack value.
+/// One variant per scalar type on the backend, plus `Missing` and `Null`
+/// which correspond to the [`Presence`] variants of the same name and
+/// let the VM lift a `Presence<&B::T>` returned by a scalar accessor
+/// into a stack value.
 ///
 /// The variants own their payload so a `Value` moved onto the VM stack does
 /// not need to keep the event alive. LoadColumn instructions clone the

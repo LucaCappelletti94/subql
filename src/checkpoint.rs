@@ -128,9 +128,9 @@ impl Checkpoint for OpaqueCheckpoint {}
 
 /// Marker for "no checkpoint is meaningful in this context."
 ///
-/// Use for synthetic unit tests that construct [`WalEvent`](crate::WalEvent)s
-/// directly, or for in-memory pipelines that do not need replay / resume
-/// semantics. Production CDC code should choose a real impl
+/// Use for synthetic unit tests that construct events with no source
+/// position, or for in-memory pipelines that do not need replay /
+/// resume semantics. Production CDC code should choose a real impl
 /// ([`PgLsn`], [`MysqlBinlogPos`], or [`OpaqueCheckpoint`]).
 ///
 /// All instances compare equal under `Ord` since there is no position to

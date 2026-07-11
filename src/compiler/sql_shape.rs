@@ -145,15 +145,21 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
     let display = func.to_uppercase();
     let column = resolve_single_column_arg(&display, f, table_id, database)?;
 
-    if let Some(col_type) = catalog_helpers::column_type(database, table_id, column) {
-        match col_type {
-            crate::ColumnType::Bool | crate::ColumnType::String => {
+    if let Some(kind) = catalog_helpers::column_scalar_kind(database, table_id, column) {
+        match kind {
+            // Numeric scalars: SUM/AVG/variance/stddev accept these.
+            crate::backend::ScalarKind::Int
+            | crate::backend::ScalarKind::Float
+            | crate::backend::ScalarKind::Decimal => {}
+            // Everything else is rejected. Give the caller the concrete
+            // kind in the error so the message matches the aggregate's
+            // requirement.
+            other => {
                 return Err(RegisterError::UnsupportedSql(format!(
-                    "{display} requires a numeric column (Int or Float), \
-                     but column {column} has type {col_type:?}"
+                    "{display} requires a numeric column (Int, Float, or Decimal), \
+                     but column {column} has type {other:?}"
                 )));
             }
-            crate::ColumnType::Int | crate::ColumnType::Float | crate::ColumnType::Unknown => {}
         }
     }
 

@@ -69,13 +69,14 @@
 // Phase 6 baseline: `ReExecEngine`, its plan/maintain layers, and the
 // `Connector` trait + diesel-backed connectors compile against
 // `Value<B>`. The auto-resolving wrappers (`AutoResolvingEngine`,
-// `AsyncAutoResolvingEngine`) still spell their bodies in `Cell`/`WalEvent`
-// terms and drive a `SubscriptionEngine<D: Dialect, ...>` shape from before
-// the Phase 5 event-typing sweep. Migrating them to `E: CdcEvent` +
-// `Value<E::Backend>` is scoped to the Phase 6 continuation tracked in
-// `docs/refactor-cdc-event-handoff.md`. Their sources remain on disk with
-// `#![cfg(any())]` at the top so they compile only when explicitly
-// re-enabled.
+// `AsyncAutoResolvingEngine`) still spell their bodies against the
+// retired `Cell` / `WalEvent` types and drive a
+// `SubscriptionEngine<D: Dialect, ...>` shape from before the Phase 5
+// event-typing sweep. Migrating them to `E: CdcEvent` +
+// `Value<E::Backend>` is Phase 10 work tracked in
+// `docs/refactor-cdc-event-handoff.md`. Their sources stay on disk
+// with `#![cfg(any())]` at the top so they compile only when
+// explicitly re-enabled.
 mod engine;
 mod maintain;
 mod plan;

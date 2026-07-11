@@ -1,3 +1,11 @@
+//! Per-PK diffing over row sets. Currently gated: the algorithm still
+//! speaks the retired `Cell` / `RowImage` types and needs a rewrite
+//! against `Value<B>` (or a Backend-typed row view derived from
+//! `CdcEvent`) before it can un-gate. Consumers are the future
+//! total-row re-execution / snapshot-refresh paths, none of which are
+//! wired in the current runtime.
+#![cfg(any())]
+
 //! Per-PK delta between two row sets.
 //!
 //! Pure function: given a previous snapshot and a current snapshot of the
