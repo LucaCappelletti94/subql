@@ -4642,7 +4642,6 @@ dependencies = [
  "futures-util",
  "hashbrown 0.16.1",
  "lz4",
- "pg2sqlite",
  "pg_walstream",
  "postcard",
  "proptest",
