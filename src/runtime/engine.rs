@@ -525,6 +525,30 @@ where
         }
     }
 
+    /// Populate [`Self::column_kinds`] for `table_id` if not already
+    /// cached. The cache is index-aligned with [`crate::ColumnId`] and
+    /// records each column's [`ScalarKind`] so dispatch routes typed
+    /// scalar accessors without re-querying the catalog. Columns whose
+    /// declared type does not map to a supported scalar fall back to
+    /// [`ScalarKind::String`], which routes to the string accessor;
+    /// events with mismatched wire shapes surface as `Presence::Missing`
+    /// and dispatch falls through to the fallback predicate set.
+    fn ensure_column_kinds_cached(&mut self, table_id: TableId) {
+        if self.column_kinds.contains_key(&table_id) {
+            return;
+        }
+        let arity = catalog_helpers::table_arity(&self.database, table_id).unwrap_or(0);
+        let kinds: Vec<ScalarKind> = (0..arity)
+            .map(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                let col: crate::ColumnId = i as crate::ColumnId;
+                catalog_helpers::column_scalar_kind(&self.database, table_id, col)
+                    .unwrap_or(ScalarKind::String)
+            })
+            .collect();
+        self.column_kinds.insert(table_id, Arc::from(kinds));
+    }
+
     /// Configure a maximum number of live subscriptions and the built-in
     /// policy applied when a registration would exceed it.
     ///
@@ -744,6 +768,13 @@ where
         // 3. Auto-assign a new subscription ID.
         let subscription_id = self.next_subscription_id;
         self.next_subscription_id += 1;
+
+        // Populate the per-table `ScalarKind` cache on first sight of this
+        // table. Dispatch relies on this cache to route event scalar
+        // accessors; without it, indexable predicates that need a column
+        // probe (e.g. range predicates on typed columns) are silently
+        // skipped in favor of the fallback set only.
+        self.ensure_column_kinds_cached(table_id);
 
         // 4. Get/create table partition and consumer dictionary
         let partition = self
@@ -1143,6 +1174,11 @@ where
             self.next_subscription_id += 1;
 
             let natural_key = (c.spec.consumer_id, c.hash, c.spec.scope);
+
+            // Populate the per-table `ScalarKind` cache on first sight of
+            // this table (batch register path). Mirrors the single-register
+            // path above.
+            self.ensure_column_kinds_cached(c.table_id);
 
             let partition = self
                 .partitions
