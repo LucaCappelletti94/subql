@@ -2,9 +2,9 @@
 
 **Branch**: `refactor/cdc-event-trait`
 **Baseline commit**: `2a68599 Introduce Backend and CdcEvent trait system for typed CDC events`
-**Status**: Phases 3-6 landed; Phase 7 (parser `impl CdcEvent`) is the next entry point.
-**Current HEAD**: `02047f3 Phase 6: expose DieselBackend and connector types; update reexec/mod.rs notes`.
-**Verified compile / test bar**: `cargo +1.88 check --lib --all-features` clean with zero warnings; `cargo +1.88 test --lib --release` = 399 passing (down from 987 baseline because ~600 legacy tests are gated behind `#![cfg(any())]` until Phase 10). Clippy and rustdoc lints not yet run; those are Phase 11.
+**Status**: Phases 3-10 landed. Phase 11 remaining (clippy + rustdoc lints, integration test rewrites).
+**Current HEAD**: `82c13c4 Gate integration tests referencing retired Cell/WalEvent APIs for Phase 11`.
+**Verified compile / test bar**: `cargo +1.88 check --lib --all-features` clean. `cargo +1.88 test --lib --release --features sqlite-cdc` = 354 passing. `cargo +1.88 test --doc --release --features sqlite-cdc` = 30 passing, 1 ignored. Integration tests under `tests/` are file-gated with `#![cfg(any())]` pending Phase 11 rewrite. Clippy and rustdoc lints not yet run under `-D warnings`.
 
 ## Why the refactor exists
 
