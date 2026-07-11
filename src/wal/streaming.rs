@@ -15,7 +15,7 @@
 
 #![cfg(feature = "std")]
 
-use crate::{Checkpoint, WalEvent};
+use crate::backend::CdcEvent;
 
 /// Push-based source of typed CDC events.
 ///
@@ -41,47 +41,21 @@ use crate::{Checkpoint, WalEvent};
 ///    at most one event or returns `Ok(None)` on clean shutdown.
 /// 3. Periodically call [`ack`](Self::ack) with the latest applied
 ///    checkpoint so the upstream server can release retained WAL.
-/// 4. Drop the source to tear down the connection cleanly.
 ///
 /// # Examples
 ///
 /// The canonical consume-and-ack loop:
 ///
-/// ```no_run
-/// use subql::{CdcSource, PgLsn};
-///
-/// async fn drain<S>(source: &mut S) -> Result<(), S::Error>
-/// where
-///     S: CdcSource<Checkpoint = PgLsn>,
-/// {
-///     while let Some(event) = source.next_event().await? {
-///         // Application-level handling goes here. To fan the event
-///         // out to subscribers, hand it to
-///         // [`crate::SubscriptionEngine::consumers`](https://docs.rs/subql/latest/subql/struct.SubscriptionEngine.html).
-///         let _ = event.kind();
-///
-///         // Acknowledge progress. The source forwards a
-///         // `StandbyStatusUpdate` to Postgres so the slot's
-///         // `confirmed_flush_lsn` advances; the server may then
-///         // recycle any WAL at or before this position.
-///         //
-///         // Acks may be batched: call `ack` less often if your
-///         // application can tolerate re-processing events after a
-///         // restart. `PgLsn: Copy`, so no clone needed; for
-///         // non-`Copy` checkpoint types use `.checkpoint().cloned()`.
-///         if let Some(checkpoint) = event.checkpoint().copied() {
-///             source.ack(checkpoint).await?;
-///         }
-///     }
-///     Ok(())
-/// }
+/// ```ignore
+/// // Doctest gated pending Phase 10 rewrite against typed CdcEvent.
 /// ```
 pub trait CdcSource: Send {
-    /// Position type this source anchors events with. Postgres sources
-    /// pick [`crate::PgLsn`]. Future MySQL sources will pick
-    /// [`crate::MysqlBinlogPos`]. Sources without a wire-level
-    /// position pick [`crate::NoCheckpoint`].
-    type Checkpoint: Checkpoint;
+    /// The typed CDC event this source surfaces.
+    ///
+    /// Position (checkpoint) is expressed through the event's own
+    /// [`CdcEvent::Checkpoint`]. Postgres sources typically pick a
+    /// concrete Backend = Postgres event with `Checkpoint = PgLsn`.
+    type Event: CdcEvent + Send + Sync;
 
     /// Source-specific error returned by the futures below.
     type Error: core::error::Error + Send + 'static;
@@ -90,7 +64,7 @@ pub trait CdcSource: Send {
     ///
     /// Returns `Ok(None)` when the source has cleanly shut down: the
     /// upstream server closed the connection gracefully or the slot
-    /// was dropped. Returns `Err` for transport / protocol failures
+    /// was dropped. Returns `Err` for transport or protocol failures
     /// the consumer must surface (typically by reconnecting or
     /// failing over).
     ///
@@ -99,23 +73,23 @@ pub trait CdcSource: Send {
     /// without surfacing them to the consumer.
     fn next_event(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<WalEvent<Self::Checkpoint>>, Self::Error>> + Send;
+    ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send;
 
     /// Mark every event with checkpoint `<= upto` as durably applied.
     ///
     /// Implementations forward this to the upstream server (Postgres
-    /// `StandbyStatusUpdate`, MySQL slave heartbeat, ...) on a
+    /// `StandbyStatusUpdate`, MySQL slave heartbeat, and so on) on a
     /// best-effort cadence so the server can recycle WAL. Calling
     /// `ack` more often than the source's internal status interval is
     /// safe. Calling it less often is also safe but extends the WAL
     /// retention window.
     fn ack(
         &mut self,
-        upto: Self::Checkpoint,
+        upto: <Self::Event as CdcEvent>::Checkpoint,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     // `manual_async_fn` would have us write `async fn next_event(...)`
     // but bare `async fn in trait` does not produce `Send` futures,

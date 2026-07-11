@@ -6,27 +6,16 @@
 //! message per change.
 
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use serde::Deserialize;
 
-use super::map_cdc::parse_event_kind;
-use super::pg_type::json_value_to_cell_strict;
-use super::row_build::{
-    build_pk_from_typed_arrays_with, build_row_from_named_typed_values_with,
-    build_row_from_typed_arrays_with,
-};
-use super::{
-    build_event_from_rows, build_pk_from_resolved, pk_from_catalog_or_empty, resolve_table,
-    strict_pk_column_ids_from_names, truncate_event, WalParseError, WalParser,
-};
-use crate::backend::{CdcEvent, Postgres, Presence, RowKind, Value};
-use crate::{catalog_helpers, Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
-use spin::Once;
-
 use super::pg_type::json_value_to_pg_value;
+use super::{parse_event_kind, resolve_table, WalParseError, WalParser};
+use crate::backend::{CdcEvent, Postgres, Presence, RowKind, Value};
+use crate::{catalog_helpers, ColumnId, EventKind, TableId};
 use sql_traits::prelude::DatabaseLike;
+use spin::Once;
 
 // ============================================================================
 // Serde structs: v1
@@ -115,26 +104,23 @@ pub struct Wal2JsonV2Parser;
 
 impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV1Parser {
     type Checkpoint = crate::NoCheckpoint;
+    type Event = Wal2JsonV1Event;
 
     fn parse_wal_message(
         &self,
         data: &[u8],
         database: &DB,
-    ) -> Result<Vec<WalEvent>, WalParseError> {
-        let msg: Option<Wal2JsonV1Message> = super::parse_json_message_or_tombstone(data)?;
-        let Some(msg) = msg else {
-            // wal2json topics may emit tombstone messages ("null") for compaction.
+    ) -> Result<Vec<Self::Event>, WalParseError> {
+        let Some(msg): Option<Wal2JsonV1Message> = super::parse_json_message_or_tombstone(data)?
+        else {
             return Ok(Vec::new());
         };
-
         let mut events = Vec::with_capacity(msg.change.len());
         for change in &msg.change {
-            if let Some(event) = super::skip_unknown_event_kind(
-                convert_v1_change(change, database),
-                "wal2json v1",
-                "kind",
-            )? {
-                events.push(event);
+            match convert_v1_change_typed(change, database) {
+                Ok(event) => events.push(event),
+                Err(WalParseError::UnknownEventKind(_)) => {}
+                Err(err) => return Err(err),
             }
         }
         Ok(events)
@@ -143,23 +129,26 @@ impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV1Parser {
 
 impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV2Parser {
     type Checkpoint = crate::PgLsn;
+    type Event = Wal2JsonV2Event;
 
     fn parse_wal_message(
         &self,
         data: &[u8],
         database: &DB,
-    ) -> Result<Vec<WalEvent<Self::Checkpoint>>, WalParseError> {
-        super::parse_single_json_event::<Wal2JsonV2Message, _, crate::PgLsn>(data, |msg| {
-            // Skip non-row transactional metadata messages.
-            if matches!(msg.action.as_str(), "B" | "C" | "M") {
-                return Ok(None);
-            }
-            super::skip_unknown_event_kind(
-                convert_v2_message(msg, database),
-                "wal2json v2",
-                "action",
-            )
-        })
+    ) -> Result<Vec<Self::Event>, WalParseError> {
+        let Some(msg): Option<Wal2JsonV2Message> = super::parse_json_message_or_tombstone(data)?
+        else {
+            return Ok(Vec::new());
+        };
+        // Skip non-row transactional metadata messages.
+        if matches!(msg.action.as_str(), "B" | "C" | "M") {
+            return Ok(Vec::new());
+        }
+        match convert_v2_message_typed(msg, database) {
+            Ok(event) => Ok(alloc::vec![event]),
+            Err(WalParseError::UnknownEventKind(_)) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -177,258 +166,12 @@ fn parse_v2_kind(action: &str) -> Result<EventKind, WalParseError> {
     parse_event_kind(action, &["I"], &["U"], &["D"], &["T"])
 }
 
-/// Build a [`RowImage`] from parallel name/type/value arrays.
-///
-/// Returns `(row_image, Vec<(ColumnId, Cell)>)`. The vec is used for PK
-/// extraction.
-fn build_row_from_arrays<DB: DatabaseLike>(
-    names: &[String],
-    types: &[String],
-    values: &[serde_json::Value],
-    table_id: TableId,
-    database: &DB,
-) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    build_row_from_typed_arrays_with(
-        names,
-        types,
-        values,
-        table_id,
-        database,
-        "column",
-        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.column.{name}")),
-    )
-}
-
-/// Build a [`RowImage`] from v2 column structs.
-fn build_row_from_v2_columns<DB: DatabaseLike>(
-    columns: &[Wal2JsonV2Column],
-    table_id: TableId,
-    database: &DB,
-) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    let typed_columns: Vec<(&str, &str, &serde_json::Value)> = columns
-        .iter()
-        .map(|col| (col.name.as_str(), col.type_name.as_str(), &col.value))
-        .collect();
-    build_row_from_named_typed_values_with(
-        &typed_columns,
-        table_id,
-        database,
-        "v2 columns",
-        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.column.{name}")),
-    )
-}
-
-/// Build a [`PrimaryKey`] from the old-keys section (names resolved through database).
-fn build_pk_from_key_arrays<DB: DatabaseLike>(
-    names: &[String],
-    types: &[String],
-    values: &[serde_json::Value],
-    table_id: TableId,
-    database: &DB,
-) -> Result<PrimaryKey, WalParseError> {
-    build_pk_from_typed_arrays_with(
-        names,
-        types,
-        values,
-        table_id,
-        database,
-        "oldkeys",
-        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.oldkeys.{name}")),
-    )
-}
-
-// ============================================================================
-// v1 conversion
-// ============================================================================
-
-fn convert_v1_change<DB: DatabaseLike>(
-    change: &Wal2JsonV1Change,
-    database: &DB,
-) -> Result<WalEvent, WalParseError> {
-    let kind = parse_v1_kind(&change.kind)?;
-    let table_id = resolve_table(&change.schema, &change.table, database)?;
-
-    if kind == EventKind::Truncate {
-        return truncate_event(table_id, None);
-    }
-
-    if matches!(kind, EventKind::Insert | EventKind::Update)
-        && change.columnnames.is_empty()
-        && change.columntypes.is_empty()
-        && change.columnvalues.is_empty()
-    {
-        return Err(WalParseError::MissingField(
-            "columnnames/columntypes/columnvalues".to_string(),
-        ));
-    }
-
-    if kind == EventKind::Delete && change.oldkeys.is_none() {
-        return Err(WalParseError::MissingField("oldkeys".to_string()));
-    }
-
-    let (new_row, new_resolved) = if kind == EventKind::Insert || kind == EventKind::Update {
-        let (row, resolved) = build_row_from_arrays(
-            &change.columnnames,
-            &change.columntypes,
-            &change.columnvalues,
-            table_id,
-            database,
-        )?;
-        (Some(row), resolved)
-    } else {
-        (None, Vec::new())
-    };
-
-    let (old_row, pk) = if let Some(ref oldkeys) = change.oldkeys {
-        // Build old row from oldkeys (sparse: only key columns)
-        let (row, _) = build_row_from_arrays(
-            &oldkeys.keynames,
-            &oldkeys.keytypes,
-            &oldkeys.keyvalues,
-            table_id,
-            database,
-        )?;
-
-        let pk = build_pk_from_key_arrays(
-            &oldkeys.keynames,
-            &oldkeys.keytypes,
-            &oldkeys.keyvalues,
-            table_id,
-            database,
-        )?;
-
-        (Some(row), pk)
-    } else {
-        // INSERT without oldkeys: extract PK from new row using database metadata
-        let pk = pk_from_catalog_or_empty(&new_resolved, table_id, database)?;
-        (None, pk)
-    };
-    let old_row_complete = super::old_row_is_complete(old_row.as_ref());
-    build_event_from_rows(
-        kind,
-        table_id,
-        pk,
-        old_row,
-        new_row,
-        old_row_complete,
-        "columnnames/columntypes/columnvalues",
-        "oldkeys",
-        None,
-    )
-}
-
-// ============================================================================
-// v2 conversion
-// ============================================================================
-
-fn convert_v2_message<DB: DatabaseLike>(
-    msg: &Wal2JsonV2Message,
-    database: &DB,
-) -> Result<WalEvent<crate::PgLsn>, WalParseError> {
-    let kind = parse_v2_kind(&msg.action)?;
-
-    let schema = msg.schema.as_deref().unwrap_or("");
-    let table = msg.table.as_deref().ok_or_else(|| {
-        WalParseError::JsonError("data message (I/U/D) missing 'table' field".to_string())
-    })?;
-    let table_id = resolve_table(schema, table, database)?;
-
-    // Parse PG LSN if wal2json was invoked with include-lsn=true. Malformed
-    // strings are dropped silently (the parser does not gate event emission
-    // on a present checkpoint - oplog / replay can fall back to None).
-    let checkpoint = msg.lsn.as_deref().and_then(crate::PgLsn::parse);
-
-    let (new_row, new_resolved) = match kind {
-        EventKind::Insert | EventKind::Update => {
-            let columns = msg
-                .columns
-                .as_ref()
-                .filter(|columns| !columns.is_empty())
-                .ok_or_else(|| WalParseError::MissingField("columns".to_string()))?;
-            let (row, resolved) = build_row_from_v2_columns(columns, table_id, database)?;
-            (Some(row), resolved)
-        }
-        EventKind::Delete | EventKind::Truncate => (None, Vec::new()),
-    };
-
-    let (old_row, identity_resolved) = match kind {
-        EventKind::Delete => {
-            let identity = msg
-                .identity
-                .as_ref()
-                .filter(|identity| !identity.is_empty())
-                .ok_or_else(|| WalParseError::MissingField("identity".to_string()))?;
-            let (row, resolved) = build_row_from_v2_columns(identity, table_id, database)?;
-            (Some(row), resolved)
-        }
-        EventKind::Update => {
-            if let Some(identity) = msg
-                .identity
-                .as_ref()
-                .filter(|identity| !identity.is_empty())
-            {
-                let (row, resolved) = build_row_from_v2_columns(identity, table_id, database)?;
-                (Some(row), resolved)
-            } else {
-                (None, Vec::new())
-            }
-        }
-        EventKind::Insert | EventKind::Truncate => (None, Vec::new()),
-    };
-    let old_row_complete = super::old_row_is_complete(old_row.as_ref());
-
-    // Build PK: prefer identity columns, then pk metadata, then database.
-    // The three-way branching is clearer as if-let chains than map_or_else.
-    #[allow(clippy::option_if_let_else)]
-    let pk = if kind == EventKind::Truncate {
-        PrimaryKey::empty()
-    } else if !identity_resolved.is_empty() {
-        // Use identity columns as PK source (UPDATE/DELETE)
-        if let Some(ref pk_cols) = msg.pk {
-            let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
-            let pk_col_ids = strict_pk_column_ids_from_names(
-                table_id,
-                &pk_names,
-                &identity_resolved,
-                database,
-                "pk",
-            )?;
-            build_pk_from_resolved(&identity_resolved, &pk_col_ids)
-        } else {
-            // No pk metadata: use all identity columns as PK
-            let cols: Vec<ColumnId> = identity_resolved.iter().map(|(c, _)| *c).collect();
-            let vals: Vec<Cell> = identity_resolved.iter().map(|(_, v)| v.clone()).collect();
-            PrimaryKey::new(Arc::from(cols), Arc::from(vals))
-                .expect("identity columns and values are built in lockstep")
-        }
-    } else if let Some(ref pk_cols) = msg.pk {
-        // INSERT: extract PK from new row using pk metadata
-        let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
-        let pk_col_ids =
-            strict_pk_column_ids_from_names(table_id, &pk_names, &new_resolved, database, "pk")?;
-        build_pk_from_resolved(&new_resolved, &pk_col_ids)
-    } else {
-        pk_from_catalog_or_empty(&new_resolved, table_id, database)?
-    };
-
-    build_event_from_rows(
-        kind,
-        table_id,
-        pk,
-        old_row,
-        new_row,
-        old_row_complete,
-        "columns",
-        "identity",
-        checkpoint,
-    )
-}
 
 // ============================================================================
 // Wal2JsonV2Event: typed [`CdcEvent`] output of the v2 parser
 // ============================================================================
 
-/// Typed CDC event surfaced by [`Wal2JsonV2Parser::parse_wal_message_typed`].
+/// Typed CDC event surfaced by [`Wal2JsonV2Parser::parse_wal_message`].
 ///
 /// Owns the wal2json v2 wire payload for one row change plus lazily
 /// populated caches of decoded [`Value<Postgres>`] cells. Scalar accessors
@@ -677,33 +420,6 @@ impl CdcEvent for Wal2JsonV2Event {
     }
 }
 
-impl Wal2JsonV2Parser {
-    /// Typed variant of [`WalParser::parse_wal_message`] returning
-    /// [`Wal2JsonV2Event`] instances that implement
-    /// [`crate::backend::CdcEvent`] directly.
-    ///
-    /// Retained alongside the legacy [`WalEvent`]-producing trait method
-    /// during Phase 7. The trait swap happens in Phase 7F.
-    pub fn parse_wal_message_typed<DB: DatabaseLike>(
-        &self,
-        data: &[u8],
-        database: &DB,
-    ) -> Result<Vec<Wal2JsonV2Event>, WalParseError> {
-        let Some(msg): Option<Wal2JsonV2Message> = super::parse_json_message_or_tombstone(data)?
-        else {
-            return Ok(Vec::new());
-        };
-        // Skip non-row transactional metadata messages.
-        if matches!(msg.action.as_str(), "B" | "C" | "M") {
-            return Ok(Vec::new());
-        }
-        match convert_v2_message_typed(msg, database) {
-            Ok(event) => Ok(alloc::vec![event]),
-            Err(WalParseError::UnknownEventKind(_)) => Ok(Vec::new()),
-            Err(err) => Err(err),
-        }
-    }
-}
 
 fn convert_v2_message_typed<DB: DatabaseLike>(
     msg: Wal2JsonV2Message,
@@ -849,7 +565,7 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
 // Wal2JsonV1Event: typed [`CdcEvent`] output of the v1 parser
 // ============================================================================
 
-/// Typed CDC event surfaced by [`Wal2JsonV1Parser::parse_wal_message_typed`].
+/// Typed CDC event surfaced by [`Wal2JsonV1Parser::parse_wal_message`].
 ///
 /// Owns the wal2json v1 wire payload for one row change plus lazily
 /// populated caches of decoded [`Value<Postgres>`] cells. Scalar accessors
@@ -1087,28 +803,6 @@ impl CdcEvent for Wal2JsonV1Event {
     }
 }
 
-impl Wal2JsonV1Parser {
-    pub fn parse_wal_message_typed<DB: DatabaseLike>(
-        &self,
-        data: &[u8],
-        database: &DB,
-    ) -> Result<Vec<Wal2JsonV1Event>, WalParseError> {
-        let Some(msg): Option<Wal2JsonV1Message> =
-            super::parse_json_message_or_tombstone(data)?
-        else {
-            return Ok(Vec::new());
-        };
-        let mut events = Vec::with_capacity(msg.change.len());
-        for change in &msg.change {
-            match convert_v1_change_typed(change, database) {
-                Ok(event) => events.push(event),
-                Err(WalParseError::UnknownEventKind(_)) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(events)
-    }
-}
 
 fn convert_v1_change_typed<DB: DatabaseLike>(
     change: &Wal2JsonV1Change,
@@ -2497,7 +2191,7 @@ mod tests {
         }"#;
 
         let events = Wal2JsonV2Parser
-            .parse_wal_message_typed(msg.as_bytes(), engine.database())
+            .parse_wal_message(msg.as_bytes(), engine.database())
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2552,7 +2246,7 @@ mod tests {
             "pk": [{"name": "id", "type": "integer"}]
         }"#;
         let events = Wal2JsonV2Parser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2589,7 +2283,7 @@ mod tests {
             "pk": [{"name": "id", "type": "integer"}]
         }"#;
         let events = Wal2JsonV2Parser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
         // amount is explicitly SQL NULL on the wire.
@@ -2619,7 +2313,7 @@ mod tests {
             "pk": [{"name": "id", "type": "integer"}]
         }"#;
         let events = Wal2JsonV2Parser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         assert!(events[0].checkpoint().is_some());
     }
@@ -2630,7 +2324,7 @@ mod tests {
         for tag in ["B", "C", "M"] {
             let msg = format!(r#"{{"action": "{tag}"}}"#);
             let events = Wal2JsonV2Parser
-                .parse_wal_message_typed(msg.as_bytes(), &database)
+                .parse_wal_message(msg.as_bytes(), &database)
                 .expect("parse succeeds");
             assert!(
                 events.is_empty(),
@@ -2643,7 +2337,7 @@ mod tests {
     fn typed_v2_tombstone_is_empty() {
         let database = orders_catalog();
         let events = Wal2JsonV2Parser
-            .parse_wal_message_typed(b"null", &database)
+            .parse_wal_message(b"null", &database)
             .expect("tombstone");
         assert!(events.is_empty());
     }
@@ -2686,7 +2380,7 @@ mod tests {
         }"#;
 
         let events = Wal2JsonV1Parser
-            .parse_wal_message_typed(msg.as_bytes(), engine.database())
+            .parse_wal_message(msg.as_bytes(), engine.database())
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2739,7 +2433,7 @@ mod tests {
             }]
         }"#;
         let events = Wal2JsonV1Parser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
         assert_eq!(
@@ -2763,7 +2457,7 @@ mod tests {
             }]
         }"#;
         let events = Wal2JsonV1Parser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
         assert_eq!(
@@ -2787,7 +2481,7 @@ mod tests {
             }]
         }"#;
         let events = Wal2JsonV1Parser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
         assert_eq!(
@@ -2804,7 +2498,7 @@ mod tests {
     fn typed_v1_tombstone_is_empty() {
         let database = orders_catalog();
         let events = Wal2JsonV1Parser
-            .parse_wal_message_typed(b"null", &database)
+            .parse_wal_message(b"null", &database)
             .expect("tombstone");
         assert!(events.is_empty());
     }
@@ -2826,7 +2520,7 @@ mod tests {
             }]
         }"#;
         let events = Wal2JsonV1Parser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2858,7 +2552,7 @@ mod tests {
             }]
         }"#;
         let events = Wal2JsonV1Parser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];

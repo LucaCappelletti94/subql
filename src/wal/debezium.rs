@@ -13,11 +13,8 @@ use hashbrown::HashMap;
 
 use serde::Deserialize;
 
-use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig, MapCdcEnvelope};
-use super::{resolve_table, WalParseError, WalParser};
-#[cfg(test)]
-use crate::Cell;
-use crate::{ColumnId, EventKind, TableId, WalEvent};
+use super::{parse_event_kind, resolve_table, WalParseError, WalParser};
+use crate::{ColumnId, EventKind, TableId};
 use sql_traits::prelude::DatabaseLike;
 
 // ============================================================================
@@ -54,13 +51,25 @@ pub struct DebeziumParser;
 
 impl<DB: DatabaseLike> WalParser<DB> for DebeziumParser {
     type Checkpoint = crate::NoCheckpoint;
+    type Event = DebeziumEvent;
 
     fn parse_wal_message(
         &self,
         data: &[u8],
         database: &DB,
-    ) -> Result<Vec<WalEvent>, WalParseError> {
-        parse_map_cdc_json_message::<DebeziumEnvelope, DB>(data, database)
+    ) -> Result<Vec<Self::Event>, WalParseError> {
+        let Some(msg): Option<DebeziumEnvelope> = super::parse_json_message_or_tombstone(data)?
+        else {
+            return Ok(Vec::new());
+        };
+        if msg.op == "m" {
+            return Ok(Vec::new());
+        }
+        match convert_debezium_message_typed(msg, database) {
+            Ok(event) => Ok(alloc::vec![event]),
+            Err(WalParseError::UnknownEventKind(_)) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -72,56 +81,6 @@ fn parse_debezium_op(op: &str) -> Result<EventKind, WalParseError> {
     parse_event_kind(op, &["c", "r"], &["u"], &["d"], &["t"])
 }
 
-impl MapCdcEnvelope for DebeziumEnvelope {
-    const PARSER_NAME: &'static str = "Debezium";
-    const TOKEN_NAME: &'static str = "op";
-
-    fn event_token(&self) -> &str {
-        &self.op
-    }
-
-    fn parse_kind(token: &str) -> Result<EventKind, WalParseError> {
-        parse_debezium_op(token)
-    }
-
-    fn resolve_table_id<DB: DatabaseLike>(&self, database: &DB) -> Result<TableId, WalParseError> {
-        // Try schema.table first, then fall back to db.table only when table is unknown.
-        match resolve_table(&self.source.schema, &self.source.table, database) {
-            Ok(table_id) => Ok(table_id),
-            Err(WalParseError::UnknownTable { .. }) => {
-                resolve_table(&self.source.db, &self.source.table, database)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn map_config(&self, _kind: EventKind) -> MapCdcConfig<'_> {
-        MapCdcConfig {
-            required_new_field: "after",
-            required_old_field: "before",
-            new_field_prefix: "debezium.after",
-            old_field_prefix: "debezium.before",
-            pk_col_names: None,
-            // Debezium's `before` reflects replica identity, which may be sparse due to
-            // non-FULL replica identity settings.  We only compute changed_columns when
-            // the old row is complete to avoid false negatives.
-            old_is_changed_columns_only: false,
-        }
-    }
-
-    fn new_map(&self, _kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
-        self.after.as_ref()
-    }
-
-    fn old_map(&self, _kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
-        self.before.as_ref()
-    }
-
-    fn skip_message(&self) -> bool {
-        // Skip message/heartbeat ops: they contain no row data.
-        self.op == "m"
-    }
-}
 
 // ============================================================================
 // DebeziumEvent: typed [`CdcEvent`] output of the typed parser
@@ -131,7 +90,7 @@ use crate::backend::{Postgres, Value};
 use crate::catalog_helpers;
 use spin::Once;
 
-/// Typed CDC event surfaced by [`DebeziumParser::parse_wal_message_typed`].
+/// Typed CDC event surfaced by [`DebeziumParser::parse_wal_message`].
 pub struct DebeziumEvent {
     kind: EventKind,
     table_id: TableId,
@@ -337,26 +296,6 @@ impl crate::backend::CdcEvent for DebeziumEvent {
     }
 }
 
-impl DebeziumParser {
-    pub fn parse_wal_message_typed<DB: DatabaseLike>(
-        &self,
-        data: &[u8],
-        database: &DB,
-    ) -> Result<Vec<DebeziumEvent>, WalParseError> {
-        let Some(msg): Option<DebeziumEnvelope> = super::parse_json_message_or_tombstone(data)?
-        else {
-            return Ok(Vec::new());
-        };
-        if msg.op == "m" {
-            return Ok(Vec::new());
-        }
-        match convert_debezium_message_typed(msg, database) {
-            Ok(event) => Ok(alloc::vec![event]),
-            Err(WalParseError::UnknownEventKind(_)) => Ok(Vec::new()),
-            Err(err) => Err(err),
-        }
-    }
-}
 
 fn convert_debezium_message_typed<DB: DatabaseLike>(
     msg: DebeziumEnvelope,
@@ -943,7 +882,7 @@ mod tests {
         }"#;
 
         let events = DebeziumParser
-            .parse_wal_message_typed(msg.as_bytes(), engine.database())
+            .parse_wal_message(msg.as_bytes(), engine.database())
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -996,7 +935,7 @@ mod tests {
             "ts_ms": 1234567890
         }"#;
         let events = DebeziumParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
         assert_eq!(
@@ -1020,7 +959,7 @@ mod tests {
             "ts_ms": 1234567890
         }"#;
         let events = DebeziumParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
         assert_eq!(
@@ -1041,7 +980,7 @@ mod tests {
     fn typed_debezium_tombstone_is_empty() {
         let database = orders_catalog();
         let events = DebeziumParser
-            .parse_wal_message_typed(b"null", &database)
+            .parse_wal_message(b"null", &database)
             .expect("tombstone");
         assert!(events.is_empty());
     }
@@ -1051,7 +990,7 @@ mod tests {
         let database = orders_catalog();
         let msg = r#"{"before":null,"after":null,"source":{"db":"testdb","schema":"public","table":"orders"},"op":"m","ts_ms":1000}"#;
         let events = DebeziumParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("message op should be skipped");
         assert!(events.is_empty(), "Message ops should produce no output");
     }
@@ -1067,7 +1006,7 @@ mod tests {
             "ts_ms": 1234567890
         }"#;
         let events = DebeziumParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1098,7 +1037,7 @@ mod tests {
             "ts_ms": 1234567890
         }"#;
         let events = DebeziumParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
         assert_eq!(event.kind(), EventKind::Update);
@@ -1123,7 +1062,7 @@ mod tests {
             "ts_ms": 1234567890
         }"#;
         let events = DebeziumParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];

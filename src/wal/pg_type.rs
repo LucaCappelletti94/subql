@@ -1,14 +1,12 @@
-//! PostgreSQL type string to [`Cell`] and [`Value<Postgres>`] conversion.
+//! PostgreSQL wire encoding to typed [`Value<Postgres>`] and
+//! [`Value<MySql>`] conversion.
 //!
-//! Shared by all JSON-based WAL parsers (wal2json, Maxwell, Debezium).
-//! The `_to_cell_strict` family produces the legacy [`Cell`] type; the
-//! `_to_pg_value` family produces the typed [`Value<Postgres>`] used by
-//! the Phase 7 [`crate::backend::CdcEvent`] parser events. The Cell path
-//! is retired in Phase 7F once every parser has migrated.
+//! Shared by all JSON-based WAL parsers (wal2json, Maxwell, Debezium)
+//! and the pgoutput binary wire path. Every consumer is now Phase-7
+//! typed; the legacy Cell-based decoders were retired in Phase 7F.
 
 use alloc::borrow::Cow;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use core::str::FromStr;
 
 use bigdecimal::BigDecimal;
@@ -17,219 +15,7 @@ use uuid::Uuid;
 
 use super::WalParseError;
 use crate::backend::{MySql, Postgres, Value};
-use crate::Cell;
 
-/// Test-only lossy converter retained for unit tests.
-#[cfg(test)]
-#[must_use]
-fn json_value_to_cell(value: &serde_json::Value, pg_type: &str) -> Cell {
-    json_value_to_cell_strict(value, pg_type, "value").unwrap_or_else(|_| string_cell(value))
-}
-
-/// Strict variant of [`json_value_to_cell`] that reports lossy numeric
-/// conversions as parse errors.
-pub(super) fn json_value_to_cell_strict(
-    value: &serde_json::Value,
-    pg_type: &str,
-    field: &str,
-) -> Result<Cell, WalParseError> {
-    if value.is_null() {
-        return Ok(Cell::Null);
-    }
-
-    // Detect array types (PostgreSQL prefix '_'), not yet supported
-    let ty = pg_type.to_ascii_lowercase();
-    if ty.starts_with('_') {
-        return Err(WalParseError::MalformedPayload(format!(
-            "array columns not yet supported: '{pg_type}'"
-        )));
-    }
-    let ty = ty.as_str();
-
-    match ty {
-        // Integer types
-        "integer" | "int" | "int2" | "int4" | "int8" | "smallint" | "bigint" | "serial"
-        | "bigserial" | "smallserial" | "oid" => int_cell_strict(value, field),
-
-        // Floating-point / numeric types
-        "real" | "float4" | "double precision" | "float8" | "numeric" | "decimal" | "money" => {
-            float_cell_strict(value, field)
-        }
-
-        // Boolean
-        "boolean" | "bool" => bool_cell_strict(value, field),
-
-        // Everything else -> String (including known text-like types)
-        _ => Ok(string_cell(value)),
-    }
-}
-
-/// Parse an integer cell. Handles JSON number and string encodings.
-fn int_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalParseError> {
-    match value {
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                return Ok(Cell::Int(i));
-            }
-
-            if let Some(u) = n.as_u64() {
-                let i = i64::try_from(u).map_err(|_| WalParseError::NumericOverflow {
-                    field: field.to_string(),
-                    value: u.to_string(),
-                    target: "i64",
-                })?;
-                return Ok(Cell::Int(i));
-            }
-
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            if let Some(f) = n.as_f64() {
-                if f.fract() != 0.0 {
-                    return Err(WalParseError::MalformedPayload(format!(
-                        "fractional numeric value in integer field '{field}': {n}"
-                    )));
-                }
-                if f > i64::MAX as f64 || f < i64::MIN as f64 {
-                    return Err(WalParseError::NumericOverflow {
-                        field: field.to_string(),
-                        value: n.to_string(),
-                        target: "i64",
-                    });
-                }
-                return Ok(Cell::Int(f as i64));
-            }
-
-            Ok(Cell::Null)
-        }
-        serde_json::Value::String(s) => Ok(s.parse::<i64>().map(Cell::Int).map_err(|_| {
-            WalParseError::MalformedPayload(format!(
-                "invalid integer value in field '{field}': {s}"
-            ))
-        })?),
-        _ => Err(WalParseError::MalformedPayload(format!(
-            "invalid integer value in field '{field}': {value}"
-        ))),
-    }
-}
-
-fn float_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalParseError> {
-    match value {
-        serde_json::Value::Number(n) => n.as_f64().map(Cell::Float).ok_or_else(|| {
-            WalParseError::MalformedPayload(format!(
-                "invalid floating value in field '{field}': {n}"
-            ))
-        }),
-        serde_json::Value::String(s) => s.parse::<f64>().map(Cell::Float).map_err(|_| {
-            WalParseError::MalformedPayload(format!(
-                "invalid floating value in field '{field}': {s}"
-            ))
-        }),
-        _ => Err(WalParseError::MalformedPayload(format!(
-            "invalid floating value in field '{field}': {value}"
-        ))),
-    }
-}
-
-/// Parse a boolean cell strictly. Accepts JSON booleans and common textual
-/// encodings. Rejects all other values.
-fn bool_cell_strict(value: &serde_json::Value, field: &str) -> Result<Cell, WalParseError> {
-    match value {
-        serde_json::Value::Bool(b) => Ok(Cell::Bool(*b)),
-        serde_json::Value::String(s) => match s.as_str() {
-            "t" | "true" | "TRUE" | "True" | "1" => Ok(Cell::Bool(true)),
-            "f" | "false" | "FALSE" | "False" | "0" => Ok(Cell::Bool(false)),
-            _ => Err(WalParseError::MalformedPayload(format!(
-                "invalid boolean value in field '{field}': {s}"
-            ))),
-        },
-        _ => Err(WalParseError::MalformedPayload(format!(
-            "invalid boolean value in field '{field}': {value}"
-        ))),
-    }
-}
-
-/// Coerce any JSON value to a String cell.
-fn string_cell(value: &serde_json::Value) -> Cell {
-    match value {
-        serde_json::Value::String(s) => Cell::String(Arc::from(s.as_str())),
-        serde_json::Value::Null => Cell::Null,
-        other => Cell::String(Arc::from(other.to_string().as_str())),
-    }
-}
-
-/// Test-only lossy converter retained for unit tests.
-#[cfg(test)]
-#[must_use]
-fn infer_cell_from_json(value: &serde_json::Value) -> Cell {
-    infer_cell_from_json_strict(value, "value").unwrap_or_else(|_| string_cell(value))
-}
-
-/// Strict variant of [`infer_cell_from_json`] that errors on unsigned values
-/// that do not fit into i64.
-pub(super) fn infer_cell_from_json_strict(
-    value: &serde_json::Value,
-    field: &str,
-) -> Result<Cell, WalParseError> {
-    match value {
-        serde_json::Value::Null => Ok(Cell::Null),
-        serde_json::Value::Bool(b) => Ok(Cell::Bool(*b)),
-        #[allow(clippy::option_if_let_else)]
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Cell::Int(i))
-            } else if let Some(u) = n.as_u64() {
-                let i = i64::try_from(u).map_err(|_| WalParseError::NumericOverflow {
-                    field: field.to_string(),
-                    value: u.to_string(),
-                    target: "i64",
-                })?;
-                Ok(Cell::Int(i))
-            } else {
-                Ok(n.as_f64().map_or(Cell::Null, Cell::Float))
-            }
-        }
-        serde_json::Value::String(s) => Ok(Cell::String(Arc::from(s.as_str()))),
-        // Arrays and objects: JSON-serialize as fallback
-        other => Ok(Cell::String(Arc::from(other.to_string().as_str()))),
-    }
-}
-
-/// Text-format converter for pgoutput parsing.
-///
-/// Returns [`WalParseError::MalformedPayload`] when typed scalar values are not
-/// valid textual encodings for the declared PostgreSQL type OID.
-pub(super) fn text_to_cell_strict(text: &str, type_oid: u32) -> Result<Cell, WalParseError> {
-    #[allow(clippy::match_same_arms)]
-    match type_oid {
-        // bool
-        16 => match text {
-            "t" => Ok(Cell::Bool(true)),
-            "f" => Ok(Cell::Bool(false)),
-            _ => Err(WalParseError::MalformedPayload(format!(
-                "invalid boolean text value for type oid {type_oid}: {text}"
-            ))),
-        },
-        // int8, int2, int4, oid
-        20 | 21 | 23 | 26 => text.parse::<i64>().map(Cell::Int).map_err(|_| {
-            WalParseError::MalformedPayload(format!(
-                "invalid integer text value for type oid {type_oid}: {text}"
-            ))
-        }),
-        // float4, float8, numeric
-        700 | 701 | 1700 => text.parse::<f64>().map(Cell::Float).map_err(|_| {
-            WalParseError::MalformedPayload(format!(
-                "invalid floating text value for type oid {type_oid}: {text}"
-            ))
-        }),
-        // text, bpchar, varchar, name, uuid
-        25 | 1042 | 1043 | 19 | 2950 => Ok(Cell::String(Arc::from(text))),
-        // date, time, timestamp, timestamptz, timetz, interval
-        1082 | 1083 | 1114 | 1184 | 1266 | 1186 => Ok(Cell::String(Arc::from(text))),
-        // json, jsonb
-        114 | 3802 => Ok(Cell::String(Arc::from(text))),
-        // everything else: String fallback
-        _ => Ok(Cell::String(Arc::from(text))),
-    }
-}
 
 // ============================================================================
 // Typed decoders producing `Value<Postgres>` (Phase 7)
@@ -669,7 +455,7 @@ fn parse_pg_time(s: &str) -> Option<NaiveTime> {
         .ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     use super::*;
     use serde_json::json;

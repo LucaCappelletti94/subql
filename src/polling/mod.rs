@@ -47,7 +47,7 @@ use pg_walstream::PgReplicationConnection;
 use sql_traits::prelude::DatabaseLike;
 
 use crate::wal::PgOutputParser;
-use crate::{PgLsn, WalEvent, WalParser};
+use crate::{PgLsn, PgOutputEvent, WalParser};
 
 /// Configuration for a [`PollingPgCdcSource`].
 ///
@@ -133,7 +133,7 @@ pub enum PollingPgCdcError {
 /// when to choose polling over the default push source.
 pub struct PollingPgCdcSource {
     config: PollingPgCdcConfig,
-    event_rx: tokio::sync::mpsc::Receiver<Result<WalEvent<PgLsn>, PollingPgCdcError>>,
+    event_rx: tokio::sync::mpsc::Receiver<Result<PgOutputEvent, PollingPgCdcError>>,
     polls_issued: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
     empty_polls_observed: Arc<AtomicU64>,
@@ -244,7 +244,7 @@ impl PollingPgCdcSource {
         self.polls_issued.load(Ordering::Relaxed)
     }
 
-    /// Cumulative number of `WalEvent`s the inner task has pushed onto
+    /// Cumulative number of typed events the inner task has pushed onto
     /// the consumer channel.
     #[must_use]
     pub fn events_received(&self) -> u64 {
@@ -315,7 +315,7 @@ fn polling_loop<DB: DatabaseLike>(
     slot_name: String,
     publication_name: String,
     poll_interval: Duration,
-    event_tx: tokio::sync::mpsc::Sender<Result<WalEvent<PgLsn>, PollingPgCdcError>>,
+    event_tx: tokio::sync::mpsc::Sender<Result<PgOutputEvent, PollingPgCdcError>>,
     polls_issued: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
     empty_polls_observed: Arc<AtomicU64>,
@@ -394,7 +394,7 @@ fn polling_loop<DB: DatabaseLike>(
                 }
             };
             for ev in events {
-                let typed = ev.set_checkpoint(None::<PgLsn>);
+                let typed = ev.with_checkpoint(None::<PgLsn>);
                 events_received.fetch_add(1, Ordering::Relaxed);
                 events_in_this_drain += 1;
                 if event_tx.blocking_send(Ok(typed)).is_err() {
@@ -408,14 +408,13 @@ fn polling_loop<DB: DatabaseLike>(
 }
 
 impl crate::CdcSource for PollingPgCdcSource {
-    type Checkpoint = PgLsn;
+    type Event = PgOutputEvent;
     type Error = PollingPgCdcError;
 
     #[allow(clippy::manual_async_fn)]
     fn next_event(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<WalEvent<Self::Checkpoint>>, Self::Error>> + Send
-    {
+    ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
         async move {
             match self.event_rx.recv().await {
                 Some(Ok(ev)) => Ok(Some(ev)),
@@ -428,7 +427,7 @@ impl crate::CdcSource for PollingPgCdcSource {
     #[allow(clippy::manual_async_fn, clippy::unused_async)]
     fn ack(
         &mut self,
-        _upto: Self::Checkpoint,
+        _upto: PgLsn,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
         // No-op: `pg_logical_slot_get_binary_changes` auto-advances the
         // slot's `confirmed_flush_lsn` as a side effect of the drain.

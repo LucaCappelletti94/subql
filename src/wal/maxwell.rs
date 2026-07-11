@@ -6,18 +6,13 @@
 //! type inference via [`infer_cell_from_json`].
 
 use alloc::string::String;
-#[cfg(test)]
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 use serde::Deserialize;
 
-use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig, MapCdcEnvelope};
-use super::{resolve_table, WalParseError, WalParser};
-#[cfg(test)]
-use crate::Cell;
+use super::{parse_event_kind, resolve_table, WalParseError, WalParser};
 use crate::backend::{CdcEvent, MySql, Presence, RowKind, Value};
-use crate::{catalog_helpers, ColumnId, EventKind, TableId, WalEvent};
+use crate::{catalog_helpers, ColumnId, EventKind, TableId};
 use spin::Once;
 use sql_traits::prelude::DatabaseLike;
 
@@ -57,13 +52,23 @@ pub struct MaxwellParser;
 
 impl<DB: DatabaseLike> WalParser<DB> for MaxwellParser {
     type Checkpoint = crate::NoCheckpoint;
+    type Event = MaxwellEvent;
 
     fn parse_wal_message(
         &self,
         data: &[u8],
         database: &DB,
-    ) -> Result<Vec<WalEvent>, WalParseError> {
-        parse_map_cdc_json_message::<MaxwellMessage, DB>(data, database)
+    ) -> Result<Vec<Self::Event>, WalParseError> {
+        let Some(msg): Option<MaxwellMessage> = super::parse_json_message_or_tombstone(data)?
+        else {
+            return Ok(Vec::new());
+        };
+        match convert_maxwell_typed(msg, database) {
+            Ok(Some(event)) => Ok(alloc::vec![event]),
+            Ok(None) => Ok(Vec::new()),
+            Err(WalParseError::UnknownEventKind(_)) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -81,73 +86,12 @@ fn parse_maxwell_kind(event_type: &str) -> Result<EventKind, WalParseError> {
     )
 }
 
-impl MapCdcEnvelope for MaxwellMessage {
-    const PARSER_NAME: &'static str = "Maxwell";
-    const TOKEN_NAME: &'static str = "event kind";
-
-    fn event_token(&self) -> &str {
-        &self.event_type
-    }
-
-    fn parse_kind(token: &str) -> Result<EventKind, WalParseError> {
-        parse_maxwell_kind(token)
-    }
-
-    fn resolve_table_id<DB: DatabaseLike>(&self, database: &DB) -> Result<TableId, WalParseError> {
-        resolve_table(&self.database, &self.table, database)
-    }
-
-    fn map_config(&self, kind: EventKind) -> MapCdcConfig<'_> {
-        let old_prefix = match kind {
-            EventKind::Delete => "maxwell.data",
-            _ => "maxwell.old",
-        };
-
-        MapCdcConfig {
-            required_new_field: "data",
-            required_old_field: "data",
-            new_field_prefix: "maxwell.data",
-            old_field_prefix: old_prefix,
-            pk_col_names: self.primary_key_columns.as_deref(),
-            // Maxwell's `old` field contains only the changed columns by design;
-            // Missing means "not changed", so changed_columns() is safe to call
-            // even on a sparse old row.
-            old_is_changed_columns_only: true,
-        }
-    }
-
-    fn new_map(&self, _kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
-        self.data.as_ref()
-    }
-
-    fn old_map(&self, kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
-        match kind {
-            EventKind::Delete => self.data.as_ref(),
-            _ => self.old.as_ref(),
-        }
-    }
-
-    fn skip_message(&self) -> bool {
-        // Skip DDL/schema events and bootstrap control events: they contain no row data.
-        matches!(
-            self.event_type.as_str(),
-            "ddl"
-                | "table-create"
-                | "table-drop"
-                | "table-alter"
-                | "database-create"
-                | "database-drop"
-                | "bootstrap-start"
-                | "bootstrap-complete"
-        )
-    }
-}
 
 // ============================================================================
 // MaxwellEvent: typed [`CdcEvent`] output of the Maxwell parser
 // ============================================================================
 
-/// Typed CDC event surfaced by [`MaxwellParser::parse_wal_message_typed`].
+/// Typed CDC event surfaced by [`MaxwellParser::parse_wal_message`].
 ///
 /// Owns the Maxwell wire payload for one row change plus lazily populated
 /// caches of decoded [`Value<MySql>`] cells. Scalar accessors on the
@@ -375,36 +319,23 @@ impl CdcEvent for MaxwellEvent {
     }
 }
 
-impl MaxwellParser {
-    /// Typed variant of [`WalParser::parse_wal_message`] returning
-    /// [`MaxwellEvent`] instances that implement
-    /// [`crate::backend::CdcEvent`] directly.
-    ///
-    /// Retained alongside the legacy [`WalEvent`]-producing trait method
-    /// during Phase 7. The trait swap happens in Phase 7F.
-    pub fn parse_wal_message_typed<DB: DatabaseLike>(
-        &self,
-        data: &[u8],
-        database: &DB,
-    ) -> Result<Vec<MaxwellEvent>, WalParseError> {
-        let Some(msg): Option<MaxwellMessage> = super::parse_json_message_or_tombstone(data)? else {
-            return Ok(Vec::new());
-        };
-        match convert_maxwell_typed(msg, database) {
-            Ok(Some(event)) => Ok(alloc::vec![event]),
-            Ok(None) => Ok(Vec::new()),
-            Err(WalParseError::UnknownEventKind(_)) => Ok(Vec::new()),
-            Err(err) => Err(err),
-        }
-    }
-}
 
 fn convert_maxwell_typed<DB: DatabaseLike>(
     msg: MaxwellMessage,
     database: &DB,
 ) -> Result<Option<MaxwellEvent>, WalParseError> {
     // Skip DDL/bootstrap events
-    if msg.skip_message() {
+    if matches!(
+        msg.event_type.as_str(),
+        "ddl"
+            | "table-create"
+            | "table-drop"
+            | "table-alter"
+            | "database-create"
+            | "database-drop"
+            | "bootstrap-start"
+            | "bootstrap-complete"
+    ) {
         return Ok(None);
     }
 
@@ -1117,7 +1048,7 @@ mod tests {
         }"#;
 
         let events = MaxwellParser
-            .parse_wal_message_typed(msg.as_bytes(), engine.database())
+            .parse_wal_message(msg.as_bytes(), engine.database())
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1151,7 +1082,7 @@ mod tests {
         }"#;
 
         let events = MaxwellParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
 
@@ -1172,7 +1103,7 @@ mod tests {
         }"#;
 
         let events = MaxwellParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
 
@@ -1194,7 +1125,7 @@ mod tests {
         }"#;
 
         let events = MaxwellParser
-            .parse_wal_message_typed(msg.as_bytes(), &database)
+            .parse_wal_message(msg.as_bytes(), &database)
             .expect("parse succeeds");
         let event = &events[0];
 
@@ -1215,7 +1146,7 @@ mod tests {
     fn typed_maxwell_tombstone_is_empty() {
         let database = typed_maxwell_catalog();
         let events = MaxwellParser
-            .parse_wal_message_typed(b"null", &database)
+            .parse_wal_message(b"null", &database)
             .expect("tombstone");
         assert!(events.is_empty());
     }
@@ -1227,7 +1158,7 @@ mod tests {
         for event_type in &["ddl", "table-create", "bootstrap-start", "bootstrap-complete"] {
             let msg = format!(r#"{{"database":"test","table":"orders","type":"{event_type}"}}"#);
             let events = MaxwellParser
-                .parse_wal_message_typed(msg.as_bytes(), &database)
+                .parse_wal_message(msg.as_bytes(), &database)
                 .unwrap_or_else(|e| panic!("{event_type} should be skipped, not error: {e:?}"));
             assert!(events.is_empty(), "{event_type} should produce no output");
         }

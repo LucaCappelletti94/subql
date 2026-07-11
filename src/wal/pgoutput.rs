@@ -16,13 +16,8 @@ use pg_walstream::protocol::{
 };
 use sql_traits::prelude::DatabaseLike;
 
-use super::pg_type::text_to_cell_strict;
-use super::{
-    build_pk_from_resolved_strict, delete_event, insert_event, pk_from_catalog_or_empty,
-    resolve_table, truncate_event, update_event_with_old_row_completeness, WalParseError,
-    WalParser,
-};
-use crate::{catalog_helpers, Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
+use super::{resolve_table, WalParseError, WalParser};
+use crate::{catalog_helpers, ColumnId, EventKind, TableId};
 
 const MAX_COLUMNS_PER_MESSAGE: usize = 10_000;
 #[cfg(not(test))]
@@ -31,9 +26,6 @@ const MAX_CACHED_RELATIONS: usize = 65_536;
 const MAX_CACHED_RELATIONS: usize = 32;
 const PROTOCOL_VERSION: u32 = 1;
 
-type ResolvedCells = Vec<(ColumnId, Cell)>;
-type TupleResult = Result<(RowImage, ResolvedCells), WalParseError>;
-type MaybeTupleResult = Result<(Option<RowImage>, ResolvedCells), WalParseError>;
 
 #[derive(Clone, Debug)]
 struct CachedRelation {
@@ -115,20 +107,17 @@ impl PgOutputParser {
 const SKIP_TAGS: &[u8] = b"BCOYMSEcAPKrbp";
 
 impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
-    type Checkpoint = crate::NoCheckpoint;
+    type Checkpoint = crate::PgLsn;
+    type Event = PgOutputEvent;
 
     fn parse_wal_message(
         &self,
         data: &[u8],
         database: &DB,
-    ) -> Result<Vec<WalEvent>, WalParseError> {
+    ) -> Result<Vec<Self::Event>, WalParseError> {
         if data.is_empty() {
             return Ok(vec![]);
         }
-
-        // Skip-list messages and unknown tags are silently dropped, matching
-        // the legacy parser. Only R/I/U/D/T (row-bearing tags) and T-prefix
-        // get forwarded to pg_walstream for full decoding.
         let tag = data[0];
         if SKIP_TAGS.contains(&tag) {
             return Ok(vec![]);
@@ -161,14 +150,20 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                 self.relations.lock().insert(relation_id, cached);
                 Ok(vec![])
             }
-
             LogicalReplicationMessage::Insert { relation_id, tuple } => {
                 let rel = self.get_relation(relation_id)?;
-                let (new_row, new_resolved) = tuple_cells_full(&rel, &tuple, true)?;
-                let pk = pk_from_catalog_or_empty(&new_resolved, rel.table_id, database)?;
-                Ok(vec![insert_event(rel.table_id, pk, new_row, None)?])
+                let new_image = tuple_wire_full(&rel, &tuple, true)?;
+                let pk_columns = pk_columns_for_new(&rel, database)?;
+                Ok(vec![PgOutputEvent {
+                    kind: EventKind::Insert,
+                    table_id: rel.table_id,
+                    pk_columns,
+                    changed_columns: Arc::from(Vec::<ColumnId>::new()),
+                    checkpoint: None,
+                    new_image: Some(new_image),
+                    old_image: None,
+                }])
             }
-
             LogicalReplicationMessage::Update {
                 relation_id,
                 old_tuple,
@@ -176,33 +171,28 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                 key_type,
             } => {
                 let rel = self.get_relation(relation_id)?;
-                let (old_row, old_resolved) = parse_update_old(&rel, old_tuple, key_type)?;
-                let (new_row, new_resolved) = tuple_cells_full(&rel, &new_tuple, true)?;
-                let pk = if old_resolved.is_empty() {
-                    pk_from_catalog_or_empty(&new_resolved, rel.table_id, database)?
-                } else {
-                    pk_from_old_resolved(&rel, &old_resolved)?
-                };
-                let old_row_complete = super::old_row_is_complete(old_row.as_ref());
-                Ok(vec![update_event_with_old_row_completeness(
-                    rel.table_id,
-                    pk,
-                    old_row,
-                    new_row,
-                    old_row_complete,
-                    None,
-                )])
+                let new_image = tuple_wire_full(&rel, &new_tuple, true)?;
+                let old_image = parse_update_old_wire(&rel, old_tuple, key_type)?;
+                let pk_columns = pk_columns_from_identity_or_catalog(&rel, database)?;
+                Ok(vec![PgOutputEvent {
+                    kind: EventKind::Update,
+                    table_id: rel.table_id,
+                    pk_columns,
+                    changed_columns: Arc::from(Vec::<ColumnId>::new()),
+                    checkpoint: None,
+                    new_image: Some(new_image),
+                    old_image,
+                }])
             }
-
             LogicalReplicationMessage::Delete {
                 relation_id,
                 old_tuple,
                 key_type,
             } => {
                 let rel = self.get_relation(relation_id)?;
-                let (old_row, old_resolved) = match key_type {
-                    'K' => tuple_cells_key(&rel, &old_tuple)?,
-                    'O' => tuple_cells_full(&rel, &old_tuple, false)?,
+                let old_image = match key_type {
+                    'K' => tuple_wire_key(&rel, &old_tuple)?,
+                    'O' => tuple_wire_full(&rel, &old_tuple, false)?,
                     other => {
                         return Err(WalParseError::MalformedPayload(format!(
                             "invalid DELETE tuple key_type 0x{:02X}",
@@ -210,21 +200,35 @@ impl<DB: DatabaseLike> WalParser<DB> for PgOutputParser {
                         )));
                     }
                 };
-                let pk = pk_from_old_resolved(&rel, &old_resolved)?;
-                Ok(vec![delete_event(rel.table_id, pk, old_row, None)?])
+                let pk_columns = pk_columns_from_identity_or_catalog(&rel, database)?;
+                Ok(vec![PgOutputEvent {
+                    kind: EventKind::Delete,
+                    table_id: rel.table_id,
+                    pk_columns,
+                    changed_columns: Arc::from(Vec::<ColumnId>::new()),
+                    checkpoint: None,
+                    new_image: None,
+                    old_image: Some(old_image),
+                }])
             }
-
             LogicalReplicationMessage::Truncate { relation_ids, .. } => {
                 let cache = self.relations.lock();
                 let mut events = Vec::with_capacity(relation_ids.len());
                 for oid in relation_ids {
                     if let Some(rel) = cache.map.get(&oid) {
-                        events.push(truncate_event(rel.table_id, None)?);
+                        events.push(PgOutputEvent {
+                            kind: EventKind::Truncate,
+                            table_id: rel.table_id,
+                            pk_columns: Arc::from(Vec::<ColumnId>::new()),
+                            changed_columns: Arc::from(Vec::<ColumnId>::new()),
+                            checkpoint: None,
+                            new_image: None,
+                            old_image: None,
+                        });
                     }
                 }
                 Ok(events)
             }
-
             _ => Ok(vec![]),
         }
     }
@@ -294,150 +298,6 @@ fn build_cached_relation<DB: DatabaseLike>(
     })
 }
 
-fn parse_update_old(
-    rel: &CachedRelation,
-    old_tuple: Option<TupleData>,
-    key_type: Option<char>,
-) -> MaybeTupleResult {
-    match (old_tuple, key_type) {
-        (Some(t), Some('K')) => {
-            let (row, resolved) = tuple_cells_key(rel, &t)?;
-            Ok((Some(row), resolved))
-        }
-        (Some(t), Some('O')) => {
-            let (row, resolved) = tuple_cells_full(rel, &t, false)?;
-            Ok((Some(row), resolved))
-        }
-        (Some(_), Some(other)) => Err(WalParseError::MalformedPayload(format!(
-            "invalid UPDATE old-tuple key_type 0x{:02X}",
-            other as u32
-        ))),
-        (None, None) => Ok((None, Vec::new())),
-        (Some(_), None) | (None, Some(_)) => Err(WalParseError::MalformedPayload(
-            "UPDATE message has inconsistent old_tuple/key_type pair".to_string(),
-        )),
-    }
-}
-
-fn tuple_cells_full(rel: &CachedRelation, tuple: &TupleData, is_new_tuple: bool) -> TupleResult {
-    let wal_count = tuple.columns.len();
-    if wal_count != rel.arity {
-        return Err(WalParseError::ArityMismatch {
-            table_id: rel.table_id,
-            wal_count,
-            catalog_arity: rel.arity,
-        });
-    }
-    let positions: Vec<usize> = (0..wal_count).collect();
-    tuple_cells_at_positions(rel, tuple, &positions, "tuple", is_new_tuple)
-}
-
-fn tuple_cells_key(rel: &CachedRelation, tuple: &TupleData) -> TupleResult {
-    let wal_count = tuple.columns.len();
-    let mapped_positions: Vec<usize> = if !rel.identity_columns.is_empty()
-        && wal_count == rel.identity_columns.len()
-    {
-        rel.identity_columns.clone()
-    } else if wal_count == rel.arity {
-        (0..wal_count).collect()
-    } else {
-        return Err(WalParseError::MalformedPayload(format!(
-            "key tuple column count {wal_count} does not match identity column count {} or relation arity {}",
-            rel.identity_columns.len(),
-            rel.arity
-        )));
-    };
-    tuple_cells_at_positions(rel, tuple, &mapped_positions, "key tuple", false)
-}
-
-fn tuple_cells_at_positions(
-    rel: &CachedRelation,
-    tuple: &TupleData,
-    positions: &[usize],
-    context: &str,
-    is_new_tuple: bool,
-) -> TupleResult {
-    if positions.len() > rel.column_ids.len() {
-        return Err(WalParseError::MalformedPayload(format!(
-            "{context} column count {} exceeds relation column count {}",
-            positions.len(),
-            rel.column_ids.len()
-        )));
-    }
-
-    let mut cells = vec![Cell::Missing; rel.arity];
-    let mut resolved = Vec::with_capacity(positions.len());
-
-    for (wire_idx, &rel_idx) in positions.iter().enumerate() {
-        if rel_idx >= rel.column_ids.len() {
-            return Err(WalParseError::MalformedPayload(format!(
-                "{context} column index {rel_idx} is out of bounds for relation column count {}",
-                rel.column_ids.len()
-            )));
-        }
-        let col_data = tuple.columns.get(wire_idx).ok_or_else(|| {
-            WalParseError::MalformedPayload(format!(
-                "{context} missing column data at wire position {wire_idx}"
-            ))
-        })?;
-        let type_oid = rel.column_type_oids[rel_idx];
-        let cell = column_data_to_cell(col_data, type_oid, is_new_tuple)?;
-        let col_id = rel.column_ids[rel_idx];
-        if (col_id as usize) < rel.arity {
-            cells[col_id as usize] = cell.clone();
-        }
-        resolved.push((col_id, cell));
-    }
-
-    Ok((
-        RowImage {
-            cells: Arc::from(cells),
-        },
-        resolved,
-    ))
-}
-
-fn column_data_to_cell(
-    col: &ColumnData,
-    type_oid: u32,
-    is_new_tuple: bool,
-) -> Result<Cell, WalParseError> {
-    if col.is_null() {
-        return Ok(Cell::Null);
-    }
-    if col.is_unchanged() {
-        if is_new_tuple {
-            return Err(WalParseError::MalformedPayload(
-                "unchanged-TOAST tag 'u' is not valid in a new-image tuple".to_string(),
-            ));
-        }
-        return Ok(Cell::Missing);
-    }
-    if col.is_binary() {
-        return Err(WalParseError::UnknownTupleTag(b'b'));
-    }
-    let bytes = col.as_bytes();
-    let text =
-        core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-    text_to_cell_strict(text, type_oid)
-}
-
-fn pk_from_old_resolved(
-    rel: &CachedRelation,
-    old_resolved: &[(ColumnId, Cell)],
-) -> Result<PrimaryKey, WalParseError> {
-    if rel.identity_columns.is_empty() {
-        let pk_col_ids: Vec<ColumnId> = old_resolved.iter().map(|(c, _)| *c).collect();
-        build_pk_from_resolved_strict(old_resolved, &pk_col_ids, "old tuple fallback key")
-    } else {
-        let pk_col_ids: Vec<ColumnId> = rel
-            .identity_columns
-            .iter()
-            .map(|&i| rel.column_ids[i])
-            .collect();
-        build_pk_from_resolved_strict(old_resolved, &pk_col_ids, "replica identity")
-    }
-}
 
 fn translate_error(err: ReplicationError) -> WalParseError {
     match err {
@@ -497,7 +357,7 @@ use spin::Once;
 
 use super::pg_type::text_to_pg_value;
 
-/// Typed CDC event surfaced by [`PgOutputParser::parse_wal_message_typed`].
+/// Typed CDC event surfaced by [`PgOutputParser::parse_wal_message`].
 ///
 /// Owns the pgoutput wire payload for one row change plus lazily
 /// populated caches of decoded [`Value<Postgres>`] cells. Scalar
@@ -782,141 +642,6 @@ impl CdcEvent for PgOutputEvent {
     }
 }
 
-impl PgOutputParser {
-    /// Typed variant of [`WalParser::parse_wal_message`] returning
-    /// [`PgOutputEvent`] instances that implement [`CdcEvent`] directly.
-    ///
-    /// Retained alongside the legacy [`WalEvent`]-producing trait method
-    /// during Phase 7. The trait swap happens in Phase 7F, at which
-    /// point the streaming layer also gets rewritten to stamp
-    /// [`PgOutputEvent`]s with `PgLsn` via [`PgOutputEvent::with_checkpoint`].
-    ///
-    /// Currently returns events with `checkpoint: None`; the streaming
-    /// layer is expected to stamp them from the enclosing `XLogData`
-    /// header (a Phase 7F wiring change).
-    pub fn parse_wal_message_typed<DB: DatabaseLike>(
-        &self,
-        data: &[u8],
-        database: &DB,
-    ) -> Result<Vec<PgOutputEvent>, WalParseError> {
-        if data.is_empty() {
-            return Ok(vec![]);
-        }
-        let tag = data[0];
-        if SKIP_TAGS.contains(&tag) {
-            return Ok(vec![]);
-        }
-        if !matches!(tag, b'R' | b'I' | b'U' | b'D' | b'T') {
-            return Ok(vec![]);
-        }
-
-        let parsed = self
-            .parser
-            .lock()
-            .parse_wal_message(data)
-            .map_err(translate_error)?;
-
-        match parsed.message {
-            LogicalReplicationMessage::Relation {
-                relation_id,
-                namespace,
-                relation_name,
-                replica_identity: _,
-                columns,
-            } => {
-                let cached = build_cached_relation(
-                    relation_id,
-                    namespace.as_ref(),
-                    relation_name.as_ref(),
-                    &columns,
-                    database,
-                )?;
-                self.relations.lock().insert(relation_id, cached);
-                Ok(vec![])
-            }
-            LogicalReplicationMessage::Insert { relation_id, tuple } => {
-                let rel = self.get_relation(relation_id)?;
-                let new_image = tuple_wire_full(&rel, &tuple, true)?;
-                let pk_columns = pk_columns_for_new(&rel, database)?;
-                Ok(vec![PgOutputEvent {
-                    kind: EventKind::Insert,
-                    table_id: rel.table_id,
-                    pk_columns,
-                    changed_columns: Arc::from(Vec::<ColumnId>::new()),
-                    checkpoint: None,
-                    new_image: Some(new_image),
-                    old_image: None,
-                }])
-            }
-            LogicalReplicationMessage::Update {
-                relation_id,
-                old_tuple,
-                new_tuple,
-                key_type,
-            } => {
-                let rel = self.get_relation(relation_id)?;
-                let new_image = tuple_wire_full(&rel, &new_tuple, true)?;
-                let old_image = parse_update_old_wire(&rel, old_tuple, key_type)?;
-                let pk_columns = pk_columns_from_identity_or_catalog(&rel, database)?;
-                Ok(vec![PgOutputEvent {
-                    kind: EventKind::Update,
-                    table_id: rel.table_id,
-                    pk_columns,
-                    changed_columns: Arc::from(Vec::<ColumnId>::new()),
-                    checkpoint: None,
-                    new_image: Some(new_image),
-                    old_image,
-                }])
-            }
-            LogicalReplicationMessage::Delete {
-                relation_id,
-                old_tuple,
-                key_type,
-            } => {
-                let rel = self.get_relation(relation_id)?;
-                let old_image = match key_type {
-                    'K' => tuple_wire_key(&rel, &old_tuple)?,
-                    'O' => tuple_wire_full(&rel, &old_tuple, false)?,
-                    other => {
-                        return Err(WalParseError::MalformedPayload(format!(
-                            "invalid DELETE tuple key_type 0x{:02X}",
-                            other as u32
-                        )));
-                    }
-                };
-                let pk_columns = pk_columns_from_identity_or_catalog(&rel, database)?;
-                Ok(vec![PgOutputEvent {
-                    kind: EventKind::Delete,
-                    table_id: rel.table_id,
-                    pk_columns,
-                    changed_columns: Arc::from(Vec::<ColumnId>::new()),
-                    checkpoint: None,
-                    new_image: None,
-                    old_image: Some(old_image),
-                }])
-            }
-            LogicalReplicationMessage::Truncate { relation_ids, .. } => {
-                let cache = self.relations.lock();
-                let mut events = Vec::with_capacity(relation_ids.len());
-                for oid in relation_ids {
-                    if let Some(rel) = cache.map.get(&oid) {
-                        events.push(PgOutputEvent {
-                            kind: EventKind::Truncate,
-                            table_id: rel.table_id,
-                            pk_columns: Arc::from(Vec::<ColumnId>::new()),
-                            changed_columns: Arc::from(Vec::<ColumnId>::new()),
-                            checkpoint: None,
-                            new_image: None,
-                            old_image: None,
-                        });
-                    }
-                }
-                Ok(events)
-            }
-            _ => Ok(vec![]),
-        }
-    }
-}
 
 fn tuple_wire_full(
     rel: &CachedRelation,
@@ -2614,7 +2339,7 @@ mod tests {
         // Seed the relation cache.
         let rel_msg = build_relation_msg(50_000, "public", "orders", &typed_orders_columns());
         let events = parser
-            .parse_wal_message_typed(&rel_msg, engine.database())
+            .parse_wal_message(&rel_msg, engine.database())
             .expect("relation parses");
         assert!(events.is_empty(), "Relation msg produces no events");
 
@@ -2629,7 +2354,7 @@ mod tests {
             ],
         );
         let events = parser
-            .parse_wal_message_typed(&insert_msg, engine.database())
+            .parse_wal_message(&insert_msg, engine.database())
             .expect("insert parses");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2670,7 +2395,7 @@ mod tests {
         let parser = PgOutputParser::new();
         let rel_msg = build_relation_msg(51_000, "public", "orders", &typed_orders_columns());
         parser
-            .parse_wal_message_typed(&rel_msg, &catalog)
+            .parse_wal_message(&rel_msg, &catalog)
             .expect("relation parses");
 
         // Update with old_tag='O' (all columns). Old image has:
@@ -2696,7 +2421,7 @@ mod tests {
             ],
         );
         let events = parser
-            .parse_wal_message_typed(&update_msg, &catalog)
+            .parse_wal_message(&update_msg, &catalog)
             .expect("update parses");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2729,13 +2454,13 @@ mod tests {
         let parser = PgOutputParser::new();
         let rel_msg = build_relation_msg(52_000, "public", "orders", &typed_orders_columns());
         parser
-            .parse_wal_message_typed(&rel_msg, &catalog)
+            .parse_wal_message(&rel_msg, &catalog)
             .expect("relation parses");
 
         // Delete with key tuple ('K') carrying only the identity column.
         let delete_msg = build_delete_msg(52_000, b'K', &[TupleCol::Text("9".into())]);
         let events = parser
-            .parse_wal_message_typed(&delete_msg, &catalog)
+            .parse_wal_message(&delete_msg, &catalog)
             .expect("delete parses");
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2769,12 +2494,12 @@ mod tests {
         let parser = PgOutputParser::new();
         let rel_msg = build_relation_msg(53_000, "public", "orders", &typed_orders_columns());
         parser
-            .parse_wal_message_typed(&rel_msg, &catalog)
+            .parse_wal_message(&rel_msg, &catalog)
             .expect("relation parses");
 
         let truncate_msg = build_truncate_msg(0, &[53_000]);
         let events = parser
-            .parse_wal_message_typed(&truncate_msg, &catalog)
+            .parse_wal_message(&truncate_msg, &catalog)
             .expect("truncate parses");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind(), EventKind::Truncate);
@@ -2786,7 +2511,7 @@ mod tests {
         let catalog = orders_catalog();
         let parser = PgOutputParser::new();
         let events = parser
-            .parse_wal_message_typed(b"", &catalog)
+            .parse_wal_message(b"", &catalog)
             .expect("empty msg");
         assert!(events.is_empty());
     }
@@ -2797,7 +2522,7 @@ mod tests {
         let parser = PgOutputParser::new();
         let rel_msg = build_relation_msg(54_000, "public", "orders", &typed_orders_columns());
         parser
-            .parse_wal_message_typed(&rel_msg, &catalog)
+            .parse_wal_message(&rel_msg, &catalog)
             .expect("relation parses");
         let insert_msg = build_insert_msg(
             54_000,
@@ -2809,7 +2534,7 @@ mod tests {
             ],
         );
         let mut events = parser
-            .parse_wal_message_typed(&insert_msg, &catalog)
+            .parse_wal_message(&insert_msg, &catalog)
             .expect("insert parses");
         assert_eq!(events.len(), 1);
         assert!(events[0].checkpoint().is_none());
@@ -2831,7 +2556,7 @@ mod tests {
                 TupleCol::Text("s".into()),
             ],
         );
-        let result = parser.parse_wal_message_typed(&insert_msg, &catalog);
+        let result = parser.parse_wal_message(&insert_msg, &catalog);
         assert!(matches!(result, Err(WalParseError::UnknownRelationOid(77_777))));
     }
 }

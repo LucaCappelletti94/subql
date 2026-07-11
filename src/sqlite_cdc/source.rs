@@ -25,7 +25,6 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::future::Future;
 
 use diesel::connection::{LoadConnection, SimpleConnection};
 use diesel::row::{Field, Row};
@@ -40,10 +39,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 
 use crate::sqlite_cdc::catalog;
 use crate::sqlite_cdc::error::SqliteCdcError;
-use crate::wal::CdcSource;
 use crate::{
-    catalog_helpers, Cell, ColumnId, ColumnType, NoCheckpoint, PrimaryKey, RowImage, TableId,
-    WalEvent,
+    catalog_helpers, Cell, ColumnId, ColumnType, PrimaryKey, RowImage, TableId, WalEvent,
 };
 
 /// Name of the unified shadow log table used to record every observed
@@ -774,6 +771,11 @@ fn sanitize_for_identifier(name: &str) -> String {
         .collect()
 }
 
+// SqliteCdcSource's CdcSource impl is gated until Phase 8, which migrates
+// the shadow-log producer from WalEvent to a typed CdcEvent (probably a
+// native `SqliteCdcEvent` with Backend = SQLite). The type stays public
+// so downstream code that only calls `poll_next_event` keeps working.
+#[cfg(any())]
 impl CdcSource for SqliteCdcSource {
     type Checkpoint = NoCheckpoint;
     type Error = SqliteCdcError;

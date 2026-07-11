@@ -2,8 +2,8 @@
 //!
 //! Owns a `pg_walstream::PgReplicationConnection` opened in replication
 //! mode plus an attached `START_REPLICATION` stream. Surfaces typed
-//! [`crate::WalEvent<PgLsn>`] values through the [`crate::CdcSource`]
-//! trait. Acks flow back to the server as `StandbyStatusUpdate` messages
+//! [`crate::PgOutputEvent`] values through the [`crate::CdcSource`]
+//! trait, each stamped with the `XLogData` header's LSN. Acks flow back
 //! so the slot's `confirmed_flush_lsn` tracks reality.
 
 use alloc::format;
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::pgoutput::PgOutputParser;
 use super::{WalParseError, WalParser};
-use crate::{PgLsn, WalEvent};
+use crate::{PgLsn, PgOutputEvent};
 
 /// Configuration for a [`PgStreamingCdcSource`].
 ///
@@ -121,7 +121,7 @@ pub enum PgStreamingError {
 /// the lifecycle contract.
 pub struct PgStreamingCdcSource {
     config: PgStreamingConfig,
-    event_rx: tokio::sync::mpsc::Receiver<Result<WalEvent<PgLsn>, PgStreamingError>>,
+    event_rx: tokio::sync::mpsc::Receiver<Result<PgOutputEvent, PgStreamingError>>,
     ack_tx: tokio::sync::mpsc::UnboundedSender<PgLsn>,
     status_updates_sent: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
@@ -266,14 +266,13 @@ impl Drop for PgStreamingCdcSource {
 }
 
 impl crate::CdcSource for PgStreamingCdcSource {
-    type Checkpoint = PgLsn;
+    type Event = PgOutputEvent;
     type Error = PgStreamingError;
 
     #[allow(clippy::manual_async_fn)]
     fn next_event(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<WalEvent<Self::Checkpoint>>, Self::Error>> + Send
-    {
+    ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
         async move {
             match self.event_rx.recv().await {
                 Some(Ok(ev)) => Ok(Some(ev)),
@@ -290,7 +289,7 @@ impl crate::CdcSource for PgStreamingCdcSource {
     #[allow(clippy::manual_async_fn, clippy::unused_async)]
     fn ack(
         &mut self,
-        upto: Self::Checkpoint,
+        upto: PgLsn,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
         let send_result = self.ack_tx.send(upto);
         async move {
@@ -308,7 +307,7 @@ impl crate::CdcSource for PgStreamingCdcSource {
 async fn streaming_task<DB: DatabaseLike>(
     mut conn: PgReplicationConnection,
     catalog: DB,
-    event_tx: tokio::sync::mpsc::Sender<Result<WalEvent<PgLsn>, PgStreamingError>>,
+    event_tx: tokio::sync::mpsc::Sender<Result<PgOutputEvent, PgStreamingError>>,
     mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<PgLsn>,
     status_counter: Arc<AtomicU64>,
     events_counter: Arc<AtomicU64>,
@@ -383,7 +382,7 @@ async fn streaming_task<DB: DatabaseLike>(
                         match parser.parse_wal_message(payload, &catalog) {
                             Ok(events) => {
                                 for ev in events {
-                                    let typed = ev.set_checkpoint(Some(PgLsn(start_lsn)));
+                                    let typed = ev.with_checkpoint(Some(PgLsn(start_lsn)));
                                     events_counter.fetch_add(1, Ordering::Relaxed);
                                     if event_tx.send(Ok(typed)).await.is_err() {
                                         return;
