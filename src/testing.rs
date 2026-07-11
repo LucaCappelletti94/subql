@@ -58,7 +58,7 @@ impl<B: Backend> TestEvent<B> {
     /// [`with_pk_columns`](Self::with_pk_columns) when the test needs a
     /// PK view).
     #[must_use]
-    pub fn insert(table_id: TableId, new_row: Vec<Value<B>>) -> Self {
+    pub const fn insert(table_id: TableId, new_row: Vec<Value<B>>) -> Self {
         Self {
             kind: EventKind::Insert,
             table_id,
@@ -71,7 +71,7 @@ impl<B: Backend> TestEvent<B> {
 
     /// Build an [`EventKind::Update`] event for `table_id`.
     #[must_use]
-    pub fn update(table_id: TableId, old_row: Vec<Value<B>>, new_row: Vec<Value<B>>) -> Self {
+    pub const fn update(table_id: TableId, old_row: Vec<Value<B>>, new_row: Vec<Value<B>>) -> Self {
         Self {
             kind: EventKind::Update,
             table_id,
@@ -85,7 +85,7 @@ impl<B: Backend> TestEvent<B> {
     /// Build an [`EventKind::Delete`] event for `table_id` carrying
     /// `old_row`.
     #[must_use]
-    pub fn delete(table_id: TableId, old_row: Vec<Value<B>>) -> Self {
+    pub const fn delete(table_id: TableId, old_row: Vec<Value<B>>) -> Self {
         Self {
             kind: EventKind::Delete,
             table_id,
@@ -98,7 +98,7 @@ impl<B: Backend> TestEvent<B> {
 
     /// Build an [`EventKind::Truncate`] event for `table_id`.
     #[must_use]
-    pub fn truncate(table_id: TableId) -> Self {
+    pub const fn truncate(table_id: TableId) -> Self {
         Self {
             kind: EventKind::Truncate,
             table_id,

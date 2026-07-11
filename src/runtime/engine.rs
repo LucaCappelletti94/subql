@@ -2105,7 +2105,7 @@ where
     /// arity validation should implement it against `event.int_at(...)`
     /// etc.
     #[allow(dead_code, clippy::unused_self, clippy::needless_pass_by_value)]
-    fn validate_row_arity(&self, _table_id: TableId) -> Result<(), DispatchError> {
+    const fn validate_row_arity(&self, _table_id: TableId) -> Result<(), DispatchError> {
         Ok(())
     }
 

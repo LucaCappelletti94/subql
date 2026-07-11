@@ -156,7 +156,7 @@ fn parse_json(s: &str, sql: &SqlValue) -> Result<serde_json::Value, RegisterErro
 /// `SingleQuotedString`, `DoubleQuotedString`, `NationalStringLiteral`,
 /// and `EscapedStringLiteral` all carry a plain `String`; hex literals
 /// are handled by the bytes path separately.
-fn quoted_string<'a>(sql: &'a SqlValue) -> Option<&'a str> {
+fn quoted_string(sql: &SqlValue) -> Option<&str> {
     match sql {
         SqlValue::SingleQuotedString(s)
         | SqlValue::DoubleQuotedString(s)
@@ -281,7 +281,7 @@ impl SqlLiteralParse for SQLite {
             // SQLite has no native BOOL; the column contract stores 0 / 1
             // as INTEGER. Coerce the sqlparser Boolean to that.
             (ScalarKind::Bool, SqlValue::Boolean(b)) => {
-                Ok(Value::Bool(if *b { 1_i64 } else { 0_i64 }))
+                Ok(Value::Bool(i64::from(*b)))
             }
             (ScalarKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
             (ScalarKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),

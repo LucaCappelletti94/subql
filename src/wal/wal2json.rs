@@ -292,7 +292,7 @@ impl V2RowImage {
 }
 
 impl V2WireCell {
-    fn col_id_field_name(&self) -> &str {
+    const fn col_id_field_name(&self) -> &'static str {
         "wal2json.v2.column"
     }
 }
@@ -453,11 +453,11 @@ fn convert_v2_message_typed<DB: DatabaseLike>(
 
     // Presence rules match convert_v2_message.
     if matches!(kind, EventKind::Insert | EventKind::Update)
-        && columns.as_ref().is_none_or(|c| c.is_empty())
+        && columns.as_ref().is_none_or(std::vec::Vec::is_empty)
     {
         return Err(WalParseError::MissingField("columns".to_string()));
     }
-    if kind == EventKind::Delete && identity.as_ref().is_none_or(|i| i.is_empty()) {
+    if kind == EventKind::Delete && identity.as_ref().is_none_or(std::vec::Vec::is_empty) {
         return Err(WalParseError::MissingField("identity".to_string()));
     }
 
@@ -721,13 +721,13 @@ impl V1RowImage {
 }
 
 impl V1WireCell {
-    fn col_id_field_name(&self) -> &str {
+    const fn col_id_field_name(&self) -> &'static str {
         "wal2json.v1.column"
     }
 }
 
 impl Wal2JsonV1Event {
-    fn kind_matches_pk_source(&self, row: RowKind) -> Option<&V1RowImage> {
+    const fn kind_matches_pk_source(&self, row: RowKind) -> Option<&V1RowImage> {
         match (self.kind, row) {
             (EventKind::Truncate, _) => None,
             (EventKind::Insert, RowKind::New | RowKind::Pk) => self.new_image.as_ref(),
@@ -927,9 +927,7 @@ fn convert_v1_change_typed<DB: DatabaseLike>(
         }
         alloc::sync::Arc::from(ids)
     } else {
-        catalog_helpers::primary_key_columns(database, table_id)
-            .map(alloc::sync::Arc::from)
-            .unwrap_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()))
+        catalog_helpers::primary_key_columns(database, table_id).map_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()), alloc::sync::Arc::from)
     };
 
     let changed_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Update {

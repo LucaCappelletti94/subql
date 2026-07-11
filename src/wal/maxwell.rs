@@ -201,7 +201,7 @@ impl MaxwellRowImage {
 }
 
 impl MaxwellEvent {
-    fn kind_matches_pk_source(&self, row: RowKind) -> Option<&MaxwellRowImage> {
+    const fn kind_matches_pk_source(&self, row: RowKind) -> Option<&MaxwellRowImage> {
         match (self.kind, row) {
             (EventKind::Truncate, _) => None,
             (EventKind::Insert, RowKind::New | RowKind::Pk) => self.new_image.as_ref(),
@@ -366,17 +366,14 @@ fn convert_maxwell_typed<DB: DatabaseLike>(
                 })?;
             if !seen.insert(col_id) {
                 return Err(WalParseError::MalformedPayload(format!(
-                    "primary_key_columns contains duplicate column '{}' (id {})",
-                    name, col_id
+                    "primary_key_columns contains duplicate column '{name}' (id {col_id})"
                 )));
             }
             ids.push(col_id);
         }
         alloc::sync::Arc::from(ids)
     } else {
-        catalog_helpers::primary_key_columns(database, table_id)
-            .map(alloc::sync::Arc::from)
-            .unwrap_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()))
+        catalog_helpers::primary_key_columns(database, table_id).map_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()), alloc::sync::Arc::from)
     };
 
     // Extract data maps before matching on kind (from_hashmap takes ownership).

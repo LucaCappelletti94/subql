@@ -134,14 +134,12 @@ impl DebeziumRowImage {
             })?;
             if !seen.insert(col_id) {
                 return Err(WalParseError::MalformedPayload(format!(
-                    "{context} contains duplicate column '{}' (id {col_id})",
-                    field_name
+                    "{context} contains duplicate column '{field_name}' (id {col_id})"
                 )));
             }
             if (col_id as usize) >= arity {
                 return Err(WalParseError::MalformedPayload(format!(
-                    "{context} column '{}' resolved to out-of-range id {col_id} for table {table_id} (arity {arity})",
-                    field_name
+                    "{context} column '{field_name}' resolved to out-of-range id {col_id} for table {table_id} (arity {arity})"
                 )));
             }
             let idx = u16::try_from(entries.len()).map_err(|_| {
@@ -321,9 +319,7 @@ fn convert_debezium_message_typed<DB: DatabaseLike>(
     let pk_columns: alloc::sync::Arc<[ColumnId]> = if kind == EventKind::Truncate {
         alloc::sync::Arc::from(Vec::<ColumnId>::new())
     } else {
-        catalog_helpers::primary_key_columns(database, table_id)
-            .map(alloc::sync::Arc::from)
-            .unwrap_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()))
+        catalog_helpers::primary_key_columns(database, table_id).map_or_else(|| alloc::sync::Arc::from(Vec::<ColumnId>::new()), alloc::sync::Arc::from)
     };
 
     let new_image = if matches!(kind, EventKind::Insert | EventKind::Update) {

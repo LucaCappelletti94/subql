@@ -167,7 +167,7 @@ impl<B: Backend> MinMaxQuery<B> {
         }
         let candidate = self.agg_value(event, row);
         if self.is_more_extreme(&candidate) {
-            self.current = candidate.clone();
+            self.current = candidate;
             Maintenance::Updated(self.current.clone())
         } else {
             Maintenance::Unchanged

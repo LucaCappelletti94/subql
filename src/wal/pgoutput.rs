@@ -740,9 +740,7 @@ fn pk_columns_for_new<DB: DatabaseLike>(
     rel: &CachedRelation,
     database: &DB,
 ) -> Result<Arc<[ColumnId]>, WalParseError> {
-    Ok(catalog_helpers::primary_key_columns(database, rel.table_id)
-        .map(Arc::from)
-        .unwrap_or_else(|| Arc::from(Vec::<ColumnId>::new())))
+    Ok(catalog_helpers::primary_key_columns(database, rel.table_id).map_or_else(|| Arc::from(Vec::<ColumnId>::new()), Arc::from))
 }
 
 /// PK column IDs for Update / Delete: prefer the relation's identity

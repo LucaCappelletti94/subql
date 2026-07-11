@@ -375,12 +375,9 @@ impl<B: Backend> Vm<B> {
                 // is a compiler bug in a well-formed program; degrade to
                 // `Unknown` rather than erroring so a malformed schema
                 // hint does not take down the whole dispatch loop.
-                let (str_val, pat_val) = match (&string, &pattern) {
-                    (Value::String(s), Value::String(p)) => (s.as_ref(), p.as_ref()),
-                    _ => {
-                        self.stack.push(StackValue::Tri(Tri::Unknown));
-                        return Ok(());
-                    }
+                let (str_val, pat_val) = if let (Value::String(s), Value::String(p)) = (&string, &pattern) { (s.as_ref(), p.as_ref()) } else {
+                    self.stack.push(StackValue::Tri(Tri::Unknown));
+                    return Ok(());
                 };
 
                 let matched = if *case_sensitive {
@@ -597,7 +594,7 @@ fn simple_like(string: &str, pattern: &str) -> bool {
 
 /// `Value::Missing` / `Value::Null` on either side propagates to
 /// `Value::Null` (SQL NULL propagation).
-fn null_propagate_binary<B: Backend>(a: &Value<B>, b: &Value<B>) -> Option<Value<B>> {
+const fn null_propagate_binary<B: Backend>(a: &Value<B>, b: &Value<B>) -> Option<Value<B>> {
     if a.is_absent() || b.is_absent() {
         Some(Value::Null)
     } else {

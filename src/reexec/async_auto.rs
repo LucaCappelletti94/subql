@@ -122,7 +122,7 @@ where
 
 impl<E, I, DB, X> AsyncAutoResolvingEngine<E, I, DB, X>
 where
-    E: CdcEvent,
+    E: CdcEvent + Sync,
     E::Backend: SqlLiteralParse,
     I: IdTypes,
     DB: DatabaseLike + 'static,

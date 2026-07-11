@@ -739,7 +739,7 @@ fn probe_column_for_agg<E: CdcEvent>(
 }
 
 #[inline]
-fn presence_only<T>(presence: Presence<&T>) -> AggCellRead {
+const fn presence_only<T>(presence: Presence<&T>) -> AggCellRead {
     match presence {
         Presence::Missing => AggCellRead::Missing,
         Presence::Null => AggCellRead::Null,
