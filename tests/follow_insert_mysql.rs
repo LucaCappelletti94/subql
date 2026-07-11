@@ -1,5 +1,3 @@
-#![cfg(any())] // Blocked on wiring `src/diesel_api/mod.rs` into `lib.rs` (register_follow_insert lives there but isn't exported). Post-Phase 11 follow-up.
-
 //! Docker-backed integration test for the MySQL follow-on-insert story.
 //!
 //! MySQL has no `RETURNING`, so `SubscriptionEngine::register_follow_insert`
@@ -14,14 +12,17 @@
 //! ```sh
 //! cargo test --test follow_insert_mysql -- --ignored --nocapture
 //! ```
+#![cfg(feature = "diesel-typed-mysql")]
 #![allow(clippy::unwrap_used)]
 
 mod common;
 
 use diesel::prelude::*;
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::PostgreSqlDialect;
-use subql::{Cell, DefaultIds, SubscriptionEngine};
+use sqlparser::dialect::MySqlDialect;
+use subql::backend::{MySql, Value};
+use subql::testing::TestEvent;
+use subql::{DefaultIds, SubscriptionEngine};
 
 diesel::table! {
     users (id) {
@@ -43,9 +44,10 @@ fn follow_inserted_row_via_execute_returning_id() {
         .expect("CREATE TABLE users");
 
     let catalog =
-        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE users (id INT PRIMARY KEY, name TEXT);")
+        ParserDB::parse::<MySqlDialect>("CREATE TABLE users (id INT PRIMARY KEY, name TEXT);")
             .expect("catalog");
-    let mut engine = SubscriptionEngine::<_, DefaultIds, _>::new(catalog, PostgreSqlDialect {});
+    let mut engine =
+        SubscriptionEngine::<TestEvent<MySql>, DefaultIds, _>::new(catalog, MySqlDialect {});
 
     // MySQL has no RETURNING; `execute_returning_id` runs the insert and reads the
     // minted AUTO_INCREMENT key straight from the client library, no extra query.
@@ -59,8 +61,14 @@ fn follow_inserted_row_via_execute_returning_id() {
     // same id (same predicate -> same subscription), proving the key threaded
     // through correctly.
     let follow = engine
-        .follow_row(1, "users", vec![Cell::Int(i64::try_from(minted).unwrap())])
+        .follow_row(
+            1,
+            "users",
+            vec![Value::Int(i64::try_from(minted).unwrap())],
+        )
         .expect("follow row");
-    let explicit = engine.follow_row(1, "users", vec![Cell::Int(1)]).unwrap();
+    let explicit = engine
+        .follow_row(1, "users", vec![Value::Int(1)])
+        .unwrap();
     assert_eq!(follow.subscription_id, explicit.subscription_id);
 }
