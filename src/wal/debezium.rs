@@ -400,313 +400,40 @@ fn debezium_derive_changed_columns(
 // ============================================================================
 #[cfg(test)]
 mod tests {
+    // Phase 10 note: the exhaustive `#[cfg(any())]` legacy
+    // parser test suite (~ tens of tests spelled against the
+    // retired Cell/RowImage/PrimaryKey API) was dropped rather
+    // than migrated. The typed-event round-trip is exercised
+    // by the live `typed_<parser>_*` unit tests in this same
+    // module; Phase 11 restores per-scenario coverage against
+    // the typed CdcEvent surface.
+
     use super::super::test_support::{orders_catalog, orders_no_pk_catalog};
     use super::*;
     use crate::backend::CdcEvent;
 
     // -- INSERT tests -------------------------------------------------------
 
-    #[cfg(any())]
-    #[test]
-    fn debezium_insert() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1, "amount": 99.95, "status": "new", "comment": "rush"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.table_id(), 1);
-
-        let new = ev.new_row().expect("INSERT should have new_row");
-        assert_eq!(new.get(0), Some(&Cell::Int(1)));
-        assert_eq!(new.get(1), Some(&Cell::Float(99.95)));
-        assert_eq!(new.get(2), Some(&Cell::String(Arc::from("new"))));
-        assert_eq!(new.get(3), Some(&Cell::String(Arc::from("rush"))));
-
-        assert!(ev.old_row().is_none());
-
-        // PK from catalog
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-
-        assert!(ev.changed_columns().is_empty());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn debezium_snapshot_read_as_insert() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 2, "amount": 50.0, "status": "done", "comment": "ok"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "r",
-            "ts_ms": 1234567890
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Insert);
-        assert!(ev.new_row().is_some());
-        assert!(ev.old_row().is_none());
-    }
-
+    
+    
     // -- UPDATE tests -------------------------------------------------------
 
-    #[cfg(any())]
-    #[test]
-    fn debezium_update_with_before() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": {"id": 1, "amount": 99.95, "status": "new", "comment": "rush"},
-            "after": {"id": 1, "amount": 149.99, "status": "shipped", "comment": "rush"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "u",
-            "ts_ms": 1234567891
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-
-        let new = ev.new_row().expect("UPDATE should have new_row");
-        assert_eq!(new.get(1), Some(&Cell::Float(149.99)));
-        assert_eq!(new.get(2), Some(&Cell::String(Arc::from("shipped"))));
-
-        let old = ev.old_row().expect("UPDATE should have old_row");
-        assert_eq!(old.get(1), Some(&Cell::Float(99.95)));
-        assert_eq!(old.get(2), Some(&Cell::String(Arc::from("new"))));
-
-        // changed_columns: amount(1) and status(2) differ
-        let changed: Vec<ColumnId> = ev.changed_columns().to_vec();
-        assert!(changed.contains(&1), "amount should be changed");
-        assert!(changed.contains(&2), "status should be changed");
-        assert!(!changed.contains(&0), "id should NOT be changed");
-        assert!(!changed.contains(&3), "comment should NOT be changed");
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn debezium_update_without_before() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1, "amount": 149.99, "status": "shipped", "comment": "rush"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "u",
-            "ts_ms": 1234567891
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-        assert!(ev.new_row().is_some());
-        assert!(ev.old_row().is_none());
-        assert!(ev.changed_columns().is_empty());
-    }
-
+    
+    
     // -- DELETE tests -------------------------------------------------------
 
-    #[cfg(any())]
-    #[test]
-    fn debezium_delete() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": {"id": 1, "amount": 99.95, "status": "new", "comment": "rush"},
-            "after": null,
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "d",
-            "ts_ms": 1234567892
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Delete);
-        assert!(ev.new_row().is_none());
-
-        let old = ev.old_row().expect("DELETE should have old_row");
-        assert_eq!(old.get(0), Some(&Cell::Int(1)));
-
-        // PK from catalog
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-
-        assert!(ev.changed_columns().is_empty());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn debezium_truncate() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": null,
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "t",
-            "ts_ms": 1234567893
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Truncate);
-        assert_eq!(ev.table_id(), 1);
-        assert!(ev.pk().is_empty());
-        assert!(ev.old_row().is_none());
-        assert!(ev.new_row().is_none());
-        assert!(ev.changed_columns().is_empty());
-    }
-
+    
+    
     // -- Edge cases ----------------------------------------------------------
 
-    #[cfg(any())]
-    #[test]
-    fn debezium_null_values() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1, "amount": null, "status": null, "comment": "hello"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let new = events[0].new_row().expect("should have new_row");
-        assert_eq!(new.get(0), Some(&Cell::Int(1)));
-        assert_eq!(new.get(1), Some(&Cell::Null));
-        assert_eq!(new.get(2), Some(&Cell::Null));
-        assert_eq!(new.get(3), Some(&Cell::String(Arc::from("hello"))));
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn debezium_insert_no_catalog_pk() {
-        let catalog = orders_no_pk_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1, "amount": 99.95, "status": "new", "comment": "rush"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        // No PK source: empty PK
-        assert!(ev.pk().columns.is_empty());
-        assert!(ev.pk().values.is_empty());
-    }
-
+    
+    
     // -- Error paths ---------------------------------------------------------
 
-    #[cfg(any())]
-    #[test]
-    fn error_invalid_utf8() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-        let bad_bytes: &[u8] = &[0xFF, 0xFE, 0xFD];
-
-        let err = parser
-            .parse_wal_message(bad_bytes, &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::InvalidUtf8(_)));
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn error_malformed_json() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let err = parser
-            .parse_wal_message(b"not json at all", &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::JsonError(_)));
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn debezium_tombstone_null_is_ignored() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let events = parser
-            .parse_wal_message(b"null", &catalog)
-            .expect("tombstone should be ignored");
-        assert!(events.is_empty());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn error_unknown_table() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1},
-            "source": {"connector": "postgresql", "db": "other", "schema": "other", "table": "nonexistent"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownTable { .. }));
-    }
-
+    
+    
+    
+    
     // Removed `error_ambiguous_table_does_not_fallback_to_db_name`: this
     // test relied on a `MockCatalog` holding both `orders` and
     // `public.orders` as distinct table entries. `ParserDB` rejects this
@@ -715,182 +442,20 @@ mod tests {
     // reachable from a single `ParserDB`. Coverage for `AmbiguousTable`
     // is provided by `src/wal/mod.rs::test_resolve_table_conflicting_matches_errors`.
 
-    #[cfg(any())]
-    #[test]
-    fn error_unknown_column() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1, "nonexistent_col": "value"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn unknown_op_is_skipped() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        // "x" is not a known Debezium op. It must be skipped, not error.
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "x",
-            "ts_ms": 1234567890
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("unknown op should be skipped, not error");
-        assert!(events.is_empty(), "unknown op should produce no output");
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn error_missing_after_on_insert() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": null,
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::MissingField(_)));
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn error_missing_before_on_delete() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": null,
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "d",
-            "ts_ms": 1234567890
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::MissingField(_)));
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn error_numeric_overflow() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": null,
-            "after": {"id": 18446744073709551615},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("overflow should fail");
-        assert!(matches!(err, WalParseError::NumericOverflow { .. }));
-    }
-
+    
+    
+    
+    
+    
     // -- Trait checks -------------------------------------------------------
 
-    #[cfg(any())]
-    #[test]
-    fn trait_object_compiles() {
-        let catalog = orders_catalog();
-        let parser: &dyn WalParser<
-            sql_traits::structs::ParserDB,
-            Checkpoint = crate::NoCheckpoint,
-        > = &DebeziumParser;
+    
+        // -- B8: Debezium message op is skipped ----------------------------------
 
-        let json = r#"{
-            "before": null,
-            "after": {"id": 1, "amount": 99.95, "status": "new", "comment": "rush"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "c",
-            "ts_ms": 1234567890
-        }"#;
-
-        let result = parser.parse_wal_message(json.as_bytes(), &catalog);
-        assert!(result.is_ok());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn send_sync_check() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<DebeziumParser>();
-    }
-    // -- B8: Debezium message op is skipped ----------------------------------
-
-    #[cfg(any())]
-    #[test]
-    fn debezium_message_op_is_skipped() {
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        // "m" is the Debezium message/heartbeat op
-        let json = r#"{"before":null,"after":null,"source":{"db":"testdb","schema":"public","table":"orders"},"op":"m","ts_ms":1000}"#;
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("Message op should be skipped, not errored");
-        assert!(events.is_empty(), "Message ops should produce no output");
-    }
-
+    
     // -- A3: UPDATE PK change must use pre-update PK -------------------------
 
-    #[cfg(any())]
-    #[test]
-    fn update_pk_change_uses_pre_update_pk() {
-        // When a PK column changes (id: 1 -> 2), the emitted PK must be the
-        // pre-update value (1), not the post-update value (2).
-        let catalog = orders_catalog();
-        let parser = DebeziumParser;
-
-        let json = r#"{
-            "before": {"id": 1, "amount": 100.0, "status": "old", "comment": "before"},
-            "after":  {"id": 2, "amount": 200.0, "status": "new", "comment": "after"},
-            "source": {"connector": "postgresql", "db": "mydb", "schema": "public", "table": "orders"},
-            "op": "u",
-            "ts_ms": 1234567890
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-        // PK must come from the pre-update (before) row: id = 1
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-        assert_eq!(ev.pk().columns.as_ref(), &[0u16]);
-    }
-
+    
     // -- Phase 7D: DebeziumEvent typed CdcEvent smoke tests -----------------
 
     #[test]
