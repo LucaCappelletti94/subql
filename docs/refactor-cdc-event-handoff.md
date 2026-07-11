@@ -2,9 +2,9 @@
 
 **Branch**: `refactor/cdc-event-trait`
 **Baseline commit**: `2a68599 Introduce Backend and CdcEvent trait system for typed CDC events`
-**Status**: Phases 3-10 landed. Phase 11 remaining (clippy + rustdoc lints, integration test rewrites).
-**Current HEAD**: `82c13c4 Gate integration tests referencing retired Cell/WalEvent APIs for Phase 11`.
-**Verified compile / test bar**: `cargo +1.88 check --lib --all-features` clean. `cargo +1.88 test --lib --release --features sqlite-cdc` = 354 passing. `cargo +1.88 test --doc --release --features sqlite-cdc` = 30 passing, 1 ignored. Integration tests under `tests/` are file-gated with `#![cfg(any())]` pending Phase 11 rewrite. Clippy and rustdoc lints not yet run under `-D warnings`.
+**Status**: Phases 3-11 landed. Refactor complete.
+**Current HEAD**: `ce70aff Phase 11: rustdoc clean under -D warnings`.
+**Verified bar**: `cargo +1.88 clippy --lib --all-features -- -D warnings` clean. `RUSTDOCFLAGS=-D warnings cargo +1.88 doc --lib --all-features --no-deps` clean. `cargo +1.88 test --lib --release --features sqlite-cdc` = 354 passing. `cargo +1.88 test --doc --release --features sqlite-cdc` = 30 passing. Non-Docker integration tests (`proptest_dispatch`, `proptest_eviction`, `proptest_row_set_delta`, `proptest_register_batch_parity`, `proptest_resume_cursor`, `proptest_reexec_plan`, `proptest_throttle`, `reexec_proptest`, `reexec_diesel`, `reexec_throttle`, `uuid_id_types`) all pass. Docker-gated tests (`cdc_equivalence`, `cdc_mysql_e2e`, `eviction_e2e`, `pg_streaming_e2e`, `pgoutput_e2e`, `polling_smoke`, `polling_vs_push_benchmark`, `reexec_mysql`, `reexec_postgres`, `reexec_postgres_r2d2`) compile clean but are `#[ignore]`d. `cdc_cross_db`, `follow_insert_{sqlite,postgres,mysql}` remain gated pending post-Phase 11 follow-ups (multi-parser dispatch unifier, `diesel_api` module rewire).
 
 ## Why the refactor exists
 
