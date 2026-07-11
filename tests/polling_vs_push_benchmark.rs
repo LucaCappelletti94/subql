@@ -1,5 +1,3 @@
-#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
-
 //! # One-shot polling-vs-push latency benchmark
 //!
 //! Compares the two library transports, [`subql::PgStreamingCdcSource`]
@@ -53,8 +51,9 @@ use std::time::{Duration, Instant};
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::CdcEvent;
 use subql::{
-    CdcSource, Cell, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig, PollingPgCdcConfig,
+    CdcSource, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig, PollingPgCdcConfig,
     PollingPgCdcSource,
 };
 
@@ -173,7 +172,8 @@ fn spawn_receiver<S>(
     tokio::task::JoinHandle<()>,
 )
 where
-    S: CdcSource<Checkpoint = PgLsn> + Send + 'static,
+    S: CdcSource + Send + 'static,
+    S::Event: subql::backend::CdcEvent<Backend = subql::backend::Postgres, Checkpoint = PgLsn>,
 {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(i64, Instant)>();
     let task = tokio::spawn(async move {
@@ -185,11 +185,12 @@ where
             if ev.kind() != EventKind::Insert {
                 continue;
             }
-            let Some(row) = ev.new_row() else { continue };
-            let Some(Cell::Int(id)) = row.get(0) else {
+            let subql::backend::Presence::Present(id) =
+                ev.int_at(subql::backend::RowKind::New, 0)
+            else {
                 continue;
             };
-            if tx.send((*id, observed_at)).is_err() {
+            if tx.send((*id as i64, observed_at)).is_err() {
                 return;
             }
         }

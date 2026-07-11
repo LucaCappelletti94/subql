@@ -1,5 +1,3 @@
-#![cfg(any())] // Phase 11: rewrite against E: CdcEvent shape. SubscriptionEngine took <Dialect,...>, now takes <E: CdcEvent,...>. Tracked in docs/refactor-cdc-event-handoff.md.
-
 //! Docker-backed end-to-end test for the pgoutput binary replication parser.
 //!
 //! Spins up a real Postgres, creates a publication + pgoutput logical slot,
@@ -23,6 +21,7 @@ mod common;
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::CdcEvent;
 use subql::{EventKind, PgOutputParser, WalParser};
 
 const SLOT: &str = "subql_pgoutput_e2e";
@@ -92,8 +91,9 @@ fn pgoutput_stream_parses_insert_update_delete() {
     assert_eq!(
         events.len(),
         4,
-        "expected 2 INSERT + 1 UPDATE + 1 DELETE, got {} events: {events:?}",
+        "expected 2 INSERT + 1 UPDATE + 1 DELETE, got {} events (kinds: {:?})",
         events.len(),
+        events.iter().map(|e| e.kind()).collect::<Vec<_>>(),
     );
     assert_eq!(events[0].kind(), EventKind::Insert);
     assert_eq!(events[1].kind(), EventKind::Insert);
@@ -156,7 +156,7 @@ fn pgoutput_stream_handles_truncate() {
         .count();
     assert!(
         truncate_count >= 1,
-        "expected at least one TRUNCATE event, got events: {events:?}",
+        "expected at least one TRUNCATE event, got kinds: {:?}", events.iter().map(|e| e.kind()).collect::<Vec<_>>(),
     );
 
     sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))

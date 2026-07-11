@@ -1,5 +1,3 @@
-#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
-
 //! Docker-backed end-to-end tests for registry-cap eviction policies.
 //!
 //! Spins up a real Postgres with `wal2json`, registers subscriptions on a
@@ -30,9 +28,10 @@ use std::time::Duration;
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::Postgres;
 use subql::{
-    catalog_helpers, ClockHandle, DefaultIds, EvictionPolicy, ManualClock, PgLsn, RegisterError,
-    SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Parser, WalEvent, WalParser,
+    catalog_helpers, ClockHandle, DefaultIds, EvictionPolicy, ManualClock, RegisterError,
+    SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Event, Wal2JsonV2Parser, WalParser,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
@@ -42,7 +41,7 @@ fn drain_typed(
     parser: &Wal2JsonV2Parser,
     catalog: &ParserDB,
     msgs: &[String],
-) -> Vec<WalEvent<PgLsn>> {
+) -> Vec<Wal2JsonV2Event> {
     msgs.iter()
         .flat_map(|m| {
             parser
@@ -73,7 +72,7 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let _orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
         SubscriptionEngine::new(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             PostgreSqlDialect {},
@@ -81,19 +80,19 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
         .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
 
     let s_oldest = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             10u64,
             "SELECT * FROM orders WHERE id = 1",
         ))
         .expect("oldest");
     let s_keep = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             20u64,
             "SELECT * FROM orders WHERE id = 2",
         ))
         .expect("keep");
     let s_new = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             30u64,
             "SELECT * FROM orders WHERE id = 3",
         ))
@@ -169,7 +168,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     let clock = Arc::new(ManualClock::new(0));
     #[allow(clippy::clone_on_ref_ptr)] // explicit dyn-trait unsize coercion
     let handle: ClockHandle = clock.clone();
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
         SubscriptionEngine::new(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             PostgreSqlDialect {},
@@ -178,13 +177,13 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
         .with_activity_clock(handle);
 
     let s_a = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             1u64,
             "SELECT * FROM orders WHERE id = 1",
         ))
         .expect("s_a");
     let s_b = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             2u64,
             "SELECT * FROM orders WHERE id = 2",
         ))
@@ -213,7 +212,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
 
     // Register s_c -> evicts s_a (lowest last_dispatch_at).
     let s_c = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             3u64,
             "SELECT * FROM orders WHERE id = 3",
         ))
@@ -277,7 +276,7 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
     common::create_slot(&mut setup, slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
         SubscriptionEngine::new(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             PostgreSqlDialect {},
@@ -288,13 +287,13 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
     // both of them, one per over-cap entry, leaving only the batch entries
     // live afterwards.
     let pre1 = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             1u64,
             "SELECT * FROM orders WHERE id = 1",
         ))
         .expect("pre1");
     let pre2 = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             2u64,
             "SELECT * FROM orders WHERE id = 2",
         ))
@@ -302,8 +301,8 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
     assert_eq!(engine.subscription_count(), 2);
 
     let results = engine.register_batch(vec![
-        SubscriptionRequest::new(3u64, "SELECT * FROM orders WHERE id = 3"),
-        SubscriptionRequest::new(4u64, "SELECT * FROM orders WHERE id = 4"),
+        SubscriptionRequest::<DefaultIds, Postgres>::new(3u64, "SELECT * FROM orders WHERE id = 3"),
+        SubscriptionRequest::<DefaultIds, Postgres>::new(4u64, "SELECT * FROM orders WHERE id = 4"),
     ]);
     let r0 = results[0].as_ref().expect("entry 0");
     let r1 = results[1].as_ref().expect("entry 1");
@@ -375,7 +374,7 @@ fn register_batch_cannot_evict_in_flight_entries() {
     let slot = "subql_evict_batch_limit_slot";
     common::create_slot(&mut setup, slot);
 
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
         SubscriptionEngine::new(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             PostgreSqlDialect {},
@@ -383,7 +382,7 @@ fn register_batch_cannot_evict_in_flight_entries() {
         .with_max_subscriptions(1, EvictionPolicy::EvictOldest);
 
     let _pre = engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             1u64,
             "SELECT * FROM orders WHERE id = 1",
         ))
@@ -394,9 +393,9 @@ fn register_batch_cannot_evict_in_flight_entries() {
     // 1/2 would need to evict from the batch's own pending state, which
     // is not supported, so they return RegistryFull.
     let results = engine.register_batch(vec![
-        SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE id = 2"),
-        SubscriptionRequest::new(3u64, "SELECT * FROM orders WHERE id = 3"),
-        SubscriptionRequest::new(4u64, "SELECT * FROM orders WHERE id = 4"),
+        SubscriptionRequest::<DefaultIds, Postgres>::new(2u64, "SELECT * FROM orders WHERE id = 2"),
+        SubscriptionRequest::<DefaultIds, Postgres>::new(3u64, "SELECT * FROM orders WHERE id = 3"),
+        SubscriptionRequest::<DefaultIds, Postgres>::new(4u64, "SELECT * FROM orders WHERE id = 4"),
     ]);
     assert!(results[0].is_ok(), "entry 0 evicts the committed pre");
     assert!(matches!(
@@ -433,7 +432,7 @@ fn reject_keeps_existing_subscriptions_intact() {
     common::create_slot(&mut setup, slot);
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
         SubscriptionEngine::new(
             ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
             PostgreSqlDialect {},
@@ -441,12 +440,12 @@ fn reject_keeps_existing_subscriptions_intact() {
         .with_max_subscriptions(1, EvictionPolicy::Reject);
 
     engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             1u64,
             "SELECT * FROM orders WHERE id = 1",
         ))
         .expect("first fits");
-    match engine.register(SubscriptionRequest::new(
+    match engine.register(SubscriptionRequest::<DefaultIds, Postgres>::new(
         2u64,
         "SELECT * FROM orders WHERE id = 2",
     )) {

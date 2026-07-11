@@ -1,5 +1,3 @@
-#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
-
 //! Docker-backed integration test for [`PgR2D2DieselConnector`].
 //!
 //! Exercises the pool-backed PG connector: a captured `MIN(price)`
@@ -30,8 +28,9 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::reexec::{
     AutoResolvingEngine, PgR2D2DieselConnector, ReExecEngine, Registered, SnapshotResult,
 };
+use subql::backend::{CdcEvent, Postgres, Value};
 use subql::{
-    Cell, DefaultIds, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Parser, WalEvent,
+    DefaultIds, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Event, Wal2JsonV2Parser,
     WalParser,
 };
 
@@ -79,8 +78,8 @@ fn build_pool(port: u16) -> r2d2::Pool<ConnectionManager<PgConnection>> {
 fn build_engine(
     catalog: ParserDB,
     pool: r2d2::Pool<ConnectionManager<PgConnection>>,
-) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, PgR2D2DieselConnector> {
-    let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
+) -> AutoResolvingEngine<Wal2JsonV2Event, DefaultIds, ParserDB, PgR2D2DieselConnector> {
+    let inner = SubscriptionEngine::<Wal2JsonV2Event, DefaultIds, ParserDB>::new(
         catalog,
         PostgreSqlDialect {},
     );
@@ -91,7 +90,7 @@ fn parse_message(
     parser: &Wal2JsonV2Parser,
     catalog: &ParserDB,
     msg: &str,
-) -> Vec<WalEvent<subql::PgLsn>> {
+) -> Vec<Wal2JsonV2Event> {
     parser
         .parse_wal_message(msg.as_bytes(), catalog)
         .expect("wal2json parse")
@@ -116,7 +115,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
 
     let captured_qid = match engine
         .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, "SELECT MIN(price) FROM orders"),
             (),
         )
         .expect("captured registration")
@@ -132,10 +131,9 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
         .expect("query_id exists");
     let (value, snapshot_lsn) = match snap {
         SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
-        SnapshotResult::Rows(_, _) => panic!("expected Scalar variant"),
         other => panic!("unexpected variant: {other:?}"),
     };
-    assert_eq!(value, Cell::Float(5.0));
+    assert_eq!(value, Value::Float(5.0));
     let snapshot_lsn = snapshot_lsn.expect("PgR2D2DieselConnector must report a checkpoint");
     assert!(
         snapshot_lsn > subql::PgLsn(0),
@@ -150,7 +148,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
 
     let msgs = common::drain_slot(&mut conn_setup, SLOT);
     let parser = Wal2JsonV2Parser;
-    let mut events: Vec<WalEvent<subql::PgLsn>> = Vec::new();
+    let mut events: Vec<Wal2JsonV2Event> = Vec::new();
     for msg in &msgs {
         events.extend(parse_message(&parser, &catalog(), msg));
     }
@@ -158,7 +156,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
 
     let notifs = engine.consumers(&events[0]).expect("consumers dispatch");
     assert_eq!(notifs.scalar_updates.len(), 1);
-    assert_eq!(notifs.scalar_updates[0].value, Cell::Float(9.0));
+    assert_eq!(notifs.scalar_updates[0].value, Value::Float(9.0));
     // The re-execution LSN should be at or after the snapshot LSN
     // (clock-monotonic). Use the event's checkpoint, propagated into
     // the ScalarUpdate.
