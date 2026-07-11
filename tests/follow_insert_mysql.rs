@@ -1,4 +1,4 @@
-#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
+#![cfg(any())] // Blocked on wiring `src/diesel_api/mod.rs` into `lib.rs` (register_follow_insert lives there but isn't exported). Post-Phase 11 follow-up.
 
 //! Docker-backed integration test for the MySQL follow-on-insert story.
 //!
