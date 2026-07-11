@@ -89,7 +89,7 @@ pub trait CdcSource: Send {
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
-#[cfg(all(test, any()))]
+#[cfg(test)]
 mod tests {
     // `manual_async_fn` would have us write `async fn next_event(...)`
     // but bare `async fn in trait` does not produce `Send` futures,
@@ -98,60 +98,38 @@ mod tests {
     #![allow(clippy::manual_async_fn)]
 
     use super::*;
-    use crate::{NoCheckpoint, PgLsn, WalEvent};
+    use crate::backend::Postgres;
+    use crate::testing::TestEvent;
+    use crate::NoCheckpoint;
     use core::convert::Infallible;
     use core::future::Future;
 
-    /// A handwritten `NoCheckpoint` impl that proves the trait is
+    /// A handwritten `CdcSource` impl that proves the trait is
     /// implementable and the returned futures are `Send`.
     struct NoopSource;
 
     impl CdcSource for NoopSource {
-        type Checkpoint = NoCheckpoint;
+        type Event = TestEvent<Postgres>;
         type Error = Infallible;
 
         fn next_event(
             &mut self,
-        ) -> impl Future<Output = Result<Option<WalEvent<Self::Checkpoint>>, Self::Error>> + Send
-        {
+        ) -> impl Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
             async { Ok(None) }
         }
 
         fn ack(
             &mut self,
-            _upto: Self::Checkpoint,
+            _upto: <Self::Event as crate::backend::CdcEvent>::Checkpoint,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             async { Ok(()) }
         }
     }
 
-    /// A second mock with `Checkpoint = PgLsn` proves the trait's
-    /// associated-type bound composes against the concrete PG position
-    /// type that the streaming impl will use.
-    struct PgLsnSource;
-
-    impl CdcSource for PgLsnSource {
-        type Checkpoint = PgLsn;
-        type Error = Infallible;
-
-        fn next_event(
-            &mut self,
-        ) -> impl Future<Output = Result<Option<WalEvent<Self::Checkpoint>>, Self::Error>> + Send
-        {
-            async { Ok(None) }
-        }
-
-        fn ack(
-            &mut self,
-            _upto: Self::Checkpoint,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            async { Ok(()) }
-        }
-    }
-
-    fn accept_pglsn_source<S>(_: &S)
+    fn accept_no_checkpoint_source<S>(_: &S)
     where
-        S: CdcSource<Checkpoint = PgLsn> + Send,
+        S: CdcSource + Send,
+        S::Event: crate::backend::CdcEvent<Checkpoint = NoCheckpoint>,
     {
     }
 
@@ -160,7 +138,6 @@ mod tests {
     #[test]
     fn cdc_source_send_bounds_compose() {
         assert_send::<NoopSource>();
-        assert_send::<PgLsnSource>();
-        accept_pglsn_source(&PgLsnSource);
+        accept_no_checkpoint_source(&NoopSource);
     }
 }

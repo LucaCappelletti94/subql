@@ -104,7 +104,7 @@ where
     }
 }
 
-#[cfg(any())] // Phase 10 test port pending
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     //! Property-based tests for [`values_equal`] and

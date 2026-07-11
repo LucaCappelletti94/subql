@@ -276,7 +276,7 @@ impl<B: Backend> BytecodeProgram<B> {
     }
 }
 
-#[cfg(any())] // Phase 10 test port pending
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::Postgres;

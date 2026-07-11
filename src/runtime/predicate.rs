@@ -362,14 +362,15 @@ impl<I: IdTypes, B: Backend> Default for PredicateStore<I, B> {
     }
 }
 
-#[cfg(any())] // Phase 10 test port pending
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::clone_on_copy)]
 mod tests {
     use super::*;
+    use crate::backend::Postgres;
     use crate::compiler::{Instruction, PrefilterPlan};
     use crate::DefaultIds;
 
-    fn make_predicate(id: usize, hash: u128, refcount: u32) -> Predicate {
+    fn make_predicate(id: usize, hash: u128, refcount: u32) -> Predicate<Postgres> {
         Predicate {
             id: PredicateId::from_slab_index(id),
             hash,
@@ -386,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_add_and_find_predicate() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0x1234, 1);
         let id = store.add_predicate(pred);
@@ -397,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_refcount_increment() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0x1234, 1);
         let id = store.add_predicate(pred);
@@ -410,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_refcount_decrement() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0x1234, 2);
         let id = store.add_predicate(pred);
@@ -426,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_binding_lifecycle() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let binding = SubscriptionBinding {
             subscription_id: 100,
@@ -449,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_predicate_consumers_bitmap() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred_id = PredicateId::from_slab_index(0);
 
@@ -482,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_add_binding_overwrite_cleans_secondary_indexes() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred1 = make_predicate(0, 0x1111, 0);
         let pred2 = make_predicate(1, 0x2222, 0);
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_remove_binding_keeps_bitmap_when_same_consumer_has_another_binding() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0x3333, 0);
         let pred_id = store.add_predicate(pred);
@@ -558,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_increment_refcount_nonexistent() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         // Try to increment refcount of non-existent predicate
         let fake_id = PredicateId::from_slab_index(999);
@@ -568,7 +569,7 @@ mod tests {
 
     #[test]
     fn test_decrement_refcount_nonexistent() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         // Try to decrement refcount of non-existent predicate
         let fake_id = PredicateId::from_slab_index(999);
@@ -578,13 +579,13 @@ mod tests {
 
     #[test]
     fn test_predicate_store_default() {
-        let store = PredicateStore::<DefaultIds>::default();
+        let store = PredicateStore::<DefaultIds, Postgres>::default();
         assert!(store.predicates.is_empty());
     }
 
     #[test]
     fn test_predicate_store_rejects_or_normalizes_mismatched_predicate_id() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         // Intentionally provide an ID that does not match the first free slab slot.
         let pred = make_predicate(99, 0xBEEF, 1);
@@ -606,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_hash_collision_lookup_uses_normalized_sql() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let mut pred1 = make_predicate(0, 0x00C0_FFEE, 1);
         pred1.normalized_sql = "amount > 100".into();
@@ -633,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_is_consumer_referenced() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0xAABB, 1);
         let pred_id = store.add_predicate(pred);
@@ -659,7 +660,7 @@ mod tests {
     /// after dispatch matches a predicate.
     #[test]
     fn test_binding_lookup_resolves_subscription_id() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
         let pred = make_predicate(0, 0xBEEF, 1);
         let pred_id = store.add_predicate(pred);
         let ord = ConsumerOrdinal::new(7);
@@ -690,7 +691,7 @@ mod tests {
     /// surface from `binding_lookup`.
     #[test]
     fn test_binding_lookup_handles_multiple_scopes_per_pair() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
         let pred = make_predicate(0, 0xCAFE, 1);
         let pred_id = store.add_predicate(pred);
         let ord = ConsumerOrdinal::new(0);
@@ -730,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_active_consumer_ids() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0xCCDD, 1);
         let pred_id = store.add_predicate(pred);

@@ -47,6 +47,7 @@ mod types;
 
 pub mod backend;
 pub mod catalog_helpers;
+pub mod testing;
 pub mod checkpoint;
 pub mod clock;
 pub mod compiler;
