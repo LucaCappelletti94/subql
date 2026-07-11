@@ -1,5 +1,3 @@
-#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
-
 //! Docker-backed end-to-end tests for [`PgStreamingCdcSource`].
 //!
 //! Each test is `#[ignore]` so default `cargo test` does not require
@@ -24,7 +22,8 @@ use std::time::{Duration, Instant};
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::{CdcSource, Cell, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig};
+use subql::backend::CdcEvent;
+use subql::{CdcSource, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig};
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price DOUBLE PRECISION)";
@@ -440,10 +439,9 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
                 .expect("next_event err")
                 .expect("source closed");
             assert_eq!(ev.kind(), EventKind::Insert);
-            let row = ev.new_row().expect("INSERT carries new_row");
-            let id = match row.get(0) {
-                Some(Cell::Int(v)) => *v,
-                other => panic!("expected Cell::Int id, got {other:?}"),
+            let id = match ev.int_at(subql::backend::RowKind::New, 0) {
+                subql::backend::Presence::Present(v) => *v,
+                other => panic!("expected int id, got {other:?}"),
             };
             observed_ids.push(id);
         }

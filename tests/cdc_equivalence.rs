@@ -1,26 +1,10 @@
-#![cfg(any())] // Phase 11: rewrite against Value<B> + TestEvent<B>. Retired Cell/WalEvent/RowImage/PrimaryKey/ColumnType api. Tracked in docs/refactor-cdc-event-handoff.md.
-
 //! Differential equivalence test: push + poll observe the same WAL.
 //!
 //! Drives a deterministic mixed-DML stream against a real Postgres
 //! through TWO slots (one per `CdcSource` impl). Both transports
 //! drain concurrently. The test asserts that after canonicalization
-//! (LSN stripped. Ack-driven divergence removed), both observed the
+//! (LSN stripped, ack-driven divergence removed), both observed the
 //! same events in the same commit order.
-//!
-//! Catches a class of regressions that single-transport tests do not:
-//!
-//! - **pgoutput parser bugs** that affect certain message shapes.
-//!   If the parser misinterprets a tuple-data byte, both transports
-//!   show the same wrong result. If the parser's behavior differs
-//!   between callers (e.g. state leaks across messages), one
-//!   transport diverges and this test catches it.
-//! - **`pg_walstream` stream-framing regressions.** The push source
-//!   reads events from `pg_walstream`'s native backend via
-//!   `START_REPLICATION`. Polling reads them via
-//!   `pg_logical_slot_get_binary_changes`. If a `pg_walstream` bump
-//!   silently changes stream framing on the push side, push diverges
-//!   from poll and this test catches it.
 
 #![cfg(feature = "pg-streaming")]
 #![allow(
@@ -36,9 +20,10 @@ use std::time::Duration;
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{CdcEvent, Presence, RowKind, Value};
 use subql::{
-    CdcSource, Cell, ColumnId, EventKind, PgStreamingCdcSource, PgStreamingConfig,
-    PollingPgCdcConfig, PollingPgCdcSource, PrimaryKey, RowImage, TableId, WalEvent,
+    CdcSource, ColumnId, EventKind, PgStreamingCdcSource, PgStreamingConfig,
+    PollingPgCdcConfig, PollingPgCdcSource, TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
@@ -53,85 +38,94 @@ fn current_thread_rt() -> tokio::runtime::Runtime {
 
 /// Structural canonical form of an event for cross-transport comparison.
 /// LSN and any transport-specific metadata are intentionally stripped.
-///
-/// Comparison is done by [`canonical_eq`] rather than `derive(PartialEq)`
-/// because `Cell::Float(f64)` blocks `Eq` and `RowImage` does not derive
-/// `PartialEq`. The comparator walks structurally and uses `Cell`'s own
-/// `PartialEq` for cell-by-cell equality.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct CanonicalEvent {
     table_id: TableId,
     kind: EventKind,
-    pk: PrimaryKey,
-    new_row: Option<RowImage>,
-    old_row: Option<RowImage>,
+    pk_columns: Vec<ColumnId>,
+    pk_ints: Vec<Option<i64>>,
+    new_row: Option<Vec<CanonicalCell>>,
+    old_row: Option<Vec<CanonicalCell>>,
     changed_columns: Vec<ColumnId>,
 }
 
-fn rows_equivalent(a: &RowImage, b: &RowImage) -> bool {
-    if a.cells.len() != b.cells.len() {
-        return false;
-    }
-    a.cells.iter().zip(b.cells.iter()).all(|(x, y)| x == y)
+/// Two-column canonical cell for the `orders (id INT, price FLOAT)`
+/// schema. `Missing` covers `Presence::Missing`. The float column stores
+/// bit-patterns for `Eq`.
+#[derive(Debug, Clone, PartialEq)]
+enum CanonicalCell {
+    Missing,
+    Null,
+    Int(i64),
+    FloatBits(u64),
 }
 
-fn pks_equivalent(a: &PrimaryKey, b: &PrimaryKey) -> bool {
-    if a.columns().len() != b.columns().len() {
-        return false;
+fn canonicalize_cell<E: CdcEvent<Backend = subql::backend::Postgres>>(
+    ev: &E,
+    row: RowKind,
+    col: ColumnId,
+) -> CanonicalCell {
+    match col {
+        0 => match ev.int_at(row, col) {
+            Presence::Missing => CanonicalCell::Missing,
+            Presence::Null => CanonicalCell::Null,
+            Presence::Present(v) => CanonicalCell::Int(*v),
+        },
+        1 => match ev.float_at(row, col) {
+            Presence::Missing => CanonicalCell::Missing,
+            Presence::Null => CanonicalCell::Null,
+            Presence::Present(v) => CanonicalCell::FloatBits(v.to_bits()),
+        },
+        _ => CanonicalCell::Missing,
     }
-    if a.values().len() != b.values().len() {
-        return false;
-    }
-    a.columns()
+}
+fn row_present<E: CdcEvent<Backend = subql::backend::Postgres>>(
+    ev: &E,
+    row: RowKind,
+    cols: &[ColumnId],
+) -> Option<Vec<CanonicalCell>> {
+    let cells: Vec<CanonicalCell> = cols
         .iter()
-        .zip(b.columns().iter())
-        .all(|(x, y)| x == y)
-        && a.values()
-            .iter()
-            .zip(b.values().iter())
-            .all(|(x, y)| x == y)
+        .map(|&c| canonicalize_cell(ev, row, c))
+        .collect();
+    if cells.iter().all(|c| matches!(c, CanonicalCell::Missing)) {
+        None
+    } else {
+        Some(cells)
+    }
 }
 
-fn canonical_eq(a: &CanonicalEvent, b: &CanonicalEvent) -> bool {
-    if a.table_id != b.table_id || a.kind != b.kind {
-        return false;
-    }
-    if !pks_equivalent(&a.pk, &b.pk) {
-        return false;
-    }
-    if a.changed_columns != b.changed_columns {
-        return false;
-    }
-    let new_row_ok = match (&a.new_row, &b.new_row) {
-        (None, None) => true,
-        (Some(x), Some(y)) => rows_equivalent(x, y),
-        _ => false,
+fn canonicalize<E: CdcEvent<Backend = subql::backend::Postgres>>(ev: &E) -> CanonicalEvent {
+    let all_cols: Vec<ColumnId> = (0..=1).collect();
+    let pk_columns: Vec<ColumnId> = ev.pk_columns().to_vec();
+    let pk_ints: Vec<Option<i64>> = pk_columns
+        .iter()
+        .map(|&c| match ev.int_at(RowKind::Pk, c) {
+            Presence::Present(v) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    let (new_row, old_row) = match ev.kind() {
+        EventKind::Insert => (row_present(ev, RowKind::New, &all_cols), None),
+        EventKind::Update => (
+            row_present(ev, RowKind::New, &all_cols),
+            row_present(ev, RowKind::Old, &all_cols),
+        ),
+        EventKind::Delete => (None, row_present(ev, RowKind::Old, &all_cols)),
+        EventKind::Truncate => (None, None),
     };
-    if !new_row_ok {
-        return false;
-    }
-    match (&a.old_row, &b.old_row) {
-        (None, None) => true,
-        (Some(x), Some(y)) => rows_equivalent(x, y),
-        _ => false,
-    }
-}
-
-fn canonicalize<C>(ev: &WalEvent<C>) -> CanonicalEvent
-where
-    C: subql::Checkpoint,
-{
     CanonicalEvent {
         table_id: ev.table_id(),
         kind: ev.kind(),
-        pk: ev.pk().clone(),
-        new_row: ev.new_row().cloned(),
-        old_row: ev.old_row().cloned(),
+        pk_columns,
+        pk_ints,
+        new_row,
+        old_row,
         changed_columns: ev.changed_columns().to_vec(),
     }
 }
 
-async fn drain_n<S>(source: &mut S, n: usize) -> Vec<WalEvent<S::Checkpoint>>
+async fn drain_n<S>(source: &mut S, n: usize) -> Vec<S::Event>
 where
     S: CdcSource,
 {
@@ -161,10 +155,6 @@ fn push_and_poll_observe_identical_event_streams() {
         .execute(&mut setup)
         .expect("REPLICA IDENTITY FULL");
 
-    // One publication, two slots. Each slot is independent so both
-    // transports observe the same WAL stream without stealing events
-    // from each other. The polling source's drain auto-advances ITS
-    // slot; the push source's slot stays where the push side has acked.
     let publication = "subql_equiv_pub";
     common::create_publication(&mut setup, publication, "orders");
     let push_slot = "subql_equiv_push";
@@ -178,9 +168,6 @@ fn push_and_poll_observe_identical_event_streams() {
     let poll_config = PollingPgCdcConfig::new(common::pg_url(port), poll_slot, publication)
         .poll_interval(Duration::from_millis(50));
 
-    // Deterministic DML stream: 5 inserts, 3 updates, 2 deletes. The
-    // exact pattern is recorded so both transports must show identical
-    // event sequences after canonicalization.
     const N_INSERTS: i32 = 5;
     const N_UPDATES: i32 = 3;
     const N_DELETES: i32 = 2;
@@ -197,10 +184,6 @@ fn push_and_poll_observe_identical_event_streams() {
         .await
         .expect("connect poll source");
 
-        // Drive deterministic DML. All commits happen BEFORE either
-        // source begins draining; this is a correctness test, not a
-        // latency test, so ordering of "produce vs drain" doesn't
-        // matter as long as both transports observe the same WAL.
         for id in 1..=N_INSERTS {
             sql_query(format!("INSERT INTO orders VALUES ({id}, {}.0)", id * 10))
                 .execute(&mut dml)
@@ -220,9 +203,6 @@ fn push_and_poll_observe_identical_event_streams() {
                 .unwrap_or_else(|e| panic!("delete id={id}: {e}"));
         }
 
-        // Drain concurrently into Vecs. tokio::join! polls both
-        // sequentially on current-thread runtime, but since each await
-        // point yields, both make progress.
         let (push_events, poll_events) = tokio::join!(
             drain_n(&mut push_source, N_TOTAL),
             drain_n(&mut poll_source, N_TOTAL)
@@ -234,17 +214,13 @@ fn push_and_poll_observe_identical_event_streams() {
         let push_canon: Vec<CanonicalEvent> = push_events.iter().map(canonicalize).collect();
         let poll_canon: Vec<CanonicalEvent> = poll_events.iter().map(canonicalize).collect();
 
-        // Index-by-index comparison so the failure message points at
-        // the first divergent event rather than dumping both vectors.
         for (i, (p, q)) in push_canon.iter().zip(poll_canon.iter()).enumerate() {
-            assert!(
-                canonical_eq(p, q),
-                "push and poll diverged at event {i}:\n  push: {p:?}\n  poll: {q:?}\n\
-                 exactly one of: push parser bug / poll harness bug / PG drift"
+            assert_eq!(
+                p, q,
+                "push and poll diverged at event {i}: exactly one of push parser bug / poll harness bug / PG drift",
             );
         }
 
-        // Sanity-check the shape too: expect inserts then updates then deletes.
         let kinds: Vec<EventKind> = push_canon.iter().map(|e| e.kind).collect();
         assert_eq!(
             &kinds[..N_INSERTS as usize],
@@ -262,14 +238,20 @@ fn push_and_poll_observe_identical_event_streams() {
             "final {N_DELETES} events must be DELETEs"
         );
 
-        // Quick sanity-check on data integrity for one event.
         // First INSERT was id=1, price=10.0.
-        if let WalEvent::Insert { new_row, .. } = &push_events[0] {
-            assert_eq!(new_row.get(0), Some(&Cell::Int(1)));
-            assert_eq!(new_row.get(1), Some(&Cell::Float(10.0)));
-        } else {
-            panic!("first event must be Insert");
-        }
+        let first = &push_events[0];
+        assert_eq!(first.kind(), EventKind::Insert);
+        assert!(matches!(
+            first.int_at(RowKind::New, 0),
+            Presence::Present(v) if *v == 1
+        ));
+        assert!(matches!(
+            first.float_at(RowKind::New, 1),
+            Presence::Present(v) if (*v - 10.0).abs() < f64::EPSILON
+        ));
+        // Value import silences unused warning when the two matches
+        // trigger their branches.
+        let _ = Value::<subql::backend::Postgres>::Null;
 
         println!("push and poll observed identical {N_TOTAL} events (canonical equality)");
     });

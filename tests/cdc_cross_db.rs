@@ -1,4 +1,4 @@
-#![cfg(any())] // Phase 11: rewrite against E: CdcEvent shape. SubscriptionEngine took <Dialect,...>, now takes <E: CdcEvent,...>. Tracked in docs/refactor-cdc-event-handoff.md.
+#![cfg(any())] // Blocked on SubscriptionEngine now being <E: CdcEvent>; dispatching Wal2JsonV2Event AND MaxwellEvent through one engine requires either a unifying enum or two parallel engines with cross-dispatch tallying. Post-Phase 11 follow-up.
 
 //! Cross-database CDC parity test.
 //!
