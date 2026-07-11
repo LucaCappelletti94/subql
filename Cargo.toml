@@ -262,6 +262,23 @@ r2d2 = { version = "0.8", optional = true }
 # libz C deps it transitively pulls.
 pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
 
+# SQLite session-extension binary formats (changeset / patchset). Backs
+# the Phase 8 `SqlitePatchsetParser`: parses patchset bytes into typed
+# `CdcEvent` instances. `no_std + alloc` posture; no C deps. Default
+# features off so subql's feature surface picks exactly what it needs
+# (the `wal2json`/`debezium`/`maxwell`/`pg-walstream` adapters ship
+# patchset-*builders* for reverse-direction PG-to-SQLite sync and are
+# not needed for subql's inbound parser).
+sqlite-diff-rs = { version = "0.1", default-features = false, optional = true }
+
+# Diesel wrapper around SQLite's session extension. Backs the Phase 8
+# `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables to
+# a session, and calls `.patchset()` to surface the accumulated change
+# bytes for `SqlitePatchsetParser` to decode. Requires the Diesel
+# `future` branch already pinned in the top-level `[patch.crates-io]`
+# block (upstream diesel PR #4966).
+diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session", optional = true }
+
 # Future-combinator helpers (FuturesUnordered + StreamExt) used by the
 # async auto-resolving engine to dispatch deduplicated triggers
 # concurrently. `alloc` feature only. We do not depend on std-only
