@@ -289,8 +289,8 @@ where
     /// The schema catalog the engine resolves tables/columns against.
     ///
     /// Borrow it when you need to read the schema alongside a live engine
-    /// (e.g. to resolve a `TableId` for building `WalEvent`s) without keeping
-    /// a separate catalog instance.
+    /// (e.g. to resolve a `TableId` for building a typed [`CdcEvent`]
+    /// fixture) without keeping a separate catalog instance.
     pub const fn database(&self) -> &DB {
         &self.database
     }

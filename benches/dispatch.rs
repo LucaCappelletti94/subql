@@ -227,7 +227,7 @@ fn build_scaling_engine(
 }
 
 /// Bench fixture catalog. A placeholder table is declared so the `orders`
-/// table id is stable at 1 (matching `WalEvent::builder(1)` in events).
+/// table id is stable at 1 (matching `TestEvent::<Postgres>::insert(1, ...)`).
 fn bench_catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE _bench_pad (id INT);\n\

@@ -4,7 +4,7 @@
 //! applies INSERT/UPDATE/DELETE through a side connection, drains the slot
 //! as raw `bytea` messages via `pg_logical_slot_get_binary_changes`, and
 //! feeds each message through [`subql::PgOutputParser`]. Asserts that the
-//! parser surfaces typed `WalEvent`s with the right kinds and primary
+//! parser surfaces typed CDC events with the right kinds and primary
 //! keys.
 //!
 //! Tests are `#[ignore]`d so default `cargo test` does not require Docker.

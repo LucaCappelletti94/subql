@@ -471,16 +471,6 @@ mod tests {
     use super::*;
     use crate::backend::CdcEvent;
 
-    // -- INSERT tests -------------------------------------------------------
-
-    // -- UPDATE tests -------------------------------------------------------
-
-    // -- DELETE tests -------------------------------------------------------
-
-    // -- Edge cases ----------------------------------------------------------
-
-    // -- Error paths ---------------------------------------------------------
-
     // Removed `error_ambiguous_table_does_not_fallback_to_db_name`: this
     // test relied on a `MockCatalog` holding both `orders` and
     // `public.orders` as distinct table entries. `ParserDB` rejects this
@@ -488,12 +478,6 @@ mod tests {
     // `public.orders` implicitly), so the ambiguity path is no longer
     // reachable from a single `ParserDB`. Coverage for `AmbiguousTable`
     // is provided by `src/wal/mod.rs::test_resolve_table_conflicting_matches_errors`.
-
-    // -- Trait checks -------------------------------------------------------
-
-    // -- B8: Debezium message op is skipped ----------------------------------
-
-    // -- A3: UPDATE PK change must use pre-update PK -------------------------
 
     // -- Phase 7D: DebeziumEvent typed CdcEvent smoke tests -----------------
 
@@ -763,6 +747,62 @@ mod tests {
         assert_eq!(
             event.int_at(crate::backend::RowKind::Pk, 0),
             crate::backend::Presence::Missing
+        );
+    }
+
+    // -- malformed JSON ---------------------------------------------------
+
+    #[test]
+    fn typed_debezium_malformed_json_envelope_errors() {
+        let database = orders_catalog();
+        let result = DebeziumParser.parse_wal_message(b"{broken", &database);
+        assert!(matches!(result, Err(WalParseError::JsonError(_))));
+    }
+
+    // -- missing op field --------------------------------------------------
+
+    #[test]
+    fn typed_debezium_missing_op_field_errors() {
+        let database = orders_catalog();
+        // Valid JSON with before/after/source but no op field.
+        // op: String is required on DebeziumEnvelope, so serde
+        // returns a deserialize error which maps to JsonError.
+        let msg = r#"{"before":null,"after":{"id":1},"source":{"db":"d","schema":"s","table":"orders"},"ts_ms":0}"#;
+        let result = DebeziumParser.parse_wal_message(msg.as_bytes(), &database);
+        assert!(matches!(result, Err(WalParseError::JsonError(_))));
+    }
+
+    // -- before/after type mismatch, deferred to accessor ------------------
+
+    #[test]
+    fn typed_debezium_before_after_shape_mismatch_errors() {
+        let database = orders_catalog();
+        // UPDATE with before.id as string "one" and after.id as integer 1.
+        // Debezium stores raw JSON values and defers typing to accessor
+        // calls via infer_pg_value_from_json_strict. Parse succeeds,
+        // but int_at on the Old image returns Missing because the string
+        // "one" infers to Value::String which does not match Int.
+        let msg = r#"{
+            "before": {"id": "one"},
+            "after":  {"id": 1},
+            "source": {"db": "d", "schema": "s", "table": "orders"},
+            "op": "u",
+            "ts_ms": 0
+        }"#;
+        let events = DebeziumParser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds with type mismatch deferred");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Update);
+        // Type mismatch surfaced as Missing on accessor, not hard error.
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&1)
         );
     }
 }

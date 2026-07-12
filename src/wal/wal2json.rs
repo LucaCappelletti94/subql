@@ -992,52 +992,6 @@ mod tests {
     // resolved table always exposes its column count, so the "arity missing"
     // failure mode is no longer reachable.
 
-    // -- v1 INSERT -----------------------------------------------------------
-
-    // -- v1 UPDATE -----------------------------------------------------------
-
-    // -- v1 DELETE -----------------------------------------------------------
-
-    // -- v1 multi-change transaction -----------------------------------------
-
-    // -- v2 INSERT -----------------------------------------------------------
-
-    // -- v2 UPDATE -----------------------------------------------------------
-
-    // -- v2 DELETE -----------------------------------------------------------
-
-    // -- Error paths ---------------------------------------------------------
-
-    // -- B1: v1 unknown kind is skipped -------------------------------------
-
-    // -- v1 unknown kind in multi-change transaction is isolated skip --------
-
-    // -- B2: v2 missing table on data action ---------------------------------
-
-    // -- Trait object safety --------------------------------------------------
-
-    // -- v1 UPDATE with full old row (REPLICA IDENTITY FULL) ----------------
-
-    // -- v1 UPDATE without oldkeys (changed_columns branch: None old_row) ----
-
-    // -- v1 INSERT without catalog PK columns --------------------------------
-
-    // -- v2 UPDATE with identity but no pk metadata --------------------------
-
-    // -- v2 INSERT without pk metadata AND without catalog PK ----------------
-
-    // -- v2 UPDATE without identity (changed_columns branch: None old_row) ---
-
-    // -- v2 unknown column error ---------------------------------------------
-
-    // -- Null handling -------------------------------------------------------
-
-    // -- INSERT without PK metadata (catalog fallback) -----------------------
-
-    // -- Error: unknown column in oldkeys ------------------------------------
-
-    // -- Direct test: build_pk_from_key_arrays with unknown column -----------
-
     // ------------------------------------------------------------------
     // Phase 7A: Wal2JsonV2Event typed CdcEvent smoke tests
     // ------------------------------------------------------------------
@@ -1567,5 +1521,293 @@ mod tests {
             event.int_at(crate::backend::RowKind::Old, 0),
             crate::backend::Presence::Missing
         );
+    }
+    #[test]
+    fn typed_v1_multi_change_transaction() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 100,
+            "change": [
+                {
+                    "kind": "insert",
+                    "schema": "public",
+                    "table": "orders",
+                    "columnnames": ["id", "customer", "amount", "status"],
+                    "columntypes": ["integer", "integer", "integer", "text"],
+                    "columnvalues": [7, 3, 250, "paid"]
+                },
+                {
+                    "kind": "update",
+                    "schema": "public",
+                    "table": "orders",
+                    "columnnames": ["id", "customer", "amount", "status"],
+                    "columntypes": ["integer", "integer", "integer", "text"],
+                    "columnvalues": [8, 4, 300, "pending"],
+                    "oldkeys": {
+                        "keynames": ["id"],
+                        "keytypes": ["integer"],
+                        "keyvalues": [8]
+                    }
+                },
+                {
+                    "kind": "delete",
+                    "schema": "public",
+                    "table": "orders",
+                    "oldkeys": {
+                        "keynames": ["id"],
+                        "keytypes": ["integer"],
+                        "keyvalues": [9]
+                    }
+                }
+            ]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 3);
+
+        let ins = &events[0];
+        assert_eq!(ins.kind(), EventKind::Insert);
+        assert_eq!(ins.pk_columns(), &[0u16]);
+        assert_eq!(
+            ins.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&7)
+        );
+
+        let upd = &events[1];
+        assert_eq!(upd.kind(), EventKind::Update);
+        assert_eq!(upd.pk_columns(), &[0u16]);
+        assert_eq!(
+            upd.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&8)
+        );
+        assert_eq!(
+            upd.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Present(&8)
+        );
+
+        let del = &events[2];
+        assert_eq!(del.kind(), EventKind::Delete);
+        assert_eq!(del.pk_columns(), &[0u16]);
+        assert_eq!(
+            del.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Present(&9)
+        );
+    }
+
+    #[test]
+    fn typed_v1_unknown_kind_in_multi_change_isolated_skip() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 100,
+            "change": [
+                {
+                    "kind": "insert",
+                    "schema": "public",
+                    "table": "orders",
+                    "columnnames": ["id", "customer", "amount", "status"],
+                    "columntypes": ["integer", "integer", "integer", "text"],
+                    "columnvalues": [7, 3, 250, "paid"]
+                },
+                {
+                    "kind": "garbage",
+                    "schema": "public",
+                    "table": "orders",
+                    "columnnames": ["id"],
+                    "columntypes": ["integer"],
+                    "columnvalues": [8]
+                },
+                {
+                    "kind": "delete",
+                    "schema": "public",
+                    "table": "orders",
+                    "oldkeys": {
+                        "keynames": ["id"],
+                        "keytypes": ["integer"],
+                        "keyvalues": [9]
+                    }
+                }
+            ]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 2);
+
+        assert_eq!(events[0].kind(), EventKind::Insert);
+        assert_eq!(events[0].pk_columns(), &[0u16]);
+
+        assert_eq!(events[1].kind(), EventKind::Delete);
+        assert_eq!(events[1].pk_columns(), &[0u16]);
+        assert_eq!(
+            events[1].int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Present(&9)
+        );
+    }
+
+    #[test]
+    fn typed_v2_unknown_column_error() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "action": "I",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "id", "type": "integer", "value": 7},
+                {"name": "phantom_col", "type": "text", "value": "boom"}
+            ],
+            "pk": [{"name": "id", "type": "integer"}]
+        }"#;
+        let result = Wal2JsonV2Parser.parse_wal_message(msg.as_bytes(), &database);
+        match result {
+            Err(WalParseError::UnknownColumn { .. }) => {}
+            Err(e) => panic!("expected UnknownColumn, got {:?}", e),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn typed_v1_insert_without_catalog_pk_columns() {
+        let database = orders_no_pk_catalog();
+        let msg = r#"{
+            "xid": 100,
+            "change": [{
+                "kind": "insert",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer", "amount", "status"],
+                "columntypes": ["integer", "integer", "integer", "text"],
+                "columnvalues": [7, 3, 250, "paid"]
+            }]
+        }"#;
+        let events = Wal2JsonV1Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Insert);
+        assert!(event.pk_columns().is_empty());
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&7)
+        );
+    }
+
+    #[test]
+    fn typed_v2_insert_without_wire_pk_and_no_catalog_pk() {
+        let database = orders_no_pk_catalog();
+        let msg = r#"{
+            "action": "I",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "id", "type": "integer", "value": 7},
+                {"name": "customer", "type": "integer", "value": 3},
+                {"name": "amount", "type": "integer", "value": 250},
+                {"name": "status", "type": "text", "value": "paid"}
+            ]
+        }"#;
+        let events = Wal2JsonV2Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Insert);
+        assert!(event.pk_columns().is_empty());
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&7)
+        );
+    }
+
+    // PK fallback chain: wire pk > identity > catalog pk.
+    // With REPLICA IDENTITY FULL, identity covers every column;
+    // pk_columns() returns every column index as the PK set.
+    #[test]
+    fn typed_v2_update_identity_used_as_pk_when_wire_pk_absent() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "action": "U",
+            "schema": "public",
+            "table": "orders",
+            "columns": [
+                {"name": "id", "type": "integer", "value": 7},
+                {"name": "customer", "type": "integer", "value": 3},
+                {"name": "amount", "type": "integer", "value": 250},
+                {"name": "status", "type": "text", "value": "paid"}
+            ],
+            "identity": [
+                {"name": "id", "type": "integer", "value": 7},
+                {"name": "customer", "type": "integer", "value": 3},
+                {"name": "amount", "type": "integer", "value": 100},
+                {"name": "status", "type": "text", "value": "pending"}
+            ]
+        }"#;
+        let events = Wal2JsonV2Parser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind(), EventKind::Update);
+        // Identity covers all columns (REPLICA IDENTITY FULL).
+        // Without wire pk metadata, fallback uses identity entries as PK columns.
+        assert_eq!(event.pk_columns(), &[0u16, 1, 2, 3]);
+        // Pk accesses old_image (identity) on Update.
+        // Identity: id=7, customer=3, amount=100, status="pending"
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&7)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 1),
+            crate::backend::Presence::Present(&3)
+        );
+    }
+
+    #[test]
+    fn typed_v1_unknown_column_in_oldkeys_errors() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "xid": 200,
+            "change": [{
+                "kind": "update",
+                "schema": "public",
+                "table": "orders",
+                "columnnames": ["id", "customer", "amount", "status"],
+                "columntypes": ["integer", "integer", "integer", "text"],
+                "columnvalues": [7, 3, 250, "paid"],
+                "oldkeys": {
+                    "keynames": ["id", "phantom_col"],
+                    "keytypes": ["integer", "text"],
+                    "keyvalues": [7, "boom"]
+                }
+            }]
+        }"#;
+        let result = Wal2JsonV1Parser.parse_wal_message(msg.as_bytes(), &database);
+        match result {
+            Err(WalParseError::UnknownColumn { .. }) => {}
+            Err(e) => panic!("expected UnknownColumn, got {:?}", e),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn typed_v2_missing_table_on_data_action() {
+        let database = orders_catalog();
+        let msg = r#"{
+            "action": "I",
+            "schema": "public",
+            "table": "phantom",
+            "columns": [
+                {"name": "id", "type": "integer", "value": 7}
+            ],
+            "pk": [{"name": "id", "type": "integer"}]
+        }"#;
+        let result = Wal2JsonV2Parser.parse_wal_message(msg.as_bytes(), &database);
+        match result {
+            Err(WalParseError::UnknownTable { .. }) => {}
+            Err(e) => panic!("expected UnknownTable, got {:?}", e),
+            Ok(_) => panic!("expected error"),
+        }
     }
 }

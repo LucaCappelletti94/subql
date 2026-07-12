@@ -6,7 +6,7 @@
 //!   coexist on one engine. Each gets the right kind of notification when
 //!   the corresponding WAL event arrives.
 //! * The [`DieselConnector`] re-executes the captured query's SQL against
-//!   real Postgres and decodes a scalar [`Cell`] correctly.
+//!   real Postgres and decodes a scalar [`Value<Postgres>`] correctly.
 //!
 //! Requires Docker. Tests are `#[ignore]`d so default `cargo test` does
 //! not spin up containers. Run with:
@@ -88,9 +88,9 @@ fn build_engine(
     AutoResolvingEngine::new(ReExecEngine::new(inner), PgDieselConnector::new(conn_exec))
 }
 
-/// Parse one wal2json v2 message into zero or more [`WalEvent`]s. The parser
-/// emits 0 events for relation-only messages (begin/commit/relation), which
-/// the test must tolerate.
+/// Parse one wal2json v2 message into zero or more [`Wal2JsonV2Event`]s.
+/// The parser emits 0 events for relation-only messages (begin/commit/
+/// relation), which the test must tolerate.
 #[allow(dead_code)] // used by the step-3 / step-4 tests
 fn parse_message(parser: &Wal2JsonV2Parser, catalog: &ParserDB, msg: &str) -> Vec<Wal2JsonV2Event> {
     parser

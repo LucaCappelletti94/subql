@@ -91,9 +91,9 @@ fn confirmed_flush_lsn(conn: &mut diesel::PgConnection, slot: &str) -> Option<Pg
 }
 
 /// Drive an INSERT in a side connection, assert
-/// `source.next_event().await` returns the corresponding `WalEvent` with
-/// COMMIT-to-event-delivery latency under the budget. This latency is
-/// wire-bound, not interval-bound.
+/// `source.next_event().await` returns the corresponding typed CDC event
+/// with COMMIT-to-event-delivery latency under the budget. This latency
+/// is wire-bound, not interval-bound.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn next_event_delivers_insert_within_latency_budget() {

@@ -913,63 +913,237 @@ mod tests {
         ]
     }
 
-    // -- Test 1: Relation caching + Insert (happy path) ----------------------
-
     // Removed `relation_with_out_of_range_catalog_column_id_errors` and
     // `relation_with_duplicate_catalog_column_id_errors`: both injected
     // out-of-range or duplicate column ordinals into a `MockCatalog`.
     // ParserDB always assigns unique, in-range ordinals to columns, so the
     // failure modes are unreachable through the public API.
 
-    // -- Test 2: Update with 'K' old key (DEFAULT replica identity) ----------
+    #[test]
+    fn typed_pgoutput_update_no_old_tuple() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let rel_msg = build_relation_msg(70_000, "public", "orders", &typed_orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation");
+        let update_msg = build_update_msg_no_old(
+            70_000,
+            &[
+                TupleCol::Text("7".into()),
+                TupleCol::Text("3".into()),
+                TupleCol::Text("250".into()),
+                TupleCol::Text("paid".into()),
+            ],
+        );
+        let events = parser
+            .parse_wal_message(&update_msg, &catalog)
+            .expect("update");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind(), EventKind::Update);
+        assert_eq!(events[0].pk_columns(), &[0u16]);
+        assert!(events[0].changed_columns().is_empty());
+        assert_eq!(
+            events[0].int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&7)
+        );
 
-    // -- Test 3: Update with 'O' full old row (FULL replica identity) --------
+        assert_eq!(
+            events[0].int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Missing
+        );
+    }
 
-    // -- Test 4: Update without old tuple ------------------------------------
+    #[test]
+    fn typed_pgoutput_delete_with_o_full_old_row() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let rel_msg = build_relation_msg(71_000, "public", "orders", &typed_orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation");
+        let delete_msg = build_delete_msg(
+            71_000,
+            b'O',
+            &[
+                TupleCol::Text("9".into()),
+                TupleCol::Text("4".into()),
+                TupleCol::Text("500".into()),
+                TupleCol::Text("cancelled".into()),
+            ],
+        );
+        let events = parser
+            .parse_wal_message(&delete_msg, &catalog)
+            .expect("delete");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind(), EventKind::Delete);
+        assert_eq!(events[0].pk_columns(), &[0u16]);
+        assert!(events[0].changed_columns().is_empty());
+        assert_eq!(
+            events[0].int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Present(&9)
+        );
+        assert_eq!(
+            events[0].int_at(crate::backend::RowKind::Old, 1),
+            crate::backend::Presence::Present(&4)
+        );
+        assert_eq!(
+            events[0].int_at(crate::backend::RowKind::Old, 2),
+            crate::backend::Presence::Present(&500)
+        );
 
-    // -- Test 5: Delete with 'K' key ----------------------------------------
+        assert_eq!(
+            events[0].int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Missing
+        );
+    }
 
-    // -- Test 6: Delete with 'O' full old row --------------------------------
+    #[test]
+    fn typed_pgoutput_metadata_messages_return_empty_vec() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let rel_msg = build_relation_msg(72_000, "public", "orders", &typed_orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation");
+        assert!(parser
+            .parse_wal_message(&[b'B', 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2], &catalog)
+            .expect("begin")
+            .is_empty());
+        assert!(parser
+            .parse_wal_message(&[b'C', 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0], &catalog)
+            .expect("commit")
+            .is_empty());
+        assert!(parser
+            .parse_wal_message(&[b'O', 0, 0, 0, 1, 0, 0, 0, 2, 0], &catalog)
+            .expect("origin")
+            .is_empty());
+        assert!(parser
+            .parse_wal_message(&[b'Y', 0], &catalog)
+            .expect("type")
+            .is_empty());
+        assert!(parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation")
+            .is_empty());
+    }
 
-    // -- Test 7: Metadata messages return empty vec --------------------------
+    #[test]
+    fn typed_pgoutput_unknown_message_type_skipped() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let rel_msg = build_relation_msg(73_000, "public", "orders", &typed_orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation");
+        assert!(parser
+            .parse_wal_message(&[b'Z', 1, 2, 3, 4], &catalog)
+            .expect("skip")
+            .is_empty());
+    }
 
-    // -- Test 8: Empty input returns empty vec --------------------------------
+    #[test]
+    fn typed_pgoutput_truncated_message_errors() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let rel_msg = build_relation_msg(74_000, "public", "orders", &typed_orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation");
+        let truncated_msg = vec![b'I'];
+        match parser.parse_wal_message(&truncated_msg, &catalog) {
+            Err(WalParseError::TruncatedMessage { .. }) => {}
+            _other => panic!("expected TruncatedMessage"),
+        }
+    }
 
-    // -- Test 9: Unknown message type -> skip --------------------------------
+    #[test]
+    fn typed_pgoutput_insert_without_catalog_pk_yields_empty_pk() {
+        let database = orders_no_pk_catalog();
+        let parser = PgOutputParser::new();
+        let rel_msg = build_relation_msg(75_000, "public", "orders", &typed_orders_columns());
+        parser
+            .parse_wal_message(&rel_msg, &database)
+            .expect("relation");
+        let insert_msg = build_insert_msg(
+            75_000,
+            &[
+                TupleCol::Text("7".into()),
+                TupleCol::Text("3".into()),
+                TupleCol::Text("250".into()),
+                TupleCol::Text("paid".into()),
+            ],
+        );
+        let events = parser
+            .parse_wal_message(&insert_msg, &database)
+            .expect("insert");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind(), EventKind::Insert);
+        assert_eq!(events[0].pk_columns(), &[] as &[u16]);
+    }
 
-    // -- Test 10: Insert without preceding Relation -> UnknownRelationOid ----
+    #[test]
+    fn typed_pgoutput_truncated_relation_message_errors() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let mut truncated_rel = vec![b'R'];
+        push_u32(&mut truncated_rel, 76_000);
+        push_cstring(&mut truncated_rel, "public");
+        push_cstring(&mut truncated_rel, "orders");
+        push_u8(&mut truncated_rel, 0);
+        push_i16(&mut truncated_rel, 99);
+        match parser.parse_wal_message(&truncated_rel, &catalog) {
+            Err(WalParseError::TruncatedMessage { .. }) => {}
+            _other => panic!("expected TruncatedMessage"),
+        }
+    }
 
-    // -- Test 11: Truncated messages -> TruncatedMessage ---------------------
+    #[test]
+    fn typed_pgoutput_delete_without_identity_uses_all_columns_as_pk() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let no_identity_columns = vec![
+            ("id", 23, 0),
+            ("customer", 23, 0),
+            ("amount", 23, 0),
+            ("status", 25, 0),
+        ];
+        let rel_msg = build_relation_msg(77_000, "public", "orders", &no_identity_columns);
+        parser
+            .parse_wal_message(&rel_msg, &catalog)
+            .expect("relation");
+        // With no identity columns, 'K' key tuple must have full arity (4 columns).
+        let delete_msg = build_delete_msg(
+            77_000,
+            b'K',
+            &[
+                TupleCol::Text("9".into()),
+                TupleCol::Text("4".into()),
+                TupleCol::Text("500".into()),
+                TupleCol::Text("cancelled".into()),
+            ],
+        );
+        let events = parser
+            .parse_wal_message(&delete_msg, &catalog)
+            .expect("delete");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind(), EventKind::Delete);
+        // With no identity columns, fallback to catalog PK.
+        assert_eq!(events[0].pk_columns(), &[0u16]);
+    }
 
-    // -- Test 12: NULL columns ('n' tag) -> Cell::Null -----------------------
-
-    // -- Test 13: Unchanged TOAST ('u' tag) -> Cell::Missing in OLD tuple ----
-
-    // -- Test 14: Type conversion for various OIDs ---------------------------
-
-    // -- Test 15: changed_columns computed correctly for FULL update ----------
-
-    // -- Test 16: Trait object safety ----------------------------------------
-
-    // -- Test 17: Thread safety (compile-time Send + Sync check) -------------
-
-    // -- Test: Insert without catalog PK -> empty PK -------------------------
-
-    // -- Test: Truncated relation message ------------------------------------
-
-    // -- Test: Delete without identity columns -> use all columns as PK ------
-
-    // -- B3: skip 2PC/keepalive/replication protocol messages ----------------
-
-    // -- B4: under-arity normal tuples are rejected --------------------------
-
-    // -- B5: LRU eviction boundary -------------------------------------------
-
-    // -- B6: TRUNCATE edge cases: zero relations, unknown OID ----------------
-
-    // -- B7: UnknownTupleTag error path --------------------------------------
-
-    // -- A2: unchanged-TOAST tag 'u' must be rejected in new-image tuples ----
+    #[test]
+    fn typed_pgoutput_skip_2pc_and_keepalive_frames() {
+        let catalog = orders_catalog();
+        let parser = PgOutputParser::new();
+        let tags: &[u8] = &[b'b', b'p', b'k', b'c', b'r', b'A', b'P', b'M'];
+        for &tag in tags {
+            let events = parser
+                .parse_wal_message(&[tag], &catalog)
+                .expect("should not error");
+            assert!(events.is_empty());
+        }
+    }
 
     // ------------------------------------------------------------------
     // Phase 7E: PgOutputEvent typed CdcEvent smoke tests

@@ -3,8 +3,8 @@
 //! [`Value<MySql>`] conversion.
 //!
 //! Shared by all JSON-based WAL parsers (wal2json, Maxwell, Debezium)
-//! and the pgoutput binary wire path. Every consumer is now Phase-7
-//! typed; the legacy Cell-based decoders were retired in Phase 7F.
+//! and the pgoutput binary wire path. Every consumer is Phase-7 typed.
+//! The legacy untyped-scalar decoders were retired in Phase 7F.
 
 use alloc::borrow::Cow;
 use alloc::string::ToString;
@@ -21,15 +21,13 @@ use crate::backend::{MySql, Postgres, Value};
 // Typed decoders producing `Value<Postgres>` (Phase 7)
 // ============================================================================
 
-/// Typed variant of [`json_value_to_cell_strict`] that produces a typed
-/// [`Value<Postgres>`] shaped to the declared PG type.
+/// Decode a JSON value shaped by the declared PG type into a typed
+/// [`Value<Postgres>`].
 ///
-/// Routes on the lowercased PG type string. Where the [`Cell`] version
-/// fell back to `Cell::String` for uuid / timestamp / date / time /
-/// numeric / json / jsonb, this variant parses those payloads into their
-/// typed [`Value`] variants; genuinely text-shaped types (`text`,
-/// `varchar`, `char`, unknown user-defined types, ...) still fall back to
-/// [`Value::String`].
+/// Routes on the lowercased PG type string. Numeric, uuid, temporal,
+/// and json/jsonb payloads parse into their typed [`Value`] variants.
+/// Genuinely text-shaped types (`text`, `varchar`, `char`, unknown
+/// user-defined types, ...) fall back to [`Value::String`].
 ///
 /// Errors on lossy numeric conversions, malformed textual encodings, and
 /// PostgreSQL array types (which subql does not yet model).
@@ -66,12 +64,13 @@ pub(super) fn json_value_to_pg_value(
     }
 }
 
-/// Type-inference typed variant of [`infer_cell_from_json_strict`].
+/// Infer a typed [`Value<Postgres>`] from a bare JSON value with no
+/// column type metadata.
 ///
 /// Used by wire formats that do not carry column type metadata (Maxwell,
 /// Debezium). Bare JSON booleans / numbers / strings map to the natural
-/// [`Value<Postgres>`] variants; JSON objects and arrays are stringified
-/// into [`Value::String`] the same way the [`Cell`] path already did.
+/// [`Value<Postgres>`] variants. JSON objects and arrays are stringified
+/// into [`Value::String`].
 // Consumed by MaxwellEvent (Phase 7C) and DebeziumEvent (Phase 7D).
 #[allow(dead_code)]
 pub(super) fn infer_pg_value_from_json_strict(
@@ -218,7 +217,7 @@ pub(super) fn text_to_pg_value(
         }),
         // text, bpchar, varchar, name
         25 | 1042 | 1043 | 19 => Ok(Value::String(text.to_string())),
-        // interval and all other types: text fallback for semantic parity with Cell
+        // interval and all other types: text fallback
         _ => Ok(Value::String(text.to_string())),
     }
 }
@@ -451,10 +450,462 @@ fn parse_pg_time(s: &str) -> Option<NaiveTime> {
         .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
         .ok()
 }
-// Phase 10 note: the previous `mod tests` block (~478 lines) exercised
-// the retired `json_value_to_cell`, `text_to_cell_strict`, and
-// `infer_cell_from_json` helpers that Phase 7 replaced with typed
-// `Value<Postgres>` decoders. The typed decoders are covered by parser
-// round-trip tests in `wal2json.rs`, `debezium.rs`, `maxwell.rs`, and
-// `pgoutput.rs`, so the pg_type mod tests block was dropped rather
-// than migrated.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Sub-block A: json_value_to_pg_value
+
+    #[test]
+    fn json_value_int_integer() {
+        let result = json_value_to_pg_value(&serde_json::json!(42), "integer", "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Int(42));
+    }
+
+    #[test]
+    fn json_value_int_int8_uppercase() {
+        let result =
+            json_value_to_pg_value(&serde_json::json!(9223372036854775807_i64), "INT8", "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Int(9223372036854775807));
+    }
+
+    #[test]
+    fn json_value_float_real() {
+        let result = json_value_to_pg_value(&serde_json::json!(3.14), "real", "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Float(3.14));
+    }
+
+    #[test]
+    fn json_value_float_money() {
+        let result = json_value_to_pg_value(&serde_json::json!(19.99), "money", "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Float(19.99));
+    }
+
+    #[test]
+    fn json_value_decimal_numeric() {
+        let result = json_value_to_pg_value(&serde_json::json!("123.456"), "numeric", "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Decimal(BigDecimal::from_str("123.456").unwrap())
+        );
+    }
+
+    #[test]
+    fn json_value_bool_true() {
+        let result = json_value_to_pg_value(&serde_json::json!(true), "boolean", "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Bool(true));
+    }
+
+    #[test]
+    fn json_value_uuid() {
+        let result = json_value_to_pg_value(
+            &serde_json::json!("550e8400-e29b-41d4-a716-446655440000"),
+            "uuid",
+            "f",
+        );
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Uuid(
+                Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn json_value_timestamp() {
+        let result =
+            json_value_to_pg_value(&serde_json::json!("2024-01-15 12:34:56"), "timestamp", "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Timestamp(
+                NaiveDateTime::parse_from_str("2024-01-15 12:34:56", "%Y-%m-%d %H:%M:%S").unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn json_value_timestamptz() {
+        let result = json_value_to_pg_value(
+            &serde_json::json!("2024-01-15 12:34:56+00:00"),
+            "timestamptz",
+            "f",
+        );
+        let expected = DateTime::parse_from_rfc3339("2024-01-15 12:34:56+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(result.unwrap(), Value::<Postgres>::TimestampTz(expected));
+    }
+
+    #[test]
+    fn json_value_date() {
+        let result = json_value_to_pg_value(&serde_json::json!("2024-01-15"), "date", "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Date(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap())
+        );
+    }
+
+    #[test]
+    fn json_value_time() {
+        let result = json_value_to_pg_value(&serde_json::json!("12:34:56"), "time", "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Time(NaiveTime::from_hms_opt(12, 34, 56).unwrap())
+        );
+    }
+
+    #[test]
+    fn json_value_json() {
+        let result = json_value_to_pg_value(&serde_json::json!({"k": "v"}), "json", "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Json(serde_json::json!({"k": "v"}))
+        );
+    }
+
+    #[test]
+    fn json_value_jsonb() {
+        let result = json_value_to_pg_value(&serde_json::json!({"k": "v"}), "jsonb", "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Jsonb(serde_json::json!({"k": "v"}))
+        );
+    }
+
+    #[test]
+    fn json_value_unknown_type_falls_back_to_string() {
+        let result = json_value_to_pg_value(&serde_json::json!("hello"), "user_defined_thing", "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn json_value_array_type_rejected() {
+        let err = json_value_to_pg_value(&serde_json::json!(1), "_int4", "f").unwrap_err();
+        let msg = format!("{err}");
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+        assert!(msg.contains("array"));
+    }
+
+    #[test]
+    fn json_value_null_input_produces_null() {
+        let result = json_value_to_pg_value(&serde_json::json!(null), "integer", "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Null);
+    }
+
+    // Sub-block B: text_to_pg_value
+
+    #[test]
+    fn text_bool_true() {
+        let result = text_to_pg_value("t", 16);
+        assert_eq!(result.unwrap(), Value::<Postgres>::Bool(true));
+    }
+
+    #[test]
+    fn text_bool_false() {
+        let result = text_to_pg_value("f", 16);
+        assert_eq!(result.unwrap(), Value::<Postgres>::Bool(false));
+    }
+
+    #[test]
+    fn text_bool_malformed() {
+        let err = text_to_pg_value("yes", 16).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_int_happy_oid23() {
+        let result = text_to_pg_value("42", 23);
+        assert_eq!(result.unwrap(), Value::<Postgres>::Int(42));
+    }
+
+    #[test]
+    fn text_int_happy_oid20_bigint() {
+        let result = text_to_pg_value("9223372036854775807", 20);
+        assert_eq!(result.unwrap(), Value::<Postgres>::Int(i64::MAX));
+    }
+
+    #[test]
+    fn text_int_malformed() {
+        let err = text_to_pg_value("not_a_number", 23).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_float_happy_oid700() {
+        let result = text_to_pg_value("3.14", 700);
+        assert_eq!(result.unwrap(), Value::<Postgres>::Float(3.14));
+    }
+
+    #[test]
+    fn text_float_malformed() {
+        let err = text_to_pg_value("nope", 701).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_decimal_happy() {
+        let result = text_to_pg_value("123.456", 1700);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Decimal(BigDecimal::from_str("123.456").unwrap())
+        );
+    }
+
+    #[test]
+    fn text_decimal_malformed() {
+        let err = text_to_pg_value("bad_decimal", 1700).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_uuid_happy() {
+        let result = text_to_pg_value("550e8400-e29b-41d4-a716-446655440000", 2950);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Uuid(
+                Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn text_uuid_malformed() {
+        let err = text_to_pg_value("not-a-uuid", 2950).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_timestamp_happy() {
+        let result = text_to_pg_value("2024-01-15 12:34:56", 1114);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Timestamp(
+                NaiveDateTime::parse_from_str("2024-01-15 12:34:56", "%Y-%m-%d %H:%M:%S").unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn text_timestamp_malformed() {
+        let err = text_to_pg_value("garbage", 1114).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_timestamptz_happy() {
+        let result = text_to_pg_value("2024-01-15 12:34:56+00:00", 1184);
+        let expected = DateTime::parse_from_rfc3339("2024-01-15 12:34:56+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(result.unwrap(), Value::<Postgres>::TimestampTz(expected));
+    }
+
+    #[test]
+    fn text_timestamptz_malformed() {
+        let err = text_to_pg_value("garbage", 1184).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_date_happy() {
+        let result = text_to_pg_value("2024-01-15", 1082);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Date(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap())
+        );
+    }
+
+    #[test]
+    fn text_date_malformed() {
+        let err = text_to_pg_value("not-a-date", 1082).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_time_happy_oid1083() {
+        let result = text_to_pg_value("12:34:56", 1083);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Time(NaiveTime::from_hms_opt(12, 34, 56).unwrap())
+        );
+    }
+
+    #[test]
+    fn text_time_happy_oid1266_timetz() {
+        let result = text_to_pg_value("12:34:56", 1266);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Time(NaiveTime::from_hms_opt(12, 34, 56).unwrap())
+        );
+    }
+
+    #[test]
+    fn text_time_malformed() {
+        let err = text_to_pg_value("garbage", 1083).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_json_happy() {
+        let result = text_to_pg_value(r#"{"k":"v"}"#, 114);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Json(serde_json::json!({"k":"v"}))
+        );
+    }
+
+    #[test]
+    fn text_json_malformed() {
+        let err = text_to_pg_value("{not_json", 114).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_jsonb_happy() {
+        let result = text_to_pg_value(r#"{"k":"v"}"#, 3802);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::Jsonb(serde_json::json!({"k":"v"}))
+        );
+    }
+
+    #[test]
+    fn text_jsonb_malformed() {
+        let err = text_to_pg_value("{not_json", 3802).unwrap_err();
+        assert!(matches!(err, WalParseError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn text_text_passthrough_oid25() {
+        let result = text_to_pg_value("hello", 25);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn text_bpchar_passthrough_oid1042() {
+        let result = text_to_pg_value("padded  ", 1042);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::String("padded  ".to_string())
+        );
+    }
+
+    #[test]
+    fn text_fallback_unknown_oid() {
+        let result = text_to_pg_value("192.168.0.1", 869);
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::String("192.168.0.1".to_string())
+        );
+    }
+
+    // Sub-block C: infer_pg_value_from_json_strict
+
+    #[test]
+    fn infer_pg_null() {
+        let result = infer_pg_value_from_json_strict(&serde_json::Value::Null, "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Null);
+    }
+
+    #[test]
+    fn infer_pg_bool_true() {
+        let result = infer_pg_value_from_json_strict(&serde_json::json!(true), "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Bool(true));
+    }
+
+    #[test]
+    fn infer_pg_int_positive() {
+        let result = infer_pg_value_from_json_strict(&serde_json::json!(42), "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Int(42));
+    }
+
+    #[test]
+    fn infer_pg_float() {
+        let result = infer_pg_value_from_json_strict(&serde_json::json!(3.14), "f");
+        assert_eq!(result.unwrap(), Value::<Postgres>::Float(3.14));
+    }
+
+    #[test]
+    fn infer_pg_string() {
+        let result = infer_pg_value_from_json_strict(&serde_json::json!("hello"), "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_pg_object_stringified() {
+        let result = infer_pg_value_from_json_strict(&serde_json::json!({"k": "v"}), "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::String(r#"{"k":"v"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn infer_pg_array_stringified() {
+        let result = infer_pg_value_from_json_strict(&serde_json::json!([1, 2, 3]), "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<Postgres>::String("[1,2,3]".to_string())
+        );
+    }
+
+    // Sub-block D: infer_mysql_value_from_json_strict
+
+    #[test]
+    fn infer_mysql_null() {
+        let result = infer_mysql_value_from_json_strict(&serde_json::Value::Null, "f");
+        assert_eq!(result.unwrap(), Value::<MySql>::Null);
+    }
+
+    #[test]
+    fn infer_mysql_bool_true() {
+        let result = infer_mysql_value_from_json_strict(&serde_json::json!(true), "f");
+        assert_eq!(result.unwrap(), Value::<MySql>::Bool(true));
+    }
+
+    #[test]
+    fn infer_mysql_int_positive() {
+        let result = infer_mysql_value_from_json_strict(&serde_json::json!(42), "f");
+        assert_eq!(result.unwrap(), Value::<MySql>::Int(42));
+    }
+
+    #[test]
+    fn infer_mysql_float() {
+        let result = infer_mysql_value_from_json_strict(&serde_json::json!(3.14), "f");
+        assert_eq!(result.unwrap(), Value::<MySql>::Float(3.14));
+    }
+
+    #[test]
+    fn infer_mysql_string() {
+        let result = infer_mysql_value_from_json_strict(&serde_json::json!("hello"), "f");
+        assert_eq!(result.unwrap(), Value::<MySql>::String("hello".to_string()));
+    }
+
+    #[test]
+    fn infer_mysql_object_stringified() {
+        let result = infer_mysql_value_from_json_strict(&serde_json::json!({"k": "v"}), "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<MySql>::String(r#"{"k":"v"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn infer_mysql_array_stringified() {
+        let result = infer_mysql_value_from_json_strict(&serde_json::json!([1, 2, 3]), "f");
+        assert_eq!(
+            result.unwrap(),
+            Value::<MySql>::String("[1,2,3]".to_string())
+        );
+    }
+}

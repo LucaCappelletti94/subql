@@ -2,13 +2,13 @@
 
 **Branch**: `refactor/cdc-event-trait`
 **Baseline commit**: `2a68599 Introduce Backend and CdcEvent trait system for typed CDC events`
-**Status**: Phases 3-15 landed. Refactor closed. Follow-up polish waves landed as uncommitted working-tree edits on top of `f265e81` (see Post-close addenda below).
-**Current HEAD**: `f265e81 Phases 3-15 complete: refresh handoff doc header` (committed). Working tree carries the addenda edits described below and is dirty.
-**Verified bar**: `cargo +1.88 clippy --lib --all-features -- -D warnings` clean. `RUSTDOCFLAGS=-D warnings cargo +1.88 doc --lib --all-features --no-deps` clean. `cargo +1.88 fmt --check` clean. `cargo +1.88 test --lib --release --all-features` = 400 passing. `cargo +1.88 test --doc --release --all-features` = 38 passing. `cargo +1.88 check --all-targets --all-features` clean. `cargo +1.88 check --benches --features testing` clean. `fuzz/` workspace: `cargo +1.88 check` clean (10 fuzz binaries). Non-Docker integration tests all pass. Docker-gated tests compile clean but are `#[ignore]`d. The former open item (`src/test_harnesses.rs`) is now un-gated behind `feature = "testing"` and its 18 harness tests pass; the fuzz binaries and both criterion benches (`benches/dispatch.rs`, `benches/sqlparser_cursed.rs`) compile clean against it.
+**Status**: Phases 3-15 landed. Refactor architecturally closed. Post-close audit identified three residual gaps (doc-comment residues, parser per-scenario coverage, `pg_type.rs` decoder coverage), all now closed with green bar. See Post-audit 3-gap closure result below.
+**Current HEAD**: `153bdda Add 4 Maxwell parser unit tests for Gap 2` (committed). Working tree carries the remaining Gap 1/2/3 edits described below.
+**Verified bar** (working tree on top of `153bdda`): `cargo +1.88 clippy --lib --all-features -- -D warnings` clean. `RUSTDOCFLAGS=-D warnings cargo +1.88 doc --lib --all-features --no-deps` clean. `cargo +1.88 fmt --check` clean. `cargo +1.88 test --lib --release --all-features` = **482 passing** (up from 400 baseline). `cargo +1.88 test --doc --release --all-features` = 38 passing. `cargo +1.88 check --all-targets --all-features` clean.
 
-## Post-close addenda (working-tree, not yet committed)
+## Post-close addenda (committed at `63cd972`)
 
-Post-`f265e81` polish that closed the last known gaps. Kept as uncommitted edits because the user has not asked for a commit.
+Post-`f265e81` polish that closed the last known engineering gaps in the CdcEvent refactor. Landed as a single commit.
 
 1. **`sqlite_cdc`: patchset -> changeset correction.** SQLite session extension's `changeset()` carries full old-images, `patchset()` carries PK-only. The Phase 8 impl was mislabeled and materially lost old-image fidelity on UPDATE/DELETE. Renamed `SqlitePatchsetEvent` -> `SqliteChangesetEvent`, `SqlitePatchsetParser` -> `SqliteChangesetParser`, wired `diesel_sqlite_session::Session::changeset()`, and it now surfaces the real old-image on UPDATE/DELETE. Reflect this correction against the Phase 8 narrative below wherever it says `SqlitePatchsetEvent`.
 2. **`pg_sqlite_emu` module (feature `pg-sqlite-emu`).** A distinct module (NOT part of `sqlite_cdc`, which stays honest `Backend = SQLite`) that fakes a Postgres logical-replication stream on top of a SQLite session changeset, so downstream code targeting `PgOutputEvent` can be exercised in unit tests without a running Postgres. Public API: `PgSqliteEmuSource` with `open_in_memory`, `execute`, `drain`, plus row-lookup fallback via `SELECT json_array(...)` for UPDATE rows whose non-PK columns were unchanged. `inject_truncate` helper closes the gap left by SQLite session's lack of TRUNCATE. `PgSqliteEmuError` for surface errors. 8 doctests on the public API. Integration coverage: `pg_sqlite_emu_smoke.rs`, `pg_sqlite_emu_dml.rs` (includes composite PK), `follow_pg_sqlite_emu.rs`, `proptest_pg_sqlite_emu_dispatch.rs`, `proptest_pg_sqlite_emu_cdc.rs` (10 tests total).
@@ -21,6 +21,45 @@ Post-`f265e81` polish that closed the last known gaps. Kept as uncommitted edits
 9. **Feature composition** for `pg-sqlite-emu`: `["std", "dep:diesel", "diesel?/sqlite", "dep:diesel-sqlite-session", "dep:pg2sqlite", "dep:bytes", "sqlite-diff-rs/pg-walstream"]`.
 10. **Semantic gotchas discovered while restoring emulator coverage** (worth capturing for anyone else touching the session-extension path): (a) SQLite session drops no-op UPDATEs where all cells are unchanged, tests have to account for that. (b) An UPDATE that does NOT change the PK reports the PK column as `(old_value, new_value) = (None, Some(pk))`, so `fallback_row_for` uses `p.0.is_none() || p.1.is_none()` (was `&&` and dropped follow rows silently). (c) The session iterates changesets in PK order, not DML order, drain-per-DML in tests is the reliable pattern. (d) There is no TRUNCATE in the session extension, `PgSqliteEmuSource::inject_truncate` synthesizes the pgoutput TRUNCATE frame.
 11. **Companion docs** under `docs/`: `emulator-coverage-restoration.md`, `upstream-sqlite-diff-pgoutput-reverse.md`. Test coverage TODO list at `tests/pg_sqlite_emu_coverage_todo.md`.
+
+## Post-audit 3-gap closure result
+
+After the addenda landed, a follow-up audit surfaced three residual gaps. All three are now closed on top of `153bdda`. The working-tree diff carries the closure edits.
+
+### Gap 1 result: stale doc-comment references (closed)
+
+Seven doc-comment sites rewritten to remove references to the retired `Cell` / `WalEvent` / `RowImage` / `PrimaryKey` types. Acceptance grep passes: remaining hits are all legitimate (diesel's own `<T as Table>::PrimaryKey`, prose-in-negation, historical narrative in `pg_sqlite_emu` mod docs, English-word usage of "cell").
+
+Sites: `src/runtime/engine.rs:292`, `src/wal/pg_type.rs:5-7,24-30,67-73,220`, `tests/pgoutput_e2e.rs:7`, `tests/pg_streaming_e2e.rs:94`, `tests/reexec_postgres.rs:9,91`, `benches/dispatch.rs:230`.
+
+### Gap 2 result: parser per-scenario coverage (closed)
+
+All four parser modules were extended with typed per-scenario unit tests, replacing the orphan banner comments left by the Phase 10 drop.
+
+- **`src/wal/pgoutput.rs`**: 10 -> 19 tests (+9). Added: `typed_pgoutput_update_no_old_tuple`, `_delete_with_o_full_old_row`, `_metadata_messages_return_empty_vec`, `_unknown_message_type_skipped`, `_truncated_message_errors`, `_insert_without_catalog_pk_yields_empty_pk`, `_truncated_relation_message_errors`, `_delete_without_identity_uses_all_columns_as_pk`, `_skip_2pc_and_keepalive_frames`. Type-conversion OID coverage lives in Gap 3.
+- **`src/wal/wal2json.rs`**: 19 -> 27 tests (+8). Added: `typed_v1_multi_change_transaction`, `_unknown_kind_in_multi_change_isolated_skip`, `typed_v2_unknown_column_error`, `typed_v1_insert_without_catalog_pk_columns`, `typed_v2_insert_without_wire_pk_and_no_catalog_pk`, `typed_v2_update_identity_used_as_pk_when_wire_pk_absent` (renamed from the plan's original name to document the actual `wire pk -> identity -> catalog pk` fallback chain), `typed_v1_unknown_column_in_oldkeys_errors`, `typed_v2_missing_table_on_data_action`. Skipped: `typed_v1_build_pk_from_key_arrays_unknown_column` (helper does not exist as a standalone fn, PK-building logic is inlined in `convert_v1_change_typed`, and the "unknown column in oldkeys" path is already covered by `typed_v1_unknown_column_in_oldkeys_errors`).
+- **`src/wal/maxwell.rs`**: 9 -> 13 tests (+4). Added: `typed_maxwell_delete_happy_path`, `_malformed_json_envelope_errors`, `_update_pk_change_uses_pre_update_pk`, `_bootstrap_insert_treated_as_normal_insert`. This slice committed on its own at `153bdda`.
+- **`src/wal/debezium.rs`**: 11 -> 14 tests (+3). Added: `typed_debezium_malformed_json_envelope_errors`, `_missing_op_field_errors`, `_before_after_shape_mismatch_errors`. Semantic notes: malformed JSON and missing `op` both surface as `WalParseError::JsonError` (missing `op` maps through serde since `DebeziumEnvelope::op` has no `#[serde(default)]`). The type-mismatch case surfaces as `Presence::Missing` on the accessor rather than a hard parse error, because Debezium stores raw JSON and defers typing to accessor calls.
+
+**Assertion discipline** across all Gap 2 tests: `kind()`, `pk_columns()`, `changed_columns()`, and per-image scalar accessors named against `Presence::Present(&v)` / `Presence::Null` / `Presence::Missing`. Error-path tests assert the specific `WalParseError` variant via `matches!(result, Err(WalParseError::<V>(_)))`. Original stashed debezium error tests used a bare `matches!` statement (no-op assertion, silent pass on wrong variant) plus `.expect_err` (compile-fails because `DebeziumEvent` is not `Debug`), both fixed during recovery.
+
+**Banner sweep**: all orphan `// -- ...` banner comments in each parser's `mod tests` block were deleted. Remaining `// -- ...` comments are legitimate section headers naming actual content below them (`// -- Binary message builders` in pgoutput, `// -- Test catalog` in maxwell, `// -- Phase 7X: ... typed CdcEvent smoke tests` in each parser).
+
+### Gap 3 result: `pg_type.rs` decoder unit tests (closed)
+
+A new inline `#[cfg(test)] mod tests` block in `src/wal/pg_type.rs` covers all four `pub(super)` decoders. **58 tests** landing, 16 for `json_value_to_pg_value` (one per pg-type-string branch plus array-prefix rejection plus null passthrough plus lowercasing check), 28 for `text_to_pg_value` (happy + malformed per OID), 7 for `infer_pg_value_from_json_strict` (6 JSON shapes plus null), 7 for `infer_mysql_value_from_json_strict` (same shape sweep with MySql target). The Phase 7F obituary comment at the bottom of the file (formerly lines 454-460) is deleted.
+
+### Total delta
+
+82 new lib tests (baseline 400 -> 482 passing) plus 38 doctests unchanged. No parser body was touched during the sweep. No regressions on any feature configuration.
+
+### Incident: subagent state loss and recovery
+
+A serious workflow observation. Between 14:55 and 15:20 during Phase 2 execution, multiple `git reset` operations reverted the working tree to `63cd972`, blowing away in-progress Gap 1 doc-comment edits, the mid-flight 3-gap plan section in this doc, and the yet-unpersisted Wal2JsonRestorer + DebeziumRestorer subagent edits. MaxwellRestorer's slice survived only because it landed as its own commit (`153bdda`) after the resets. The four `reset: moving to HEAD` reflog entries show the pattern.
+
+Recovery came from `git fsck --dangling`. Both lost subagent test blocks were still reachable as stash-index commits: `eb87928` (wal2json.rs, 15:27:46, +291 lines, all 8 Wal2Json tests) and `4e0b203` (debezium.rs, 14:57:02, +75 lines, all 3 Debezium tests). Files restored via `git show <sha>:<path> > <path>`, then re-swept for banners and fmt-normalized. Two debezium error tests needed pattern-let / `assert!(matches!(...))` rewrite because the stashed versions used `.expect_err()` (needs `Debug` on the Ok variant that `DebeziumEvent` does not implement) plus bare `matches!(err, ...)` statements (no assertion effect).
+
+Lesson: rely on `git fsck --dangling` when task-tool subagents report success but their edits are not in the working tree. The stash-index commits produced by internal `git stash push` operations are reachable indefinitely until pruned. Also: encourage subagents to land their slice as its own commit when the change is at any risk of being reset, following MaxwellRestorer's pattern.
 
 ## Why the refactor exists
 
