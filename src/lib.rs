@@ -9,6 +9,8 @@ extern crate alloc;
 // Re-export public API
 pub use compiler::{AggSpec, QueryProjection};
 pub use errors::*;
+#[cfg(feature = "pg-sqlite-emu")]
+pub use pg_sqlite_emu::{PgSqliteEmuError, PgSqliteEmuSource};
 #[cfg(feature = "pg-streaming")]
 pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
 pub use runtime::{
@@ -17,7 +19,7 @@ pub use runtime::{
 };
 #[cfg(feature = "sqlite-cdc")]
 pub use sqlite_cdc::{SqliteCdcError, SqliteCdcSource};
-pub use sqlite_cdc::{SqlitePatchsetEvent, SqlitePatchsetParser};
+pub use sqlite_cdc::{SqliteChangesetEvent, SqliteChangesetParser};
 pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
@@ -60,6 +62,8 @@ pub mod testing;
 pub mod memory_profile_workload;
 #[cfg(feature = "std")]
 pub mod persistence;
+#[cfg(feature = "pg-sqlite-emu")]
+pub mod pg_sqlite_emu;
 #[cfg(feature = "pg-streaming")]
 pub mod polling;
 pub mod reexec;
@@ -74,10 +78,10 @@ pub mod wal;
 #[cfg(feature = "diesel-typed")]
 pub mod diesel_api;
 
-// `test_harnesses` still speaks the retired `Cell` / `RowImage` /
-// `WalEvent` types. Phase 10 rewrites it against `CdcEvent` typed
-// events. Excluded from the current lib build.
-#[cfg(any())]
+// Shared fuzz harness functions. Feature-gated behind `testing`
+// (not part of the production build; enabled by the `subql-fuzz`
+// workspace and by `cargo test --features testing`).
+#[cfg(feature = "testing")]
 pub mod test_harnesses;
 
 // Version and metadata

@@ -4,8 +4,8 @@
 //! attached via [`diesel_sqlite_session`]. Every DML the caller runs
 //! through [`SqliteCdcSource::connection`] accumulates into the session.
 //! [`SqliteCdcSource::poll_next_event`] drains the accumulated bytes as
-//! a patchset, parses them via [`super::SqlitePatchsetParser`], and
-//! yields the resulting [`SqlitePatchsetEvent`] instances one at a
+//! a changeset, parses them via [`super::SqliteChangesetParser`], and
+//! yields the resulting [`SqliteChangesetEvent`] instances one at a
 //! time.
 //!
 //! Analogue of [`crate::PgStreamingCdcSource`]. The parser stays
@@ -21,8 +21,8 @@ use diesel::SqliteConnection;
 use diesel_sqlite_session::{Session, SessionError, SqliteSessionExt};
 use sql_traits::prelude::DatabaseLike;
 
-use super::event::SqlitePatchsetEvent;
-use super::parser::SqlitePatchsetParser;
+use super::event::SqliteChangesetEvent;
+use super::parser::SqliteChangesetParser;
 use crate::wal::{WalParseError, WalParser};
 
 /// Errors surfaced by [`SqliteCdcSource`].
@@ -30,12 +30,12 @@ use crate::wal::{WalParseError, WalParser};
 #[non_exhaustive]
 pub enum SqliteCdcError {
     /// Underlying `diesel-sqlite-session` failure (session creation,
-    /// attach, or patchset export).
+    /// attach, or changeset export).
     #[error("diesel-sqlite-session: {0}")]
     Session(#[from] SessionError),
-    /// The patchset parser could not decode the bytes surfaced by the
+    /// The changeset parser could not decode the bytes surfaced by the
     /// session extension.
-    #[error("patchset parse: {0}")]
+    #[error("changeset parse: {0}")]
     Parse(#[from] WalParseError),
     /// Underlying diesel connection error (statement execution).
     #[error("diesel: {0}")]
@@ -48,10 +48,10 @@ pub struct SqliteCdcSource<DB: DatabaseLike> {
     connection: SqliteConnection,
     session: Session,
     catalog: DB,
-    /// Events buffered from the last patchset drain. Consumed FIFO by
+    /// Events buffered from the last changeset drain. Consumed FIFO by
     /// [`Self::poll_next_event`]. When empty and the session has
-    /// accumulated new changes, the next poll drains a fresh patchset.
-    pending: VecDeque<SqlitePatchsetEvent>,
+    /// accumulated new changes, the next poll drains a fresh changeset.
+    pending: VecDeque<SqliteChangesetEvent>,
 }
 
 impl<DB: DatabaseLike> SqliteCdcSource<DB> {
@@ -90,14 +90,14 @@ impl<DB: DatabaseLike> SqliteCdcSource<DB> {
     /// # Errors
     ///
     /// [`SqliteCdcError::Session`] on any SQLite failure during
-    /// `.patchset()`. [`SqliteCdcError::Parse`] when the emitted
-    /// patchset bytes cannot be decoded.
-    pub fn poll_next_event(&mut self) -> Result<Option<SqlitePatchsetEvent>, SqliteCdcError> {
+    /// `.changeset()`. [`SqliteCdcError::Parse`] when the emitted
+    /// changeset bytes cannot be decoded.
+    pub fn poll_next_event(&mut self) -> Result<Option<SqliteChangesetEvent>, SqliteCdcError> {
         if self.pending.is_empty() && !self.session.is_empty() {
-            let bytes = self.session.patchset()?;
-            let events = SqlitePatchsetParser.parse_wal_message(&bytes, &self.catalog)?;
+            let bytes = self.session.changeset()?;
+            let events = SqliteChangesetParser.parse_wal_message(&bytes, &self.catalog)?;
             self.pending.extend(events);
-            // SQLite sessions accumulate: `.patchset()` snapshots
+            // SQLite sessions accumulate: `.changeset()` snapshots
             // everything tracked since the session was created rather
             // than draining. Recreate the session so the next poll only
             // sees changes that happen AFTER this drain.
@@ -125,14 +125,14 @@ impl<DB: DatabaseLike> SqliteCdcSource<DB> {
 }
 
 impl<DB: DatabaseLike> crate::CdcSource for SqliteCdcSource<DB> {
-    type Event = SqlitePatchsetEvent;
+    type Event = SqliteChangesetEvent;
     type Error = SqliteCdcError;
 
     fn next_event(
         &mut self,
     ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
         // `poll_next_event` never blocks. It touches the in-process
-        // session state and, on drain, the in-memory patchset buffer.
+        // session state and, on drain, the in-memory changeset buffer.
         // Wrapping the sync body in `core::future::ready` avoids the
         // extra state machine an `async` block would spin up.
         core::future::ready(self.poll_next_event())
@@ -142,7 +142,7 @@ impl<DB: DatabaseLike> crate::CdcSource for SqliteCdcSource<DB> {
         &mut self,
         _upto: <Self::Event as crate::backend::CdcEvent>::Checkpoint,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
-        // Patchset events carry `NoCheckpoint`. The session extension
+        // Changeset events carry `NoCheckpoint`. The session extension
         // has no upstream to acknowledge against, so `ack` is a no-op.
         core::future::ready(Ok(()))
     }

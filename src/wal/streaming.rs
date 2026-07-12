@@ -5,8 +5,9 @@
 //! other backends). Concrete impls (e.g. `PgStreamingCdcSource` behind
 //! the `pg-streaming` feature) own the underlying connection, parse
 //! the wire bytes via the existing [`crate::wal`] parsers, and surface
-//! typed [`crate::WalEvent`]s through `next_event`. The caller drives
-//! the loop. Acks flow back through `ack`.
+//! their parser output through `next_event`. Every event type impls
+//! [`crate::backend::CdcEvent`], so the caller reads typed scalars off
+//! it directly. The caller drives the loop. Acks flow back through `ack`.
 //!
 //! The trait is runtime-agnostic: method signatures use `impl Future +
 //! Send` (RPITIT) rather than naming any specific executor. Subql core

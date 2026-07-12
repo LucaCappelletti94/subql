@@ -8,7 +8,7 @@ use super::{
     partition::TablePartition,
     predicate::{Predicate, SubscriptionBinding},
 };
-use crate::backend::{Backend, CdcEvent, ScalarKind};
+use crate::backend::{Backend, CdcEvent, Presence, RowKind, ScalarKind, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::{
     catalog_helpers,
@@ -1931,18 +1931,62 @@ where
         let notifications = self.consumers(event)?;
         let aggregate_deltas = self.aggregate_deltas(event)?;
         let output = crate::DispatchOutput::from_parts(notifications, aggregate_deltas);
-        // A single-row (pk) follow self-closes once its row is deleted.
-        // Under Phase 5's typed-accessor model, deriving the deleted PK
-        // from `event` requires walking `event.pk_columns()` and
-        // calling the per-scalar accessor for each with `RowKind::Pk`.
-        // Defer that plumbing to a follow-up (pk-follows are best-effort;
-        // loss of the auto-close marker degrades gracefully to an
-        // ordinary inert subscription per the `pk_follows` doc contract).
+        // Any single-row (pk) follow whose row was just deleted
+        // self-closes. Its `WHERE pk = <value>` predicate can never
+        // match again, so leaving the subscription registered would
+        // leak memory and spuriously fire on future rows that reuse
+        // the same PK.
         if event.kind() == EventKind::Delete && !self.pk_follows.is_empty() {
-            // TODO(phase-5): re-implement close_deleted_pk_follows against
-            // the CdcEvent typed-accessor surface.
+            self.close_deleted_pk_follows(event);
         }
         Ok(output)
+    }
+
+    /// Auto-unregister every pk-follow whose tracked row matches the
+    /// deleted row on `event`.
+    ///
+    /// Reads the event's PK columns through the typed
+    /// [`CdcEvent`] accessors under [`RowKind::Pk`], lifts them into
+    /// `Vec<Value<E::Backend>>`, and closes each pk-follow whose
+    /// stored `(TableId, pk_values)` equals the event's.
+    ///
+    /// Silently no-ops when the PK cannot be materialised (unknown
+    /// column, missing scalar, or `Presence::Null`). pk-follows are
+    /// best-effort per the `pk_follows` doc contract; loss of the
+    /// auto-close marker degrades gracefully to an ordinary inert
+    /// subscription rather than surfacing an error.
+    fn close_deleted_pk_follows(&mut self, event: &E) {
+        let table_id = event.table_id();
+        let pk_cols: alloc::vec::Vec<crate::ColumnId> = event.pk_columns().to_vec();
+
+        // Extract the event's PK cells once so we can compare each
+        // follow against the same materialised Vec.
+        let mut event_pk: alloc::vec::Vec<Value<E::Backend>> =
+            alloc::vec::Vec::with_capacity(pk_cols.len());
+        for &col in &pk_cols {
+            let Some(kind) = catalog_helpers::column_scalar_kind(&self.database, table_id, col)
+            else {
+                return;
+            };
+            let Some(v) = extract_pk_value::<E>(event, col, kind) else {
+                return;
+            };
+            event_pk.push(v);
+        }
+
+        // Collect first, mutate second: `unregister_subscription_internal`
+        // needs `&mut self` while `pk_follows` iteration holds an
+        // immutable borrow.
+        let to_close: alloc::vec::Vec<SubscriptionId> = self
+            .pk_follows
+            .iter()
+            .filter_map(|(&sub_id, (follow_table, follow_pk))| {
+                (*follow_table == table_id && follow_pk == &event_pk).then_some(sub_id)
+            })
+            .collect();
+        for sub_id in to_close {
+            self.unregister_subscription_internal(sub_id);
+        }
     }
 
     /// Unregister all subscriptions for a session
@@ -2815,3 +2859,38 @@ where
 }
 
 // Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
+
+/// Read one primary-key column off a [`CdcEvent`] via [`RowKind::Pk`]
+/// and lift it into a typed [`Value`] matching the caller-provided
+/// [`ScalarKind`]. Returns `None` when the accessor reports
+/// [`Presence::Missing`] or [`Presence::Null`], so callers upstream
+/// can bail out cleanly without materialising a partial key.
+fn extract_pk_value<E: CdcEvent>(
+    event: &E,
+    col: crate::ColumnId,
+    kind: ScalarKind,
+) -> Option<Value<E::Backend>> {
+    macro_rules! ext {
+        ($accessor:ident, $variant:ident) => {
+            match event.$accessor(RowKind::Pk, col) {
+                Presence::Present(v) => Some(Value::$variant(v.clone())),
+                Presence::Missing | Presence::Null => None,
+            }
+        };
+    }
+    match kind {
+        ScalarKind::Bool => ext!(bool_at, Bool),
+        ScalarKind::Int => ext!(int_at, Int),
+        ScalarKind::Float => ext!(float_at, Float),
+        ScalarKind::String => ext!(string_at, String),
+        ScalarKind::Bytes => ext!(bytes_at, Bytes),
+        ScalarKind::Uuid => ext!(uuid_at, Uuid),
+        ScalarKind::Timestamp => ext!(timestamp_at, Timestamp),
+        ScalarKind::TimestampTz => ext!(timestamp_tz_at, TimestampTz),
+        ScalarKind::Date => ext!(date_at, Date),
+        ScalarKind::Time => ext!(time_at, Time),
+        ScalarKind::Decimal => ext!(decimal_at, Decimal),
+        ScalarKind::Json => ext!(json_at, Json),
+        ScalarKind::Jsonb => ext!(jsonb_at, Jsonb),
+    }
+}

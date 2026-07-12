@@ -1,12 +1,13 @@
-//! Parser: SQLite session-extension patchset bytes into typed
-//! [`SqlitePatchsetEvent`] instances.
+//! Parser: SQLite session-extension changeset bytes into typed
+//! [`SqliteChangesetEvent`] instances.
 //!
-//! Turns [`sqlite_diff_rs::ParsedDiffSet::Patchset`] into a stream of
+//! Turns [`sqlite_diff_rs::ParsedDiffSet::Changeset`] into a stream of
 //! typed events by:
 //!
 //! 1. Parsing the wire bytes via `sqlite_diff_rs::ParsedDiffSet::parse`.
-//! 2. Rejecting a changeset-marker payload up front (subql only
-//!    consumes patchset for now).
+//! 2. Rejecting a patchset-marker payload up front (subql only consumes
+//!    changesets so `UPDATE` and `DELETE` events carry full old-row
+//!    images, which patchsets omit).
 //! 3. Resolving each op's table name against the catalog, computing PK
 //!    column ordinals from the wire's `pk_flags`, and looking up the
 //!    per-column [`crate::backend::ScalarKind`] from the catalog to
@@ -16,26 +17,27 @@
 //!    `Box<[Value<SQLite>]>` with [`Value::Missing`] for cells the wire
 //!    did not carry on that side.
 
-use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use sql_traits::prelude::DatabaseLike;
-use sqlite_diff_rs::{ParseError, ParsedDiffSet, PatchsetOp, TableSchema, Value as WireValue};
+use sqlite_diff_rs::{
+    ChangesetOp, ChangesetUpdatePair, ParseError, ParsedDiffSet, TableSchema, Value as WireValue,
+};
 
-use super::event::SqlitePatchsetEvent;
+use super::event::SqliteChangesetEvent;
 use crate::backend::{SQLite, ScalarKind, Value};
 use crate::wal::{resolve_table, WalParseError, WalParser};
 use crate::{catalog_helpers, ColumnId, EventKind, TableId};
 
 /// Parser marker type. Zero-sized; safe to construct freely.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct SqlitePatchsetParser;
+pub struct SqliteChangesetParser;
 
-impl<DB: DatabaseLike> WalParser<DB> for SqlitePatchsetParser {
+impl<DB: DatabaseLike> WalParser<DB> for SqliteChangesetParser {
     type Checkpoint = crate::NoCheckpoint;
-    type Event = SqlitePatchsetEvent;
+    type Event = SqliteChangesetEvent;
 
     fn parse_wal_message(
         &self,
@@ -46,9 +48,9 @@ impl<DB: DatabaseLike> WalParser<DB> for SqlitePatchsetParser {
             return Ok(Vec::new());
         }
         let parsed = ParsedDiffSet::parse(data).map_err(convert_parse_error)?;
-        let ParsedDiffSet::Patchset(diffset) = parsed else {
+        let ParsedDiffSet::Changeset(diffset) = parsed else {
             return Err(WalParseError::MalformedPayload(
-                "expected SQLite patchset marker 'P', got changeset marker 'T'".to_string(),
+                "expected SQLite changeset marker 'T', got patchset marker 'P'".to_string(),
             ));
         };
         let mut events = Vec::new();
@@ -77,9 +79,9 @@ fn convert_parse_error(err: ParseError) -> WalParseError {
 
 #[allow(clippy::needless_pass_by_value)]
 fn op_to_event<DB: DatabaseLike>(
-    op: PatchsetOp<'_, TableSchema<alloc::string::String>, alloc::string::String, Vec<u8>>,
+    op: ChangesetOp<'_, TableSchema<alloc::string::String>, alloc::string::String, Vec<u8>>,
     database: &DB,
-) -> Result<Option<SqlitePatchsetEvent>, WalParseError> {
+) -> Result<Option<SqliteChangesetEvent>, WalParseError> {
     let schema = op.table();
     let table_name = schema.name();
     let table_id = resolve_table("", table_name.as_str(), database)?;
@@ -100,7 +102,7 @@ fn op_to_event<DB: DatabaseLike>(
     let scalar_kinds = column_scalar_kinds(database, table_id, arity);
 
     let (kind, new_row, old_row, changed_columns) = match op {
-        PatchsetOp::Insert { values, .. } => {
+        ChangesetOp::Insert { values, .. } => {
             if values.len() != arity {
                 return Err(WalParseError::ArityMismatch {
                     table_id,
@@ -122,48 +124,59 @@ fn op_to_event<DB: DatabaseLike>(
                 Arc::from(Vec::<ColumnId>::new()),
             )
         }
-        PatchsetOp::Update { pk, entries, .. } => {
-            if entries.len() != arity {
+        ChangesetOp::Update { values, .. } => {
+            if values.len() != arity {
                 return Err(WalParseError::ArityMismatch {
                     table_id,
-                    wal_count: entries.len(),
+                    wal_count: values.len(),
                     catalog_arity: arity,
                 });
             }
             let mut new_row: Vec<Value<SQLite>> = Vec::with_capacity(arity);
+            let mut old_row: Vec<Value<SQLite>> = Vec::with_capacity(arity);
             let mut changed = Vec::new();
-            for (col, ((), maybe_new)) in entries.iter().enumerate() {
-                if let Some(wire) = maybe_new {
+            for (col, pair) in values.iter().enumerate() {
+                let kind = scalar_kind_for(&scalar_kinds, col);
+                let (old_v, new_v) = decode_update_pair(pair, kind);
+                if is_changed(pair) {
                     #[allow(clippy::cast_possible_truncation)]
                     changed.push(col as ColumnId);
-                    new_row.push(decode_wire_value(
-                        wire.clone(),
-                        scalar_kind_for(&scalar_kinds, col),
-                    ));
-                } else {
-                    new_row.push(Value::Missing);
                 }
+                old_row.push(old_v);
+                new_row.push(new_v);
             }
-            let old_row = old_row_from_pk(pk, &pk_columns, arity, &scalar_kinds);
             (
                 EventKind::Update,
                 Some(new_row.into_boxed_slice()),
-                Some(old_row),
+                Some(old_row.into_boxed_slice()),
                 Arc::from(changed),
             )
         }
-        PatchsetOp::Delete { pk, .. } => {
-            let old_row = old_row_from_pk(pk, &pk_columns, arity, &scalar_kinds);
+        ChangesetOp::Delete { old_values, .. } => {
+            if old_values.len() != arity {
+                return Err(WalParseError::ArityMismatch {
+                    table_id,
+                    wal_count: old_values.len(),
+                    catalog_arity: arity,
+                });
+            }
+            let mut row: Vec<Value<SQLite>> = Vec::with_capacity(arity);
+            for (col, wire) in old_values.iter().enumerate() {
+                row.push(decode_wire_value(
+                    wire.clone(),
+                    scalar_kind_for(&scalar_kinds, col),
+                ));
+            }
             (
                 EventKind::Delete,
                 None,
-                Some(old_row),
+                Some(row.into_boxed_slice()),
                 Arc::from(Vec::<ColumnId>::new()),
             )
         }
     };
 
-    Ok(Some(SqlitePatchsetEvent {
+    Ok(Some(SqliteChangesetEvent {
         kind,
         table_id,
         pk_columns,
@@ -173,28 +186,37 @@ fn op_to_event<DB: DatabaseLike>(
     }))
 }
 
-/// Build an arity-sized old-row image populated only for PK columns.
+/// Decode a changeset UPDATE column pair into `(old, new)` typed values.
 ///
-/// `pk_values` holds the PK column values in PK-declaration order (as
-/// carried by the wire). We route each PK value to its ColumnId ordinal
-/// so the row image looks like every other one: index-aligned with
-/// [`ColumnId`], [`Value::Missing`] for non-PK cells.
-fn old_row_from_pk(
-    pk_values: &[WireValue<alloc::string::String, Vec<u8>>],
-    pk_columns: &[ColumnId],
-    arity: usize,
-    scalar_kinds: &[Option<ScalarKind>],
-) -> Box<[Value<SQLite>]> {
-    let mut old_row: Vec<Value<SQLite>> = (0..arity).map(|_| Value::Missing).collect();
-    for (i, wire) in pk_values.iter().enumerate() {
-        let Some(&col) = pk_columns.get(i) else {
-            break;
-        };
-        if let Some(slot) = old_row.get_mut(col as usize) {
-            *slot = decode_wire_value(wire.clone(), scalar_kind_for(scalar_kinds, col as usize));
-        }
+/// A slot marked `None` on the wire means "the changeset did not carry
+/// this side", which happens for the non-diffed columns of an UPDATE
+/// (both slots `None`). We surface that as [`Value::Missing`] on the
+/// corresponding side.
+fn decode_update_pair(
+    pair: &ChangesetUpdatePair<alloc::string::String, Vec<u8>>,
+    kind: Option<ScalarKind>,
+) -> (Value<SQLite>, Value<SQLite>) {
+    let old = pair
+        .0
+        .as_ref()
+        .map_or(Value::Missing, |v| decode_wire_value(v.clone(), kind));
+    let new = pair
+        .1
+        .as_ref()
+        .map_or(Value::Missing, |v| decode_wire_value(v.clone(), kind));
+    (old, new)
+}
+
+/// A column counts as changed when the wire distinguishes its old and
+/// new values. Undefined-undefined pairs (unchanged non-PK columns)
+/// return false; equal-value pairs (unchanged PK columns) also return
+/// false so `changed_columns` stays semantically accurate.
+fn is_changed(pair: &ChangesetUpdatePair<alloc::string::String, Vec<u8>>) -> bool {
+    match (pair.0.as_ref(), pair.1.as_ref()) {
+        (None, None) => false,
+        (Some(a), Some(b)) => a != b,
+        _ => true,
     }
-    old_row.into_boxed_slice()
 }
 
 fn pk_columns_from_flags(pk_flags: &[u8]) -> Arc<[ColumnId]> {
@@ -309,7 +331,7 @@ mod tests {
     use super::*;
     use crate::backend::{CdcEvent, Presence, RowKind};
     use sql_traits::structs::ParserDB;
-    use sqlite_diff_rs::{DiffOps, Insert, PatchDelete, PatchSet, SimpleTable, Update};
+    use sqlite_diff_rs::{ChangeDelete, ChangeSet, DiffOps, Insert, SimpleTable, Update};
 
     fn orders_db() -> ParserDB {
         ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
@@ -326,14 +348,14 @@ mod tests {
     #[test]
     fn typed_sqlite_event_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<SqlitePatchsetEvent>();
+        assert_send_sync::<SqliteChangesetEvent>();
     }
 
     #[test]
     fn typed_sqlite_insert_roundtrip() {
         let db = orders_db();
         let orders = orders_table();
-        let patchset = PatchSet::<_, alloc::string::String, Vec<u8>>::new().insert(
+        let changeset = ChangeSet::<_, alloc::string::String, Vec<u8>>::new().insert(
             Insert::from(orders)
                 .set(0, 7_i64)
                 .unwrap()
@@ -342,8 +364,8 @@ mod tests {
                 .set(2, "paid")
                 .unwrap(),
         );
-        let bytes: Vec<u8> = patchset.into();
-        let events = SqlitePatchsetParser
+        let bytes: Vec<u8> = changeset.into();
+        let events = SqliteChangesetParser
             .parse_wal_message(&bytes, &db)
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
@@ -363,33 +385,34 @@ mod tests {
     }
 
     #[test]
-    fn typed_sqlite_update_carries_changed_columns_and_pk() {
+    fn typed_sqlite_update_carries_full_old_and_new() {
         let db = orders_db();
         let orders = orders_table();
-        // Patchset Update: PK must be part of the wire values so the
-        // builder can extract it. Set col 0 (PK) to its unchanged value
-        // and col 2 (status) to its new value; col 1 (amount) stays
-        // Undefined.
-        let patchset = PatchSet::<_, alloc::string::String, Vec<u8>>::new().update(
-            Update::<_, sqlite_diff_rs::PatchsetFormat, alloc::string::String, Vec<u8>>::from(
+        // Changeset UPDATE: PK column and the changed non-PK column
+        // both carry (old, new). The unchanged non-PK column carries
+        // (None, None). `Update::set(col, old, new)` on the changeset
+        // builder expresses that directly.
+        let changeset = ChangeSet::<_, alloc::string::String, Vec<u8>>::new().update(
+            Update::<_, sqlite_diff_rs::ChangesetFormat, alloc::string::String, Vec<u8>>::from(
                 orders,
             )
-            .set(0, 7_i64)
+            .set(0, 7_i64, 7_i64)
             .unwrap()
-            .set(2, "shipped")
+            .set(2, "pending", "shipped")
             .unwrap(),
         );
-        let bytes: Vec<u8> = patchset.into();
-        let events = SqlitePatchsetParser
+        let bytes: Vec<u8> = changeset.into();
+        let events = SqliteChangesetParser
             .parse_wal_message(&bytes, &db)
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Update);
         assert_eq!(ev.pk_columns(), &[0u16]);
-        let mut changed = ev.changed_columns().to_vec();
-        changed.sort_unstable();
-        assert_eq!(changed, alloc::vec![0u16, 2u16]);
+        // Only the status column truly changed; the PK column pair
+        // `(7, 7)` is unchanged and stays out of `changed_columns`.
+        let changed = ev.changed_columns().to_vec();
+        assert_eq!(changed, alloc::vec![2u16]);
         assert_eq!(ev.int_at(RowKind::New, 0), Presence::Present(&7));
         assert_eq!(ev.int_at(RowKind::New, 1), Presence::Missing);
         assert_eq!(
@@ -398,17 +421,28 @@ mod tests {
         );
         assert_eq!(ev.int_at(RowKind::Old, 0), Presence::Present(&7));
         assert_eq!(ev.int_at(RowKind::Old, 1), Presence::Missing);
+        assert_eq!(
+            ev.string_at(RowKind::Old, 2),
+            Presence::Present(&alloc::string::String::from("pending"))
+        );
         assert_eq!(ev.int_at(RowKind::Pk, 0), Presence::Present(&7));
     }
 
     #[test]
-    fn typed_sqlite_delete_carries_pk_only() {
+    fn typed_sqlite_delete_carries_full_old_image() {
         let db = orders_db();
         let orders = orders_table();
-        let patchset = PatchSet::<_, alloc::string::String, Vec<u8>>::new()
-            .delete(PatchDelete::new(orders, alloc::vec![WireValue::Integer(9)]));
-        let bytes: Vec<u8> = patchset.into();
-        let events = SqlitePatchsetParser
+        let changeset = ChangeSet::<_, alloc::string::String, Vec<u8>>::new().delete(
+            ChangeDelete::from(orders)
+                .set(0, 9_i64)
+                .unwrap()
+                .set(1, 500_i64)
+                .unwrap()
+                .set(2, "paid")
+                .unwrap(),
+        );
+        let bytes: Vec<u8> = changeset.into();
+        let events = SqliteChangesetParser
             .parse_wal_message(&bytes, &db)
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);
@@ -416,7 +450,11 @@ mod tests {
         assert_eq!(ev.kind(), EventKind::Delete);
         assert!(ev.changed_columns().is_empty());
         assert_eq!(ev.int_at(RowKind::Old, 0), Presence::Present(&9));
-        assert_eq!(ev.int_at(RowKind::Old, 1), Presence::Missing);
+        assert_eq!(ev.int_at(RowKind::Old, 1), Presence::Present(&500));
+        assert_eq!(
+            ev.string_at(RowKind::Old, 2),
+            Presence::Present(&alloc::string::String::from("paid"))
+        );
         assert_eq!(ev.int_at(RowKind::Pk, 0), Presence::Present(&9));
         assert_eq!(ev.int_at(RowKind::New, 0), Presence::Missing);
     }
@@ -424,17 +462,17 @@ mod tests {
     #[test]
     fn typed_sqlite_empty_data_yields_empty_events() {
         let db = orders_db();
-        let events = SqlitePatchsetParser
+        let events = SqliteChangesetParser
             .parse_wal_message(&[], &db)
             .expect("parse succeeds");
         assert!(events.is_empty());
     }
 
     #[test]
-    fn typed_sqlite_changeset_marker_is_rejected() {
+    fn typed_sqlite_patchset_marker_is_rejected() {
         let db = orders_db();
-        let bytes: alloc::vec::Vec<u8> = alloc::vec![b'T', 0, 0];
-        let result = SqlitePatchsetParser.parse_wal_message(&bytes, &db);
+        let bytes: alloc::vec::Vec<u8> = alloc::vec![b'P', 0, 0];
+        let result = SqliteChangesetParser.parse_wal_message(&bytes, &db);
         assert!(matches!(result, Err(WalParseError::MalformedPayload(_))));
     }
 
@@ -442,7 +480,7 @@ mod tests {
     fn typed_sqlite_dispatches_through_engine() {
         let db = orders_db();
         let mut engine: crate::SubscriptionEngine<
-            SqlitePatchsetEvent,
+            SqliteChangesetEvent,
             crate::DefaultIds,
             ParserDB,
         > = crate::SubscriptionEngine::new(db, sqlparser::dialect::SQLiteDialect {});
@@ -453,7 +491,7 @@ mod tests {
             )
             .expect("register subscription");
         let orders = orders_table();
-        let patchset = PatchSet::<_, alloc::string::String, Vec<u8>>::new().insert(
+        let changeset = ChangeSet::<_, alloc::string::String, Vec<u8>>::new().insert(
             Insert::from(orders)
                 .set(0, 7_i64)
                 .unwrap()
@@ -462,8 +500,8 @@ mod tests {
                 .set(2, "paid")
                 .unwrap(),
         );
-        let bytes: Vec<u8> = patchset.into();
-        let events = SqlitePatchsetParser
+        let bytes: Vec<u8> = changeset.into();
+        let events = SqliteChangesetParser
             .parse_wal_message(&bytes, engine.database())
             .expect("parse succeeds");
         assert_eq!(events.len(), 1);

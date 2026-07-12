@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-subql = { path = "..", features = ["testing", "sqlite-cdc"] }
+subql = { path = "..", features = ["testing", "pg-sqlite-emu"] }
 
 # Standalone workspace - kept out of the parent on purpose. The root
 # workspace has `lto = true` on its release profile, and cargo-fuzz
@@ -29,7 +29,15 @@ members = ["."]
 # delete both blocks together once the bundled PRs land and a patched
 # sqlparser release is on crates.io.
 [patch.crates-io]
+# Mirror root Cargo.toml [patch.crates-io] pins. cargo-fuzz's standalone
+# workspace does not inherit the parent's patch table.
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+# Route diesel through the LucaCappelletti94/future fork so the
+# `SqliteConnection` here is the same type diesel-sqlite-session sees.
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 
 [profile.release]
 debug = 1

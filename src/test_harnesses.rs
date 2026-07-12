@@ -3,7 +3,7 @@
 //! Each `harness_*` function takes raw bytes and exercises a library subsystem.
 //! The contract: errors are fine, **panics are bugs**.
 //!
-//! This module is only compiled under `#[cfg(any(feature = "testing", test))]`.
+//! This module is only compiled under `#[cfg(feature = "testing")]`.
 
 // Clippy allows scoped to this fuzz-harness module. These lints flag
 // stylistic patterns (manual let-else, items after statements, doc
@@ -21,25 +21,22 @@
     clippy::match_same_arms
 )]
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
 use arbitrary::{Arbitrary, Unstructured};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use std::collections::BTreeMap;
-
+use crate::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value};
 use crate::compiler::bytecode::{BytecodeProgram, Instruction};
 use crate::compiler::canonicalize::{hash_sql, normalize_sql};
 use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
-use crate::types::{Cell, PrimaryKey, RowImage};
+use crate::testing::TestEvent;
 use crate::wal::{MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Parser, WalParser};
-use crate::{
-    catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest, WalEvent,
-};
+use crate::{catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 /// Build a permissive fuzz schema as a [`ParserDB`].
 ///
@@ -53,35 +50,69 @@ pub fn fuzz_catalog() -> ParserDB {
         "CREATE TABLE orders (\
              id INT PRIMARY KEY, amount INT, status TEXT, \
              c0 INT, c1 INT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, \
-             c8 INT, c9 INT, c10 INT, c11 INT, c12 INT, c13 INT, c14 INT, c15 INT\
+             c8 INT, c9 INT, c10 INT, c11 INT, c12 INT, c13 INT, c14 INT, c15 INT \
          );",
     )
     .expect("fuzz fixture DDL parses")
 }
 
-/// Generate a [`Cell`] from fuzzer-controlled bytes.
-fn arb_cell(u: &mut Unstructured<'_>) -> arbitrary::Result<Cell> {
+/// Generate a [`Value<Postgres>`] from fuzzer-controlled bytes.
+///
+/// Six shapes mirror what the retired `Cell` enum carried plus the
+/// three-valued `Missing` / `Null` semantics: `Missing`, `Null`,
+/// `Bool`, `Int`, `Float`, `String`. The three-valued shapes exercise
+/// the VM's `IS NULL` / arithmetic-against-null paths.
+fn arb_value(u: &mut Unstructured<'_>) -> arbitrary::Result<Value<Postgres>> {
     match u.int_in_range(0u8..=5)? {
-        0 => Ok(Cell::Null),
-        1 => Ok(Cell::Missing),
-        2 => Ok(Cell::Bool(bool::arbitrary(u)?)),
-        3 => Ok(Cell::Int(i64::arbitrary(u)?)),
-        4 => Ok(Cell::Float(f64::arbitrary(u)?)),
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Missing),
+        2 => Ok(Value::Bool(bool::arbitrary(u)?)),
+        3 => Ok(Value::Int(i64::arbitrary(u)?)),
+        4 => Ok(Value::Float(f64::arbitrary(u)?)),
         _ => {
             let len = u.int_in_range(0usize..=64)?;
             let bytes: Vec<u8> = (0..len)
                 .map(|_| u.arbitrary())
                 .collect::<arbitrary::Result<_>>()?;
-            Ok(Cell::String(String::from_utf8_lossy(&bytes).into()))
+            Ok(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
         }
     }
 }
 
-/// Generate an [`Instruction`] from fuzzer-controlled bytes.
-fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction> {
+/// Generate a [`ScalarKind`] for `LoadColumn`.
+///
+/// Draws from every one of the 13 kinds so the VM's per-scalar
+/// dispatch surface is exercised on every accessor. When the drawn
+/// kind does not match the underlying [`Value`] at that column, the
+/// event's accessor returns [`crate::backend::Presence::Missing`]; the
+/// VM lifts that into `Value::Missing` and keeps evaluating. That
+/// mismatch path is desirable coverage, not a bug.
+fn arb_scalar_kind(u: &mut Unstructured<'_>) -> arbitrary::Result<ScalarKind> {
+    Ok(match u.int_in_range(0u8..=12)? {
+        0 => ScalarKind::Bool,
+        1 => ScalarKind::Int,
+        2 => ScalarKind::Float,
+        3 => ScalarKind::String,
+        4 => ScalarKind::Bytes,
+        5 => ScalarKind::Uuid,
+        6 => ScalarKind::Timestamp,
+        7 => ScalarKind::TimestampTz,
+        8 => ScalarKind::Date,
+        9 => ScalarKind::Time,
+        10 => ScalarKind::Decimal,
+        11 => ScalarKind::Json,
+        _ => ScalarKind::Jsonb,
+    })
+}
+
+/// Generate an [`Instruction<Postgres>`] from fuzzer-controlled bytes.
+fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction<Postgres>> {
     match u.int_in_range(0u8..=23)? {
-        0 => Ok(Instruction::PushLiteral(arb_cell(u)?)),
-        1 => Ok(Instruction::LoadColumn(u.int_in_range(0u16..=63)?)),
+        0 => Ok(Instruction::PushLiteral(arb_value(u)?)),
+        1 => Ok(Instruction::LoadColumn(
+            u.int_in_range(0u16..=63)?,
+            arb_scalar_kind(u)?,
+        )),
         2 => Ok(Instruction::Equal),
         3 => Ok(Instruction::NotEqual),
         4 => Ok(Instruction::LessThan),
@@ -101,8 +132,8 @@ fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction> {
         18 => Ok(Instruction::Negate),
         19 => {
             let len = u.int_in_range(0usize..=8)?;
-            let list: Vec<Cell> = (0..len)
-                .map(|_| arb_cell(u))
+            let list: Vec<Value<Postgres>> = (0..len)
+                .map(|_| arb_value(u))
                 .collect::<arbitrary::Result<_>>()?;
             Ok(Instruction::In(list))
         }
@@ -138,7 +169,7 @@ pub fn harness_parse_sql(data: &[u8]) {
     let catalog = fuzz_catalog();
     let pg = PostgreSqlDialect {};
 
-    let _ = parse_and_compile(sql, &pg, &catalog);
+    let _ = parse_and_compile::<Postgres, _>(sql, &pg, &catalog);
 }
 
 /// Generate random bytecode + row and evaluate with the VM.
@@ -149,7 +180,7 @@ pub fn harness_vm_eval(data: &[u8]) {
     let Ok(n_instr) = u.int_in_range(1usize..=32) else {
         return;
     };
-    let instructions: Vec<Instruction> = match (0..n_instr)
+    let instructions: Vec<Instruction<Postgres>> = match (0..n_instr)
         .map(|_| arb_instruction(&mut u))
         .collect::<arbitrary::Result<_>>()
     {
@@ -161,8 +192,8 @@ pub fn harness_vm_eval(data: &[u8]) {
     let Ok(n_cells) = u.int_in_range(0usize..=16) else {
         return;
     };
-    let cells: Vec<Cell> = match (0..n_cells)
-        .map(|_| arb_cell(&mut u))
+    let cells: Vec<Value<Postgres>> = match (0..n_cells)
+        .map(|_| arb_value(&mut u))
         .collect::<arbitrary::Result<_>>()
     {
         Ok(v) => v,
@@ -170,12 +201,10 @@ pub fn harness_vm_eval(data: &[u8]) {
     };
 
     let program = BytecodeProgram::new(instructions);
-    let row = RowImage {
-        cells: Arc::from(cells),
-    };
+    let event = TestEvent::<Postgres>::insert(0, cells);
 
-    let mut vm = Vm::new();
-    let _ = vm.eval(&program, &row);
+    let mut vm = Vm::<Postgres>::new();
+    let _ = vm.eval(&program, &event, RowKind::New);
 }
 
 /// Feed raw bytes to shard deserialization.
@@ -444,7 +473,7 @@ impl MaxwellEnvelope {
 /// v2, and Maxwell parsers, skipping raw-bytes JSON tokenisation (which
 /// is serde_json's job, already heavily fuzzed upstream) and exercising
 /// subql's post-parse semantic-validation layer: column-count vs
-/// relation-cache mismatches, JSON-value-to-Cell coercion, sparse-old-row
+/// relation-cache mismatches, JSON-value-to-typed coercion, sparse-old-row
 /// handling, PK extraction, action-tag dispatch.
 ///
 /// Contract: panics are bugs. Any `Err(WalParseError)` is fine.
@@ -533,19 +562,16 @@ impl VirtRow {
     }
 }
 
-/// Build a 3-cell `RowImage` (id, amount, status) matching the
-/// `agg_catalog()` schema.
-fn agg_row_image(id: i64, row: &VirtRow) -> RowImage {
-    let cells = [
-        Cell::Int(id),
-        row.amount.map_or(Cell::Null, Cell::Int),
+/// Build the 3-cell row image `(id, amount, status)` matching
+/// `agg_catalog()`'s schema, using `Value<Postgres>` variants.
+fn agg_row_values(id: i64, row: &VirtRow) -> Vec<Value<Postgres>> {
+    vec![
+        Value::Int(id),
+        row.amount.map_or(Value::Null, Value::Int),
         row.status
             .as_deref()
-            .map_or(Cell::Null, |s| Cell::String(s.into())),
-    ];
-    RowImage {
-        cells: Arc::from(cells.as_slice()),
-    }
+            .map_or(Value::Null, |s| Value::String(s.to_string())),
+    ]
 }
 
 /// Build the `agg_catalog()` `ParserDB` once: three columns, single-
@@ -570,7 +596,7 @@ fn agg_catalog() -> ParserDB {
 /// shared by every iteration on the only worker thread. Re-entrancy is
 /// not possible.
 struct AggEngineCell {
-    engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
+    engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
     table_id: crate::TableId,
     pk_col: crate::ColumnId,
 }
@@ -582,7 +608,7 @@ impl AggEngineCell {
             .expect("agg_catalog must expose an `orders` table");
         let pk_col = catalog_helpers::column_id(&database, table_id, "id")
             .expect("agg_catalog `orders` must expose an `id` column");
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+        let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(database, PostgreSqlDialect {});
         engine
             .register(SubscriptionRequest::<DefaultIds>::new(
@@ -672,31 +698,18 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
         let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
 
         for op in ops {
-            let (event, mutated): (Option<WalEvent>, bool) = match op {
+            let (event, mutated): (Option<TestEvent<Postgres>>, bool) = match op {
                 AggOp::Insert { id, amount, status } => {
                     let id = i64::from(id);
                     if virt.contains_key(&id) {
                         (None, false)
                     } else {
                         let row = VirtRow::from_op(amount, status);
-                        let image = agg_row_image(id, &row);
+                        let values = agg_row_values(id, &row);
                         virt.insert(id, row);
-                        let pk = match PrimaryKey::new(
-                            Arc::from([pk_col].as_slice()),
-                            Arc::from([Cell::Int(id)].as_slice()),
-                        ) {
-                            Ok(pk) => pk,
-                            Err(_) => return,
-                        };
-                        let event = WalEvent::builder(table_id)
-                            .insert()
-                            .pk(pk)
-                            .new_row(image)
-                            .build();
-                        match event {
-                            Ok(e) => (Some(e), true),
-                            Err(_) => return,
-                        }
+                        let event = TestEvent::<Postgres>::insert(table_id, values)
+                            .with_pk_columns([pk_col]);
+                        (Some(event), true)
                     }
                 }
                 AggOp::Update { id, amount, status } => {
@@ -705,49 +718,22 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
                         continue;
                     };
                     let new_row = VirtRow::from_op(amount, status);
-                    let old_image = agg_row_image(id, &old);
-                    let new_image = agg_row_image(id, &new_row);
+                    let old_values = agg_row_values(id, &old);
+                    let new_values = agg_row_values(id, &new_row);
                     virt.insert(id, new_row);
-                    let pk = match PrimaryKey::new(
-                        Arc::from([pk_col].as_slice()),
-                        Arc::from([Cell::Int(id)].as_slice()),
-                    ) {
-                        Ok(pk) => pk,
-                        Err(_) => return,
-                    };
-                    let event = WalEvent::builder(table_id)
-                        .update()
-                        .pk(pk)
-                        .old_row(old_image)
-                        .new_row(new_image)
-                        .build();
-                    match event {
-                        Ok(e) => (Some(e), true),
-                        Err(_) => return,
-                    }
+                    let event = TestEvent::<Postgres>::update(table_id, old_values, new_values)
+                        .with_pk_columns([pk_col]);
+                    (Some(event), true)
                 }
                 AggOp::Delete { id } => {
                     let id = i64::from(id);
                     let Some(old) = virt.remove(&id) else {
                         continue;
                     };
-                    let old_image = agg_row_image(id, &old);
-                    let pk = match PrimaryKey::new(
-                        Arc::from([pk_col].as_slice()),
-                        Arc::from([Cell::Int(id)].as_slice()),
-                    ) {
-                        Ok(pk) => pk,
-                        Err(_) => return,
-                    };
-                    let event = WalEvent::builder(table_id)
-                        .delete()
-                        .pk(pk)
-                        .old_row(old_image)
-                        .build();
-                    match event {
-                        Ok(e) => (Some(e), true),
-                        Err(_) => return,
-                    }
+                    let old_values = agg_row_values(id, &old);
+                    let event = TestEvent::<Postgres>::delete(table_id, old_values)
+                        .with_pk_columns([pk_col]);
+                    (Some(event), true)
                 }
             };
 
@@ -940,12 +926,12 @@ fn snapshot_workdir() -> std::path::PathBuf {
     p
 }
 
-fn snap_event_to_walevent(
+fn snap_event_to_event(
     op: SnapEvent,
     table_id: crate::TableId,
     pk_col: crate::ColumnId,
     virt: &mut BTreeMap<i64, VirtRow>,
-) -> Option<WalEvent> {
+) -> Option<TestEvent<Postgres>> {
     match op {
         SnapEvent::Insert { id, amount, status } => {
             let id = i64::from(id);
@@ -953,55 +939,27 @@ fn snap_event_to_walevent(
                 return None;
             }
             let row = VirtRow::from_op(amount, status);
-            let image = agg_row_image(id, &row);
+            let values = agg_row_values(id, &row);
             virt.insert(id, row);
-            let pk = PrimaryKey::new(
-                Arc::from([pk_col].as_slice()),
-                Arc::from([Cell::Int(id)].as_slice()),
-            )
-            .ok()?;
-            WalEvent::builder(table_id)
-                .insert()
-                .pk(pk)
-                .new_row(image)
-                .build()
-                .ok()
+            Some(TestEvent::<Postgres>::insert(table_id, values).with_pk_columns([pk_col]))
         }
         SnapEvent::Update { id, amount, status } => {
             let id = i64::from(id);
             let old = virt.get(&id).cloned()?;
             let new_row = VirtRow::from_op(amount, status);
-            let old_image = agg_row_image(id, &old);
-            let new_image = agg_row_image(id, &new_row);
+            let old_values = agg_row_values(id, &old);
+            let new_values = agg_row_values(id, &new_row);
             virt.insert(id, new_row);
-            let pk = PrimaryKey::new(
-                Arc::from([pk_col].as_slice()),
-                Arc::from([Cell::Int(id)].as_slice()),
+            Some(
+                TestEvent::<Postgres>::update(table_id, old_values, new_values)
+                    .with_pk_columns([pk_col]),
             )
-            .ok()?;
-            WalEvent::builder(table_id)
-                .update()
-                .pk(pk)
-                .old_row(old_image)
-                .new_row(new_image)
-                .build()
-                .ok()
         }
         SnapEvent::Delete { id } => {
             let id = i64::from(id);
             let old = virt.remove(&id)?;
-            let old_image = agg_row_image(id, &old);
-            let pk = PrimaryKey::new(
-                Arc::from([pk_col].as_slice()),
-                Arc::from([Cell::Int(id)].as_slice()),
-            )
-            .ok()?;
-            WalEvent::builder(table_id)
-                .delete()
-                .pk(pk)
-                .old_row(old_image)
-                .build()
-                .ok()
+            let old_values = agg_row_values(id, &old);
+            Some(TestEvent::<Postgres>::delete(table_id, old_values).with_pk_columns([pk_col]))
         }
     }
 }
@@ -1078,7 +1036,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
         None => return,
     };
 
-    let mut engine_a: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    let mut engine_a: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         match SubscriptionEngine::with_storage(agg_catalog(), PostgreSqlDialect {}, workdir.clone())
         {
             Ok(e) => e,
@@ -1103,7 +1061,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
         return;
     }
 
-    let mut engine_b: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    let mut engine_b: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         match SubscriptionEngine::with_storage(database, PostgreSqlDialect {}, workdir) {
             Ok(e) => e,
             Err(_) => return,
@@ -1111,7 +1069,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
 
     let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
     for op in events {
-        let Some(event) = snap_event_to_walevent(op, table_id, pk_col, &mut virt) else {
+        let Some(event) = snap_event_to_event(op, table_id, pk_col, &mut virt) else {
             continue;
         };
         let notif_a = match engine_a.consumers(&event) {
@@ -1124,7 +1082,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
         };
         assert!(
             notifications_equal(&notif_a, &notif_b),
-            "snapshot/restore drift: A={:?} B={:?} event={:?}",
+            "snapshot/restore drift: A={:?} B={:?} event_kind={:?}",
             (notif_a.inserted(), notif_a.updated(), notif_a.deleted()),
             (notif_b.inserted(), notif_b.updated(), notif_b.deleted()),
             event.kind(),
@@ -1169,39 +1127,39 @@ pub fn harness_pgoutput(data: &[u8]) {
         }
     }
 }
-/// pgoutput round-trip full end-to-end fuzz harness.
+
+/// End-to-end pgoutput fuzz harness on the fake-Postgres-over-SQLite
+/// emulator.
 ///
-/// Drives an arbitrary DML stream through [`crate::SqliteCdcSource`],
-/// routes each emitted [`WalEvent`] through [`crate::PgOutputBridge`]
-/// and [`PgOutputParser`], and dispatches the parser's output through
-/// a populated [`SubscriptionEngine`]. Exercises the whole pipeline
-/// (catalog plus triggers plus shadow log plus IR translation plus
-/// `pgoutput` encode plus `pgoutput` decode plus VM dispatch) on every
-/// input, using the in-process `SqliteCdcSource` as a stand-in for a
-/// real PostgreSQL source.
+/// Drives an arbitrary DML stream through [`crate::PgSqliteEmuSource`],
+/// which internally re-encodes each session changeset as pgoutput wire
+/// bytes and feeds them through the production [`PgOutputParser`], and
+/// dispatches every emitted [`crate::PgOutputEvent`] through a
+/// populated [`SubscriptionEngine`]. Exercises the whole pipeline
+/// (catalog plus pg2sqlite plus session extension plus changeset->
+/// pgoutput encode plus pgoutput decode plus VM dispatch) on every
+/// input.
 ///
 /// # Invariants enforced at fixture build time
 ///
-/// Several seams of the harness use fixed inputs (the DDL string, the
-/// connection target, the subscription SQL). A regression that breaks
-/// any of them should crash the very first fuzz iteration, never report
-/// "green" while silently fuzzing nothing. The init path asserts:
+/// Several seams use fixed inputs (the DDL string, the connection
+/// target, the subscription SQL). A regression that breaks any of them
+/// should crash the very first fuzz iteration, never report "green"
+/// while silently fuzzing nothing. The init path asserts:
 ///
-/// * the fixed PG DDL parses into a [`ParserDB`],
+/// * the fixed PG DDL parses and applies through `pg2sqlite`,
 /// * the in-memory SQLite connection opens,
-/// * the SQLite-side schema applies through `pg2sqlite`,
 /// * every fixed [`SubscriptionRequest`] compiles and registers.
 ///
 /// # Per-iteration contract
 ///
-/// Panics inside `bridge.encode_event`, `parser.parse_wal_message`,
-/// `engine.consumers`, or any of the Diesel paths are bugs. Errors at
-/// those seams are fine because adversarial DML can legitimately
-/// produce them (constraint violations, malformed WAL bytes the parser
-/// rejects, dispatch errors when an UPDATE arrives without the old
+/// Panics inside `source.execute`, `source.poll_next_event`, or
+/// `engine.consumers` are bugs. Errors at those seams are fine because
+/// adversarial DML can legitimately produce them (constraint
+/// violations, dispatch errors when an UPDATE arrives without the old
 /// row), but the result is fed to [`core::hint::black_box`] so the
 /// optimizer cannot dead-code-eliminate the dispatch.
-#[cfg(feature = "sqlite-cdc")]
+#[cfg(feature = "pg-sqlite-emu")]
 pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
     use core::cell::RefCell;
     use core::hint::black_box;
@@ -1230,14 +1188,11 @@ pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
         let op_count = u.int_in_range(0u8..=64).unwrap_or(0);
         for _ in 0..op_count {
             // 4 % chance of injecting a synthetic Truncate event. The
-            // SQLite source has no TRUNCATE analog, so this is the only
-            // way the bridge's Truncate arm and the engine's Truncate
-            // dispatch fire in this harness.
+            // session extension has no TRUNCATE analog, so this is the
+            // only way the engine's Truncate dispatch fires in this
+            // harness.
             if u.int_in_range(0u8..=24).unwrap_or(0) == 0 {
-                let event = WalEvent::builder(fixture.table_id).truncate().build();
-                if let Ok(event) = event {
-                    fixture.route_event(&event);
-                }
+                let _ = fixture.inject_truncate();
                 continue;
             }
 
@@ -1247,7 +1202,7 @@ pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
             // Execute the DML against SQLite. Errors here are
             // adversarial-input territory (constraint violations,
             // syntax we did not anticipate) and skipped.
-            if fixture.source.execute(&sql).is_err() {
+            if fixture.execute(&sql).is_err() {
                 continue;
             }
             fixture.drain_and_dispatch(&mut |ev| {
@@ -1257,27 +1212,23 @@ pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
     });
 }
 
-#[cfg(feature = "sqlite-cdc")]
+#[cfg(feature = "pg-sqlite-emu")]
 struct E2eFixture {
-    catalog: ParserDB,
+    source: crate::PgSqliteEmuSource,
+    engine: SubscriptionEngine<crate::PgOutputEvent, DefaultIds, ParserDB>,
     table_id: crate::TableId,
-    engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>,
-    source: crate::SqliteCdcSource,
-    bridge: crate::PgOutputBridge,
-    parser: PgOutputParser,
 }
 
-#[cfg(feature = "sqlite-cdc")]
+#[cfg(feature = "pg-sqlite-emu")]
 impl E2eFixture {
     /// Fixed PG-dialect DDL for the `orders` table. Single-column INT
     /// primary key, one nullable INT, one nullable TEXT. Composite PK
-    /// and REPLICA IDENTITY DEFAULT (key-only old tuples) belong in a
-    /// separate harness with its own fixture.
+    /// and a wider column set belong in a separate harness with its
+    /// own fixture.
     const PG_DDL: &'static str =
         "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
 
-    /// Subscriptions the engine dispatches against. Mirrors the fixed
-    /// query set in `tests/proptest_sqlite_dispatch.rs`.
+    /// Subscriptions the engine dispatches against.
     const SUBSCRIPTIONS: &'static [(u64, &'static str)] = &[
         (1, "SELECT * FROM orders WHERE amount > 100"),
         (2, "SELECT * FROM orders WHERE status = 'paid'"),
@@ -1287,62 +1238,53 @@ impl E2eFixture {
     ];
 
     fn init() -> Self {
-        use diesel::{Connection, SqliteConnection};
-
-        use crate::{PgOutputBridge, SqliteCdcConfig, SqliteCdcSource};
-
-        let catalog_db = ParserDB::parse::<PostgreSqlDialect>(Self::PG_DDL)
-            .expect("fuzz fixture DDL must parse (regression: invariant broken)");
-        let table_id = catalog_helpers::table_id(&catalog_db, "orders")
+        let source = crate::PgSqliteEmuSource::open_in_memory(Self::PG_DDL)
+            .expect("PgSqliteEmuSource fixture must construct from fixed PG DDL");
+        let table_id = catalog_helpers::table_id(source.pg_catalog(), "orders")
             .expect("fuzz fixture orders table must resolve");
 
-        let mut engine = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            ParserDB::parse::<PostgreSqlDialect>(Self::PG_DDL)
-                .expect("fuzz fixture DDL must parse"),
-            PostgreSqlDialect {},
-        );
+        let mut engine: SubscriptionEngine<crate::PgOutputEvent, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
         for (consumer_id, sql) in Self::SUBSCRIPTIONS {
             engine
                 .register(SubscriptionRequest::new(*consumer_id, *sql))
                 .expect("fuzz fixture subscription must register");
         }
 
-        let conn =
-            SqliteConnection::establish(":memory:").expect("in-memory SQLite connection must open");
-        let source = SqliteCdcSource::with_pg_ddl(conn, Self::PG_DDL, SqliteCdcConfig::default())
-            .expect("SqliteCdcSource must construct from fixed PG DDL");
-
         Self {
-            catalog: catalog_db,
-            table_id,
-            engine,
             source,
-            bridge: PgOutputBridge::new(),
-            parser: PgOutputParser::new(),
+            engine,
+            table_id,
         }
     }
 
-    /// Clear shadow + table state between iterations. The connection,
-    /// triggers, engine, bridge, and parser all survive.
+    /// Clear table state between iterations. The source, session, and
+    /// engine all survive.
     fn reset(&mut self) {
-        // The bulk DELETE fires one trigger per row, leaving DELETE
-        // entries on the shadow log we need to drain so the next
-        // iter's events arrive in deterministic order.
+        // The bulk DELETE fires one changeset op per row, which then
+        // flows through the drain loop; we discard everything so the
+        // next iter starts with an empty stream.
         let _ = self.source.execute("DELETE FROM orders");
         while let Ok(Some(_)) = self.source.poll_next_event() {
-            // Discard residual shadow-log entries from the bulk DELETE.
+            // Discard residual events from the bulk DELETE.
         }
     }
 
-    /// Drain every shadow-log entry into the dispatch chain, calling
-    /// `sink` with whatever the engine returned for each parsed event.
+    fn execute(&mut self, sql: &str) -> Result<usize, crate::PgSqliteEmuError> {
+        self.source.execute(sql)
+    }
+
+    fn inject_truncate(&mut self) -> Result<(), crate::PgSqliteEmuError> {
+        self.source.inject_truncate(self.table_id)
+    }
+
+    /// Drain every event the source has for us and dispatch each
+    /// through the engine, feeding the dispatch result to `sink` so the
+    /// optimizer cannot dead-code-eliminate the whole loop.
     fn drain_and_dispatch<F>(&mut self, sink: &mut F)
     where
         F: FnMut(
-            &Result<
-                crate::ConsumerNotifications<DefaultIds, crate::NoCheckpoint>,
-                crate::DispatchError,
-            >,
+            &Result<crate::ConsumerNotifications<DefaultIds, crate::PgLsn>, crate::DispatchError>,
         ),
     {
         loop {
@@ -1350,44 +1292,13 @@ impl E2eFixture {
                 Ok(Some(ev)) => ev,
                 Ok(None) | Err(_) => break,
             };
-            self.route_event_inner(&event, sink);
-        }
-    }
-
-    /// Encode -> parse -> dispatch a single `WalEvent`. Used by both the
-    /// SQLite-sourced events and the synthetic Truncate-injection path.
-    fn route_event(&mut self, event: &WalEvent) {
-        self.route_event_inner(event, &mut |result| {
-            let _ = core::hint::black_box(result);
-        });
-    }
-
-    fn route_event_inner<F>(&mut self, event: &WalEvent, sink: &mut F)
-    where
-        F: FnMut(
-            &Result<
-                crate::ConsumerNotifications<DefaultIds, crate::NoCheckpoint>,
-                crate::DispatchError,
-            >,
-        ),
-    {
-        let frames = match self.bridge.encode_event(event, &self.catalog) {
-            Ok(frames) => frames,
-            Err(_) => return,
-        };
-        for frame in frames {
-            let Ok(parsed_events) = self.parser.parse_wal_message(&frame, &self.catalog) else {
-                continue;
-            };
-            for parsed in parsed_events {
-                let result = self.engine.consumers(&parsed);
-                sink(&result);
-            }
+            let result = self.engine.consumers(&event);
+            sink(&result);
         }
     }
 }
 
-#[cfg(feature = "sqlite-cdc")]
+#[cfg(feature = "pg-sqlite-emu")]
 fn next_dml(u: &mut Unstructured<'_>, _table_id: crate::TableId) -> Option<String> {
     // Six branches widen the previous `0u8..=2` mix: NULL inserts, NULL
     // updates, and PK-changing updates all exercise paths the original
@@ -1404,7 +1315,7 @@ fn next_dml(u: &mut Unstructured<'_>, _table_id: crate::TableId) -> Option<Strin
         }
         1 => {
             // INSERT with NULL amount and / or status. Exercises the
-            // Cell::Null branch end-to-end, including the
+            // Value::Null branch end-to-end, including the
             // `amount IS NULL` subscription registered above.
             let id = u.int_in_range(1i32..=8).ok()?;
             let amount = if bool::arbitrary(u).ok()? {
@@ -1465,14 +1376,15 @@ fn next_dml(u: &mut Unstructured<'_>, _table_id: crate::TableId) -> Option<Strin
     })
 }
 
-#[cfg(feature = "sqlite-cdc")]
+#[cfg(feature = "pg-sqlite-emu")]
+#[allow(clippy::range_minus_one)] // `Unstructured::int_in_range` takes `RangeInclusive` only.
 fn pick_status(u: &mut Unstructured<'_>) -> &'static str {
     const STATUSES: &[&str] = &["paid", "open", "closed", "pending"];
     let idx = u.int_in_range(0usize..=STATUSES.len() - 1).unwrap_or(0);
     STATUSES[idx]
 }
 
-#[cfg(feature = "sqlite-cdc")]
+#[cfg(feature = "pg-sqlite-emu")]
 fn alloc_format(args: core::fmt::Arguments<'_>) -> String {
     use core::fmt::Write;
     let mut out = String::new();
@@ -1486,21 +1398,23 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    fn cell_kind(cell: &Cell) -> u8 {
-        match cell {
-            Cell::Null => 0,
-            Cell::Missing => 1,
-            Cell::Bool(_) => 2,
-            Cell::Int(_) => 3,
-            Cell::Float(_) => 4,
-            Cell::String(_) => 5,
+    fn value_kind(v: &Value<Postgres>) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Missing => 1,
+            Value::Bool(_) => 2,
+            Value::Int(_) => 3,
+            Value::Float(_) => 4,
+            Value::String(_) => 5,
+            // arb_value never emits these variants; keep exhaustive.
+            _ => 99,
         }
     }
 
-    fn instruction_kind(instr: &Instruction) -> u8 {
+    fn instruction_kind(instr: &Instruction<Postgres>) -> u8 {
         match instr {
             Instruction::PushLiteral(_) => 0,
-            Instruction::LoadColumn(_) => 1,
+            Instruction::LoadColumn(_, _) => 1,
             Instruction::Equal => 2,
             Instruction::NotEqual => 3,
             Instruction::LessThan => 4,
@@ -1549,18 +1463,22 @@ mod tests {
     }
 
     #[test]
-    fn test_arb_cell_covers_all_variants() {
+    fn test_arb_value_covers_all_generated_variants() {
         let mut seen = BTreeSet::new();
         for seed in u8::MIN..=u8::MAX {
             let mut data = vec![0u8; 1024];
             data[0] = seed;
             let mut u = Unstructured::new(&data);
-            if let Ok(cell) = arb_cell(&mut u) {
-                seen.insert(cell_kind(&cell));
+            if let Ok(v) = arb_value(&mut u) {
+                seen.insert(value_kind(&v));
             }
         }
 
-        assert_eq!(seen.len(), 6, "expected all Cell variants, saw {seen:?}");
+        assert_eq!(
+            seen.len(),
+            6,
+            "expected all 6 arb_value shapes, saw {seen:?}"
+        );
     }
 
     #[test]
