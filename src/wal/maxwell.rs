@@ -520,7 +520,6 @@ mod tests {
 
     // -- UPDATE tests -------------------------------------------------------
 
-    // -- DELETE tests -------------------------------------------------------
 
     // -- Edge cases ----------------------------------------------------------
 
@@ -530,9 +529,7 @@ mod tests {
 
     // -- B8: Maxwell DDL events are skipped ---------------------------------
 
-    // -- A3: UPDATE PK change must use pre-update PK -------------------------
 
-    // -- A4: bootstrap-insert events must be treated as normal inserts -------
 
     // ------------------------------------------------------------------
     // Phase 7C: MaxwellEvent typed CdcEvent smoke tests
@@ -728,4 +725,114 @@ mod tests {
             assert!(events.is_empty(), "{event_type} should produce no output");
         }
     }
+
+    /// DELETE happy path: Maxwell puts the deleted row in data,
+    /// which becomes old_image. PK reads from old_image.
+    #[test]
+    fn typed_maxwell_delete_happy_path() {
+        let database = typed_maxwell_catalog();
+        let msg = r#"{"database":"test","table":"orders","type":"delete",
+            "data":{"id":7,"amount":10,"status":"paid"}}"#;
+
+        let events = MaxwellParser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+
+        assert_eq!(event.kind(), EventKind::Delete);
+        assert_eq!(event.pk_columns(), &[0u16]);
+
+        // PK column reachable via old image.
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Old, 0),
+            crate::backend::Presence::Present(&7)
+        );
+
+        // RowKind::New accessor returns Missing for every column.
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 1),
+            crate::backend::Presence::Missing
+        );
+        assert_eq!(
+            event.string_at(crate::backend::RowKind::New, 2),
+            crate::backend::Presence::Missing
+        );
+    }
+
+    /// Malformed JSON envelope surfaces WalParseError::JsonError.
+    #[test]
+    fn typed_maxwell_malformed_json_envelope_errors() {
+        let database = typed_maxwell_catalog();
+        let result = MaxwellParser.parse_wal_message(b"{not json", &database);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("malformed JSON must error"),
+        };
+        assert!(matches!(&err, WalParseError::JsonError(_)));
+    }
+
+    /// UPDATE with PK change: RowKind::Pk reads from old_image,
+    /// so the pre-update PK (7) is what identifies the row.
+    #[test]
+    fn typed_maxwell_update_pk_change_uses_pre_update_pk() {
+        let database = typed_maxwell_catalog();
+        let msg = r#"{"database":"test","table":"orders","type":"update",
+            "data":{"id":99,"amount":250,"status":"paid"},
+            "old":{"id":7,"amount":10,"status":"pending"}}"#;
+
+        let events = MaxwellParser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+
+        assert_eq!(event.kind(), EventKind::Update);
+        assert_eq!(event.pk_columns(), &[0u16]);
+
+        // Pre-update PK (from old_image) is what identifies the row.
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&7)
+        );
+
+        // Post-update PK (from new_image) is available via RowKind::New.
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&99)
+        );
+    }
+
+    /// bootstrap-insert messages are treated as normal inserts.
+    #[test]
+    fn typed_maxwell_bootstrap_insert_treated_as_normal_insert() {
+        let database = typed_maxwell_catalog();
+        let msg = r#"{"database":"test","table":"orders","type":"bootstrap-insert",
+            "data":{"id":42,"amount":100,"status":"open"}}"#;
+
+        let events = MaxwellParser
+            .parse_wal_message(msg.as_bytes(), &database)
+            .expect("parse succeeds");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+
+        assert_eq!(event.kind(), EventKind::Insert);
+        assert_eq!(event.pk_columns(), &[0u16]);
+
+        // Same row-identity assertions as a normal insert.
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::New, 0),
+            crate::backend::Presence::Present(&42)
+        );
+        assert_eq!(
+            event.int_at(crate::backend::RowKind::Pk, 0),
+            crate::backend::Presence::Present(&42)
+        );
+        assert!(event.changed_columns().is_empty());
+    }
+
 }
