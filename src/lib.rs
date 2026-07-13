@@ -60,6 +60,8 @@ pub mod testing;
 // the shipping API surface.
 #[cfg(feature = "dhat-heap")]
 pub mod memory_profile_workload;
+#[cfg(any(feature = "apply-patchset-postgres", feature = "apply-patchset-mysql"))]
+pub mod patchset;
 #[cfg(feature = "std")]
 pub mod persistence;
 #[cfg(feature = "pg-sqlite-emu")]
