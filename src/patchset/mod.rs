@@ -49,6 +49,11 @@ pub mod mysql;
 #[cfg(feature = "apply-patchset-mysql")]
 pub use mysql::MysqlAdapter;
 
+#[cfg(feature = "apply-patchset-sqlite")]
+pub mod sqlite;
+#[cfg(feature = "apply-patchset-sqlite")]
+pub use sqlite::SqliteAdapter;
+
 // ============================================================================
 // Engine entry point (generic over any diesel Backend)
 // ============================================================================

@@ -260,7 +260,7 @@ r2d2 = { version = "0.8", optional = true }
 # posture, no C deps. `default-features = false` drops the reverse
 # adapters (`wal2json`/`debezium`/`maxwell`/`pg-walstream` build SQLite
 # changesets from PG CDC) which subql does not consume.
-sqlite-diff-rs = { version = "0.1.3", default-features = false }
+sqlite-diff-rs = { version = "0.1.4", default-features = false }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables
@@ -402,12 +402,14 @@ executor-diesel-postgres-r2d2 = [
 # Opt-in: ship the `patchset::PgAdapter` and the
 # `SubscriptionEngine::apply_patchset` entry point for executing a
 # client-uploaded SQLite session patchset against a Postgres target via
-# the diesel connection. Enables `sqlite-diff-rs`'s `diesel` feature
-# and pulls in diesel's `postgres` backend. Bool is the MVP dispatch;
-# other native PG types land as follow-up work.
+# the diesel connection. Enables `sqlite-diff-rs`'s `diesel` feature,
+# pulls in diesel's `postgres` backend, and turns on diesel's `uuid`
+# feature for native `UUID` binds. Dispatches `BOOLEAN` and `UUID`
+# today; other native PG types land as follow-up work.
 apply-patchset-postgres = [
     "executor-diesel-postgres",
     "sqlite-diff-rs/diesel",
+    "diesel?/uuid",
 ]
 # Opt-in: ship `MysqlDieselConnector`, a binlog-position-aware sync connector
 # built on `executor-diesel` + diesel's `mysql` feature. Snapshots taken through
@@ -421,6 +423,18 @@ executor-diesel-mysql = ["executor-diesel", "diesel?/mysql"]
 # MVP dispatch; other native MySQL types land as follow-up work.
 apply-patchset-mysql = [
     "executor-diesel-mysql",
+    "sqlite-diff-rs/diesel",
+]
+# Opt-in: ship the `patchset::SqliteAdapter` for executing a
+# client-uploaded SQLite session patchset against another SQLite
+# database via the diesel connection. The trivial case: source and
+# target speak the same affinity-based type system, so every column
+# falls through to `sqlite_diff_rs::DefaultBinder` and no per-type
+# dispatch is needed. The adapter still exists so callers can resolve
+# column names against a subql catalog.
+apply-patchset-sqlite = [
+    "dep:diesel",
+    "diesel?/sqlite",
     "sqlite-diff-rs/diesel",
 ]
 # Opt-in: ship the push-based PG CDC source. Activates `pg_walstream`'s
