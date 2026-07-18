@@ -20,17 +20,21 @@
 //!
 //! # Scope
 //!
-//! The wal2json vehicle is wired here: [`wal2json_patchset`] digests
-//! subql-owned `sqlite_diff_rs::wal2json::{MessageV2, ChangeV1}` events.
-//! The schema side ([`WireCatalog`], [`WireTable`]) is source-agnostic
-//! and is reused verbatim when the pg_walstream and Maxwell emission
-//! paths land.
+//! Three vehicles are wired over one source-agnostic schema side
+//! ([`WireCatalog`], [`WireTable`]): [`wal2json_patchset`] digests
+//! subql-owned `sqlite_diff_rs::wal2json` events, [`maxwell_patchset`]
+//! digests `sqlite_diff_rs::maxwell` events, and (behind the
+//! `pgoutput-emit` feature) [`pgoutput_patchset`] digests pg_walstream
+//! `ChangeEvent`s. Each differs only in its decoder registry.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use hashbrown::HashMap;
 use sql_traits::prelude::{DatabaseLike, TableLike};
+use sqlite_diff_rs::maxwell::{
+    ConversionError as MaxwellConversionError, Maxwell, Message as MaxwellMessage,
+};
 #[cfg(feature = "pgoutput-emit")]
 use sqlite_diff_rs::pg_walstream::{
     ChangeEvent as PgChangeEvent, ConversionError as PgConversionError, PgWalstream,
@@ -346,6 +350,55 @@ pub fn pgoutput_patchset<DB: DatabaseLike>(
     events: &[PgChangeEvent],
 ) -> Result<Vec<u8>, PgConversionError> {
     Ok(pgoutput_patchset_builder(database, events)?.build())
+}
+
+/// The Maxwell decoder registry subql feeds to `digest`.
+///
+/// MySQL has no native UUID type, so a UUID stored as `BINARY(16)`
+/// classifies as [`ScalarKind::Bytes`] and rides [`WireType::Bytes`],
+/// which the default `MySqlBinaryDecoder` base64-decodes to a compact
+/// 16-byte `Value::Blob`. That matches the SQLite client's blob storage
+/// and the way subql's `MysqlAdapter` rebinds the blob as MySQL binary,
+/// so the defaults need no override.
+#[must_use]
+pub fn maxwell_adapter() -> TypeMap<Maxwell, String, Vec<u8>> {
+    TypeMap::defaults()
+}
+
+/// Fold a batch of Maxwell `Message`s into one [`PatchsetFormat`]
+/// patchset builder over `database`, mirroring [`wal2json_patchset_builder`].
+///
+/// Each row message folds into the builder over the same source-agnostic
+/// [`WireCatalog`]. Control messages carry no row data and should be
+/// dropped before this call (subql's `parse_maxwell` does so).
+///
+/// # Errors
+///
+/// Propagates the Maxwell source `ConversionError` when a message names a
+/// table or column absent from `database`, or a decoder rejects a payload.
+pub fn maxwell_patchset_builder<DB: DatabaseLike>(
+    database: &DB,
+    events: &[MaxwellMessage],
+) -> Result<PatchSet<WireTable, String, Vec<u8>>, MaxwellConversionError> {
+    let catalog = WireCatalog::from_database(database);
+    let adapter = maxwell_adapter();
+    let mut builder = PatchSet::<WireTable, String, Vec<u8>>::new();
+    for event in events {
+        builder = builder.digest(event, &catalog, &adapter)?;
+    }
+    Ok(builder)
+}
+
+/// Serialize [`maxwell_patchset_builder`] to wire bytes.
+///
+/// # Errors
+///
+/// Propagates the Maxwell source `ConversionError`.
+pub fn maxwell_patchset<DB: DatabaseLike>(
+    database: &DB,
+    events: &[MaxwellMessage],
+) -> Result<Vec<u8>, MaxwellConversionError> {
+    Ok(maxwell_patchset_builder(database, events)?.build())
 }
 
 #[cfg(test)]

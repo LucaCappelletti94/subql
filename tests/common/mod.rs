@@ -13,9 +13,9 @@
 use std::time::Duration;
 
 use diesel::{Connection, MysqlConnection, PgConnection, RunQueryDsl};
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner;
-use testcontainers::{Container, GenericImage, ImageExt};
+use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 
 // Shared round-trip dispatch machinery, only for test crates that enable
 // the full apply stack. Empty (undeclared) for every other test.
@@ -25,6 +25,11 @@ use testcontainers::{Container, GenericImage, ImageExt};
     feature = "sqlite-cdc"
 ))]
 pub mod dispatch;
+
+// Source-agnostic round-trip helper (patchset rebuild), for test crates
+// that enable the SQLite apply and session stack.
+#[cfg(all(feature = "apply-patchset-sqlite", feature = "sqlite-cdc"))]
+pub mod roundtrip;
 
 const PG_IMAGE: &str = "subql-test/postgres-wal2json";
 const PG_TAG: &str = "16";
@@ -212,18 +217,18 @@ pub fn create_pgoutput_slot(conn: &mut PgConnection, name: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// MySQL helpers (used by reexec_mysql.rs)
+// MySQL and Maxwell helpers
 // ---------------------------------------------------------------------------
 
-/// Spin up a MySQL 8.0 container with binary logging enabled (ROW format,
-/// FULL row images), waiting until the server is accepting connections.
+/// Base MySQL 8.0 container request with binary logging enabled (ROW
+/// format, FULL row images) and port 3306 exposed for host connections.
+/// Binary logging is required both for Maxwell replication and for the
+/// binlog coordinate `SHOW MASTER STATUS` reports.
 ///
 /// MySQL 8.0 prints "ready for connections" twice during startup (once for
 /// the bootstrap temp server, once for the real one). We wait for the
-/// "port: 3306" line, which only appears in the final ready message. Binary
-/// logging is required for `SHOW MASTER STATUS` (the binlog coordinate the
-/// `MysqlDieselConnector` reports).
-pub fn mysql_8() -> Container<GenericImage> {
+/// "port: 3306" line, which only appears in the final ready message.
+fn mysql_request() -> ContainerRequest<GenericImage> {
     GenericImage::new("mysql", "8.0")
         .with_wait_for(WaitFor::message_on_stderr("port: 3306"))
         .with_exposed_port(3306.tcp())
@@ -236,8 +241,25 @@ pub fn mysql_8() -> Container<GenericImage> {
             "--binlog-row-image=FULL",
         ])
         .with_startup_timeout(Duration::from_secs(120))
+}
+
+/// Spin up a standalone MySQL 8.0 container. See [`mysql_request`] for the
+/// binary-logging setup.
+pub fn mysql_8() -> Container<GenericImage> {
+    mysql_request().start().expect("start mysql")
+}
+
+/// Spin up a MySQL 8.0 container attached to `network` under
+/// `container_name`, so a sibling container (Maxwell) can reach it by
+/// name. The mapped 3306 port is still exposed for host connections.
+pub fn mysql_networked(network: &str, container_name: &str) -> Container<GenericImage> {
+    mysql_request()
+        .with_network(network)
+        .with_container_name(container_name)
         .start()
-        .expect("start mysql")
+        .unwrap_or_else(|e| {
+            panic!("start networked mysql network={network} name={container_name}: {e}")
+        })
 }
 
 /// Build the diesel URL for a MySQL container at the given mapped port.
@@ -253,4 +275,65 @@ pub fn mysql_connect(port: u16) -> MysqlConnection {
 /// Mapped host port for a started MySQL container.
 pub fn mysql_port(c: &Container<GenericImage>) -> u16 {
     c.get_host_port_ipv4(3306.tcp()).expect("mysql port")
+}
+
+const MAXWELL_IMAGE: &str = "zendesk/maxwell";
+const MAXWELL_TAG: &str = "v1.44.0";
+
+/// Start a Maxwell daemon on `network`, replicating from the MySQL
+/// container named `mysql_name` and writing CDC as JSONL into `output_dir`
+/// (bind-mounted at `/output`). `output_dir` must be world-writable so the
+/// in-container Maxwell process can write it.
+pub fn start_maxwell(network: &str, mysql_name: &str, output_dir: &str) -> Container<GenericImage> {
+    let host_flag = format!("--host={mysql_name}");
+    GenericImage::new(MAXWELL_IMAGE, MAXWELL_TAG)
+        .with_wait_for(WaitFor::message_on_stderr("Binlog connected"))
+        .with_network(network)
+        .with_mount(Mount::bind_mount(output_dir, "/output"))
+        .with_cmd([
+            "bin/maxwell",
+            "--producer=file",
+            "--output_file=/output/maxwell.jsonl",
+            "--output_primary_key_columns=true",
+            &host_flag,
+            "--port=3306",
+            "--user=root",
+            "--password=subql_test",
+        ])
+        .with_startup_timeout(Duration::from_secs(90))
+        .start()
+        .unwrap_or_else(|e| panic!("start maxwell network={network} mysql={mysql_name}: {e}"))
+}
+
+/// Poll the Maxwell JSONL output for row-change lines on `table` until at
+/// least `expected` have arrived, returning them in file (commit) order.
+/// Panics after a fixed timeout.
+pub fn maxwell_collect(output_dir: &str, table: &str, expected: usize) -> Vec<String> {
+    let path = std::path::Path::new(output_dir).join("maxwell.jsonl");
+    let table_tag = format!("\"table\":\"{table}\"");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let matching: Vec<String> = content
+                .lines()
+                .filter(|line| {
+                    line.contains(&table_tag)
+                        && (line.contains("\"type\":\"insert\"")
+                            || line.contains("\"type\":\"update\"")
+                            || line.contains("\"type\":\"delete\""))
+                })
+                .map(String::from)
+                .collect();
+            if matching.len() >= expected {
+                return matching;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {expected} Maxwell rows on {table} at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
