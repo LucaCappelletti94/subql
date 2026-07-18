@@ -36,7 +36,7 @@ mod common;
 
 use std::time::Duration;
 
-use diesel::sql_types::{BigInt, Binary, Bool, Integer, Text};
+use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
 use diesel::{
     sql_query, Connection, MysqlConnection, QueryableByName, RunQueryDsl, SqliteConnection,
 };
@@ -54,11 +54,11 @@ use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine};
 
 // UUID stored as BINARY(16). MySQL has no native UUID type, so the column
 // classifies as bytes and the 16-byte blob rides WireType::Bytes.
-const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'))";
+const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255))";
 // The subql catalog only needs the table shape. `feeling` is an unknown
 // scalar (the enum), so subql treats it as text on the wire.
-const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'));";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT);";
+const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255));";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -81,6 +81,8 @@ struct MyOrder {
     token: Vec<u8>,
     #[diesel(sql_type = Text)]
     feeling: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    note: Option<String>,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -97,6 +99,8 @@ struct SqliteOrder {
     token: Vec<u8>,
     #[diesel(sql_type = Text)]
     feeling: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    note: Option<String>,
 }
 
 /// The 16 UUID bytes as a 32-char lowercase hex string for a MySQL
@@ -114,25 +118,25 @@ fn subql_catalog() -> ParserDB {
 }
 
 fn load_mysql(my: &mut MysqlConnection) -> Vec<MyOrder> {
-    sql_query("SELECT id, amount, status, active, token, feeling FROM orders ORDER BY id")
+    sql_query("SELECT id, amount, status, active, token, feeling, note FROM orders ORDER BY id")
         .load(my)
         .unwrap()
 }
 
 fn load_sqlite(sqlite: &mut SqliteConnection) -> Vec<SqliteOrder> {
-    sql_query("SELECT id, amount, status, active, token, feeling FROM orders ORDER BY id")
+    sql_query("SELECT id, amount, status, active, token, feeling, note FROM orders ORDER BY id")
         .load(sqlite)
         .unwrap()
 }
 
 fn seed_dml(my: &mut MysqlConnection) {
-    for (id, amount, status, active, token, feeling) in [
-        (ID_A, 100, "new", "true", TOKEN_A, "happy"),
-        (ID_B, 200, "new", "false", TOKEN_B, "sad"),
-        (ID_C, 300, "new", "true", TOKEN_C, "neutral"),
+    for (id, amount, status, active, token, feeling, note) in [
+        (ID_A, 100, "new", "true", TOKEN_A, "happy", "NULL"),
+        (ID_B, 200, "new", "false", TOKEN_B, "sad", "'packed'"),
+        (ID_C, 300, "new", "true", TOKEN_C, "neutral", "'void'"),
     ] {
         let stmt = format!(
-            "INSERT INTO orders (id, amount, status, active, token, feeling) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}')",
+            "INSERT INTO orders (id, amount, status, active, token, feeling, note) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note})",
             hex16(id),
             hex16(token)
         );
@@ -142,7 +146,7 @@ fn seed_dml(my: &mut MysqlConnection) {
 
 fn mutate_dml(my: &mut MysqlConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral' WHERE id = x'{}'",
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL WHERE id = x'{}'",
         hex16(ID_B)
     ))
     .execute(my)
@@ -161,6 +165,7 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             active: true,
             token: uuid_bytes(TOKEN_A),
             feeling: "happy".to_owned(),
+            note: None,
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -169,6 +174,7 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             active: false,
             token: uuid_bytes(TOKEN_B),
             feeling: "sad".to_owned(),
+            note: Some("packed".to_owned()),
         },
         MyOrder {
             id: uuid_bytes(ID_C),
@@ -177,12 +183,15 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             active: true,
             token: uuid_bytes(TOKEN_C),
             feeling: "neutral".to_owned(),
+            note: Some("void".to_owned()),
         },
     ]
 }
 
 // Net state after the mutate: id_b updated (amount, status, active,
-// feeling; token unchanged), id_c deleted.
+// feeling, and note cleared to NULL; token unchanged), id_c deleted. id_a
+// keeps its NULL note from the seed, so a NULL survives both an insert and
+// an update across the whole loop.
 fn final_mysql_rows() -> Vec<MyOrder> {
     vec![
         MyOrder {
@@ -192,6 +201,7 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             active: true,
             token: uuid_bytes(TOKEN_A),
             feeling: "happy".to_owned(),
+            note: None,
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -200,6 +210,7 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             active: true,
             token: uuid_bytes(TOKEN_B),
             feeling: "neutral".to_owned(),
+            note: None,
         },
     ]
 }
@@ -212,6 +223,7 @@ fn sqlite_view(row: &MyOrder) -> SqliteOrder {
         active: i64::from(row.active),
         token: row.token.clone(),
         feeling: row.feeling.clone(),
+        note: row.note.clone(),
     }
 }
 

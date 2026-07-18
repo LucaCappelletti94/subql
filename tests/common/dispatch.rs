@@ -192,11 +192,11 @@ where
 
 const PG_CREATE_MOOD: &str = "CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')";
 const PG_CREATE_SKU: &str = "CREATE DOMAIN sku AS TEXT";
-const PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood)";
+const PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT)";
 /// The subql catalog only needs the table shape. `sku` and `mood` are
 /// unknown scalars, so subql treats their columns as text on the wire.
-const SUBQL_PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood);";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, code TEXT, feeling TEXT);";
+const SUBQL_PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT);";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, code TEXT, feeling TEXT, note TEXT);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -221,6 +221,8 @@ struct PgOrder {
     code: Sku,
     #[diesel(sql_type = MoodType)]
     feeling: Mood,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    note: Option<String>,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -239,6 +241,8 @@ struct SqliteOrder {
     code: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     feeling: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    note: Option<String>,
 }
 
 fn uuid(text: &str) -> Uuid {
@@ -246,15 +250,19 @@ fn uuid(text: &str) -> Uuid {
 }
 
 fn load_pg(conn: &mut PgConnection) -> Vec<PgOrder> {
-    sql_query("SELECT id, amount, status, active, token, code, feeling FROM orders ORDER BY id")
-        .load(conn)
-        .unwrap()
+    sql_query(
+        "SELECT id, amount, status, active, token, code, feeling, note FROM orders ORDER BY id",
+    )
+    .load(conn)
+    .unwrap()
 }
 
 fn load_sqlite(conn: &mut SqliteConnection) -> Vec<SqliteOrder> {
-    sql_query("SELECT id, amount, status, active, token, code, feeling FROM orders ORDER BY id")
-        .load(conn)
-        .unwrap()
+    sql_query(
+        "SELECT id, amount, status, active, token, code, feeling, note FROM orders ORDER BY id",
+    )
+    .load(conn)
+    .unwrap()
 }
 
 fn seed_pg_rows() -> Vec<PgOrder> {
@@ -267,6 +275,7 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             token: uuid(TOKEN_A),
             code: Sku("SKU-1".to_owned()),
             feeling: Mood::Happy,
+            note: None,
         },
         PgOrder {
             id: uuid(ID_B),
@@ -276,6 +285,7 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             token: uuid(TOKEN_B),
             code: Sku("SKU-2".to_owned()),
             feeling: Mood::Sad,
+            note: Some("packed".to_owned()),
         },
         PgOrder {
             id: uuid(ID_C),
@@ -285,12 +295,15 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             token: uuid(TOKEN_C),
             code: Sku("SKU-3".to_owned()),
             feeling: Mood::Neutral,
+            note: Some("void".to_owned()),
         },
     ]
 }
 
 // Net state after the mutate: id_b updated (amount, status, active,
-// feeling; token and code unchanged), id_c deleted.
+// feeling, and note cleared to NULL; token and code unchanged), id_c
+// deleted. id_a keeps its NULL note from the seed, so a NULL survives an
+// insert and an update across the whole loop.
 fn final_pg_rows() -> Vec<PgOrder> {
     vec![
         PgOrder {
@@ -301,6 +314,7 @@ fn final_pg_rows() -> Vec<PgOrder> {
             token: uuid(TOKEN_A),
             code: Sku("SKU-1".to_owned()),
             feeling: Mood::Happy,
+            note: None,
         },
         PgOrder {
             id: uuid(ID_B),
@@ -310,6 +324,7 @@ fn final_pg_rows() -> Vec<PgOrder> {
             token: uuid(TOKEN_B),
             code: Sku("SKU-2".to_owned()),
             feeling: Mood::Neutral,
+            note: None,
         },
     ]
 }
@@ -331,6 +346,7 @@ fn sqlite_view(row: PgOrder) -> SqliteOrder {
         token: row.token.as_bytes().to_vec(),
         code: row.code.0,
         feeling: row.feeling.label().to_owned(),
+        note: row.note,
     }
 }
 
@@ -354,9 +370,9 @@ pub fn create_schema(pg: &mut PgConnection) {
 /// Seed phase: insert three rows with UUID primary keys.
 pub fn seed_dml(pg: &mut PgConnection) {
     for stmt in [
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling) VALUES ('{ID_A}', 100, 'new', true, '{TOKEN_A}', 'SKU-1', 'happy')"),
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling) VALUES ('{ID_B}', 200, 'new', false, '{TOKEN_B}', 'SKU-2', 'sad')"),
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling) VALUES ('{ID_C}', 300, 'new', true, '{TOKEN_C}', 'SKU-3', 'neutral')"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note) VALUES ('{ID_A}', 100, 'new', true, '{TOKEN_A}', 'SKU-1', 'happy', NULL)"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note) VALUES ('{ID_B}', 200, 'new', false, '{TOKEN_B}', 'SKU-2', 'sad', 'packed')"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note) VALUES ('{ID_C}', 300, 'new', true, '{TOKEN_C}', 'SKU-3', 'neutral', 'void')"),
     ] {
         sql_query(&stmt).execute(pg).unwrap();
     }
@@ -366,7 +382,7 @@ pub fn seed_dml(pg: &mut PgConnection) {
 /// columns) and delete another, both matched on the UUID primary key.
 pub fn mutate_dml(pg: &mut PgConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral' WHERE id = '{ID_B}'"
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL WHERE id = '{ID_B}'"
     ))
     .execute(pg)
     .unwrap();
