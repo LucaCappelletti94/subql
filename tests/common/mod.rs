@@ -26,11 +26,6 @@ use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 ))]
 pub mod dispatch;
 
-// Source-agnostic round-trip helper (patchset rebuild), for test crates
-// that enable the SQLite apply and session stack.
-#[cfg(all(feature = "apply-patchset-sqlite", feature = "sqlite-cdc"))]
-pub mod roundtrip;
-
 const PG_IMAGE: &str = "subql-test/postgres-wal2json";
 const PG_TAG: &str = "16";
 

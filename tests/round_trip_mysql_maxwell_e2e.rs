@@ -42,7 +42,7 @@ use diesel::{
 };
 use diesel_sqlite_session::SqliteSessionExt;
 use sql_traits::structs::ParserDB;
-use sqlite_diff_rs::{PatchSet, SimpleTable};
+use sqlite_diff_rs::PatchSet;
 use sqlparser::dialect::{MySqlDialect, SQLiteDialect};
 use uuid::Uuid;
 
@@ -66,8 +66,6 @@ const ID_C: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 const TOKEN_A: &str = "11111111-1111-1111-1111-111111111111";
 const TOKEN_B: &str = "22222222-2222-2222-2222-222222222222";
 const TOKEN_C: &str = "33333333-3333-3333-3333-333333333333";
-
-const COLUMNS: [&str; 6] = ["id", "amount", "status", "active", "token", "feeling"];
 
 #[derive(QueryableByName, Debug, PartialEq)]
 struct MyOrder {
@@ -278,10 +276,9 @@ fn finish_loop(
     let session_patchset = session.patchset().unwrap();
     assert!(!session_patchset.is_empty(), "session recorded no changes");
 
-    let orders = SimpleTable::new("orders", &COLUMNS, &[0]);
-    let rebuilt = common::roundtrip::rebuild(&session_patchset, &orders);
-
-    // Re-seed a fresh MySQL, then apply the captured update and delete.
+    // Re-seed a fresh MySQL, then re-apply the captured session patchset
+    // (a genuine update and delete) through the production inbound API,
+    // which reconstructs the ops from the raw bytes.
     sql_query("TRUNCATE orders").execute(my).unwrap();
 
     let my_engine: SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> =
@@ -291,7 +288,9 @@ fn finish_loop(
     my_engine.apply_patchset(seed, my, &my_adapter).unwrap();
     assert_eq!(load_mysql(my), seed_mysql_rows(), "MySQL after re-seed");
 
-    my_engine.apply_patchset(&rebuilt, my, &my_adapter).unwrap();
+    my_engine
+        .apply_patchset_bytes(&session_patchset, my, &my_adapter)
+        .unwrap();
     assert_eq!(
         load_mysql(my),
         source_net,

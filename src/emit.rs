@@ -31,7 +31,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use hashbrown::HashMap;
-use sql_traits::prelude::{DatabaseLike, TableLike};
+use sql_traits::prelude::DatabaseLike;
 use sqlite_diff_rs::maxwell::{
     ConversionError as MaxwellConversionError, Maxwell, Message as MaxwellMessage,
 };
@@ -199,25 +199,15 @@ impl WireSchema for WireCatalog {
 /// Build one [`WireTable`] for `table_id`, or `None` when the table id
 /// or any of its columns cannot be resolved.
 fn build_wire_table<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<WireTable> {
-    let arity = catalog_helpers::table_arity(database, table_id)?;
-    let mut column_names: Vec<String> = Vec::with_capacity(arity);
+    let inner = catalog_helpers::simple_table(database, table_id)?;
+    let arity = inner.number_of_columns();
     let mut wire_types: Vec<WireType> = Vec::with_capacity(arity);
     for ordinal in 0..arity {
         let column_id = ColumnId::try_from(ordinal).ok()?;
-        column_names.push(catalog_helpers::column_name(database, table_id, column_id)?);
         let wire_type = catalog_helpers::column_scalar_kind(database, table_id, column_id)
             .map_or(WireType::Text, scalar_kind_to_wire_type);
         wire_types.push(wire_type);
     }
-    let index = usize::try_from(table_id).ok()?;
-    let table_name = database.table_by_id(index)?.table_name().to_string();
-    let pk_indices: Vec<usize> = catalog_helpers::primary_key_columns(database, table_id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(usize::from)
-        .collect();
-    let column_refs: Vec<&str> = column_names.iter().map(String::as_str).collect();
-    let inner = SimpleTable::new(table_name, &column_refs, &pk_indices);
     Some(WireTable { inner, wire_types })
 }
 

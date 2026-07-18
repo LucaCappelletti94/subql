@@ -21,6 +21,7 @@ use sql_traits::{
         identifier_resolution::stored_identifier_matches_lookup,
     },
 };
+use sqlite_diff_rs::SimpleTable;
 
 use crate::backend::ScalarKind;
 use crate::types::{ColumnId, TableId};
@@ -156,6 +157,35 @@ pub fn column_name<DB: DatabaseLike>(
         .columns(database)
         .find(|col| col.column_id(database) == Some(column_id as usize))
         .map(|col| col.column_name().to_string())
+}
+
+/// Build a [`SimpleTable`] from the catalog for `table_id`.
+///
+/// Reads the column names in order and the primary-key indices from the
+/// catalog, so the catalog is the authoritative source for both. Returns
+/// `None` when the table id or any of its columns cannot be resolved. The
+/// outbound emit path and the inbound patchset apply path both build their
+/// table shape through this one helper, so a single catalog is the source
+/// of truth for the column order and the primary key on both sides.
+#[must_use]
+pub fn simple_table<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<SimpleTable> {
+    use alloc::string::{String, ToString};
+
+    let arity = table_arity(database, table_id)?;
+    let mut column_names: Vec<String> = Vec::with_capacity(arity);
+    for ordinal in 0..arity {
+        let column_id = ColumnId::try_from(ordinal).ok()?;
+        column_names.push(column_name(database, table_id, column_id)?);
+    }
+    let index = usize::try_from(table_id).ok()?;
+    let table_name = database.table_by_id(index)?.table_name().to_string();
+    let pk_indices: Vec<usize> = primary_key_columns(database, table_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(usize::from)
+        .collect();
+    let column_refs: Vec<&str> = column_names.iter().map(String::as_str).collect();
+    Some(SimpleTable::new(table_name, &column_refs, &pk_indices))
 }
 
 /// A table resolved to subql's compact ids, returned by [`resolve_table`].

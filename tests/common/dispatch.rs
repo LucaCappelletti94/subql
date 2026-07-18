@@ -32,7 +32,6 @@
 
 use std::io::Write;
 
-use super::roundtrip::rebuild;
 use diesel::deserialize::{self, FromSql};
 use diesel::pg::{Pg, PgValue};
 use diesel::query_builder::AstPass;
@@ -42,7 +41,7 @@ use diesel::{sql_query, Connection, PgConnection, QueryableByName, RunQueryDsl, 
 use diesel_sqlite_session::SqliteSessionExt;
 use sql_traits::prelude::DatabaseLike;
 use sql_traits::structs::ParserDB;
-use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, PatchSet, SimpleTable, Value};
+use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, PatchSet, Value};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use subql::backend::SQLite as SqliteBackend;
 use subql::emit::WireTable;
@@ -205,10 +204,6 @@ const ID_C: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 const TOKEN_A: &str = "11111111-1111-1111-1111-111111111111";
 const TOKEN_B: &str = "22222222-2222-2222-2222-222222222222";
 const TOKEN_C: &str = "33333333-3333-3333-3333-333333333333";
-
-const COLUMNS: [&str; 7] = [
-    "id", "amount", "status", "active", "token", "code", "feeling",
-];
 
 #[derive(QueryableByName, Debug, PartialEq)]
 struct PgOrder {
@@ -433,10 +428,9 @@ pub fn finish_loop(
     let session_patchset = session.patchset().unwrap();
     assert!(!session_patchset.is_empty(), "session recorded no changes");
 
-    let orders = SimpleTable::new("orders", &COLUMNS, &[0]);
-    let rebuilt = rebuild(&session_patchset, &orders);
-
-    // Re-seed a fresh Postgres, then apply the captured update and delete.
+    // Re-seed a fresh Postgres, then re-apply the captured session
+    // patchset (a genuine update and delete) through the production
+    // inbound API, which reconstructs the ops from the raw bytes.
     sql_query("TRUNCATE orders").execute(pg).unwrap();
 
     let pg_engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
@@ -448,7 +442,9 @@ pub fn finish_loop(
     pg_engine.apply_patchset(seed, pg, &pg_adapter).unwrap();
     assert_eq!(load_pg(pg), seed_pg_rows(), "Postgres after re-seed");
 
-    pg_engine.apply_patchset(&rebuilt, pg, &pg_adapter).unwrap();
+    pg_engine
+        .apply_patchset_bytes(&session_patchset, pg, &pg_adapter)
+        .unwrap();
     assert_eq!(
         load_pg(pg),
         source_net,
