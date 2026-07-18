@@ -29,14 +29,11 @@ mod common;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{CdcEvent, Postgres, Value};
+use subql::backend::{Postgres, Value};
 use subql::reexec::{
     AutoResolvingEngine, Connector, PgDieselConnector, ReExecEngine, Registered, SnapshotResult,
 };
-use subql::{
-    DefaultIds, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Event, Wal2JsonV2Parser,
-    WalParser,
-};
+use subql::{parse_wal2json_v2, DefaultIds, MessageV2, SubscriptionEngine, SubscriptionRequest};
 
 const SLOT: &str = "subql_test";
 const DDL: &str =
@@ -80,22 +77,17 @@ fn catalog() -> ParserDB {
 fn build_engine(
     catalog: ParserDB,
     conn_exec: PgConnection,
-) -> AutoResolvingEngine<Wal2JsonV2Event, DefaultIds, ParserDB, PgDieselConnector> {
-    let inner = SubscriptionEngine::<Wal2JsonV2Event, DefaultIds, ParserDB>::new(
-        catalog,
-        PostgreSqlDialect {},
-    );
+) -> AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, PgDieselConnector> {
+    let inner =
+        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
     AutoResolvingEngine::new(ReExecEngine::new(inner), PgDieselConnector::new(conn_exec))
 }
 
-/// Parse one wal2json v2 message into zero or more [`Wal2JsonV2Event`]s.
+/// Parse one wal2json v2 message into zero or more [`MessageV2`]s.
 /// The parser emits 0 events for relation-only messages (begin/commit/
 /// relation), which the test must tolerate.
-#[allow(dead_code)] // used by the step-3 / step-4 tests
-fn parse_message(parser: &Wal2JsonV2Parser, catalog: &ParserDB, msg: &str) -> Vec<Wal2JsonV2Event> {
-    parser
-        .parse_wal_message(msg.as_bytes(), catalog)
-        .expect("wal2json parse")
+fn parse_message(msg: &str) -> Vec<MessageV2> {
+    parse_wal2json_v2(msg.as_bytes()).expect("wal2json parse")
 }
 
 /// Harness health check: container starts, three PG connections, catalog
@@ -225,10 +217,9 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         "expected at least one wal2json message after INSERT+DELETE"
     );
 
-    let parser = Wal2JsonV2Parser;
-    let mut events: Vec<Wal2JsonV2Event> = Vec::new();
+    let mut events: Vec<MessageV2> = Vec::new();
     for msg in &msgs {
-        events.extend(parse_message(&parser, &catalog(), msg));
+        events.extend(parse_message(msg));
     }
     assert_eq!(
         events.len(),
@@ -316,10 +307,9 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
         .expect("update id=1 price=20.0");
 
     let msgs = common::drain_slot(&mut conn_setup, SLOT);
-    let parser = Wal2JsonV2Parser;
-    let mut events: Vec<Wal2JsonV2Event> = Vec::new();
+    let mut events: Vec<MessageV2> = Vec::new();
     for msg in &msgs {
-        events.extend(parse_message(&parser, &catalog(), msg));
+        events.extend(parse_message(msg));
     }
     assert_eq!(events.len(), 1, "expected exactly one UPDATE event");
 

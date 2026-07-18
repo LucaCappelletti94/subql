@@ -27,14 +27,14 @@
 
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, Value};
-use subql::{DefaultIds, EventKind, PgOutputEvent, PgSqliteEmuSource, SubscriptionEngine};
+use subql::{ChangeEvent, DefaultIds, EventKind, PgSqliteEmuSource, SubscriptionEngine};
 
 const PG_DDL: &str = "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);";
 
 #[test]
 fn follow_row_receives_inserted_row_delta() {
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("build source");
-    let mut engine: SubscriptionEngine<PgOutputEvent, DefaultIds, _> =
+    let mut engine: SubscriptionEngine<ChangeEvent, DefaultIds, _> =
         SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
 
     // Registering a follow before the row exists is the interesting
@@ -77,7 +77,7 @@ fn follow_row_ignores_unrelated_deletes() {
     // Prove that after a followed row goes away, the follow does not
     // spuriously fire on later inserts targeting a different PK.
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("build source");
-    let mut engine: SubscriptionEngine<PgOutputEvent, DefaultIds, _> =
+    let mut engine: SubscriptionEngine<ChangeEvent, DefaultIds, _> =
         SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
 
     engine
@@ -124,7 +124,7 @@ fn deleting_a_followed_row_auto_closes_the_pk_follow() {
     // stops occupying a subscription slot. Pre-fix (Phase-5 TODO),
     // the auto-close was disabled and the follow leaked.
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("build source");
-    let mut engine: SubscriptionEngine<PgOutputEvent, DefaultIds, _> =
+    let mut engine: SubscriptionEngine<ChangeEvent, DefaultIds, _> =
         SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
 
     source
@@ -175,7 +175,7 @@ fn deleting_an_unrelated_row_leaves_the_pk_follow_open() {
     // a pk-follow tracking another PK. Verifies the auto-close
     // condition is a PK match, not a table-wide DELETE sweep.
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("build source");
-    let mut engine: SubscriptionEngine<PgOutputEvent, DefaultIds, _> =
+    let mut engine: SubscriptionEngine<ChangeEvent, DefaultIds, _> =
         SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
 
     source

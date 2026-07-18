@@ -13,7 +13,7 @@
 #![cfg(feature = "pg-sqlite-emu")]
 #![allow(clippy::unwrap_used)]
 
-use subql::backend::{CdcEvent, Presence, RowKind};
+use subql::backend::{CdcEvent, RowKind, Value};
 use subql::{catalog_helpers, EventKind, PgSqliteEmuSource};
 
 const PG_DDL: &str =
@@ -37,25 +37,40 @@ fn insert_round_trips_through_the_emulator() {
         .expect("exactly one event pending");
 
     assert_eq!(event.kind(), EventKind::Insert);
-    assert_eq!(event.table_id(), expected_table_id);
-    assert_eq!(event.pk_columns(), &[0u16]);
+    assert_eq!(event.table_id(source.pg_catalog()), expected_table_id);
+    assert_eq!(event.pk_columns(source.pg_catalog()), &[0u16]);
 
     // Full row image round-trips through the pgoutput wire.
-    assert_eq!(event.int_at(RowKind::New, 0), Presence::Present(&7));
-    assert_eq!(event.float_at(RowKind::New, 1), Presence::Present(&9.5));
-    assert_eq!(event.int_at(RowKind::New, 2), Presence::Present(&1));
     assert_eq!(
-        event.string_at(RowKind::New, 3),
-        Presence::Present(&"paid".to_string()),
+        event.value_at(source.pg_catalog(), RowKind::New, 0),
+        Value::Int(7)
+    );
+    assert_eq!(
+        event.value_at(source.pg_catalog(), RowKind::New, 1),
+        Value::Float(9.5)
+    );
+    assert_eq!(
+        event.value_at(source.pg_catalog(), RowKind::New, 2),
+        Value::Int(1)
+    );
+    assert_eq!(
+        event.value_at(source.pg_catalog(), RowKind::New, 3),
+        Value::String("paid".to_string()),
     );
 
     // PK view reads the same integer from the new-image (INSERT has no
     // old image).
-    assert_eq!(event.int_at(RowKind::Pk, 0), Presence::Present(&7));
+    assert_eq!(
+        event.value_at(source.pg_catalog(), RowKind::Pk, 0),
+        Value::Int(7)
+    );
 
     // Non-PK columns are Missing under RowKind::Pk per the design
     // contract.
-    assert_eq!(event.float_at(RowKind::Pk, 1), Presence::Missing);
+    assert_eq!(
+        event.value_at(source.pg_catalog(), RowKind::Pk, 1),
+        Value::Missing
+    );
 
     assert!(
         source

@@ -1,30 +1,32 @@
-//! WAL stream parsing: convert raw CDC bytes into typed [`crate::backend::CdcEvent`]s.
+//! WAL stream parsing: convert raw CDC bytes into typed
+//! [`CdcEvent`](crate::backend::CdcEvent)s.
 //!
-//! The [`WalParser`] trait abstracts over format-specific encodings
-//! (wal2json, Maxwell, Debezium, pgoutput) so callers can feed raw
-//! replication messages and receive typed events that implement
-//! [`CdcEvent`](crate::backend::CdcEvent) directly.
+//! The pgoutput, wal2json, and Maxwell paths implement `CdcEvent` directly on
+//! the ecosystem message types (`pg_walstream::ChangeEvent`,
+//! `sqlite_diff_rs::wal2json::{MessageV2, ChangeV1}`, and
+//! `sqlite_diff_rs::maxwell::Message`). The [`WalParser`] trait remains for the
+//! SQLite changeset path.
 
-mod debezium;
+mod change_event;
 mod maxwell;
 #[cfg(feature = "pg-streaming")]
 mod pg_streaming;
 mod pg_type;
-mod pgoutput;
 #[cfg(feature = "std")]
 mod streaming;
-#[cfg(test)]
-mod test_support;
 mod wal2json;
 
-pub use debezium::{DebeziumEvent, DebeziumParser};
-pub use maxwell::{MaxwellEvent, MaxwellParser};
+#[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
+pub(crate) use change_event::into_engine_events;
+pub use maxwell::parse_messages as parse_maxwell;
 #[cfg(feature = "pg-streaming")]
 pub use pg_streaming::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
-pub use pgoutput::{PgOutputEvent, PgOutputParser};
+pub use pg_walstream::ChangeEvent;
+pub use sqlite_diff_rs::maxwell::Message as MaxwellMessage;
+pub use sqlite_diff_rs::wal2json::{ChangeV1, MessageV2};
 #[cfg(feature = "std")]
 pub use streaming::CdcSource;
-pub use wal2json::{Wal2JsonV1Event, Wal2JsonV1Parser, Wal2JsonV2Event, Wal2JsonV2Parser};
+pub use wal2json::{parse_wal2json_v1, parse_wal2json_v2};
 
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{Checkpoint, TableId};
@@ -38,7 +40,10 @@ use thiserror::Error;
 /// Parameterized by the concrete [`DatabaseLike`] implementation supplying
 /// schema metadata at parse time. Each parser type nominates the concrete
 /// [`CdcEvent`] it emits via [`Self::Event`]; the engine dispatches on the
-/// typed event directly with no intermediate `WalEvent` shim.
+/// typed event directly with no intermediate `WalEvent` shim. The pgoutput,
+/// wal2json, and Maxwell paths implement [`CdcEvent`] directly on their
+/// ecosystem message types, leaving `SqliteChangesetParser` as the sole
+/// implementor.
 ///
 /// [`CdcEvent`]: crate::backend::CdcEvent
 pub trait WalParser<DB: DatabaseLike>: Send + Sync {
@@ -57,33 +62,13 @@ pub trait WalParser<DB: DatabaseLike>: Send + Sync {
 
     /// Parse a raw WAL message into zero or more typed events.
     ///
-    /// Batched formats (e.g. wal2json v1, pgoutput Truncate) may return
-    /// multiple events per message. Per-change formats (e.g. wal2json v2,
-    /// Maxwell, Debezium) return at most one. Non-data control frames
-    /// (relation catalog updates, transactional metadata) return an empty
-    /// vector.
+    /// A single SQLite changeset frame expands to one event per changed
+    /// row. Control frames carrying no row changes return an empty vector.
     fn parse_wal_message(
         &self,
         data: &[u8],
         database: &DB,
     ) -> Result<Vec<Self::Event>, WalParseError>;
-}
-
-/// Parse a UTF-8 JSON message into a typed payload.
-pub(crate) fn parse_json_message<T>(data: &[u8]) -> Result<T, WalParseError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let text = core::str::from_utf8(data).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-    serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))
-}
-
-/// Parse JSON payloads that may legally be tombstones (`null`) in CDC streams.
-pub(crate) fn parse_json_message_or_tombstone<T>(data: &[u8]) -> Result<Option<T>, WalParseError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    parse_json_message(data)
 }
 
 /// Errors that can occur during WAL message parsing.
@@ -194,36 +179,9 @@ pub(crate) fn resolve_table<DB: DatabaseLike>(
     })
 }
 
-/// Parse a wire event kind token by matching it against the allowed
-/// tokens for each [`EventKind`]. Returns
-/// [`WalParseError::UnknownEventKind`] when the token does not match any
-/// list; parsers may then map that to a silent skip.
-pub(crate) fn parse_event_kind(
-    token: &str,
-    insert_tokens: &[&str],
-    update_tokens: &[&str],
-    delete_tokens: &[&str],
-    truncate_tokens: &[&str],
-) -> Result<crate::EventKind, WalParseError> {
-    use crate::EventKind;
-    if insert_tokens.contains(&token) {
-        return Ok(EventKind::Insert);
-    }
-    if update_tokens.contains(&token) {
-        return Ok(EventKind::Update);
-    }
-    if delete_tokens.contains(&token) {
-        return Ok(EventKind::Delete);
-    }
-    if truncate_tokens.contains(&token) {
-        return Ok(EventKind::Truncate);
-    }
-    Err(WalParseError::UnknownEventKind(token.to_string()))
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::sync::Arc;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
 
@@ -309,33 +267,5 @@ mod tests {
             }
             _ => panic!("unexpected error variant"),
         }
-    }
-
-    #[test]
-    fn test_parse_json_message_invalid_utf8() {
-        let err = parse_json_message::<serde_json::Value>(&[0xFF])
-            .expect_err("invalid UTF-8 should fail");
-        assert!(matches!(err, WalParseError::InvalidUtf8(_)));
-    }
-
-    #[test]
-    fn test_parse_json_message_invalid_json() {
-        let err =
-            parse_json_message::<serde_json::Value>(b"{").expect_err("malformed JSON should fail");
-        assert!(matches!(err, WalParseError::JsonError(_)));
-    }
-
-    #[test]
-    fn test_parse_json_message_allows_tombstone_option() {
-        let parsed: Option<serde_json::Value> =
-            parse_json_message(b"null").expect("tombstone should parse to None");
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_parse_json_message_or_tombstone_object() {
-        let parsed: Option<serde_json::Value> =
-            parse_json_message_or_tombstone(br#"{"x":1}"#).expect("object should parse");
-        assert!(parsed.is_some());
     }
 }

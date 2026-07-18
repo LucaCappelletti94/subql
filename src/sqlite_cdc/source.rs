@@ -151,7 +151,7 @@ impl<DB: DatabaseLike> crate::CdcSource for SqliteCdcSource<DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{CdcEvent, Presence, RowKind};
+    use crate::backend::{CdcEvent, RowKind, Value};
     use diesel::{sql_query, Connection, RunQueryDsl};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::SQLiteDialect;
@@ -188,12 +188,18 @@ mod tests {
             .expect("poll succeeds")
             .expect("one event pending");
         assert_eq!(event.kind(), crate::EventKind::Insert);
-        assert_eq!(event.pk_columns(), &[0u16]);
-        assert_eq!(event.int_at(RowKind::New, 0), Presence::Present(&7));
-        assert_eq!(event.int_at(RowKind::New, 1), Presence::Present(&250));
+        assert_eq!(event.pk_columns(source.catalog()), &[0u16]);
         assert_eq!(
-            event.string_at(RowKind::New, 2),
-            Presence::Present(&alloc::string::String::from("paid"))
+            event.value_at(source.catalog(), RowKind::New, 0),
+            Value::Int(7)
+        );
+        assert_eq!(
+            event.value_at(source.catalog(), RowKind::New, 1),
+            Value::Int(250)
+        );
+        assert_eq!(
+            event.value_at(source.catalog(), RowKind::New, 2),
+            Value::String("paid".into())
         );
         assert!(source.poll_next_event().expect("post-drain poll").is_none());
     }
@@ -241,10 +247,13 @@ mod tests {
             .expect("update poll")
             .expect("one event");
         assert_eq!(update.kind(), crate::EventKind::Update);
-        let mut changed = update.changed_columns().to_vec();
+        let mut changed = update.changed_columns(source.catalog());
         changed.sort_unstable();
         assert!(changed.contains(&2u16));
-        assert_eq!(update.int_at(RowKind::Pk, 0), Presence::Present(&5));
+        assert_eq!(
+            update.value_at(source.catalog(), RowKind::Pk, 0),
+            Value::Int(5)
+        );
 
         sql_query("DELETE FROM orders WHERE id = 5")
             .execute(source.connection())
@@ -254,7 +263,10 @@ mod tests {
             .expect("delete poll")
             .expect("one event");
         assert_eq!(delete.kind(), crate::EventKind::Delete);
-        assert_eq!(delete.int_at(RowKind::Pk, 0), Presence::Present(&5));
+        assert_eq!(
+            delete.value_at(source.catalog(), RowKind::Pk, 0),
+            Value::Int(5)
+        );
     }
 
     #[test]
@@ -266,7 +278,7 @@ mod tests {
         use std::task::Wake;
 
         struct NoopWake;
-        #[allow(clippy::manual_noop_waker)]
+        #[allow(unknown_lints, clippy::manual_noop_waker)]
         impl Wake for NoopWake {
             fn wake(self: Arc<Self>) {}
         }
@@ -296,7 +308,10 @@ mod tests {
             .expect("next_event succeeds")
             .expect("one event pending");
         assert_eq!(event.kind(), crate::EventKind::Insert);
-        assert_eq!(event.int_at(RowKind::New, 0), Presence::Present(&1));
+        assert_eq!(
+            event.value_at(source.catalog(), RowKind::New, 0),
+            Value::Int(1)
+        );
 
         let ack =
             <SqliteCdcSource<ParserDB> as crate::CdcSource>::ack(&mut source, crate::NoCheckpoint);

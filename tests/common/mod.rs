@@ -17,6 +17,15 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
+// Shared round-trip dispatch machinery, only for test crates that enable
+// the full apply stack. Empty (undeclared) for every other test.
+#[cfg(all(
+    feature = "apply-patchset-postgres",
+    feature = "apply-patchset-sqlite",
+    feature = "sqlite-cdc"
+))]
+pub mod dispatch;
+
 const PG_IMAGE: &str = "subql-test/postgres-wal2json";
 const PG_TAG: &str = "16";
 
@@ -160,8 +169,9 @@ pub fn create_slot(conn: &mut PgConnection, name: &str) {
 
 /// Drain every queued WAL change from the named slot as wal2json v2 JSON
 /// strings. Returns `Vec<String>` in commit order. Empty if there is nothing
-/// pending. The format options match what subql's `Wal2JsonV2Parser` expects:
-/// `format-version=2` and `include-pk=true`.
+/// pending. The format options match what subql's `parse_wal2json_v2` expects:
+/// `format-version=2`, `include-pk=true`, and `include-lsn=true` so each
+/// change carries the LSN that `MessageV2` surfaces as its checkpoint.
 pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -172,7 +182,8 @@ pub fn drain_slot(conn: &mut PgConnection, name: &str) -> Vec<String> {
         "SELECT data FROM pg_logical_slot_get_changes(\
             '{name}', NULL, NULL, \
             'format-version', '2', \
-            'include-pk', 'true'\
+            'include-pk', 'true', \
+            'include-lsn', 'true'\
         )"
     ))
     .load(conn)
@@ -242,26 +253,4 @@ pub fn mysql_connect(port: u16) -> MysqlConnection {
 /// Mapped host port for a started MySQL container.
 pub fn mysql_port(c: &Container<GenericImage>) -> u16 {
     c.get_host_port_ipv4(3306.tcp()).expect("mysql port")
-}
-
-/// Drain every queued WAL change from a `pgoutput` slot as raw binary
-/// messages. Each `Vec<u8>` is a single pgoutput message body suitable
-/// for [`subql::PgOutputParser::parse_wal_message`](subql::PgOutputParser).
-/// Uses `proto_version=1`, which is the subset the parser understands.
-pub fn drain_pgoutput_slot(conn: &mut PgConnection, name: &str, publication: &str) -> Vec<Vec<u8>> {
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Bytea)]
-        data: Vec<u8>,
-    }
-    let rows: Vec<Row> = diesel::sql_query(format!(
-        "SELECT data FROM pg_logical_slot_get_binary_changes(\
-            '{name}', NULL, NULL, \
-            'proto_version', '1', \
-            'publication_names', '{publication}'\
-        )"
-    ))
-    .load(conn)
-    .expect("pg_logical_slot_get_binary_changes");
-    rows.into_iter().map(|r| r.data).collect()
 }

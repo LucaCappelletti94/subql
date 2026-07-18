@@ -3,9 +3,11 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
-use crate::backend::{CdcEvent, Presence, RowKind, SQLite, Value};
+use crate::backend::{CdcEvent, RowKind, SQLite, Value};
 use crate::{ColumnId, EventKind, NoCheckpoint, TableId};
+use sql_traits::prelude::DatabaseLike;
 
 /// One row change decoded from a SQLite session-extension changeset.
 ///
@@ -55,21 +57,6 @@ impl SqliteChangesetEvent {
     }
 }
 
-/// Present the row lookup + variant match as a single macro so each
-/// scalar accessor stays a one-liner.
-macro_rules! changeset_scalar_accessor {
-    ($self:ident, $row:ident, $col:ident, $variant:ident) => {{
-        let Some(v) = $self.row_view($row, $col) else {
-            return Presence::Missing;
-        };
-        match v {
-            Value::$variant(x) => Presence::Present(x),
-            Value::Null => Presence::Null,
-            _ => Presence::Missing,
-        }
-    }};
-}
-
 impl CdcEvent for SqliteChangesetEvent {
     type Backend = SQLite;
     type Checkpoint = NoCheckpoint;
@@ -77,76 +64,25 @@ impl CdcEvent for SqliteChangesetEvent {
     fn kind(&self) -> EventKind {
         self.kind
     }
-
-    fn table_id(&self) -> TableId {
+    fn table_id<DB: DatabaseLike>(&self, _db: &DB) -> TableId {
         self.table_id
     }
-
-    fn checkpoint(&self) -> Option<&Self::Checkpoint> {
+    fn checkpoint(&self) -> Option<Self::Checkpoint> {
         None
     }
-
-    fn pk_columns(&self) -> &[ColumnId] {
-        &self.pk_columns
+    fn pk_columns<DB: DatabaseLike>(&self, _db: &DB) -> Vec<ColumnId> {
+        self.pk_columns.to_vec()
+    }
+    fn changed_columns<DB: DatabaseLike>(&self, _db: &DB) -> Vec<ColumnId> {
+        self.changed_columns.to_vec()
     }
 
-    fn changed_columns(&self) -> &[ColumnId] {
-        &self.changed_columns
-    }
-
-    fn bool_at(&self, row: RowKind, col: ColumnId) -> Presence<&i64> {
-        changeset_scalar_accessor!(self, row, col, Bool)
-    }
-
-    fn int_at(&self, row: RowKind, col: ColumnId) -> Presence<&i64> {
-        changeset_scalar_accessor!(self, row, col, Int)
-    }
-
-    fn float_at(&self, row: RowKind, col: ColumnId) -> Presence<&f64> {
-        changeset_scalar_accessor!(self, row, col, Float)
-    }
-
-    fn string_at(&self, row: RowKind, col: ColumnId) -> Presence<&alloc::string::String> {
-        changeset_scalar_accessor!(self, row, col, String)
-    }
-
-    fn bytes_at(&self, row: RowKind, col: ColumnId) -> Presence<&alloc::vec::Vec<u8>> {
-        changeset_scalar_accessor!(self, row, col, Bytes)
-    }
-
-    fn uuid_at(&self, row: RowKind, col: ColumnId) -> Presence<&alloc::string::String> {
-        changeset_scalar_accessor!(self, row, col, Uuid)
-    }
-
-    fn timestamp_at(&self, row: RowKind, col: ColumnId) -> Presence<&chrono::NaiveDateTime> {
-        changeset_scalar_accessor!(self, row, col, Timestamp)
-    }
-
-    fn timestamp_tz_at(
+    fn value_at<DB: DatabaseLike>(
         &self,
+        _db: &DB,
         row: RowKind,
         col: ColumnId,
-    ) -> Presence<&chrono::DateTime<chrono::Utc>> {
-        changeset_scalar_accessor!(self, row, col, TimestampTz)
-    }
-
-    fn date_at(&self, row: RowKind, col: ColumnId) -> Presence<&chrono::NaiveDate> {
-        changeset_scalar_accessor!(self, row, col, Date)
-    }
-
-    fn time_at(&self, row: RowKind, col: ColumnId) -> Presence<&chrono::NaiveTime> {
-        changeset_scalar_accessor!(self, row, col, Time)
-    }
-
-    fn decimal_at(&self, row: RowKind, col: ColumnId) -> Presence<&bigdecimal::BigDecimal> {
-        changeset_scalar_accessor!(self, row, col, Decimal)
-    }
-
-    fn json_at(&self, row: RowKind, col: ColumnId) -> Presence<&serde_json::Value> {
-        changeset_scalar_accessor!(self, row, col, Json)
-    }
-
-    fn jsonb_at(&self, row: RowKind, col: ColumnId) -> Presence<&serde_json::Value> {
-        changeset_scalar_accessor!(self, row, col, Jsonb)
+    ) -> Value<Self::Backend> {
+        self.row_view(row, col).cloned().unwrap_or(Value::Missing)
     }
 }

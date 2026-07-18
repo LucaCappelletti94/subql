@@ -5,10 +5,10 @@
 //! caller's Postgres DDL to SQLite DDL via [`pg2sqlite`], applies it to
 //! the local database, and each poll drains a fresh session changeset,
 //! re-encodes each row change as `pgoutput` wire bytes with
-//! [`pg_walstream::encode_message`], and feeds those bytes back through
-//! the production [`crate::PgOutputParser`]. The emitted events look
-//! identical to what a real Postgres logical replication stream would
-//! produce (`Backend = Postgres`, `Event = PgOutputEvent`).
+//! [`pg_walstream::encode_message`], decodes them with `pg_walstream`'s
+//! `PgOutputDecoder`, and surfaces the resulting [`crate::ChangeEvent`]
+//! values. The emitted events look identical to what a real Postgres
+//! logical replication stream would produce (`Backend = Postgres`).
 //!
 //! # When to use
 //!
@@ -37,7 +37,7 @@
 //! ```
 //! use sqlparser::dialect::PostgreSqlDialect;
 //! use subql::{
-//!     DefaultIds, PgOutputEvent, PgSqliteEmuSource, SubscriptionEngine,
+//!     ChangeEvent, DefaultIds, PgSqliteEmuSource, SubscriptionEngine,
 //!     SubscriptionRequest,
 //! };
 //!
@@ -46,7 +46,7 @@
 //!
 //! let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL)?;
 //!
-//! let mut engine: SubscriptionEngine<PgOutputEvent, DefaultIds, _> =
+//! let mut engine: SubscriptionEngine<ChangeEvent, DefaultIds, _> =
 //!     SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
 //! engine.register(SubscriptionRequest::new(
 //!     1,

@@ -16,8 +16,8 @@
 #![cfg(feature = "pg-sqlite-emu")]
 #![allow(clippy::unwrap_used)]
 
-use subql::backend::{CdcEvent, Presence, RowKind};
-use subql::{catalog_helpers, EventKind, PgOutputEvent, PgSqliteEmuSource};
+use subql::backend::{CdcEvent, RowKind, Value};
+use subql::{catalog_helpers, ChangeEvent, EventKind, PgSqliteEmuSource};
 
 const SINGLE_PK_PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
@@ -26,7 +26,7 @@ const COMPOSITE_PK_PG_DDL: &str = "CREATE TABLE items (\
     region_id INT, item_id INT, name TEXT, \
     PRIMARY KEY (region_id, item_id));";
 
-fn drain_one(source: &mut PgSqliteEmuSource) -> PgOutputEvent {
+fn drain_one(source: &mut PgSqliteEmuSource) -> ChangeEvent {
     source
         .poll_next_event()
         .expect("poll succeeds")
@@ -47,14 +47,23 @@ fn single_pk_insert_update_delete_round_trip() {
     // to a net zero change and yield nothing.
     let insert = drain_one(&mut source);
     assert_eq!(insert.kind(), EventKind::Insert);
-    assert_eq!(insert.table_id(), table_id);
-    assert_eq!(insert.pk_columns(), &[0u16]);
-    assert_eq!(insert.int_at(RowKind::Pk, 0), Presence::Present(&1));
-    assert_eq!(insert.int_at(RowKind::New, 0), Presence::Present(&1));
-    assert_eq!(insert.float_at(RowKind::New, 1), Presence::Present(&5.0));
+    assert_eq!(insert.table_id(source.pg_catalog()), table_id);
+    assert_eq!(insert.pk_columns(source.pg_catalog()), &[0u16]);
     assert_eq!(
-        insert.string_at(RowKind::New, 2),
-        Presence::Present(&"paid".to_string()),
+        insert.value_at(source.pg_catalog(), RowKind::Pk, 0),
+        Value::Int(1)
+    );
+    assert_eq!(
+        insert.value_at(source.pg_catalog(), RowKind::New, 0),
+        Value::Int(1)
+    );
+    assert_eq!(
+        insert.value_at(source.pg_catalog(), RowKind::New, 1),
+        Value::Float(5.0)
+    );
+    assert_eq!(
+        insert.value_at(source.pg_catalog(), RowKind::New, 2),
+        Value::String("paid".to_string()),
     );
 
     source
@@ -64,19 +73,28 @@ fn single_pk_insert_update_delete_round_trip() {
     // Some/Some on both sides; no row-lookup fallback needed).
     let update = drain_one(&mut source);
     assert_eq!(update.kind(), EventKind::Update);
-    assert_eq!(update.table_id(), table_id);
-    assert_eq!(update.int_at(RowKind::Pk, 0), Presence::Present(&1));
-    assert_eq!(update.float_at(RowKind::Old, 1), Presence::Present(&5.0));
-    assert_eq!(update.float_at(RowKind::New, 1), Presence::Present(&9.0));
+    assert_eq!(update.table_id(source.pg_catalog()), table_id);
     assert_eq!(
-        update.string_at(RowKind::Old, 2),
-        Presence::Present(&"paid".to_string()),
+        update.value_at(source.pg_catalog(), RowKind::Pk, 0),
+        Value::Int(1)
     );
     assert_eq!(
-        update.string_at(RowKind::New, 2),
-        Presence::Present(&"shipped".to_string()),
+        update.value_at(source.pg_catalog(), RowKind::Old, 1),
+        Value::Float(5.0)
     );
-    let mut changed = update.changed_columns().to_vec();
+    assert_eq!(
+        update.value_at(source.pg_catalog(), RowKind::New, 1),
+        Value::Float(9.0)
+    );
+    assert_eq!(
+        update.value_at(source.pg_catalog(), RowKind::Old, 2),
+        Value::String("paid".to_string()),
+    );
+    assert_eq!(
+        update.value_at(source.pg_catalog(), RowKind::New, 2),
+        Value::String("shipped".to_string()),
+    );
+    let mut changed = update.changed_columns(source.pg_catalog());
     changed.sort_unstable();
     assert_eq!(
         changed,
@@ -88,13 +106,22 @@ fn single_pk_insert_update_delete_round_trip() {
     // DELETE (full old-image is the whole point of using changesets).
     let delete = drain_one(&mut source);
     assert_eq!(delete.kind(), EventKind::Delete);
-    assert_eq!(delete.table_id(), table_id);
-    assert_eq!(delete.int_at(RowKind::Pk, 0), Presence::Present(&1));
-    assert_eq!(delete.int_at(RowKind::Old, 0), Presence::Present(&1));
-    assert_eq!(delete.float_at(RowKind::Old, 1), Presence::Present(&9.0));
+    assert_eq!(delete.table_id(source.pg_catalog()), table_id);
     assert_eq!(
-        delete.string_at(RowKind::Old, 2),
-        Presence::Present(&"shipped".to_string()),
+        delete.value_at(source.pg_catalog(), RowKind::Pk, 0),
+        Value::Int(1)
+    );
+    assert_eq!(
+        delete.value_at(source.pg_catalog(), RowKind::Old, 0),
+        Value::Int(1)
+    );
+    assert_eq!(
+        delete.value_at(source.pg_catalog(), RowKind::Old, 1),
+        Value::Float(9.0)
+    );
+    assert_eq!(
+        delete.value_at(source.pg_catalog(), RowKind::Old, 2),
+        Value::String("shipped".to_string()),
     );
 
     assert!(
@@ -121,19 +148,25 @@ fn single_pk_partial_update_uses_row_lookup_fallback() {
 
     let update = drain_one(&mut source);
     assert_eq!(update.kind(), EventKind::Update);
-    assert_eq!(update.float_at(RowKind::Old, 1), Presence::Present(&3.5));
-    assert_eq!(update.float_at(RowKind::New, 1), Presence::Present(&3.5));
     assert_eq!(
-        update.string_at(RowKind::Old, 2),
-        Presence::Present(&"open".to_string()),
+        update.value_at(source.pg_catalog(), RowKind::Old, 1),
+        Value::Float(3.5)
     );
     assert_eq!(
-        update.string_at(RowKind::New, 2),
-        Presence::Present(&"closed".to_string()),
+        update.value_at(source.pg_catalog(), RowKind::New, 1),
+        Value::Float(3.5)
+    );
+    assert_eq!(
+        update.value_at(source.pg_catalog(), RowKind::Old, 2),
+        Value::String("open".to_string()),
+    );
+    assert_eq!(
+        update.value_at(source.pg_catalog(), RowKind::New, 2),
+        Value::String("closed".to_string()),
     );
     // Only `status` differs; `price` is unchanged so it stays out of
     // `changed_columns`.
-    assert_eq!(update.changed_columns(), &[2u16]);
+    assert_eq!(update.changed_columns(source.pg_catalog()), &[2u16]);
 }
 
 #[test]
@@ -148,17 +181,26 @@ fn composite_pk_insert_update_delete_round_trip() {
     // INSERT
     let insert = drain_one(&mut source);
     assert_eq!(insert.kind(), EventKind::Insert);
-    assert_eq!(insert.table_id(), table_id);
+    assert_eq!(insert.table_id(source.pg_catalog()), table_id);
     // Composite PK surfaces both columns in `pk_columns`.
-    assert_eq!(insert.pk_columns(), &[0u16, 1u16]);
+    assert_eq!(insert.pk_columns(source.pg_catalog()), &[0u16, 1u16]);
     // Both PK columns readable through `RowKind::Pk`.
-    assert_eq!(insert.int_at(RowKind::Pk, 0), Presence::Present(&1));
-    assert_eq!(insert.int_at(RowKind::Pk, 1), Presence::Present(&100));
-    // Non-PK columns still Missing under `RowKind::Pk`.
-    assert_eq!(insert.string_at(RowKind::Pk, 2), Presence::Missing);
     assert_eq!(
-        insert.string_at(RowKind::New, 2),
-        Presence::Present(&"widget".to_string()),
+        insert.value_at(source.pg_catalog(), RowKind::Pk, 0),
+        Value::Int(1)
+    );
+    assert_eq!(
+        insert.value_at(source.pg_catalog(), RowKind::Pk, 1),
+        Value::Int(100)
+    );
+    // Non-PK columns still Missing under `RowKind::Pk`.
+    assert_eq!(
+        insert.value_at(source.pg_catalog(), RowKind::Pk, 2),
+        Value::Missing
+    );
+    assert_eq!(
+        insert.value_at(source.pg_catalog(), RowKind::New, 2),
+        Value::String("widget".to_string()),
     );
 
     source
@@ -168,18 +210,24 @@ fn composite_pk_insert_update_delete_round_trip() {
     // slots so both old and new images stay complete.
     let update = drain_one(&mut source);
     assert_eq!(update.kind(), EventKind::Update);
-    assert_eq!(update.pk_columns(), &[0u16, 1u16]);
-    assert_eq!(update.int_at(RowKind::Pk, 0), Presence::Present(&1));
-    assert_eq!(update.int_at(RowKind::Pk, 1), Presence::Present(&100));
+    assert_eq!(update.pk_columns(source.pg_catalog()), &[0u16, 1u16]);
     assert_eq!(
-        update.string_at(RowKind::Old, 2),
-        Presence::Present(&"widget".to_string()),
+        update.value_at(source.pg_catalog(), RowKind::Pk, 0),
+        Value::Int(1)
     );
     assert_eq!(
-        update.string_at(RowKind::New, 2),
-        Presence::Present(&"gadget".to_string()),
+        update.value_at(source.pg_catalog(), RowKind::Pk, 1),
+        Value::Int(100)
     );
-    assert_eq!(update.changed_columns(), &[2u16]);
+    assert_eq!(
+        update.value_at(source.pg_catalog(), RowKind::Old, 2),
+        Value::String("widget".to_string()),
+    );
+    assert_eq!(
+        update.value_at(source.pg_catalog(), RowKind::New, 2),
+        Value::String("gadget".to_string()),
+    );
+    assert_eq!(update.changed_columns(source.pg_catalog()), &[2u16]);
 
     source
         .execute("DELETE FROM items WHERE region_id = 1 AND item_id = 100")
@@ -188,13 +236,25 @@ fn composite_pk_insert_update_delete_round_trip() {
     // DELETE
     let delete = drain_one(&mut source);
     assert_eq!(delete.kind(), EventKind::Delete);
-    assert_eq!(delete.int_at(RowKind::Pk, 0), Presence::Present(&1));
-    assert_eq!(delete.int_at(RowKind::Pk, 1), Presence::Present(&100));
-    assert_eq!(delete.int_at(RowKind::Old, 0), Presence::Present(&1));
-    assert_eq!(delete.int_at(RowKind::Old, 1), Presence::Present(&100));
     assert_eq!(
-        delete.string_at(RowKind::Old, 2),
-        Presence::Present(&"gadget".to_string()),
+        delete.value_at(source.pg_catalog(), RowKind::Pk, 0),
+        Value::Int(1)
+    );
+    assert_eq!(
+        delete.value_at(source.pg_catalog(), RowKind::Pk, 1),
+        Value::Int(100)
+    );
+    assert_eq!(
+        delete.value_at(source.pg_catalog(), RowKind::Old, 0),
+        Value::Int(1)
+    );
+    assert_eq!(
+        delete.value_at(source.pg_catalog(), RowKind::Old, 1),
+        Value::Int(100)
+    );
+    assert_eq!(
+        delete.value_at(source.pg_catalog(), RowKind::Old, 2),
+        Value::String("gadget".to_string()),
     );
 
     assert!(

@@ -4,8 +4,8 @@
 //! in [`sqlite_diff_rs::pg_walstream_reverse`]. This module owns the
 //! surrounding orchestration: PG DDL translation via [`pg2sqlite`],
 //! session lifecycle, per-table [`RelationSchema`] cache, the
-//! unchanged-column row lookup, and the [`PgOutputParser`] feedback
-//! loop that turns the encoded frames back into typed [`PgOutputEvent`]s.
+//! unchanged-column row lookup, and the `PgOutputDecoder` feedback loop
+//! that turns the encoded frames back into typed [`crate::ChangeEvent`]s.
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -19,18 +19,18 @@ use diesel::{
 use diesel_sqlite_session::{Session, SqliteSessionExt};
 use hashbrown::{HashMap, HashSet};
 use pg2sqlite::{options::Pg2SqliteOptions, pg2sqlite::Pg2Sqlite};
-use pg_walstream::{encode_message, LogicalReplicationMessage, Oid};
+use pg_walstream::{encode_message, ChangeEvent, Lsn, PgOutputDecoder};
 use sql_traits::prelude::{ColumnLike, DatabaseLike, TableLike};
 use sql_traits::structs::ParserDB;
 use sqlite_diff_rs::pg_walstream_reverse::{
-    op_to_message, relation_message, ColumnSchema, RelationSchema,
+    op_to_message, relation_message, ColumnSchema, LogicalReplicationMessage, Oid, RelationSchema,
 };
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, TableSchema, Value as WireValue};
 
 use super::error::PgSqliteEmuError;
 use crate::backend::ScalarKind;
-use crate::wal::WalParser;
-use crate::{catalog_helpers, ColumnId, PgOutputEvent, PgOutputParser, TableId};
+use crate::wal::into_engine_events;
+use crate::{catalog_helpers, ColumnId, TableId};
 
 /// `pgoutput` protocol version 1: base messages only. Matches what the
 /// production parser handles by default.
@@ -42,12 +42,12 @@ const PROTOCOL_VERSION: u8 = 1;
 /// # Examples
 ///
 /// Build a source, drive one INSERT through the wrapped connection,
-/// and inspect the typed [`PgOutputEvent`] the source materialises
+/// and inspect the typed [`ChangeEvent`] the source materialises
 /// from SQLite's session changeset. Full engine-dispatch pipeline
 /// lives in the [module docs](super#quickstart).
 ///
 /// ```
-/// use subql::backend::{Presence, RowKind};
+/// use subql::backend::{RowKind, Value};
 /// use subql::{EventKind, PgSqliteEmuSource};
 /// use subql::backend::CdcEvent;
 ///
@@ -58,16 +58,16 @@ const PROTOCOL_VERSION: u8 = 1;
 ///
 /// let event = source.poll_next_event()?.expect("insert reaches the queue");
 /// assert_eq!(event.kind(), EventKind::Insert);
-/// assert_eq!(event.int_at(RowKind::New, 0), Presence::Present(&7));
-/// assert_eq!(event.int_at(RowKind::New, 1), Presence::Present(&250));
+/// assert_eq!(event.value_at(source.pg_catalog(), RowKind::New, 0), Value::Int(7));
+/// assert_eq!(event.value_at(source.pg_catalog(), RowKind::New, 1), Value::Int(250));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct PgSqliteEmuSource {
     connection: SqliteConnection,
     session: Session,
     pg_catalog: ParserDB,
-    parser: PgOutputParser,
-    pending: VecDeque<PgOutputEvent>,
+    decoder: PgOutputDecoder,
+    pending: VecDeque<ChangeEvent>,
     announced: HashSet<Oid>,
     tables: HashMap<String, TableMeta>,
 }
@@ -150,7 +150,7 @@ impl PgSqliteEmuSource {
             connection,
             session,
             pg_catalog,
-            parser: PgOutputParser::new(),
+            decoder: PgOutputDecoder::with_protocol_version(u32::from(PROTOCOL_VERSION)),
             pending: VecDeque::new(),
             announced: HashSet::new(),
             tables,
@@ -179,10 +179,10 @@ impl PgSqliteEmuSource {
     ///
     /// Shortest usable pipeline: open, run one DML, drain one event.
     /// The typed row image round-trips through the pgoutput wire and
-    /// back into a `PgOutputEvent` before the assertion sees it.
+    /// back into a `ChangeEvent` before the assertion sees it.
     ///
     /// ```
-    /// use subql::backend::{CdcEvent, Presence, RowKind};
+    /// use subql::backend::{CdcEvent, RowKind, Value};
     /// use subql::{EventKind, PgSqliteEmuSource};
     ///
     /// let mut source = PgSqliteEmuSource::open_in_memory(
@@ -193,8 +193,8 @@ impl PgSqliteEmuSource {
     /// let event = source.poll_next_event()?.expect("one event pending");
     /// assert_eq!(event.kind(), EventKind::Insert);
     /// assert_eq!(
-    ///     event.string_at(RowKind::New, 1),
-    ///     Presence::Present(&"paid".to_string()),
+    ///     event.value_at(source.pg_catalog(), RowKind::New, 1),
+    ///     Value::String("paid".to_string()),
     /// );
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -262,7 +262,7 @@ impl PgSqliteEmuSource {
     /// assert!(source.drain()?.is_empty(), "queue is now flushed");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn drain(&mut self) -> Result<Vec<PgOutputEvent>, PgSqliteEmuError> {
+    pub fn drain(&mut self) -> Result<Vec<ChangeEvent>, PgSqliteEmuError> {
         let mut out = Vec::new();
         while let Some(ev) = self.poll_next_event()? {
             out.push(ev);
@@ -294,7 +294,7 @@ impl PgSqliteEmuSource {
     /// assert!(source.poll_next_event()?.is_none());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn poll_next_event(&mut self) -> Result<Option<PgOutputEvent>, PgSqliteEmuError> {
+    pub fn poll_next_event(&mut self) -> Result<Option<ChangeEvent>, PgSqliteEmuError> {
         if self.pending.is_empty() && !self.session.is_empty() {
             self.drain_session()?;
             // SQLite sessions accumulate: `.changeset()` snapshots
@@ -337,7 +337,7 @@ impl PgSqliteEmuSource {
     /// source.inject_truncate(table_id)?;
     /// let event = source.poll_next_event()?.expect("truncate emitted");
     /// assert_eq!(event.kind(), EventKind::Truncate);
-    /// assert_eq!(event.table_id(), table_id);
+    /// assert_eq!(event.table_id(source.pg_catalog()), table_id);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn inject_truncate(&mut self, table_id: TableId) -> Result<(), PgSqliteEmuError> {
@@ -368,8 +368,9 @@ impl PgSqliteEmuSource {
     }
 
     /// Immutable access to the PG catalog. Downstream consumers pass
-    /// this into `SubscriptionEngine::new` so the engine and the
-    /// `PgOutputParser` share one catalog.
+    /// this into `SubscriptionEngine::new` so the engine resolves the
+    /// emitted events against the same catalog.
+    #[must_use]
     pub const fn pg_catalog(&self) -> &ParserDB {
         &self.pg_catalog
     }
@@ -425,19 +426,17 @@ impl PgSqliteEmuSource {
         let msg = relation_message(&schema);
         let mut buf = BytesMut::new();
         encode_message(&msg, PROTOCOL_VERSION, &mut buf);
-        // Relation frames prime the parser's relation cache; they
-        // never emit a data event, so we discard whatever the parser
-        // returns.
-        if let Ok(events) = self.parser.parse_wal_message(&buf, &self.pg_catalog) {
-            self.pending.extend(events);
-        }
+        // Relation frames prime the decoder's relation cache and never
+        // emit a data event, so we discard the decode result.
+        let _ = self.decoder.decode_message(buf, Lsn::new(0));
     }
 
     fn push_frame(&mut self, msg: &LogicalReplicationMessage) -> Result<(), PgSqliteEmuError> {
         let mut buf = BytesMut::new();
         encode_message(msg, PROTOCOL_VERSION, &mut buf);
-        let events = self.parser.parse_wal_message(&buf, &self.pg_catalog)?;
-        self.pending.extend(events);
+        if let Some(decoded) = self.decoder.decode_message(buf, Lsn::new(0))? {
+            self.pending.extend(into_engine_events(decoded));
+        }
         Ok(())
     }
 
@@ -517,7 +516,7 @@ impl TableMeta {
 }
 
 impl crate::CdcSource for PgSqliteEmuSource {
-    type Event = PgOutputEvent;
+    type Event = ChangeEvent;
     type Error = PgSqliteEmuError;
 
     fn next_event(
@@ -606,10 +605,10 @@ const fn synth_oid(table_id: TableId) -> Oid {
     1_000 + table_id
 }
 
-/// Map subql's [`ScalarKind`] to a PostgreSQL type OID the production
-/// [`PgOutputParser`] decodes back into the matching [`ScalarKind`].
-/// Unknown / composite columns fall back to `TEXT` (25), which the
-/// parser routes into [`crate::backend::Value::String`].
+/// Map subql's [`ScalarKind`] to a PostgreSQL type OID for the encoded
+/// `pgoutput` relation message. The OID labels the column on the wire,
+/// while the engine decodes each cell against the catalog scalar kind.
+/// Unknown or composite columns fall back to `TEXT` (25).
 const fn pg_type_oid_for_kind(kind: Option<ScalarKind>) -> Oid {
     match kind {
         Some(ScalarKind::Bool) => 16,
@@ -752,7 +751,7 @@ fn json_value_to_wire(v: &serde_json::Value) -> WireValue<String, Vec<u8>> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::backend::{CdcEvent, Presence, RowKind};
+    use crate::backend::{CdcEvent, RowKind, Value};
     use diesel::Connection;
 
     const ORDERS_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -776,11 +775,17 @@ mod tests {
             .unwrap();
         let ev = src.poll_next_event().unwrap().expect("one event pending");
         assert_eq!(ev.kind(), crate::EventKind::Insert);
-        assert_eq!(ev.int_at(RowKind::New, 0), Presence::Present(&1));
-        assert_eq!(ev.int_at(RowKind::New, 1), Presence::Present(&250));
         assert_eq!(
-            ev.string_at(RowKind::New, 2),
-            Presence::Present(&String::from("paid"))
+            ev.value_at(src.pg_catalog(), RowKind::New, 0),
+            Value::Int(1)
+        );
+        assert_eq!(
+            ev.value_at(src.pg_catalog(), RowKind::New, 1),
+            Value::Int(250)
+        );
+        assert_eq!(
+            ev.value_at(src.pg_catalog(), RowKind::New, 2),
+            Value::String("paid".into())
         );
         assert!(src.poll_next_event().unwrap().is_none());
     }
@@ -797,16 +802,22 @@ mod tests {
             .unwrap();
         let ev = src.poll_next_event().unwrap().expect("update event");
         assert_eq!(ev.kind(), crate::EventKind::Update);
-        assert_eq!(ev.int_at(RowKind::Pk, 0), Presence::Present(&5));
-        assert_eq!(ev.int_at(RowKind::Old, 1), Presence::Present(&100));
+        assert_eq!(ev.value_at(src.pg_catalog(), RowKind::Pk, 0), Value::Int(5));
         assert_eq!(
-            ev.string_at(RowKind::Old, 2),
-            Presence::Present(&String::from("pending"))
+            ev.value_at(src.pg_catalog(), RowKind::Old, 1),
+            Value::Int(100)
         );
-        assert_eq!(ev.int_at(RowKind::New, 1), Presence::Present(&100));
         assert_eq!(
-            ev.string_at(RowKind::New, 2),
-            Presence::Present(&String::from("shipped"))
+            ev.value_at(src.pg_catalog(), RowKind::Old, 2),
+            Value::String("pending".into())
+        );
+        assert_eq!(
+            ev.value_at(src.pg_catalog(), RowKind::New, 1),
+            Value::Int(100)
+        );
+        assert_eq!(
+            ev.value_at(src.pg_catalog(), RowKind::New, 2),
+            Value::String("shipped".into())
         );
     }
 
@@ -840,19 +851,31 @@ mod tests {
         let [del, ins] = events;
 
         assert_eq!(del.kind(), crate::EventKind::Delete);
-        assert_eq!(del.int_at(RowKind::Old, 0), Presence::Present(&7));
-        assert_eq!(del.int_at(RowKind::Old, 1), Presence::Present(&500));
         assert_eq!(
-            del.string_at(RowKind::Old, 2),
-            Presence::Present(&String::from("paid"))
+            del.value_at(src.pg_catalog(), RowKind::Old, 0),
+            Value::Int(7)
+        );
+        assert_eq!(
+            del.value_at(src.pg_catalog(), RowKind::Old, 1),
+            Value::Int(500)
+        );
+        assert_eq!(
+            del.value_at(src.pg_catalog(), RowKind::Old, 2),
+            Value::String("paid".into())
         );
 
         assert_eq!(ins.kind(), crate::EventKind::Insert);
-        assert_eq!(ins.int_at(RowKind::New, 0), Presence::Present(&8));
-        assert_eq!(ins.int_at(RowKind::New, 1), Presence::Present(&500));
         assert_eq!(
-            ins.string_at(RowKind::New, 2),
-            Presence::Present(&String::from("paid"))
+            ins.value_at(src.pg_catalog(), RowKind::New, 0),
+            Value::Int(8)
+        );
+        assert_eq!(
+            ins.value_at(src.pg_catalog(), RowKind::New, 1),
+            Value::Int(500)
+        );
+        assert_eq!(
+            ins.value_at(src.pg_catalog(), RowKind::New, 2),
+            Value::String("paid".into())
         );
     }
 
@@ -868,11 +891,17 @@ mod tests {
             .unwrap();
         let ev = src.poll_next_event().unwrap().expect("delete event");
         assert_eq!(ev.kind(), crate::EventKind::Delete);
-        assert_eq!(ev.int_at(RowKind::Old, 0), Presence::Present(&9));
-        assert_eq!(ev.int_at(RowKind::Old, 1), Presence::Present(&500));
         assert_eq!(
-            ev.string_at(RowKind::Old, 2),
-            Presence::Present(&String::from("paid"))
+            ev.value_at(src.pg_catalog(), RowKind::Old, 0),
+            Value::Int(9)
+        );
+        assert_eq!(
+            ev.value_at(src.pg_catalog(), RowKind::Old, 1),
+            Value::Int(500)
+        );
+        assert_eq!(
+            ev.value_at(src.pg_catalog(), RowKind::Old, 2),
+            Value::String("paid".into())
         );
     }
 
@@ -883,6 +912,6 @@ mod tests {
         src.inject_truncate(table_id).expect("truncate");
         let ev = src.poll_next_event().unwrap().expect("truncate event");
         assert_eq!(ev.kind(), crate::EventKind::Truncate);
-        assert_eq!(ev.table_id(), table_id);
+        assert_eq!(ev.table_id(src.pg_catalog()), table_id);
     }
 }

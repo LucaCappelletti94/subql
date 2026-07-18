@@ -213,9 +213,8 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
 /// Distinguishes every scalar subql cares about (`JSONB` vs `JSON`,
 /// `TIMESTAMPTZ` vs `TIMESTAMP`, and so on) via
 /// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token).
-/// The compiler tags every
-/// [`crate::compiler::Instruction::LoadColumn`] instruction with the
-/// result.
+/// The compiler coerces comparison literals to the column's kind with it,
+/// and the WAL decoders route each wire cell to its typed value against it.
 ///
 /// Returns `None` when the table / column id is unknown or when the
 /// declared type doesn't match any supported scalar (compiler surfaces

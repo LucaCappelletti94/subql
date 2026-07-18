@@ -2,7 +2,7 @@
 //!
 //! Owns a `pg_walstream::PgReplicationConnection` opened in replication
 //! mode plus an attached `START_REPLICATION` stream. Surfaces typed
-//! [`crate::PgOutputEvent`] values through the [`crate::CdcSource`]
+//! [`crate::ChangeEvent`] values through the [`crate::CdcSource`]
 //! trait, each stamped with the `XLogData` header's LSN. Acks flow back
 //! so the slot's `confirmed_flush_lsn` tracks reality.
 
@@ -13,13 +13,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
 use pg_walstream::error::ReplicationError;
-use pg_walstream::PgReplicationConnection;
+use pg_walstream::{ChangeEvent, Lsn, PgOutputDecoder, PgReplicationConnection};
 use sql_traits::prelude::DatabaseLike;
 use tokio_util::sync::CancellationToken;
 
-use super::pgoutput::PgOutputParser;
-use super::{WalParseError, WalParser};
-use crate::{PgLsn, PgOutputEvent};
+use super::into_engine_events;
+use crate::PgLsn;
 
 /// Configuration for a [`PgStreamingCdcSource`].
 ///
@@ -104,9 +103,6 @@ pub enum PgStreamingError {
     /// Underlying `pg_walstream` failure (transport, auth, server error).
     #[error("postgres error: {0}")]
     Postgres(#[from] ReplicationError),
-    /// The pgoutput payload could not be parsed.
-    #[error("pgoutput parse error: {0}")]
-    Parse(#[from] WalParseError),
     /// The server's response to a replication command did not match
     /// what the spec mandates (e.g. truncated `XLogData` header).
     #[error("replication protocol error: {0}")]
@@ -121,7 +117,7 @@ pub enum PgStreamingError {
 /// the lifecycle contract.
 pub struct PgStreamingCdcSource {
     config: PgStreamingConfig,
-    event_rx: tokio::sync::mpsc::Receiver<Result<PgOutputEvent, PgStreamingError>>,
+    event_rx: tokio::sync::mpsc::Receiver<Result<ChangeEvent, PgStreamingError>>,
     ack_tx: tokio::sync::mpsc::UnboundedSender<PgLsn>,
     status_updates_sent: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
@@ -148,9 +144,14 @@ impl PgStreamingCdcSource {
     ///   exist with the `pgoutput` plugin.
     /// - `config.url` is a libpq conninfo string. The source appends
     ///   `replication=database` if the caller did not.
+    ///
+    /// `catalog` is retained for API stability and is currently unused.
+    /// The source yields raw `ChangeEvent`s that the engine resolves
+    /// against its own catalog at dispatch time.
+    #[allow(clippy::needless_pass_by_value)]
     pub async fn connect<DB: DatabaseLike + 'static>(
         config: PgStreamingConfig,
-        catalog: DB,
+        _catalog: DB,
     ) -> Result<Self, PgStreamingError> {
         let conninfo = ensure_replication_param(&config.url);
         let slot_name = config.slot_name.clone();
@@ -195,7 +196,6 @@ impl PgStreamingCdcSource {
 
         let task = tokio::spawn(streaming_task(
             conn,
-            catalog,
             event_tx,
             ack_rx,
             task_status_counter,
@@ -226,7 +226,7 @@ impl PgStreamingCdcSource {
         self.status_updates_sent.load(Ordering::Relaxed)
     }
 
-    /// Cumulative number of typed [`PgOutputEvent`]s the inner task has
+    /// Cumulative number of typed [`ChangeEvent`]s the inner task has
     /// pushed onto the consumer-facing channel since `connect`.
     /// Symmetric with
     /// [`crate::polling::PollingPgCdcSource::events_received`].
@@ -267,7 +267,7 @@ impl Drop for PgStreamingCdcSource {
 }
 
 impl crate::CdcSource for PgStreamingCdcSource {
-    type Event = PgOutputEvent;
+    type Event = ChangeEvent;
     type Error = PgStreamingError;
 
     #[allow(clippy::manual_async_fn)]
@@ -305,10 +305,9 @@ impl crate::CdcSource for PgStreamingCdcSource {
 // ============================================================================
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-async fn streaming_task<DB: DatabaseLike>(
+async fn streaming_task(
     mut conn: PgReplicationConnection,
-    catalog: DB,
-    event_tx: tokio::sync::mpsc::Sender<Result<PgOutputEvent, PgStreamingError>>,
+    event_tx: tokio::sync::mpsc::Sender<Result<ChangeEvent, PgStreamingError>>,
     mut ack_rx: tokio::sync::mpsc::UnboundedReceiver<PgLsn>,
     status_counter: Arc<AtomicU64>,
     events_counter: Arc<AtomicU64>,
@@ -324,7 +323,7 @@ async fn streaming_task<DB: DatabaseLike>(
     }
     let _exit_guard = ExitGuard(task_exited);
 
-    let parser = PgOutputParser::new();
+    let mut decoder = PgOutputDecoder::with_protocol_version(1);
     let mut latest_received_lsn: u64 = 0;
     // Never regress the reported flush_lsn; slots track `min(reported)`.
     let mut latest_acked_lsn: u64 = 0;
@@ -377,21 +376,21 @@ async fn streaming_task<DB: DatabaseLike>(
                         let wal_end = u64::from_be_bytes(
                             bytes[9..17].try_into().expect("slice is exactly 8 bytes"),
                         );
-                        let payload = &bytes[XLOG_DATA_HEADER_LEN..];
+                        let payload = bytes.slice(XLOG_DATA_HEADER_LEN..);
                         latest_received_lsn = latest_received_lsn.max(wal_end);
 
-                        match parser.parse_wal_message(payload, &catalog) {
-                            Ok(events) => {
-                                for ev in events {
-                                    let typed = ev.with_checkpoint(Some(PgLsn(start_lsn)));
+                        match decoder.decode_message(payload, Lsn::new(start_lsn)) {
+                            Ok(Some(change)) => {
+                                for ev in into_engine_events(change) {
                                     events_counter.fetch_add(1, Ordering::Relaxed);
-                                    if event_tx.send(Ok(typed)).await.is_err() {
+                                    if event_tx.send(Ok(ev)).await.is_err() {
                                         return;
                                     }
                                 }
                             }
+                            Ok(None) => {}
                             Err(e) => {
-                                let _ = event_tx.send(Err(PgStreamingError::Parse(e))).await;
+                                let _ = event_tx.send(Err(PgStreamingError::Postgres(e))).await;
                                 return;
                             }
                         }

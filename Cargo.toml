@@ -26,6 +26,15 @@ diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future
 # ships.
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+# sqlite-diff-rs `main`: migrated to pg_walstream 0.8 so subql's 0.8
+# `ChangeEvent` digests through the crate's pg `Digestable`. Repoint at a
+# crates.io release once 0.5.0 ships.
+sqlite-diff-rs = { git = "https://github.com/LucaCappelletti94/sqlite-diff-rs", branch = "main" }
+# Unify pg_walstream across subql and sqlite-diff-rs on subql's fork
+# branch (0.8.0 plus the `PgOutputDecoder`), so the `EventType` the
+# crate's pg `Digestable` consumes is the same type subql's sources
+# produce. This also lets `pg-sqlite-emu` encode through pg_walstream 0.8.
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
 
 # diesel-sqlite-session depends on diesel via git (not crates.io), so
 # `[patch.crates-io]` above does not reach that graph. Route the git
@@ -175,6 +184,36 @@ required-features = ["pg-streaming"]
 name = "polling_vs_push_benchmark"
 required-features = ["pg-streaming"]
 
+# Docker-backed full CDC round-trip test on the wal2json vehicle:
+# Postgres DML to wal2json CDC to emitted patchset, applied to a SQLite
+# replica via `SqliteAdapter`, session patchset captured and re-applied
+# to Postgres via `PgAdapter`, asserting row parity across the cycle.
+# Run with:
+#   cargo test --test round_trip_pg_wal2json_e2e \
+#       --features "apply-patchset-postgres apply-patchset-sqlite sqlite-cdc" -- --ignored --nocapture
+[[test]]
+name = "round_trip_pg_wal2json_e2e"
+required-features = [
+    "apply-patchset-postgres",
+    "apply-patchset-sqlite",
+    "sqlite-cdc",
+]
+
+# Docker-backed full CDC round-trip test on the pgoutput vehicle: the
+# same four-type loop as the wal2json test, but driven by real pgoutput
+# binary changes decoded to `ChangeEvent` and emitted via
+# `pgoutput_patchset_builder`. Run with:
+#   cargo test --test round_trip_pg_pgoutput_e2e \
+#       --features "pgoutput-emit apply-patchset-postgres apply-patchset-sqlite sqlite-cdc" -- --ignored --nocapture
+[[test]]
+name = "round_trip_pg_pgoutput_e2e"
+required-features = [
+    "pgoutput-emit",
+    "apply-patchset-postgres",
+    "apply-patchset-sqlite",
+    "sqlite-cdc",
+]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }
@@ -232,13 +271,17 @@ tracing = { version = "0.1", default-features = false, optional = true }
 dhat = { version = "0.3", optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
-# PostgreSQL logical-replication (`pgoutput`) parser. Backs the
-# `PgOutputParser` adapter in `src/wal/pgoutput.rs`. Default features
-# (`std`, `libpq`) are off so subql's `--no-default-features` build stays
-# `no_std + alloc` with no `tokio` and no native `libpq`. The `std`
-# feature below propagates `pg_walstream/std`; `pg-streaming` opts into
-# `pg_walstream/rustls-tls` for the pure-Rust replication client.
-pg_walstream = { version = "0.7", default-features = false }
+# PostgreSQL logical-replication decoder plus low-level parser.
+# Temporarily pinned to the `feat/pgoutput-decoder` branch of the
+# LucaCappelletti94 fork, which adds a connection-independent
+# `PgOutputDecoder` (pgoutput bytes to `ChangeEvent`) so subql can drop
+# its bespoke pgoutput parser. Repoint at a crates.io release once the
+# decoder lands upstream. Default features (`std`, `rustls-tls`) are off
+# so the base `--no-default-features` build stays `no_std + alloc` with
+# no `tokio`. The `std` feature below propagates `pg_walstream/std`, and
+# `pg-streaming` opts into `pg_walstream/rustls-tls` for the pure-Rust
+# replication client.
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder", default-features = false }
 
 # Optional diesel-backed Connector for the auto-resolving re-execution
 # engine. Off by default - the lib's no_std + alloc / wasm32 surface stays
@@ -254,13 +297,13 @@ diesel = { version = "2", optional = true }
 r2d2 = { version = "0.8", optional = true }
 
 
-# SQLite session-extension binary formats (changeset / patchset).
-# Backs the `SqliteChangesetParser` (bytes -> typed events) that ships
-# unconditionally alongside the wal-format parsers. `no_std + alloc`
-# posture, no C deps. `default-features = false` drops the reverse
-# adapters (`wal2json`/`debezium`/`maxwell`/`pg-walstream` build SQLite
-# changesets from PG CDC) which subql does not consume.
-sqlite-diff-rs = { version = "0.1.4", default-features = false }
+# SQLite session-extension binary formats (changeset / patchset) plus the
+# wal2json and Maxwell parsers subql implements `CdcEvent` on. Backs the
+# `SqliteChangesetParser` and the Postgres/MySQL JSON CDC paths. `no_std +
+# alloc` posture, no C deps (the `wal2json` and `maxwell` features pull only
+# serde). `default-features = false` drops the `diesel` and `pg-walstream`
+# reverse adapters, which the feature gates below opt into when needed.
+sqlite-diff-rs = { version = "0.5", default-features = false, features = ["wal2json", "maxwell"] }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables
@@ -296,7 +339,7 @@ async-lock = { version = "3", default-features = false }
 # `tokio-util` is what its `CancellationToken` lives in.
 tokio = { version = "1", optional = true, features = ["sync", "rt", "macros", "time"] }
 tokio-util = { version = "0.7", optional = true }
-bytes = { version = "1", optional = true }
+bytes = { version = "1", default-features = false }
 
 [dev-dependencies]
 # Benchmarking
@@ -448,7 +491,6 @@ pg-streaming = [
     "pg_walstream/rustls-tls",
     "dep:tokio",
     "dep:tokio-util",
-    "dep:bytes",
 ]
 
 # Opt-in: the live SqliteCdcSource that owns a diesel SqliteConnection
@@ -471,11 +513,11 @@ sqlite-cdc = [
 # `diesel-sqlite-session`), translates the caller's PG DDL to SQLite
 # DDL via `pg2sqlite`, applies it to the local database, and each poll
 # drains a fresh session `changeset()`, re-encodes each row change as
-# `pgoutput` wire bytes with `pg_walstream::encode_message`, and feeds
-# those bytes back through the production `PgOutputParser`. The emitted
-# events therefore look identical to what a real Postgres logical
-# replication stream would produce (`Backend = Postgres`,
-# `Event = PgOutputEvent`), which lets doctests and fuzz harnesses
+# `pgoutput` wire bytes (via `sqlite-diff-rs`, which tracks `pg_walstream`
+# 0.7), decodes them with the 0.8 `PgOutputDecoder`, and surfaces the
+# resulting `ChangeEvent` values. They look identical to a real Postgres
+# logical replication stream (`Backend = Postgres`), which lets doctests
+# and fuzz harnesses
 # exercise the pgoutput pipeline end-to-end without Docker. Distinct
 # from `sqlite-cdc` (which is the honest `Backend = SQLite` source).
 pg-sqlite-emu = [
@@ -484,9 +526,15 @@ pg-sqlite-emu = [
     "diesel?/sqlite",
     "dep:diesel-sqlite-session",
     "dep:pg2sqlite",
-    "dep:bytes",
     "sqlite-diff-rs/pg-walstream",
 ]
+
+# Opt-in: outbound patchset emission from pgoutput `ChangeEvent`s. Turns
+# on sqlite-diff-rs's pg-walstream digest surface so subql's pg_walstream
+# 0.8 events fold through `DiffSetBuilder::digest`. The wal2json and
+# Maxwell emission paths need no feature (their digest surface is
+# unconditional in `sqlite-diff-rs`), only the pg path does.
+pgoutput-emit = ["sqlite-diff-rs/pg-walstream"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]

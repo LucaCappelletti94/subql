@@ -7,7 +7,7 @@ use super::{
     partition::{ColumnProbe, TablePartition},
     predicate::{Predicate, PredicateStore},
 };
-use crate::backend::{Backend, CdcEvent, Presence, RowKind, ScalarKind, Value};
+use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use crate::runtime::indexes::IndexableCell;
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm},
@@ -16,6 +16,7 @@ use crate::{
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 use roaring::RoaringBitmap;
+use sql_traits::prelude::DatabaseLike;
 
 /// Consumer dictionary translating between ordinals and ConsumerIds.
 ///
@@ -204,23 +205,23 @@ fn resolve_ordinals<I: IdTypes>(
 /// * `Update` -> dual-eval (old + new), three-way split.
 /// * `Truncate` -> all row subscribers to `deleted`.
 ///
-/// `column_kinds` names the [`ScalarKind`] for each column of the target
-/// table, index-aligned with [`crate::ColumnId`]. The dispatcher uses it to
-/// route event scalar accessors correctly. Callers cache this per table
-/// (via [`crate::catalog_helpers::column_scalar_kind`]).
-pub fn dispatch_consumers<I, E>(
+/// `arity` is the target table's column count, used to bound index
+/// candidate selection.
+pub fn dispatch_consumers<I, E, DB>(
     event: &E,
     partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm<E::Backend>,
-    column_kinds: &[ScalarKind],
+    arity: usize,
+    db: &DB,
 ) -> Result<ConsumerNotifications<I, E::Checkpoint>, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
+    DB: DatabaseLike,
 {
     let (notifs, _) =
-        dispatch_consumers_with_stamps(event, partition, consumer_dict, vm, column_kinds)?;
+        dispatch_consumers_with_stamps(event, partition, consumer_dict, vm, arity, db)?;
     Ok(notifs)
 }
 
@@ -230,18 +231,20 @@ where
 /// Used by activity-aware eviction policies to stamp matched
 /// subscriptions in O(1) per matched pair via the `binding_lookup` index
 /// on `PredicateStore`.
-pub fn dispatch_consumers_with_stamps<I, E>(
+pub fn dispatch_consumers_with_stamps<I, E, DB>(
     event: &E,
     partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm<E::Backend>,
-    column_kinds: &[ScalarKind],
+    arity: usize,
+    db: &DB,
 ) -> Result<(ConsumerNotifications<I, E::Checkpoint>, Vec<SubscriptionId>), DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
+    DB: DatabaseLike,
 {
-    let checkpoint = event.checkpoint().cloned();
+    let checkpoint = event.checkpoint();
     let mut stamps: Vec<SubscriptionId> = Vec::new();
     let notifs: ConsumerNotifications<I, E::Checkpoint> = match event.kind() {
         EventKind::Truncate => {
@@ -254,7 +257,8 @@ where
                 RowKind::New,
                 partition,
                 vm,
-                column_kinds,
+                arity,
+                db,
                 &mut stamps,
             )?;
             ConsumerNotifications::from_parts(
@@ -269,7 +273,8 @@ where
                 RowKind::Old,
                 partition,
                 vm,
-                column_kinds,
+                arity,
+                db,
                 &mut stamps,
             )?;
             ConsumerNotifications::from_parts(
@@ -283,7 +288,8 @@ where
             partition,
             consumer_dict,
             vm,
-            column_kinds,
+            arity,
+            db,
             &mut stamps,
         )?,
     };
@@ -308,30 +314,32 @@ fn collect_stamps_for_predicate<I: IdTypes, B: Backend>(
 /// to produce view-relative `inserted` / `deleted` / `updated` sets.
 ///
 /// Callers whose source cannot provide a complete old row (Postgres
-/// REPLICA IDENTITY DEFAULT for example) will see `Presence::Missing` on
+/// REPLICA IDENTITY DEFAULT for example) will see `Value::Missing` on
 /// old-row accessors, causing the VM to return `Tri::Unknown`. Unknown
 /// verdicts collapse to "did not match" in this splitter — that is
 /// conservative-safe but may misclassify view membership. A future
 /// enhancement would surface the incompleteness through a
 /// `CdcEvent::has_complete_row` method and fall back to single-eval on
 /// the new row (matches to `updated`, matching pre-Phase-5 behaviour).
-fn dispatch_update_with_stamps<I, E>(
+fn dispatch_update_with_stamps<I, E, DB>(
     event: &E,
     partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm<E::Backend>,
-    column_kinds: &[ScalarKind],
+    arity: usize,
+    db: &DB,
     stamps: &mut Vec<SubscriptionId>,
 ) -> Result<ConsumerNotifications<I, E::Checkpoint>, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
+    DB: DatabaseLike,
 {
     let candidates = partition.select_candidates(
-        column_kinds.len(),
-        |col| probe_column_for_index(event, RowKind::New, col, column_kinds),
+        arity,
+        |col| probe_column_for_index(event, RowKind::New, col, arity, db),
         EventKind::Update,
-        event.changed_columns(),
+        &event.changed_columns(db),
     );
     let snapshot = partition.load_snapshot();
 
@@ -354,12 +362,12 @@ where
         }
 
         let new_match = vm
-            .eval(&pred.bytecode, event, RowKind::New)
+            .eval(&pred.bytecode, event, RowKind::New, db)
             .map_err(|e| DispatchError::VmError(format!("{e:?}")))?
             == Tri::True;
 
         let old_match = vm
-            .eval(&pred.bytecode, event, RowKind::Old)
+            .eval(&pred.bytecode, event, RowKind::Old, db)
             .map_err(|e| DispatchError::VmError(format!("{e:?}")))?
             == Tri::True;
 
@@ -392,23 +400,25 @@ where
 /// Single-eval dispatch: evaluate one row_kind, return the matching
 /// ordinals bitmap and accumulate matched subscription ids into `stamps`.
 /// Used for INSERT (New) and DELETE (Old).
-fn dispatch_single_eval_bitmap_with_stamps<I, E>(
+fn dispatch_single_eval_bitmap_with_stamps<I, E, DB>(
     event: &E,
     row: RowKind,
     partition: &TablePartition<I, E::Backend>,
     vm: &mut Vm<E::Backend>,
-    column_kinds: &[ScalarKind],
+    arity: usize,
+    db: &DB,
     stamps: &mut Vec<SubscriptionId>,
 ) -> Result<RoaringBitmap, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
+    DB: DatabaseLike,
 {
     let candidates = partition.select_candidates(
-        column_kinds.len(),
-        |col| probe_column_for_index(event, row, col, column_kinds),
+        arity,
+        |col| probe_column_for_index(event, row, col, arity, db),
         event.kind(),
-        event.changed_columns(),
+        &event.changed_columns(db),
     );
     let snapshot = partition.load_snapshot();
     let mut matching_ordinals = RoaringBitmap::new();
@@ -419,6 +429,7 @@ where
         event,
         row,
         vm,
+        db,
         |pred, consumers| {
             if matches!(pred.projection, QueryProjection::Rows) {
                 matching_ordinals |= consumers;
@@ -431,17 +442,19 @@ where
     Ok(matching_ordinals)
 }
 
-fn for_each_matching_predicate<I, E, F>(
+fn for_each_matching_predicate<I, E, F, DB>(
     candidates: &RoaringBitmap,
     store: &PredicateStore<I, E::Backend>,
     event: &E,
     row: RowKind,
     vm: &mut Vm<E::Backend>,
+    db: &DB,
     mut on_match: F,
 ) -> Result<(), DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
+    DB: DatabaseLike,
     F: FnMut(&Predicate<E::Backend>, &RoaringBitmap) -> Result<(), DispatchError>,
 {
     for pred_id_u32 in candidates {
@@ -454,7 +467,7 @@ where
         };
 
         let result = vm
-            .eval(&pred.bytecode, event, row)
+            .eval(&pred.bytecode, event, row, db)
             .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
 
         if result == Tri::True {
@@ -473,12 +486,15 @@ where
 /// * `Delete`   -> `[(-1, RowKind::Old)]`
 /// * `Update`   -> `[(-1, RowKind::Old), (+1, RowKind::New)]`
 /// * `Truncate` -> `Err(TruncateRequiresReset)`
-fn weighted_rows_for_agg<E: CdcEvent>(event: &E) -> Result<Vec<(i64, RowKind)>, DispatchError> {
+fn weighted_rows_for_agg<E: CdcEvent, DB: DatabaseLike>(
+    event: &E,
+    db: &DB,
+) -> Result<Vec<(i64, RowKind)>, DispatchError> {
     match event.kind() {
         EventKind::Insert => Ok(vec![(1, RowKind::New)]),
         EventKind::Delete => Ok(vec![(-1, RowKind::Old)]),
         EventKind::Update => Ok(vec![(-1, RowKind::Old), (1, RowKind::New)]),
-        EventKind::Truncate => Err(DispatchError::TruncateRequiresReset(event.table_id())),
+        EventKind::Truncate => Err(DispatchError::TruncateRequiresReset(event.table_id(db))),
     }
 }
 
@@ -492,18 +508,20 @@ fn weighted_rows_for_agg<E: CdcEvent>(event: &E) -> Result<Vec<(i64, RowKind)>, 
 /// The same user may appear multiple times in the result (once per
 /// aggregate kind).
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-pub(crate) fn compute_agg_deltas<I, E>(
+pub(crate) fn compute_agg_deltas<I, E, DB>(
     event: &E,
     partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm<E::Backend>,
-    column_kinds: &[ScalarKind],
+    arity: usize,
+    db: &DB,
 ) -> Result<Vec<(I::ConsumerId, AggDelta)>, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
+    DB: DatabaseLike,
 {
-    let weighted_rows = weighted_rows_for_agg(event)?;
+    let weighted_rows = weighted_rows_for_agg(event, db)?;
 
     // Separate accumulators for each aggregate kind (avoids mixed-type confusion).
     let mut count_weights: HashMap<ConsumerOrdinal, i64> = HashMap::new();
@@ -517,12 +535,12 @@ where
 
     // For UPDATE, use dependency-aware candidate selection; for INSERT /
     // DELETE pass empty changed_cols to get all agg candidates.
-    let changed_cols: &[crate::ColumnId] = if event.kind() == EventKind::Update {
-        event.changed_columns()
+    let changed_cols: Vec<crate::ColumnId> = if event.kind() == EventKind::Update {
+        event.changed_columns(db)
     } else {
-        &[]
+        Vec::new()
     };
-    let candidates = partition.select_agg_candidates(event.kind(), changed_cols);
+    let candidates = partition.select_agg_candidates(event.kind(), &changed_cols);
 
     for (weight, row) in weighted_rows {
         for_each_matching_predicate(
@@ -531,13 +549,14 @@ where
             event,
             row,
             vm,
+            db,
             |pred, consumers| {
                 let QueryProjection::Aggregate(spec) = &pred.projection else {
                     return Ok(());
                 };
 
                 let Some(delta) = agg_delta_for_row(spec, weight, |col| {
-                    probe_column_for_agg(event, row, col, column_kinds)
+                    probe_column_for_agg(event, row, col, arity, db)
                 }) else {
                     return Ok(());
                 };
@@ -629,122 +648,68 @@ where
 /// Probe column `col` at the `row` view of `event` for the equality /
 /// range / null indexes tracked by [`TablePartition::select_candidates`].
 ///
-/// Dispatches on the pre-cached [`ScalarKind`] to the matching typed
-/// accessor. Values whose scalar payload downcasts to one of the four
-/// indexable primitives (`bool` / `i64` / `f64` / `String`) become
-/// [`IndexableCell`] variants; every other scalar returns
+/// Values whose scalar payload downcasts to one of the four indexable
+/// primitives (`bool` / `i64` / `f64` / `String`) become
+/// [`IndexableCell`] variants. Every other scalar returns
 /// [`ColumnProbe::present`] with `value: None`, causing the caller to
 /// consult only the fallback index for that column.
-fn probe_column_for_index<E: CdcEvent>(
+fn probe_column_for_index<E: CdcEvent, DB: DatabaseLike>(
     event: &E,
     row: RowKind,
     col: crate::ColumnId,
-    column_kinds: &[ScalarKind],
+    arity: usize,
+    db: &DB,
 ) -> ColumnProbe {
-    let Some(&kind) = column_kinds.get(col as usize) else {
+    if col as usize >= arity {
         return ColumnProbe::missing();
-    };
-    match kind {
-        ScalarKind::Bool => lift_present(event.bool_at(row, col), |v| {
-            IndexableCell::from_value::<E::Backend>(&Value::Bool(v.clone()))
-        }),
-        ScalarKind::Int => lift_present(event.int_at(row, col), |v| {
-            IndexableCell::from_value::<E::Backend>(&Value::Int(v.clone()))
-        }),
-        ScalarKind::Float => lift_present(event.float_at(row, col), |v| {
-            IndexableCell::from_value::<E::Backend>(&Value::Float(v.clone()))
-        }),
-        ScalarKind::String => lift_present(event.string_at(row, col), |v| {
-            IndexableCell::from_value::<E::Backend>(&Value::String(v.clone()))
-        }),
-        ScalarKind::Bytes => lift_present(event.bytes_at(row, col), |_| None),
-        ScalarKind::Uuid => lift_present(event.uuid_at(row, col), |_| None),
-        ScalarKind::Timestamp => lift_present(event.timestamp_at(row, col), |_| None),
-        ScalarKind::TimestampTz => lift_present(event.timestamp_tz_at(row, col), |_| None),
-        ScalarKind::Date => lift_present(event.date_at(row, col), |_| None),
-        ScalarKind::Time => lift_present(event.time_at(row, col), |_| None),
-        ScalarKind::Decimal => lift_present(event.decimal_at(row, col), |_| None),
-        ScalarKind::Json => lift_present(event.json_at(row, col), |_| None),
-        ScalarKind::Jsonb => lift_present(event.jsonb_at(row, col), |_| None),
     }
-}
-
-/// Lift a `Presence<&T>` into a [`ColumnProbe`] via a caller-supplied
-/// indexable-payload extractor.
-#[inline]
-fn lift_present<T, F>(presence: Presence<&T>, extract: F) -> ColumnProbe
-where
-    F: FnOnce(&T) -> Option<IndexableCell>,
-{
-    match presence {
-        Presence::Missing => ColumnProbe::missing(),
-        Presence::Null => ColumnProbe::null(),
-        Presence::Present(v) => ColumnProbe::present(extract(v)),
+    match event.value_at(db, row, col) {
+        Value::Missing => ColumnProbe::missing(),
+        Value::Null => ColumnProbe::null(),
+        v => ColumnProbe::present(IndexableCell::from_value::<E::Backend>(&v)),
     }
 }
 
 /// Probe column `col` at the `row` view of `event` for aggregate delta
 /// computation.
 ///
-/// Dispatches on the pre-cached [`ScalarKind`] and downcasts the scalar
-/// payload to `f64` when the column carries a numeric type
-/// ([`ScalarKind::Int`] or [`ScalarKind::Float`]). Every other scalar is
+/// Downcasts the scalar payload to `f64` when the column carries a
+/// numeric type (`Value::Int` or `Value::Float`). Every other scalar is
 /// reported as [`AggCellRead::NonNumeric`] when present.
-fn probe_column_for_agg<E: CdcEvent>(
+fn probe_column_for_agg<E: CdcEvent, DB: DatabaseLike>(
     event: &E,
     row: RowKind,
     col: crate::ColumnId,
-    column_kinds: &[ScalarKind],
+    arity: usize,
+    db: &DB,
 ) -> AggCellRead {
     use core::any::Any;
-    let Some(&kind) = column_kinds.get(col as usize) else {
+    if col as usize >= arity {
         return AggCellRead::Missing;
-    };
-    match kind {
-        ScalarKind::Int => match event.int_at(row, col) {
-            Presence::Missing => AggCellRead::Missing,
-            Presence::Null => AggCellRead::Null,
-            Presence::Present(v) => (v as &dyn Any).downcast_ref::<i64>().map_or(
-                AggCellRead::NonNumeric,
-                #[allow(clippy::cast_precision_loss)]
-                |i| AggCellRead::Numeric(*i as f64),
-            ),
-        },
-        ScalarKind::Float => match event.float_at(row, col) {
-            Presence::Missing => AggCellRead::Missing,
-            Presence::Null => AggCellRead::Null,
-            Presence::Present(v) => {
-                (v as &dyn Any)
-                    .downcast_ref::<f64>()
-                    .map_or(AggCellRead::NonNumeric, |f| {
-                        if f.is_finite() {
-                            AggCellRead::Numeric(*f)
-                        } else {
-                            AggCellRead::NonNumeric
-                        }
-                    })
-            }
-        },
-        ScalarKind::Bool => presence_only(event.bool_at(row, col)),
-        ScalarKind::String => presence_only(event.string_at(row, col)),
-        ScalarKind::Bytes => presence_only(event.bytes_at(row, col)),
-        ScalarKind::Uuid => presence_only(event.uuid_at(row, col)),
-        ScalarKind::Timestamp => presence_only(event.timestamp_at(row, col)),
-        ScalarKind::TimestampTz => presence_only(event.timestamp_tz_at(row, col)),
-        ScalarKind::Date => presence_only(event.date_at(row, col)),
-        ScalarKind::Time => presence_only(event.time_at(row, col)),
-        ScalarKind::Decimal => presence_only(event.decimal_at(row, col)),
-        ScalarKind::Json => presence_only(event.json_at(row, col)),
-        ScalarKind::Jsonb => presence_only(event.jsonb_at(row, col)),
     }
-}
-
-#[inline]
-const fn presence_only<T>(presence: Presence<&T>) -> AggCellRead {
-    match presence {
-        Presence::Missing => AggCellRead::Missing,
-        Presence::Null => AggCellRead::Null,
-        Presence::Present(_) => AggCellRead::NonNumeric,
+    match &event.value_at(db, row, col) {
+        Value::Missing => AggCellRead::Missing,
+        Value::Null => AggCellRead::Null,
+        Value::Int(i) => {
+            (i as &dyn Any)
+                .downcast_ref::<i64>()
+                .map_or(AggCellRead::NonNumeric, |i64_ref| {
+                    #[allow(clippy::cast_precision_loss)]
+                    AggCellRead::Numeric(*i64_ref as f64)
+                })
+        }
+        Value::Float(f) => {
+            (f as &dyn Any)
+                .downcast_ref::<f64>()
+                .map_or(AggCellRead::NonNumeric, |f64_ref| {
+                    if f64_ref.is_finite() {
+                        AggCellRead::Numeric(*f64_ref)
+                    } else {
+                        AggCellRead::NonNumeric
+                    }
+                })
+        }
+        _ => AggCellRead::NonNumeric,
     }
 }
 

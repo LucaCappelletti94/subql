@@ -779,13 +779,16 @@ where
                     column: col_name,
                 }
             })?;
-            let kind = crate::catalog_helpers::column_scalar_kind(database, table_id, col_id)
-                .ok_or_else(|| {
+            // Reject a column whose declared type the runtime decoder cannot
+            // resolve against the catalog (an unsupported SQL type).
+            crate::catalog_helpers::column_scalar_kind(database, table_id, col_id).ok_or_else(
+                || {
                     RegisterError::UnsupportedSql(format!(
                         "Column {col_id} of table {table_id} has an unsupported SQL type for the compiler"
                     ))
-                })?;
-            out.push(Instruction::LoadColumn(col_id, kind));
+                },
+            )?;
+            out.push(Instruction::LoadColumn(col_id));
         }
 
         // ====================================================================

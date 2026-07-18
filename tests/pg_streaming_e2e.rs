@@ -208,7 +208,7 @@ fn ack_advances_confirmed_flush_lsn() {
                 .expect("next_event err")
                 .expect("source closed");
             assert_eq!(ev.kind(), EventKind::Insert);
-            last_lsn = *ev.checkpoint().expect("XLogData carries an LSN");
+            last_lsn = ev.checkpoint().expect("XLogData carries an LSN");
         }
         assert!(
             last_lsn.0 > 0,
@@ -431,6 +431,7 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
         // Drain all N events. If the inner task drops events under
         // back-pressure, fewer than N arrive. If ordering is broken,
         // the observed ids won't be 1..=N.
+        let schema = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
         let mut observed_ids = Vec::with_capacity(N as usize);
         for _ in 0..N {
             let ev = tokio::time::timeout(Duration::from_secs(5), source.next_event())
@@ -439,8 +440,8 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
                 .expect("next_event err")
                 .expect("source closed");
             assert_eq!(ev.kind(), EventKind::Insert);
-            let id = match ev.int_at(subql::backend::RowKind::New, 0) {
-                subql::backend::Presence::Present(v) => *v,
+            let id = match ev.value_at(&schema, subql::backend::RowKind::New, 0) {
+                subql::backend::Value::Int(v) => v,
                 other => panic!("expected int id, got {other:?}"),
             };
             observed_ids.push(id);

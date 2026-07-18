@@ -4,7 +4,7 @@ use alloc::string::String;
 
 use diesel_sqlite_session::SessionError;
 
-use crate::wal::WalParseError;
+use pg_walstream::error::ReplicationError;
 
 /// Everything a `PgSqliteEmuSource` can fail with.
 ///
@@ -29,10 +29,10 @@ pub enum PgSqliteEmuError {
     /// The changeset bytes emitted by SQLite did not parse.
     #[error("changeset parse: {0}")]
     Changeset(#[from] sqlite_diff_rs::ParseError),
-    /// The pgoutput frames re-encoded from a changeset did not parse
-    /// back through `PgOutputParser`.
-    #[error("pgoutput parse: {0}")]
-    PgOutput(#[from] WalParseError),
+    /// The re-encoded pgoutput frames failed to decode back into a
+    /// `ChangeEvent` through the `PgOutputDecoder`.
+    #[error("pgoutput decode: {0}")]
+    PgOutput(#[from] ReplicationError),
     /// The changeset referenced a table the emulator's PG catalog does
     /// not know about. Fires when the caller ran DDL directly against
     /// the underlying `SqliteConnection` instead of routing it through

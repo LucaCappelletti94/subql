@@ -274,7 +274,6 @@ where
         let runtime = QueryRuntime::Partial(MinMaxQuery::new(
             kind,
             agg_column,
-            agg_kind,
             where_program,
             dependency_columns,
             Value::Null,
@@ -420,9 +419,11 @@ where
             // partition; there are no per-consumer notifications, but
             // the re-execution queries still need to run.
             Err(DispatchError::UnknownTableId(_))
-                if self.table_deps.contains_key(&event.table_id()) =>
+                if self
+                    .table_deps
+                    .contains_key(&event.table_id(self.inner.database())) =>
             {
-                ConsumerNotifications::empty().with_checkpoint(event.checkpoint().cloned())
+                ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
             }
             Err(e) => return Err(e),
         };
@@ -447,14 +448,18 @@ where
         Vec<ReExecutionTrigger<I, E::Checkpoint>>,
     ) {
         // Snapshot affected ids before borrowing `reexec` / `vm` mutably.
-        let query_ids: Vec<ReExecQueryId> = match self.table_deps.get(&event.table_id()) {
+        let table_id = event.table_id(self.inner.database());
+        let query_ids: Vec<ReExecQueryId> = match self.table_deps.get(&table_id) {
             Some(ids) => ids.iter().copied().collect(),
             None => return (Vec::new(), Vec::new()),
         };
 
         // Split-borrow disjoint fields so `on_event` can take `&mut vm`
-        // while we mutate `reexec`.
-        let Self { reexec, vm, .. } = self;
+        // and the catalog while we mutate `reexec`.
+        let Self {
+            reexec, vm, inner, ..
+        } = self;
+        let database = inner.database();
 
         let mut scalar_updates = Vec::new();
         let mut triggers = Vec::new();
@@ -466,7 +471,7 @@ where
             // UPDATE that changes no column the query depends on can't
             // affect it: skip without running the machine.
             if event.kind() == EventKind::Update {
-                let changed = event.changed_columns();
+                let changed = event.changed_columns(database);
                 if !changed.is_empty()
                     && !changed
                         .iter()
@@ -477,8 +482,8 @@ where
             }
 
             let consumer_id = entry.consumer_id;
-            let checkpoint = event.checkpoint().cloned();
-            match entry.runtime.on_event(event, vm) {
+            let checkpoint = event.checkpoint();
+            match entry.runtime.on_event(event, vm, database) {
                 Maintenance::Unchanged => {}
                 Maintenance::Updated(value) => {
                     scalar_updates.push(ScalarUpdate {

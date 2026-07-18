@@ -2,13 +2,12 @@
 //! shard, dispatching a matching event on the restored table must
 //! surface the restored subscription.
 //!
-//! The bug: `load_shard` restored the partition + consumer dictionary,
-//! but skipped `ensure_column_kinds_cached`, which normally fires on
-//! `register()`. Without the per-table `ScalarKind` cache the dispatch
-//! path took `arity = 0`, evaluated only the fallback bitmap, and
-//! silently dropped every predicate whose `IndexableAtom`s were
-//! equality or range (i.e. anything the prefilter could actually
-//! index). Fixed by populating the cache from `load_shard`.
+//! Historically `load_shard` restored the partition and consumer
+//! dictionary but skipped seeding the per-table column arity dispatch
+//! relied on, so a restored range predicate saw `arity = 0`, evaluated
+//! only the fallback bitmap, and was silently dropped. Dispatch now
+//! derives arity from the catalog on every call, so a restore cannot
+//! desync it. This test guards that behavior end to end.
 #![cfg(feature = "std")]
 #![allow(clippy::unwrap_used)]
 

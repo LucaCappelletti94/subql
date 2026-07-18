@@ -11,28 +11,24 @@
 
 use alloc::vec::Vec;
 
-use crate::backend::{Backend, CdcEvent, Presence, RowKind, Value};
+use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use crate::checkpoint::NoCheckpoint;
 use crate::{ColumnId, EventKind, TableId};
+use sql_traits::prelude::DatabaseLike;
 
 /// Concrete [`CdcEvent`] fixture for tests.
 ///
 /// Fields are public so tests can mutate individual row images without
-/// going through the builder API. The scalar accessors dispatch on the
-/// requested [`RowKind`] and return the matching scalar variant.
+/// going through the builder API. [`value_at`](CdcEvent::value_at) reads
+/// the requested [`RowKind`] and returns the stored [`Value`].
 ///
 /// # Semantics
 ///
-/// * Column index out of range for the requested view returns
-///   [`Presence::Missing`].
-/// * [`Value::Missing`] at that index returns [`Presence::Missing`].
-/// * [`Value::Null`] at that index returns [`Presence::Null`].
-/// * Wrong scalar variant vs. accessor returns [`Presence::Missing`].
-///   In a real event this would be a compiler bug. In a test it means
-///   the fixture and the compiled program disagree on a column's
-///   scalar shape.
+/// * A column index out of range for the requested view returns
+///   [`Value::Missing`].
+/// * A stored [`Value::Missing`] or [`Value::Null`] returns itself.
 /// * [`RowKind::Pk`] on a `col` not listed in `pk_columns` returns
-///   [`Presence::Missing`], matching the design contract.
+///   [`Value::Missing`], matching the design contract.
 #[derive(Clone, Debug)]
 pub struct TestEvent<B: Backend> {
     /// Event kind ([`EventKind::Insert`], [`EventKind::Update`],
@@ -150,20 +146,6 @@ impl<B: Backend> TestEvent<B> {
         }
         self.read_view(row).get(col as usize)
     }
-
-    fn read<T>(
-        &self,
-        row: RowKind,
-        col: ColumnId,
-        extract: impl FnOnce(&Value<B>) -> Option<&T>,
-    ) -> Presence<&T> {
-        match self.cell(row, col) {
-            None => Presence::Missing,
-            Some(Value::Missing) => Presence::Missing,
-            Some(Value::Null) => Presence::Null,
-            Some(v) => extract(v).map_or(Presence::Missing, Presence::Present),
-        }
-    }
 }
 
 impl<B: Backend> CdcEvent for TestEvent<B> {
@@ -173,95 +155,25 @@ impl<B: Backend> CdcEvent for TestEvent<B> {
     fn kind(&self) -> EventKind {
         self.kind
     }
-    fn table_id(&self) -> TableId {
+    fn table_id<DB: DatabaseLike>(&self, _db: &DB) -> TableId {
         self.table_id
     }
-    fn checkpoint(&self) -> Option<&NoCheckpoint> {
+    fn checkpoint(&self) -> Option<NoCheckpoint> {
         None
     }
-    fn pk_columns(&self) -> &[ColumnId] {
-        &self.pk_columns
+    fn pk_columns<DB: DatabaseLike>(&self, _db: &DB) -> Vec<ColumnId> {
+        self.pk_columns.clone()
     }
-    fn changed_columns(&self) -> &[ColumnId] {
-        &self.changed_columns
+    fn changed_columns<DB: DatabaseLike>(&self, _db: &DB) -> Vec<ColumnId> {
+        self.changed_columns.clone()
     }
 
-    fn bool_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Bool> {
-        self.read(row, col, |v| match v {
-            Value::Bool(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn int_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Int> {
-        self.read(row, col, |v| match v {
-            Value::Int(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn float_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Float> {
-        self.read(row, col, |v| match v {
-            Value::Float(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn string_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::String> {
-        self.read(row, col, |v| match v {
-            Value::String(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn bytes_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Bytes> {
-        self.read(row, col, |v| match v {
-            Value::Bytes(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn uuid_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Uuid> {
-        self.read(row, col, |v| match v {
-            Value::Uuid(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn timestamp_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Timestamp> {
-        self.read(row, col, |v| match v {
-            Value::Timestamp(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn timestamp_tz_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::TimestampTz> {
-        self.read(row, col, |v| match v {
-            Value::TimestampTz(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn date_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Date> {
-        self.read(row, col, |v| match v {
-            Value::Date(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn time_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Time> {
-        self.read(row, col, |v| match v {
-            Value::Time(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn decimal_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Decimal> {
-        self.read(row, col, |v| match v {
-            Value::Decimal(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn json_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Json> {
-        self.read(row, col, |v| match v {
-            Value::Json(x) => Some(x),
-            _ => None,
-        })
-    }
-    fn jsonb_at(&self, row: RowKind, col: ColumnId) -> Presence<&B::Jsonb> {
-        self.read(row, col, |v| match v {
-            Value::Jsonb(x) => Some(x),
-            _ => None,
-        })
+    fn value_at<DB: DatabaseLike>(
+        &self,
+        _db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Value<Self::Backend> {
+        self.cell(row, col).cloned().unwrap_or(Value::Missing)
     }
 }

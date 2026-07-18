@@ -16,15 +16,15 @@
 //! trait-level invariant that `Backend::Int` and `Backend::Float` are
 //! independent Rust types with independent arithmetic surfaces.
 
-use crate::backend::{Backend, ScalarKind, Value};
+use crate::backend::{Backend, Value};
 use crate::types::ColumnId;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// VM instruction for tri-state predicate evaluation.
 ///
-/// Parameterised on the observed [`Backend`] so that `PushLiteral`,
-/// `LoadColumn`, and `In` carry backend-typed payloads. Every other variant
+/// Parameterised on the observed [`Backend`] so that `PushLiteral` and
+/// `In` carry backend-typed payloads. Every other variant
 /// is backend-agnostic but shares the type parameter for uniform storage.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -39,13 +39,12 @@ pub enum Instruction<B: Backend> {
 
     /// Read a cell from the current CDC event and push it onto the stack.
     ///
-    /// The [`ScalarKind`] tag names which typed accessor on
-    /// [`crate::backend::CdcEvent`] to call (`bool_at`, `int_at`, ...). The
-    /// VM lifts the returned `Presence<&B::T>` into `Value::Missing`,
-    /// `Value::Null`, or `Value::T(v.clone())` respectively.
+    /// The VM reads the cell through
+    /// [`CdcEvent::value_at`](crate::backend::CdcEvent::value_at), which
+    /// decodes it against the catalog and returns an owned [`Value`].
     ///
     /// Stack: `[...] -> [..., Value]`.
-    LoadColumn(ColumnId, ScalarKind),
+    LoadColumn(ColumnId),
 
     // ========================================================================
     // Comparison Operators (pop 2 values, push Tri)
@@ -255,7 +254,7 @@ impl<B: Backend> BytecodeProgram<B> {
         let mut cols: Vec<ColumnId> = instructions
             .iter()
             .filter_map(|inst| {
-                if let Instruction::LoadColumn(col_id, _) = inst {
+                if let Instruction::LoadColumn(col_id) = inst {
                     Some(*col_id)
                 } else {
                     None
@@ -276,58 +275,6 @@ impl<B: Backend> BytecodeProgram<B> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::Postgres;
-
-    #[test]
-    fn test_extract_dependencies() {
-        // age > 18 AND status = 'active'
-        let instructions: Vec<Instruction<Postgres>> = vec![
-            Instruction::LoadColumn(5, ScalarKind::Int), // age
-            Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
-            Instruction::LoadColumn(7, ScalarKind::String), // status
-            Instruction::PushLiteral(Value::String("active".into())),
-            Instruction::Equal,
-            Instruction::And,
-        ];
-
-        let program = BytecodeProgram::new(instructions);
-        assert_eq!(program.dependency_columns, vec![5, 7]);
-        assert!(!program.is_constant());
-    }
-
-    #[test]
-    fn test_constant_program() {
-        // Just a literal true (e.g., WHERE true)
-        let instructions: Vec<Instruction<Postgres>> =
-            vec![Instruction::PushLiteral(Value::Bool(true))];
-
-        let program = BytecodeProgram::new(instructions);
-        assert_eq!(program.dependency_columns, Vec::<ColumnId>::new());
-        assert!(program.is_constant());
-    }
-
-    #[test]
-    fn test_dependency_deduplication() {
-        // age > 18 AND age < 65 (age used twice)
-        let instructions: Vec<Instruction<Postgres>> = vec![
-            Instruction::LoadColumn(5, ScalarKind::Int),
-            Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
-            Instruction::LoadColumn(5, ScalarKind::Int), // Same column again
-            Instruction::PushLiteral(Value::Int(65)),
-            Instruction::LessThan,
-            Instruction::And,
-        ];
-
-        let program = BytecodeProgram::new(instructions);
-        assert_eq!(program.dependency_columns, vec![5]); // Deduplicated
-    }
-}
-
 // Manual `Clone` / `Debug` / `PartialEq` impls on `Instruction<B>` and
 // `BytecodeProgram<B>` — `#[derive(...)]` would infer `B: Clone` etc.,
 // which is not implied by `Backend`. See the matching hand-impls on
@@ -337,7 +284,7 @@ impl<B: Backend> Clone for Instruction<B> {
     fn clone(&self) -> Self {
         match self {
             Self::PushLiteral(v) => Self::PushLiteral(v.clone()),
-            Self::LoadColumn(col, kind) => Self::LoadColumn(*col, *kind),
+            Self::LoadColumn(col) => Self::LoadColumn(*col),
             Self::Equal => Self::Equal,
             Self::NotEqual => Self::NotEqual,
             Self::LessThan => Self::LessThan,
@@ -370,9 +317,7 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::PushLiteral(v) => f.debug_tuple("PushLiteral").field(v).finish(),
-            Self::LoadColumn(col, kind) => {
-                f.debug_tuple("LoadColumn").field(col).field(kind).finish()
-            }
+            Self::LoadColumn(col) => f.debug_tuple("LoadColumn").field(col).finish(),
             Self::Equal => f.write_str("Equal"),
             Self::NotEqual => f.write_str("NotEqual"),
             Self::LessThan => f.write_str("LessThan"),
@@ -406,7 +351,7 @@ impl<B: Backend> PartialEq for Instruction<B> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::PushLiteral(a), Self::PushLiteral(b)) => a == b,
-            (Self::LoadColumn(ac, ak), Self::LoadColumn(bc, bk)) => ac == bc && ak == bk,
+            (Self::LoadColumn(ac), Self::LoadColumn(bc)) => ac == bc,
             (Self::Equal, Self::Equal)
             | (Self::NotEqual, Self::NotEqual)
             | (Self::LessThan, Self::LessThan)
@@ -456,5 +401,56 @@ impl<B: Backend> PartialEq for BytecodeProgram<B> {
     fn eq(&self, other: &Self) -> bool {
         self.instructions == other.instructions
             && self.dependency_columns == other.dependency_columns
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Postgres;
+
+    #[test]
+    fn test_extract_dependencies() {
+        // age > 18 AND status = 'active'
+        let instructions: Vec<Instruction<Postgres>> = vec![
+            Instruction::LoadColumn(5), // age
+            Instruction::PushLiteral(Value::Int(18)),
+            Instruction::GreaterThan,
+            Instruction::LoadColumn(7), // status
+            Instruction::PushLiteral(Value::String("active".into())),
+            Instruction::Equal,
+            Instruction::And,
+        ];
+
+        let program = BytecodeProgram::new(instructions);
+        assert_eq!(program.dependency_columns, vec![5, 7]);
+        assert!(!program.is_constant());
+    }
+
+    #[test]
+    fn test_constant_program() {
+        // Just a literal true (e.g., WHERE true)
+        let instructions: Vec<Instruction<Postgres>> =
+            vec![Instruction::PushLiteral(Value::Bool(true))];
+
+        let program = BytecodeProgram::new(instructions);
+        assert_eq!(program.dependency_columns, Vec::<ColumnId>::new());
+        assert!(program.is_constant());
+    }
+
+    #[test]
+    fn test_dependency_deduplication() {
+        // age > 18 AND age < 65 (age used twice)
+        let instructions: Vec<Instruction<Postgres>> = vec![
+            Instruction::LoadColumn(5),
+            Instruction::PushLiteral(Value::Int(18)),
+            Instruction::GreaterThan,
+            Instruction::LoadColumn(5), // Same column again
+            Instruction::PushLiteral(Value::Int(65)),
+            Instruction::LessThan,
+            Instruction::And,
+        ];
+
+        let program = BytecodeProgram::new(instructions);
+        assert_eq!(program.dependency_columns, vec![5]); // Deduplicated
     }
 }

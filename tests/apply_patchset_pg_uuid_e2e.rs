@@ -38,7 +38,7 @@ use sqlite_diff_rs::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::patchset::PgAdapter;
-use subql::{DefaultIds, PgOutputEvent, SubscriptionEngine};
+use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
 use uuid::Uuid;
 
 const DDL: &str = "CREATE TABLE things (id UUID PRIMARY KEY, name TEXT);";
@@ -66,7 +66,7 @@ fn apply_patchset_uuid_blob_and_text_roundtrip() {
     sql_query(PG_DDL).execute(&mut conn).expect("create table");
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse subql DDL");
-    let engine: SubscriptionEngine<PgOutputEvent, DefaultIds, ParserDB> =
+    let engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     let adapter = PgAdapter::new(engine.database());
 
@@ -180,7 +180,7 @@ fn apply_patchset_uuid_integer_wire_is_refused_and_transaction_rolls_back() {
     sql_query(PG_DDL).execute(&mut conn).expect("create table");
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse subql DDL");
-    let engine: SubscriptionEngine<PgOutputEvent, DefaultIds, ParserDB> =
+    let engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     let adapter = PgAdapter::new(engine.database());
 

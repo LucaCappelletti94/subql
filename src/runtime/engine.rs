@@ -8,7 +8,7 @@ use super::{
     partition::TablePartition,
     predicate::{Predicate, SubscriptionBinding},
 };
-use crate::backend::{Backend, CdcEvent, Presence, RowKind, ScalarKind, Value};
+use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::{
     catalog_helpers,
@@ -150,28 +150,11 @@ thread_local! {
     // `table_id` from a different thread under cargo's parallel runner.
     static INJECT_BATCH_PHASE3_PARTITION_DROP_TABLES: std::cell::RefCell<HashSet<TableId>> =
         std::cell::RefCell::new(HashSet::new());
-    static INJECT_COMPILE_HASH_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, u128>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 #[cfg(test)]
 fn injected_parent_dir_sync_failure_dirs() -> &'static Mutex<HashSet<PathBuf>> {
     INJECT_PARENT_DIR_SYNC_FAILURE_DIRS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-#[cfg(test)]
-fn with_injected_compile_hash_overrides<R>(
-    f: impl FnOnce(&mut std::collections::HashMap<String, u128>) -> R,
-) -> R {
-    INJECT_COMPILE_HASH_OVERRIDES.with(|cell| {
-        let mut map = cell.borrow_mut();
-        f(&mut map)
-    })
-}
-
-#[cfg(test)]
-fn injected_compile_hash_override(normalized: &str) -> Option<u128> {
-    INJECT_COMPILE_HASH_OVERRIDES.with(|cell| cell.borrow().get(normalized).copied())
 }
 
 #[cfg(feature = "std")]
@@ -197,10 +180,6 @@ where
     database: DB,
     /// Table partitions (TableId -> TablePartition).
     partitions: HashMap<TableId, TablePartition<I, E::Backend>>,
-    /// Per-table [`ScalarKind`] cache, index-aligned with [`crate::ColumnId`].
-    /// Populated when a subscription first targets a table so dispatch
-    /// can route event scalar accessors without re-querying the catalog.
-    column_kinds: HashMap<TableId, Arc<[ScalarKind]>>,
     /// User dictionaries (TableId -> ConsumerDictionary).
     consumer_dictionaries: HashMap<TableId, ConsumerDictionary<I>>,
     /// Subscription index for O(1) unregister / upsert lookup.
@@ -325,8 +304,6 @@ where
         // kind must map to distinct predicates.
         let hash_input = crate::compiler::parser::projection_hash_input(&normalized, &projection);
         let hash = canonicalize::hash_sql(&hash_input);
-        #[cfg(test)]
-        let hash = injected_compile_hash_override(&normalized).unwrap_or(hash);
 
         Ok(CompiledSpec {
             spec,
@@ -503,7 +480,6 @@ where
             dialect,
             database,
             partitions: HashMap::new(),
-            column_kinds: HashMap::new(),
             consumer_dictionaries: HashMap::new(),
             subscription_to_table: HashMap::new(),
             next_subscription_id: 1,
@@ -526,30 +502,6 @@ where
             resume_cursors: HashMap::new(),
             pk_follows: HashMap::new(),
         }
-    }
-
-    /// Populate [`Self::column_kinds`] for `table_id` if not already
-    /// cached. The cache is index-aligned with [`crate::ColumnId`] and
-    /// records each column's [`ScalarKind`] so dispatch routes typed
-    /// scalar accessors without re-querying the catalog. Columns whose
-    /// declared type does not map to a supported scalar fall back to
-    /// [`ScalarKind::String`], which routes to the string accessor;
-    /// events with mismatched wire shapes surface as `Presence::Missing`
-    /// and dispatch falls through to the fallback predicate set.
-    fn ensure_column_kinds_cached(&mut self, table_id: TableId) {
-        if self.column_kinds.contains_key(&table_id) {
-            return;
-        }
-        let arity = catalog_helpers::table_arity(&self.database, table_id).unwrap_or(0);
-        let kinds: Vec<ScalarKind> = (0..arity)
-            .map(|i| {
-                #[allow(clippy::cast_possible_truncation)]
-                let col: crate::ColumnId = i as crate::ColumnId;
-                catalog_helpers::column_scalar_kind(&self.database, table_id, col)
-                    .unwrap_or(ScalarKind::String)
-            })
-            .collect();
-        self.column_kinds.insert(table_id, Arc::from(kinds));
     }
 
     /// Configure a maximum number of live subscriptions and the built-in
@@ -775,13 +727,6 @@ where
         // 3. Auto-assign a new subscription ID.
         let subscription_id = self.next_subscription_id;
         self.next_subscription_id += 1;
-
-        // Populate the per-table `ScalarKind` cache on first sight of this
-        // table. Dispatch relies on this cache to route event scalar
-        // accessors; without it, indexable predicates that need a column
-        // probe (e.g. range predicates on typed columns) are silently
-        // skipped in favor of the fallback set only.
-        self.ensure_column_kinds_cached(table_id);
 
         // 4. Get/create table partition and consumer dictionary
         let partition = self
@@ -1185,11 +1130,6 @@ where
             self.next_subscription_id += 1;
 
             let natural_key = (c.spec.consumer_id, c.hash, c.spec.scope);
-
-            // Populate the per-table `ScalarKind` cache on first sight of
-            // this table (batch register path). Mirrors the single-register
-            // path above.
-            self.ensure_column_kinds_cached(c.table_id);
 
             let partition = self
                 .partitions
@@ -1740,12 +1680,12 @@ where
         // subscription affects nobody: report empty rather than
         // erroring. Reserve `UnknownTableId` for ids not in the schema
         // at all (genuine drift or a caller bug).
-        if !self.partitions.contains_key(&event.table_id()) {
-            return if self.table_in_catalog(event.table_id()) {
-                Ok(crate::ConsumerNotifications::empty()
-                    .with_checkpoint(event.checkpoint().cloned()))
+        let table_id = event.table_id(&self.database);
+        if !self.partitions.contains_key(&table_id) {
+            return if self.table_in_catalog(table_id) {
+                Ok(crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint()))
             } else {
-                Err(DispatchError::UnknownTableId(event.table_id()))
+                Err(DispatchError::UnknownTableId(table_id))
             };
         }
 
@@ -1755,17 +1695,10 @@ where
         // vector.
         let needs_stamps = self.eviction_strategy.needs_activity_tracking();
 
-        let column_kinds = self
-            .column_kinds
-            .get(&event.table_id())
-            .cloned()
-            .unwrap_or_else(|| Arc::from(Vec::<ScalarKind>::new()));
+        let arity = catalog_helpers::table_arity(&self.database, table_id).unwrap_or(0);
 
-        let (partition, consumer_dict) = table_context(
-            &self.partitions,
-            &self.consumer_dictionaries,
-            event.table_id(),
-        )?;
+        let (partition, consumer_dict) =
+            table_context(&self.partitions, &self.consumer_dictionaries, table_id)?;
 
         if needs_stamps {
             let (notifs, stamps) = dispatch_consumers_with_stamps(
@@ -1773,12 +1706,20 @@ where
                 partition,
                 consumer_dict,
                 &mut self.vm,
-                &column_kinds,
+                arity,
+                &self.database,
             )?;
             self.stamp_activity(&stamps);
             Ok(notifs)
         } else {
-            dispatch_consumers(event, partition, consumer_dict, &mut self.vm, &column_kinds)
+            dispatch_consumers(
+                event,
+                partition,
+                consumer_dict,
+                &mut self.vm,
+                arity,
+                &self.database,
+            )
         }
     }
 
@@ -1859,32 +1800,27 @@ where
         // See `consumers`: a cataloged table with no subscription
         // contributes no aggregate deltas; only a truly unknown table id
         // errors.
-        if !self.partitions.contains_key(&event.table_id()) {
-            return if self.table_in_catalog(event.table_id()) {
+        let table_id = event.table_id(&self.database);
+        if !self.partitions.contains_key(&table_id) {
+            return if self.table_in_catalog(table_id) {
                 Ok(Vec::new())
             } else {
-                Err(DispatchError::UnknownTableId(event.table_id()))
+                Err(DispatchError::UnknownTableId(table_id))
             };
         }
 
-        let column_kinds = self
-            .column_kinds
-            .get(&event.table_id())
-            .cloned()
-            .unwrap_or_else(|| Arc::from(Vec::<ScalarKind>::new()));
+        let arity = catalog_helpers::table_arity(&self.database, table_id).unwrap_or(0);
 
-        let (partition, consumer_dict) = table_context(
-            &self.partitions,
-            &self.consumer_dictionaries,
-            event.table_id(),
-        )?;
+        let (partition, consumer_dict) =
+            table_context(&self.partitions, &self.consumer_dictionaries, table_id)?;
 
         super::dispatch::compute_agg_deltas(
             event,
             partition,
             consumer_dict,
             &mut self.vm,
-            &column_kinds,
+            arity,
+            &self.database,
         )
     }
 
@@ -1945,30 +1881,26 @@ where
     /// Auto-unregister every pk-follow whose tracked row matches the
     /// deleted row on `event`.
     ///
-    /// Reads the event's PK columns through the typed
-    /// [`CdcEvent`] accessors under [`RowKind::Pk`], lifts them into
-    /// `Vec<Value<E::Backend>>`, and closes each pk-follow whose
-    /// stored `(TableId, pk_values)` equals the event's.
+    /// Reads the event's PK columns through [`CdcEvent::value_at`] under
+    /// [`RowKind::Pk`], collects them into `Vec<Value<E::Backend>>`, and
+    /// closes each pk-follow whose stored `(TableId, pk_values)` equals the
+    /// event's.
     ///
-    /// Silently no-ops when the PK cannot be materialised (unknown
-    /// column, missing scalar, or `Presence::Null`). pk-follows are
+    /// Silently no-ops when the PK cannot be materialised (unknown column,
+    /// [`Value::Missing`], or [`Value::Null`]). pk-follows are
     /// best-effort per the `pk_follows` doc contract; loss of the
     /// auto-close marker degrades gracefully to an ordinary inert
     /// subscription rather than surfacing an error.
     fn close_deleted_pk_follows(&mut self, event: &E) {
-        let table_id = event.table_id();
-        let pk_cols: alloc::vec::Vec<crate::ColumnId> = event.pk_columns().to_vec();
+        let table_id = event.table_id(&self.database);
+        let pk_cols: alloc::vec::Vec<crate::ColumnId> = event.pk_columns(&self.database);
 
         // Extract the event's PK cells once so we can compare each
         // follow against the same materialised Vec.
         let mut event_pk: alloc::vec::Vec<Value<E::Backend>> =
             alloc::vec::Vec::with_capacity(pk_cols.len());
         for &col in &pk_cols {
-            let Some(kind) = catalog_helpers::column_scalar_kind(&self.database, table_id, col)
-            else {
-                return;
-            };
-            let Some(v) = extract_pk_value::<E>(event, col, kind) else {
+            let Some(v) = extract_pk_value(event, &self.database, col) else {
                 return;
             };
             event_pk.push(v);
@@ -2523,12 +2455,6 @@ where
                 RebuildPayloadError::Corrupt(msg) => StorageError::Corrupt(msg),
             })?;
 
-        // Dispatch routes typed scalar accessors via the per-table
-        // `ScalarKind` cache. `ensure_column_kinds_cached` normally fills
-        // it on the first `register()` for a table; on restore we bypass
-        // that path, so populate it here for every restored shard.
-        self.ensure_column_kinds_cached(table_id);
-
         Ok(())
     }
 
@@ -2860,37 +2786,94 @@ where
 
 // Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
 
-/// Read one primary-key column off a [`CdcEvent`] via [`RowKind::Pk`]
-/// and lift it into a typed [`Value`] matching the caller-provided
-/// [`ScalarKind`]. Returns `None` when the accessor reports
-/// [`Presence::Missing`] or [`Presence::Null`], so callers upstream
-/// can bail out cleanly without materialising a partial key.
-fn extract_pk_value<E: CdcEvent>(
+/// Read one primary-key column off a [`CdcEvent`] via [`RowKind::Pk`].
+/// Returns `None` when the cell is [`Value::Missing`] or [`Value::Null`],
+/// so callers upstream can bail out cleanly without materialising a
+/// partial key.
+fn extract_pk_value<E: CdcEvent, DB: DatabaseLike>(
     event: &E,
+    db: &DB,
     col: crate::ColumnId,
-    kind: ScalarKind,
 ) -> Option<Value<E::Backend>> {
-    macro_rules! ext {
-        ($accessor:ident, $variant:ident) => {
-            match event.$accessor(RowKind::Pk, col) {
-                Presence::Present(v) => Some(Value::$variant(v.clone())),
-                Presence::Missing | Presence::Null => None,
-            }
-        };
+    match event.value_at(db, RowKind::Pk, col) {
+        Value::Missing | Value::Null => None,
+        v => Some(v),
     }
-    match kind {
-        ScalarKind::Bool => ext!(bool_at, Bool),
-        ScalarKind::Int => ext!(int_at, Int),
-        ScalarKind::Float => ext!(float_at, Float),
-        ScalarKind::String => ext!(string_at, String),
-        ScalarKind::Bytes => ext!(bytes_at, Bytes),
-        ScalarKind::Uuid => ext!(uuid_at, Uuid),
-        ScalarKind::Timestamp => ext!(timestamp_at, Timestamp),
-        ScalarKind::TimestampTz => ext!(timestamp_tz_at, TimestampTz),
-        ScalarKind::Date => ext!(date_at, Date),
-        ScalarKind::Time => ext!(time_at, Time),
-        ScalarKind::Decimal => ext!(decimal_at, Decimal),
-        ScalarKind::Json => ext!(json_at, Json),
-        ScalarKind::Jsonb => ext!(jsonb_at, Jsonb),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Postgres;
+    use crate::testing::TestEvent;
+    use crate::{DefaultIds, EvictionPolicy, SubscriptionRequest};
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
+
+    type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+
+    fn cap1_evict_oldest() -> Engine {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        SubscriptionEngine::new(db, PostgreSqlDialect {})
+            .with_max_subscriptions(1, EvictionPolicy::EvictOldest)
+    }
+
+    fn spec(consumer: u64, id: u64) -> SubscriptionRequest<DefaultIds, Postgres> {
+        SubscriptionRequest::new(consumer, format!("SELECT * FROM orders WHERE id = {id}"))
+    }
+
+    /// `register_batch` under `EvictOldest` matches a sequential `register`
+    /// loop: each over-cap entry evicts the subscription committed just before
+    /// it and succeeds, so a batch never shields its own members. Guards
+    /// against reintroducing a "no self-eviction" divergence, which would break
+    /// the parity contract fixed in commit 95b435d and enforced by
+    /// `tests/proptest_register_batch_parity.rs`.
+    #[test]
+    fn register_batch_evict_oldest_churns_like_sequential() {
+        let mut engine = cap1_evict_oldest();
+        let pre = engine.register(spec(1, 1)).expect("pre registers");
+
+        let results = engine.register_batch(vec![spec(2, 2), spec(3, 3), spec(4, 4)]);
+        let oks: Vec<&RegisterResult> = results
+            .iter()
+            .map(|r| r.as_ref().expect("entry ok"))
+            .collect();
+
+        // Every entry evicts the subscription committed just before it.
+        assert_eq!(oks[0].evicted, vec![pre.subscription_id]);
+        assert_eq!(oks[1].evicted, vec![oks[0].subscription_id]);
+        assert_eq!(oks[2].evicted, vec![oks[1].subscription_id]);
+        // Cap 1 leaves only the last-registered subscription alive.
+        assert_eq!(engine.subscription_count(), 1);
+    }
+
+    /// The batch path does not special-case eviction: the same specs run as a
+    /// batch and as a sequential loop produce identical ids, evictions, and
+    /// final registry size.
+    #[test]
+    fn register_batch_equals_sequential_loop_under_cap() {
+        let specs = || vec![spec(2, 2), spec(3, 3), spec(4, 4)];
+
+        let mut batch_engine = cap1_evict_oldest();
+        let batch = batch_engine.register_batch(specs());
+
+        let mut seq_engine = cap1_evict_oldest();
+        let seq: Vec<_> = specs()
+            .into_iter()
+            .map(|s| seq_engine.register(s))
+            .collect();
+
+        for (b, s) in batch.iter().zip(seq.iter()) {
+            let b = b.as_ref().expect("batch entry ok");
+            let s = s.as_ref().expect("sequential entry ok");
+            assert_eq!(b.subscription_id, s.subscription_id);
+            assert_eq!(b.evicted, s.evicted);
+        }
+        assert_eq!(
+            batch_engine.subscription_count(),
+            seq_engine.subscription_count()
+        );
     }
 }

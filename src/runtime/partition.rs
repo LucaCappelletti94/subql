@@ -17,7 +17,7 @@ use roaring::RoaringBitmap;
 /// Three-valued presence flag reported by
 /// [`TablePartition::select_candidates`]'s column-probe closure.
 ///
-/// Mirrors the shape of [`crate::backend::Presence`] but without a
+/// Names whether a probed cell was missing, null, or present, without a
 /// payload: the caller conveys the payload via the paired
 /// [`ColumnProbe::value`] field.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -32,6 +32,7 @@
 // This benchmark is a one-shot measurement tool, not a unit test or
 // library component. Standard test-style lint allowances apply.
 #![allow(
+    unknown_lints,
     clippy::unwrap_used,
     clippy::print_stdout,
     clippy::cast_precision_loss,
@@ -176,6 +177,7 @@ where
     S::Event: subql::backend::CdcEvent<Backend = subql::backend::Postgres, Checkpoint = PgLsn>,
 {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(i64, Instant)>();
+    let schema = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let task = tokio::spawn(async move {
         loop {
             let Ok(Some(ev)) = source.next_event().await else {
@@ -185,11 +187,12 @@ where
             if ev.kind() != EventKind::Insert {
                 continue;
             }
-            let subql::backend::Presence::Present(id) = ev.int_at(subql::backend::RowKind::New, 0)
+            let subql::backend::Value::Int(id) =
+                ev.value_at(&schema, subql::backend::RowKind::New, 0)
             else {
                 continue;
             };
-            if tx.send((*id as i64, observed_at)).is_err() {
+            if tx.send((id, observed_at)).is_err() {
                 return;
             }
         }

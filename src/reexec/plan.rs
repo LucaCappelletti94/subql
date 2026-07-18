@@ -42,8 +42,9 @@ pub(super) struct MinMaxPlan<B: Backend> {
     /// The aggregated column.
     pub agg_column: ColumnId,
     /// [`ScalarKind`](crate::backend::ScalarKind) of the aggregated
-    /// column, used by maintenance to route event scalar accessors and
-    /// as the decode hint returned to the materializer.
+    /// column. Not consumed by in-process maintenance (MIN/MAX compares
+    /// `Value` variants directly), but returned to the materializer via
+    /// [`Registered::ReExec`](super::Registered::ReExec) as a decode hint.
     pub agg_kind: crate::backend::ScalarKind,
     /// Columns whose change can alter the result: the aggregated column
     /// plus every column the WHERE clause reads (UPDATE routing

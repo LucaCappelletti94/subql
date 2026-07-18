@@ -26,7 +26,7 @@ use sqlite_diff_rs::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::patchset::PgAdapter;
-use subql::{DefaultIds, PgOutputEvent, SubscriptionEngine};
+use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
 
 const DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN);";
 const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN)";
@@ -52,7 +52,7 @@ fn apply_patchset_bool_roundtrip_insert_update_delete() {
     // subql catalog mirrors the PG DDL so the adapter can resolve
     // "things.active -> BOOLEAN" for dispatch.
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse subql DDL");
-    let engine: SubscriptionEngine<PgOutputEvent, DefaultIds, ParserDB> =
+    let engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
     // SQLite session table descriptor. Column 0 is the PK.

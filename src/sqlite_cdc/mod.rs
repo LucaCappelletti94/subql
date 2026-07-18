@@ -4,8 +4,8 @@
 //!
 //! * [`SqliteChangesetParser`]: unconditional parser that turns SQLite
 //!   session-extension changeset binary bytes (via `sqlite-diff-rs`) into
-//!   typed [`SqliteChangesetEvent`] instances. Analogue of
-//!   [`crate::PgOutputParser`] on the Postgres side.
+//!   typed [`SqliteChangesetEvent`] instances. The SQLite analogue of
+//!   the pgoutput decode path on the Postgres side.
 //! * [`SqliteCdcSource`](https://docs.rs/subql): a live-connection
 //!   wrapper that owns a diesel `SqliteConnection`, attaches tables to a
 //!   SQLite session, calls `.changeset()` on poll, and feeds the bytes to
@@ -14,7 +14,7 @@
 //!   branch already pinned in the top-level `[patch.crates-io]`). Not
 //!   part of the `no_std + alloc` surface.
 //!
-//! Mirror of how [`crate::PgOutputParser`] is unconditional while
+//! Mirror of how the pgoutput decode path is unconditional while
 //! [`crate::PgStreamingCdcSource`] hides behind the `pg-streaming`
 //! feature.
 

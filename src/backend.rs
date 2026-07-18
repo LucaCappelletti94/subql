@@ -19,93 +19,34 @@
 //! # CdcEvent
 //!
 //! [`CdcEvent`] describes one CDC row event as read by the engine. It carries
-//! the observing [`Backend`] as an associated type, so scalar accessors are
-//! typed at compile time (`event.bool_at(...)` returns
-//! `Presence<&Postgres::Bool>` on a Postgres-backed payload,
-//! `Presence<&SQLite::Bool>` on a SQLite-backed payload).
+//! the observing [`Backend`] as an associated type, so [`CdcEvent::value_at`]
+//! returns a typed [`Value`] (`Value<Postgres>` on a Postgres-backed payload,
+//! `Value<SQLite>` on a SQLite-backed payload).
 //!
 //! One CDC event is always about exactly one row identity. [`RowKind`] selects
 //! the view: the old-row image (Delete + Update), the new-row image (Insert +
 //! Update), or the PK projection.
 //!
-//! Cell presence is three-valued via [`Presence`]: `Missing` for cells the
-//! source did not carry, `Null` for SQL NULL, `Present` for a value.
+//! Cell state is three-valued through [`Value`]: [`Value::Missing`] for cells
+//! the source did not carry, [`Value::Null`] for SQL NULL, and a typed variant
+//! for a present value.
 
 use crate::checkpoint::Checkpoint;
 use crate::types::{ColumnId, EventKind, TableId};
+use alloc::vec::Vec;
+use sql_traits::prelude::DatabaseLike;
 
 // ---------------------------------------------------------------------------
-// Presence, RowKind
+// RowKind
 // ---------------------------------------------------------------------------
-
-/// Three-valued cell state at every scalar accessor call.
-///
-/// * `Missing` — the source's row image did not carry this cell. Distinct
-///   from `Null`: `Missing` means "no information transmitted", not "value
-///   is SQL NULL". Predicate evaluation on a `Missing` cell is unable to
-///   proceed and must escalate (typically to a re-execution against the
-///   authoritative store).
-/// * `Null` — the cell carries a SQL NULL. Predicate three-valued logic
-///   applies.
-/// * `Present` — the cell carries a value of the scalar type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Presence<T> {
-    /// Cell was not carried by this row image.
-    Missing,
-    /// Cell carries a SQL NULL.
-    Null,
-    /// Cell carries a value.
-    Present(T),
-}
-
-impl<T> Presence<T> {
-    /// True when the variant is `Present`.
-    #[inline]
-    pub const fn is_present(&self) -> bool {
-        matches!(self, Self::Present(_))
-    }
-
-    /// True when the variant is `Null`.
-    #[inline]
-    pub const fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
-    }
-
-    /// True when the variant is `Missing`.
-    #[inline]
-    pub const fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing)
-    }
-
-    /// Return the contained value, or `None` for `Null` and `Missing` alike.
-    /// Callers that need to distinguish `Null` from `Missing` must match
-    /// against `Presence` directly.
-    #[inline]
-    pub fn present(self) -> Option<T> {
-        match self {
-            Self::Present(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    /// Map the `Present` payload, preserving `Missing` and `Null`.
-    #[inline]
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Presence<U> {
-        match self {
-            Self::Present(v) => Presence::Present(f(v)),
-            Self::Missing => Presence::Missing,
-            Self::Null => Presence::Null,
-        }
-    }
-}
 
 /// Selector for which row view of a CDC event to read.
 ///
 /// Every CDC event concerns one row identity. `Old` and `New` name the
 /// before/after images (which may be absent depending on `EventKind`).
-/// `Pk` names the PK projection of that row — accessors called with
+/// `Pk` names the PK projection of that row. `value_at` called with
 /// `RowKind::Pk` and a `col` that is not in
-/// [`CdcEvent::pk_columns`] return [`Presence::Missing`].
+/// [`CdcEvent::pk_columns`] returns [`Value::Missing`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RowKind {
     /// Old row image — populated for Delete and (source-permitting) Update.
@@ -120,13 +61,15 @@ pub enum RowKind {
 // ScalarKind, Value
 // ---------------------------------------------------------------------------
 
-/// Runtime tag naming one scalar type on a [`Backend`].
+/// Compile-time tag naming one scalar type on a [`Backend`].
 ///
-/// Used as an operand on bytecode instructions that must read a typed cell
-/// off an event: the compiler emits the [`ScalarKind`] alongside the
-/// [`crate::ColumnId`], and the VM dispatches to the matching accessor
-/// (`bool_at`, `int_at`, ...). Also used anywhere the code must remember
-/// which variant of [`Value`] to expect without carrying the value itself.
+/// Returned by
+/// [`column_scalar_kind`](crate::catalog_helpers::column_scalar_kind) and
+/// used in two places: the compiler coerces a comparison's literal to the
+/// paired column's kind, and the WAL decoders route a wire cell to its
+/// typed [`Value`] variant against the catalog at decode time. It is never
+/// carried in the bytecode nor consumed by the runtime VM, which reads
+/// cells through [`CdcEvent::value_at`] directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ScalarKind {
     /// [`Backend::Bool`].
@@ -160,10 +103,9 @@ pub enum ScalarKind {
 /// A scalar value carried in the VM's evaluation stack, or as a literal
 /// operand in the compiled bytecode.
 ///
-/// One variant per scalar type on the backend, plus `Missing` and `Null`
-/// which correspond to the [`Presence`] variants of the same name and
-/// let the VM lift a `Presence<&B::T>` returned by a scalar accessor
-/// into a stack value.
+/// One variant per scalar type on the backend, plus [`Value::Missing`] and
+/// [`Value::Null`], which name cells the source did not carry and SQL NULL
+/// respectively. [`CdcEvent::value_at`] returns this type directly.
 ///
 /// The variants own their payload so a `Value` moved onto the VM stack does
 /// not need to keep the event alive. LoadColumn instructions clone the
@@ -528,9 +470,9 @@ impl Backend for SQLite {
 /// One CDC row event as seen by the engine.
 ///
 /// An impl exposes the event's structure (kind, table, PK layout, changed
-/// columns, checkpoint) plus one typed scalar accessor per [`Backend`]
-/// scalar. Every accessor takes a [`RowKind`] to select the row view and a
-/// [`ColumnId`] to address the cell.
+/// columns, checkpoint) plus [`value_at`](CdcEvent::value_at), which decodes
+/// one cell to a typed [`Value`]. It takes a [`RowKind`] to select the row
+/// view and a [`ColumnId`] to address the cell.
 ///
 /// # Access patterns
 ///
@@ -544,14 +486,12 @@ impl Backend for SQLite {
 /// * Truncate: no row images. `pk_columns` is empty; `changed_columns` is
 ///   empty. Structural event only.
 ///
-/// # PK accessors
+/// # PK access
 ///
-/// A scalar accessor called with `RowKind::Pk` and a `col` that is not in
-/// [`pk_columns`](Self::pk_columns) returns [`Presence::Missing`]. Composite
-/// PKs are read by iterating `pk_columns()` and calling the appropriate
-/// scalar accessor per column (the caller consults its catalog for each
-/// column's SQL type).
-#[allow(clippy::too_many_arguments)]
+/// [`value_at`](CdcEvent::value_at) called with `RowKind::Pk` and a `col`
+/// that is not in [`pk_columns`](Self::pk_columns) returns
+/// [`Value::Missing`]. Composite PKs are read by iterating `pk_columns()`
+/// and calling `value_at` per column.
 pub trait CdcEvent {
     /// The database this event observes.
     type Backend: Backend;
@@ -564,85 +504,60 @@ pub trait CdcEvent {
     fn kind(&self) -> EventKind;
 
     /// Table the event belongs to.
-    fn table_id(&self) -> TableId;
+    ///
+    /// `db` is the catalog for the observed database. A raw ecosystem
+    /// event knows only the table name, so resolving it to a subql
+    /// [`TableId`] needs the catalog.
+    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId;
 
     /// Checkpoint (position in the source stream) when the source carries one.
-    fn checkpoint(&self) -> Option<&Self::Checkpoint>;
+    ///
+    /// Returned owned so an event can bridge a source-native position
+    /// type (a `pg_walstream` LSN, say) to a subql
+    /// [`Checkpoint`](Self::Checkpoint) on demand.
+    fn checkpoint(&self) -> Option<Self::Checkpoint>;
 
     /// Column ids that make up the primary key, in PK declaration order.
     ///
-    /// For a composite PK the slice length is greater than one; ordering
-    /// matters (matches the schema). For a Truncate event the slice is
-    /// empty.
-    fn pk_columns(&self) -> &[ColumnId];
+    /// For a composite PK the returned length is greater than one, and
+    /// ordering matches the schema. For a Truncate event the result is
+    /// empty. The identity reflects the event's replica identity plus
+    /// the catalog, not the catalog alone, so `db` resolves the wire
+    /// key layout to subql column ordinals.
+    ///
+    /// Returned owned as a [`Vec`] because a raw ecosystem event stores
+    /// no subql [`ColumnId`] ordinals to borrow. PK arity is small, so
+    /// the per-call allocation is cheap. A fill-into-buffer variant can
+    /// replace this later if profiling shows it matters.
+    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId>;
 
     /// Column ids whose cells changed on an Update event.
     ///
-    /// For non-Update events the slice is empty. For Update events sources
-    /// vary in whether they populate this: sources that only carry the
-    /// changed columns (wal2json v2 with `add-tables`, Debezium with column
-    /// filtering) list only those; sources that carry the full row image
-    /// list every column whose value differs. Consumers should treat the
-    /// slice as a hint for optimisation, not as an authoritative diff.
-    fn changed_columns(&self) -> &[ColumnId];
+    /// For non-Update events the result is empty. For Update events
+    /// sources vary in whether they populate this: sources that only
+    /// carry the changed columns (wal2json v2 with `add-tables`) list
+    /// only those. Sources that carry the full row image list every
+    /// column whose value differs. Consumers should treat the result as
+    /// a hint for optimisation, not as an authoritative diff. `db`
+    /// resolves wire names to subql column ordinals.
+    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId>;
 
-    // ---------- Typed scalar accessors ----------
+    // ---------- Cell accessor ----------
 
-    /// Read a `BOOL` cell.
-    fn bool_at(&self, row: RowKind, col: ColumnId) -> Presence<&<Self::Backend as Backend>::Bool>;
-
-    /// Read an integer cell.
-    fn int_at(&self, row: RowKind, col: ColumnId) -> Presence<&<Self::Backend as Backend>::Int>;
-
-    /// Read a floating-point cell.
-    fn float_at(&self, row: RowKind, col: ColumnId)
-        -> Presence<&<Self::Backend as Backend>::Float>;
-
-    /// Read a text cell.
-    fn string_at(
+    /// Decode one cell to an owned [`Value<Self::Backend>`].
+    ///
+    /// `db` is the catalog for the observed database. Formats whose wire
+    /// carries no column type metadata (Maxwell, and positional pgoutput
+    /// tuples) resolve the column's type from `db` at decode time. Formats
+    /// that already carry their own type state may ignore it.
+    ///
+    /// Returns [`Value::Missing`] for cells the source did not carry or
+    /// could not decode, [`Value::Null`] for SQL NULL, and the matching
+    /// typed variant for a present value.
+    fn value_at<DB: DatabaseLike>(
         &self,
+        db: &DB,
         row: RowKind,
         col: ColumnId,
-    ) -> Presence<&<Self::Backend as Backend>::String>;
-
-    /// Read a binary cell.
-    fn bytes_at(&self, row: RowKind, col: ColumnId)
-        -> Presence<&<Self::Backend as Backend>::Bytes>;
-
-    /// Read a UUID cell.
-    fn uuid_at(&self, row: RowKind, col: ColumnId) -> Presence<&<Self::Backend as Backend>::Uuid>;
-
-    /// Read a `TIMESTAMP` (no time zone) cell.
-    fn timestamp_at(
-        &self,
-        row: RowKind,
-        col: ColumnId,
-    ) -> Presence<&<Self::Backend as Backend>::Timestamp>;
-
-    /// Read a `TIMESTAMP WITH TIME ZONE` cell.
-    fn timestamp_tz_at(
-        &self,
-        row: RowKind,
-        col: ColumnId,
-    ) -> Presence<&<Self::Backend as Backend>::TimestampTz>;
-
-    /// Read a `DATE` cell.
-    fn date_at(&self, row: RowKind, col: ColumnId) -> Presence<&<Self::Backend as Backend>::Date>;
-
-    /// Read a `TIME` cell.
-    fn time_at(&self, row: RowKind, col: ColumnId) -> Presence<&<Self::Backend as Backend>::Time>;
-
-    /// Read a `NUMERIC` / `DECIMAL` cell.
-    fn decimal_at(
-        &self,
-        row: RowKind,
-        col: ColumnId,
-    ) -> Presence<&<Self::Backend as Backend>::Decimal>;
-
-    /// Read a `JSON` cell.
-    fn json_at(&self, row: RowKind, col: ColumnId) -> Presence<&<Self::Backend as Backend>::Json>;
-
-    /// Read a `JSONB` cell.
-    fn jsonb_at(&self, row: RowKind, col: ColumnId)
-        -> Presence<&<Self::Backend as Backend>::Jsonb>;
+    ) -> Value<Self::Backend>;
 }

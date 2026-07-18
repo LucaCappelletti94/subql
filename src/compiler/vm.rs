@@ -17,23 +17,23 @@
 //!   lift to `Tri::Unknown`). Any other final shape is a compiler bug and
 //!   surfaces as [`VmError::MalformedProgram`].
 //! * Same-scalar arithmetic only. Cross-scalar operands, or `Missing` /
-//!   `Null` operands, collapse to `Value::Null`. See
-//!   `docs/refactor-cdc-event-handoff.md` gotcha 4.
-//! * A `LoadColumn` instruction dispatches on its [`ScalarKind`] operand to
-//!   the matching typed accessor on `E`. Boolean predicates on a bare
-//!   column MUST be lowered by the compiler as an explicit comparison
-//!   (`LoadColumn(col, Bool)` + `PushLiteral(Bool(true))` + `Equal`); the
-//!   VM does not lift a bare `Value::Bool` on the stack to `Tri` because
-//!   that lift is backend-specific (Postgres `Bool = bool`, SQLite
+//!   `Null` operands, collapse to `Value::Null`.
+//! * A `LoadColumn` instruction reads its cell through
+//!   [`CdcEvent::value_at`], which decodes it against the catalog and
+//!   returns an owned [`Value`]. Boolean predicates on a bare column
+//!   MUST be lowered by the compiler as an explicit comparison
+//!   (`LoadColumn(col)` + `PushLiteral(Bool(true))` + `Equal`)
+//!   because the VM does not lift a bare `Value::Bool` on the stack to
+//!   `Tri` (that lift is backend-specific: Postgres `Bool = bool`, SQLite
 //!   `Bool = i64`).
 
 use super::{
     value_cmp::{compare_ordered_values, values_equal},
     BytecodeProgram, Instruction, Tri,
 };
-use crate::backend::{Backend, CdcEvent, Presence, RowKind, ScalarKind, Value};
-use crate::types::ColumnId;
+use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use alloc::vec::Vec;
+use sql_traits::prelude::DatabaseLike;
 
 /// VM evaluation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +52,8 @@ pub enum VmError {
     },
 
     /// Column index out of range for the observed event / schema. Currently
-    /// unused (`LoadColumn` never emits this — an out-of-range column reads
-    /// as `Presence::Missing`), but kept for future use.
+    /// unused (`LoadColumn` never emits this: an out-of-range column reads
+    /// as `Value::Missing`), but kept for future use.
     InvalidColumnIndex(u16),
 
     /// Jump offset is invalid: either zero (no forward progress) or lands
@@ -143,14 +143,16 @@ impl<B: Backend> Vm<B> {
     ///
     /// Returns [`VmError`] variants only on malformed bytecode. A
     /// well-formed program never errors here.
-    pub fn eval<E>(
+    pub fn eval<E, DB>(
         &mut self,
         program: &BytecodeProgram<B>,
         event: &E,
         row: RowKind,
+        db: &DB,
     ) -> Result<Tri, VmError>
     where
         E: CdcEvent<Backend = B>,
+        DB: DatabaseLike,
     {
         self.stack.clear();
 
@@ -190,7 +192,7 @@ impl<B: Backend> Vm<B> {
                     }
                 }
                 other => {
-                    self.execute(other, event, row)?;
+                    self.execute(other, event, row, db)?;
                 }
             }
             ip += 1;
@@ -206,9 +208,9 @@ impl<B: Backend> Vm<B> {
             }
             Some(StackValue::Value(v)) => {
                 // Bare `Null` / `Missing` at TOS is a legitimate `WHERE NULL`
-                // (or an accessor that returned `Presence::Missing` fed
+                // (or a `value_at` that returned `Value::Missing` fed
                 // straight into the WHERE): both collapse to `Unknown`.
-                // Any other bare `Value` is a compiler bug — boolean
+                // Any other bare `Value` is a compiler bug: boolean
                 // columns must be lowered with an explicit comparison.
                 if self.stack.is_empty() && v.is_absent() {
                     Ok(Tri::Unknown)
@@ -221,22 +223,24 @@ impl<B: Backend> Vm<B> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute<E>(
+    fn execute<E, DB>(
         &mut self,
         instruction: &Instruction<B>,
         event: &E,
         row: RowKind,
+        db: &DB,
     ) -> Result<(), VmError>
     where
         E: CdcEvent<Backend = B>,
+        DB: DatabaseLike,
     {
         match instruction {
             Instruction::PushLiteral(value) => {
                 self.stack.push(StackValue::Value(value.clone()));
             }
 
-            Instruction::LoadColumn(col_id, kind) => {
-                let value = load_column::<E>(event, row, *col_id, *kind);
+            Instruction::LoadColumn(col_id) => {
+                let value = event.value_at(db, row, *col_id);
                 self.stack.push(StackValue::Value(value));
             }
 
@@ -495,48 +499,6 @@ impl<B: Backend> Default for Vm<B> {
 }
 
 // ============================================================================
-// Column-load dispatch
-// ============================================================================
-
-/// Read `col` from `event` at the `row` view, dispatch on `kind` to the
-/// right typed accessor, and lift the returned [`Presence`] into a
-/// [`Value`].
-fn load_column<E>(event: &E, row: RowKind, col: ColumnId, kind: ScalarKind) -> Value<E::Backend>
-where
-    E: CdcEvent,
-{
-    match kind {
-        ScalarKind::Bool => lift(event.bool_at(row, col), Value::Bool),
-        ScalarKind::Int => lift(event.int_at(row, col), Value::Int),
-        ScalarKind::Float => lift(event.float_at(row, col), Value::Float),
-        ScalarKind::String => lift(event.string_at(row, col), Value::String),
-        ScalarKind::Bytes => lift(event.bytes_at(row, col), Value::Bytes),
-        ScalarKind::Uuid => lift(event.uuid_at(row, col), Value::Uuid),
-        ScalarKind::Timestamp => lift(event.timestamp_at(row, col), Value::Timestamp),
-        ScalarKind::TimestampTz => lift(event.timestamp_tz_at(row, col), Value::TimestampTz),
-        ScalarKind::Date => lift(event.date_at(row, col), Value::Date),
-        ScalarKind::Time => lift(event.time_at(row, col), Value::Time),
-        ScalarKind::Decimal => lift(event.decimal_at(row, col), Value::Decimal),
-        ScalarKind::Json => lift(event.json_at(row, col), Value::Json),
-        ScalarKind::Jsonb => lift(event.jsonb_at(row, col), Value::Jsonb),
-    }
-}
-
-#[inline]
-fn lift<B, T, F>(presence: Presence<&T>, ctor: F) -> Value<B>
-where
-    B: Backend,
-    T: Clone,
-    F: FnOnce(T) -> Value<B>,
-{
-    match presence {
-        Presence::Missing => Value::Missing,
-        Presence::Null => Value::Null,
-        Presence::Present(v) => ctor(v.clone()),
-    }
-}
-
-// ============================================================================
 // LIKE
 // ============================================================================
 
@@ -724,7 +686,11 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::uninlined_format_args)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::uninlined_format_args,
+    clippy::approx_constant
+)]
 mod tests {
     //! Behavioural tests for the Backend-generic VM.
     //!
@@ -738,6 +704,14 @@ mod tests {
     use crate::backend::Postgres;
     use crate::testing::TestEvent;
     use crate::types::EventKind;
+    use sql_traits::structs::ParserDB;
+
+    /// Trivial catalog for [`Vm::eval`]. `TestEvent` decodes from its own
+    /// stored `Value`s and never consults the schema, so any catalog works.
+    pub(super) fn pg_catalog() -> ParserDB {
+        ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>("CREATE TABLE t (a INT);")
+            .expect("catalog parses")
+    }
 
     /// Convenience: make an Insert event with a `Postgres`-typed row image.
     pub(super) fn insert_pg(cells: Vec<Value<Postgres>>) -> TestEvent<Postgres> {
@@ -754,45 +728,60 @@ mod tests {
     fn simple_comparison_int_greater_than_literal() {
         let mut vm: Vm<Postgres> = Vm::new();
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::Int),
+            Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(18)),
             Instruction::GreaterThan,
         ]);
 
         let e = insert_pg(vec![Value::Int(25)]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::True);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::True
+        );
 
         let e = insert_pg(vec![Value::Int(15)]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::False);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::False
+        );
 
         let e = insert_pg(vec![Value::Int(18)]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::False);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::False
+        );
     }
 
     #[test]
     fn null_operand_propagates_to_unknown() {
         let mut vm: Vm<Postgres> = Vm::new();
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::Int),
+            Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(18)),
             Instruction::GreaterThan,
         ]);
 
         let e = insert_pg(vec![Value::Null]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::Unknown);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::Unknown
+        );
     }
 
     #[test]
     fn missing_operand_propagates_to_unknown() {
         let mut vm: Vm<Postgres> = Vm::new();
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(5, ScalarKind::Int), // out of range
+            Instruction::LoadColumn(5), // out of range
             Instruction::PushLiteral(Value::Int(18)),
             Instruction::GreaterThan,
         ]);
 
         let e = insert_pg(vec![Value::Int(25)]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::Unknown);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::Unknown
+        );
     }
 
     #[test]
@@ -800,35 +789,42 @@ mod tests {
         let mut vm: Vm<Postgres> = Vm::new();
         // Column 0 is Int(5). Compare with String("5") — no coercion.
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::Int),
+            Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::String("5".into())),
             Instruction::Equal,
         ]);
 
         let e = insert_pg(vec![Value::Int(5)]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::False);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::False
+        );
     }
 
     #[test]
     fn is_null_on_missing_cell() {
         let mut vm: Vm<Postgres> = Vm::new();
-        let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::String),
-            Instruction::IsNull,
-        ]);
+        let program: BytecodeProgram<Postgres> =
+            BytecodeProgram::new(vec![Instruction::LoadColumn(0), Instruction::IsNull]);
 
         let e = insert_pg(vec![Value::Null]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::True);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::True
+        );
 
         let e = insert_pg(vec![Value::String("hi".into())]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::False);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::False
+        );
     }
 
     #[test]
     fn in_list_matches_string() {
         let mut vm: Vm<Postgres> = Vm::new();
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::String),
+            Instruction::LoadColumn(0),
             Instruction::In(vec![
                 Value::String("pending".into()),
                 Value::String("active".into()),
@@ -836,10 +832,16 @@ mod tests {
         ]);
 
         let e = insert_pg(vec![Value::String("pending".into())]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::True);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::True
+        );
 
         let e = insert_pg(vec![Value::String("completed".into())]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::False);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::False
+        );
     }
 
     #[test]
@@ -847,7 +849,7 @@ mod tests {
         let mut vm: Vm<Postgres> = Vm::new();
         // (col0 + 3) > 10
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::Int),
+            Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(3)),
             Instruction::Add,
             Instruction::PushLiteral(Value::Int(10)),
@@ -855,10 +857,16 @@ mod tests {
         ]);
 
         let e = insert_pg(vec![Value::Int(8)]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::True);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::True
+        );
 
         let e = insert_pg(vec![Value::Int(5)]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::False);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::False
+        );
     }
 
     #[test]
@@ -866,7 +874,7 @@ mod tests {
         let mut vm: Vm<Postgres> = Vm::new();
         // (col0 / 0) > 1 -> Unknown
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::Int),
+            Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(0)),
             Instruction::Divide,
             Instruction::PushLiteral(Value::Int(1)),
@@ -874,7 +882,10 @@ mod tests {
         ]);
 
         let e = insert_pg(vec![Value::Int(10)]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::Unknown);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::Unknown
+        );
     }
 
     #[test]
@@ -882,7 +893,7 @@ mod tests {
         let mut vm: Vm<Postgres> = Vm::new();
         // Predicate: col0 == 1
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::Int),
+            Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(1)),
             Instruction::Equal,
         ]);
@@ -896,14 +907,17 @@ mod tests {
             new_row: vec![Value::Int(1), Value::Int(42)],
             old_row: Vec::new(),
         };
-        assert_eq!(vm.eval(&program, &e, RowKind::Pk).unwrap(), Tri::Unknown);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::Pk, &pg_catalog()).unwrap(),
+            Tri::Unknown
+        );
     }
 
     #[test]
     fn like_pattern_case_sensitive_match() {
         let mut vm: Vm<Postgres> = Vm::new();
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
-            Instruction::LoadColumn(0, ScalarKind::String),
+            Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::String("h%".into())),
             Instruction::Like {
                 case_sensitive: true,
@@ -911,10 +925,16 @@ mod tests {
         ]);
 
         let e = insert_pg(vec![Value::String("hello".into())]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::True);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::True
+        );
 
         let e = insert_pg(vec![Value::String("world".into())]);
-        assert_eq!(vm.eval(&program, &e, RowKind::New).unwrap(), Tri::False);
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
+            Tri::False
+        );
     }
 
     #[test]

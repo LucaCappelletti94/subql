@@ -24,8 +24,8 @@ pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
 pub use wal::{
-    DebeziumEvent, DebeziumParser, MaxwellEvent, MaxwellParser, PgOutputEvent, PgOutputParser,
-    Wal2JsonV1Event, Wal2JsonV1Parser, Wal2JsonV2Event, Wal2JsonV2Parser, WalParseError, WalParser,
+    parse_maxwell, parse_wal2json_v1, parse_wal2json_v2, ChangeEvent, ChangeV1, MaxwellMessage,
+    MessageV2, WalParseError, WalParser,
 };
 #[cfg(feature = "pg-streaming")]
 pub use wal::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
@@ -55,6 +55,7 @@ pub mod clock;
 pub mod compiler;
 #[cfg(feature = "std")]
 pub mod config;
+pub mod emit;
 pub mod testing;
 // Memory profiling harness driven by the `dhat-heap` feature. Not part of
 // the shipping API surface.

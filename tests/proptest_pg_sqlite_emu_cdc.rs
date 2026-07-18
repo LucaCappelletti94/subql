@@ -32,8 +32,9 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use subql::backend::{CdcEvent, Presence, RowKind};
-use subql::{ColumnId, EventKind, PgOutputEvent, PgSqliteEmuSource};
+use sql_traits::structs::ParserDB;
+use subql::backend::{CdcEvent, RowKind, Value};
+use subql::{ChangeEvent, ColumnId, EventKind, PgSqliteEmuSource};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);";
 
@@ -102,25 +103,26 @@ fn diff(old: &Row, new: &Row) -> Vec<ColumnId> {
     changed
 }
 fn assert_row_matches(
-    event: &PgOutputEvent,
+    event: &ChangeEvent,
+    db: &ParserDB,
     side: RowKind,
     expected: &Row,
 ) -> Result<(), TestCaseError> {
     prop_assert_eq!(
-        event.int_at(side, 0),
-        Presence::Present(&expected.id),
+        event.value_at(db, side, 0),
+        Value::Int(expected.id),
         "{:?} side id mismatch",
         side,
     );
     prop_assert_eq!(
-        event.float_at(side, 1),
-        Presence::Present(&expected.price),
+        event.value_at(db, side, 1),
+        Value::Float(expected.price),
         "{:?} side price mismatch",
         side,
     );
     prop_assert_eq!(
-        event.string_at(side, 2),
-        Presence::Present(&expected.status),
+        event.value_at(db, side, 2),
+        Value::String(expected.status.clone()),
         "{:?} side status mismatch",
         side,
     );
@@ -212,12 +214,12 @@ proptest! {
                 ExpectedEvent::Insert { pk, new } => {
                     prop_assert_eq!(act.kind(), EventKind::Insert, "event {} kind", i);
                     prop_assert_eq!(
-                        act.int_at(RowKind::Pk, 0),
-                        Presence::Present(pk),
+                        act.value_at(source.pg_catalog(), RowKind::Pk, 0),
+                        Value::Int(*pk),
                         "event {} pk",
                         i,
                     );
-                    assert_row_matches(&act, RowKind::New, new)?;
+                    assert_row_matches(&act, source.pg_catalog(), RowKind::New, new)?;
                 }
                 ExpectedEvent::Update {
                     pk,
@@ -227,14 +229,14 @@ proptest! {
                 } => {
                     prop_assert_eq!(act.kind(), EventKind::Update, "event {} kind", i);
                     prop_assert_eq!(
-                        act.int_at(RowKind::Pk, 0),
-                        Presence::Present(pk),
+                        act.value_at(source.pg_catalog(), RowKind::Pk, 0),
+                        Value::Int(*pk),
                         "event {} pk",
                         i,
                     );
-                    assert_row_matches(&act, RowKind::Old, old)?;
-                    assert_row_matches(&act, RowKind::New, new)?;
-                    let mut actual_changed = act.changed_columns().to_vec();
+                    assert_row_matches(&act, source.pg_catalog(), RowKind::Old, old)?;
+                    assert_row_matches(&act, source.pg_catalog(), RowKind::New, new)?;
+                    let mut actual_changed = act.changed_columns(source.pg_catalog());
                     actual_changed.sort_unstable();
                     let mut expected_changed = changed.clone();
                     expected_changed.sort_unstable();
@@ -248,12 +250,12 @@ proptest! {
                 ExpectedEvent::Delete { pk, old } => {
                     prop_assert_eq!(act.kind(), EventKind::Delete, "event {} kind", i);
                     prop_assert_eq!(
-                        act.int_at(RowKind::Pk, 0),
-                        Presence::Present(pk),
+                        act.value_at(source.pg_catalog(), RowKind::Pk, 0),
+                        Value::Int(*pk),
                         "event {} pk",
                         i,
                     );
-                    assert_row_matches(&act, RowKind::Old, old)?;
+                    assert_row_matches(&act, source.pg_catalog(), RowKind::Old, old)?;
                 }
             }
         }

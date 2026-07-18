@@ -20,7 +20,7 @@ use std::time::Duration;
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{CdcEvent, Presence, RowKind, Value};
+use subql::backend::{CdcEvent, RowKind, Value};
 use subql::{
     CdcSource, ColumnId, EventKind, PgStreamingCdcSource, PgStreamingConfig, PollingPgCdcConfig,
     PollingPgCdcSource, TableId,
@@ -62,31 +62,33 @@ enum CanonicalCell {
 
 fn canonicalize_cell<E: CdcEvent<Backend = subql::backend::Postgres>>(
     ev: &E,
+    db: &ParserDB,
     row: RowKind,
     col: ColumnId,
 ) -> CanonicalCell {
     match col {
-        0 => match ev.int_at(row, col) {
-            Presence::Missing => CanonicalCell::Missing,
-            Presence::Null => CanonicalCell::Null,
-            Presence::Present(v) => CanonicalCell::Int(*v),
+        0 => match ev.value_at(db, row, col) {
+            Value::Null => CanonicalCell::Null,
+            Value::Int(v) => CanonicalCell::Int(v),
+            _ => CanonicalCell::Missing,
         },
-        1 => match ev.float_at(row, col) {
-            Presence::Missing => CanonicalCell::Missing,
-            Presence::Null => CanonicalCell::Null,
-            Presence::Present(v) => CanonicalCell::FloatBits(v.to_bits()),
+        1 => match ev.value_at(db, row, col) {
+            Value::Null => CanonicalCell::Null,
+            Value::Float(v) => CanonicalCell::FloatBits(v.to_bits()),
+            _ => CanonicalCell::Missing,
         },
         _ => CanonicalCell::Missing,
     }
 }
 fn row_present<E: CdcEvent<Backend = subql::backend::Postgres>>(
     ev: &E,
+    db: &ParserDB,
     row: RowKind,
     cols: &[ColumnId],
 ) -> Option<Vec<CanonicalCell>> {
     let cells: Vec<CanonicalCell> = cols
         .iter()
-        .map(|&c| canonicalize_cell(ev, row, c))
+        .map(|&c| canonicalize_cell(ev, db, row, c))
         .collect();
     if cells.iter().all(|c| matches!(c, CanonicalCell::Missing)) {
         None
@@ -95,33 +97,36 @@ fn row_present<E: CdcEvent<Backend = subql::backend::Postgres>>(
     }
 }
 
-fn canonicalize<E: CdcEvent<Backend = subql::backend::Postgres>>(ev: &E) -> CanonicalEvent {
+fn canonicalize<E: CdcEvent<Backend = subql::backend::Postgres>>(
+    ev: &E,
+    db: &ParserDB,
+) -> CanonicalEvent {
     let all_cols: Vec<ColumnId> = (0..=1).collect();
-    let pk_columns: Vec<ColumnId> = ev.pk_columns().to_vec();
+    let pk_columns: Vec<ColumnId> = ev.pk_columns(db);
     let pk_ints: Vec<Option<i64>> = pk_columns
         .iter()
-        .map(|&c| match ev.int_at(RowKind::Pk, c) {
-            Presence::Present(v) => Some(*v),
+        .map(|&c| match ev.value_at(db, RowKind::Pk, c) {
+            Value::Int(v) => Some(v),
             _ => None,
         })
         .collect();
     let (new_row, old_row) = match ev.kind() {
-        EventKind::Insert => (row_present(ev, RowKind::New, &all_cols), None),
+        EventKind::Insert => (row_present(ev, db, RowKind::New, &all_cols), None),
         EventKind::Update => (
-            row_present(ev, RowKind::New, &all_cols),
-            row_present(ev, RowKind::Old, &all_cols),
+            row_present(ev, db, RowKind::New, &all_cols),
+            row_present(ev, db, RowKind::Old, &all_cols),
         ),
-        EventKind::Delete => (None, row_present(ev, RowKind::Old, &all_cols)),
+        EventKind::Delete => (None, row_present(ev, db, RowKind::Old, &all_cols)),
         EventKind::Truncate => (None, None),
     };
     CanonicalEvent {
-        table_id: ev.table_id(),
+        table_id: ev.table_id(db),
         kind: ev.kind(),
         pk_columns,
         pk_ints,
         new_row,
         old_row,
-        changed_columns: ev.changed_columns().to_vec(),
+        changed_columns: ev.changed_columns(db),
     }
 }
 
@@ -143,6 +148,7 @@ where
 
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
+#[allow(clippy::too_many_lines)]
 fn push_and_poll_observe_identical_event_streams() {
     common::assert_docker_available();
     let container = common::pg_with_wal2json();
@@ -211,8 +217,12 @@ fn push_and_poll_observe_identical_event_streams() {
         assert_eq!(push_events.len(), N_TOTAL);
         assert_eq!(poll_events.len(), N_TOTAL);
 
-        let push_canon: Vec<CanonicalEvent> = push_events.iter().map(canonicalize).collect();
-        let poll_canon: Vec<CanonicalEvent> = poll_events.iter().map(canonicalize).collect();
+        let canon_catalog =
+            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL for canonicalize");
+        let push_canon: Vec<CanonicalEvent> =
+            push_events.iter().map(|e| canonicalize(e, &canon_catalog)).collect();
+        let poll_canon: Vec<CanonicalEvent> =
+            poll_events.iter().map(|e| canonicalize(e, &canon_catalog)).collect();
 
         for (i, (p, q)) in push_canon.iter().zip(poll_canon.iter()).enumerate() {
             assert_eq!(
@@ -242,16 +252,13 @@ fn push_and_poll_observe_identical_event_streams() {
         let first = &push_events[0];
         assert_eq!(first.kind(), EventKind::Insert);
         assert!(matches!(
-            first.int_at(RowKind::New, 0),
-            Presence::Present(v) if *v == 1
+            first.value_at(&canon_catalog, RowKind::New, 0),
+            Value::Int(v) if v == 1
         ));
         assert!(matches!(
-            first.float_at(RowKind::New, 1),
-            Presence::Present(v) if (*v - 10.0).abs() < f64::EPSILON
+            first.value_at(&canon_catalog, RowKind::New, 1),
+            Value::Float(v) if (v - 10.0).abs() < f64::EPSILON
         ));
-        // Value import silences unused warning when the two matches
-        // trigger their branches.
-        let _ = Value::<subql::backend::Postgres>::Null;
 
         println!("push and poll observed identical {N_TOTAL} events (canonical equality)");
     });

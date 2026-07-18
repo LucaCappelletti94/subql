@@ -666,7 +666,7 @@ mod tests {
     /// than panicking so callers can race snapshot against unregister.
     #[test]
     fn snapshot_unknown_query_returns_none() {
-        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
         assert!(e.snapshot(99999).unwrap().is_none());
         // Connector was never called.
         assert_eq!(e.connector().call_count(), 0);
@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn unregister_drops_auth_context() {
-        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),

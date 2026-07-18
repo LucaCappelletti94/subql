@@ -28,7 +28,7 @@ use sqlite_diff_rs::{
 };
 use sqlparser::dialect::MySqlDialect;
 use subql::patchset::MysqlAdapter;
-use subql::wal::MaxwellEvent;
+use subql::wal::MaxwellMessage;
 use subql::{DefaultIds, SubscriptionEngine};
 
 const DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, active BOOLEAN);";
@@ -57,7 +57,7 @@ fn apply_patchset_bool_roundtrip_insert_update_delete_mysql() {
     // subql catalog mirrors the MySQL DDL so the adapter can resolve
     // "things.active -> BOOLEAN" for dispatch.
     let catalog = ParserDB::parse::<MySqlDialect>(DDL).expect("parse subql DDL");
-    let engine: SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> =
+    let engine: SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> =
         SubscriptionEngine::new(catalog, MySqlDialect {});
 
     // SQLite session table descriptor. Column 0 is the PK.

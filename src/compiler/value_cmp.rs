@@ -135,7 +135,6 @@ mod tests {
     use super::*;
     use crate::backend::Postgres;
     use alloc::string::{String, ToString};
-    use alloc::vec::Vec;
     use core::cmp::Ordering;
     use proptest::prelude::*;
 

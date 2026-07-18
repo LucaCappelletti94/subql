@@ -327,9 +327,10 @@ fn parse_naive_time(s: &str) -> Option<chrono::NaiveTime> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::backend::{CdcEvent, Presence, RowKind};
+    use crate::backend::{CdcEvent, RowKind};
     use sql_traits::structs::ParserDB;
     use sqlite_diff_rs::{ChangeDelete, ChangeSet, DiffOps, Insert, SimpleTable, Update};
 
@@ -371,17 +372,17 @@ mod tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.pk_columns(), &[0u16]);
-        assert!(ev.changed_columns().is_empty());
-        assert_eq!(ev.int_at(RowKind::New, 0), Presence::Present(&7));
-        assert_eq!(ev.int_at(RowKind::New, 1), Presence::Present(&250));
+        assert_eq!(ev.pk_columns(&db), &[0u16]);
+        assert!(ev.changed_columns(&db).is_empty());
+        assert_eq!(ev.value_at(&db, RowKind::New, 0), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::New, 1), Value::Int(250));
         assert_eq!(
-            ev.string_at(RowKind::New, 2),
-            Presence::Present(&alloc::string::String::from("paid"))
+            ev.value_at(&db, RowKind::New, 2),
+            Value::String("paid".into())
         );
-        assert_eq!(ev.int_at(RowKind::Pk, 0), Presence::Present(&7));
-        assert_eq!(ev.int_at(RowKind::Pk, 1), Presence::Missing);
-        assert_eq!(ev.int_at(RowKind::Old, 0), Presence::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 1), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0), Value::Missing);
     }
 
     #[test]
@@ -408,24 +409,24 @@ mod tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Update);
-        assert_eq!(ev.pk_columns(), &[0u16]);
+        assert_eq!(ev.pk_columns(&db), &[0u16]);
         // Only the status column truly changed; the PK column pair
         // `(7, 7)` is unchanged and stays out of `changed_columns`.
-        let changed = ev.changed_columns().to_vec();
+        let changed = ev.changed_columns(&db);
         assert_eq!(changed, alloc::vec![2u16]);
-        assert_eq!(ev.int_at(RowKind::New, 0), Presence::Present(&7));
-        assert_eq!(ev.int_at(RowKind::New, 1), Presence::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::New, 0), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::New, 1), Value::Missing);
         assert_eq!(
-            ev.string_at(RowKind::New, 2),
-            Presence::Present(&alloc::string::String::from("shipped"))
+            ev.value_at(&db, RowKind::New, 2),
+            Value::String("shipped".into())
         );
-        assert_eq!(ev.int_at(RowKind::Old, 0), Presence::Present(&7));
-        assert_eq!(ev.int_at(RowKind::Old, 1), Presence::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Old, 1), Value::Missing);
         assert_eq!(
-            ev.string_at(RowKind::Old, 2),
-            Presence::Present(&alloc::string::String::from("pending"))
+            ev.value_at(&db, RowKind::Old, 2),
+            Value::String("pending".into())
         );
-        assert_eq!(ev.int_at(RowKind::Pk, 0), Presence::Present(&7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(7));
     }
 
     #[test]
@@ -448,15 +449,15 @@ mod tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Delete);
-        assert!(ev.changed_columns().is_empty());
-        assert_eq!(ev.int_at(RowKind::Old, 0), Presence::Present(&9));
-        assert_eq!(ev.int_at(RowKind::Old, 1), Presence::Present(&500));
+        assert!(ev.changed_columns(&db).is_empty());
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0), Value::Int(9));
+        assert_eq!(ev.value_at(&db, RowKind::Old, 1), Value::Int(500));
         assert_eq!(
-            ev.string_at(RowKind::Old, 2),
-            Presence::Present(&alloc::string::String::from("paid"))
+            ev.value_at(&db, RowKind::Old, 2),
+            Value::String("paid".into())
         );
-        assert_eq!(ev.int_at(RowKind::Pk, 0), Presence::Present(&9));
-        assert_eq!(ev.int_at(RowKind::New, 0), Presence::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(9));
+        assert_eq!(ev.value_at(&db, RowKind::New, 0), Value::Missing);
     }
 
     #[test]

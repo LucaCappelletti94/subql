@@ -1,6 +1,6 @@
 //! SQL literal parsing: sqlparser AST -> typed [`Value`].
 //!
-//! The compiler emits `PushLiteral(Value<B>)` and `LoadColumn(col, kind)`
+//! The compiler emits `PushLiteral(Value<B>)` and `LoadColumn(col)`
 //! against a specific [`crate::backend::Backend`]. To keep those two in
 //! step, SQL literals need backend-aware coercion: `WHERE bool_col = true`
 //! on Postgres produces `Value::<Postgres>::Bool(true)` (Rust `bool`), on

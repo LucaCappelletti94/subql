@@ -27,7 +27,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use crate::backend::{CdcEvent, Postgres, RowKind, ScalarKind, Value};
+use crate::backend::{CdcEvent, Postgres, RowKind, Value};
 use crate::compiler::bytecode::{BytecodeProgram, Instruction};
 use crate::compiler::canonicalize::{hash_sql, normalize_sql};
 use crate::compiler::parser::parse_and_compile;
@@ -35,8 +35,9 @@ use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
 use crate::testing::TestEvent;
-use crate::wal::{MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Parser, WalParser};
+use crate::wal::{parse_maxwell, parse_wal2json_v1, parse_wal2json_v2};
 use crate::{catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use pg_walstream::{Lsn, PgOutputDecoder};
 
 /// Build a permissive fuzz schema as a [`ParserDB`].
 ///
@@ -79,40 +80,11 @@ fn arb_value(u: &mut Unstructured<'_>) -> arbitrary::Result<Value<Postgres>> {
     }
 }
 
-/// Generate a [`ScalarKind`] for `LoadColumn`.
-///
-/// Draws from every one of the 13 kinds so the VM's per-scalar
-/// dispatch surface is exercised on every accessor. When the drawn
-/// kind does not match the underlying [`Value`] at that column, the
-/// event's accessor returns [`crate::backend::Presence::Missing`]; the
-/// VM lifts that into `Value::Missing` and keeps evaluating. That
-/// mismatch path is desirable coverage, not a bug.
-fn arb_scalar_kind(u: &mut Unstructured<'_>) -> arbitrary::Result<ScalarKind> {
-    Ok(match u.int_in_range(0u8..=12)? {
-        0 => ScalarKind::Bool,
-        1 => ScalarKind::Int,
-        2 => ScalarKind::Float,
-        3 => ScalarKind::String,
-        4 => ScalarKind::Bytes,
-        5 => ScalarKind::Uuid,
-        6 => ScalarKind::Timestamp,
-        7 => ScalarKind::TimestampTz,
-        8 => ScalarKind::Date,
-        9 => ScalarKind::Time,
-        10 => ScalarKind::Decimal,
-        11 => ScalarKind::Json,
-        _ => ScalarKind::Jsonb,
-    })
-}
-
 /// Generate an [`Instruction<Postgres>`] from fuzzer-controlled bytes.
 fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction<Postgres>> {
     match u.int_in_range(0u8..=23)? {
         0 => Ok(Instruction::PushLiteral(arb_value(u)?)),
-        1 => Ok(Instruction::LoadColumn(
-            u.int_in_range(0u16..=63)?,
-            arb_scalar_kind(u)?,
-        )),
+        1 => Ok(Instruction::LoadColumn(u.int_in_range(0u16..=63)?)),
         2 => Ok(Instruction::Equal),
         3 => Ok(Instruction::NotEqual),
         4 => Ok(Instruction::LessThan),
@@ -204,7 +176,7 @@ pub fn harness_vm_eval(data: &[u8]) {
     let event = TestEvent::<Postgres>::insert(0, cells);
 
     let mut vm = Vm::<Postgres>::new();
-    let _ = vm.eval(&program, &event, RowKind::New);
+    let _ = vm.eval(&program, &event, RowKind::New, &fuzz_catalog());
 }
 
 /// Feed raw bytes to shard deserialization.
@@ -493,16 +465,15 @@ pub fn harness_wal_json_postparse(data: &[u8]) {
         return;
     };
 
-    let catalog = fuzz_catalog();
     match parser_kind {
         0 => {
-            let _ = Wal2JsonV1Parser.parse_wal_message(&bytes, &catalog);
+            let _ = parse_wal2json_v1(&bytes);
         }
         1 => {
-            let _ = Wal2JsonV2Parser.parse_wal_message(&bytes, &catalog);
+            let _ = parse_wal2json_v2(&bytes);
         }
         _ => {
-            let _ = MaxwellParser.parse_wal_message(&bytes, &catalog);
+            let _ = parse_maxwell(&bytes);
         }
     }
 }
@@ -1094,25 +1065,18 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
 /// the cursor-parsing paths in every message-type branch (single-message
 /// mode) and the relation-cache cross-message state (sequenced mode).
 ///
-/// Contract: panics are bugs. Any `Err(WalParseError)` is fine.
+/// Contract: panics are bugs. Any decode error is fine.
 pub fn harness_pgoutput(data: &[u8]) {
-    let catalog = fuzz_catalog();
-
-    // Single-message mode: the whole input is one pgoutput message.
-    // Exercises the message-type dispatch and cursor parsing of every
-    // tuple-bearing branch (I/U/D/R/T).
+    // Single-message mode: the whole input is one pgoutput message body.
     {
-        let parser = PgOutputParser::new();
-        let _ = parser.parse_wal_message(data, &catalog);
+        let mut decoder = PgOutputDecoder::with_protocol_version(1);
+        let _ = decoder.decode_message(data.to_vec(), Lsn::new(0));
     }
 
-    // Sequenced mode: up to 8 length-prefixed chunks fed through the
-    // same parser instance. Lets the mutator populate the relation
-    // cache with one chunk and reference it from a later chunk,
-    // surfacing cache-mismatch and replica-identity bugs that a
-    // single-message harness cannot reach.
+    // Sequenced mode: up to 8 length-prefixed chunks through one decoder
+    // so a relation chunk can prime the cache for a later chunk.
     {
-        let parser = PgOutputParser::new();
+        let mut decoder = PgOutputDecoder::with_protocol_version(1);
         let mut cur = data;
         for _ in 0..8 {
             if cur.len() < 2 {
@@ -1123,7 +1087,7 @@ pub fn harness_pgoutput(data: &[u8]) {
             let take = len.min(cur.len());
             let (chunk, rest) = cur.split_at(take);
             cur = rest;
-            let _ = parser.parse_wal_message(chunk, &catalog);
+            let _ = decoder.decode_message(chunk.to_vec(), Lsn::new(0));
         }
     }
 }
@@ -1133,8 +1097,8 @@ pub fn harness_pgoutput(data: &[u8]) {
 ///
 /// Drives an arbitrary DML stream through [`crate::PgSqliteEmuSource`],
 /// which internally re-encodes each session changeset as pgoutput wire
-/// bytes and feeds them through the production [`PgOutputParser`], and
-/// dispatches every emitted [`crate::PgOutputEvent`] through a
+/// bytes, decodes them with `pg_walstream`'s `PgOutputDecoder`, and
+/// dispatches every emitted [`crate::ChangeEvent`] through a
 /// populated [`SubscriptionEngine`]. Exercises the whole pipeline
 /// (catalog plus pg2sqlite plus session extension plus changeset->
 /// pgoutput encode plus pgoutput decode plus VM dispatch) on every
@@ -1215,7 +1179,7 @@ pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
 #[cfg(feature = "pg-sqlite-emu")]
 struct E2eFixture {
     source: crate::PgSqliteEmuSource,
-    engine: SubscriptionEngine<crate::PgOutputEvent, DefaultIds, ParserDB>,
+    engine: SubscriptionEngine<crate::ChangeEvent, DefaultIds, ParserDB>,
     table_id: crate::TableId,
 }
 
@@ -1243,7 +1207,7 @@ impl E2eFixture {
         let table_id = catalog_helpers::table_id(source.pg_catalog(), "orders")
             .expect("fuzz fixture orders table must resolve");
 
-        let mut engine: SubscriptionEngine<crate::PgOutputEvent, DefaultIds, ParserDB> =
+        let mut engine: SubscriptionEngine<crate::ChangeEvent, DefaultIds, ParserDB> =
             SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
         for (consumer_id, sql) in Self::SUBSCRIPTIONS {
             engine
@@ -1414,7 +1378,7 @@ mod tests {
     fn instruction_kind(instr: &Instruction<Postgres>) -> u8 {
         match instr {
             Instruction::PushLiteral(_) => 0,
-            Instruction::LoadColumn(_, _) => 1,
+            Instruction::LoadColumn(_) => 1,
             Instruction::Equal => 2,
             Instruction::NotEqual => 3,
             Instruction::LessThan => 4,

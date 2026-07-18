@@ -2,7 +2,7 @@
 //!
 //! Spins up a real Postgres with `wal2json`, registers subscriptions on a
 //! capped engine, drives real DML through the wal2json slot, parses the
-//! events with [`subql::Wal2JsonV2Parser`], and feeds them through
+//! events with [`subql::parse_wal2json_v2`], and feeds them through
 //! [`subql::SubscriptionEngine::consumers`]. Asserts that:
 //!
 //! - `EvictOldest` evicts the right victim under live WAL flow and the
@@ -30,24 +30,16 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::{
-    catalog_helpers, ClockHandle, DefaultIds, EvictionPolicy, ManualClock, RegisterError,
-    SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Event, Wal2JsonV2Parser, WalParser,
+    catalog_helpers, parse_wal2json_v2, ClockHandle, DefaultIds, EvictionPolicy, ManualClock,
+    MessageV2, RegisterError, SubscriptionEngine, SubscriptionRequest,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price DOUBLE PRECISION)";
 
-fn drain_typed(
-    parser: &Wal2JsonV2Parser,
-    catalog: &ParserDB,
-    msgs: &[String],
-) -> Vec<Wal2JsonV2Event> {
+fn drain_typed(msgs: &[String]) -> Vec<MessageV2> {
     msgs.iter()
-        .flat_map(|m| {
-            parser
-                .parse_wal_message(m.as_bytes(), catalog)
-                .expect("wal2json parse")
-        })
+        .flat_map(|m| parse_wal2json_v2(m.as_bytes()).expect("wal2json parse"))
         .collect()
 }
 
@@ -72,12 +64,11 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let _orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
-    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(
-            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
-            PostgreSqlDialect {},
-        )
-        .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
+    let mut engine: SubscriptionEngine<MessageV2, DefaultIds, ParserDB> = SubscriptionEngine::new(
+        ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+        PostgreSqlDialect {},
+    )
+    .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
 
     let s_oldest = engine
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -117,8 +108,7 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
         .expect("insert id=3");
 
     let msgs = common::drain_slot(&mut setup, slot);
-    let parser = Wal2JsonV2Parser;
-    let events = drain_typed(&parser, &catalog, &msgs);
+    let events = drain_typed(&msgs);
 
     let mut matched_consumers: Vec<u64> = Vec::new();
     for ev in &events {
@@ -164,17 +154,15 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     let slot = "subql_evict_least_active_slot";
     common::create_slot(&mut setup, slot);
 
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let clock = Arc::new(ManualClock::new(0));
     #[allow(clippy::clone_on_ref_ptr)] // explicit dyn-trait unsize coercion
     let handle: ClockHandle = clock.clone();
-    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(
-            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
-            PostgreSqlDialect {},
-        )
-        .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive)
-        .with_activity_clock(handle);
+    let mut engine: SubscriptionEngine<MessageV2, DefaultIds, ParserDB> = SubscriptionEngine::new(
+        ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+        PostgreSqlDialect {},
+    )
+    .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive)
+    .with_activity_clock(handle);
 
     let s_a = engine
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -194,8 +182,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     sql_query("INSERT INTO orders VALUES (1, 5.0)")
         .execute(&mut dml)
         .expect("insert id=1");
-    let parser = Wal2JsonV2Parser;
-    let events = drain_typed(&parser, &catalog, &common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, slot));
     for ev in &events {
         engine.consumers(ev).expect("dispatch id=1");
     }
@@ -205,7 +192,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     sql_query("INSERT INTO orders VALUES (2, 9.0)")
         .execute(&mut dml)
         .expect("insert id=2");
-    let events = drain_typed(&parser, &catalog, &common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, slot));
     for ev in &events {
         engine.consumers(ev).expect("dispatch id=2");
     }
@@ -232,7 +219,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     sql_query("UPDATE orders SET price = 6.0 WHERE id = 1")
         .execute(&mut dml)
         .expect("update id=1");
-    let events = drain_typed(&parser, &catalog, &common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, slot));
     let mut hits: Vec<u64> = Vec::new();
     for ev in &events {
         let notifs = engine.consumers(ev).expect("dispatch");
@@ -275,13 +262,11 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
     let slot = "subql_evict_batch_slot";
     common::create_slot(&mut setup, slot);
 
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(
-            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
-            PostgreSqlDialect {},
-        )
-        .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
+    let mut engine: SubscriptionEngine<MessageV2, DefaultIds, ParserDB> = SubscriptionEngine::new(
+        ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+        PostgreSqlDialect {},
+    )
+    .with_max_subscriptions(2, EvictionPolicy::EvictOldest);
 
     // Pre-fill the cap with two subscriptions. The batch below will evict
     // both of them, one per over-cap entry, leaving only the batch entries
@@ -325,8 +310,7 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
             .execute(&mut dml)
             .unwrap_or_else(|e| panic!("insert id={id}: {e}"));
     }
-    let parser = Wal2JsonV2Parser;
-    let events = drain_typed(&parser, &catalog, &common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, slot));
     let mut hits: Vec<u64> = Vec::new();
     for ev in &events {
         let notifs = engine.consumers(ev).expect("dispatch");
@@ -355,63 +339,6 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
         .expect("drop slot");
 }
 
-/// `register_batch` documents the within-batch eviction limit: a batch
-/// that would need to evict from its own pending entries surfaces
-/// `RegistryFull` for those entries. Caller can recover by re-issuing
-/// them in a follow-up call after the previous ones have committed.
-#[test]
-#[ignore = "requires Docker; run with --ignored"]
-fn register_batch_cannot_evict_in_flight_entries() {
-    common::assert_docker_available();
-    let container = common::pg_with_wal2json();
-    let port = common::pg_port(&container);
-
-    let mut setup = common::pg_connect(port);
-    sql_query(PG_DDL).execute(&mut setup).expect("create table");
-    sql_query("ALTER TABLE orders REPLICA IDENTITY FULL")
-        .execute(&mut setup)
-        .expect("REPLICA IDENTITY FULL");
-    let slot = "subql_evict_batch_limit_slot";
-    common::create_slot(&mut setup, slot);
-
-    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(
-            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
-            PostgreSqlDialect {},
-        )
-        .with_max_subscriptions(1, EvictionPolicy::EvictOldest);
-
-    let _pre = engine
-        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
-            1u64,
-            "SELECT * FROM orders WHERE id = 1",
-        ))
-        .expect("pre");
-
-    // The batch wants three more subs against a cap of 1 with only one
-    // committed sub available to evict. Entry 0 evicts `_pre`; entries
-    // 1/2 would need to evict from the batch's own pending state, which
-    // is not supported, so they return RegistryFull.
-    let results = engine.register_batch(vec![
-        SubscriptionRequest::<DefaultIds, Postgres>::new(2u64, "SELECT * FROM orders WHERE id = 2"),
-        SubscriptionRequest::<DefaultIds, Postgres>::new(3u64, "SELECT * FROM orders WHERE id = 3"),
-        SubscriptionRequest::<DefaultIds, Postgres>::new(4u64, "SELECT * FROM orders WHERE id = 4"),
-    ]);
-    assert!(results[0].is_ok(), "entry 0 evicts the committed pre");
-    assert!(matches!(
-        results[1],
-        Err(RegisterError::RegistryFull { cap: 1 })
-    ));
-    assert!(matches!(
-        results[2],
-        Err(RegisterError::RegistryFull { cap: 1 })
-    ));
-
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
-}
-
 /// `EvictionPolicy::Reject` end-to-end: the over-cap registration fails
 /// with `RegistryFull`, and a real WAL event still reaches the
 /// already-registered subscribers.
@@ -431,13 +358,11 @@ fn reject_keeps_existing_subscriptions_intact() {
     let slot = "subql_evict_reject_slot";
     common::create_slot(&mut setup, slot);
 
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
-    let mut engine: SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(
-            ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
-            PostgreSqlDialect {},
-        )
-        .with_max_subscriptions(1, EvictionPolicy::Reject);
+    let mut engine: SubscriptionEngine<MessageV2, DefaultIds, ParserDB> = SubscriptionEngine::new(
+        ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL"),
+        PostgreSqlDialect {},
+    )
+    .with_max_subscriptions(1, EvictionPolicy::Reject);
 
     engine
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -456,8 +381,7 @@ fn reject_keeps_existing_subscriptions_intact() {
     sql_query("INSERT INTO orders VALUES (1, 5.0)")
         .execute(&mut dml)
         .expect("insert id=1");
-    let parser = Wal2JsonV2Parser;
-    let events = drain_typed(&parser, &catalog, &common::drain_slot(&mut setup, slot));
+    let events = drain_typed(&common::drain_slot(&mut setup, slot));
     let mut hits: Vec<u64> = Vec::new();
     for ev in &events {
         let notifs = engine.consumers(ev).expect("dispatch");

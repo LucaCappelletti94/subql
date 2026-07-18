@@ -21,8 +21,8 @@ use testcontainers::{GenericImage, ImageExt};
 use sql_traits::structs::ParserDB;
 use subql::backend::{MySql, Postgres};
 use subql::{
-    DefaultIds, MaxwellEvent, MaxwellParser, SubscriptionEngine, SubscriptionRequest,
-    Wal2JsonV2Event, Wal2JsonV2Parser, WalParser,
+    parse_maxwell, parse_wal2json_v2, DefaultIds, MaxwellMessage, MessageV2, SubscriptionEngine,
+    SubscriptionRequest,
 };
 
 // ============================================================================
@@ -382,7 +382,7 @@ const SUBSCRIPTIONS: &[(u64, &str)] = &[
     (4, "SELECT * FROM readings WHERE sensor_id = 1"),
 ];
 
-fn setup_pg_engine(catalog: ParserDB) -> SubscriptionEngine<Wal2JsonV2Event, DefaultIds, ParserDB> {
+fn setup_pg_engine(catalog: ParserDB) -> SubscriptionEngine<MessageV2, DefaultIds, ParserDB> {
     let mut engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
     for (consumer_id, sql) in SUBSCRIPTIONS {
         engine
@@ -395,7 +395,9 @@ fn setup_pg_engine(catalog: ParserDB) -> SubscriptionEngine<Wal2JsonV2Event, Def
     engine
 }
 
-fn setup_mysql_engine(catalog: ParserDB) -> SubscriptionEngine<MaxwellEvent, DefaultIds, ParserDB> {
+fn setup_mysql_engine(
+    catalog: ParserDB,
+) -> SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> {
     let mut engine = SubscriptionEngine::new(catalog, MySqlDialect {});
     for (consumer_id, sql) in SUBSCRIPTIONS {
         engine
@@ -412,22 +414,20 @@ fn setup_mysql_engine(catalog: ParserDB) -> SubscriptionEngine<MaxwellEvent, Def
 // Dispatch and collect matched consumers
 // ============================================================================
 
-fn dispatch_events<P>(
-    engine: &mut SubscriptionEngine<P::Event, DefaultIds, ParserDB>,
-    parser: &P,
+fn dispatch_events<E>(
+    engine: &mut SubscriptionEngine<E, DefaultIds, ParserDB>,
+    parse: impl Fn(&[u8]) -> Result<Vec<E>, subql::WalParseError>,
     messages: &[String],
-    catalog: &ParserDB,
 ) -> Vec<BTreeSet<u64>>
 where
-    P: WalParser<ParserDB>,
-    <P::Event as subql::backend::CdcEvent>::Backend: subql::compiler::literals::SqlLiteralParse,
+    E: subql::backend::CdcEvent,
+    E::Backend: subql::compiler::literals::SqlLiteralParse,
 {
     let mut results = Vec::with_capacity(messages.len());
 
     for (i, msg) in messages.iter().enumerate() {
-        let events = parser
-            .parse_wal_message(msg.as_bytes(), catalog)
-            .unwrap_or_else(|e| panic!("Failed to parse message {i}: {e}"));
+        let events =
+            parse(msg.as_bytes()).unwrap_or_else(|e| panic!("Failed to parse message {i}: {e}"));
 
         for event in &events {
             let notifs = engine
@@ -517,13 +517,12 @@ fn cross_db_cdc_parity() {
     let mx_messages = maxwell_read_changes(&maxwell_path, 4);
 
     // Set up engines, one per CDC source
-    let catalog = iot_catalog();
     let mut pg_engine = setup_pg_engine(iot_catalog());
     let mut mx_engine = setup_mysql_engine(iot_catalog());
 
     // Dispatch and collect results
-    let pg_results = dispatch_events(&mut pg_engine, &Wal2JsonV2Parser, &pg_messages, &catalog);
-    let mx_results = dispatch_events(&mut mx_engine, &MaxwellParser, &mx_messages, &catalog);
+    let pg_results = dispatch_events(&mut pg_engine, parse_wal2json_v2, &pg_messages);
+    let mx_results = dispatch_events(&mut mx_engine, parse_maxwell, &mx_messages);
 
     // Expected matched consumer IDs per event.
     //
