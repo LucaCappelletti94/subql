@@ -187,8 +187,9 @@ where
             if ev.kind() != EventKind::Insert {
                 continue;
             }
-            let subql::backend::Value::Int(id) =
-                ev.value_at(&schema, subql::backend::RowKind::New, 0)
+            let subql::backend::Value::Int(id) = ev
+                .value_at(&schema, subql::backend::RowKind::New, 0)
+                .unwrap()
             else {
                 continue;
             };

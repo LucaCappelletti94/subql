@@ -67,12 +67,12 @@ fn canonicalize_cell<E: CdcEvent<Backend = subql::backend::Postgres>>(
     col: ColumnId,
 ) -> CanonicalCell {
     match col {
-        0 => match ev.value_at(db, row, col) {
+        0 => match ev.value_at(db, row, col).unwrap() {
             Value::Null => CanonicalCell::Null,
             Value::Int(v) => CanonicalCell::Int(v),
             _ => CanonicalCell::Missing,
         },
-        1 => match ev.value_at(db, row, col) {
+        1 => match ev.value_at(db, row, col).unwrap() {
             Value::Null => CanonicalCell::Null,
             Value::Float(v) => CanonicalCell::FloatBits(v.to_bits()),
             _ => CanonicalCell::Missing,
@@ -105,7 +105,7 @@ fn canonicalize<E: CdcEvent<Backend = subql::backend::Postgres>>(
     let pk_columns: Vec<ColumnId> = ev.pk_columns(db);
     let pk_ints: Vec<Option<i64>> = pk_columns
         .iter()
-        .map(|&c| match ev.value_at(db, RowKind::Pk, c) {
+        .map(|&c| match ev.value_at(db, RowKind::Pk, c).unwrap() {
             Value::Int(v) => Some(v),
             _ => None,
         })
@@ -252,11 +252,11 @@ fn push_and_poll_observe_identical_event_streams() {
         let first = &push_events[0];
         assert_eq!(first.kind(), EventKind::Insert);
         assert!(matches!(
-            first.value_at(&canon_catalog, RowKind::New, 0),
+            first.value_at(&canon_catalog, RowKind::New, 0).unwrap(),
             Value::Int(v) if v == 1
         ));
         assert!(matches!(
-            first.value_at(&canon_catalog, RowKind::New, 1),
+            first.value_at(&canon_catalog, RowKind::New, 1).unwrap(),
             Value::Float(v) if (v - 10.0).abs() < f64::EPSILON
         ));
 

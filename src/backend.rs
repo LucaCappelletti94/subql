@@ -551,13 +551,15 @@ pub trait CdcEvent {
     /// tuples) resolve the column's type from `db` at decode time. Formats
     /// that already carry their own type state may ignore it.
     ///
-    /// Returns [`Value::Missing`] for cells the source did not carry or
-    /// could not decode, [`Value::Null`] for SQL NULL, and the matching
-    /// typed variant for a present value.
+    /// Returns `Ok(Value::Missing)` for cells the source did not carry,
+    /// `Ok(Value::Null)` for SQL NULL, `Ok(_)` with the matching typed
+    /// variant for a present value, and `Err` when the source carried a
+    /// cell of a known type that cannot be decoded (for example an
+    /// integer above `i64::MAX`).
     fn value_at<DB: DatabaseLike>(
         &self,
         db: &DB,
         row: RowKind,
         col: ColumnId,
-    ) -> Value<Self::Backend>;
+    ) -> Result<Value<Self::Backend>, crate::ValueError>;
 }

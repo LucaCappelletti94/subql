@@ -10,13 +10,22 @@ use super::{
 use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use crate::runtime::indexes::IndexableCell;
 use crate::{
-    compiler::{sql_shape::QueryProjection, Tri, Vm},
+    compiler::{sql_shape::QueryProjection, Tri, Vm, VmError},
     AggDelta, ConsumerNotifications, DispatchError, EventKind, IdTypes, SubscriptionId,
 };
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 use roaring::RoaringBitmap;
 use sql_traits::prelude::DatabaseLike;
+
+/// Map a [`VmError`] surfaced during evaluation into a [`DispatchError`],
+/// preserving a structured cell-decode failure as [`DispatchError::Value`].
+fn dispatch_vm_error(error: VmError) -> DispatchError {
+    match error {
+        VmError::Value(inner) => DispatchError::Value(inner),
+        other => DispatchError::VmError(format!("{other:?}")),
+    }
+}
 
 /// Consumer dictionary translating between ordinals and ConsumerIds.
 ///
@@ -363,12 +372,12 @@ where
 
         let new_match = vm
             .eval(&pred.bytecode, event, RowKind::New, db)
-            .map_err(|e| DispatchError::VmError(format!("{e:?}")))?
+            .map_err(dispatch_vm_error)?
             == Tri::True;
 
         let old_match = vm
             .eval(&pred.bytecode, event, RowKind::Old, db)
-            .map_err(|e| DispatchError::VmError(format!("{e:?}")))?
+            .map_err(dispatch_vm_error)?
             == Tri::True;
 
         if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
@@ -468,7 +477,7 @@ where
 
         let result = vm
             .eval(&pred.bytecode, event, row, db)
-            .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
+            .map_err(dispatch_vm_error)?;
 
         if result == Tri::True {
             if let Some(bitmap) = store.predicate_consumers.get(&pred_id) {
@@ -555,9 +564,21 @@ where
                     return Ok(());
                 };
 
-                let Some(delta) = agg_delta_for_row(spec, weight, |col| {
-                    probe_column_for_agg(event, row, col, arity, db)
-                }) else {
+                let mut decode_err: Option<crate::ValueError> = None;
+                let maybe_delta =
+                    agg_delta_for_row(spec, weight, |col| {
+                        match probe_column_for_agg(event, row, col, arity, db) {
+                            Ok(read) => read,
+                            Err(error) => {
+                                decode_err = Some(error);
+                                AggCellRead::Missing
+                            }
+                        }
+                    });
+                if let Some(error) = decode_err {
+                    return Err(DispatchError::Value(error));
+                }
+                let Some(delta) = maybe_delta else {
                     return Ok(());
                 };
 
@@ -664,9 +685,10 @@ fn probe_column_for_index<E: CdcEvent, DB: DatabaseLike>(
         return ColumnProbe::missing();
     }
     match event.value_at(db, row, col) {
-        Value::Missing => ColumnProbe::missing(),
-        Value::Null => ColumnProbe::null(),
-        v => ColumnProbe::present(IndexableCell::from_value::<E::Backend>(&v)),
+        Ok(Value::Missing) => ColumnProbe::missing(),
+        Ok(Value::Null) => ColumnProbe::null(),
+        Ok(v) => ColumnProbe::present(IndexableCell::from_value::<E::Backend>(&v)),
+        Err(_) => ColumnProbe::undecodable(),
     }
 }
 
@@ -682,12 +704,13 @@ fn probe_column_for_agg<E: CdcEvent, DB: DatabaseLike>(
     col: crate::ColumnId,
     arity: usize,
     db: &DB,
-) -> AggCellRead {
+) -> Result<AggCellRead, crate::ValueError> {
     use core::any::Any;
-    if col as usize >= arity {
-        return AggCellRead::Missing;
+    if usize::from(col) >= arity {
+        return Ok(AggCellRead::Missing);
     }
-    match &event.value_at(db, row, col) {
+    let value = event.value_at(db, row, col)?;
+    Ok(match &value {
         Value::Missing => AggCellRead::Missing,
         Value::Null => AggCellRead::Null,
         Value::Int(i) => {
@@ -710,7 +733,7 @@ fn probe_column_for_agg<E: CdcEvent, DB: DatabaseLike>(
                 })
         }
         _ => AggCellRead::NonNumeric,
-    }
+    })
 }
 
 // Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.

@@ -99,7 +99,9 @@ impl<B: Backend> MinMaxQuery<B> {
         E: CdcEvent<Backend = B>,
         DB: DatabaseLike,
     {
-        event.value_at(db, row, self.agg_column)
+        event
+            .value_at(db, row, self.agg_column)
+            .unwrap_or(Value::Missing)
     }
 
     /// Whether any column the query depends on is absent (`Missing`) in
@@ -109,9 +111,11 @@ impl<B: Backend> MinMaxQuery<B> {
         E: CdcEvent<Backend = B>,
         DB: DatabaseLike,
     {
-        self.dependency_columns
-            .iter()
-            .any(|&col| event.value_at(db, row, col).is_missing())
+        self.dependency_columns.iter().any(|&col| {
+            event
+                .value_at(db, row, col)
+                .map_or(true, |v| v.is_missing())
+        })
     }
 
     /// Whether `candidate` would become the new extreme versus `current`.

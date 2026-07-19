@@ -58,8 +58,8 @@ const PROTOCOL_VERSION: u8 = 1;
 ///
 /// let event = source.poll_next_event()?.expect("insert reaches the queue");
 /// assert_eq!(event.kind(), EventKind::Insert);
-/// assert_eq!(event.value_at(source.pg_catalog(), RowKind::New, 0), Value::Int(7));
-/// assert_eq!(event.value_at(source.pg_catalog(), RowKind::New, 1), Value::Int(250));
+/// assert_eq!(event.value_at(source.pg_catalog(), RowKind::New, 0).unwrap(), Value::Int(7));
+/// assert_eq!(event.value_at(source.pg_catalog(), RowKind::New, 1).unwrap(), Value::Int(250));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct PgSqliteEmuSource {
@@ -193,7 +193,7 @@ impl PgSqliteEmuSource {
     /// let event = source.poll_next_event()?.expect("one event pending");
     /// assert_eq!(event.kind(), EventKind::Insert);
     /// assert_eq!(
-    ///     event.value_at(source.pg_catalog(), RowKind::New, 1),
+    ///     event.value_at(source.pg_catalog(), RowKind::New, 1).unwrap(),
     ///     Value::String("paid".to_string()),
     /// );
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -776,15 +776,15 @@ mod tests {
         let ev = src.poll_next_event().unwrap().expect("one event pending");
         assert_eq!(ev.kind(), crate::EventKind::Insert);
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::New, 0),
+            ev.value_at(src.pg_catalog(), RowKind::New, 0).unwrap(),
             Value::Int(1)
         );
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::New, 1),
+            ev.value_at(src.pg_catalog(), RowKind::New, 1).unwrap(),
             Value::Int(250)
         );
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::New, 2),
+            ev.value_at(src.pg_catalog(), RowKind::New, 2).unwrap(),
             Value::String("paid".into())
         );
         assert!(src.poll_next_event().unwrap().is_none());
@@ -802,21 +802,24 @@ mod tests {
             .unwrap();
         let ev = src.poll_next_event().unwrap().expect("update event");
         assert_eq!(ev.kind(), crate::EventKind::Update);
-        assert_eq!(ev.value_at(src.pg_catalog(), RowKind::Pk, 0), Value::Int(5));
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::Old, 1),
+            ev.value_at(src.pg_catalog(), RowKind::Pk, 0).unwrap(),
+            Value::Int(5)
+        );
+        assert_eq!(
+            ev.value_at(src.pg_catalog(), RowKind::Old, 1).unwrap(),
             Value::Int(100)
         );
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::Old, 2),
+            ev.value_at(src.pg_catalog(), RowKind::Old, 2).unwrap(),
             Value::String("pending".into())
         );
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::New, 1),
+            ev.value_at(src.pg_catalog(), RowKind::New, 1).unwrap(),
             Value::Int(100)
         );
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::New, 2),
+            ev.value_at(src.pg_catalog(), RowKind::New, 2).unwrap(),
             Value::String("shipped".into())
         );
     }
@@ -852,29 +855,29 @@ mod tests {
 
         assert_eq!(del.kind(), crate::EventKind::Delete);
         assert_eq!(
-            del.value_at(src.pg_catalog(), RowKind::Old, 0),
+            del.value_at(src.pg_catalog(), RowKind::Old, 0).unwrap(),
             Value::Int(7)
         );
         assert_eq!(
-            del.value_at(src.pg_catalog(), RowKind::Old, 1),
+            del.value_at(src.pg_catalog(), RowKind::Old, 1).unwrap(),
             Value::Int(500)
         );
         assert_eq!(
-            del.value_at(src.pg_catalog(), RowKind::Old, 2),
+            del.value_at(src.pg_catalog(), RowKind::Old, 2).unwrap(),
             Value::String("paid".into())
         );
 
         assert_eq!(ins.kind(), crate::EventKind::Insert);
         assert_eq!(
-            ins.value_at(src.pg_catalog(), RowKind::New, 0),
+            ins.value_at(src.pg_catalog(), RowKind::New, 0).unwrap(),
             Value::Int(8)
         );
         assert_eq!(
-            ins.value_at(src.pg_catalog(), RowKind::New, 1),
+            ins.value_at(src.pg_catalog(), RowKind::New, 1).unwrap(),
             Value::Int(500)
         );
         assert_eq!(
-            ins.value_at(src.pg_catalog(), RowKind::New, 2),
+            ins.value_at(src.pg_catalog(), RowKind::New, 2).unwrap(),
             Value::String("paid".into())
         );
     }
@@ -892,15 +895,15 @@ mod tests {
         let ev = src.poll_next_event().unwrap().expect("delete event");
         assert_eq!(ev.kind(), crate::EventKind::Delete);
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::Old, 0),
+            ev.value_at(src.pg_catalog(), RowKind::Old, 0).unwrap(),
             Value::Int(9)
         );
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::Old, 1),
+            ev.value_at(src.pg_catalog(), RowKind::Old, 1).unwrap(),
             Value::Int(500)
         );
         assert_eq!(
-            ev.value_at(src.pg_catalog(), RowKind::Old, 2),
+            ev.value_at(src.pg_catalog(), RowKind::Old, 2).unwrap(),
             Value::String("paid".into())
         );
     }

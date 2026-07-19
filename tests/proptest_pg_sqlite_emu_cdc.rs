@@ -109,19 +109,19 @@ fn assert_row_matches(
     expected: &Row,
 ) -> Result<(), TestCaseError> {
     prop_assert_eq!(
-        event.value_at(db, side, 0),
+        event.value_at(db, side, 0).unwrap(),
         Value::Int(expected.id),
         "{:?} side id mismatch",
         side,
     );
     prop_assert_eq!(
-        event.value_at(db, side, 1),
+        event.value_at(db, side, 1).unwrap(),
         Value::Float(expected.price),
         "{:?} side price mismatch",
         side,
     );
     prop_assert_eq!(
-        event.value_at(db, side, 2),
+        event.value_at(db, side, 2).unwrap(),
         Value::String(expected.status.clone()),
         "{:?} side status mismatch",
         side,
@@ -214,7 +214,7 @@ proptest! {
                 ExpectedEvent::Insert { pk, new } => {
                     prop_assert_eq!(act.kind(), EventKind::Insert, "event {} kind", i);
                     prop_assert_eq!(
-                        act.value_at(source.pg_catalog(), RowKind::Pk, 0),
+                        act.value_at(source.pg_catalog(), RowKind::Pk, 0).unwrap(),
                         Value::Int(*pk),
                         "event {} pk",
                         i,
@@ -229,7 +229,7 @@ proptest! {
                 } => {
                     prop_assert_eq!(act.kind(), EventKind::Update, "event {} kind", i);
                     prop_assert_eq!(
-                        act.value_at(source.pg_catalog(), RowKind::Pk, 0),
+                        act.value_at(source.pg_catalog(), RowKind::Pk, 0).unwrap(),
                         Value::Int(*pk),
                         "event {} pk",
                         i,
@@ -250,7 +250,7 @@ proptest! {
                 ExpectedEvent::Delete { pk, old } => {
                     prop_assert_eq!(act.kind(), EventKind::Delete, "event {} kind", i);
                     prop_assert_eq!(
-                        act.value_at(source.pg_catalog(), RowKind::Pk, 0),
+                        act.value_at(source.pg_catalog(), RowKind::Pk, 0).unwrap(),
                         Value::Int(*pk),
                         "event {} pk",
                         i,

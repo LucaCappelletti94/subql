@@ -93,21 +93,25 @@ pub fn parse_wal2json_v1(bytes: &[u8]) -> Result<Vec<ChangeV1>, WalParseError> {
 // ---------------------------------------------------------------------------
 
 /// Decode one wal2json JSON cell against the catalog's declared type.
-/// `None` (the wire did not carry the column) yields [`Value::Missing`]; a
-/// JSON null yields [`Value::Null`].
+/// `None` (the wire did not carry the column) yields `Ok(Value::Missing)`,
+/// a JSON null yields `Ok(Value::Null)`, and a carried cell of a known
+/// kind that will not decode yields `Err`.
 fn decode_cell<DB: DatabaseLike>(
     value: Option<&serde_json::Value>,
     db: &DB,
     table_id: TableId,
     col: ColumnId,
-) -> Value<Postgres> {
+) -> Result<Value<Postgres>, crate::ValueError> {
     match value {
-        None => Value::Missing,
-        Some(v) if v.is_null() => Value::Null,
-        Some(v) => catalog_helpers::column_scalar_kind(db, table_id, col)
-            .map_or(Value::Missing, |kind| {
-                json_value_to_pg_value_by_kind(v, kind)
-            }),
+        None => Ok(Value::Missing),
+        Some(v) if v.is_null() => Ok(Value::Null),
+        Some(v) => catalog_helpers::column_scalar_kind(db, table_id, col).map_or(
+            Ok(Value::Missing),
+            |kind| match json_value_to_pg_value_by_kind(v, kind) {
+                Value::Missing => Err(crate::ValueError { column: col, kind }),
+                decoded => Ok(decoded),
+            },
+        ),
     }
 }
 
@@ -186,18 +190,23 @@ impl CdcEvent for MessageV2 {
         })
     }
 
-    fn value_at<DB: DatabaseLike>(&self, db: &DB, row: RowKind, col: ColumnId) -> Value<Postgres> {
+    fn value_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
         let Some(table_id) = v2_table_id(self, db) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
-            return Value::Missing;
+            return Ok(Value::Missing);
         }
         let Some(columns) = v2_image(self, row) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         decode_cell(column_value(columns, &name), db, table_id, col)
     }
@@ -289,18 +298,23 @@ impl CdcEvent for ChangeV1 {
         })
     }
 
-    fn value_at<DB: DatabaseLike>(&self, db: &DB, row: RowKind, col: ColumnId) -> Value<Postgres> {
+    fn value_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
         let Ok(table_id) = resolve_table(&self.schema, &self.table, db) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
-            return Value::Missing;
+            return Ok(Value::Missing);
         }
         let Some((names, values)) = v1_image(self, row) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         decode_cell(v1_value(names, values, &name), db, table_id, col)
     }
@@ -365,13 +379,13 @@ mod tests {
         assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
         assert_eq!(ev.checkpoint(), PgLsn::parse("0/16B2270"));
         assert!(ev.checkpoint().is_some());
-        assert_eq!(ev.value_at(&db, RowKind::New, 2), Value::Int(250));
+        assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Int(250));
         assert_eq!(
-            ev.value_at(&db, RowKind::New, 3),
+            ev.value_at(&db, RowKind::New, 3).unwrap(),
             Value::String("paid".into())
         );
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(7));
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 2), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 2).unwrap(), Value::Missing);
     }
 
     #[test]
@@ -391,8 +405,8 @@ mod tests {
         let mut changed = ev.changed_columns(&db);
         changed.sort_unstable();
         assert_eq!(changed, alloc::vec![2u16, 3u16]);
-        assert_eq!(ev.value_at(&db, RowKind::Old, 2), Value::Int(100));
-        assert_eq!(ev.value_at(&db, RowKind::New, 2), Value::Int(250));
+        assert_eq!(ev.value_at(&db, RowKind::Old, 2).unwrap(), Value::Int(100));
+        assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Int(250));
     }
 
     #[test]
@@ -413,8 +427,8 @@ mod tests {
         let ev = changes.remove(0);
         assert_eq!(ev.kind(), EventKind::Delete);
         assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
-        assert_eq!(ev.value_at(&db, RowKind::Old, 0), Value::Int(42));
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(42));
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0).unwrap(), Value::Int(42));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(42));
         assert_eq!(ev.checkpoint(), None);
     }
 
@@ -432,8 +446,14 @@ mod tests {
         .expect("parse");
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].kind(), EventKind::Insert);
-        assert_eq!(changes[0].value_at(&db, RowKind::New, 0), Value::Int(7));
+        assert_eq!(
+            changes[0].value_at(&db, RowKind::New, 0).unwrap(),
+            Value::Int(7)
+        );
         assert_eq!(changes[1].kind(), EventKind::Delete);
-        assert_eq!(changes[1].value_at(&db, RowKind::Old, 0), Value::Int(9));
+        assert_eq!(
+            changes[1].value_at(&db, RowKind::Old, 0).unwrap(),
+            Value::Int(9)
+        );
     }
 }

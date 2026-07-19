@@ -124,6 +124,22 @@ pub enum RegisterError {
     },
 }
 
+/// Error decoding a carried CDC cell into its typed [`crate::backend::Value`].
+///
+/// [`crate::backend::CdcEvent::value_at`] returns this when the source
+/// carried a cell subql cannot represent (for example a MySQL `BIGINT
+/// UNSIGNED` above `i64::MAX`) or that is malformed for the column's
+/// declared type. A cell the source did not carry is `Ok(Value::Missing)`,
+/// not an error.
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+#[error("column {column} carried a value that could not be decoded as its {kind:?} type")]
+pub struct ValueError {
+    /// Column ordinal whose carried cell failed to decode.
+    pub column: crate::ColumnId,
+    /// The catalog scalar kind subql tried to decode the cell into.
+    pub kind: crate::backend::ScalarKind,
+}
+
 /// Errors during event dispatch
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
@@ -177,6 +193,11 @@ pub enum DispatchError {
     /// Caller must re-query the database to obtain the correct count.
     #[error("TRUNCATE on table {0} requires aggregate count reset. Re-query the database")]
     TruncateRequiresReset(crate::TableId),
+
+    /// A carried CDC cell could not be decoded to its declared type
+    /// (for example a value above `i64::MAX` for an integer column).
+    #[error("value decode error: {0}")]
+    Value(#[from] ValueError),
 }
 
 /// Errors during persistence operations

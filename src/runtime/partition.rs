@@ -28,6 +28,11 @@ pub enum CellPresence {
     Null,
     /// The cell carries a value (see [`ColumnProbe::value`]).
     Present,
+    /// The source carried the cell but subql could not decode it to its
+    /// declared type. The prefilter cannot index it, so every predicate
+    /// depending on the column is selected as a candidate and the VM
+    /// surfaces the decode error.
+    Undecodable,
 }
 
 /// Column probe result yielded by
@@ -72,6 +77,16 @@ impl ColumnProbe {
         Self {
             presence: CellPresence::Present,
             value,
+        }
+    }
+
+    /// Convenience: an `Undecodable` cell. The prefilter selects every
+    /// predicate depending on this column so the VM re-reads and errors.
+    #[must_use]
+    pub const fn undecodable() -> Self {
+        Self {
+            presence: CellPresence::Undecodable,
+            value: None,
         }
     }
 }
@@ -332,6 +347,11 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
                     }
                 }
                 CellPresence::Missing => {}
+                CellPresence::Undecodable => {
+                    if let Some(deps) = snapshot.indexes.dependency.get(&col_id) {
+                        candidates |= deps;
+                    }
+                }
             }
         }
 

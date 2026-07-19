@@ -173,7 +173,7 @@ impl<B: Backend> CdcEvent for TestEvent<B> {
         _db: &DB,
         row: RowKind,
         col: ColumnId,
-    ) -> Value<Self::Backend> {
-        self.cell(row, col).cloned().unwrap_or(Value::Missing)
+    ) -> Result<Value<Self::Backend>, crate::ValueError> {
+        Ok(self.cell(row, col).cloned().unwrap_or(Value::Missing))
     }
 }

@@ -440,7 +440,10 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
                 .expect("next_event err")
                 .expect("source closed");
             assert_eq!(ev.kind(), EventKind::Insert);
-            let id = match ev.value_at(&schema, subql::backend::RowKind::New, 0) {
+            let id = match ev
+                .value_at(&schema, subql::backend::RowKind::New, 0)
+                .unwrap()
+            {
                 subql::backend::Value::Int(v) => v,
                 other => panic!("expected int id, got {other:?}"),
             };

@@ -149,6 +149,7 @@ impl<DB: DatabaseLike> crate::CdcSource for SqliteCdcSource<DB> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::backend::{CdcEvent, RowKind, Value};
@@ -190,15 +191,15 @@ mod tests {
         assert_eq!(event.kind(), crate::EventKind::Insert);
         assert_eq!(event.pk_columns(source.catalog()), &[0u16]);
         assert_eq!(
-            event.value_at(source.catalog(), RowKind::New, 0),
+            event.value_at(source.catalog(), RowKind::New, 0).unwrap(),
             Value::Int(7)
         );
         assert_eq!(
-            event.value_at(source.catalog(), RowKind::New, 1),
+            event.value_at(source.catalog(), RowKind::New, 1).unwrap(),
             Value::Int(250)
         );
         assert_eq!(
-            event.value_at(source.catalog(), RowKind::New, 2),
+            event.value_at(source.catalog(), RowKind::New, 2).unwrap(),
             Value::String("paid".into())
         );
         assert!(source.poll_next_event().expect("post-drain poll").is_none());
@@ -251,7 +252,7 @@ mod tests {
         changed.sort_unstable();
         assert!(changed.contains(&2u16));
         assert_eq!(
-            update.value_at(source.catalog(), RowKind::Pk, 0),
+            update.value_at(source.catalog(), RowKind::Pk, 0).unwrap(),
             Value::Int(5)
         );
 
@@ -264,7 +265,7 @@ mod tests {
             .expect("one event");
         assert_eq!(delete.kind(), crate::EventKind::Delete);
         assert_eq!(
-            delete.value_at(source.catalog(), RowKind::Pk, 0),
+            delete.value_at(source.catalog(), RowKind::Pk, 0).unwrap(),
             Value::Int(5)
         );
     }
@@ -309,7 +310,7 @@ mod tests {
             .expect("one event pending");
         assert_eq!(event.kind(), crate::EventKind::Insert);
         assert_eq!(
-            event.value_at(source.catalog(), RowKind::New, 0),
+            event.value_at(source.catalog(), RowKind::New, 0).unwrap(),
             Value::Int(1)
         );
 

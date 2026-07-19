@@ -82,7 +82,7 @@ impl CdcEvent for SqliteChangesetEvent {
         _db: &DB,
         row: RowKind,
         col: ColumnId,
-    ) -> Value<Self::Backend> {
-        self.row_view(row, col).cloned().unwrap_or(Value::Missing)
+    ) -> Result<Value<Self::Backend>, crate::ValueError> {
+        Ok(self.row_view(row, col).cloned().unwrap_or(Value::Missing))
     }
 }

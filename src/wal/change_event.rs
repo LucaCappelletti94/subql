@@ -168,32 +168,43 @@ impl CdcEvent for ChangeEvent {
         changed
     }
 
-    fn value_at<DB: DatabaseLike>(&self, db: &DB, row: RowKind, col: ColumnId) -> Value<Postgres> {
+    fn value_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
         let Some(table_id) = event_table_id(self, db) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
-            return Value::Missing;
+            return Ok(Value::Missing);
         }
         let Some(image) = image_for(self, row) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         match image.get(&name) {
             // A column the wire did not carry, and binary-format cells
             // (which do not appear on subql's text-mode proto v1 streams),
-            // are both undecodable here.
-            None | Some(ColumnValue::Binary(_)) => Value::Missing,
-            Some(ColumnValue::Null) => Value::Null,
-            Some(ColumnValue::Text(bytes)) => {
-                let Some(kind) = catalog_helpers::column_scalar_kind(db, table_id, col) else {
-                    return Value::Missing;
-                };
-                core::str::from_utf8(bytes)
-                    .map_or(Value::Missing, |text| text_to_pg_value_by_kind(text, kind))
-            }
+            // are both Missing here: they escalate to re-execution rather
+            // than surfacing as a decode error.
+            None | Some(ColumnValue::Binary(_)) => Ok(Value::Missing),
+            Some(ColumnValue::Null) => Ok(Value::Null),
+            Some(ColumnValue::Text(bytes)) => catalog_helpers::column_scalar_kind(
+                db, table_id, col,
+            )
+            .map_or(Ok(Value::Missing), |kind| {
+                core::str::from_utf8(bytes).map_or_else(
+                    |_| Err(crate::ValueError { column: col, kind }),
+                    |text| match text_to_pg_value_by_kind(text, kind) {
+                        Value::Missing => Err(crate::ValueError { column: col, kind }),
+                        decoded => Ok(decoded),
+                    },
+                )
+            }),
         }
     }
 }
@@ -240,16 +251,16 @@ mod tests {
         assert_eq!(ev.pk_columns(&db), vec![0u16]);
         assert!(ev.changed_columns(&db).is_empty());
         assert_eq!(ev.checkpoint(), Some(PgLsn(0x10)));
-        assert_eq!(ev.value_at(&db, RowKind::New, 0), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(7));
         assert_eq!(
-            ev.value_at(&db, RowKind::New, 3),
+            ev.value_at(&db, RowKind::New, 3).unwrap(),
             Value::String("paid".into())
         );
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
         // Non-PK column read through Pk is Missing.
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 2), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 2).unwrap(), Value::Missing);
         // Insert carries no old image.
-        assert_eq!(ev.value_at(&db, RowKind::Old, 0), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0).unwrap(), Value::Missing);
     }
 
     #[test]
@@ -283,8 +294,8 @@ mod tests {
         let mut changed = ev.changed_columns(&db);
         changed.sort_unstable();
         assert_eq!(changed, vec![2u16, 3u16]);
-        assert_eq!(ev.value_at(&db, RowKind::Old, 2), Value::Int(100));
-        assert_eq!(ev.value_at(&db, RowKind::New, 2), Value::Int(250));
+        assert_eq!(ev.value_at(&db, RowKind::Old, 2).unwrap(), Value::Int(100));
+        assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Int(250));
     }
 
     #[test]
@@ -311,7 +322,7 @@ mod tests {
         };
         assert!(ev.changed_columns(&db).is_empty());
         // Pre-update PK identifies the row through the old image.
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
     }
 
     #[test]
@@ -331,9 +342,9 @@ mod tests {
         };
         assert_eq!(ev.kind(), EventKind::Delete);
         assert_eq!(ev.pk_columns(&db), vec![0u16]);
-        assert_eq!(ev.value_at(&db, RowKind::Old, 0), Value::Int(9));
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(9));
-        assert_eq!(ev.value_at(&db, RowKind::New, 0), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0).unwrap(), Value::Int(9));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(9));
+        assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Missing);
     }
 
     #[test]
@@ -353,9 +364,9 @@ mod tests {
             metadata: None,
         };
         // Present-but-NULL decodes to Null.
-        assert_eq!(ev.value_at(&db, RowKind::New, 3), Value::Null);
+        assert_eq!(ev.value_at(&db, RowKind::New, 3).unwrap(), Value::Null);
         // Column the wire did not carry decodes to Missing.
-        assert_eq!(ev.value_at(&db, RowKind::New, 1), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Missing);
     }
 
     #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]

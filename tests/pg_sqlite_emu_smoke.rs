@@ -42,33 +42,41 @@ fn insert_round_trips_through_the_emulator() {
 
     // Full row image round-trips through the pgoutput wire.
     assert_eq!(
-        event.value_at(source.pg_catalog(), RowKind::New, 0),
+        event
+            .value_at(source.pg_catalog(), RowKind::New, 0)
+            .unwrap(),
         Value::Int(7)
     );
     assert_eq!(
-        event.value_at(source.pg_catalog(), RowKind::New, 1),
+        event
+            .value_at(source.pg_catalog(), RowKind::New, 1)
+            .unwrap(),
         Value::Float(9.5)
     );
     assert_eq!(
-        event.value_at(source.pg_catalog(), RowKind::New, 2),
+        event
+            .value_at(source.pg_catalog(), RowKind::New, 2)
+            .unwrap(),
         Value::Int(1)
     );
     assert_eq!(
-        event.value_at(source.pg_catalog(), RowKind::New, 3),
+        event
+            .value_at(source.pg_catalog(), RowKind::New, 3)
+            .unwrap(),
         Value::String("paid".to_string()),
     );
 
     // PK view reads the same integer from the new-image (INSERT has no
     // old image).
     assert_eq!(
-        event.value_at(source.pg_catalog(), RowKind::Pk, 0),
+        event.value_at(source.pg_catalog(), RowKind::Pk, 0).unwrap(),
         Value::Int(7)
     );
 
     // Non-PK columns are Missing under RowKind::Pk per the design
     // contract.
     assert_eq!(
-        event.value_at(source.pg_catalog(), RowKind::Pk, 1),
+        event.value_at(source.pg_catalog(), RowKind::Pk, 1).unwrap(),
         Value::Missing
     );
 

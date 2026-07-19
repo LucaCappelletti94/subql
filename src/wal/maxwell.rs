@@ -137,30 +137,38 @@ impl CdcEvent for Message {
             .collect()
     }
 
-    fn value_at<DB: DatabaseLike>(&self, db: &DB, row: RowKind, col: ColumnId) -> Value<MySql> {
+    fn value_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<MySql>, crate::ValueError> {
         let Ok(table_id) = resolve_table(&self.database, &self.table, db) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         if row == RowKind::Pk
             && !catalog_helpers::primary_key_columns(db, table_id)
                 .unwrap_or_default()
                 .contains(&col)
         {
-            return Value::Missing;
+            return Ok(Value::Missing);
         }
         let Some(image) = image_for(self, row) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
-            return Value::Missing;
+            return Ok(Value::Missing);
         };
         match image.get(name.as_str()) {
-            None => Value::Missing,
-            Some(value) if value.is_null() => Value::Null,
-            Some(value) => catalog_helpers::column_scalar_kind(db, table_id, col)
-                .map_or(Value::Missing, |kind| {
-                    json_value_to_mysql_value_by_kind(value, kind)
-                }),
+            None => Ok(Value::Missing),
+            Some(value) if value.is_null() => Ok(Value::Null),
+            Some(value) => catalog_helpers::column_scalar_kind(db, table_id, col).map_or(
+                Ok(Value::Missing),
+                |kind| match json_value_to_mysql_value_by_kind(value, kind) {
+                    Value::Missing => Err(crate::ValueError { column: col, kind }),
+                    decoded => Ok(decoded),
+                },
+            ),
         }
     }
 }
@@ -194,13 +202,13 @@ mod tests {
         assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
         assert!(ev.changed_columns(&db).is_empty());
         assert_eq!(ev.checkpoint(), None);
-        assert_eq!(ev.value_at(&db, RowKind::New, 1), Value::Int(250));
+        assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Int(250));
         assert_eq!(
-            ev.value_at(&db, RowKind::New, 2),
+            ev.value_at(&db, RowKind::New, 2).unwrap(),
             Value::String("paid".into())
         );
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(7));
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 1), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 1).unwrap(), Value::Missing);
     }
 
     #[test]
@@ -213,8 +221,8 @@ mod tests {
         let mut changed = ev.changed_columns(&db);
         changed.sort_unstable();
         assert_eq!(changed, alloc::vec![1u16, 2u16]);
-        assert_eq!(ev.value_at(&db, RowKind::New, 1), Value::Int(250));
-        assert_eq!(ev.value_at(&db, RowKind::Old, 1), Value::Int(100));
+        assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Int(250));
+        assert_eq!(ev.value_at(&db, RowKind::Old, 1).unwrap(), Value::Int(100));
     }
 
     #[test]
@@ -224,9 +232,9 @@ mod tests {
                  "data":{"id":9,"amount":10,"status":"paid"}}"#);
         assert_eq!(ev.kind(), EventKind::Delete);
         assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
-        assert_eq!(ev.value_at(&db, RowKind::Old, 0), Value::Int(9));
-        assert_eq!(ev.value_at(&db, RowKind::Pk, 0), Value::Int(9));
-        assert_eq!(ev.value_at(&db, RowKind::New, 0), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0).unwrap(), Value::Int(9));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(9));
+        assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Missing);
     }
 
     #[test]
@@ -247,7 +255,7 @@ mod tests {
                  "data":{"id":42,"amount":100,"status":"open"}}"#,
         );
         assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.value_at(&db, RowKind::New, 0), Value::Int(42));
+        assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(42));
     }
 
     #[test]
@@ -255,7 +263,24 @@ mod tests {
         let db = orders();
         let ev = one(br#"{"database":"test","table":"orders","type":"insert",
                  "data":{"id":7,"status":null}}"#);
-        assert_eq!(ev.value_at(&db, RowKind::New, 2), Value::Null);
-        assert_eq!(ev.value_at(&db, RowKind::New, 1), Value::Missing);
+        assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Null);
+        assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Missing);
+    }
+
+    #[test]
+    fn value_at_errors_on_unsigned_bigint_above_i64_max() {
+        // A MySQL BIGINT UNSIGNED cell above i64::MAX cannot be
+        // represented as subql's i64-backed Int, so value_at surfaces a
+        // decode error rather than silently dropping the cell.
+        let db = ParserDB::parse::<MySqlDialect>(
+            "CREATE TABLE t (id INT PRIMARY KEY, big BIGINT UNSIGNED);",
+        )
+        .expect("parse DDL");
+        let ev = one(br#"{"database":"test","table":"t","type":"insert",
+                 "data":{"id":1,"big":18446744073709551615}}"#);
+        assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(1));
+        let err = ev.value_at(&db, RowKind::New, 1).unwrap_err();
+        assert_eq!(err.column, 1);
+        assert_eq!(err.kind, crate::backend::ScalarKind::Int);
     }
 }

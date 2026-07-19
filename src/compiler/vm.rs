@@ -63,6 +63,10 @@ pub enum VmError {
     /// Program terminated with a stack shape not reducible to a single
     /// `Tri`. Compiler bug.
     MalformedProgram,
+
+    /// A carried cell could not be decoded to its declared type, surfaced
+    /// from [`crate::backend::CdcEvent::value_at`].
+    Value(crate::ValueError),
 }
 
 /// Slot on the VM's evaluation stack.
@@ -240,7 +244,7 @@ impl<B: Backend> Vm<B> {
             }
 
             Instruction::LoadColumn(col_id) => {
-                let value = event.value_at(db, row, *col_id);
+                let value = event.value_at(db, row, *col_id).map_err(VmError::Value)?;
                 self.stack.push(StackValue::Value(value));
             }
 

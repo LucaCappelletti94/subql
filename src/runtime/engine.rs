@@ -2787,17 +2787,17 @@ where
 // Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
 
 /// Read one primary-key column off a [`CdcEvent`] via [`RowKind::Pk`].
-/// Returns `None` when the cell is [`Value::Missing`] or [`Value::Null`],
-/// so callers upstream can bail out cleanly without materialising a
-/// partial key.
+/// Returns `None` when the cell is [`Value::Missing`], [`Value::Null`], or
+/// carried a value subql could not decode, so callers upstream can bail
+/// out cleanly without materialising a partial key.
 fn extract_pk_value<E: CdcEvent, DB: DatabaseLike>(
     event: &E,
     db: &DB,
     col: crate::ColumnId,
 ) -> Option<Value<E::Backend>> {
     match event.value_at(db, RowKind::Pk, col) {
-        Value::Missing | Value::Null => None,
-        v => Some(v),
+        Ok(Value::Missing | Value::Null) | Err(_) => None,
+        Ok(v) => Some(v),
     }
 }
 
