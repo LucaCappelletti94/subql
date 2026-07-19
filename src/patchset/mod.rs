@@ -17,19 +17,23 @@
 //! # Extension
 //!
 //! [`PgAdapter`] and [`MysqlAdapter`] are plain structs that implement
-//! [`sqlite_diff_rs::Adapter`]. Downstream users who need dispatch for
-//! domain-specific types (custom enums, ranges, uuid variants, ...)
-//! either wrap one of them with their own [`sqlite_diff_rs::Adapter`]
-//! impl that intercepts the columns they own and delegates the rest,
-//! or roll a whole new adapter.
+//! [`sqlite_diff_rs::Adapter`]. For Postgres user-defined types (custom
+//! enums, domains, and the like) that [`PgAdapter`] cannot bind on its
+//! own, wrap it in a [`pg::CustomTypePgAdapter`] and register a
+//! [`pg::PgCustomBinder`] per type, building the native bind with
+//! [`pg::bind_as`]. For anything more exotic, wrap either adapter with a
+//! bespoke [`sqlite_diff_rs::Adapter`] impl that intercepts the columns
+//! it owns and delegates the rest, or roll a whole new adapter.
 //!
 //! # Scope
 //!
 //! `INTEGER`, `TEXT`, `REAL`, and `BLOB`/`BYTEA` already work through
 //! [`sqlite_diff_rs::DefaultBinder`] on both backends. [`PgAdapter`]
-//! additionally dispatches `BOOLEAN`, `UUID`, and `NUMERIC`/`DECIMAL`
-//! natively, and [`MysqlAdapter`] dispatches `BOOLEAN`. Temporal and
-//! json/jsonb native dispatch land as follow-up.
+//! additionally dispatches `BOOLEAN`, `UUID`, `NUMERIC`/`DECIMAL`, the
+//! temporals (`TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, `TIME`), and
+//! `JSON`/`JSONB` natively, with [`pg::CustomTypePgAdapter`] adding
+//! caller-registered `ENUM` and `DOMAIN` binds. [`MysqlAdapter`]
+//! dispatches `BOOLEAN`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -48,7 +52,7 @@ use sqlite_diff_rs::{
 #[cfg(feature = "apply-patchset-postgres")]
 pub mod pg;
 #[cfg(feature = "apply-patchset-postgres")]
-pub use pg::PgAdapter;
+pub use pg::{bind_as, CustomTypePgAdapter, PgAdapter, PgCustomBinder};
 
 #[cfg(feature = "apply-patchset-mysql")]
 pub mod mysql;

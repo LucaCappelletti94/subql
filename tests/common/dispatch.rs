@@ -2,7 +2,7 @@
 //! vehicle (wal2json and pgoutput). Both drive the same two-phase DML on
 //! a Postgres source, emit patchsets, apply them to a SQLite replica
 //! through [`SqliteAdapter`], capture the SQLite session patchset, and
-//! re-apply it to a fresh Postgres through a dispatch-aware [`PgAdapter`].
+//! re-apply it to a fresh Postgres through the shipped [`CustomTypePgAdapter`].
 //!
 //! # Two phases, so update and delete are real patchset ops
 //!
@@ -42,18 +42,16 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use diesel::deserialize::{self, FromSql};
 use diesel::pg::{Pg, PgValue};
-use diesel::query_builder::AstPass;
 use diesel::result::{Error as DieselError, QueryResult};
 use diesel::serialize::{self, IsNull, Output, ToSql};
 use diesel::{sql_query, Connection, PgConnection, QueryableByName, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::SqliteSessionExt;
-use sql_traits::prelude::DatabaseLike;
 use sql_traits::structs::ParserDB;
-use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, PatchSet, Value};
+use sqlite_diff_rs::{Binder, PatchSet, Value};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use subql::backend::SQLite as SqliteBackend;
 use subql::emit::WireTable;
-use subql::patchset::{PgAdapter, SqliteAdapter};
+use subql::patchset::{bind_as, CustomTypePgAdapter, PgCustomBinder, SqliteAdapter};
 use subql::testing::TestEvent;
 use subql::{ChangeEvent, DefaultIds, SubscriptionEngine};
 use uuid::Uuid;
@@ -129,69 +127,38 @@ impl FromSql<SkuType, Pg> for Sku {
     }
 }
 
-struct MoodBinder(Mood);
+struct MoodBinding;
 
-impl Binder<Pg> for MoodBinder {
-    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
-        out.push_bind_param::<MoodType, Mood>(&self.0)
+impl PgCustomBinder<String, Vec<u8>> for MoodBinding {
+    fn bind<'a>(
+        &self,
+        value: &'a Value<String, Vec<u8>>,
+    ) -> QueryResult<Box<dyn Binder<Pg> + Send + 'a>> {
+        match value {
+            Value::Text(s) => Mood::from_label(s)
+                .map(|m| -> Box<dyn Binder<Pg> + Send + 'a> { bind_as::<MoodType, Mood>(m) })
+                .ok_or_else(|| query_error(format!("unknown mood label {s:?}"))),
+            _ => Err(query_error("mood column expects TEXT or NULL")),
+        }
     }
 }
 
-struct SkuBinder(Sku);
+struct SkuBinding;
 
-impl Binder<Pg> for SkuBinder {
-    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
-        out.push_bind_param::<SkuType, Sku>(&self.0)
+impl PgCustomBinder<String, Vec<u8>> for SkuBinding {
+    fn bind<'a>(
+        &self,
+        value: &'a Value<String, Vec<u8>>,
+    ) -> QueryResult<Box<dyn Binder<Pg> + Send + 'a>> {
+        match value {
+            Value::Text(s) => Ok(bind_as::<SkuType, Sku>(Sku(s.clone()))),
+            _ => Err(query_error("sku column expects TEXT or NULL")),
+        }
     }
-}
-
-/// [`PgAdapter`] wrapped with dispatch for the `feeling` (enum) and
-/// `code` (domain) columns, delegating everything else (including the
-/// bool and both UUID columns) to the inner adapter.
-struct DomainAwarePgAdapter<'db, DB: DatabaseLike> {
-    inner: PgAdapter<'db, DB>,
 }
 
 fn query_error(message: impl Into<String>) -> DieselError {
     DieselError::QueryBuilderError(message.into().into())
-}
-
-impl<DB, S, B> Adapter<Pg, S, B> for DomainAwarePgAdapter<'_, DB>
-where
-    DB: DatabaseLike,
-    S: AsRef<str> + Sync,
-    B: AsRef<[u8]> + Sync,
-{
-    fn column_name(&self, table_name: &str, column_index: usize) -> &str {
-        <PgAdapter<'_, DB> as Adapter<Pg, S, B>>::column_name(&self.inner, table_name, column_index)
-    }
-
-    fn bind<'a>(
-        &self,
-        table_name: &str,
-        column_index: usize,
-        value: &'a Value<S, B>,
-    ) -> Result<Box<dyn Binder<Pg> + Send + 'a>, DieselError> {
-        match <PgAdapter<'_, DB> as Adapter<Pg, S, B>>::column_name(
-            &self.inner,
-            table_name,
-            column_index,
-        ) {
-            "feeling" => match value {
-                Value::Text(s) => Mood::from_label(s.as_ref())
-                    .map(|m| -> Box<dyn Binder<Pg> + Send + 'a> { Box::new(MoodBinder(m)) })
-                    .ok_or_else(|| query_error(format!("unknown mood label {:?}", s.as_ref()))),
-                Value::Null => Ok(Box::new(DefaultBinder::from(value))),
-                _ => Err(query_error("mood column expects TEXT or NULL")),
-            },
-            "code" => match value {
-                Value::Text(s) => Ok(Box::new(SkuBinder(Sku(s.as_ref().to_owned())))),
-                Value::Null => Ok(Box::new(DefaultBinder::from(value))),
-                _ => Err(query_error("sku column expects TEXT or NULL")),
-            },
-            _ => self.inner.bind(table_name, column_index, value),
-        }
-    }
 }
 
 // ============================================================================
@@ -517,7 +484,7 @@ pub fn mutate_dml(pg: &mut PgConnection) {
 /// Applies the seed patchset to a fresh SQLite replica, then (with a
 /// session tracking) the mutate patchset, so the session records a real
 /// update and delete. That session patchset is re-applied to a
-/// re-seeded Postgres through the dispatch-aware [`PgAdapter`], and row
+/// re-seeded Postgres through the shipped [`CustomTypePgAdapter`], and row
 /// parity is asserted at every step. Update and delete match on the UUID
 /// primary key, bound natively.
 pub fn finish_loop(
@@ -571,9 +538,9 @@ pub fn finish_loop(
 
     let pg_engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(subql_catalog(), PostgreSqlDialect {});
-    let pg_adapter = DomainAwarePgAdapter {
-        inner: PgAdapter::new(pg_engine.database()),
-    };
+    let pg_adapter = CustomTypePgAdapter::new(pg_engine.database())
+        .register("mood", MoodBinding)
+        .register("sku", SkuBinding);
 
     pg_engine.apply_patchset(seed, pg, &pg_adapter).unwrap();
     assert_eq!(load_pg(pg), seed_pg_rows(), "Postgres after re-seed");
