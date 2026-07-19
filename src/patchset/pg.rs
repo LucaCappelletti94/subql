@@ -29,6 +29,12 @@
 //!   Each column is classified through the catalog's [`ScalarKind`],
 //!   since Postgres has no implicit assignment cast from text to these
 //!   types. Any other wire shape on such a column is rejected.
+//! * `JSON` and `JSONB` get native binds when the wire carries a
+//!   `Value::Text` holding JSON text, parsed through `serde_json`. A
+//!   `JSONB` column normalizes key order and whitespace on store, so a
+//!   round trip preserves the value, not the exact input bytes. Each is
+//!   classified through the catalog's [`ScalarKind`]. Any other wire
+//!   shape on such a column is rejected.
 //!
 //! Every other column falls through to [`sqlite_diff_rs::DefaultBinder`]
 //! which handles the trivial SQLite-to-diesel type mappings (`Integer ->
@@ -46,7 +52,9 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use diesel::pg::Pg;
 use diesel::query_builder::AstPass;
 use diesel::result::{Error as DieselError, QueryResult};
-use diesel::sql_types::{Bool, Date, Numeric, Time, Timestamp, Timestamptz, Uuid as UuidSqlType};
+use diesel::sql_types::{
+    Bool, Date, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid as UuidSqlType,
+};
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TableLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
@@ -185,6 +193,16 @@ where
             Some(ScalarKind::Time) => text_scalar_bind(col_name, value, "time TEXT or NULL", |s| {
                 Some(Box::new(TimeBinder(parse_pg_time(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
             }),
+            Some(ScalarKind::Json) => text_scalar_bind(col_name, value, "json TEXT or NULL", |s| {
+                Some(Box::new(JsonBinder(serde_json::from_str(s).ok()?))
+                    as Box<dyn Binder<Pg> + Send + 'a>)
+            }),
+            Some(ScalarKind::Jsonb) => {
+                text_scalar_bind(col_name, value, "jsonb TEXT or NULL", |s| {
+                    Some(Box::new(JsonbBinder(serde_json::from_str(s).ok()?))
+                        as Box<dyn Binder<Pg> + Send + 'a>)
+                })
+            }
             _ => Ok(Box::new(DefaultBinder::from(value))),
         }
     }
@@ -291,6 +309,28 @@ struct TimeBinder(NaiveTime);
 impl Binder<Pg> for TimeBinder {
     fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         out.push_bind_param::<Time, NaiveTime>(&self.0)
+    }
+}
+
+/// Binder that pushes a JSON document onto the AST as a native [`Json`]
+/// bind. Constructed by [`PgAdapter`] for JSON `Value::Text` on a
+/// Postgres `JSON` column.
+struct JsonBinder(serde_json::Value);
+
+impl Binder<Pg> for JsonBinder {
+    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        out.push_bind_param::<Json, serde_json::Value>(&self.0)
+    }
+}
+
+/// Binder that pushes a JSON document onto the AST as a native [`Jsonb`]
+/// bind. Constructed by [`PgAdapter`] for JSON `Value::Text` on a
+/// Postgres `JSONB` column.
+struct JsonbBinder(serde_json::Value);
+
+impl Binder<Pg> for JsonbBinder {
+    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        out.push_bind_param::<Jsonb, serde_json::Value>(&self.0)
     }
 }
 

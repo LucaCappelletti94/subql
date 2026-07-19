@@ -353,11 +353,13 @@ arbitrary = { version = "1", features = ["derive"] }
 
 # Cross-DB CDC integration test (`tests/cdc_cross_db.rs`) plus the
 # DieselConnector integration test (`tests/reexec_diesel.rs`) which uses
-# in-memory SQLite. `numeric` and `chrono` let the round-trip tests load
-# a `NUMERIC` / `DECIMAL` column back as `bigdecimal::BigDecimal` and the
-# temporal columns back as `chrono` types for the parity assertions,
-# regardless of which apply feature a given test enables.
-diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "numeric", "chrono"] }
+# in-memory SQLite. `numeric`, `chrono`, and `serde_json` let the
+# round-trip tests load a `NUMERIC` / `DECIMAL` column back as
+# `bigdecimal::BigDecimal`, the temporal columns back as `chrono` types,
+# and the `JSON` / `JSONB` columns back as `serde_json::Value` for the
+# parity assertions, regardless of which apply feature a given test
+# enables.
+diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "numeric", "chrono", "serde_json"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 
 # Property-based testing
@@ -451,9 +453,10 @@ executor-diesel-postgres-r2d2 = [
 # the diesel connection. Enables `sqlite-diff-rs`'s `diesel` feature,
 # pulls in diesel's `postgres` backend, turns on diesel's `uuid` feature
 # for native `UUID` binds, `numeric` for native `NUMERIC` / `DECIMAL`
-# binds through `bigdecimal`, and `chrono` for native temporal binds
-# (`TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, `TIME`). Dispatches `BOOLEAN`,
-# `UUID`, `NUMERIC` / `DECIMAL`, and the temporals today; other native PG
+# binds through `bigdecimal`, `chrono` for native temporal binds
+# (`TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, `TIME`), and `serde_json` for
+# native `JSON` / `JSONB` binds. Dispatches `BOOLEAN`, `UUID`, `NUMERIC` /
+# `DECIMAL`, the temporals, and `JSON` / `JSONB` today; other native PG
 # types land as follow-up work.
 apply-patchset-postgres = [
     "executor-diesel-postgres",
@@ -461,6 +464,7 @@ apply-patchset-postgres = [
     "diesel?/uuid",
     "diesel?/numeric",
     "diesel?/chrono",
+    "diesel?/serde_json",
 ]
 # Opt-in: ship `MysqlDieselConnector`, a binlog-position-aware sync connector
 # built on `executor-diesel` + diesel's `mysql` feature. Snapshots taken through

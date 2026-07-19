@@ -41,7 +41,7 @@ use std::time::Duration;
 use bigdecimal::BigDecimal;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use diesel::sql_types::{
-    BigInt, Binary, Bool, Date, Datetime, Integer, Nullable, Numeric, Text, Time, Timestamp,
+    BigInt, Binary, Bool, Date, Datetime, Integer, Json, Nullable, Numeric, Text, Time, Timestamp,
 };
 use diesel::{
     sql_query, Connection, MysqlConnection, QueryableByName, RunQueryDsl, SqliteConnection,
@@ -60,11 +60,11 @@ use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine};
 
 // UUID stored as BINARY(16). MySQL has no native UUID type, so the column
 // classifies as bytes and the 16-byte blob rides WireType::Bytes.
-const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6))";
+const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6), js JSON)";
 // The subql catalog only needs the table shape. `feeling` is an unknown
 // scalar (the enum), so subql treats it as text on the wire.
-const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6));";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT, price TEXT, dt TEXT, ts TEXT, d TEXT, t TEXT);";
+const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6), js JSON);";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT, price TEXT, dt TEXT, ts TEXT, d TEXT, t TEXT, js TEXT);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -99,6 +99,8 @@ struct MyOrder {
     d: NaiveDate,
     #[diesel(sql_type = Time)]
     t: NaiveTime,
+    #[diesel(sql_type = Json)]
+    js: serde_json::Value,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -154,13 +156,20 @@ const fn nt(h: u32, mi: u32, s: u32, us: u32) -> NaiveTime {
     NaiveTime::from_hms_micro_opt(h, mi, s, us).unwrap()
 }
 
+// JSON documents for the `js` (JSON) column, compared structurally as
+// `serde_json::Value` so normalization on either side does not matter.
+const JS_A: &str = r#"{"k":"a"}"#;
+const JS_B: &str = r#"{"k":"b"}"#;
+const JS_C: &str = r#"{"k":"c"}"#;
+const JS_B2: &str = r#"{"k":"b2"}"#;
+
 fn subql_catalog() -> ParserDB {
     ParserDB::parse::<MySqlDialect>(SUBQL_MYSQL_DDL).unwrap()
 }
 
 fn load_mysql(my: &mut MysqlConnection) -> Vec<MyOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, feeling, note, price, dt, ts, d, t FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, feeling, note, price, dt, ts, d, t, js FROM orders ORDER BY id",
     )
     .load(my)
     .unwrap()
@@ -175,7 +184,7 @@ fn load_sqlite(sqlite: &mut SqliteConnection) -> Vec<SqliteOrder> {
 }
 
 fn seed_dml(my: &mut MysqlConnection) {
-    for (id, amount, status, active, token, feeling, note, price, datetime, date, time) in [
+    for (id, amount, status, active, token, feeling, note, price, datetime, date, time, js) in [
         (
             ID_A,
             100,
@@ -188,6 +197,7 @@ fn seed_dml(my: &mut MysqlConnection) {
             "2024-01-15 08:30:00.123456",
             "2024-01-15",
             "08:30:00.123456",
+            JS_A,
         ),
         (
             ID_B,
@@ -201,6 +211,7 @@ fn seed_dml(my: &mut MysqlConnection) {
             "2023-06-20 22:10:05.654321",
             "2023-06-20",
             "22:10:05.654321",
+            JS_B,
         ),
         (
             ID_C,
@@ -214,10 +225,11 @@ fn seed_dml(my: &mut MysqlConnection) {
             "2022-12-31 23:59:59.999999",
             "2022-12-31",
             "23:59:59.999999",
+            JS_C,
         ),
     ] {
         let stmt = format!(
-            "INSERT INTO orders (id, amount, status, active, token, feeling, note, price, dt, ts, d, t) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note}, {price}, '{datetime}', '{datetime}', '{date}', '{time}')",
+            "INSERT INTO orders (id, amount, status, active, token, feeling, note, price, dt, ts, d, t, js) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note}, {price}, '{datetime}', '{datetime}', '{date}', '{time}', '{js}')",
             hex16(id),
             hex16(token)
         );
@@ -227,7 +239,7 @@ fn seed_dml(my: &mut MysqlConnection) {
 
 fn mutate_dml(my: &mut MysqlConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357, dt = '2025-03-03 03:03:03.030303', ts = '2025-03-03 03:03:03.030303', d = '2025-03-03', t = '03:03:03.030303' WHERE id = x'{}'",
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357, dt = '2025-03-03 03:03:03.030303', ts = '2025-03-03 03:03:03.030303', d = '2025-03-03', t = '03:03:03.030303', js = '{JS_B2}' WHERE id = x'{}'",
         hex16(ID_B)
     ))
     .execute(my)
@@ -252,6 +264,7 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             ts: ndt(2024, 1, 15, 8, 30, 0, 123456),
             d: nd(2024, 1, 15),
             t: nt(8, 30, 0, 123456),
+            js: serde_json::from_str(JS_A).unwrap(),
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -266,6 +279,7 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             ts: ndt(2023, 6, 20, 22, 10, 5, 654321),
             d: nd(2023, 6, 20),
             t: nt(22, 10, 5, 654321),
+            js: serde_json::from_str(JS_B).unwrap(),
         },
         MyOrder {
             id: uuid_bytes(ID_C),
@@ -280,6 +294,7 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             ts: ndt(2022, 12, 31, 23, 59, 59, 999999),
             d: nd(2022, 12, 31),
             t: nt(23, 59, 59, 999999),
+            js: serde_json::from_str(JS_C).unwrap(),
         },
     ]
 }
@@ -303,6 +318,7 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             ts: ndt(2024, 1, 15, 8, 30, 0, 123456),
             d: nd(2024, 1, 15),
             t: nt(8, 30, 0, 123456),
+            js: serde_json::from_str(JS_A).unwrap(),
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -317,6 +333,7 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             ts: ndt(2025, 3, 3, 3, 3, 3, 30303),
             d: nd(2025, 3, 3),
             t: nt(3, 3, 3, 30303),
+            js: serde_json::from_str(JS_B2).unwrap(),
         },
     ]
 }
