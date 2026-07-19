@@ -26,10 +26,6 @@ diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future
 # ships.
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
-# sqlite-diff-rs `main`: migrated to pg_walstream 0.8 so subql's 0.8
-# `ChangeEvent` digests through the crate's pg `Digestable`. Repoint at a
-# crates.io release once 0.5.0 ships.
-sqlite-diff-rs = { git = "https://github.com/LucaCappelletti94/sqlite-diff-rs", branch = "main" }
 # Unify pg_walstream across subql and sqlite-diff-rs on subql's fork
 # branch (0.8.0 plus the `PgOutputDecoder`), so the `EventType` the
 # crate's pg `Digestable` consumes is the same type subql's sources
@@ -303,7 +299,7 @@ r2d2 = { version = "0.8", optional = true }
 # alloc` posture, no C deps (the `wal2json` and `maxwell` features pull only
 # serde). `default-features = false` drops the `diesel` and `pg-walstream`
 # reverse adapters, which the feature gates below opt into when needed.
-sqlite-diff-rs = { version = "0.5", default-features = false, features = ["wal2json", "maxwell"] }
+sqlite-diff-rs = { version = "0.5.1", default-features = false, features = ["wal2json", "maxwell"] }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables

@@ -200,11 +200,11 @@ where
 
 const PG_CREATE_MOOD: &str = "CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')";
 const PG_CREATE_SKU: &str = "CREATE DOMAIN sku AS TEXT";
-const PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4), ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME, js JSON, jb JSONB)";
+const PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4), ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME, js JSON, jb JSONB, dp DOUBLE PRECISION, bin BYTEA)";
 /// The subql catalog only needs the table shape. `sku` and `mood` are
 /// unknown scalars, so subql treats their columns as text on the wire.
-const SUBQL_PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4), ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME, js JSON, jb JSONB);";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, code TEXT, feeling TEXT, note TEXT, price TEXT, ts TEXT, tstz TEXT, d TEXT, t TEXT, js TEXT, jb TEXT);";
+const SUBQL_PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4), ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME, js JSON, jb JSONB, dp DOUBLE PRECISION, bin BYTEA);";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, code TEXT, feeling TEXT, note TEXT, price TEXT, ts TEXT, tstz TEXT, d TEXT, t TEXT, js TEXT, jb TEXT, dp REAL, bin BLOB);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -245,6 +245,10 @@ struct PgOrder {
     js: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Jsonb)]
     jb: serde_json::Value,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    dp: f64,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    bin: Vec<u8>,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -275,6 +279,10 @@ struct SqliteOrder {
     d: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     t: String,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    dp: f64,
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    bin: Vec<u8>,
 }
 
 fn uuid(text: &str) -> Uuid {
@@ -310,7 +318,7 @@ const JB_B2: &str = "[7,8,9]";
 
 fn load_pg(conn: &mut PgConnection) -> Vec<PgOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, js, jb FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, js, jb, dp, bin FROM orders ORDER BY id",
     )
     .load(conn)
     .unwrap()
@@ -318,7 +326,7 @@ fn load_pg(conn: &mut PgConnection) -> Vec<PgOrder> {
 
 fn load_sqlite(conn: &mut SqliteConnection) -> Vec<SqliteOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, dp, bin FROM orders ORDER BY id",
     )
     .load(conn)
     .unwrap()
@@ -342,6 +350,8 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             t: nt(8, 30, 0, 123456),
             js: serde_json::from_str(JS_A).unwrap(),
             jb: serde_json::from_str(JB_A).unwrap(),
+            dp: 1.5,
+            bin: vec![0x00, 0x01, 0xde, 0xad, 0xff],
         },
         PgOrder {
             id: uuid(ID_B),
@@ -359,6 +369,8 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             t: nt(22, 10, 5, 654321),
             js: serde_json::from_str(JS_B).unwrap(),
             jb: serde_json::from_str(JB_B).unwrap(),
+            dp: 2.25,
+            bin: vec![0x01, 0x02, 0x03],
         },
         PgOrder {
             id: uuid(ID_C),
@@ -376,6 +388,8 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             t: nt(23, 59, 59, 999999),
             js: serde_json::from_str(JS_C).unwrap(),
             jb: serde_json::from_str(JB_C).unwrap(),
+            dp: 3.75,
+            bin: vec![0xff, 0xfe],
         },
     ]
 }
@@ -402,6 +416,8 @@ fn final_pg_rows() -> Vec<PgOrder> {
             t: nt(8, 30, 0, 123456),
             js: serde_json::from_str(JS_A).unwrap(),
             jb: serde_json::from_str(JB_A).unwrap(),
+            dp: 1.5,
+            bin: vec![0x00, 0x01, 0xde, 0xad, 0xff],
         },
         PgOrder {
             id: uuid(ID_B),
@@ -419,6 +435,8 @@ fn final_pg_rows() -> Vec<PgOrder> {
             t: nt(3, 3, 3, 30303),
             js: serde_json::from_str(JS_B2).unwrap(),
             jb: serde_json::from_str(JB_B2).unwrap(),
+            dp: 4.125,
+            bin: vec![0x0a, 0x14, 0x1e],
         },
     ]
 }
@@ -446,6 +464,8 @@ fn sqlite_view(row: PgOrder) -> SqliteOrder {
         tstz: row.tstz.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string(),
         d: row.d.format("%Y-%m-%d").to_string(),
         t: row.t.format("%H:%M:%S%.6f").to_string(),
+        dp: row.dp,
+        bin: row.bin,
     }
 }
 
@@ -470,9 +490,9 @@ pub fn create_schema(pg: &mut PgConnection) {
 /// Seed phase: insert three rows with UUID primary keys.
 pub fn seed_dml(pg: &mut PgConnection) {
     for stmt in [
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, js, jb) VALUES ('{ID_A}', 100, 'new', true, '{TOKEN_A}', 'SKU-1', 'happy', NULL, 1234.5678, '2024-01-15 08:30:00.123456', '2024-01-15 08:30:00.123456+00', '2024-01-15', '08:30:00.123456', '{JS_A}', '{JB_A}')"),
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, js, jb) VALUES ('{ID_B}', 200, 'new', false, '{TOKEN_B}', 'SKU-2', 'sad', 'packed', 8765.4321, '2023-06-20 22:10:05.654321', '2023-06-20 22:10:05.654321+00', '2023-06-20', '22:10:05.654321', '{JS_B}', '{JB_B}')"),
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, js, jb) VALUES ('{ID_C}', 300, 'new', true, '{TOKEN_C}', 'SKU-3', 'neutral', 'void', NULL, '2022-12-31 23:59:59.999999', '2022-12-31 23:59:59.999999+00', '2022-12-31', '23:59:59.999999', '{JS_C}', '{JB_C}')"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, js, jb, dp, bin) VALUES ('{ID_A}', 100, 'new', true, '{TOKEN_A}', 'SKU-1', 'happy', NULL, 1234.5678, '2024-01-15 08:30:00.123456', '2024-01-15 08:30:00.123456+00', '2024-01-15', '08:30:00.123456', '{JS_A}', '{JB_A}', 1.5, '\\x0001deadff')"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, js, jb, dp, bin) VALUES ('{ID_B}', 200, 'new', false, '{TOKEN_B}', 'SKU-2', 'sad', 'packed', 8765.4321, '2023-06-20 22:10:05.654321', '2023-06-20 22:10:05.654321+00', '2023-06-20', '22:10:05.654321', '{JS_B}', '{JB_B}', 2.25, '\\x010203')"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t, js, jb, dp, bin) VALUES ('{ID_C}', 300, 'new', true, '{TOKEN_C}', 'SKU-3', 'neutral', 'void', NULL, '2022-12-31 23:59:59.999999', '2022-12-31 23:59:59.999999+00', '2022-12-31', '23:59:59.999999', '{JS_C}', '{JB_C}', 3.75, '\\xfffe')"),
     ] {
         sql_query(&stmt).execute(pg).unwrap();
     }
@@ -482,7 +502,7 @@ pub fn seed_dml(pg: &mut PgConnection) {
 /// columns) and delete another, both matched on the UUID primary key.
 pub fn mutate_dml(pg: &mut PgConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357, ts = '2025-03-03 03:03:03.030303', tstz = '2025-03-03 03:03:03.030303+00', d = '2025-03-03', t = '03:03:03.030303', js = '{JS_B2}', jb = '{JB_B2}' WHERE id = '{ID_B}'"
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357, ts = '2025-03-03 03:03:03.030303', tstz = '2025-03-03 03:03:03.030303+00', d = '2025-03-03', t = '03:03:03.030303', js = '{JS_B2}', jb = '{JB_B2}', dp = 4.125, bin = '\\x0a141e' WHERE id = '{ID_B}'"
     ))
     .execute(pg)
     .unwrap();

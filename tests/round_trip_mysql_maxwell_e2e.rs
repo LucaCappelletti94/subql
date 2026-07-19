@@ -41,7 +41,8 @@ use std::time::Duration;
 use bigdecimal::BigDecimal;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use diesel::sql_types::{
-    BigInt, Binary, Bool, Date, Datetime, Integer, Json, Nullable, Numeric, Text, Time, Timestamp,
+    BigInt, Binary, Bool, Date, Datetime, Double, Integer, Json, Nullable, Numeric, Text, Time,
+    Timestamp,
 };
 use diesel::{
     sql_query, Connection, MysqlConnection, QueryableByName, RunQueryDsl, SqliteConnection,
@@ -60,11 +61,11 @@ use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine};
 
 // UUID stored as BINARY(16). MySQL has no native UUID type, so the column
 // classifies as bytes and the 16-byte blob rides WireType::Bytes.
-const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6), js JSON)";
+const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6), js JSON, dp DOUBLE, bin VARBINARY(16))";
 // The subql catalog only needs the table shape. `feeling` is an unknown
 // scalar (the enum), so subql treats it as text on the wire.
-const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6), js JSON);";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT, price TEXT, dt TEXT, ts TEXT, d TEXT, t TEXT, js TEXT);";
+const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6), js JSON, dp DOUBLE, bin VARBINARY(16));";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT, price TEXT, dt TEXT, ts TEXT, d TEXT, t TEXT, js TEXT, dp REAL, bin BLOB);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -101,6 +102,10 @@ struct MyOrder {
     t: NaiveTime,
     #[diesel(sql_type = Json)]
     js: serde_json::Value,
+    #[diesel(sql_type = Double)]
+    dp: f64,
+    #[diesel(sql_type = Binary)]
+    bin: Vec<u8>,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -129,6 +134,10 @@ struct SqliteOrder {
     d: String,
     #[diesel(sql_type = Text)]
     t: String,
+    #[diesel(sql_type = Double)]
+    dp: f64,
+    #[diesel(sql_type = Binary)]
+    bin: Vec<u8>,
 }
 
 /// The 16 UUID bytes as a 32-char lowercase hex string for a MySQL
@@ -169,7 +178,7 @@ fn subql_catalog() -> ParserDB {
 
 fn load_mysql(my: &mut MysqlConnection) -> Vec<MyOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, feeling, note, price, dt, ts, d, t, js FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, feeling, note, price, dt, ts, d, t, js, dp, bin FROM orders ORDER BY id",
     )
     .load(my)
     .unwrap()
@@ -177,14 +186,29 @@ fn load_mysql(my: &mut MysqlConnection) -> Vec<MyOrder> {
 
 fn load_sqlite(sqlite: &mut SqliteConnection) -> Vec<SqliteOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, feeling, note, price, dt, ts, d, t FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, feeling, note, price, dt, ts, d, t, dp, bin FROM orders ORDER BY id",
     )
     .load(sqlite)
     .unwrap()
 }
 
 fn seed_dml(my: &mut MysqlConnection) {
-    for (id, amount, status, active, token, feeling, note, price, datetime, date, time, js) in [
+    for (
+        id,
+        amount,
+        status,
+        active,
+        token,
+        feeling,
+        note,
+        price,
+        datetime,
+        date,
+        time,
+        js,
+        dp,
+        bin,
+    ) in [
         (
             ID_A,
             100,
@@ -198,6 +222,8 @@ fn seed_dml(my: &mut MysqlConnection) {
             "2024-01-15",
             "08:30:00.123456",
             JS_A,
+            "1.5",
+            "0001deadff",
         ),
         (
             ID_B,
@@ -212,6 +238,8 @@ fn seed_dml(my: &mut MysqlConnection) {
             "2023-06-20",
             "22:10:05.654321",
             JS_B,
+            "2.25",
+            "010203",
         ),
         (
             ID_C,
@@ -226,10 +254,12 @@ fn seed_dml(my: &mut MysqlConnection) {
             "2022-12-31",
             "23:59:59.999999",
             JS_C,
+            "3.75",
+            "fffe",
         ),
     ] {
         let stmt = format!(
-            "INSERT INTO orders (id, amount, status, active, token, feeling, note, price, dt, ts, d, t, js) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note}, {price}, '{datetime}', '{datetime}', '{date}', '{time}', '{js}')",
+            "INSERT INTO orders (id, amount, status, active, token, feeling, note, price, dt, ts, d, t, js, dp, bin) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note}, {price}, '{datetime}', '{datetime}', '{date}', '{time}', '{js}', {dp}, x'{bin}')",
             hex16(id),
             hex16(token)
         );
@@ -239,7 +269,7 @@ fn seed_dml(my: &mut MysqlConnection) {
 
 fn mutate_dml(my: &mut MysqlConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357, dt = '2025-03-03 03:03:03.030303', ts = '2025-03-03 03:03:03.030303', d = '2025-03-03', t = '03:03:03.030303', js = '{JS_B2}' WHERE id = x'{}'",
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357, dt = '2025-03-03 03:03:03.030303', ts = '2025-03-03 03:03:03.030303', d = '2025-03-03', t = '03:03:03.030303', js = '{JS_B2}', dp = 4.125, bin = x'0a141e' WHERE id = x'{}'",
         hex16(ID_B)
     ))
     .execute(my)
@@ -265,6 +295,8 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             d: nd(2024, 1, 15),
             t: nt(8, 30, 0, 123456),
             js: serde_json::from_str(JS_A).unwrap(),
+            dp: 1.5,
+            bin: vec![0x00, 0x01, 0xde, 0xad, 0xff],
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -280,6 +312,8 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             d: nd(2023, 6, 20),
             t: nt(22, 10, 5, 654321),
             js: serde_json::from_str(JS_B).unwrap(),
+            dp: 2.25,
+            bin: vec![0x01, 0x02, 0x03],
         },
         MyOrder {
             id: uuid_bytes(ID_C),
@@ -295,6 +329,8 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             d: nd(2022, 12, 31),
             t: nt(23, 59, 59, 999999),
             js: serde_json::from_str(JS_C).unwrap(),
+            dp: 3.75,
+            bin: vec![0xff, 0xfe],
         },
     ]
 }
@@ -319,6 +355,8 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             d: nd(2024, 1, 15),
             t: nt(8, 30, 0, 123456),
             js: serde_json::from_str(JS_A).unwrap(),
+            dp: 1.5,
+            bin: vec![0x00, 0x01, 0xde, 0xad, 0xff],
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -334,6 +372,8 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             d: nd(2025, 3, 3),
             t: nt(3, 3, 3, 30303),
             js: serde_json::from_str(JS_B2).unwrap(),
+            dp: 4.125,
+            bin: vec![0x0a, 0x14, 0x1e],
         },
     ]
 }
@@ -352,6 +392,8 @@ fn sqlite_view(row: &MyOrder) -> SqliteOrder {
         ts: row.ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
         d: row.d.format("%Y-%m-%d").to_string(),
         t: row.t.format("%H:%M:%S%.6f").to_string(),
+        dp: row.dp,
+        bin: row.bin.clone(),
     }
 }
 
