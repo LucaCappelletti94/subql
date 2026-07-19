@@ -353,8 +353,11 @@ arbitrary = { version = "1", features = ["derive"] }
 
 # Cross-DB CDC integration test (`tests/cdc_cross_db.rs`) plus the
 # DieselConnector integration test (`tests/reexec_diesel.rs`) which uses
-# in-memory SQLite.
-diesel = { version = "2", features = ["postgres", "mysql", "sqlite"] }
+# in-memory SQLite. `numeric` lets the round-trip tests load a
+# `NUMERIC` / `DECIMAL` column back as `bigdecimal::BigDecimal` for the
+# decimal parity assertions, regardless of which apply feature a given
+# test enables.
+diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "numeric"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 
 # Property-based testing
@@ -446,13 +449,16 @@ executor-diesel-postgres-r2d2 = [
 # `SubscriptionEngine::apply_patchset` entry point for executing a
 # client-uploaded SQLite session patchset against a Postgres target via
 # the diesel connection. Enables `sqlite-diff-rs`'s `diesel` feature,
-# pulls in diesel's `postgres` backend, and turns on diesel's `uuid`
-# feature for native `UUID` binds. Dispatches `BOOLEAN` and `UUID`
-# today; other native PG types land as follow-up work.
+# pulls in diesel's `postgres` backend, turns on diesel's `uuid` feature
+# for native `UUID` binds, and `numeric` for native `NUMERIC` / `DECIMAL`
+# binds through `bigdecimal`. Dispatches `BOOLEAN`, `UUID`, and
+# `NUMERIC` / `DECIMAL` today; other native PG types land as follow-up
+# work.
 apply-patchset-postgres = [
     "executor-diesel-postgres",
     "sqlite-diff-rs/diesel",
     "diesel?/uuid",
+    "diesel?/numeric",
 ]
 # Opt-in: ship `MysqlDieselConnector`, a binlog-position-aware sync connector
 # built on `executor-diesel` + diesel's `mysql` feature. Snapshots taken through

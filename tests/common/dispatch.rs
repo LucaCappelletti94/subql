@@ -30,8 +30,10 @@
 
 #![allow(dead_code)]
 
+use core::str::FromStr;
 use std::io::Write;
 
+use bigdecimal::BigDecimal;
 use diesel::deserialize::{self, FromSql};
 use diesel::pg::{Pg, PgValue};
 use diesel::query_builder::AstPass;
@@ -192,11 +194,11 @@ where
 
 const PG_CREATE_MOOD: &str = "CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')";
 const PG_CREATE_SKU: &str = "CREATE DOMAIN sku AS TEXT";
-const PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT)";
+const PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4))";
 /// The subql catalog only needs the table shape. `sku` and `mood` are
 /// unknown scalars, so subql treats their columns as text on the wire.
-const SUBQL_PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT);";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, code TEXT, feeling TEXT, note TEXT);";
+const SUBQL_PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4));";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, code TEXT, feeling TEXT, note TEXT, price TEXT);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -223,6 +225,8 @@ struct PgOrder {
     feeling: Mood,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     note: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Numeric>)]
+    price: Option<BigDecimal>,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -243,6 +247,8 @@ struct SqliteOrder {
     feeling: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     note: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    price: Option<String>,
 }
 
 fn uuid(text: &str) -> Uuid {
@@ -251,7 +257,7 @@ fn uuid(text: &str) -> Uuid {
 
 fn load_pg(conn: &mut PgConnection) -> Vec<PgOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, code, feeling, note FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, code, feeling, note, price FROM orders ORDER BY id",
     )
     .load(conn)
     .unwrap()
@@ -259,7 +265,7 @@ fn load_pg(conn: &mut PgConnection) -> Vec<PgOrder> {
 
 fn load_sqlite(conn: &mut SqliteConnection) -> Vec<SqliteOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, code, feeling, note FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, code, feeling, note, price FROM orders ORDER BY id",
     )
     .load(conn)
     .unwrap()
@@ -276,6 +282,7 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             code: Sku("SKU-1".to_owned()),
             feeling: Mood::Happy,
             note: None,
+            price: Some(BigDecimal::from_str("1234.5678").unwrap()),
         },
         PgOrder {
             id: uuid(ID_B),
@@ -286,6 +293,7 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             code: Sku("SKU-2".to_owned()),
             feeling: Mood::Sad,
             note: Some("packed".to_owned()),
+            price: Some(BigDecimal::from_str("8765.4321").unwrap()),
         },
         PgOrder {
             id: uuid(ID_C),
@@ -296,6 +304,7 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             code: Sku("SKU-3".to_owned()),
             feeling: Mood::Neutral,
             note: Some("void".to_owned()),
+            price: None,
         },
     ]
 }
@@ -315,6 +324,7 @@ fn final_pg_rows() -> Vec<PgOrder> {
             code: Sku("SKU-1".to_owned()),
             feeling: Mood::Happy,
             note: None,
+            price: Some(BigDecimal::from_str("1234.5678").unwrap()),
         },
         PgOrder {
             id: uuid(ID_B),
@@ -325,6 +335,7 @@ fn final_pg_rows() -> Vec<PgOrder> {
             code: Sku("SKU-2".to_owned()),
             feeling: Mood::Neutral,
             note: None,
+            price: Some(BigDecimal::from_str("2468.1357").unwrap()),
         },
     ]
 }
@@ -347,6 +358,7 @@ fn sqlite_view(row: PgOrder) -> SqliteOrder {
         code: row.code.0,
         feeling: row.feeling.label().to_owned(),
         note: row.note,
+        price: row.price.as_ref().map(ToString::to_string),
     }
 }
 
@@ -370,9 +382,9 @@ pub fn create_schema(pg: &mut PgConnection) {
 /// Seed phase: insert three rows with UUID primary keys.
 pub fn seed_dml(pg: &mut PgConnection) {
     for stmt in [
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note) VALUES ('{ID_A}', 100, 'new', true, '{TOKEN_A}', 'SKU-1', 'happy', NULL)"),
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note) VALUES ('{ID_B}', 200, 'new', false, '{TOKEN_B}', 'SKU-2', 'sad', 'packed')"),
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note) VALUES ('{ID_C}', 300, 'new', true, '{TOKEN_C}', 'SKU-3', 'neutral', 'void')"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price) VALUES ('{ID_A}', 100, 'new', true, '{TOKEN_A}', 'SKU-1', 'happy', NULL, 1234.5678)"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price) VALUES ('{ID_B}', 200, 'new', false, '{TOKEN_B}', 'SKU-2', 'sad', 'packed', 8765.4321)"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price) VALUES ('{ID_C}', 300, 'new', true, '{TOKEN_C}', 'SKU-3', 'neutral', 'void', NULL)"),
     ] {
         sql_query(&stmt).execute(pg).unwrap();
     }
@@ -382,7 +394,7 @@ pub fn seed_dml(pg: &mut PgConnection) {
 /// columns) and delete another, both matched on the UUID primary key.
 pub fn mutate_dml(pg: &mut PgConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL WHERE id = '{ID_B}'"
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357 WHERE id = '{ID_B}'"
     ))
     .execute(pg)
     .unwrap();
@@ -461,9 +473,23 @@ pub fn finish_loop(
     pg_engine
         .apply_patchset_bytes(&session_patchset, pg, &pg_adapter)
         .unwrap();
+    let round_tripped = load_pg(pg);
     assert_eq!(
-        load_pg(pg),
-        source_net,
+        round_tripped, source_net,
         "round-tripped Postgres rows equal the source net state"
+    );
+    // Fidelity: NUMERIC(12,4) preserves the exact scale (four fractional
+    // digits) across the whole loop, not merely the numeric value.
+    let price_a = round_tripped
+        .iter()
+        .find(|row| row.id == uuid(ID_A))
+        .unwrap()
+        .price
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        price_a.to_string(),
+        "1234.5678",
+        "decimal scale preserved through the round trip"
     );
 }

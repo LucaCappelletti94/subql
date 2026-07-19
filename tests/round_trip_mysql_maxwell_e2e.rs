@@ -34,9 +34,11 @@
 
 mod common;
 
+use core::str::FromStr;
 use std::time::Duration;
 
-use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
+use bigdecimal::BigDecimal;
+use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Numeric, Text};
 use diesel::{
     sql_query, Connection, MysqlConnection, QueryableByName, RunQueryDsl, SqliteConnection,
 };
@@ -54,11 +56,11 @@ use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine};
 
 // UUID stored as BINARY(16). MySQL has no native UUID type, so the column
 // classifies as bytes and the 16-byte blob rides WireType::Bytes.
-const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255))";
+const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4))";
 // The subql catalog only needs the table shape. `feeling` is an unknown
 // scalar (the enum), so subql treats it as text on the wire.
-const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255));";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT);";
+const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4));";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT, price TEXT);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -83,6 +85,8 @@ struct MyOrder {
     feeling: String,
     #[diesel(sql_type = Nullable<Text>)]
     note: Option<String>,
+    #[diesel(sql_type = Nullable<Numeric>)]
+    price: Option<BigDecimal>,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -101,6 +105,8 @@ struct SqliteOrder {
     feeling: String,
     #[diesel(sql_type = Nullable<Text>)]
     note: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    price: Option<String>,
 }
 
 /// The 16 UUID bytes as a 32-char lowercase hex string for a MySQL
@@ -118,25 +124,49 @@ fn subql_catalog() -> ParserDB {
 }
 
 fn load_mysql(my: &mut MysqlConnection) -> Vec<MyOrder> {
-    sql_query("SELECT id, amount, status, active, token, feeling, note FROM orders ORDER BY id")
-        .load(my)
-        .unwrap()
+    sql_query(
+        "SELECT id, amount, status, active, token, feeling, note, price FROM orders ORDER BY id",
+    )
+    .load(my)
+    .unwrap()
 }
 
 fn load_sqlite(sqlite: &mut SqliteConnection) -> Vec<SqliteOrder> {
-    sql_query("SELECT id, amount, status, active, token, feeling, note FROM orders ORDER BY id")
-        .load(sqlite)
-        .unwrap()
+    sql_query(
+        "SELECT id, amount, status, active, token, feeling, note, price FROM orders ORDER BY id",
+    )
+    .load(sqlite)
+    .unwrap()
 }
 
 fn seed_dml(my: &mut MysqlConnection) {
-    for (id, amount, status, active, token, feeling, note) in [
-        (ID_A, 100, "new", "true", TOKEN_A, "happy", "NULL"),
-        (ID_B, 200, "new", "false", TOKEN_B, "sad", "'packed'"),
-        (ID_C, 300, "new", "true", TOKEN_C, "neutral", "'void'"),
+    for (id, amount, status, active, token, feeling, note, price) in [
+        (
+            ID_A,
+            100,
+            "new",
+            "true",
+            TOKEN_A,
+            "happy",
+            "NULL",
+            "1234.5678",
+        ),
+        (
+            ID_B,
+            200,
+            "new",
+            "false",
+            TOKEN_B,
+            "sad",
+            "'packed'",
+            "8765.4321",
+        ),
+        (
+            ID_C, 300, "new", "true", TOKEN_C, "neutral", "'void'", "NULL",
+        ),
     ] {
         let stmt = format!(
-            "INSERT INTO orders (id, amount, status, active, token, feeling, note) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note})",
+            "INSERT INTO orders (id, amount, status, active, token, feeling, note, price) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note}, {price})",
             hex16(id),
             hex16(token)
         );
@@ -146,7 +176,7 @@ fn seed_dml(my: &mut MysqlConnection) {
 
 fn mutate_dml(my: &mut MysqlConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL WHERE id = x'{}'",
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357 WHERE id = x'{}'",
         hex16(ID_B)
     ))
     .execute(my)
@@ -166,6 +196,7 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             token: uuid_bytes(TOKEN_A),
             feeling: "happy".to_owned(),
             note: None,
+            price: Some(BigDecimal::from_str("1234.5678").unwrap()),
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -175,6 +206,7 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             token: uuid_bytes(TOKEN_B),
             feeling: "sad".to_owned(),
             note: Some("packed".to_owned()),
+            price: Some(BigDecimal::from_str("8765.4321").unwrap()),
         },
         MyOrder {
             id: uuid_bytes(ID_C),
@@ -184,6 +216,7 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             token: uuid_bytes(TOKEN_C),
             feeling: "neutral".to_owned(),
             note: Some("void".to_owned()),
+            price: None,
         },
     ]
 }
@@ -202,6 +235,7 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             token: uuid_bytes(TOKEN_A),
             feeling: "happy".to_owned(),
             note: None,
+            price: Some(BigDecimal::from_str("1234.5678").unwrap()),
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -211,6 +245,7 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             token: uuid_bytes(TOKEN_B),
             feeling: "neutral".to_owned(),
             note: None,
+            price: Some(BigDecimal::from_str("2468.1357").unwrap()),
         },
     ]
 }
@@ -224,6 +259,7 @@ fn sqlite_view(row: &MyOrder) -> SqliteOrder {
         token: row.token.clone(),
         feeling: row.feeling.clone(),
         note: row.note.clone(),
+        price: row.price.as_ref().map(ToString::to_string),
     }
 }
 

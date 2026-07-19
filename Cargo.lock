@@ -1154,6 +1154,7 @@ name = "diesel"
 version = "2.3.10"
 source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
 dependencies = [
+ "bigdecimal",
  "bitflags",
  "byteorder",
  "diesel_derives",
@@ -1161,6 +1162,9 @@ dependencies = [
  "itoa",
  "libsqlite3-sys",
  "mysqlclient-sys",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "percent-encoding",
  "pq-sys",
  "r2d2",

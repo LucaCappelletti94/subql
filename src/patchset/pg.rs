@@ -16,6 +16,12 @@
 //!   BLOB storage and clients that prefer TEXT storage to coexist against
 //!   the same server without changing the adapter. Any other wire shape
 //!   on a `UUID` column is rejected.
+//! * `NUMERIC` / `DECIMAL` gets a native `Numeric` bind when the wire
+//!   carries a `Value::Text` holding the verbatim decimal digits, parsed
+//!   through [`bigdecimal::BigDecimal`]. The target column is classified
+//!   through the catalog's [`ScalarKind`], since Postgres has no implicit
+//!   assignment cast from text to `numeric`. Any other wire shape on a
+//!   decimal column is rejected.
 //!
 //! Every other column falls through to [`sqlite_diff_rs::DefaultBinder`]
 //! which handles the trivial SQLite-to-diesel type mappings (`Integer ->
@@ -26,13 +32,19 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use core::fmt;
+use core::str::FromStr;
 
+use bigdecimal::BigDecimal;
 use diesel::pg::Pg;
 use diesel::query_builder::AstPass;
 use diesel::result::{Error as DieselError, QueryResult};
-use diesel::sql_types::{Bool, Uuid as UuidSqlType};
+use diesel::sql_types::{Bool, Numeric, Uuid as UuidSqlType};
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TableLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
+
+use crate::backend::ScalarKind;
+use crate::catalog_helpers;
+use crate::types::ColumnId;
 
 /// Adapter that resolves column names and native diesel binders for a
 /// Postgres target from a subql catalog.
@@ -56,6 +68,16 @@ impl<'db, DB: DatabaseLike> PgAdapter<'db, DB> {
             .tables()
             .find(|t| t.table_name() == table_name)?;
         table.columns(self.catalog).nth(index)
+    }
+
+    /// Classify the target column through the catalog's [`ScalarKind`],
+    /// the dispatch key for families Postgres will not assignment-cast
+    /// from a text bind. Returns `None` for an unknown table or column,
+    /// or a declared type that maps to no supported scalar.
+    fn scalar_kind_at(&self, table_name: &str, column_index: usize) -> Option<ScalarKind> {
+        let table_id = catalog_helpers::table_id(self.catalog, table_name)?;
+        let column_id = ColumnId::try_from(column_index).ok()?;
+        catalog_helpers::column_scalar_kind(self.catalog, table_id, column_id)
     }
 }
 
@@ -125,6 +147,26 @@ where
             };
         }
 
+        // NUMERIC / DECIMAL: Postgres has no assignment cast from text to
+        // numeric, so the verbatim decimal text binds natively as Numeric.
+        // Other wire shapes are refused with a rollback-inducing error.
+        if matches!(
+            self.scalar_kind_at(table_name, column_index),
+            Some(ScalarKind::Decimal)
+        ) {
+            return match value {
+                Value::Text(s) => BigDecimal::from_str(s.as_ref())
+                    .map(|d| -> Box<dyn Binder<Pg> + Send + 'a> { Box::new(DecimalBinder(d)) })
+                    .map_err(|_| bind_error(col_name, "decimal TEXT", "unparseable TEXT")),
+                Value::Null => Ok(Box::new(DefaultBinder::from(value))),
+                other => Err(bind_error(
+                    col_name,
+                    "decimal TEXT or NULL",
+                    shape_of(other),
+                )),
+            };
+        }
+
         Ok(Box::new(DefaultBinder::from(value)))
     }
 }
@@ -151,6 +193,17 @@ struct UuidBinder(uuid::Uuid);
 impl Binder<Pg> for UuidBinder {
     fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         out.push_bind_param::<UuidSqlType, uuid::Uuid>(&self.0)
+    }
+}
+
+/// Binder that pushes a decimal onto the AST as a native [`Numeric`]
+/// bind. Constructed by [`PgAdapter`] for verbatim decimal TEXT on a
+/// Postgres `NUMERIC` / `DECIMAL` column.
+struct DecimalBinder(BigDecimal);
+
+impl Binder<Pg> for DecimalBinder {
+    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        out.push_bind_param::<Numeric, BigDecimal>(&self.0)
     }
 }
 

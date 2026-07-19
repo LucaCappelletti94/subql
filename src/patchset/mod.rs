@@ -25,10 +25,11 @@
 //!
 //! # Scope
 //!
-//! MVP dispatch on both backends: boolean columns only. `INTEGER`,
-//! `TEXT`, `REAL`, and `BLOB`/`BYTEA` already work through
-//! [`sqlite_diff_rs::DefaultBinder`]. UUID, timestamp, decimal, and
-//! json/jsonb dispatch land as follow-up.
+//! `INTEGER`, `TEXT`, `REAL`, and `BLOB`/`BYTEA` already work through
+//! [`sqlite_diff_rs::DefaultBinder`] on both backends. [`PgAdapter`]
+//! additionally dispatches `BOOLEAN`, `UUID`, and `NUMERIC`/`DECIMAL`
+//! natively, and [`MysqlAdapter`] dispatches `BOOLEAN`. Temporal and
+//! json/jsonb native dispatch land as follow-up.
 
 use alloc::string::String;
 use alloc::vec::Vec;
