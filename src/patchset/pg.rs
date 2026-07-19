@@ -22,6 +22,13 @@
 //!   through the catalog's [`ScalarKind`], since Postgres has no implicit
 //!   assignment cast from text to `numeric`. Any other wire shape on a
 //!   decimal column is rejected.
+//! * `TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, and `TIME` get native temporal
+//!   binds when the wire carries a `Value::Text` holding the verbatim
+//!   Postgres text form, parsed through the shared `chrono` parsers in
+//!   `crate::wal::pg_type`. `TIMESTAMPTZ` normalizes to a UTC instant.
+//!   Each column is classified through the catalog's [`ScalarKind`],
+//!   since Postgres has no implicit assignment cast from text to these
+//!   types. Any other wire shape on such a column is rejected.
 //!
 //! Every other column falls through to [`sqlite_diff_rs::DefaultBinder`]
 //! which handles the trivial SQLite-to-diesel type mappings (`Integer ->
@@ -35,16 +42,18 @@ use core::fmt;
 use core::str::FromStr;
 
 use bigdecimal::BigDecimal;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use diesel::pg::Pg;
 use diesel::query_builder::AstPass;
 use diesel::result::{Error as DieselError, QueryResult};
-use diesel::sql_types::{Bool, Numeric, Uuid as UuidSqlType};
+use diesel::sql_types::{Bool, Date, Numeric, Time, Timestamp, Timestamptz, Uuid as UuidSqlType};
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TableLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
 use crate::backend::ScalarKind;
 use crate::catalog_helpers;
 use crate::types::ColumnId;
+use crate::wal::pg_type::{parse_pg_date, parse_pg_time, parse_pg_timestamp, parse_pg_timestamptz};
 
 /// Adapter that resolves column names and native diesel binders for a
 /// Postgres target from a subql catalog.
@@ -147,27 +156,61 @@ where
             };
         }
 
-        // NUMERIC / DECIMAL: Postgres has no assignment cast from text to
-        // numeric, so the verbatim decimal text binds natively as Numeric.
-        // Other wire shapes are refused with a rollback-inducing error.
-        if matches!(
-            self.scalar_kind_at(table_name, column_index),
-            Some(ScalarKind::Decimal)
-        ) {
-            return match value {
-                Value::Text(s) => BigDecimal::from_str(s.as_ref())
-                    .map(|d| -> Box<dyn Binder<Pg> + Send + 'a> { Box::new(DecimalBinder(d)) })
-                    .map_err(|_| bind_error(col_name, "decimal TEXT", "unparseable TEXT")),
-                Value::Null => Ok(Box::new(DefaultBinder::from(value))),
-                other => Err(bind_error(
-                    col_name,
-                    "decimal TEXT or NULL",
-                    shape_of(other),
-                )),
-            };
+        // Rich scalars Postgres will not assignment-cast from a text
+        // bind: decimal and the temporals. Each parses the verbatim wire
+        // text into its diesel type and binds it natively. Bool and UUID
+        // are handled above, and everything else falls to DefaultBinder.
+        match self.scalar_kind_at(table_name, column_index) {
+            Some(ScalarKind::Decimal) => {
+                text_scalar_bind(col_name, value, "decimal TEXT or NULL", |s| {
+                    Some(Box::new(DecimalBinder(BigDecimal::from_str(s).ok()?))
+                        as Box<dyn Binder<Pg> + Send + 'a>)
+                })
+            }
+            Some(ScalarKind::Timestamp) => {
+                text_scalar_bind(col_name, value, "timestamp TEXT or NULL", |s| {
+                    Some(Box::new(TimestampBinder(parse_pg_timestamp(s)?))
+                        as Box<dyn Binder<Pg> + Send + 'a>)
+                })
+            }
+            Some(ScalarKind::TimestampTz) => {
+                text_scalar_bind(col_name, value, "timestamptz TEXT or NULL", |s| {
+                    Some(Box::new(TimestampTzBinder(parse_pg_timestamptz(s)?))
+                        as Box<dyn Binder<Pg> + Send + 'a>)
+                })
+            }
+            Some(ScalarKind::Date) => text_scalar_bind(col_name, value, "date TEXT or NULL", |s| {
+                Some(Box::new(DateBinder(parse_pg_date(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
+            }),
+            Some(ScalarKind::Time) => text_scalar_bind(col_name, value, "time TEXT or NULL", |s| {
+                Some(Box::new(TimeBinder(parse_pg_time(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
+            }),
+            _ => Ok(Box::new(DefaultBinder::from(value))),
         }
+    }
+}
 
-        Ok(Box::new(DefaultBinder::from(value)))
+/// Bind a rich scalar carried as verbatim `Value::Text`. `parse` turns
+/// the text into a native binder. `Value::Null` passes through as a
+/// literal NULL, and any other wire shape (or a parse failure) is
+/// refused with a rollback-inducing error naming the column and the
+/// expected shape.
+fn text_scalar_bind<'a, S, B>(
+    col_name: &str,
+    value: &'a Value<S, B>,
+    expected: &str,
+    parse: impl FnOnce(&str) -> Option<Box<dyn Binder<Pg> + Send + 'a>>,
+) -> Result<Box<dyn Binder<Pg> + Send + 'a>, DieselError>
+where
+    S: AsRef<str> + Sync,
+    B: AsRef<[u8]> + Sync,
+{
+    match value {
+        Value::Text(s) => {
+            parse(s.as_ref()).ok_or_else(|| bind_error(col_name, expected, "unparseable TEXT"))
+        }
+        Value::Null => Ok(Box::new(DefaultBinder::from(value))),
+        other => Err(bind_error(col_name, expected, shape_of(other))),
     }
 }
 
@@ -204,6 +247,50 @@ struct DecimalBinder(BigDecimal);
 impl Binder<Pg> for DecimalBinder {
     fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         out.push_bind_param::<Numeric, BigDecimal>(&self.0)
+    }
+}
+
+/// Binder that pushes a naive datetime onto the AST as a native
+/// [`Timestamp`] bind. Constructed by [`PgAdapter`] for verbatim
+/// timestamp TEXT on a Postgres `TIMESTAMP` column.
+struct TimestampBinder(NaiveDateTime);
+
+impl Binder<Pg> for TimestampBinder {
+    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        out.push_bind_param::<Timestamp, NaiveDateTime>(&self.0)
+    }
+}
+
+/// Binder that pushes a UTC instant onto the AST as a native
+/// [`Timestamptz`] bind. Constructed by [`PgAdapter`] for verbatim
+/// timestamptz TEXT on a Postgres `TIMESTAMPTZ` column, normalized to UTC.
+struct TimestampTzBinder(DateTime<Utc>);
+
+impl Binder<Pg> for TimestampTzBinder {
+    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        out.push_bind_param::<Timestamptz, DateTime<Utc>>(&self.0)
+    }
+}
+
+/// Binder that pushes a date onto the AST as a native [`Date`] bind.
+/// Constructed by [`PgAdapter`] for verbatim date TEXT on a Postgres
+/// `DATE` column.
+struct DateBinder(NaiveDate);
+
+impl Binder<Pg> for DateBinder {
+    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        out.push_bind_param::<Date, NaiveDate>(&self.0)
+    }
+}
+
+/// Binder that pushes a time-of-day onto the AST as a native [`Time`]
+/// bind. Constructed by [`PgAdapter`] for verbatim time TEXT on a
+/// Postgres `TIME` column.
+struct TimeBinder(NaiveTime);
+
+impl Binder<Pg> for TimeBinder {
+    fn walk<'b>(&'b self, out: &mut AstPass<'_, 'b, Pg>) -> QueryResult<()> {
+        out.push_bind_param::<Time, NaiveTime>(&self.0)
     }
 }
 

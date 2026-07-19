@@ -11,7 +11,7 @@ mod change_event;
 mod maxwell;
 #[cfg(feature = "pg-streaming")]
 mod pg_streaming;
-mod pg_type;
+pub(crate) mod pg_type;
 #[cfg(feature = "std")]
 mod streaming;
 mod wal2json;

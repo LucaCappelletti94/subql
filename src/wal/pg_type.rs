@@ -217,9 +217,7 @@ fn json_timestamptz(value: &serde_json::Value) -> Option<DateTime<Utc>> {
 }
 
 fn json_date(value: &serde_json::Value) -> Option<NaiveDate> {
-    value
-        .as_str()
-        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+    value.as_str().and_then(parse_pg_date)
 }
 
 fn json_time(value: &serde_json::Value) -> Option<NaiveTime> {
@@ -233,7 +231,11 @@ fn json_document(value: &serde_json::Value) -> Option<serde_json::Value> {
     }
 }
 
-fn parse_pg_timestamp(s: &str) -> Option<NaiveDateTime> {
+pub fn parse_pg_date(s: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+pub fn parse_pg_timestamp(s: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
         .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
@@ -241,7 +243,7 @@ fn parse_pg_timestamp(s: &str) -> Option<NaiveDateTime> {
         .ok()
 }
 
-fn parse_pg_timestamptz(s: &str) -> Option<DateTime<Utc>> {
+pub fn parse_pg_timestamptz(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
@@ -258,7 +260,7 @@ fn parse_pg_timestamptz(s: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-fn parse_pg_time(s: &str) -> Option<NaiveTime> {
+pub fn parse_pg_time(s: &str) -> Option<NaiveTime> {
     NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
         .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
         .ok()

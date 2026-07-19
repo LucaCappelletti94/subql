@@ -31,6 +31,7 @@
     feature = "sqlite-cdc"
 ))]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::unreadable_literal)]
 
 mod common;
 
@@ -38,7 +39,10 @@ use core::str::FromStr;
 use std::time::Duration;
 
 use bigdecimal::BigDecimal;
-use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Numeric, Text};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use diesel::sql_types::{
+    BigInt, Binary, Bool, Date, Datetime, Integer, Nullable, Numeric, Text, Time, Timestamp,
+};
 use diesel::{
     sql_query, Connection, MysqlConnection, QueryableByName, RunQueryDsl, SqliteConnection,
 };
@@ -56,11 +60,11 @@ use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine};
 
 // UUID stored as BINARY(16). MySQL has no native UUID type, so the column
 // classifies as bytes and the 16-byte blob rides WireType::Bytes.
-const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4))";
+const MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6))";
 // The subql catalog only needs the table shape. `feeling` is an unknown
 // scalar (the enum), so subql treats it as text on the wire.
-const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4));";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT, price TEXT);";
+const SUBQL_MYSQL_DDL: &str = "CREATE TABLE orders (id BINARY(16) PRIMARY KEY, amount INT, status VARCHAR(255), active BOOLEAN, token BINARY(16), feeling ENUM('happy','sad','neutral'), note VARCHAR(255), price DECIMAL(12,4), dt DATETIME(6), ts TIMESTAMP(6), d DATE, t TIME(6));";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, feeling TEXT, note TEXT, price TEXT, dt TEXT, ts TEXT, d TEXT, t TEXT);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -87,6 +91,14 @@ struct MyOrder {
     note: Option<String>,
     #[diesel(sql_type = Nullable<Numeric>)]
     price: Option<BigDecimal>,
+    #[diesel(sql_type = Datetime)]
+    dt: NaiveDateTime,
+    #[diesel(sql_type = Timestamp)]
+    ts: NaiveDateTime,
+    #[diesel(sql_type = Date)]
+    d: NaiveDate,
+    #[diesel(sql_type = Time)]
+    t: NaiveTime,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -107,6 +119,14 @@ struct SqliteOrder {
     note: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     price: Option<String>,
+    #[diesel(sql_type = Text)]
+    dt: String,
+    #[diesel(sql_type = Text)]
+    ts: String,
+    #[diesel(sql_type = Text)]
+    d: String,
+    #[diesel(sql_type = Text)]
+    t: String,
 }
 
 /// The 16 UUID bytes as a 32-char lowercase hex string for a MySQL
@@ -119,13 +139,28 @@ fn uuid_bytes(uuid_str: &str) -> Vec<u8> {
     Uuid::parse_str(uuid_str).unwrap().as_bytes().to_vec()
 }
 
+const fn ndt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32, us: u32) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(y, mo, d)
+        .unwrap()
+        .and_hms_micro_opt(h, mi, s, us)
+        .unwrap()
+}
+
+const fn nd(y: i32, mo: u32, d: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(y, mo, d).unwrap()
+}
+
+const fn nt(h: u32, mi: u32, s: u32, us: u32) -> NaiveTime {
+    NaiveTime::from_hms_micro_opt(h, mi, s, us).unwrap()
+}
+
 fn subql_catalog() -> ParserDB {
     ParserDB::parse::<MySqlDialect>(SUBQL_MYSQL_DDL).unwrap()
 }
 
 fn load_mysql(my: &mut MysqlConnection) -> Vec<MyOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, feeling, note, price FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, feeling, note, price, dt, ts, d, t FROM orders ORDER BY id",
     )
     .load(my)
     .unwrap()
@@ -133,14 +168,14 @@ fn load_mysql(my: &mut MysqlConnection) -> Vec<MyOrder> {
 
 fn load_sqlite(sqlite: &mut SqliteConnection) -> Vec<SqliteOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, feeling, note, price FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, feeling, note, price, dt, ts, d, t FROM orders ORDER BY id",
     )
     .load(sqlite)
     .unwrap()
 }
 
 fn seed_dml(my: &mut MysqlConnection) {
-    for (id, amount, status, active, token, feeling, note, price) in [
+    for (id, amount, status, active, token, feeling, note, price, datetime, date, time) in [
         (
             ID_A,
             100,
@@ -150,6 +185,9 @@ fn seed_dml(my: &mut MysqlConnection) {
             "happy",
             "NULL",
             "1234.5678",
+            "2024-01-15 08:30:00.123456",
+            "2024-01-15",
+            "08:30:00.123456",
         ),
         (
             ID_B,
@@ -160,13 +198,26 @@ fn seed_dml(my: &mut MysqlConnection) {
             "sad",
             "'packed'",
             "8765.4321",
+            "2023-06-20 22:10:05.654321",
+            "2023-06-20",
+            "22:10:05.654321",
         ),
         (
-            ID_C, 300, "new", "true", TOKEN_C, "neutral", "'void'", "NULL",
+            ID_C,
+            300,
+            "new",
+            "true",
+            TOKEN_C,
+            "neutral",
+            "'void'",
+            "NULL",
+            "2022-12-31 23:59:59.999999",
+            "2022-12-31",
+            "23:59:59.999999",
         ),
     ] {
         let stmt = format!(
-            "INSERT INTO orders (id, amount, status, active, token, feeling, note, price) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note}, {price})",
+            "INSERT INTO orders (id, amount, status, active, token, feeling, note, price, dt, ts, d, t) VALUES (x'{}', {amount}, '{status}', {active}, x'{}', '{feeling}', {note}, {price}, '{datetime}', '{datetime}', '{date}', '{time}')",
             hex16(id),
             hex16(token)
         );
@@ -176,7 +227,7 @@ fn seed_dml(my: &mut MysqlConnection) {
 
 fn mutate_dml(my: &mut MysqlConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357 WHERE id = x'{}'",
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357, dt = '2025-03-03 03:03:03.030303', ts = '2025-03-03 03:03:03.030303', d = '2025-03-03', t = '03:03:03.030303' WHERE id = x'{}'",
         hex16(ID_B)
     ))
     .execute(my)
@@ -197,6 +248,10 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             feeling: "happy".to_owned(),
             note: None,
             price: Some(BigDecimal::from_str("1234.5678").unwrap()),
+            dt: ndt(2024, 1, 15, 8, 30, 0, 123456),
+            ts: ndt(2024, 1, 15, 8, 30, 0, 123456),
+            d: nd(2024, 1, 15),
+            t: nt(8, 30, 0, 123456),
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -207,6 +262,10 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             feeling: "sad".to_owned(),
             note: Some("packed".to_owned()),
             price: Some(BigDecimal::from_str("8765.4321").unwrap()),
+            dt: ndt(2023, 6, 20, 22, 10, 5, 654321),
+            ts: ndt(2023, 6, 20, 22, 10, 5, 654321),
+            d: nd(2023, 6, 20),
+            t: nt(22, 10, 5, 654321),
         },
         MyOrder {
             id: uuid_bytes(ID_C),
@@ -217,6 +276,10 @@ fn seed_mysql_rows() -> Vec<MyOrder> {
             feeling: "neutral".to_owned(),
             note: Some("void".to_owned()),
             price: None,
+            dt: ndt(2022, 12, 31, 23, 59, 59, 999999),
+            ts: ndt(2022, 12, 31, 23, 59, 59, 999999),
+            d: nd(2022, 12, 31),
+            t: nt(23, 59, 59, 999999),
         },
     ]
 }
@@ -236,6 +299,10 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             feeling: "happy".to_owned(),
             note: None,
             price: Some(BigDecimal::from_str("1234.5678").unwrap()),
+            dt: ndt(2024, 1, 15, 8, 30, 0, 123456),
+            ts: ndt(2024, 1, 15, 8, 30, 0, 123456),
+            d: nd(2024, 1, 15),
+            t: nt(8, 30, 0, 123456),
         },
         MyOrder {
             id: uuid_bytes(ID_B),
@@ -246,6 +313,10 @@ fn final_mysql_rows() -> Vec<MyOrder> {
             feeling: "neutral".to_owned(),
             note: None,
             price: Some(BigDecimal::from_str("2468.1357").unwrap()),
+            dt: ndt(2025, 3, 3, 3, 3, 3, 30303),
+            ts: ndt(2025, 3, 3, 3, 3, 3, 30303),
+            d: nd(2025, 3, 3),
+            t: nt(3, 3, 3, 30303),
         },
     ]
 }
@@ -260,6 +331,10 @@ fn sqlite_view(row: &MyOrder) -> SqliteOrder {
         feeling: row.feeling.clone(),
         note: row.note.clone(),
         price: row.price.as_ref().map(ToString::to_string),
+        dt: row.dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        ts: row.ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        d: row.d.format("%Y-%m-%d").to_string(),
+        t: row.t.format("%H:%M:%S%.6f").to_string(),
     }
 }
 
@@ -372,6 +447,9 @@ fn round_trip_maxwell_dispatches_bool_uuid_enum() {
 
     let port = common::mysql_port(&mysql);
     let mut my = common::mysql_connect(port);
+    sql_query("SET time_zone = '+00:00'")
+        .execute(&mut my)
+        .unwrap();
 
     sql_query(MYSQL_DDL).execute(&mut my).unwrap();
     // Let Maxwell observe the DDL before any DML.

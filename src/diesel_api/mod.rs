@@ -206,8 +206,8 @@ impl BindDecode for diesel::sqlite::Sqlite {
                 RegisterError::UnsupportedSql(format!("diesel bind collection failed: {e}"))
             })?;
         let data = collector.moveable();
-        let mut values = Vec::with_capacity(data.binds.len());
-        for (value, _ty) in &data.binds {
+        let mut values = Vec::with_capacity(data.binds().len());
+        for (value, _ty) in data.binds() {
             values.push(owned_sqlite_to_value(value)?);
         }
         Ok((sql, values))

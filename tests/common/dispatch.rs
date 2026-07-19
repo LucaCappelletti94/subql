@@ -26,14 +26,20 @@
 //! over text), and `feeling mood` (an `ENUM`). The domain and enum bind
 //! through diesel's own `SqlType`/`ToSql` resolved by OID name.
 //!
+//! `price NUMERIC(12,4)` binds natively as `Numeric`, and `ts TIMESTAMP`,
+//! `tstz TIMESTAMPTZ`, `d DATE`, and `t TIME` bind natively as their
+//! matching diesel temporal types, all through [`PgAdapter`].
+//!
 //! Only compiled for test crates that enable the full apply stack.
 
 #![allow(dead_code)]
+#![allow(clippy::unreadable_literal)]
 
 use core::str::FromStr;
 use std::io::Write;
 
 use bigdecimal::BigDecimal;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use diesel::deserialize::{self, FromSql};
 use diesel::pg::{Pg, PgValue};
 use diesel::query_builder::AstPass;
@@ -194,11 +200,11 @@ where
 
 const PG_CREATE_MOOD: &str = "CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')";
 const PG_CREATE_SKU: &str = "CREATE DOMAIN sku AS TEXT";
-const PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4))";
+const PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4), ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME)";
 /// The subql catalog only needs the table shape. `sku` and `mood` are
 /// unknown scalars, so subql treats their columns as text on the wire.
-const SUBQL_PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4));";
-const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, code TEXT, feeling TEXT, note TEXT, price TEXT);";
+const SUBQL_PG_DDL: &str = "CREATE TABLE orders (id UUID PRIMARY KEY, amount INT, status TEXT, active BOOLEAN, token UUID, code sku, feeling mood, note TEXT, price NUMERIC(12,4), ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME);";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY, amount INTEGER, status TEXT, active INTEGER, token BLOB, code TEXT, feeling TEXT, note TEXT, price TEXT, ts TEXT, tstz TEXT, d TEXT, t TEXT);";
 
 const ID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -227,6 +233,14 @@ struct PgOrder {
     note: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Numeric>)]
     price: Option<BigDecimal>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    ts: NaiveDateTime,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    tstz: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Date)]
+    d: NaiveDate,
+    #[diesel(sql_type = diesel::sql_types::Time)]
+    t: NaiveTime,
 }
 
 #[derive(QueryableByName, Debug, PartialEq)]
@@ -249,15 +263,38 @@ struct SqliteOrder {
     note: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     price: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    ts: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    tstz: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    d: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    t: String,
 }
 
 fn uuid(text: &str) -> Uuid {
     Uuid::parse_str(text).unwrap()
 }
 
+const fn ndt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32, us: u32) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(y, mo, d)
+        .unwrap()
+        .and_hms_micro_opt(h, mi, s, us)
+        .unwrap()
+}
+
+const fn nd(y: i32, mo: u32, d: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(y, mo, d).unwrap()
+}
+
+const fn nt(h: u32, mi: u32, s: u32, us: u32) -> NaiveTime {
+    NaiveTime::from_hms_micro_opt(h, mi, s, us).unwrap()
+}
+
 fn load_pg(conn: &mut PgConnection) -> Vec<PgOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, code, feeling, note, price FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t FROM orders ORDER BY id",
     )
     .load(conn)
     .unwrap()
@@ -265,7 +302,7 @@ fn load_pg(conn: &mut PgConnection) -> Vec<PgOrder> {
 
 fn load_sqlite(conn: &mut SqliteConnection) -> Vec<SqliteOrder> {
     sql_query(
-        "SELECT id, amount, status, active, token, code, feeling, note, price FROM orders ORDER BY id",
+        "SELECT id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t FROM orders ORDER BY id",
     )
     .load(conn)
     .unwrap()
@@ -283,6 +320,10 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             feeling: Mood::Happy,
             note: None,
             price: Some(BigDecimal::from_str("1234.5678").unwrap()),
+            ts: ndt(2024, 1, 15, 8, 30, 0, 123456),
+            tstz: ndt(2024, 1, 15, 8, 30, 0, 123456).and_utc(),
+            d: nd(2024, 1, 15),
+            t: nt(8, 30, 0, 123456),
         },
         PgOrder {
             id: uuid(ID_B),
@@ -294,6 +335,10 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             feeling: Mood::Sad,
             note: Some("packed".to_owned()),
             price: Some(BigDecimal::from_str("8765.4321").unwrap()),
+            ts: ndt(2023, 6, 20, 22, 10, 5, 654321),
+            tstz: ndt(2023, 6, 20, 22, 10, 5, 654321).and_utc(),
+            d: nd(2023, 6, 20),
+            t: nt(22, 10, 5, 654321),
         },
         PgOrder {
             id: uuid(ID_C),
@@ -305,6 +350,10 @@ fn seed_pg_rows() -> Vec<PgOrder> {
             feeling: Mood::Neutral,
             note: Some("void".to_owned()),
             price: None,
+            ts: ndt(2022, 12, 31, 23, 59, 59, 999999),
+            tstz: ndt(2022, 12, 31, 23, 59, 59, 999999).and_utc(),
+            d: nd(2022, 12, 31),
+            t: nt(23, 59, 59, 999999),
         },
     ]
 }
@@ -325,6 +374,10 @@ fn final_pg_rows() -> Vec<PgOrder> {
             feeling: Mood::Happy,
             note: None,
             price: Some(BigDecimal::from_str("1234.5678").unwrap()),
+            ts: ndt(2024, 1, 15, 8, 30, 0, 123456),
+            tstz: ndt(2024, 1, 15, 8, 30, 0, 123456).and_utc(),
+            d: nd(2024, 1, 15),
+            t: nt(8, 30, 0, 123456),
         },
         PgOrder {
             id: uuid(ID_B),
@@ -336,6 +389,10 @@ fn final_pg_rows() -> Vec<PgOrder> {
             feeling: Mood::Neutral,
             note: None,
             price: Some(BigDecimal::from_str("2468.1357").unwrap()),
+            ts: ndt(2025, 3, 3, 3, 3, 3, 30303),
+            tstz: ndt(2025, 3, 3, 3, 3, 3, 30303).and_utc(),
+            d: nd(2025, 3, 3),
+            t: nt(3, 3, 3, 30303),
         },
     ]
 }
@@ -359,6 +416,10 @@ fn sqlite_view(row: PgOrder) -> SqliteOrder {
         feeling: row.feeling.label().to_owned(),
         note: row.note,
         price: row.price.as_ref().map(ToString::to_string),
+        ts: row.ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        tstz: row.tstz.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string(),
+        d: row.d.format("%Y-%m-%d").to_string(),
+        t: row.t.format("%H:%M:%S%.6f").to_string(),
     }
 }
 
@@ -371,6 +432,7 @@ pub fn subql_catalog() -> ParserDB {
 /// Create the enum, domain, and table on the source, with `REPLICA
 /// IDENTITY FULL` so update and delete carry full old-row images.
 pub fn create_schema(pg: &mut PgConnection) {
+    sql_query("SET TIME ZONE 'UTC'").execute(pg).unwrap();
     sql_query(PG_CREATE_MOOD).execute(pg).unwrap();
     sql_query(PG_CREATE_SKU).execute(pg).unwrap();
     sql_query(PG_DDL).execute(pg).unwrap();
@@ -382,9 +444,9 @@ pub fn create_schema(pg: &mut PgConnection) {
 /// Seed phase: insert three rows with UUID primary keys.
 pub fn seed_dml(pg: &mut PgConnection) {
     for stmt in [
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price) VALUES ('{ID_A}', 100, 'new', true, '{TOKEN_A}', 'SKU-1', 'happy', NULL, 1234.5678)"),
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price) VALUES ('{ID_B}', 200, 'new', false, '{TOKEN_B}', 'SKU-2', 'sad', 'packed', 8765.4321)"),
-        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price) VALUES ('{ID_C}', 300, 'new', true, '{TOKEN_C}', 'SKU-3', 'neutral', 'void', NULL)"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t) VALUES ('{ID_A}', 100, 'new', true, '{TOKEN_A}', 'SKU-1', 'happy', NULL, 1234.5678, '2024-01-15 08:30:00.123456', '2024-01-15 08:30:00.123456+00', '2024-01-15', '08:30:00.123456')"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t) VALUES ('{ID_B}', 200, 'new', false, '{TOKEN_B}', 'SKU-2', 'sad', 'packed', 8765.4321, '2023-06-20 22:10:05.654321', '2023-06-20 22:10:05.654321+00', '2023-06-20', '22:10:05.654321')"),
+        format!("INSERT INTO orders (id, amount, status, active, token, code, feeling, note, price, ts, tstz, d, t) VALUES ('{ID_C}', 300, 'new', true, '{TOKEN_C}', 'SKU-3', 'neutral', 'void', NULL, '2022-12-31 23:59:59.999999', '2022-12-31 23:59:59.999999+00', '2022-12-31', '23:59:59.999999')"),
     ] {
         sql_query(&stmt).execute(pg).unwrap();
     }
@@ -394,7 +456,7 @@ pub fn seed_dml(pg: &mut PgConnection) {
 /// columns) and delete another, both matched on the UUID primary key.
 pub fn mutate_dml(pg: &mut PgConnection) {
     sql_query(format!(
-        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357 WHERE id = '{ID_B}'"
+        "UPDATE orders SET amount = 250, status = 'shipped', active = true, feeling = 'neutral', note = NULL, price = 2468.1357, ts = '2025-03-03 03:03:03.030303', tstz = '2025-03-03 03:03:03.030303+00', d = '2025-03-03', t = '03:03:03.030303' WHERE id = '{ID_B}'"
     ))
     .execute(pg)
     .unwrap();

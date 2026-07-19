@@ -443,4 +443,38 @@ mod tests {
     fn scalar_kind_from_raw_returns_none_for_unknown() {
         assert_eq!(scalar_kind_from_raw("SOME_UNKNOWN_TYPE"), None);
     }
+
+    #[test]
+    fn column_scalar_kind_classifies_temporal_columns_through_ddl() {
+        // Postgres spellings must classify precisely, because `PgAdapter`
+        // dispatches native temporal binds off the resolved `ScalarKind`.
+        let pg = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE TABLE e (id INT PRIMARY KEY, ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME);",
+        )
+        .unwrap();
+        let tid = table_id(&pg, "e").unwrap();
+        assert_eq!(column_scalar_kind(&pg, tid, 1), Some(ScalarKind::Timestamp));
+        assert_eq!(
+            column_scalar_kind(&pg, tid, 2),
+            Some(ScalarKind::TimestampTz)
+        );
+        assert_eq!(column_scalar_kind(&pg, tid, 3), Some(ScalarKind::Date));
+        assert_eq!(column_scalar_kind(&pg, tid, 4), Some(ScalarKind::Time));
+
+        // MySQL spellings, including `DATETIME` and `BIGINT UNSIGNED`,
+        // both unblocked by the sql-traits normalization fix (see
+        // `docs/uphill-sql-traits-phase3-scalar-normalization.md`).
+        // `DATETIME` classifies as a wall-clock `Timestamp`, and `BIGINT
+        // UNSIGNED` folds into the integer family.
+        let my = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+            "CREATE TABLE e (id INT PRIMARY KEY, dt DATETIME, ts TIMESTAMP, d DATE, t TIME, big BIGINT UNSIGNED);",
+        )
+        .unwrap();
+        let tid = table_id(&my, "e").unwrap();
+        assert_eq!(column_scalar_kind(&my, tid, 1), Some(ScalarKind::Timestamp));
+        assert_eq!(column_scalar_kind(&my, tid, 2), Some(ScalarKind::Timestamp));
+        assert_eq!(column_scalar_kind(&my, tid, 3), Some(ScalarKind::Date));
+        assert_eq!(column_scalar_kind(&my, tid, 4), Some(ScalarKind::Time));
+        assert_eq!(column_scalar_kind(&my, tid, 5), Some(ScalarKind::Int));
+    }
 }

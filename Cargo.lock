@@ -1151,12 +1151,13 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.3.10"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
+version = "2.3.11"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
 dependencies = [
  "bigdecimal",
  "bitflags",
  "byteorder",
+ "chrono",
  "diesel_derives",
  "downcast-rs",
  "itoa",
@@ -1187,10 +1188,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "diesel_attribute_parser"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
 dependencies = [
+ "diesel_attribute_parser",
  "diesel_table_macro_syntax",
  "dsl_auto_type",
  "proc-macro2",
@@ -1201,7 +1213,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
 dependencies = [
  "syn",
 ]
@@ -1765,7 +1777,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
 dependencies = [
  "darling 0.23.0",
  "either",
@@ -4447,7 +4459,7 @@ checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#c78a18ed084b3d58be8f25424ea8fa31647d6b83"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e9e31c3063f7e89bcea7afb00005bd34a3c46fa3"
 dependencies = [
  "geometric-traits",
  "sha2 0.10.9",
