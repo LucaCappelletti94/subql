@@ -277,23 +277,23 @@ impl<C: Connection, B: DieselBackend> DieselConnector<C, B> {
 
 #[cfg(feature = "executor-diesel")]
 #[derive(diesel::QueryableByName)]
-struct IntRow {
+pub struct IntRow {
     #[diesel(sql_type = Nullable<BigInt>)]
-    v: Option<i64>,
+    pub v: Option<i64>,
 }
 
 #[cfg(feature = "executor-diesel")]
 #[derive(diesel::QueryableByName)]
-struct FloatRow {
+pub struct FloatRow {
     #[diesel(sql_type = Nullable<Double>)]
-    v: Option<f64>,
+    pub v: Option<f64>,
 }
 
 #[cfg(feature = "executor-diesel")]
 #[derive(diesel::QueryableByName)]
-struct TextRow {
+pub struct TextRow {
     #[diesel(sql_type = Nullable<Text>)]
-    v: Option<String>,
+    pub v: Option<String>,
 }
 
 /// Route the projected column through the `Nullable<BigInt|Double|Text>`
@@ -430,11 +430,14 @@ impl PgDieselConnector {
     }
 }
 
-#[cfg(feature = "executor-diesel-postgres")]
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
 #[derive(diesel::QueryableByName)]
-struct PgLsnRow {
+pub struct PgLsnRow {
     #[diesel(sql_type = Text)]
-    lsn: String,
+    pub lsn: String,
 }
 
 #[cfg(feature = "executor-diesel-postgres")]
@@ -538,16 +541,19 @@ impl MysqlDieselConnector {
     }
 }
 
-#[cfg(feature = "executor-diesel-mysql")]
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
 #[derive(diesel::QueryableByName)]
-struct LogStatusRow {
+pub struct LogStatusRow {
     #[diesel(sql_type = Nullable<Text>, column_name = "file")]
-    file: Option<String>,
+    pub file: Option<String>,
     #[diesel(
         sql_type = Nullable<diesel::sql_types::Unsigned<BigInt>>,
         column_name = "position"
     )]
-    position: Option<u64>,
+    pub position: Option<u64>,
 }
 
 /// Read the current binlog coordinate from `performance_schema.log_status`.

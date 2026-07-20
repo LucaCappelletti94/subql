@@ -50,6 +50,28 @@ use sqlite_diff_rs::{
     SchemaWithPK, SimpleTable, TableSchema, Update,
 };
 
+// Async execution driver, present only when an async apply feature (which
+// enables `sqlite-diff-rs/diesel-async`) is on.
+#[cfg(any(
+    feature = "apply-patchset-postgres-async",
+    feature = "apply-patchset-mysql-async"
+))]
+use sqlite_diff_rs::ApplyOpsAsync;
+
+/// Owned reconstructed batch produced by
+/// [`SubscriptionEngine::apply_diffset_bytes_async`] before it hands the
+/// ops to the async execution driver. Owning the batch lets the returned
+/// future borrow only the batch, connection, and adapter, never the
+/// non-`Sync` engine, so the future stays `Send`.
+#[cfg(any(
+    feature = "apply-patchset-postgres-async",
+    feature = "apply-patchset-mysql-async"
+))]
+enum ReconstructedDiff {
+    Patchset(PatchSet<SimpleTable, String, Vec<u8>>),
+    Changeset(ChangeSet<SimpleTable, String, Vec<u8>>),
+}
+
 #[cfg(feature = "apply-patchset-postgres")]
 pub mod pg;
 #[cfg(feature = "apply-patchset-postgres")]
@@ -214,6 +236,164 @@ where
             ParsedDiffSet::Changeset(diff) => {
                 let changeset = self.reconstruct_changeset(&diff)?;
                 self.apply_changeset(&changeset, conn, adapter)
+            }
+        }
+    }
+
+    /// Async peer of [`Self::apply_patchset`], driven by
+    /// [`diesel_async`]. Same contract (one transaction, summed
+    /// affected-row count), bounded on an
+    /// [`AsyncConnection`](diesel_async::AsyncConnection). Reuses the
+    /// shipped [`PgAdapter`] and [`MysqlAdapter`] unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first [`diesel::result::Error`] any op produces
+    /// (with the transaction rolled back).
+    #[cfg(any(
+        feature = "apply-patchset-postgres-async",
+        feature = "apply-patchset-mysql-async"
+    ))]
+    pub fn apply_patchset_async<'a, DBend, Conn, T, S, B, A>(
+        &self,
+        patchset: &'a PatchSet<T, S, B>,
+        conn: &'a mut Conn,
+        adapter: &'a A,
+    ) -> impl core::future::Future<Output = QueryResult<usize>> + Send + 'a
+    where
+        DBend: Backend
+            + HasSqlType<BigInt>
+            + HasSqlType<Double>
+            + HasSqlType<Text>
+            + HasSqlType<Binary>,
+        Conn: diesel_async::AsyncConnection<Backend = DBend>,
+        A: Adapter<DBend, S, B> + Send + Sync + 'a,
+        T: SchemaWithPK + ColumnNames + Send + Sync + 'a,
+        S: AsRef<str> + Clone + Hash + Eq + Send + Sync + 'a,
+        B: AsRef<[u8]> + Clone + Hash + Eq + Send + Sync + 'a,
+        i64: ToSql<BigInt, DBend>,
+        f64: ToSql<Double, DBend>,
+        str: ToSql<Text, DBend>,
+        [u8]: ToSql<Binary, DBend>,
+    {
+        // `self` is not touched, so the returned future does not borrow the
+        // non-`Sync` engine and stays `Send`.
+        patchset
+            .iter()
+            .map(|op| op.with_adapter::<DBend, _>(adapter))
+            .apply_transactional_async(conn)
+    }
+
+    /// Async peer of [`Self::apply_changeset`], driven by
+    /// [`diesel_async`]. The changeset format carries the old and new
+    /// value of every column, so this path can apply a
+    /// primary-key-changing UPDATE a patchset cannot represent. One
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first [`diesel::result::Error`] any op produces,
+    /// with the transaction rolled back.
+    #[cfg(any(
+        feature = "apply-patchset-postgres-async",
+        feature = "apply-patchset-mysql-async"
+    ))]
+    pub fn apply_changeset_async<'a, DBend, Conn, T, S, B, A>(
+        &self,
+        changeset: &'a ChangeSet<T, S, B>,
+        conn: &'a mut Conn,
+        adapter: &'a A,
+    ) -> impl core::future::Future<Output = QueryResult<usize>> + Send + 'a
+    where
+        DBend: Backend
+            + HasSqlType<BigInt>
+            + HasSqlType<Double>
+            + HasSqlType<Text>
+            + HasSqlType<Binary>,
+        Conn: diesel_async::AsyncConnection<Backend = DBend>,
+        A: Adapter<DBend, S, B> + Send + Sync + 'a,
+        T: SchemaWithPK + ColumnNames + Send + Sync + 'a,
+        S: AsRef<str> + Clone + Hash + Eq + core::fmt::Debug + Send + Sync + 'a,
+        B: AsRef<[u8]> + Clone + Hash + Eq + core::fmt::Debug + Send + Sync + 'a,
+        i64: ToSql<BigInt, DBend>,
+        f64: ToSql<Double, DBend>,
+        str: ToSql<Text, DBend>,
+        [u8]: ToSql<Binary, DBend>,
+    {
+        changeset
+            .iter()
+            .map(|op| op.with_adapter::<DBend, _>(adapter))
+            .apply_transactional_async(conn)
+    }
+
+    /// Async peer of [`Self::apply_diffset_bytes`], driven by
+    /// [`diesel_async`]. Parses raw uploaded diffset bytes, reconstructs
+    /// the batch against subql's catalog, and applies it in one
+    /// transaction. Dispatches on the format marker (patchset or
+    /// changeset) exactly like the sync entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`diesel::result::Error::QueryBuilderError`] when the
+    /// bytes fail to parse or name a table absent from the catalog.
+    /// Propagates the first bind or execution error any op produces, with
+    /// the whole transaction rolled back.
+    #[cfg(any(
+        feature = "apply-patchset-postgres-async",
+        feature = "apply-patchset-mysql-async"
+    ))]
+    pub fn apply_diffset_bytes_async<'a, DBend, Conn, A>(
+        &self,
+        bytes: &[u8],
+        conn: &'a mut Conn,
+        adapter: &'a A,
+    ) -> impl core::future::Future<Output = QueryResult<usize>> + Send + 'a
+    where
+        DBend: Backend
+            + HasSqlType<BigInt>
+            + HasSqlType<Double>
+            + HasSqlType<Text>
+            + HasSqlType<Binary>,
+        Conn: diesel_async::AsyncConnection<Backend = DBend>,
+        A: Adapter<DBend, String, Vec<u8>> + Send + Sync + 'a,
+        i64: ToSql<BigInt, DBend>,
+        f64: ToSql<Double, DBend>,
+        str: ToSql<Text, DBend>,
+        [u8]: ToSql<Binary, DBend>,
+    {
+        // Parse and reconstruct against the catalog synchronously up front
+        // (this is the only step that touches the engine), so the returned
+        // future carries only the owned batch, `conn`, and `adapter`.
+        let reconstructed = ParsedDiffSet::parse(bytes)
+            .map_err(|err| {
+                ingest_error(alloc::format!(
+                    "failed to parse uploaded SQLite session diffset bytes: {err}"
+                ))
+            })
+            .and_then(|parsed| match parsed {
+                ParsedDiffSet::Patchset(diff) => self
+                    .reconstruct_patchset(&diff)
+                    .map(ReconstructedDiff::Patchset),
+                ParsedDiffSet::Changeset(diff) => self
+                    .reconstruct_changeset(&diff)
+                    .map(ReconstructedDiff::Changeset),
+            });
+        async move {
+            match reconstructed? {
+                ReconstructedDiff::Patchset(patchset) => {
+                    patchset
+                        .iter()
+                        .map(|op| op.with_adapter::<DBend, _>(adapter))
+                        .apply_transactional_async(conn)
+                        .await
+                }
+                ReconstructedDiff::Changeset(changeset) => {
+                    changeset
+                        .iter()
+                        .map(|op| op.with_adapter::<DBend, _>(adapter))
+                        .apply_transactional_async(conn)
+                        .await
+                }
             }
         }
     }

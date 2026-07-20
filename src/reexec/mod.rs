@@ -75,11 +75,19 @@ mod plan;
 // impls are gated inside the file.
 mod async_auto;
 mod async_connector;
+#[cfg(feature = "executor-diesel-async")]
+mod async_diesel;
 mod auto;
 mod connector;
 
 pub use async_auto::AsyncAutoResolvingEngine;
 pub use async_connector::AsyncConnector;
+#[cfg(feature = "executor-diesel-async")]
+pub use async_diesel::DieselAsyncError;
+#[cfg(feature = "executor-diesel-async-mysql")]
+pub use async_diesel::MysqlAsyncDieselConnector;
+#[cfg(feature = "executor-diesel-async-postgres")]
+pub use async_diesel::PgAsyncDieselConnector;
 pub use auto::{AutoResolvingEngine, SnapshotResult};
 #[cfg(feature = "executor-diesel-mysql")]
 pub use connector::MysqlDieselConnector;

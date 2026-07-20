@@ -53,10 +53,12 @@ categories = ["database", "parser-implementations"]
 
 [package.metadata.cargo-udeps.ignore]
 # `arbitrary` is a dev-dependency used only by feature-gated integration
-# tests (the pg-sqlite-emu proptests and the sqlite patchset e2e). udeps
+# tests (the pg-sqlite-emu proptests and the sqlite patchset e2e).
+# `diesel-async` is likewise a dev-dependency used only by the async e2e
+# tests, which are gated behind the async apply / executor features. udeps
 # runs with default features and never compiles those targets, so it
-# false-positives the dev-dependency as unused.
-development = ["arbitrary"]
+# false-positives both as unused.
+development = ["arbitrary", "diesel-async"]
 
 [lib]
 name = "subql"
@@ -154,6 +156,49 @@ required-features = ["executor-diesel-postgres-r2d2"]
 [[test]]
 name = "reexec_mysql"
 required-features = ["executor-diesel-mysql"]
+
+# Docker-backed E2E for apply_patchset_async against Postgres over a
+# diesel-async connection. Run with:
+#   cargo test --test apply_patchset_pg_async_e2e \
+#       --features apply-patchset-postgres-async -- --ignored --nocapture
+[[test]]
+name = "apply_patchset_pg_async_e2e"
+required-features = ["apply-patchset-postgres-async"]
+
+# Docker-backed E2E for apply_diffset_bytes_async (patchset + changeset
+# arms) and apply_changeset_async against Postgres over a diesel-async
+# connection. Run with:
+#   cargo test --test apply_diffset_async_pg_e2e \
+#       --features apply-patchset-postgres-async -- --ignored --nocapture
+[[test]]
+name = "apply_diffset_async_pg_e2e"
+required-features = ["apply-patchset-postgres-async"]
+
+# Docker-backed E2E for apply_patchset_async against MySQL over a
+# diesel-async connection. Run with:
+#   cargo test --test apply_patchset_mysql_async_e2e \
+#       --features apply-patchset-mysql-async -- --ignored --nocapture
+[[test]]
+name = "apply_patchset_mysql_async_e2e"
+required-features = ["apply-patchset-mysql-async"]
+
+# Docker-backed integration test for AsyncAutoResolvingEngine +
+# PgAsyncDieselConnector against a real Postgres with logical replication.
+# Run with:
+#   cargo test --test reexec_postgres_async \
+#       --features executor-diesel-async-postgres -- --ignored --nocapture
+[[test]]
+name = "reexec_postgres_async"
+required-features = ["executor-diesel-async-postgres"]
+
+# Docker-backed integration test for AsyncAutoResolvingEngine +
+# MysqlAsyncDieselConnector against a real MySQL 8.0 with binary logging.
+# Run with:
+#   cargo test --test reexec_mysql_async \
+#       --features executor-diesel-async-mysql -- --ignored --nocapture
+[[test]]
+name = "reexec_mysql_async"
+required-features = ["executor-diesel-async-mysql"]
 
 # Docker-backed integration test for PgStreamingCdcSource (push-based PG
 # CDC source using START_REPLICATION via pg_walstream). Run with:
@@ -293,6 +338,15 @@ diesel = { version = "2", optional = true }
 # `executor-diesel-postgres-r2d2` feature. Ignored otherwise.
 r2d2 = { version = "0.8", optional = true }
 
+# Async diesel execution driver. Backs both async paths: the async
+# re-exec connectors (`src/reexec/async_diesel.rs`) and the async patchset
+# apply methods (`src/patchset/mod.rs`). Off by default and
+# `default-features = false` so its backend selection stays under subql's
+# own feature gates. std-only (diesel-async needs an async runtime). Must
+# resolve to the same diesel node as subql's `future` fork patch, which it
+# does because diesel-async's `diesel ~2.3` requirement is satisfied by
+# the fork.
+diesel-async = { version = "0.7", optional = true, default-features = false }
 
 # SQLite session-extension binary formats (changeset / patchset) plus the
 # wal2json and Maxwell parsers subql implements `CdcEvent` on. Backs the
@@ -300,7 +354,7 @@ r2d2 = { version = "0.8", optional = true }
 # alloc` posture, no C deps (the `wal2json` and `maxwell` features pull only
 # serde). `default-features = false` drops the `diesel` and `pg-walstream`
 # reverse adapters, which the feature gates below opt into when needed.
-sqlite-diff-rs = { version = "0.6.1", default-features = false, features = ["wal2json", "maxwell"] }
+sqlite-diff-rs = { version = "0.7.0", default-features = false, features = ["wal2json", "maxwell"] }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables
@@ -359,13 +413,21 @@ arbitrary = { version = "1", features = ["derive"] }
 diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "numeric", "chrono", "serde_json"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 
+# Async diesel execution for the async apply and async re-exec e2e tests
+# (`apply_patchset_pg_async_e2e`, `reexec_postgres_async`, and the MySQL
+# peers). The `bb8` feature provides the pool type the connectors wrap,
+# reached through diesel-async's re-export. Both backends are enabled so a
+# test can target whichever backend regardless of the single library
+# feature it turns on.
+diesel-async = { version = "0.7", default-features = false, features = ["postgres", "mysql", "bb8"] }
+
 # Property-based testing
 proptest = "1"
 
 # Multi-task async runtime for tests that need real concurrency (e.g.
 # `tests/reexec_throttle.rs`, which observes peak in-flight connector
 # calls during a batch). Just enough features to spawn tasks and sleep.
-tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 
 # Non-poisoning locks in test fixtures. Matches the workspace rs-parking-lot
 # rule that bans `std::sync::Mutex/RwLock` where the guard is unwrapped.
@@ -476,6 +538,54 @@ executor-diesel-mysql = ["executor-diesel", "diesel?/mysql"]
 apply-patchset-mysql = [
     "executor-diesel-mysql",
     "sqlite-diff-rs/diesel",
+]
+# Opt-in: async execution base. Ships the async re-exec connectors and the
+# async patchset apply methods, both driven by `diesel-async`. Builds on
+# the backend-agnostic `executor-diesel` base (which brings `std` plus the
+# `DieselBackend` trait and the scalar row types the async connectors
+# reuse) and adds `diesel-async`. The base pulls only diesel's
+# backend-agnostic surface, no libpq or libmysqlclient. First-class peer of
+# the sync `executor-diesel` ladder, additive: the sync surface is
+# unchanged. The user activates a backend below.
+executor-diesel-async = ["executor-diesel", "dep:diesel-async"]
+# Opt-in: ship `PgAsyncDieselConnector`, the async LSN-aware analogue of
+# `PgDieselConnector`. Wraps a `bb8` pool over `AsyncPgConnection`, is
+# `Send + Sync`, and reads `pg_current_wal_lsn()` inside the same
+# read-only repeatable-read transaction as the user query. `diesel-async/bb8`
+# supplies the `ManageConnection` impl the pool needs.
+executor-diesel-async-postgres = [
+    "executor-diesel-async",
+    "diesel-async/postgres",
+    "diesel-async/bb8",
+]
+# Opt-in: ship `MysqlAsyncDieselConnector`, the async binlog-position-aware
+# analogue of `MysqlDieselConnector`. Wraps a `bb8` pool over
+# `AsyncMysqlConnection` and reads `performance_schema.log_status` in the
+# same transaction as the user query.
+executor-diesel-async-mysql = [
+    "executor-diesel-async",
+    "diesel-async/mysql",
+    "diesel-async/bb8",
+]
+# Opt-in: async peer of `apply-patchset-postgres`. Adds the
+# `apply_patchset_async` / `apply_changeset_async` / `apply_diffset_bytes_async`
+# entry points against an async Postgres connection, driven by
+# `sqlite-diff-rs`'s `diesel-async` execution surface. Reuses `PgAdapter`
+# unchanged. std-only.
+apply-patchset-postgres-async = [
+    "apply-patchset-postgres",
+    "dep:diesel-async",
+    "diesel-async/postgres",
+    "sqlite-diff-rs/diesel-async",
+]
+# Opt-in: async peer of `apply-patchset-mysql`. Adds the async apply entry
+# points against an async MySQL connection. Reuses `MysqlAdapter`
+# unchanged. std-only.
+apply-patchset-mysql-async = [
+    "apply-patchset-mysql",
+    "dep:diesel-async",
+    "diesel-async/mysql",
+    "sqlite-diff-rs/diesel-async",
 ]
 # Opt-in: ship the `patchset::SqliteAdapter` for executing a
 # client-uploaded SQLite session patchset against another SQLite

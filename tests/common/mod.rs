@@ -78,6 +78,17 @@ pub fn assert_docker_available() {
     );
 }
 
+/// Multi-thread tokio runtime for the async e2e tests. Built at the sync
+/// test boundary so blocking testcontainers setup runs before `block_on`,
+/// then used to drive the async apply and re-exec paths. Multi-thread so
+/// the connectors' `Send` futures are exercised across worker threads.
+pub fn multi_thread_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build multi-thread tokio runtime")
+}
+
 /// Spin up a Postgres 16 container with the wal2json output plugin and
 /// `wal_level=logical`, waiting until the server is accepting connections.
 pub fn pg_with_wal2json() -> Container<GenericImage> {
