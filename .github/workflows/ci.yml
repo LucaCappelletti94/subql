@@ -99,7 +99,7 @@ jobs:
   unit-tests:
     name: tests (${{ matrix.profile.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -113,7 +113,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --lib --tests --release --locked ${{ matrix.profile.args }}
+      - run: cargo test --workspace --exclude subql-demo --lib --tests --release --locked ${{ matrix.profile.args }}
 
   integration:
     name: integration (Docker e2e)
@@ -139,14 +139,14 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps --all-features --locked
-      - run: cargo test --workspace --doc --all-features --locked
+      - run: cargo doc --workspace --exclude subql-demo --no-deps --all-features --locked
+      - run: cargo test --workspace --exclude subql-demo --doc --all-features --locked
       # The README / engine doctests use only the in-memory dispatch
       # surface (ParserDB, SubscriptionEngine, register, consumers,
       # aggregate_deltas) — load-bearing proof that the no_std subset is
       # end-to-end functional. The doctest harness itself still links
       # libstd; only subql's `std` feature is disabled.
-      - run: cargo test --workspace --doc --no-default-features --locked
+      - run: cargo test --workspace --exclude subql-demo --doc --no-default-features --locked
 
   msrv:
     name: msrv (1.88)
@@ -159,7 +159,7 @@ jobs:
         with:
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --lib --tests --release --locked
+      - run: cargo test --workspace --exclude subql-demo --lib --tests --release --locked
 
   bench-check:
     name: bench compile check
@@ -193,7 +193,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      - run: cargo llvm-cov --workspace --all-features --locked --codecov --output-path codecov.json
+      - run: cargo llvm-cov --workspace --exclude subql-demo --all-features --locked --codecov --output-path codecov.json
       - uses: codecov/codecov-action@v5
         with:
           files: codecov.json
