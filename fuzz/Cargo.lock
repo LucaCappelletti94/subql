@@ -807,9 +807,8 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df358894530c213c234e3f8effc3d285971e0401bd87b6461b4f12ac2040509a"
+version = "0.8.0"
+source = "git+https://github.com/LucaCappelletti94/pg-walstream?branch=feat%2Fpgoutput-decoder#4ebcb96cf515cce84e60da2d9d789cac455eee3f"
 dependencies = [
  "bytes",
  "chrono",
@@ -1130,13 +1129,14 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.1.2"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32997decde2b3f934b807bc74fe7cffb28ba62978ccd085a697b480756194115"
+checksum = "28f7ccbce1f3aa053784a9e8b0a2035c81d5a431e6e9133262cf252f9ee95c3c"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
  "pg_walstream",
+ "serde",
  "serde_json",
  "thiserror",
 ]

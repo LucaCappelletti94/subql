@@ -2,7 +2,7 @@
 //! to sqlite DDL via pg2sqlite, apply it, and load seed rows.
 //!
 //! The companion [`capture`] module installs diesel hooks that turn sqlite
-//! `INSERT`/`UPDATE`/`DELETE` into SubQL `WalEvent`s.
+//! `INSERT`/`UPDATE`/`DELETE` into SubQL `TestEvent`s.
 
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -12,7 +12,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use subql::{catalog_helpers, Cell, ColumnId, TableId};
+use subql::{backend::Postgres, backend::Value, catalog_helpers, ColumnId, TableId};
 
 use crate::presets::PresetSchema;
 
@@ -80,11 +80,11 @@ impl SqliteHarness {
     }
 
     /// Run an `INSERT` against the wrapped table. Returns the assigned `rowid`.
-    pub fn exec_insert(&mut self, row: &[Cell]) -> Result<i64, HarnessError> {
+    pub fn exec_insert(&mut self, row: &[Value<Postgres>]) -> Result<i64, HarnessError> {
         let cols = self.columns.join(", ");
         let values = row
             .iter()
-            .map(cell_to_sql_literal)
+            .map(value_to_sql_literal)
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
@@ -98,12 +98,16 @@ impl SqliteHarness {
     }
 
     /// Replace the row at `rowid` with the given cell values.
-    pub fn exec_update(&mut self, rowid: i64, new_row: &[Cell]) -> Result<(), HarnessError> {
+    pub fn exec_update(
+        &mut self,
+        rowid: i64,
+        new_row: &[Value<Postgres>],
+    ) -> Result<(), HarnessError> {
         let sets = self
             .columns
             .iter()
             .zip(new_row.iter())
-            .map(|(c, v)| format!("{c} = {}", cell_to_sql_literal(v)))
+            .map(|(c, v)| format!("{c} = {}", value_to_sql_literal(v)))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
@@ -132,25 +136,23 @@ impl SqliteHarness {
     }
 }
 
-/// Render a `Cell` as a sqlite literal. Sufficient for the preset-driven
+/// Render a `Value` as a sqlite literal. Sufficient for the preset-driven
 /// demo where data shape is fully controlled by the simulation.
-fn cell_to_sql_literal(cell: &Cell) -> String {
-    match cell {
-        Cell::Missing | Cell::Null => "NULL".into(),
-        Cell::Bool(b) => (if *b { "1" } else { "0" }).into(),
-        Cell::Int(i) => i.to_string(),
-        Cell::Float(f) => {
+fn value_to_sql_literal(value: &Value<Postgres>) -> String {
+    match value {
+        Value::Missing | Value::Null => "NULL".into(),
+        Value::Bool(b) => (if *b { "1" } else { "0" }).into(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => {
             if f.is_finite() {
                 format!("{f}")
             } else {
                 "NULL".into()
             }
         }
-        Cell::String(s) => format!("'{}'", s.replace('\'', "''")),
-        // Cell is `#[non_exhaustive]`; treat any future variant we don't know
-        // about as NULL on the sqlite side. The demo only emits the variants
-        // above through its preset generators, so this should not fire in
-        // practice.
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        // The demo only emits the variants above through its preset
+        // generators, so any other value maps to NULL on the sqlite side.
         _ => "NULL".into(),
     }
 }

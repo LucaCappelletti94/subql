@@ -32,9 +32,14 @@ members = ["."]
 # Mirror root Cargo.toml [patch.crates-io] pins. cargo-fuzz's standalone
 # workspace does not inherit the parent's patch table.
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 # Route diesel through the LucaCappelletti94/future fork so the
 # `SqliteConnection` here is the same type diesel-sqlite-session sees.
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+# Unify pg_walstream across subql and sqlite-diff-rs on this fork branch,
+# so the `EventType` sqlite-diff-rs consumes is the type subql produces
+# and `pg-sqlite-emu` encodes through the same pg_walstream 0.8.
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
 
 [patch."https://github.com/diesel-rs/diesel"]
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }

@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use rand::rngs::SmallRng;
 use rand::seq::IndexedRandom;
 use rand::Rng;
 
-use subql::Cell;
+use subql::backend::Value;
 
 use super::{PresetSchema, Row};
 
@@ -39,10 +37,10 @@ fn seed() -> Vec<Row> {
 
 fn row(id: i64, age: Option<i64>, email: Option<&str>, name: Option<&str>) -> Row {
     vec![
-        Cell::Int(id),
-        age.map_or(Cell::Null, Cell::Int),
-        email.map_or(Cell::Null, |s| Cell::String(Arc::from(s))),
-        name.map_or(Cell::Null, |s| Cell::String(Arc::from(s))),
+        Value::Int(id),
+        age.map_or(Value::Null, Value::Int),
+        email.map_or(Value::Null, |s| Value::String(s.to_owned())),
+        name.map_or(Value::Null, |s| Value::String(s.to_owned())),
     ]
 }
 
@@ -60,9 +58,9 @@ fn generate(rng: &mut SmallRng) -> Row {
         Some(format!("{name}{id}@example.com"))
     };
     vec![
-        Cell::Int(id),
-        age.map_or(Cell::Null, Cell::Int),
-        email.map_or(Cell::Null, |s| Cell::String(Arc::from(s.as_str()))),
-        Cell::String(Arc::from(name)),
+        Value::Int(id),
+        age.map_or(Value::Null, Value::Int),
+        email.map_or(Value::Null, Value::String),
+        Value::String(name.to_owned()),
     ]
 }

@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use rand::rngs::SmallRng;
 use rand::seq::IndexedRandom;
 use rand::Rng;
 
-use subql::Cell;
+use subql::backend::Value;
 
 use super::{PresetSchema, Row};
 
@@ -37,10 +35,10 @@ fn seed() -> Vec<Row> {
 
 fn row(id: i64, amount: Option<i64>, status: Option<&str>, comment: Option<&str>) -> Row {
     vec![
-        Cell::Int(id),
-        amount.map_or(Cell::Null, Cell::Int),
-        status.map_or(Cell::Null, |s| Cell::String(Arc::from(s))),
-        comment.map_or(Cell::Null, |s| Cell::String(Arc::from(s))),
+        Value::Int(id),
+        amount.map_or(Value::Null, Value::Int),
+        status.map_or(Value::Null, |s| Value::String(s.to_owned())),
+        comment.map_or(Value::Null, |s| Value::String(s.to_owned())),
     ]
 }
 
@@ -58,9 +56,9 @@ fn generate(rng: &mut SmallRng) -> Row {
         None
     };
     vec![
-        Cell::Int(id),
-        amount.map_or(Cell::Null, Cell::Int),
-        Cell::String(Arc::from(status)),
-        comment.map_or(Cell::Null, |s| Cell::String(Arc::from(s.as_str()))),
+        Value::Int(id),
+        amount.map_or(Value::Null, Value::Int),
+        Value::String(status.to_owned()),
+        comment.map_or(Value::Null, Value::String),
     ]
 }

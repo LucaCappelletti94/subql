@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use rand::rngs::SmallRng;
 use rand::seq::IndexedRandom;
 use rand::Rng;
 
-use subql::Cell;
+use subql::backend::Value;
 
 use super::{PresetSchema, Row};
 
@@ -38,10 +36,10 @@ fn seed() -> Vec<Row> {
 
 fn row(sensor_id: i64, temperature: f64, humidity: f64, location: &str) -> Row {
     vec![
-        Cell::Int(sensor_id),
-        Cell::Float(temperature),
-        Cell::Float(humidity),
-        Cell::String(Arc::from(location)),
+        Value::Int(sensor_id),
+        Value::Float(temperature),
+        Value::Float(humidity),
+        Value::String(location.to_owned()),
     ]
 }
 
@@ -51,9 +49,9 @@ fn generate(rng: &mut SmallRng) -> Row {
     let humidity: f64 = rng.random_range(15.0..90.0);
     let location = LOCATIONS.choose(rng).copied().unwrap_or("warehouse-A");
     vec![
-        Cell::Int(sensor_id),
-        Cell::Float(temperature),
-        Cell::Float(humidity),
-        Cell::String(Arc::from(location)),
+        Value::Int(sensor_id),
+        Value::Float(temperature),
+        Value::Float(humidity),
+        Value::String(location.to_owned()),
     ]
 }

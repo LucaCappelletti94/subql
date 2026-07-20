@@ -14,6 +14,7 @@
 //! before handing anything to the engine, so [`CdcEvent::kind`] is only
 //! ever called on an Insert, Update, Delete, or Truncate.
 
+#[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
