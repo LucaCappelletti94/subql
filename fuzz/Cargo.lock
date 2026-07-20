@@ -1088,12 +1088,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spin"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
-
-[[package]]
 name = "sql-traits"
 version = "0.1.0"
 source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#fe18e678abd23ce8dbc5fc348fa5478146cabe39"
@@ -1221,7 +1215,6 @@ dependencies = [
  "serde",
  "serde_json",
  "slab",
- "spin",
  "sql-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main)",
  "sqlite-diff-rs",
  "sqlparser",

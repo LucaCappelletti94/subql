@@ -51,6 +51,13 @@ readme = "README.md"
 keywords = ["sql", "cdc", "subscription", "postgres", "streaming"]
 categories = ["database", "parser-implementations"]
 
+[package.metadata.cargo-udeps.ignore]
+# `arbitrary` is a dev-dependency used only by feature-gated integration
+# tests (the pg-sqlite-emu proptests and the sqlite patchset e2e). udeps
+# runs with default features and never compiles those targets, so it
+# false-positives the dev-dependency as unused.
+development = ["arbitrary"]
+
 [lib]
 name = "subql"
 path = "src/lib.rs"
@@ -228,12 +235,6 @@ slab = "0.4"
 
 # Atomic pointer swap for immutable snapshots
 arc-swap = "1.7"
-
-# `spin::Mutex` for the relation cache in the pgoutput parser. We pick spin
-# because it's the standard no_std Mutex (works under WASM where OS threads
-# are absent) and the relation cache is a low-contention surface where
-# spin-wait overhead vs std Mutex is irrelevant.
-spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex", "once", "lazy"] }
 
 # Fast hashing. `hashbrown` is no_std-friendly and ships its own default
 # hasher (foldhash) via the `default-hasher` feature — no direct ahash dep

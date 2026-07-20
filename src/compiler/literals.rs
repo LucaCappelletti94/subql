@@ -81,7 +81,7 @@ fn parse_decimal(n: &str, sql: &SqlValue) -> Result<bigdecimal::BigDecimal, Regi
 }
 
 fn parse_hex_bytes(s: &str, sql: &SqlValue) -> Result<Vec<u8>, RegisterError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(err_parse(sql, ScalarKind::Bytes, "odd-length hex literal"));
     }
     let mut out = Vec::with_capacity(s.len() / 2);
