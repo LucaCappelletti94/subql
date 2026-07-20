@@ -8,10 +8,9 @@
 //! 5. Dependency: col -> predicates referencing col (for UPDATE optimization)
 
 use super::ids::PredicateId;
-use crate::{
-    compiler::{PlannerAtom, PlannerValue},
-    Cell, ColumnId,
-};
+use crate::backend::{Backend, Value};
+use crate::compiler::{BytecodeProgram, Instruction, PlannerAtom, PlannerValue};
+use crate::ColumnId;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -30,15 +29,35 @@ pub enum IndexableCell {
 }
 
 impl IndexableCell {
-    /// Convert Cell to IndexableCell (None if NULL/Missing)
+    /// Convert a `Value<B>` into an `IndexableCell` when its payload
+    /// downcasts to one of the four indexable primitives (`bool`, `i64`,
+    /// `f64`, `String`). Returns `None` for `Missing` / `Null` and for
+    /// scalars whose payload type does not match one of those four.
+    ///
+    /// Uses [`Any::downcast_ref`](core::any::Any), which is safe under
+    /// `Backend`'s `'static` bound on every scalar. For the three
+    /// shipped backends (Postgres, MySql, SQLite) this matches
+    /// `Value::Bool` (Postgres / MySql `bool`, SQLite `i64` also routes
+    /// via `Value::Int`), `Value::Int` (`i64`), `Value::Float` (`f64`),
+    /// and `Value::String` (`alloc::String`); every other scalar
+    /// variant returns `None`, causing the caller to emit
+    /// `IndexableAtom::Fallback`.
     #[must_use]
-    pub fn from_cell(cell: &Cell) -> Option<Self> {
-        match cell {
-            Cell::Bool(b) => Some(Self::Bool(*b)),
-            Cell::Int(i) => Some(Self::Int(*i)),
-            Cell::Float(f) => Some(Self::Float(f.to_bits())),
-            Cell::String(s) => Some(Self::String(Arc::clone(s))),
-            Cell::Null | Cell::Missing => None,
+    pub fn from_value<B: Backend>(v: &Value<B>) -> Option<Self> {
+        use core::any::Any;
+        match v {
+            Value::Bool(x) => (x as &dyn Any)
+                .downcast_ref::<bool>()
+                .map(|b| Self::Bool(*b))
+                .or_else(|| (x as &dyn Any).downcast_ref::<i64>().map(|i| Self::Int(*i))),
+            Value::Int(x) => (x as &dyn Any).downcast_ref::<i64>().map(|i| Self::Int(*i)),
+            Value::Float(x) => (x as &dyn Any)
+                .downcast_ref::<f64>()
+                .map(|f| Self::Float(f.to_bits())),
+            Value::String(x) => (x as &dyn Any)
+                .downcast_ref::<alloc::string::String>()
+                .map(|s| Self::String(Arc::from(s.as_str()))),
+            _ => None,
         }
     }
 
@@ -51,6 +70,18 @@ impl IndexableCell {
             PlannerValue::Float(bits) => Self::Float(*bits),
             PlannerValue::String(s) => Self::String(Arc::clone(s)),
         }
+    }
+}
+
+/// Convert a `Value<B>` back to an `i64` when the underlying payload
+/// downcasts to `i64` (Postgres / MySql / SQLite `Backend::Int`). Returns
+/// `None` for exotic backends whose integer type is not `i64`.
+#[must_use]
+fn value_as_i64<B: Backend>(v: &Value<B>) -> Option<i64> {
+    use core::any::Any;
+    match v {
+        Value::Int(x) => (x as &dyn Any).downcast_ref::<i64>().copied(),
+        _ => None,
     }
 }
 
@@ -442,18 +473,17 @@ impl Default for HybridIndexes {
 /// Returns empty vec if predicate is too complex to index efficiently.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn extract_indexable_atoms(
-    bytecode: &crate::compiler::BytecodeProgram,
+pub fn extract_indexable_atoms<B: Backend>(
+    bytecode: &BytecodeProgram<B>,
     _deps: &[ColumnId],
 ) -> Vec<IndexableAtom> {
-    use crate::compiler::Instruction;
-
     let mut atoms = Vec::new();
     let instructions = &bytecode.instructions;
 
-    // Safety: OR predicates require ALL branches to be indexed for correctness.
-    // If any branch isn't indexed, the predicate could be missed during candidate
-    // selection. Add Fallback to ensure OR predicates are always VM-evaluated.
+    // Safety: OR predicates require ALL branches to be indexed for
+    // correctness. If any branch isn't indexed, the predicate could be
+    // missed during candidate selection. Add Fallback to ensure OR
+    // predicates are always VM-evaluated.
     let has_or = instructions
         .iter()
         .any(|instr| matches!(instr, Instruction::Or | Instruction::JumpIfTrue(_)));
@@ -461,49 +491,47 @@ pub fn extract_indexable_atoms(
         atoms.push(IndexableAtom::Fallback);
     }
 
-    // Pattern matching on instruction sequences
     let mut i = 0;
     while i < instructions.len() {
-        // Check for 5-instruction patterns (BETWEEN with negated bound)
-        // Pattern: LoadColumn, PushLiteral, Negate, PushLiteral, Between
+        // 5-instruction pattern: LoadColumn, PushLiteral, Negate, PushLiteral, Between.
         if let Some(
             [Instruction::LoadColumn(col), Instruction::PushLiteral(lower), Instruction::Negate, Instruction::PushLiteral(upper), Instruction::Between],
         ) = instructions.get(i..i.saturating_add(5))
         {
-            if let (Cell::Int(lower_val), Cell::Int(upper_val)) = (lower, upper) {
+            if let (Some(lower_val), Some(upper_val)) = (value_as_i64(lower), value_as_i64(upper)) {
                 atoms.push(IndexableAtom::Range {
                     column_id: *col,
                     lower: Some(-lower_val),
-                    upper: Some(*upper_val),
+                    upper: Some(upper_val),
                 });
             }
             i += 5;
             continue;
         }
 
-        // Check for 4-instruction patterns first (BETWEEN)
+        // 4-instruction pattern: LoadColumn, PushLiteral, PushLiteral, Between.
         if let Some(
             [Instruction::LoadColumn(col), Instruction::PushLiteral(lower), Instruction::PushLiteral(upper), Instruction::Between],
         ) = instructions.get(i..i.saturating_add(4))
         {
-            if let (Cell::Int(lower_val), Cell::Int(upper_val)) = (lower, upper) {
+            if let (Some(lower_val), Some(upper_val)) = (value_as_i64(lower), value_as_i64(upper)) {
                 atoms.push(IndexableAtom::Range {
                     column_id: *col,
-                    lower: Some(*lower_val),
-                    upper: Some(*upper_val),
+                    lower: Some(lower_val),
+                    upper: Some(upper_val),
                 });
             }
             i += 4;
             continue;
         }
 
-        // Check for 3-instruction patterns
+        // 3-instruction patterns.
         match instructions.get(i..i.saturating_add(3)) {
-            // Pattern 1: LoadColumn, PushLiteral, Equal -> Equality index
+            // LoadColumn, PushLiteral, Equal -> Equality index.
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::Equal],
             ) => {
-                if let Some(indexable) = IndexableCell::from_cell(val) {
+                if let Some(indexable) = IndexableCell::from_value(val) {
                     atoms.push(IndexableAtom::Equality {
                         column_id: *col,
                         value: indexable,
@@ -512,18 +540,18 @@ pub fn extract_indexable_atoms(
                 i += 3;
             }
 
-            // Pattern 2: LoadColumn, PushLiteral, NotEqual -> Skip (not easily indexable)
+            // LoadColumn, PushLiteral, NotEqual -> not easily indexable, skip.
             Some(
                 [Instruction::LoadColumn(_), Instruction::PushLiteral(_), Instruction::NotEqual],
             ) => {
                 i += 3;
             }
 
-            // Pattern 3: LoadColumn, PushLiteral, GreaterThan -> Range [val+1, inf)
+            // LoadColumn, PushLiteral, GreaterThan -> Range [val+1, inf).
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThan],
             ) => {
-                if let Cell::Int(int_val) = val {
+                if let Some(int_val) = value_as_i64(val) {
                     atoms.push(IndexableAtom::Range {
                         column_id: *col,
                         lower: Some(int_val.saturating_add(1)),
@@ -533,25 +561,25 @@ pub fn extract_indexable_atoms(
                 i += 3;
             }
 
-            // Pattern 4: LoadColumn, PushLiteral, GreaterThanOrEqual -> Range [val, inf)
+            // LoadColumn, PushLiteral, GreaterThanOrEqual -> Range [val, inf).
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::GreaterThanOrEqual],
             ) => {
-                if let Cell::Int(int_val) = val {
+                if let Some(int_val) = value_as_i64(val) {
                     atoms.push(IndexableAtom::Range {
                         column_id: *col,
-                        lower: Some(*int_val),
+                        lower: Some(int_val),
                         upper: None,
                     });
                 }
                 i += 3;
             }
 
-            // Pattern 5: LoadColumn, PushLiteral, LessThan -> Range (-inf, val-1]
+            // LoadColumn, PushLiteral, LessThan -> Range (-inf, val-1].
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThan],
             ) => {
-                if let Cell::Int(int_val) = val {
+                if let Some(int_val) = value_as_i64(val) {
                     atoms.push(IndexableAtom::Range {
                         column_id: *col,
                         lower: None,
@@ -561,66 +589,56 @@ pub fn extract_indexable_atoms(
                 i += 3;
             }
 
-            // Pattern 6: LoadColumn, PushLiteral, LessThanOrEqual -> Range (-inf, val]
+            // LoadColumn, PushLiteral, LessThanOrEqual -> Range (-inf, val].
             Some(
                 [Instruction::LoadColumn(col), Instruction::PushLiteral(val), Instruction::LessThanOrEqual],
             ) => {
-                if let Cell::Int(int_val) = val {
+                if let Some(int_val) = value_as_i64(val) {
                     atoms.push(IndexableAtom::Range {
                         column_id: *col,
                         lower: None,
-                        upper: Some(*int_val),
+                        upper: Some(int_val),
                     });
                 }
                 i += 3;
             }
 
-            _ => {
-                // Check for other patterns
-                match instructions.get(i) {
-                    // Pattern 7: LoadColumn, IsNull -> NULL check
-                    Some(Instruction::LoadColumn(col)) => {
-                        if matches!(instructions.get(i + 1), Some(Instruction::IsNull)) {
-                            atoms.push(IndexableAtom::Null {
-                                column_id: *col,
-                                kind: NullKind::IsNull,
-                            });
-                            i += 2;
-                        } else if matches!(instructions.get(i + 1), Some(Instruction::IsNotNull)) {
-                            // Pattern 8: LoadColumn, IsNotNull -> NULL check
-                            atoms.push(IndexableAtom::Null {
-                                column_id: *col,
-                                kind: NullKind::IsNotNull,
-                            });
-                            i += 2;
-                        } else if matches!(instructions.get(i + 1), Some(Instruction::In(_))) {
-                            // Pattern 9: LoadColumn, In([...]) -> Multiple equality atoms
-                            if let Some(Instruction::In(values)) = instructions.get(i + 1) {
-                                for val in values {
-                                    if let Some(indexable) = IndexableCell::from_cell(val) {
-                                        atoms.push(IndexableAtom::Equality {
-                                            column_id: *col,
-                                            value: indexable,
-                                        });
-                                    }
-                                }
+            _ => match instructions.get(i) {
+                // LoadColumn, IsNull / IsNotNull / In -> NULL / multiple equality atoms.
+                Some(Instruction::LoadColumn(col)) => {
+                    if matches!(instructions.get(i + 1), Some(Instruction::IsNull)) {
+                        atoms.push(IndexableAtom::Null {
+                            column_id: *col,
+                            kind: NullKind::IsNull,
+                        });
+                        i += 2;
+                    } else if matches!(instructions.get(i + 1), Some(Instruction::IsNotNull)) {
+                        atoms.push(IndexableAtom::Null {
+                            column_id: *col,
+                            kind: NullKind::IsNotNull,
+                        });
+                        i += 2;
+                    } else if let Some(Instruction::In(values)) = instructions.get(i + 1) {
+                        for val in values {
+                            if let Some(indexable) = IndexableCell::from_value(val) {
+                                atoms.push(IndexableAtom::Equality {
+                                    column_id: *col,
+                                    value: indexable,
+                                });
                             }
-                            i += 2;
-                        } else {
-                            i += 1;
                         }
+                        i += 2;
+                    } else {
+                        i += 1;
                     }
-
-                    // Pattern 10: LoadColumn, PushLiteral, PushLiteral, Between -> Range [lower, upper]
-                    Some(_) => i += 1,
-
-                    None => break,
                 }
-            }
+
+                Some(_) => i += 1,
+                None => break,
+            },
         }
     }
 
-    // If no indexable atoms found, return Fallback
     if atoms.is_empty() {
         vec![IndexableAtom::Fallback]
     } else {
@@ -632,21 +650,28 @@ pub fn extract_indexable_atoms(
 #[allow(clippy::unwrap_used, clippy::approx_constant)]
 mod tests {
     use super::*;
+    use crate::backend::{Postgres, Value};
 
     #[test]
-    fn test_indexable_cell_from_cell() {
+    fn test_indexable_cell_from_value() {
         assert_eq!(
-            IndexableCell::from_cell(&Cell::Int(42)),
+            IndexableCell::from_value(&Value::<Postgres>::Int(42)),
             Some(IndexableCell::Int(42))
         );
 
         assert_eq!(
-            IndexableCell::from_cell(&Cell::Bool(true)),
+            IndexableCell::from_value(&Value::<Postgres>::Bool(true)),
             Some(IndexableCell::Bool(true))
         );
 
-        assert_eq!(IndexableCell::from_cell(&Cell::Null), None);
-        assert_eq!(IndexableCell::from_cell(&Cell::Missing), None);
+        assert_eq!(IndexableCell::from_value(&Value::<Postgres>::Null), None);
+        assert_eq!(IndexableCell::from_value(&Value::<Postgres>::Missing), None);
+
+        let float = IndexableCell::from_value(&Value::<Postgres>::Float(3.14));
+        assert!(matches!(float, Some(IndexableCell::Float(_))));
+
+        let string = IndexableCell::from_value(&Value::<Postgres>::String("test".into()));
+        assert_eq!(string, Some(IndexableCell::String("test".into())));
     }
 
     #[test]
@@ -814,7 +839,7 @@ mod tests {
         // Bytecode for: age = 42
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(42)),
             Instruction::Equal,
         ]);
 
@@ -837,7 +862,7 @@ mod tests {
         // Bytecode for: age > 18
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(18)),
             Instruction::GreaterThan,
         ]);
 
@@ -861,8 +886,8 @@ mod tests {
         // Bytecode for: age BETWEEN 18 AND 65
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
-            Instruction::PushLiteral(Cell::Int(65)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(18)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(65)),
             Instruction::Between,
         ]);
 
@@ -884,7 +909,8 @@ mod tests {
         use crate::compiler::{BytecodeProgram, Instruction};
 
         // Bytecode for: status IS NULL
-        let bytecode = BytecodeProgram::new(vec![Instruction::LoadColumn(2), Instruction::IsNull]);
+        let bytecode =
+            BytecodeProgram::<Postgres>::new(vec![Instruction::LoadColumn(2), Instruction::IsNull]);
 
         let atoms = extract_indexable_atoms(&bytecode, &[2]);
 
@@ -906,8 +932,8 @@ mod tests {
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(2),
             Instruction::In(vec![
-                Cell::String("active".into()),
-                Cell::String("pending".into()),
+                Value::<Postgres>::String("active".into()),
+                Value::<Postgres>::String("pending".into()),
             ]),
         ]);
 
@@ -937,7 +963,7 @@ mod tests {
         // Bytecode for: name LIKE '%test%' (complex, not easily indexable)
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
-            Instruction::PushLiteral(Cell::String("%test%".into())),
+            Instruction::PushLiteral(Value::<Postgres>::String("%test%".into())),
             Instruction::Like {
                 case_sensitive: true,
             },
@@ -947,21 +973,6 @@ mod tests {
 
         assert_eq!(atoms.len(), 1);
         assert!(matches!(atoms[0], IndexableAtom::Fallback));
-    }
-
-    #[test]
-    fn test_indexable_cell_from_float() {
-        let float_cell = Cell::Float(3.14);
-        let indexable = IndexableCell::from_cell(&float_cell);
-        assert!(indexable.is_some());
-        assert!(matches!(indexable, Some(IndexableCell::Float(_))));
-    }
-
-    #[test]
-    fn test_indexable_cell_from_string() {
-        let string_cell = Cell::String("test".into());
-        let indexable = IndexableCell::from_cell(&string_cell);
-        assert_eq!(indexable, Some(IndexableCell::String("test".into())));
     }
 
     #[test]
@@ -1138,7 +1149,7 @@ mod tests {
         // Bytecode for: age != 42 (not indexable, skipped)
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(42)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(42)),
             Instruction::NotEqual,
         ]);
 
@@ -1156,7 +1167,7 @@ mod tests {
         // Bytecode for: age >= 18
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(18)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(18)),
             Instruction::GreaterThanOrEqual,
         ]);
 
@@ -1180,7 +1191,7 @@ mod tests {
         // Bytecode for: age < 30
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(30)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(30)),
             Instruction::LessThan,
         ]);
 
@@ -1204,7 +1215,7 @@ mod tests {
         // Bytecode for: age <= 65
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Int(65)),
+            Instruction::PushLiteral(Value::<Postgres>::Int(65)),
             Instruction::LessThanOrEqual,
         ]);
 
@@ -1226,8 +1237,10 @@ mod tests {
         use crate::compiler::{BytecodeProgram, Instruction};
 
         // Bytecode for: status IS NOT NULL
-        let bytecode =
-            BytecodeProgram::new(vec![Instruction::LoadColumn(2), Instruction::IsNotNull]);
+        let bytecode = BytecodeProgram::<Postgres>::new(vec![
+            Instruction::LoadColumn(2),
+            Instruction::IsNotNull,
+        ]);
 
         let atoms = extract_indexable_atoms(&bytecode, &[2]);
 
@@ -1248,7 +1261,7 @@ mod tests {
         // Bytecode for: price >= 9.99 (Float - range only works with Int)
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Float(9.99)),
+            Instruction::PushLiteral(Value::<Postgres>::Float(9.99)),
             Instruction::GreaterThanOrEqual,
         ]);
 
@@ -1266,7 +1279,7 @@ mod tests {
         // Bytecode for: price < 100.0 (Float - range only works with Int)
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Float(100.0)),
+            Instruction::PushLiteral(Value::<Postgres>::Float(100.0)),
             Instruction::LessThan,
         ]);
 
@@ -1283,7 +1296,7 @@ mod tests {
         // Bytecode for: price <= 50.0 (Float - range only works with Int)
         let bytecode = BytecodeProgram::new(vec![
             Instruction::LoadColumn(1),
-            Instruction::PushLiteral(Cell::Float(50.0)),
+            Instruction::PushLiteral(Value::<Postgres>::Float(50.0)),
             Instruction::LessThanOrEqual,
         ]);
 

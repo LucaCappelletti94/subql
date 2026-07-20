@@ -9,15 +9,14 @@
 //! register/dispatch, session teardown, and the snapshot/restore round-trip.
 #![allow(clippy::unwrap_used)]
 
-use std::sync::Arc;
-
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use uuid::Uuid;
 
+use subql::backend::{Postgres, Value};
+use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, Cell, IdTypes, RowImage, SubscriptionEngine, SubscriptionRequest,
-    SubscriptionScope, TableId, WalEvent,
+    catalog_helpers, IdTypes, SubscriptionEngine, SubscriptionRequest, SubscriptionScope, TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -37,30 +36,28 @@ fn catalog() -> ParserDB {
 }
 
 /// `orders.id` is the PK; columns are `id=0, amount=1, status=2`.
-fn insert_event(table_id: TableId, id: i64, amount: i64) -> WalEvent {
-    WalEvent::builder(table_id)
-        .insert()
-        .new_row(RowImage {
-            cells: Arc::from([
-                Cell::Int(id),
-                Cell::Int(amount),
-                Cell::String("paid".into()),
-            ]),
-        })
-        .build()
-        .expect("build insert event")
+fn insert_event(table_id: TableId, id: i64, amount: i64) -> TestEvent<Postgres> {
+    TestEvent::<Postgres>::insert(
+        table_id,
+        vec![
+            Value::Int(id),
+            Value::Int(amount),
+            Value::String("paid".into()),
+        ],
+    )
+    .with_pk_columns([0u16])
 }
 
 #[test]
 fn uuid_consumer_ids_dispatch() {
     let database = catalog();
     let orders = catalog_helpers::table_id(&database, "orders").unwrap();
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, UuidIds, ParserDB> =
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, UuidIds, ParserDB> =
         SubscriptionEngine::new(database, PostgreSqlDialect {});
 
     let consumer = Uuid::from_u128(0x0000_1234);
     engine
-        .register(SubscriptionRequest::<UuidIds>::new(
+        .register(SubscriptionRequest::<UuidIds, Postgres>::new(
             consumer,
             "SELECT * FROM orders WHERE amount > 100",
         ))
@@ -81,14 +78,14 @@ fn uuid_consumer_ids_dispatch() {
 fn uuid_session_scope_unregister() {
     let database = catalog();
     let orders = catalog_helpers::table_id(&database, "orders").unwrap();
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, UuidIds, ParserDB> =
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, UuidIds, ParserDB> =
         SubscriptionEngine::new(database, PostgreSqlDialect {});
 
     let consumer = Uuid::from_u128(0x0000_AAAA);
     let session = Uuid::from_u128(0x0000_BBBB);
     engine
         .register(
-            SubscriptionRequest::<UuidIds>::new(
+            SubscriptionRequest::<UuidIds, Postgres>::new(
                 consumer,
                 "SELECT * FROM orders WHERE amount > 100",
             )
@@ -126,11 +123,11 @@ fn uuid_consumer_ids_survive_snapshot_restore() {
     let consumer = Uuid::from_u128(0x00C0_FFEE);
 
     {
-        let mut engine: SubscriptionEngine<PostgreSqlDialect, UuidIds, ParserDB> =
+        let mut engine: SubscriptionEngine<TestEvent<Postgres>, UuidIds, ParserDB> =
             SubscriptionEngine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
                 .expect("with_storage");
         engine
-            .register(SubscriptionRequest::<UuidIds>::new(
+            .register(SubscriptionRequest::<UuidIds, Postgres>::new(
                 consumer,
                 "SELECT * FROM orders WHERE amount > 100",
             ))
@@ -139,7 +136,7 @@ fn uuid_consumer_ids_survive_snapshot_restore() {
     }
 
     // Fresh engine over the same directory restores the binding from disk.
-    let mut restored: SubscriptionEngine<PostgreSqlDialect, UuidIds, ParserDB> =
+    let mut restored: SubscriptionEngine<TestEvent<Postgres>, UuidIds, ParserDB> =
         SubscriptionEngine::with_storage(catalog(), PostgreSqlDialect {}, path)
             .expect("restore with_storage");
 

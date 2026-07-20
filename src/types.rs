@@ -1,9 +1,7 @@
 //! Core type definitions for subql
 
 use crate::checkpoint::{Checkpoint, NoCheckpoint};
-use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::hash::Hash;
@@ -136,1074 +134,68 @@ pub enum EventKind {
     Truncate,
 }
 
-/// Cell value in a row image
-///
-/// Three-valued logic:
-/// - `Missing`: Column not present in this image (UPDATE `old_row` may be incomplete)
-/// - `Null`: SQL NULL value
-/// - Typed value: Bool, Int, Float, String
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum Cell {
-    /// Column not present in row image
-    Missing,
-    /// SQL NULL
-    Null,
-    /// Boolean value
-    Bool(bool),
-    /// 64-bit signed integer
-    Int(i64),
-    /// 64-bit float
-    Float(f64),
-    /// UTF-8 string (Arc for cheap cloning)
-    String(Arc<str>),
-}
-
-impl Cell {
-    /// Returns true if this cell is SQL NULL
-    #[must_use]
-    pub const fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
-    }
-
-    /// Returns true if this cell is missing from row image
-    #[must_use]
-    pub const fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing)
-    }
-
-    /// Returns true if this cell has a concrete value (not NULL or Missing)
-    #[must_use]
-    pub const fn is_present(&self) -> bool {
-        !matches!(self, Self::Null | Self::Missing)
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::approx_constant, clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cell_is_null() {
-        assert!(Cell::Null.is_null());
-        assert!(!Cell::Missing.is_null());
-        assert!(!Cell::Bool(true).is_null());
-        assert!(!Cell::Int(42).is_null());
-        assert!(!Cell::Float(3.14).is_null());
-        assert!(!Cell::String("test".into()).is_null());
-    }
-
-    #[test]
-    fn test_cell_is_missing() {
-        assert!(Cell::Missing.is_missing());
-        assert!(!Cell::Null.is_missing());
-        assert!(!Cell::Bool(false).is_missing());
-        assert!(!Cell::Int(0).is_missing());
-        assert!(!Cell::Float(0.0).is_missing());
-        assert!(!Cell::String("".into()).is_missing());
-    }
-
-    #[test]
-    fn test_cell_is_present() {
-        assert!(Cell::Bool(true).is_present());
-        assert!(Cell::Int(42).is_present());
-        assert!(Cell::Float(3.14).is_present());
-        assert!(Cell::String("test".into()).is_present());
-        assert!(!Cell::Null.is_present());
-        assert!(!Cell::Missing.is_present());
-    }
-
-    #[test]
-    fn test_row_image_get() {
-        let row = RowImage {
-            cells: Arc::from(vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]),
-        };
-
-        assert_eq!(row.get(0), Some(&Cell::Int(1)));
-        assert_eq!(row.get(1), Some(&Cell::Int(2)));
-        assert_eq!(row.get(2), Some(&Cell::Int(3)));
-        assert_eq!(row.get(3), None);
-        assert_eq!(row.get(100), None);
-    }
-
-    #[test]
-    fn test_row_image_len() {
-        let empty = RowImage {
-            cells: Arc::from(vec![]),
-        };
-        assert_eq!(empty.len(), 0);
-        assert!(empty.is_empty());
-
-        let row = RowImage {
-            cells: Arc::from(vec![Cell::Int(1), Cell::Int(2)]),
-        };
-        assert_eq!(row.len(), 2);
-        assert!(!row.is_empty());
-    }
-
-    #[test]
-    fn test_event_kind() {
-        assert_ne!(EventKind::Insert, EventKind::Update);
-        assert_ne!(EventKind::Update, EventKind::Delete);
-        assert_eq!(EventKind::Insert, EventKind::Insert);
-    }
-
-    #[test]
-    fn test_insert_builder_success() {
-        let event = WalEvent::builder(7)
-            .insert()
-            .pk_cell(0, Cell::Int(1))
-            .new_row(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::String("ok".into())]),
-            })
-            .build()
-            .expect("insert builder should succeed");
-
-        assert_eq!(event.kind(), EventKind::Insert);
-        assert_eq!(event.table_id(), 7);
-        assert_eq!(event.pk().columns(), &[0]);
-        assert_eq!(event.pk().values(), &[Cell::Int(1)]);
-        assert!(event.old_row().is_none());
-        assert!(event.new_row().is_some());
-    }
-
-    #[test]
-    fn test_insert_builder_missing_new_row() {
-        let err = WalEvent::builder(1)
-            .insert()
-            .pk_cell(0, Cell::Int(1))
-            .build()
-            .expect_err("insert without new_row must fail");
-        assert_eq!(err, WalEventBuildError::MissingNewRow);
-    }
-
-    #[test]
-    fn test_delete_builder_missing_old_row() {
-        let err = WalEvent::builder(1)
-            .delete()
-            .pk_cell(0, Cell::Int(1))
-            .build()
-            .expect_err("delete without old_row must fail");
-        assert_eq!(err, WalEventBuildError::MissingOldRow);
-    }
-
-    #[test]
-    fn test_update_builder_changed_columns_and_old_row() {
-        let event = WalEvent::builder(1)
-            .update()
-            .pk_cell(0, Cell::Int(1))
-            .old_row(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(10)]),
-            })
-            .new_row(RowImage {
-                cells: Arc::from([Cell::Int(1), Cell::Int(20)]),
-            })
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("update builder should succeed");
-
-        assert_eq!(event.kind(), EventKind::Update);
-        assert_eq!(event.changed_columns(), &[1]);
-        assert!(event.old_row().is_some());
-        assert!(event.new_row().is_some());
-    }
-
-    #[test]
-    fn test_builder_rejects_duplicate_pk_column() {
-        let err = WalEvent::builder(1)
-            .insert()
-            .pk_cell(0, Cell::Int(1))
-            .pk_cell(0, Cell::Int(2))
-            .new_row(RowImage {
-                cells: Arc::from([Cell::Int(1)]),
-            })
-            .build()
-            .expect_err("duplicate PK columns must fail");
-        assert_eq!(err, WalEventBuildError::DuplicatePkColumn(0));
-    }
-
-    #[test]
-    fn subscription_scope_wire_compatible_with_option() {
-        let none_bytes = crate::persistence::codec::serialize(&Option::<u64>::None).unwrap();
-        let durable_bytes =
-            crate::persistence::codec::serialize(&SubscriptionScope::<DefaultIds>::Durable)
-                .unwrap();
-        assert_eq!(none_bytes, durable_bytes);
-
-        let some_bytes = crate::persistence::codec::serialize(&Some(42u64)).unwrap();
-        let session_bytes =
-            crate::persistence::codec::serialize(&SubscriptionScope::<DefaultIds>::Session(42))
-                .unwrap();
-        assert_eq!(some_bytes, session_bytes);
-    }
-
-    #[test]
-    fn test_subscriptions_view_iterates_metadata_entries() {
-        let entries: Vec<SubscriptionMetadata<DefaultIds>> = vec![
-            SubscriptionMetadata {
-                subscription_id: 1,
-                consumer_id: 10,
-                scope: SubscriptionScope::Durable,
-                last_dispatch_at: None,
-                dispatch_count: 0,
-            },
-            SubscriptionMetadata {
-                subscription_id: 2,
-                consumer_id: 20,
-                scope: SubscriptionScope::Session(99),
-                last_dispatch_at: Some(1_000_000),
-                dispatch_count: 4,
-            },
-        ];
-
-        let view = SubscriptionsView::<DefaultIds>::new(&entries);
-        assert_eq!(view.len(), 2);
-        assert!(!view.is_empty());
-
-        let collected: Vec<u64> = view.iter().map(|m| m.subscription_id).collect();
-        assert_eq!(collected, vec![1, 2]);
-
-        let coldest = view
-            .iter()
-            .min_by_key(|m| m.dispatch_count)
-            .map(|m| m.subscription_id);
-        assert_eq!(coldest, Some(1));
-
-        let least_active = view
-            .iter()
-            .min_by_key(|m| m.last_dispatch_at.unwrap_or(0))
-            .map(|m| m.subscription_id);
-        assert_eq!(least_active, Some(1));
-
-        let session_count = view
-            .iter()
-            .filter(|m| matches!(m.scope, SubscriptionScope::Session(_)))
-            .count();
-        assert_eq!(session_count, 1);
-    }
-}
-
-/// Row image: array of cells indexed by `ColumnId`
-///
-/// Cells are stored in column-ordinal order (`ColumnId` is index).
-/// Missing columns are represented as `Cell::Missing`.
-#[derive(Clone, Debug)]
-pub struct RowImage {
-    pub cells: Arc<[Cell]>,
-}
-
-impl RowImage {
-    /// Get cell by column ID
-    #[must_use]
-    pub fn get(&self, col_id: ColumnId) -> Option<&Cell> {
-        self.cells.get(col_id as usize)
-    }
-
-    /// Owned copy of the cell at `col_id`, if present.
-    ///
-    /// ```
-    /// use std::sync::Arc;
-    /// use subql::{Cell, RowImage};
-    ///
-    /// let row = RowImage { cells: Arc::from([Cell::Int(7), Cell::String("paid".into())]) };
-    /// assert_eq!(row.cell(0), Some(Cell::Int(7)));
-    /// assert_eq!(row.iter().count(), 2);
-    /// ```
-    #[must_use]
-    pub fn cell(&self, col_id: ColumnId) -> Option<Cell> {
-        self.get(col_id).cloned()
-    }
-
-    /// Iterate the cells in column order.
-    pub fn iter(&self) -> core::slice::Iter<'_, Cell> {
-        self.cells.iter()
-    }
-
-    /// Number of columns in this image
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.cells.len()
-    }
-
-    /// Returns true if row image is empty
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
-    }
-}
-
-impl<'a> IntoIterator for &'a RowImage {
-    type Item = &'a Cell;
-    type IntoIter = core::slice::Iter<'a, Cell>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.cells.iter()
-    }
-}
-
-/// Primary key columns and values
-#[derive(Clone, Debug)]
-pub struct PrimaryKey {
-    /// Column IDs comprising the primary key
-    pub(crate) columns: Arc<[ColumnId]>,
-    /// Values of the primary key columns
-    pub(crate) values: Arc<[Cell]>,
-}
-
-/// Error returned when constructing an invalid [`PrimaryKey`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrimaryKeyError {
-    columns_len: usize,
-    values_len: usize,
-}
-
-impl core::fmt::Display for PrimaryKeyError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "primary key columns/values length mismatch: columns={}, values={}",
-            self.columns_len, self.values_len
-        )
-    }
-}
-
-impl core::error::Error for PrimaryKeyError {}
-
-impl PrimaryKeyError {
-    /// Number of column IDs in the invalid input.
-    #[must_use]
-    pub const fn columns_len(&self) -> usize {
-        self.columns_len
-    }
-
-    /// Number of values in the invalid input.
-    #[must_use]
-    pub const fn values_len(&self) -> usize {
-        self.values_len
-    }
-}
-
-impl PrimaryKey {
-    /// Create a validated primary key.
-    pub fn new(columns: Arc<[ColumnId]>, values: Arc<[Cell]>) -> Result<Self, PrimaryKeyError> {
-        if columns.len() != values.len() {
-            return Err(PrimaryKeyError {
-                columns_len: columns.len(),
-                values_len: values.len(),
-            });
-        }
-        Ok(Self { columns, values })
-    }
-
-    /// Empty primary key (used when PK metadata is unavailable).
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            columns: Arc::from([]),
-            values: Arc::from([]),
-        }
-    }
-
-    /// Returns true when no PK columns/values are present.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.columns.is_empty() && self.values.is_empty()
-    }
-
-    /// Number of key columns.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.columns.len()
-    }
-
-    /// Primary-key column IDs.
-    #[must_use]
-    pub fn columns(&self) -> &[ColumnId] {
-        &self.columns
-    }
-
-    /// Primary-key values.
-    #[must_use]
-    pub fn values(&self) -> &[Cell] {
-        &self.values
-    }
-}
-
-/// WAL event from PostgreSQL CDC.
-///
-/// Generic in `C: Checkpoint` so events can carry the source's position
-/// token. Synthetic tests and checkpoint-free contexts may use the default
-/// `C = NoCheckpoint`. CDC sources (wal2json, Maxwell, Debezium) pin their
-/// own concrete `Checkpoint` impl ([`crate::PgLsn`],
-/// [`crate::MysqlBinlogPos`], etc.).
-#[derive(Clone, Debug)]
-pub enum WalEvent<C: Checkpoint = NoCheckpoint> {
-    /// Row insertion.
-    Insert {
-        /// Table this event belongs to.
-        table_id: TableId,
-        /// Primary key of affected row.
-        pk: PrimaryKey,
-        /// New row image.
-        new_row: RowImage,
-        /// Position of this event in the source stream, when known.
-        checkpoint: Option<C>,
-    },
-    /// Row update.
-    Update {
-        /// Table this event belongs to.
-        table_id: TableId,
-        /// Primary key of affected row.
-        pk: PrimaryKey,
-        /// Old row image (may be missing from source CDC).
-        old_row: Option<RowImage>,
-        /// New row image.
-        new_row: RowImage,
-        /// Columns that changed (for UPDATE optimization).
-        changed_columns: Arc<[ColumnId]>,
-        /// Position of this event in the source stream, when known.
-        checkpoint: Option<C>,
-    },
-    /// Row deletion.
-    Delete {
-        /// Table this event belongs to.
-        table_id: TableId,
-        /// Primary key of affected row.
-        pk: PrimaryKey,
-        /// Old row image.
-        old_row: RowImage,
-        /// Position of this event in the source stream, when known.
-        checkpoint: Option<C>,
-    },
-    /// Table truncate.
-    Truncate {
-        /// Table this event belongs to.
-        table_id: TableId,
-        /// Position of this event in the source stream, when known.
-        checkpoint: Option<C>,
-    },
-}
-
-/// Errors returned by `WalEvent` fluent builders.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WalEventBuildError {
-    /// INSERT/UPDATE requires `new_row`.
-    MissingNewRow,
-    /// DELETE requires `old_row`.
-    MissingOldRow,
-    /// PK columns and values had different lengths.
-    MismatchedPkLengths {
-        /// Number of PK columns.
-        columns_len: usize,
-        /// Number of PK values.
-        values_len: usize,
-    },
-    /// Duplicate PK column ID was provided.
-    DuplicatePkColumn(ColumnId),
-    /// A field was configured for an incompatible event kind.
-    FieldNotAllowedForKind(&'static str),
-}
-
-impl core::fmt::Display for WalEventBuildError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::MissingNewRow => write!(f, "missing required field: new_row"),
-            Self::MissingOldRow => write!(f, "missing required field: old_row"),
-            Self::MismatchedPkLengths {
-                columns_len,
-                values_len,
-            } => {
-                write!(
-                    f,
-                    "primary key columns/values length mismatch: columns={columns_len}, values={values_len}"
-                )
-            }
-            Self::DuplicatePkColumn(col) => write!(f, "duplicate primary key column: {col}"),
-            Self::FieldNotAllowedForKind(field) => {
-                write!(f, "field '{field}' is not allowed for this event kind")
-            }
-        }
-    }
-}
-
-impl core::error::Error for WalEventBuildError {}
-
-/// Start of fluent `WalEvent` construction.
-///
-/// Call [`with_checkpoint`](Self::with_checkpoint) before [`insert`](Self::insert)
-/// / [`update`](Self::update) / [`delete`](Self::delete) /
-/// [`truncate`](Self::truncate) to anchor the resulting event to a
-/// position. Defaults to `NoCheckpoint` and `checkpoint: None`.
-#[derive(Clone, Debug)]
-pub struct WalEventBuilderStart<C: Checkpoint = NoCheckpoint> {
-    table_id: TableId,
-    checkpoint: Option<C>,
-}
-
-/// Fluent builder for [`WalEvent::Insert`].
-#[derive(Clone, Debug)]
-pub struct InsertEventBuilder<C: Checkpoint = NoCheckpoint> {
-    table_id: TableId,
-    pk_columns: Vec<ColumnId>,
-    pk_values: Vec<Cell>,
-    new_row: Option<RowImage>,
-    checkpoint: Option<C>,
-}
-
-/// Fluent builder for [`WalEvent::Update`].
-#[derive(Clone, Debug)]
-pub struct UpdateEventBuilder<C: Checkpoint = NoCheckpoint> {
-    table_id: TableId,
-    pk_columns: Vec<ColumnId>,
-    pk_values: Vec<Cell>,
-    old_row: Option<RowImage>,
-    new_row: Option<RowImage>,
-    changed_columns: Arc<[ColumnId]>,
-    checkpoint: Option<C>,
-}
-
-/// Fluent builder for [`WalEvent::Delete`].
-#[derive(Clone, Debug)]
-pub struct DeleteEventBuilder<C: Checkpoint = NoCheckpoint> {
-    table_id: TableId,
-    pk_columns: Vec<ColumnId>,
-    pk_values: Vec<Cell>,
-    old_row: Option<RowImage>,
-    checkpoint: Option<C>,
-}
-
-/// Fluent builder for [`WalEvent::Truncate`].
-#[derive(Clone, Debug)]
-pub struct TruncateEventBuilder<C: Checkpoint = NoCheckpoint> {
-    table_id: TableId,
-    checkpoint: Option<C>,
-}
-
-fn build_primary_key(
-    columns: Vec<ColumnId>,
-    values: Vec<Cell>,
-) -> Result<PrimaryKey, WalEventBuildError> {
-    if columns.len() != values.len() {
-        return Err(WalEventBuildError::MismatchedPkLengths {
-            columns_len: columns.len(),
-            values_len: values.len(),
-        });
-    }
-    let mut seen = BTreeSet::new();
-    for col in &columns {
-        if !seen.insert(*col) {
-            return Err(WalEventBuildError::DuplicatePkColumn(*col));
-        }
-    }
-    PrimaryKey::new(Arc::from(columns), Arc::from(values)).map_err(|e| {
-        WalEventBuildError::MismatchedPkLengths {
-            columns_len: e.columns_len(),
-            values_len: e.values_len(),
-        }
-    })
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn apply_pk(columns: &mut Vec<ColumnId>, values: &mut Vec<Cell>, pk: PrimaryKey) {
-    columns.clear();
-    values.clear();
-    for (&col, value) in pk.columns().iter().zip(pk.values().iter()) {
-        columns.push(col);
-        values.push(value.clone());
-    }
-}
-
-impl<C: Checkpoint> WalEventBuilderStart<C> {
-    /// Anchor the resulting event to a position. Subsequent
-    /// `insert`/`update`/`delete`/`truncate` calls preserve the checkpoint.
-    #[must_use]
-    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
-        self.checkpoint = Some(checkpoint);
-        self
-    }
-
-    /// Type-transition the builder to a different checkpoint type by
-    /// providing a checkpoint value. Useful when a no-checkpoint default
-    /// builder needs to become typed once the parser has read the source
-    /// position (`WalEvent::builder(t).with_typed_checkpoint(PgLsn(42))`).
-    #[must_use]
-    pub fn with_typed_checkpoint<C2: Checkpoint>(self, checkpoint: C2) -> WalEventBuilderStart<C2> {
-        WalEventBuilderStart {
-            table_id: self.table_id,
-            checkpoint: Some(checkpoint),
-        }
-    }
-
-    /// Start building an INSERT event.
-    #[must_use]
-    pub fn insert(self) -> InsertEventBuilder<C> {
-        InsertEventBuilder {
-            table_id: self.table_id,
-            pk_columns: Vec::new(),
-            pk_values: Vec::new(),
-            new_row: None,
-            checkpoint: self.checkpoint,
-        }
-    }
-
-    /// Start building an UPDATE event.
-    #[must_use]
-    pub fn update(self) -> UpdateEventBuilder<C> {
-        UpdateEventBuilder {
-            table_id: self.table_id,
-            pk_columns: Vec::new(),
-            pk_values: Vec::new(),
-            old_row: None,
-            new_row: None,
-            changed_columns: Arc::from([]),
-            checkpoint: self.checkpoint,
-        }
-    }
-
-    /// Start building a DELETE event.
-    #[must_use]
-    pub fn delete(self) -> DeleteEventBuilder<C> {
-        DeleteEventBuilder {
-            table_id: self.table_id,
-            pk_columns: Vec::new(),
-            pk_values: Vec::new(),
-            old_row: None,
-            checkpoint: self.checkpoint,
-        }
-    }
-
-    /// Start building a TRUNCATE event.
-    #[must_use]
-    pub fn truncate(self) -> TruncateEventBuilder<C> {
-        TruncateEventBuilder {
-            table_id: self.table_id,
-            checkpoint: self.checkpoint,
-        }
-    }
-}
-
-impl<C: Checkpoint> InsertEventBuilder<C> {
-    /// Set primary key from a prebuilt value.
-    #[must_use]
-    pub fn pk(mut self, pk: PrimaryKey) -> Self {
-        apply_pk(&mut self.pk_columns, &mut self.pk_values, pk);
-        self
-    }
-
-    /// Append one PK `(column, value)` pair.
-    #[must_use]
-    pub fn pk_cell(mut self, column: ColumnId, value: Cell) -> Self {
-        self.pk_columns.push(column);
-        self.pk_values.push(value);
-        self
-    }
-
-    /// Append multiple PK `(column, value)` pairs.
-    #[must_use]
-    pub fn pk_cells(mut self, pairs: impl IntoIterator<Item = (ColumnId, Cell)>) -> Self {
-        for (column, value) in pairs {
-            self.pk_columns.push(column);
-            self.pk_values.push(value);
-        }
-        self
-    }
-
-    /// Set full new-row image.
-    #[must_use]
-    pub fn new_row(mut self, row: RowImage) -> Self {
-        self.new_row = Some(row);
-        self
-    }
-
-    /// Anchor the resulting event to a position.
-    #[must_use]
-    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
-        self.checkpoint = Some(checkpoint);
-        self
-    }
-
-    /// Build the insert event.
-    pub fn build(self) -> Result<WalEvent<C>, WalEventBuildError> {
-        let new_row = self.new_row.ok_or(WalEventBuildError::MissingNewRow)?;
-        let pk = build_primary_key(self.pk_columns, self.pk_values)?;
-        Ok(WalEvent::Insert {
-            table_id: self.table_id,
-            pk,
-            new_row,
-            checkpoint: self.checkpoint,
-        })
-    }
-}
-
-impl<C: Checkpoint> UpdateEventBuilder<C> {
-    /// Set primary key from a prebuilt value.
-    #[must_use]
-    pub fn pk(mut self, pk: PrimaryKey) -> Self {
-        apply_pk(&mut self.pk_columns, &mut self.pk_values, pk);
-        self
-    }
-
-    /// Append one PK `(column, value)` pair.
-    #[must_use]
-    pub fn pk_cell(mut self, column: ColumnId, value: Cell) -> Self {
-        self.pk_columns.push(column);
-        self.pk_values.push(value);
-        self
-    }
-
-    /// Append multiple PK `(column, value)` pairs.
-    #[must_use]
-    pub fn pk_cells(mut self, pairs: impl IntoIterator<Item = (ColumnId, Cell)>) -> Self {
-        for (column, value) in pairs {
-            self.pk_columns.push(column);
-            self.pk_values.push(value);
-        }
-        self
-    }
-
-    /// Set old row image.
-    #[must_use]
-    pub fn old_row(mut self, old_row: RowImage) -> Self {
-        self.old_row = Some(old_row);
-        self
-    }
-
-    /// Set old row image directly (including `None`).
-    #[must_use]
-    pub fn maybe_old_row(mut self, old_row: Option<RowImage>) -> Self {
-        self.old_row = old_row;
-        self
-    }
-
-    /// Set full new-row image.
-    #[must_use]
-    pub fn new_row(mut self, row: RowImage) -> Self {
-        self.new_row = Some(row);
-        self
-    }
-
-    /// Set changed columns.
-    #[must_use]
-    pub fn changed_columns(mut self, changed_columns: Arc<[ColumnId]>) -> Self {
-        self.changed_columns = changed_columns;
-        self
-    }
-
-    /// Anchor the resulting event to a position.
-    #[must_use]
-    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
-        self.checkpoint = Some(checkpoint);
-        self
-    }
-
-    /// Build the update event.
-    pub fn build(self) -> Result<WalEvent<C>, WalEventBuildError> {
-        let new_row = self.new_row.ok_or(WalEventBuildError::MissingNewRow)?;
-        let pk = build_primary_key(self.pk_columns, self.pk_values)?;
-        Ok(WalEvent::Update {
-            table_id: self.table_id,
-            pk,
-            old_row: self.old_row,
-            new_row,
-            changed_columns: self.changed_columns,
-            checkpoint: self.checkpoint,
-        })
-    }
-}
-
-impl<C: Checkpoint> DeleteEventBuilder<C> {
-    /// Set primary key from a prebuilt value.
-    #[must_use]
-    pub fn pk(mut self, pk: PrimaryKey) -> Self {
-        apply_pk(&mut self.pk_columns, &mut self.pk_values, pk);
-        self
-    }
-
-    /// Append one PK `(column, value)` pair.
-    #[must_use]
-    pub fn pk_cell(mut self, column: ColumnId, value: Cell) -> Self {
-        self.pk_columns.push(column);
-        self.pk_values.push(value);
-        self
-    }
-
-    /// Append multiple PK `(column, value)` pairs.
-    #[must_use]
-    pub fn pk_cells(mut self, pairs: impl IntoIterator<Item = (ColumnId, Cell)>) -> Self {
-        for (column, value) in pairs {
-            self.pk_columns.push(column);
-            self.pk_values.push(value);
-        }
-        self
-    }
-
-    /// Set full old-row image.
-    #[must_use]
-    pub fn old_row(mut self, row: RowImage) -> Self {
-        self.old_row = Some(row);
-        self
-    }
-
-    /// Anchor the resulting event to a position.
-    #[must_use]
-    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
-        self.checkpoint = Some(checkpoint);
-        self
-    }
-
-    /// Build the delete event.
-    pub fn build(self) -> Result<WalEvent<C>, WalEventBuildError> {
-        let old_row = self.old_row.ok_or(WalEventBuildError::MissingOldRow)?;
-        let pk = build_primary_key(self.pk_columns, self.pk_values)?;
-        Ok(WalEvent::Delete {
-            table_id: self.table_id,
-            pk,
-            old_row,
-            checkpoint: self.checkpoint,
-        })
-    }
-}
-
-impl<C: Checkpoint> TruncateEventBuilder<C> {
-    /// Anchor the resulting event to a position.
-    #[must_use]
-    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
-        self.checkpoint = Some(checkpoint);
-        self
-    }
-
-    /// Build the truncate event.
-    pub fn build(self) -> Result<WalEvent<C>, WalEventBuildError> {
-        Ok(WalEvent::Truncate {
-            table_id: self.table_id,
-            checkpoint: self.checkpoint,
-        })
-    }
-}
-
-impl WalEvent<NoCheckpoint> {
-    /// Start fluent construction for a WAL event with no checkpoint.
-    ///
-    /// Returns a builder pinned to `NoCheckpoint`. This is what synthetic
-    /// tests and checkpoint-free contexts want. To produce events with a
-    /// concrete checkpoint type, use
-    /// [`WalEventBuilderStart::with_typed_checkpoint`] or
-    /// [`WalEventBuilderStart::new`].
-    #[must_use]
-    pub const fn builder(table_id: TableId) -> WalEventBuilderStart<NoCheckpoint> {
-        WalEventBuilderStart {
-            table_id,
-            checkpoint: None,
-        }
-    }
-}
-
-impl<C: Checkpoint> WalEventBuilderStart<C> {
-    /// Construct a builder pinned to a concrete `Checkpoint` type, with an
-    /// optional checkpoint value. Useful from parser-internal helpers that
-    /// receive an `Option<C>` from the wire format.
-    #[must_use]
-    pub const fn new(table_id: TableId, checkpoint: Option<C>) -> Self {
-        Self {
-            table_id,
-            checkpoint,
-        }
-    }
-}
-
-impl<C: Checkpoint> WalEvent<C> {
-    /// Event kind.
-    #[must_use]
-    pub const fn kind(&self) -> EventKind {
-        match self {
-            Self::Insert { .. } => EventKind::Insert,
-            Self::Update { .. } => EventKind::Update,
-            Self::Delete { .. } => EventKind::Delete,
-            Self::Truncate { .. } => EventKind::Truncate,
-        }
-    }
-
-    /// Table ID associated with this event.
-    #[must_use]
-    pub const fn table_id(&self) -> TableId {
-        match self {
-            Self::Insert { table_id, .. }
-            | Self::Update { table_id, .. }
-            | Self::Delete { table_id, .. }
-            | Self::Truncate { table_id, .. } => *table_id,
-        }
-    }
-
-    /// Source position of this event in its CDC stream, when known.
-    ///
-    /// `None` when the parser could not determine a position (e.g. wal2json
-    /// messages with no `lsn` field, synthetic test events). Engines + oplogs
-    /// propagate this through to notifications.
-    #[must_use]
-    pub const fn checkpoint(&self) -> Option<&C> {
-        match self {
-            Self::Insert { checkpoint, .. }
-            | Self::Update { checkpoint, .. }
-            | Self::Delete { checkpoint, .. }
-            | Self::Truncate { checkpoint, .. } => checkpoint.as_ref(),
-        }
-    }
-
-    /// Primary key for row-level events. Truncate returns an empty key.
-    #[must_use]
-    pub fn pk(&self) -> &PrimaryKey {
-        static EMPTY_PK: spin::Lazy<PrimaryKey> = spin::Lazy::new(PrimaryKey::empty);
-        match self {
-            Self::Insert { pk, .. } | Self::Update { pk, .. } | Self::Delete { pk, .. } => pk,
-            Self::Truncate { .. } => &EMPTY_PK,
-        }
-    }
-
-    /// Replace this event's checkpoint with one of a different type.
-    ///
-    /// Useful when a parser produces events anchored to one checkpoint
-    /// type (e.g. [`crate::NoCheckpoint`] for parsers that read only the
-    /// plugin payload) and an outer transport supplies the actual
-    /// position out-of-band (e.g. the LSN carried in a pgoutput
-    /// `XLogData` frame header). The event's structural content
-    /// (`table_id`, `pk`, row images, `changed_columns`) is preserved
-    /// byte-for-byte. Only the checkpoint type and value change.
-    #[must_use]
-    pub fn set_checkpoint<C2: Checkpoint>(self, new_checkpoint: Option<C2>) -> WalEvent<C2> {
-        match self {
-            Self::Insert {
-                table_id,
-                pk,
-                new_row,
-                checkpoint: _,
-            } => WalEvent::Insert {
-                table_id,
-                pk,
-                new_row,
-                checkpoint: new_checkpoint,
-            },
-            Self::Update {
-                table_id,
-                pk,
-                old_row,
-                new_row,
-                changed_columns,
-                checkpoint: _,
-            } => WalEvent::Update {
-                table_id,
-                pk,
-                old_row,
-                new_row,
-                changed_columns,
-                checkpoint: new_checkpoint,
-            },
-            Self::Delete {
-                table_id,
-                pk,
-                old_row,
-                checkpoint: _,
-            } => WalEvent::Delete {
-                table_id,
-                pk,
-                old_row,
-                checkpoint: new_checkpoint,
-            },
-            Self::Truncate {
-                table_id,
-                checkpoint: _,
-            } => WalEvent::Truncate {
-                table_id,
-                checkpoint: new_checkpoint,
-            },
-        }
-    }
-
-    /// Old row image if present.
-    #[must_use]
-    pub const fn old_row(&self) -> Option<&RowImage> {
-        match self {
-            Self::Update { old_row, .. } => old_row.as_ref(),
-            Self::Delete { old_row, .. } => Some(old_row),
-            Self::Insert { .. } | Self::Truncate { .. } => None,
-        }
-    }
-
-    /// New row image if present.
-    #[must_use]
-    pub const fn new_row(&self) -> Option<&RowImage> {
-        match self {
-            Self::Insert { new_row, .. } | Self::Update { new_row, .. } => Some(new_row),
-            Self::Delete { .. } | Self::Truncate { .. } => None,
-        }
-    }
-
-    /// Columns changed by the update.
-    #[must_use]
-    pub fn changed_columns(&self) -> &[ColumnId] {
-        match self {
-            Self::Update {
-                changed_columns, ..
-            } => changed_columns,
-            Self::Insert { .. } | Self::Delete { .. } | Self::Truncate { .. } => &[],
-        }
-    }
-}
-
 // ============================================================================
 // Subscription Types
 // ============================================================================
 
 /// Subscription request provided by caller
 ///
-/// `Eq` is not derived: `binds` holds [`Cell`]s, which carry `f64` and are only
-/// `PartialEq`.
+/// `Eq` is not derived: `binds` holds [`crate::backend::Value<B>`]s,
+/// which may carry `f64` and are only `PartialEq`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SubscriptionRequest<I: IdTypes> {
-    /// Consumer who owns this subscription
+pub struct SubscriptionRequest<I: IdTypes, B: crate::backend::Backend = crate::backend::Postgres> {
+    /// Consumer who owns this subscription.
     pub(crate) consumer_id: I::ConsumerId,
-    /// Lifetime scope: durable or session-bound
+    /// Lifetime scope: durable or session-bound.
     pub(crate) scope: SubscriptionScope<I>,
-    /// SQL SELECT statement with WHERE clause
+    /// SQL SELECT statement with WHERE clause.
     pub(crate) sql: String,
-    /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
+    /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch).
     pub(crate) updated_at_unix_ms: u64,
-    /// Resolved bind values for `$N`/`?` placeholders in `sql`, in placeholder
-    /// order. Empty for plain literal SQL (the default). Populated by the typed
-    /// diesel API, which renders parameterized SQL plus these values.
-    pub(crate) binds: Vec<Cell>,
+    /// Resolved bind values for `$N` / `?` placeholders in `sql`, in
+    /// placeholder order. Empty for plain literal SQL (the default);
+    /// populated by the typed diesel API, which renders parameterised
+    /// SQL plus these values.
+    ///
+    /// Binds are typed to the observed [`crate::backend::Backend`]. When
+    /// binds are empty the `B` parameter is inferred from context; the
+    /// default `B = Postgres` covers the common Postgres-backed use.
+    pub(crate) binds: alloc::vec::Vec<crate::backend::Value<B>>,
 }
 
-impl<I: IdTypes> SubscriptionRequest<I> {
-    /// Create a new subscription request with default scope (`Durable`) and timestamp (`0`).
+impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
+    /// Create a new subscription request with default scope (`Durable`)
+    /// and timestamp (`0`).
     pub fn new(consumer_id: I::ConsumerId, sql: impl Into<String>) -> Self {
         Self {
             consumer_id,
             scope: SubscriptionScope::Durable,
             sql: sql.into(),
             updated_at_unix_ms: 0,
-            binds: Vec::new(),
+            binds: alloc::vec::Vec::new(),
         }
     }
 
-    /// Set the subscription scope (default: `SubscriptionScope::Durable`).
+    /// Set the subscription scope (default: [`SubscriptionScope::Durable`]).
     #[must_use]
     pub const fn scope(mut self, scope: SubscriptionScope<I>) -> Self {
         self.scope = scope;
         self
     }
 
-    /// Set the conflict-resolution timestamp in milliseconds since Unix epoch (default: `0`).
+    /// Set the conflict-resolution timestamp in milliseconds since Unix
+    /// epoch (default: `0`).
     #[must_use]
     pub const fn updated_at_unix_ms(mut self, ts: u64) -> Self {
         self.updated_at_unix_ms = ts;
         self
     }
 
-    /// Attach resolved bind values for `$N`/`?` placeholders in the SQL, in
-    /// placeholder order (default: none). Used by the typed diesel API.
+    /// Attach resolved bind values for `$N` / `?` placeholders in the
+    /// SQL, in placeholder order (default: none). Used by the typed
+    /// diesel API.
     #[must_use]
-    pub fn binds(mut self, binds: Vec<Cell>) -> Self {
+    pub fn binds(mut self, binds: alloc::vec::Vec<crate::backend::Value<B>>) -> Self {
         self.binds = binds;
         self
     }
@@ -1226,16 +218,15 @@ impl<I: IdTypes> SubscriptionRequest<I> {
 ///
 /// use sql_traits::structs::ParserDB;
 /// use sqlparser::dialect::PostgreSqlDialect;
-/// use subql::{
-///     DefaultIds, EvictionPolicy, RegisterError, SubscriptionEngine,
-///     SubscriptionRequest,
-/// };
+/// use subql::backend::{Postgres, Value};
+/// use subql::testing::TestEvent;
+/// use subql::{DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest};
 ///
 /// let database = ParserDB::parse::<PostgreSqlDialect>(
 ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
 /// )?;
 ///
-/// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+/// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
 ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
 ///         .with_max_subscriptions(1, EvictionPolicy::EvictOldest);
 ///
@@ -1263,6 +254,8 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     DefaultIds, EvictionPolicy, RegisterError, SubscriptionEngine,
     ///     SubscriptionRequest,
@@ -1271,7 +264,7 @@ pub enum EvictionPolicy {
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(1, EvictionPolicy::Reject);
     ///
@@ -1312,9 +305,11 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
-    ///     catalog_helpers, Cell, ClockHandle, DefaultIds, EvictionPolicy, ManualClock,
-    ///     PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
+    ///     catalog_helpers, ClockHandle, DefaultIds, EvictionPolicy, ManualClock,
+    ///     SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
@@ -1324,19 +319,17 @@ pub enum EvictionPolicy {
     /// let clock = Arc::new(ManualClock::new(0));
     /// let handle: ClockHandle = clock.clone();
     ///
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(2, EvictionPolicy::EvictLeastActive)
     ///         .with_activity_clock(handle);
     ///
-    /// let make_event = |id: i64, amount: i64| -> Result<_, Box<dyn std::error::Error>> {
-    ///     Ok(WalEvent::builder(orders_id)
-    ///         .insert()
-    ///         .pk(PrimaryKey::new(Arc::from([0u16]), Arc::from([Cell::Int(id)]))?)
-    ///         .new_row(RowImage {
-    ///             cells: Arc::from([Cell::Int(id), Cell::Int(amount)]),
-    ///         })
-    ///         .build()?)
+    /// let make_event = |id: i64, amount: i64| -> TestEvent<Postgres> {
+    ///     TestEvent::<Postgres>::insert(
+    ///         orders_id,
+    ///         vec![Value::Int(id), Value::Int(amount)],
+    ///     )
+    ///     .with_pk_columns([0u16])
     /// };
     ///
     /// // Register and stamp `first` early. Predicate matches amount = 5.
@@ -1345,7 +338,7 @@ pub enum EvictionPolicy {
     ///     "SELECT * FROM orders WHERE amount = 5",
     /// ))?;
     /// clock.advance(Duration::from_micros(10));
-    /// engine.consumers(&make_event(1, 5)?)?;
+    /// engine.consumers(&make_event(1, 5))?;
     ///
     /// // Register `second` and stamp it later. Predicate matches amount = 10
     /// // exclusively, so `first` is not re-stamped.
@@ -1354,7 +347,7 @@ pub enum EvictionPolicy {
     ///     "SELECT * FROM orders WHERE amount = 10",
     /// ))?;
     /// clock.advance(Duration::from_micros(20));
-    /// engine.consumers(&make_event(2, 10)?)?;
+    /// engine.consumers(&make_event(2, 10))?;
     ///
     /// // Third registration hits the cap. `first` was stamped at t=10
     /// // and `_second` at t=30. `first` is the least active and is
@@ -1378,9 +371,11 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
-    ///     catalog_helpers, Cell, DefaultIds, EvictionPolicy, PrimaryKey, RowImage,
-    ///     SubscriptionEngine, SubscriptionRequest, WalEvent,
+    ///     catalog_helpers, DefaultIds, EvictionPolicy,
+    ///     SubscriptionEngine, SubscriptionRequest,
     /// };
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
@@ -1388,7 +383,7 @@ pub enum EvictionPolicy {
     /// )?;
     /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
     ///
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(2, EvictionPolicy::EvictColdest);
     ///
@@ -1401,13 +396,11 @@ pub enum EvictionPolicy {
     ///     "SELECT * FROM orders WHERE amount = 9999",
     /// ))?;
     /// for i in 0..3 {
-    ///     let event = WalEvent::builder(orders_id)
-    ///         .insert()
-    ///         .pk(PrimaryKey::new(Arc::from([0u16]), Arc::from([Cell::Int(i)]))?)
-    ///         .new_row(RowImage {
-    ///             cells: Arc::from([Cell::Int(i), Cell::Int(5)]),
-    ///         })
-    ///         .build()?;
+    ///     let event = TestEvent::<Postgres>::insert(
+    ///         orders_id,
+    ///         vec![Value::Int(i), Value::Int(5)],
+    ///     )
+    ///     .with_pk_columns([0u16]);
     ///     engine.consumers(&event)?;
     /// }
     /// let third = engine.register(SubscriptionRequest::new(
@@ -1427,6 +420,8 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest,
     ///     SubscriptionScope,
@@ -1435,7 +430,7 @@ pub enum EvictionPolicy {
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(2, EvictionPolicy::EvictBySession);
     ///
@@ -1465,6 +460,8 @@ pub enum EvictionPolicy {
     ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::{Postgres, Value};
+    /// use subql::testing::TestEvent;
     /// use subql::{
     ///     DefaultIds, EvictionPolicy, SubscriptionEngine, SubscriptionRequest,
     /// };
@@ -1472,7 +469,7 @@ pub enum EvictionPolicy {
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
     /// )?;
-    /// let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {})
     ///         .with_max_subscriptions(3, EvictionPolicy::EvictByConsumer);
     ///
@@ -1690,65 +687,65 @@ pub struct MergeReport {
 // Trait Definitions
 // ============================================================================
 
-/// Subscription registration operations
-pub trait SubscriptionRegistration<I: IdTypes>: Send {
-    /// Register a new subscription
+/// Subscription registration operations.
+///
+/// Parameterised on the observed [`crate::backend::Backend`] so
+/// `register` accepts a typed [`SubscriptionRequest`] whose bind values
+/// are `Value<B>`.
+pub trait SubscriptionRegistration<I: IdTypes, B: crate::backend::Backend>: Send {
+    /// Register a new subscription.
     ///
-    /// Parses SQL, compiles to bytecode, deduplicates predicates, and binds consumer.
-    /// Returns error if SQL is unparseable or unsupported.
+    /// Parses SQL, compiles to bytecode, deduplicates predicates, and
+    /// binds consumer. Returns error if SQL is unparseable or unsupported.
     fn register(
         &mut self,
-        spec: SubscriptionRequest<I>,
+        spec: SubscriptionRequest<I, B>,
     ) -> Result<RegisterResult, crate::RegisterError>;
 
-    /// Unregister a subscription by ID
+    /// Unregister a subscription by ID.
     ///
-    /// Decrements predicate refcount. If refcount reaches 0, predicate is removed.
-    /// Returns true if subscription existed and was removed.
+    /// Decrements predicate refcount. If refcount reaches 0, predicate
+    /// is removed. Returns true if subscription existed and was removed.
     fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool;
 }
 
 /// Event dispatch operations.
 ///
-/// The associated [`Notifications`](Self::Notifications) type lets each engine
-/// layer return its own notification shape: the base engine yields
-/// [`ConsumerNotifications`], while the re-execution wrappers yield their richer
-/// `ReExecNotifications`. See [`AsyncSubscriptionDispatch`] for the async engine.
-pub trait SubscriptionDispatch<I: IdTypes>: Send {
-    /// Notifications produced for a dispatched event, parameterized by the
-    /// event's checkpoint type.
-    type Notifications<C: Checkpoint>;
+/// Parameterised on the observed `E: CdcEvent` so `consumers` accepts a
+/// backend-typed event and returns notifications carrying `E::Checkpoint`.
+/// Each engine layer chooses its own [`Notifications`](Self::Notifications)
+/// shape: the base engine yields [`ConsumerNotifications`], while the
+/// re-execution wrappers yield their richer `ReExecNotifications`.
+pub trait SubscriptionDispatch<I: IdTypes, E: crate::backend::CdcEvent>: Send {
+    /// Notifications produced for a dispatched event.
+    type Notifications;
     /// Error returned when dispatch fails.
     type Error;
 
-    /// Get interested consumers for a WAL event.
+    /// Get interested consumers for a CDC event.
     ///
-    /// Returns view-relative notifications: each consumer sees INSERT/DELETE/UPDATE
-    /// relative to their own result set.
-    fn consumers<C: Checkpoint>(
-        &mut self,
-        event: &WalEvent<C>,
-    ) -> Result<Self::Notifications<C>, Self::Error>;
+    /// Returns view-relative notifications: each consumer sees
+    /// INSERT / DELETE / UPDATE relative to their own result set.
+    fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error>;
 }
 
 /// Async counterpart of [`SubscriptionDispatch`].
 ///
-/// Separate trait because the async engine's `consumers` returns a future. The
-/// `+ Send` bound on that future is the point of spelling it out as
-/// return-position `impl Future` rather than `async fn` (same idiom as
-/// [`crate::reexec::AsyncConnector`]).
-pub trait AsyncSubscriptionDispatch<I: IdTypes>: Send {
-    /// Notifications produced for a dispatched event, parameterized by the
-    /// event's checkpoint type.
-    type Notifications<C: Checkpoint>;
+/// Separate trait because the async engine's `consumers` returns a
+/// future. The `+ Send` bound on that future is the point of spelling it
+/// out as return-position `impl Future` rather than `async fn` (same
+/// idiom as [`crate::reexec::AsyncConnector`]).
+pub trait AsyncSubscriptionDispatch<I: IdTypes, E: crate::backend::CdcEvent>: Send {
+    /// Notifications produced for a dispatched event.
+    type Notifications;
     /// Error returned when dispatch fails.
     type Error;
 
-    /// Get interested consumers for a WAL event.
-    fn consumers<C: Checkpoint>(
+    /// Get interested consumers for a CDC event.
+    fn consumers(
         &mut self,
-        event: &WalEvent<C>,
-    ) -> impl core::future::Future<Output = Result<Self::Notifications<C>, Self::Error>> + Send;
+        event: &E,
+    ) -> impl core::future::Future<Output = Result<Self::Notifications, Self::Error>> + Send;
 }
 
 /// Session lifecycle operations
@@ -1781,26 +778,6 @@ pub trait SubscriptionUnregistration<I: IdTypes>: Send {
 pub trait DurableShardStore: Send {
     /// Snapshot a table partition to durable storage.
     fn snapshot_table(&self, table_id: TableId) -> Result<(), crate::StorageError>;
-}
-
-/// Column value type for aggregate validation at registration time.
-///
-/// Returned by [`crate::catalog_helpers::column_type`] when the live database
-/// exposes type information for the column. SUM/AVG over `Bool`/`String`
-/// columns is rejected at registration time, while `Unknown` is permissive.
-#[non_exhaustive]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ColumnType {
-    /// 64-bit signed integer
-    Int,
-    /// 64-bit float
-    Float,
-    /// Boolean
-    Bool,
-    /// UTF-8 string
-    String,
-    /// Unknown or mixed type (treated as potentially numeric, no error)
-    Unknown,
 }
 
 /// Typed signed delta from an aggregate subscription.
@@ -2200,15 +1177,17 @@ impl<I: IdTypes, C: Checkpoint> IntoIterator for ConsumerNotifications<I, C> {
 ///    Re-query the DB and replace the stored value.
 /// 4. **Reset on TRUNCATE**: engine returns `Err(TruncateRequiresReset)`.
 ///    Re-query and replace the stored value.
-pub trait AggregateDispatch<I: IdTypes>: Send {
-    /// Compute typed signed deltas for all matching aggregate subscriptions.
+pub trait AggregateDispatch<I: IdTypes, E: crate::backend::CdcEvent>: Send {
+    /// Compute typed signed deltas for all matching aggregate
+    /// subscriptions.
     ///
-    /// Returns `Vec<(ConsumerId, AggDelta)>` where each entry is the signed change
-    /// for that consumer's subscription. Zero-net entries are omitted.
-    /// The same consumer may appear multiple times (once per aggregate kind).
+    /// Returns `Vec<(ConsumerId, AggDelta)>` where each entry is the
+    /// signed change for that consumer's subscription. Zero-net entries
+    /// are omitted. The same consumer may appear multiple times (once
+    /// per aggregate kind).
     fn aggregate_deltas(
         &mut self,
-        event: &WalEvent,
+        event: &E,
     ) -> Result<Vec<(I::ConsumerId, AggDelta)>, crate::DispatchError>;
 }
 
@@ -2227,4 +1206,58 @@ pub trait DurableShardMerge: Send {
         &mut self,
         job_id: MergeJobId,
     ) -> Result<Option<MergeReport>, crate::MergeError>;
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_scope_wire_compatible_with_option() {
+        let none_bytes = crate::persistence::codec::serialize(&Option::<u64>::None).unwrap();
+        let durable_bytes =
+            crate::persistence::codec::serialize(&SubscriptionScope::<DefaultIds>::Durable)
+                .unwrap();
+        assert_eq!(none_bytes, durable_bytes);
+
+        let some_bytes = crate::persistence::codec::serialize(&Some(42u64)).unwrap();
+        let session_bytes =
+            crate::persistence::codec::serialize(&SubscriptionScope::<DefaultIds>::Session(42))
+                .unwrap();
+        assert_eq!(some_bytes, session_bytes);
+    }
+
+    #[test]
+    fn subscriptions_view_iterates_metadata_entries() {
+        let entries: alloc::vec::Vec<SubscriptionMetadata<DefaultIds>> = alloc::vec![
+            SubscriptionMetadata::new(1, 10, SubscriptionScope::Durable, None, 0),
+            SubscriptionMetadata::new(2, 20, SubscriptionScope::Session(99), Some(1_000_000), 4),
+        ];
+
+        let view = SubscriptionsView::<DefaultIds>::new(&entries);
+        assert_eq!(view.len(), 2);
+        assert!(!view.is_empty());
+
+        let collected: alloc::vec::Vec<u64> = view.iter().map(|m| m.subscription_id).collect();
+        assert_eq!(collected, alloc::vec![1, 2]);
+
+        let coldest = view
+            .iter()
+            .min_by_key(|m| m.dispatch_count)
+            .map(|m| m.subscription_id);
+        assert_eq!(coldest, Some(1));
+
+        let least_active = view
+            .iter()
+            .min_by_key(|m| m.last_dispatch_at.unwrap_or(0))
+            .map(|m| m.subscription_id);
+        assert_eq!(least_active, Some(1));
+
+        let session_count = view
+            .iter()
+            .filter(|m| matches!(m.scope, SubscriptionScope::Session(_)))
+            .count();
+        assert_eq!(session_count, 1);
+    }
 }

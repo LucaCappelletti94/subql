@@ -6,9 +6,10 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Samplin
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use std::hint::black_box;
-use std::sync::Arc;
 use std::time::Duration;
-use subql::{Cell, DefaultIds, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent};
+use subql::backend::{Postgres, Value};
+use subql::testing::TestEvent;
+use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 const STATUS_BUCKETS: [&str; 7] = [
     "pending",
@@ -208,10 +209,10 @@ const fn realistic_workload_seed(subscription_ix: u64) -> u64 {
 
 fn build_scaling_engine(
     predicate_count: usize,
-) -> SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> {
+) -> SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> {
     let catalog = bench_catalog();
-    let mut engine =
-        SubscriptionEngine::<_, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
     for i in 0..predicate_count {
         let i_u64 = u64::try_from(i).unwrap_or(0);
@@ -226,7 +227,7 @@ fn build_scaling_engine(
 }
 
 /// Bench fixture catalog. A placeholder table is declared so the `orders`
-/// table id is stable at 1 (matching `WalEvent::builder(1)` in events).
+/// table id is stable at 1 (matching `TestEvent::<Postgres>::insert(1, ...)`).
 fn bench_catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE _bench_pad (id INT);\n\
@@ -239,53 +240,50 @@ fn bench_catalog() -> ParserDB {
     .expect("bench DDL parses")
 }
 
-fn make_test_event(seed: u64) -> WalEvent {
+fn make_test_event(seed: u64) -> TestEvent<Postgres> {
     let id = 1 + bounded_i64(seed ^ 0x1A2A, 500_000);
     let user_id = bounded_i64(seed ^ 0x2B3B, 20_000);
     let amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
     let priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
     let quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
     let discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
-        Cell::Null
+        Value::<Postgres>::Null
     } else {
-        Cell::Int(bounded_i64(seed ^ 0x7A8A, 18))
+        Value::<Postgres>::Int(bounded_i64(seed ^ 0x7A8A, 18))
     };
     let tax = 2 + bounded_i64(seed ^ 0x8B9B, 40);
     let shipping = 4 + bounded_i64(seed ^ 0x9CAC, 30);
     let created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
     let status = status_for(seed ^ 0xBECF);
 
-    WalEvent::builder(1)
-        .insert()
-        .pk_cell(0, Cell::Int(id))
-        .new_row(RowImage {
-            cells: Arc::from([
-                Cell::Int(id),
-                Cell::Int(user_id),
-                Cell::Int(amount),
-                Cell::String(status.into()),
-                Cell::Int(priority),
-                Cell::Int(quantity),
-                discount,
-                Cell::Int(tax),
-                Cell::Int(shipping),
-                Cell::Int(created_at),
-            ]),
-        })
-        .build()
-        .expect("insert event builder should be valid")
+    TestEvent::<Postgres>::insert(
+        1,
+        vec![
+            Value::Int(id),
+            Value::Int(user_id),
+            Value::Int(amount),
+            Value::String(status.into()),
+            Value::Int(priority),
+            Value::Int(quantity),
+            discount,
+            Value::Int(tax),
+            Value::Int(shipping),
+            Value::Int(created_at),
+        ],
+    )
+    .with_pk_columns([0u16])
 }
 
-fn make_test_update_event(seed: u64) -> WalEvent {
+fn make_test_update_event(seed: u64) -> TestEvent<Postgres> {
     let id = 1 + bounded_i64(seed ^ 0x1A2A, 500_000);
     let user_id = bounded_i64(seed ^ 0x2B3B, 20_000);
     let old_amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
     let old_priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
     let old_quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
     let old_discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
-        Cell::Null
+        Value::<Postgres>::Null
     } else {
-        Cell::Int(bounded_i64(seed ^ 0x7A8A, 18))
+        Value::<Postgres>::Int(bounded_i64(seed ^ 0x7A8A, 18))
     };
     let old_tax = 2 + bounded_i64(seed ^ 0x8B9B, 40);
     let old_shipping = 4 + bounded_i64(seed ^ 0x9CAC, 30);
@@ -300,106 +298,102 @@ fn make_test_update_event(seed: u64) -> WalEvent {
     let mut new_shipping = old_shipping;
     let mut new_status = old_status;
 
-    let changed_columns: Arc<[u16]> = match mix_seed(seed ^ 0xDEAD_BEEF) % 4 {
+    let changed_columns: Vec<u16> = match mix_seed(seed ^ 0xDEAD_BEEF) % 4 {
         0 => {
             new_amount = old_amount + 1 + bounded_i64(seed ^ 0x1111_2222, 40);
-            Arc::from([2u16])
+            vec![2u16]
         }
         1 => {
             new_status = status_for(seed ^ 0x3333_4444);
-            Arc::from([3u16])
+            vec![3u16]
         }
         2 => {
             new_priority = old_priority + 1;
             new_quantity = old_quantity + 2;
-            Arc::from([4u16, 5u16])
+            vec![4u16, 5u16]
         }
         _ => {
-            new_discount = if old_discount.is_null() {
-                Cell::Int(1 + bounded_i64(seed ^ 0x5555_6666, 12))
+            new_discount = if matches!(old_discount, Value::Null) {
+                Value::<Postgres>::Int(1 + bounded_i64(seed ^ 0x5555_6666, 12))
             } else {
-                Cell::Null
+                Value::<Postgres>::Null
             };
             new_tax = old_tax + 1;
             new_shipping = old_shipping + 1;
-            Arc::from([6u16, 7u16, 8u16])
+            vec![6u16, 7u16, 8u16]
         }
     };
 
-    WalEvent::builder(1)
-        .update()
-        .new_row(RowImage {
-            cells: Arc::from([
-                Cell::Int(id),
-                Cell::Int(user_id),
-                Cell::Int(new_amount),
-                Cell::String(new_status.into()),
-                Cell::Int(new_priority),
-                Cell::Int(new_quantity),
-                new_discount,
-                Cell::Int(new_tax),
-                Cell::Int(new_shipping),
-                Cell::Int(old_created_at),
-            ]),
-        })
-        .pk_cell(0, Cell::Int(id))
-        .maybe_old_row(Some(RowImage {
-            cells: Arc::from([
-                Cell::Int(id),
-                Cell::Int(user_id),
-                Cell::Int(old_amount),
-                Cell::String(old_status.into()),
-                Cell::Int(old_priority),
-                Cell::Int(old_quantity),
-                old_discount,
-                Cell::Int(old_tax),
-                Cell::Int(old_shipping),
-                Cell::Int(old_created_at),
-            ]),
-        }))
-        .changed_columns(changed_columns)
-        .build()
-        .expect("update event builder should be valid")
+    TestEvent::<Postgres>::update(
+        1,
+        vec![
+            Value::Int(id),
+            Value::Int(user_id),
+            Value::Int(old_amount),
+            Value::String(old_status.into()),
+            Value::Int(old_priority),
+            Value::Int(old_quantity),
+            old_discount,
+            Value::Int(old_tax),
+            Value::Int(old_shipping),
+            Value::Int(old_created_at),
+        ],
+        vec![
+            Value::Int(id),
+            Value::Int(user_id),
+            Value::Int(new_amount),
+            Value::String(new_status.into()),
+            Value::Int(new_priority),
+            Value::Int(new_quantity),
+            new_discount,
+            Value::Int(new_tax),
+            Value::Int(new_shipping),
+            Value::Int(old_created_at),
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_changed_columns(changed_columns)
 }
 
-fn make_test_delete_event(seed: u64) -> WalEvent {
+fn make_test_delete_event(seed: u64) -> TestEvent<Postgres> {
     let id = 1 + bounded_i64(seed ^ 0x1A2A, 500_000);
     let user_id = bounded_i64(seed ^ 0x2B3B, 20_000);
     let amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
     let priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
     let quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
     let discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
-        Cell::Null
+        Value::<Postgres>::Null
     } else {
-        Cell::Int(bounded_i64(seed ^ 0x7A8A, 18))
+        Value::<Postgres>::Int(bounded_i64(seed ^ 0x7A8A, 18))
     };
     let tax = 2 + bounded_i64(seed ^ 0x8B9B, 40);
     let shipping = 4 + bounded_i64(seed ^ 0x9CAC, 30);
     let created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
     let status = status_for(seed ^ 0xBECF);
 
-    WalEvent::builder(1)
-        .delete()
-        .pk_cell(0, Cell::Int(id))
-        .old_row(RowImage {
-            cells: Arc::from([
-                Cell::Int(id),
-                Cell::Int(user_id),
-                Cell::Int(amount),
-                Cell::String(status.into()),
-                Cell::Int(priority),
-                Cell::Int(quantity),
-                discount,
-                Cell::Int(tax),
-                Cell::Int(shipping),
-                Cell::Int(created_at),
-            ]),
-        })
-        .build()
-        .expect("delete event builder should be valid")
+    TestEvent::<Postgres>::delete(
+        1,
+        vec![
+            Value::Int(id),
+            Value::Int(user_id),
+            Value::Int(amount),
+            Value::String(status.into()),
+            Value::Int(priority),
+            Value::Int(quantity),
+            discount,
+            Value::Int(tax),
+            Value::Int(shipping),
+            Value::Int(created_at),
+        ],
+    )
+    .with_pk_columns([0u16])
 }
 
-fn event_corpus(size: usize, salt: u64, make_event: fn(u64) -> WalEvent) -> Vec<WalEvent> {
+fn event_corpus(
+    size: usize,
+    salt: u64,
+    make_event: fn(u64) -> TestEvent<Postgres>,
+) -> Vec<TestEvent<Postgres>> {
     (0..size)
         .map(|i| {
             let i_u64 = u64::try_from(i).unwrap_or(0);
@@ -627,7 +621,7 @@ fn registration_benchmark(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let catalog = bench_catalog();
-                let engine = SubscriptionEngine::<_, DefaultIds, ParserDB>::new(
+                let engine = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
                     catalog,
                     PostgreSqlDialect {},
                 );
@@ -649,10 +643,11 @@ fn registration_benchmark(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let catalog = bench_catalog();
-                let mut engine = SubscriptionEngine::<_, DefaultIds, ParserDB>::new(
-                    catalog,
-                    PostgreSqlDialect {},
-                );
+                let mut engine =
+                    SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+                        catalog,
+                        PostgreSqlDialect {},
+                    );
 
                 // Pre-register one predicate so the measured operation always
                 // takes the dedup/reuse path against a stable engine state.

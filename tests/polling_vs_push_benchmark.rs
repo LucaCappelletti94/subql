@@ -32,6 +32,7 @@
 // This benchmark is a one-shot measurement tool, not a unit test or
 // library component. Standard test-style lint allowances apply.
 #![allow(
+    unknown_lints,
     clippy::unwrap_used,
     clippy::print_stdout,
     clippy::cast_precision_loss,
@@ -51,8 +52,9 @@ use std::time::{Duration, Instant};
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::CdcEvent;
 use subql::{
-    CdcSource, Cell, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig, PollingPgCdcConfig,
+    CdcSource, EventKind, PgLsn, PgStreamingCdcSource, PgStreamingConfig, PollingPgCdcConfig,
     PollingPgCdcSource,
 };
 
@@ -171,9 +173,11 @@ fn spawn_receiver<S>(
     tokio::task::JoinHandle<()>,
 )
 where
-    S: CdcSource<Checkpoint = PgLsn> + Send + 'static,
+    S: CdcSource + Send + 'static,
+    S::Event: subql::backend::CdcEvent<Backend = subql::backend::Postgres, Checkpoint = PgLsn>,
 {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(i64, Instant)>();
+    let schema = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let task = tokio::spawn(async move {
         loop {
             let Ok(Some(ev)) = source.next_event().await else {
@@ -183,11 +187,13 @@ where
             if ev.kind() != EventKind::Insert {
                 continue;
             }
-            let Some(row) = ev.new_row() else { continue };
-            let Some(Cell::Int(id)) = row.get(0) else {
+            let subql::backend::Value::Int(id) = ev
+                .value_at(&schema, subql::backend::RowKind::New, 0)
+                .unwrap()
+            else {
                 continue;
             };
-            if tx.send((*id, observed_at)).is_err() {
+            if tx.send((id, observed_at)).is_err() {
                 return;
             }
         }

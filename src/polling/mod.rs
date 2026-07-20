@@ -33,8 +33,6 @@
 //!
 //! [`CdcSource`]: crate::CdcSource
 
-#![cfg(feature = "pg-streaming")]
-
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -43,11 +41,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
 use pg_walstream::error::ReplicationError;
-use pg_walstream::PgReplicationConnection;
+use pg_walstream::{parse_lsn, ChangeEvent, Lsn, PgOutputDecoder, PgReplicationConnection};
 use sql_traits::prelude::DatabaseLike;
 
-use crate::wal::PgOutputParser;
-use crate::{PgLsn, WalEvent, WalParser};
+use crate::wal::into_engine_events;
+use crate::PgLsn;
 
 /// Configuration for a [`PollingPgCdcSource`].
 ///
@@ -116,9 +114,6 @@ pub enum PollingPgCdcError {
     /// Underlying `pg_walstream` failure (transport, auth, server error).
     #[error("postgres error: {0}")]
     Postgres(#[from] ReplicationError),
-    /// The pgoutput payload could not be parsed.
-    #[error("pgoutput parse error: {0}")]
-    Parse(#[from] crate::WalParseError),
     /// Unexpected protocol shape (e.g. `pg_logical_slot_get_binary_changes`
     /// returned an unparseable row).
     #[error("polling protocol error: {0}")]
@@ -133,7 +128,7 @@ pub enum PollingPgCdcError {
 /// when to choose polling over the default push source.
 pub struct PollingPgCdcSource {
     config: PollingPgCdcConfig,
-    event_rx: tokio::sync::mpsc::Receiver<Result<WalEvent<PgLsn>, PollingPgCdcError>>,
+    event_rx: tokio::sync::mpsc::Receiver<Result<ChangeEvent, PollingPgCdcError>>,
     polls_issued: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
     empty_polls_observed: Arc<AtomicU64>,
@@ -153,9 +148,13 @@ impl PollingPgCdcSource {
     /// Open a regular SQL connection to Postgres, validate the slot
     /// exists, and spawn the inner task that drains the slot at the
     /// configured cadence.
+    /// `catalog` is retained for API stability and is currently unused.
+    /// The source yields raw `ChangeEvent`s that the engine resolves
+    /// against its own catalog at dispatch time.
+    #[allow(clippy::needless_pass_by_value)]
     pub async fn connect<DB: DatabaseLike + 'static>(
         config: PollingPgCdcConfig,
-        catalog: DB,
+        _catalog: DB,
     ) -> Result<Self, PollingPgCdcError> {
         let slot_name_for_check = config.slot_name.clone();
         let url = config.url.clone();
@@ -204,7 +203,6 @@ impl PollingPgCdcSource {
         let task = tokio::task::spawn_blocking(move || {
             polling_loop(
                 conn,
-                catalog,
                 task_slot,
                 task_publication,
                 task_interval,
@@ -244,7 +242,7 @@ impl PollingPgCdcSource {
         self.polls_issued.load(Ordering::Relaxed)
     }
 
-    /// Cumulative number of `WalEvent`s the inner task has pushed onto
+    /// Cumulative number of typed events the inner task has pushed onto
     /// the consumer channel.
     #[must_use]
     pub fn events_received(&self) -> u64 {
@@ -309,13 +307,12 @@ impl Drop for PollingPgCdcSource {
 // would only push us toward `Arc::clone` at every call site without a
 // real readability win.
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
-fn polling_loop<DB: DatabaseLike>(
+fn polling_loop(
     mut conn: PgReplicationConnection,
-    catalog: DB,
     slot_name: String,
     publication_name: String,
     poll_interval: Duration,
-    event_tx: tokio::sync::mpsc::Sender<Result<WalEvent<PgLsn>, PollingPgCdcError>>,
+    event_tx: tokio::sync::mpsc::Sender<Result<ChangeEvent, PollingPgCdcError>>,
     polls_issued: Arc<AtomicU64>,
     events_received: Arc<AtomicU64>,
     empty_polls_observed: Arc<AtomicU64>,
@@ -331,7 +328,7 @@ fn polling_loop<DB: DatabaseLike>(
     }
     let _exit_guard = ExitGuard(task_exited);
 
-    let parser = PgOutputParser::new();
+    let mut decoder = PgOutputDecoder::with_protocol_version(1);
 
     // pg_walstream's `exec` uses libpq's `PQexec` which returns all
     // columns in text format, so we cannot fetch raw BYTEA bytes
@@ -341,7 +338,7 @@ fn polling_loop<DB: DatabaseLike>(
     // would let us request binary result format and drop this round
     // trip entirely.
     let query = format!(
-        "SELECT encode(data, 'hex') FROM pg_logical_slot_get_binary_changes(\
+        "SELECT lsn::text, encode(data, 'hex') FROM pg_logical_slot_get_binary_changes(\
             {slot}, NULL, NULL, \
             'proto_version', '1', \
             'publication_names', {pub_name}\
@@ -376,7 +373,10 @@ fn polling_loop<DB: DatabaseLike>(
         let mut events_in_this_drain: u64 = 0;
 
         for row_idx in 0..result.ntuples() {
-            let Some(hex_text) = result.get_value(row_idx, 0) else {
+            let Some(lsn_text) = result.get_value(row_idx, 0) else {
+                continue;
+            };
+            let Some(hex_text) = result.get_value(row_idx, 1) else {
                 continue;
             };
             let bytes = match hex_decode(hex_text.as_bytes()) {
@@ -386,18 +386,25 @@ fn polling_loop<DB: DatabaseLike>(
                     return;
                 }
             };
-            let events = match parser.parse_wal_message(&bytes, &catalog) {
-                Ok(events) => events,
+            let lsn = match parse_lsn(&lsn_text) {
+                Ok(v) => Lsn::new(v),
                 Err(e) => {
-                    let _ = event_tx.blocking_send(Err(PollingPgCdcError::Parse(e)));
+                    let _ = event_tx.blocking_send(Err(PollingPgCdcError::Postgres(e)));
                     return;
                 }
             };
-            for ev in events {
-                let typed = ev.set_checkpoint(None::<PgLsn>);
+            let change = match decoder.decode_message(bytes, lsn) {
+                Ok(Some(c)) => c,
+                Ok(None) => continue,
+                Err(e) => {
+                    let _ = event_tx.blocking_send(Err(PollingPgCdcError::Postgres(e)));
+                    return;
+                }
+            };
+            for ev in into_engine_events(change) {
                 events_received.fetch_add(1, Ordering::Relaxed);
                 events_in_this_drain += 1;
-                if event_tx.blocking_send(Ok(typed)).is_err() {
+                if event_tx.blocking_send(Ok(ev)).is_err() {
                     return;
                 }
             }
@@ -408,14 +415,13 @@ fn polling_loop<DB: DatabaseLike>(
 }
 
 impl crate::CdcSource for PollingPgCdcSource {
-    type Checkpoint = PgLsn;
+    type Event = ChangeEvent;
     type Error = PollingPgCdcError;
 
     #[allow(clippy::manual_async_fn)]
     fn next_event(
         &mut self,
-    ) -> impl core::future::Future<Output = Result<Option<WalEvent<Self::Checkpoint>>, Self::Error>> + Send
-    {
+    ) -> impl core::future::Future<Output = Result<Option<Self::Event>, Self::Error>> + Send {
         async move {
             match self.event_rx.recv().await {
                 Some(Ok(ev)) => Ok(Some(ev)),
@@ -428,7 +434,7 @@ impl crate::CdcSource for PollingPgCdcSource {
     #[allow(clippy::manual_async_fn, clippy::unused_async)]
     fn ack(
         &mut self,
-        _upto: Self::Checkpoint,
+        _upto: PgLsn,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
         // No-op: `pg_logical_slot_get_binary_changes` auto-advances the
         // slot's `confirmed_flush_lsn` as a side effect of the drain.

@@ -22,16 +22,24 @@
 use core::future::Future;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
 use std::time::Instant;
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{Postgres, ScalarKind, Value};
 use subql::reexec::{AsyncAutoResolvingEngine, AsyncConnector, ReExecEngine, Registered, Snapshot};
+use subql::testing::TestEvent;
 use subql::{
-    Cell, ColumnType, DefaultIds, NoCheckpoint, RowImage, SubscriptionEngine, SubscriptionRequest,
-    WalEvent,
+    catalog_helpers, DefaultIds, NoCheckpoint, SubscriptionEngine, SubscriptionRequest, TableId,
 };
+
+type Engine = AsyncAutoResolvingEngine<
+    TestEvent<Postgres>,
+    DefaultIds,
+    ParserDB,
+    ConcurrencyProbingConnector,
+>;
 
 /// Async connector that waits a fixed delay on every `execute_scalar`
 /// (long enough that many calls can overlap under a multi-task
@@ -39,7 +47,7 @@ use subql::{
 /// queue is FIFO with `Mutex<Vec>::remove(0)`. We pre-load with as many
 /// values as there are triggers.
 struct ConcurrencyProbingConnector {
-    values: Mutex<Vec<Cell>>,
+    values: Mutex<Vec<Value<Postgres>>>,
     inflight: AtomicUsize,
     peak: AtomicUsize,
     total_calls: AtomicUsize,
@@ -47,7 +55,7 @@ struct ConcurrencyProbingConnector {
 }
 
 impl ConcurrencyProbingConnector {
-    fn new(values: Vec<Cell>, delay: Duration) -> Self {
+    fn new(values: Vec<Value<Postgres>>, delay: Duration) -> Self {
         Self {
             values: Mutex::new(values),
             inflight: AtomicUsize::new(0),
@@ -80,13 +88,15 @@ impl AsyncConnector for ConcurrencyProbingConnector {
     type AuthContext = ();
     type Error = ProbeError;
     type Checkpoint = NoCheckpoint;
+    type Backend = Postgres;
 
     fn execute_scalar(
         &self,
         _sql: &str,
-        _column_type: ColumnType,
+        _kind: ScalarKind,
         _auth: &(),
-    ) -> impl Future<Output = Result<(Cell, Option<Self::Checkpoint>), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
+    {
         async move {
             let now = self.inflight.fetch_add(1, Ordering::AcqRel) + 1;
             self.peak.fetch_max(now, Ordering::AcqRel);
@@ -95,8 +105,8 @@ impl AsyncConnector for ConcurrencyProbingConnector {
             // before we return, so a real concurrency cap actually
             // gates the schedule.
             tokio::time::sleep(self.delay).await;
-            let cell = {
-                let mut q = self.values.lock().unwrap();
+            let value = {
+                let mut q = self.values.lock();
                 if q.is_empty() {
                     self.inflight.fetch_sub(1, Ordering::Release);
                     return Err(ProbeError("queue empty"));
@@ -104,7 +114,7 @@ impl AsyncConnector for ConcurrencyProbingConnector {
                 q.remove(0)
             };
             self.inflight.fetch_sub(1, Ordering::Release);
-            Ok((cell, None))
+            Ok((value, None))
         }
     }
 
@@ -112,8 +122,9 @@ impl AsyncConnector for ConcurrencyProbingConnector {
         &self,
         _sql: &str,
         _auth: &(),
-    ) -> impl Future<Output = Result<Snapshot<Vec<RowImage>, Self::Checkpoint>, Self::Error>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>,
+    > + Send {
         async move { Err(ProbeError("execute_rows not exercised in this test")) }
     }
 }
@@ -125,52 +136,47 @@ fn catalog() -> ParserDB {
     .unwrap()
 }
 
-fn row(id: i64, price: f64, quantity: i64) -> RowImage {
-    RowImage {
-        cells: Arc::from([
-            Cell::Int(id),
-            Cell::Float(price),
-            Cell::Int(quantity),
-            Cell::String(Arc::from("paid")),
-        ]),
-    }
+fn orders_id(database: &ParserDB) -> TableId {
+    catalog_helpers::table_id(database, "orders").expect("orders table")
 }
 
-fn delete_event(id: i64, price: f64, quantity: i64) -> WalEvent {
-    WalEvent::builder(0)
-        .delete()
-        .pk_cell(0, Cell::Int(id))
-        .old_row(row(id, price, quantity))
-        .build()
-        .unwrap()
+fn row(id: i64, price: f64, quantity: i64) -> Vec<Value<Postgres>> {
+    vec![
+        Value::Int(id),
+        Value::Float(price),
+        Value::Int(quantity),
+        Value::String("paid".into()),
+    ]
+}
+
+fn delete_event(tid: TableId, id: i64, price: f64, quantity: i64) -> TestEvent<Postgres> {
+    TestEvent::<Postgres>::delete(tid, row(id, price, quantity)).with_pk_columns([0u16])
 }
 
 /// The six captured aggregates we use as distinct queries: every one
 /// re-executes on a delete of row `(id=1, price=7.0, quantity=1)`
 /// because its installed extremum equals that column's deleted value.
-const QUERIES: &[(&str, fn() -> Cell)] = &[
-    ("SELECT MIN(id) FROM orders", || Cell::Int(1)),
-    ("SELECT MAX(id) FROM orders", || Cell::Int(1)),
-    ("SELECT MIN(price) FROM orders", || Cell::Float(7.0)),
-    ("SELECT MAX(price) FROM orders", || Cell::Float(7.0)),
-    ("SELECT MIN(quantity) FROM orders", || Cell::Int(1)),
-    ("SELECT MAX(quantity) FROM orders", || Cell::Int(1)),
+const QUERIES: &[(&str, fn() -> Value<Postgres>)] = &[
+    ("SELECT MIN(id) FROM orders", || Value::Int(1)),
+    ("SELECT MAX(id) FROM orders", || Value::Int(1)),
+    ("SELECT MIN(price) FROM orders", || Value::Float(7.0)),
+    ("SELECT MAX(price) FROM orders", || Value::Float(7.0)),
+    ("SELECT MIN(quantity) FROM orders", || Value::Int(1)),
+    ("SELECT MAX(quantity) FROM orders", || Value::Int(1)),
 ];
 
 /// Build an async engine, register every query in `QUERIES`, install
 /// the extremum so the upcoming delete will displace it, and pre-load
 /// the connector with one reply value per query.
-fn engine_with_all_queries(
-    cap: usize,
-    delay: Duration,
-) -> AsyncAutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, ConcurrencyProbingConnector>
-{
-    let seeded_values: Vec<Cell> = (0..QUERIES.len())
-        .map(|i| Cell::Float(100.0 + i as f64))
+fn engine_with_all_queries(cap: usize, delay: Duration) -> (Engine, TableId) {
+    let seeded_values: Vec<Value<Postgres>> = (0..QUERIES.len())
+        .map(|i| Value::Float(100.0 + i as f64))
         .collect();
     let connector = ConcurrencyProbingConnector::new(seeded_values, delay);
-    let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-        catalog(),
+    let database = catalog();
+    let tid = orders_id(&database);
+    let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+        database,
         PostgreSqlDialect {},
     );
     let mut engine = AsyncAutoResolvingEngine::new(ReExecEngine::new(inner), connector)
@@ -178,7 +184,10 @@ fn engine_with_all_queries(
 
     for (i, (sql, install_value)) in QUERIES.iter().enumerate() {
         let registered = engine
-            .register(SubscriptionRequest::new(i as u64 + 1, *sql), ())
+            .register(
+                SubscriptionRequest::<DefaultIds, Postgres>::new(i as u64 + 1, *sql),
+                (),
+            )
             .unwrap();
         let qid = match registered {
             Registered::ReExec { query_id, .. } => query_id,
@@ -186,7 +195,7 @@ fn engine_with_all_queries(
         };
         assert!(engine.install(qid, install_value()));
     }
-    engine
+    (engine, tid)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -201,18 +210,15 @@ async fn throttle_peak_inflight_under_cap_for_cap_2() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn throttle_peak_inflight_at_cap_equals_trigger_count() {
-    // Cap equals the trigger count: every trigger can run concurrently.
     run_peak_inflight_assertion(QUERIES.len()).await;
 }
 
 async fn run_peak_inflight_assertion(cap: usize) {
     let delay = Duration::from_millis(20);
     let n_triggers = QUERIES.len();
-    let mut engine = engine_with_all_queries(cap, delay);
+    let (mut engine, tid) = engine_with_all_queries(cap, delay);
 
-    // One event that displaces every captured query's stored extremum
-    // (id=1, price=7.0, quantity=1 match all six installed extrema).
-    let events = vec![delete_event(1, 7.0, 1)];
+    let events = vec![delete_event(tid, 1, 7.0, 1)];
 
     let started = Instant::now();
     let outcome = engine.consumers_batch(&events).await.unwrap();
@@ -241,8 +247,6 @@ async fn run_peak_inflight_assertion(cap: usize) {
         "inflight must return to 0 after the batch completes"
     );
 
-    // With cap=1 the batch must serialise: at least n_triggers * delay
-    // wall-clock. CI timing is noisy so we leave a generous lower bound.
     if cap == 1 {
         let expected_min = delay.saturating_mul(n_triggers.try_into().unwrap_or(u32::MAX)) / 2;
         assert!(

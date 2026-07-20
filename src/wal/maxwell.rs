@@ -1,664 +1,286 @@
-//! Maxwell's Daemon CDC parser.
+//! [`CdcEvent`] for the `sqlite-diff-rs` Maxwell message type.
 //!
-//! [Maxwell](https://maxwells-daemon.io/) reads MySQL binlogs and emits
-//! one JSON message per row change. Unlike wal2json, Maxwell provides no
-//! column type information. Values are bare JSON primitives, so we use
-//! type inference via [`infer_cell_from_json`].
+//! subql parses Maxwell JSON with `sqlite_diff_rs::maxwell::parse` and views
+//! the resulting [`Message`] as a [`CdcEvent`], resolving table and column
+//! names to catalog ordinals and decoding each cell against the catalog on
+//! demand. This replaces the former bespoke `MaxwellParser` and `MaxwellEvent`.
+//!
+//! [`parse_messages`] adapts the two Maxwell shapes `sqlite-diff-rs` does not
+//! model: control messages (`ddl`, `bootstrap-start`, and friends) carry no
+//! row `data` and are dropped, and `bootstrap-insert` is normalized to a
+//! plain insert.
 
-use alloc::string::String;
-#[cfg(test)]
-use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use hashbrown::HashMap;
+
 use serde::Deserialize;
-
-use super::map_cdc::{parse_event_kind, parse_map_cdc_json_message, MapCdcConfig, MapCdcEnvelope};
-use super::{resolve_table, WalParseError, WalParser};
-#[cfg(test)]
-use crate::Cell;
-use crate::{EventKind, TableId, WalEvent};
 use sql_traits::prelude::DatabaseLike;
+use sqlite_diff_rs::maxwell::{Message, OpType};
 
-// ============================================================================
-// Serde structs
-// ============================================================================
+use super::pg_type::json_value_to_mysql_value_by_kind;
+use super::{resolve_table, WalParseError};
+use crate::backend::{CdcEvent, MySql, RowKind, Value};
+use crate::catalog_helpers;
+use crate::types::{ColumnId, EventKind, TableId};
 
+/// Minimal peek at a Maxwell message's `type`, so control and bootstrap
+/// messages can be classified before the full row parse.
 #[derive(Deserialize)]
-struct MaxwellMessage {
-    database: String,
-    table: String,
+struct MaxwellType {
     #[serde(rename = "type")]
-    event_type: String,
-    #[serde(default)]
-    data: Option<HashMap<String, serde_json::Value>>,
-    #[serde(default)]
-    old: Option<HashMap<String, serde_json::Value>>,
-    #[serde(default)]
-    primary_key_columns: Option<Vec<String>>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    ts: Option<u64>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    xid: Option<u64>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    commit: Option<bool>,
+    type_name: String,
 }
 
-// ============================================================================
-// Parser
-// ============================================================================
+/// Parse one Maxwell JSON message into the row events subql dispatches.
+///
+/// Returns an empty vector for control messages (`ddl`, `table-create`,
+/// `bootstrap-start`, and friends) that carry no row data. `bootstrap-insert`
+/// is normalized to an insert. Insert, update, and delete each yield a single
+/// [`Message`].
+///
+/// # Errors
+///
+/// [`WalParseError::InvalidUtf8`] for non-UTF-8 input and
+/// [`WalParseError::JsonError`] for malformed JSON.
+pub fn parse_messages(bytes: &[u8]) -> Result<Vec<Message>, WalParseError> {
+    let text =
+        core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
+    let peek: MaxwellType =
+        serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
+    match peek.type_name.as_str() {
+        "insert" | "update" | "delete" => {
+            let msg = sqlite_diff_rs::maxwell::parse(text)
+                .map_err(|e| WalParseError::JsonError(e.to_string()))?;
+            Ok(alloc::vec![msg])
+        }
+        // `sqlite-diff-rs`'s `OpType` has no bootstrap variant, so rewrite the
+        // type to a plain insert before the row parse.
+        "bootstrap-insert" => {
+            let mut value: serde_json::Value =
+                serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("type".to_string(), serde_json::Value::from("insert"));
+            }
+            let msg: Message = serde_json::from_value(value)
+                .map_err(|e| WalParseError::JsonError(e.to_string()))?;
+            Ok(alloc::vec![msg])
+        }
+        // ddl, table-*, database-*, bootstrap-start, bootstrap-complete, ...
+        _ => Ok(Vec::new()),
+    }
+}
 
-/// Maxwell's Daemon CDC parser (per-change: one JSON message per row change).
-pub struct MaxwellParser;
+const fn op_kind(op: OpType) -> EventKind {
+    match op {
+        OpType::Insert => EventKind::Insert,
+        OpType::Update => EventKind::Update,
+        OpType::Delete => EventKind::Delete,
+    }
+}
 
-impl<DB: DatabaseLike> WalParser<DB> for MaxwellParser {
+/// The row map `row` selects for `msg`, or `None` when the message does not
+/// carry that image. Insert exposes `data` as New and Pk, Delete exposes
+/// `data` (Maxwell puts the deleted row there) as Old and Pk, and Update
+/// exposes `data` as New and `old` as Old and Pk.
+const fn image_for(msg: &Message, row: RowKind) -> Option<&BTreeMap<String, serde_json::Value>> {
+    match (msg.op_type, row) {
+        (OpType::Insert, RowKind::New | RowKind::Pk)
+        | (OpType::Delete, RowKind::Old | RowKind::Pk)
+        | (OpType::Update, RowKind::New) => Some(&msg.data),
+        (OpType::Update, RowKind::Old | RowKind::Pk) => msg.old.as_ref(),
+        _ => None,
+    }
+}
+
+impl CdcEvent for Message {
+    type Backend = MySql;
     type Checkpoint = crate::NoCheckpoint;
 
-    fn parse_wal_message(
-        &self,
-        data: &[u8],
-        database: &DB,
-    ) -> Result<Vec<WalEvent>, WalParseError> {
-        parse_map_cdc_json_message::<MaxwellMessage, DB>(data, database)
-    }
-}
-
-// ============================================================================
-// Conversion logic
-// ============================================================================
-
-fn parse_maxwell_kind(event_type: &str) -> Result<EventKind, WalParseError> {
-    parse_event_kind(
-        event_type,
-        &["insert", "bootstrap-insert"],
-        &["update"],
-        &["delete"],
-        &[],
-    )
-}
-
-impl MapCdcEnvelope for MaxwellMessage {
-    const PARSER_NAME: &'static str = "Maxwell";
-    const TOKEN_NAME: &'static str = "event kind";
-
-    fn event_token(&self) -> &str {
-        &self.event_type
+    fn kind(&self) -> EventKind {
+        op_kind(self.op_type)
     }
 
-    fn parse_kind(token: &str) -> Result<EventKind, WalParseError> {
-        parse_maxwell_kind(token)
+    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+        // Infallible in the trait, so an unresolved name yields the `u32`
+        // sentinel, which the engine reports as an unknown table.
+        resolve_table(&self.database, &self.table, db).unwrap_or(TableId::MAX)
     }
 
-    fn resolve_table_id<DB: DatabaseLike>(&self, database: &DB) -> Result<TableId, WalParseError> {
-        resolve_table(&self.database, &self.table, database)
+    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+        None
     }
 
-    fn map_config(&self, kind: EventKind) -> MapCdcConfig<'_> {
-        let old_prefix = match kind {
-            EventKind::Delete => "maxwell.data",
-            _ => "maxwell.old",
+    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        // The primary key is the row identity subql matches follows and PK
+        // projections against, so it comes from the catalog.
+        resolve_table(&self.database, &self.table, db)
+            .ok()
+            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id))
+            .unwrap_or_default()
+    }
+
+    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        if self.op_type != OpType::Update {
+            return Vec::new();
+        }
+        let Some(old) = self.old.as_ref() else {
+            return Vec::new();
         };
+        let Ok(table_id) = resolve_table(&self.database, &self.table, db) else {
+            return Vec::new();
+        };
+        // Maxwell's `old` carries exactly the columns whose value changed, so
+        // it is an authoritative changed-column set.
+        old.keys()
+            .filter_map(|name| catalog_helpers::column_id(db, table_id, name))
+            .collect()
+    }
 
-        MapCdcConfig {
-            required_new_field: "data",
-            required_old_field: "data",
-            new_field_prefix: "maxwell.data",
-            old_field_prefix: old_prefix,
-            pk_col_names: self.primary_key_columns.as_deref(),
-            // Maxwell's `old` field contains only the changed columns by design;
-            // Missing means "not changed", so changed_columns() is safe to call
-            // even on a sparse old row.
-            old_is_changed_columns_only: true,
+    fn value_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<MySql>, crate::ValueError> {
+        let Ok(table_id) = resolve_table(&self.database, &self.table, db) else {
+            return Ok(Value::Missing);
+        };
+        if row == RowKind::Pk
+            && !catalog_helpers::primary_key_columns(db, table_id)
+                .unwrap_or_default()
+                .contains(&col)
+        {
+            return Ok(Value::Missing);
         }
-    }
-
-    fn new_map(&self, _kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
-        self.data.as_ref()
-    }
-
-    fn old_map(&self, kind: EventKind) -> Option<&HashMap<String, serde_json::Value>> {
-        match kind {
-            EventKind::Delete => self.data.as_ref(),
-            _ => self.old.as_ref(),
+        let Some(image) = image_for(self, row) else {
+            return Ok(Value::Missing);
+        };
+        let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
+            return Ok(Value::Missing);
+        };
+        match image.get(name.as_str()) {
+            None => Ok(Value::Missing),
+            Some(value) if value.is_null() => Ok(Value::Null),
+            Some(value) => catalog_helpers::column_scalar_kind(db, table_id, col).map_or(
+                Ok(Value::Missing),
+                |kind| match json_value_to_mysql_value_by_kind(value, kind) {
+                    Value::Missing => Err(crate::ValueError { column: col, kind }),
+                    decoded => Ok(decoded),
+                },
+            ),
         }
-    }
-
-    fn skip_message(&self) -> bool {
-        // Skip DDL/schema events and bootstrap control events: they contain no row data.
-        matches!(
-            self.event_type.as_str(),
-            "ddl"
-                | "table-create"
-                | "table-drop"
-                | "table-alter"
-                | "database-create"
-                | "database-drop"
-                | "bootstrap-start"
-                | "bootstrap-complete"
-        )
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use sql_traits::structs::ParserDB;
-    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::dialect::MySqlDialect;
 
-    // -- Test catalog --------------------------------------------------------
-
-    /// Maxwell test table: table="e", columns: id=0, m=1, c=2, comment=3, PK=[id].
-    /// A leading `_maxwell_pad` table keeps `e`'s table id stable at 1.
-    fn maxwell_e_catalog() -> ParserDB {
-        ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE _maxwell_pad (id INT);\n\
-             CREATE TABLE e (id INT PRIMARY KEY, m DOUBLE PRECISION, c TEXT, comment TEXT);",
+    fn orders() -> ParserDB {
+        ParserDB::parse::<MySqlDialect>(
+            "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
         )
-        .expect("maxwell e DDL parses")
+        .expect("parse DDL")
     }
 
-    fn maxwell_e_no_pk_catalog() -> ParserDB {
-        ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE _maxwell_pad (id INT);\n\
-             CREATE TABLE e (id INT, m DOUBLE PRECISION, c TEXT, comment TEXT);",
-        )
-        .expect("maxwell e (no-PK) DDL parses")
+    fn one(bytes: &[u8]) -> Message {
+        let mut msgs = parse_messages(bytes).expect("parse succeeds");
+        assert_eq!(msgs.len(), 1);
+        msgs.remove(0)
     }
-
-    fn maxwell_e_table_id() -> crate::TableId {
-        crate::catalog_helpers::table_id(&maxwell_e_catalog(), "e").expect("e table id")
-    }
-
-    // -- INSERT tests -------------------------------------------------------
 
     #[test]
-    fn maxwell_insert() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert","ts":1477053217,
-            "data":{"id":1,"m":4.2341,"c":"2016-10-21 05:33:37","comment":"hello"}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
+    fn insert_exposes_pk_and_typed_cells() {
+        let db = orders();
+        let ev = one(br#"{"database":"test","table":"orders","type":"insert",
+                 "data":{"id":7,"amount":250,"status":"paid"}}"#);
         assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.table_id(), maxwell_e_table_id());
-
-        let new = ev.new_row().expect("INSERT should have new_row");
-        assert_eq!(new.get(0), Some(&Cell::Int(1)));
-        assert_eq!(new.get(1), Some(&Cell::Float(4.2341)));
+        assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
+        assert!(ev.changed_columns(&db).is_empty());
+        assert_eq!(ev.checkpoint(), None);
+        assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Int(250));
         assert_eq!(
-            new.get(2),
-            Some(&Cell::String(Arc::from("2016-10-21 05:33:37")))
+            ev.value_at(&db, RowKind::New, 2).unwrap(),
+            Value::String("paid".into())
         );
-        assert_eq!(new.get(3), Some(&Cell::String(Arc::from("hello"))));
-
-        assert!(ev.old_row().is_none());
-
-        // PK from catalog
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-
-        assert!(ev.changed_columns().is_empty());
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 1).unwrap(), Value::Missing);
     }
 
     #[test]
-    fn maxwell_insert_with_pk_columns() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert","ts":1477053217,
-            "data":{"id":1,"m":4.2341,"c":"2016-10-21 05:33:37","comment":"hello"},
-            "primary_key_columns":["id","c"]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        // PK from message: both id and c
-        assert_eq!(ev.pk().columns.len(), 2);
-        assert!(ev.pk().columns.contains(&0)); // id
-        assert!(ev.pk().columns.contains(&2)); // c
-    }
-
-    // -- UPDATE tests -------------------------------------------------------
-
-    #[test]
-    fn maxwell_update() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"update",
-            "data":{"id":1,"m":5.444,"c":"2016-10-21 05:33:54","comment":"hello"},
-            "old":{"m":4.2341,"c":"2016-10-21 05:33:37"}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
+    fn update_old_field_is_authoritative_changed_columns() {
+        let db = orders();
+        let ev = one(br#"{"database":"test","table":"orders","type":"update",
+                 "data":{"id":7,"amount":250,"status":"paid"},
+                 "old":{"amount":100,"status":"pending"}}"#);
         assert_eq!(ev.kind(), EventKind::Update);
-
-        // New row present
-        let new = ev.new_row().expect("UPDATE should have new_row");
-        assert_eq!(new.get(1), Some(&Cell::Float(5.444)));
-
-        // Old row (sparse: only changed columns)
-        let old = ev.old_row().expect("UPDATE should have old_row");
-        assert_eq!(old.get(1), Some(&Cell::Float(4.2341)));
-        assert_eq!(
-            old.get(2),
-            Some(&Cell::String(Arc::from("2016-10-21 05:33:37")))
-        );
-        // Columns not in `old` are Missing
-        assert_eq!(old.get(0), Some(&Cell::Missing));
-        assert_eq!(old.get(3), Some(&Cell::Missing));
-
-        // Maxwell's `old` contains only changed columns; Missing means "not changed".
-        // changed_columns() skips Missing cells, so the result is exactly the
-        // columns that differed: m (col 1) and c (col 2).
-        let changed: Vec<u16> = ev.changed_columns().to_vec();
-        assert_eq!(changed, vec![1, 2]);
+        let mut changed = ev.changed_columns(&db);
+        changed.sort_unstable();
+        assert_eq!(changed, alloc::vec![1u16, 2u16]);
+        assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Int(250));
+        assert_eq!(ev.value_at(&db, RowKind::Old, 1).unwrap(), Value::Int(100));
     }
 
     #[test]
-    fn maxwell_update_without_old() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"update",
-            "data":{"id":1,"m":5.444,"c":"2016-10-21 05:33:54","comment":"hello"}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-        assert!(ev.new_row().is_some());
-        assert!(ev.old_row().is_none());
-        assert!(ev.changed_columns().is_empty());
-    }
-
-    // -- DELETE tests -------------------------------------------------------
-
-    #[test]
-    fn maxwell_delete() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"delete",
-            "data":{"id":1,"m":5.444,"c":"2016-10-21 05:33:54","comment":"hello"}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
+    fn delete_reads_pk_and_old_from_data() {
+        let db = orders();
+        let ev = one(br#"{"database":"test","table":"orders","type":"delete",
+                 "data":{"id":9,"amount":10,"status":"paid"}}"#);
         assert_eq!(ev.kind(), EventKind::Delete);
-        assert!(ev.new_row().is_none());
-
-        let old = ev.old_row().expect("DELETE should have old_row");
-        assert_eq!(old.get(0), Some(&Cell::Int(1)));
-
-        // PK from catalog
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-
-        assert!(ev.changed_columns().is_empty());
+        assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0).unwrap(), Value::Int(9));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(9));
+        assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Missing);
     }
 
     #[test]
-    fn maxwell_delete_with_pk_columns() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"delete",
-            "data":{"id":1,"m":5.444,"c":"2016-10-21 05:33:54","comment":"hello"},
-            "primary_key_columns":["id"]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-    }
-
-    // -- Edge cases ----------------------------------------------------------
-
-    #[test]
-    fn maxwell_null_values() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert",
-            "data":{"id":1,"m":null,"c":null,"comment":"hello"}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let new = events[0].new_row().expect("should have new_row");
-        assert_eq!(new.get(0), Some(&Cell::Int(1)));
-        assert_eq!(new.get(1), Some(&Cell::Null));
-        assert_eq!(new.get(2), Some(&Cell::Null));
-        assert_eq!(new.get(3), Some(&Cell::String(Arc::from("hello"))));
-    }
-
-    #[test]
-    fn maxwell_insert_no_catalog_pk() {
-        let catalog = maxwell_e_no_pk_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert",
-            "data":{"id":1,"m":4.2341,"c":"2016-10-21 05:33:37","comment":"hello"}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        // No PK source: empty PK
-        assert!(ev.pk().columns.is_empty());
-        assert!(ev.pk().values.is_empty());
-    }
-
-    // -- Error paths ---------------------------------------------------------
-
-    #[test]
-    fn error_invalid_utf8() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-        let bad_bytes: &[u8] = &[0xFF, 0xFE, 0xFD];
-
-        let err = parser
-            .parse_wal_message(bad_bytes, &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::InvalidUtf8(_)));
-    }
-
-    #[test]
-    fn error_malformed_json() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let err = parser
-            .parse_wal_message(b"not json at all", &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::JsonError(_)));
-    }
-
-    #[test]
-    fn maxwell_tombstone_null_is_ignored() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let events = parser
-            .parse_wal_message(b"null", &catalog)
-            .expect("tombstone should be ignored");
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn error_unknown_table() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"other","table":"nonexistent","type":"insert",
-            "data":{"id":1}
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownTable { .. }));
-    }
-
-    #[test]
-    fn error_unknown_column() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert",
-            "data":{"id":1,"nonexistent_col":"value"}
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
-    }
-
-    #[test]
-    fn unknown_event_kind_is_skipped() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        // "truncate" is not a known Maxwell event type. It must be skipped, not error.
-        let json = r#"{
-            "database":"test","table":"e","type":"truncate",
-            "data":{"id":1}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("unknown event kind should be skipped, not error");
+    fn control_messages_drop_and_bootstrap_insert_is_an_insert() {
         assert!(
-            events.is_empty(),
-            "unknown event kind should produce no output"
+            parse_messages(br#"{"database":"test","table":"orders","type":"ddl"}"#)
+                .expect("ddl parses")
+                .is_empty()
         );
-    }
-
-    #[test]
-    fn error_missing_data() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert"
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::MissingField(_)));
-    }
-
-    #[test]
-    fn error_numeric_overflow() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert",
-            "data":{"id":18446744073709551615}
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("overflow should fail");
-        assert!(matches!(err, WalParseError::NumericOverflow { .. }));
-    }
-
-    #[test]
-    fn error_pk_metadata_unknown_column() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert",
-            "data":{"id":1,"m":4.2,"c":"2020-01-01","comment":"hello"},
-            "primary_key_columns":["id","does_not_exist"]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("unknown PK metadata column should fail");
-        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
-    }
-
-    #[test]
-    fn error_pk_metadata_column_missing_in_row() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert",
-            "data":{"m":4.2,"c":"2020-01-01","comment":"hello"},
-            "primary_key_columns":["id"]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("missing PK value in row should fail");
-        assert!(matches!(err, WalParseError::MalformedPayload(_)));
-    }
-
-    // -- Trait checks -------------------------------------------------------
-
-    #[test]
-    fn trait_object_compiles() {
-        let catalog = maxwell_e_catalog();
-        let parser: &dyn WalParser<ParserDB, Checkpoint = crate::NoCheckpoint> = &MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"insert",
-            "data":{"id":1,"m":4.2341,"c":"2016-10-21 05:33:37","comment":"hello"}
-        }"#;
-
-        let result = parser.parse_wal_message(json.as_bytes(), &catalog);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn send_sync_check() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<MaxwellParser>();
-    }
-    // -- B8: Maxwell DDL events are skipped ---------------------------------
-
-    #[test]
-    fn maxwell_ddl_event_is_skipped() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{"type":"ddl","database":"test","table":"e","def":"ALTER TABLE e ADD COLUMN x INT"}"#;
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("DDL event should be skipped, not errored");
-        assert!(events.is_empty(), "DDL events should produce no output");
-    }
-
-    #[test]
-    fn maxwell_table_create_is_skipped() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{"type":"table-create","database":"test","table":"e","def":"CREATE TABLE e (id INT)"}"#;
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("table-create event should be skipped");
-        assert!(
-            events.is_empty(),
-            "table-create events should produce no output"
+        assert!(parse_messages(
+            br#"{"type":"bootstrap-start","database":"test","table":"orders"}"#
+        )
+        .expect("bootstrap-start parses")
+        .is_empty());
+        let db = orders();
+        let ev = one(
+            br#"{"database":"test","table":"orders","type":"bootstrap-insert",
+                 "data":{"id":42,"amount":100,"status":"open"}}"#,
         );
-    }
-
-    // -- A3: UPDATE PK change must use pre-update PK -------------------------
-
-    #[test]
-    fn update_pk_change_uses_pre_update_pk() {
-        // When a PK column changes (id: 1 -> 2), the emitted PK must be the
-        // pre-update value (1), not the post-update value (2).
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"update",
-            "data":{"id":2,"m":200.0,"c":"2016-10-22","comment":"after"},
-            "old":{"id":1,"m":100.0,"c":"2016-10-21","comment":"before"}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-        // PK must come from the pre-update (old) row: id = 1
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-        assert_eq!(ev.pk().columns.as_ref(), &[0u16]);
-    }
-
-    // -- A4: bootstrap-insert events must be treated as normal inserts -------
-
-    #[test]
-    fn bootstrap_insert_is_treated_as_insert() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
-
-        let json = r#"{
-            "database":"test","table":"e","type":"bootstrap-insert","ts":1477053217,
-            "data":{"id":1,"m":4.2341,"c":"2016-10-21 05:33:37","comment":"hello"}
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("bootstrap-insert should parse as insert");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.table_id(), maxwell_e_table_id());
-        assert!(ev.new_row().is_some());
-        assert!(ev.old_row().is_none());
+        assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(42));
     }
 
     #[test]
-    fn bootstrap_start_and_complete_are_skipped() {
-        let catalog = maxwell_e_catalog();
-        let parser = MaxwellParser;
+    fn null_is_distinct_from_missing() {
+        let db = orders();
+        let ev = one(br#"{"database":"test","table":"orders","type":"insert",
+                 "data":{"id":7,"status":null}}"#);
+        assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Null);
+        assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Missing);
+    }
 
-        for event_type in &["bootstrap-start", "bootstrap-complete"] {
-            let json = format!(r#"{{"database":"test","table":"e","type":"{event_type}"}}"#);
-            let events = parser
-                .parse_wal_message(json.as_bytes(), &catalog)
-                .unwrap_or_else(|e| panic!("{event_type} should be skipped, not error: {e:?}"));
-            assert!(events.is_empty(), "{event_type} should produce no output");
-        }
+    #[test]
+    fn value_at_errors_on_unsigned_bigint_above_i64_max() {
+        // A MySQL BIGINT UNSIGNED cell above i64::MAX cannot be
+        // represented as subql's i64-backed Int, so value_at surfaces a
+        // decode error rather than silently dropping the cell.
+        let db = ParserDB::parse::<MySqlDialect>(
+            "CREATE TABLE t (id INT PRIMARY KEY, big BIGINT UNSIGNED);",
+        )
+        .expect("parse DDL");
+        let ev = one(br#"{"database":"test","table":"t","type":"insert",
+                 "data":{"id":1,"big":18446744073709551615}}"#);
+        assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(1));
+        let err = ev.value_at(&db, RowKind::New, 1).unwrap_err();
+        assert_eq!(err.column, 1);
+        assert_eq!(err.kind, crate::backend::ScalarKind::Int);
     }
 }

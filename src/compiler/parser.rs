@@ -1,21 +1,28 @@
-//! SQL parser for subscription predicates
+//! SQL parser for subscription predicates.
 //!
-//! Supports generic SQL dialects via sqlparser crate.
+//! Compiles subscription `SELECT` statements into a Backend-generic
+//! [`BytecodeProgram<B>`] the VM interprets against any
+//! `E: CdcEvent<Backend = B>`. Public entry points are parameterised on
+//! `B: Backend + SqlLiteralParse`; the concrete backend supplies both the
+//! [`sqlparser::dialect::Dialect`] used to parse SQL text and the
+//! literal-coercion rules ([`SqlLiteralParse::parse_literal`]) used to
+//! turn AST literals into typed `Value<B>`.
 
 use super::{
     canonicalize,
-    literals::{resolve_column_ref, sql_value_to_cell_strict},
+    literals::{resolve_column_ref, SqlLiteralParse},
     prefilter::build_prefilter_plan,
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
+use crate::backend::{Backend, ScalarKind, Value};
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
-use crate::{Cell, ColumnId, RegisterError, TableId};
+use crate::{ColumnId, RegisterError, TableId};
 use alloc::borrow::ToOwned;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{Expr, ObjectName, Statement, Value};
+use sqlparser::ast::{Expr, ObjectName, Statement, Value as SqlValue};
 use sqlparser::dialect::Dialect;
 
 struct SqlTableName {
@@ -50,33 +57,42 @@ impl SqlTableName {
     }
 }
 
-/// Parse and compile SQL SELECT statement to bytecode
+/// Parse and compile a subscription SQL statement into bytecode.
 ///
 /// # Arguments
-/// * `sql` - SQL SELECT statement with optional WHERE clause
-/// * `dialect` - SQL dialect (`PostgreSQL`, `MySQL`, `SQLite`, etc.)
-/// * `database` - Schema database for table/column resolution
+/// * `sql` — SQL `SELECT` statement with optional WHERE clause.
+/// * `dialect` — the sqlparser dialect for `B`. Callers typically pass
+///   `&<B::Dialect as Default>::default()` or a shared instance.
+/// * `database` — schema catalog for table / column resolution.
 ///
-/// # Returns
-/// * `Ok((table_id, program))` - Compiled bytecode for the WHERE clause
-/// * `Err(RegisterError)` - Parse error, unsupported SQL, or schema error
-#[allow(clippy::option_if_let_else)]
-pub fn parse_and_compile<D: Dialect, DB: DatabaseLike>(
+/// # Errors
+///
+/// Returns [`RegisterError`] variants for parse, catalog, or literal
+/// coercion failures.
+pub fn parse_and_compile<B, DB>(
     sql: &str,
-    dialect: &D,
+    dialect: &B::Dialect,
     database: &DB,
-) -> Result<(TableId, BytecodeProgram), RegisterError> {
+) -> Result<(TableId, BytecodeProgram<B>), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
     let (table_id, program, _normalized, _, _) =
         parse_compile_normalize_and_prefilter(sql, dialect, database)?;
     Ok((table_id, program))
 }
 
 /// Parse SQL once and produce compiled bytecode plus canonical normalized form.
-pub fn parse_compile_and_normalize<D: Dialect, DB: DatabaseLike>(
+pub fn parse_compile_and_normalize<B, DB>(
     sql: &str,
-    dialect: &D,
+    dialect: &B::Dialect,
     database: &DB,
-) -> Result<(TableId, BytecodeProgram, String), RegisterError> {
+) -> Result<(TableId, BytecodeProgram<B>, String), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
     let (table_id, program, normalized, _, _) =
         parse_compile_normalize_and_prefilter(sql, dialect, database)?;
     Ok((table_id, program, normalized))
@@ -91,15 +107,19 @@ struct ParsedQuery {
     normalized: String,
 }
 
-fn parse_query_front_half<D: Dialect, DB: DatabaseLike>(
+fn parse_query_front_half<B, DB>(
     sql: &str,
-    dialect: &D,
+    dialect: &B::Dialect,
     database: &DB,
-    binds: &[Cell],
-) -> Result<ParsedQuery, RegisterError> {
-    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+    binds: &[Value<B>],
+) -> Result<ParsedQuery, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let stmt = sql_shape::parse_single_statement(sql, dialect as &dyn Dialect)?;
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
-    let where_clause = resolve_where_placeholders(where_clause, binds)?;
+    let where_clause = resolve_where_placeholders::<B>(where_clause, binds)?;
     let table_id = resolve_table_id(&table_name, database)?;
     let projection = sql_shape::extract_projection(&stmt, table_id, database)?;
     let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
@@ -113,53 +133,67 @@ fn parse_query_front_half<D: Dialect, DB: DatabaseLike>(
 
 /// Parse SQL once and produce compiled bytecode, canonical normalized form,
 /// OR/NOT-aware prefilter plan, and projection kind.
-pub fn parse_compile_normalize_and_prefilter<D: Dialect, DB: DatabaseLike>(
+pub fn parse_compile_normalize_and_prefilter<B, DB>(
     sql: &str,
-    dialect: &D,
+    dialect: &B::Dialect,
     database: &DB,
 ) -> Result<
     (
         TableId,
-        BytecodeProgram,
+        BytecodeProgram<B>,
         String,
         PrefilterPlan,
         QueryProjection,
     ),
     RegisterError,
-> {
+>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
     parse_compile_normalize_and_prefilter_with_binds(sql, dialect, database, &[])
 }
 
 /// Like [`parse_compile_normalize_and_prefilter`], but first resolves `$N`/`?`
 /// placeholders in the WHERE clause against `binds` (in placeholder order).
 ///
-/// Used by the typed diesel API, which renders parameterized SQL plus a list of
-/// bind values. With an empty `binds` slice this is identical to the plain
-/// entry point.
-pub fn parse_compile_normalize_and_prefilter_with_binds<D: Dialect, DB: DatabaseLike>(
+/// Used by the typed diesel API, which renders parameterised SQL plus a
+/// list of typed bind values. With an empty `binds` slice this is
+/// identical to the plain entry point.
+pub fn parse_compile_normalize_and_prefilter_with_binds<B, DB>(
     sql: &str,
-    dialect: &D,
+    dialect: &B::Dialect,
     database: &DB,
-    binds: &[Cell],
+    binds: &[Value<B>],
 ) -> Result<
     (
         TableId,
-        BytecodeProgram,
+        BytecodeProgram<B>,
         String,
         PrefilterPlan,
         QueryProjection,
     ),
     RegisterError,
-> {
-    let pq = parse_query_front_half(sql, dialect, database, binds)?;
+>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let pq = parse_query_front_half::<B, DB>(sql, dialect, database, binds)?;
 
-    // Compile WHERE clause to bytecode
-    let program = if let Some(expr) = pq.where_clause.as_ref() {
-        compile_expression(expr, pq.table_id, database)?
+    // Compile WHERE clause to bytecode.
+    let program: BytecodeProgram<B> = if let Some(expr) = pq.where_clause.as_ref() {
+        compile_expression::<B, DB>(expr, pq.table_id, database)?
     } else {
-        // No WHERE clause = always match
-        // Push True onto stack
-        BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(true))])
+        // No WHERE clause matches every row. Feed the bare `true` literal
+        // through the same wrapper that trailing bare-value predicates use
+        // so the VM sees a Tri-typed result at TOS.
+        let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
+            &SqlValue::Boolean(true),
+            ScalarKind::Bool,
+        )?)];
+        wrap_bare_value_as_tri::<B>(&mut instructions)?;
+        BytecodeProgram::new(instructions)
     };
 
     let prefilter_plan = build_prefilter_plan(pq.where_clause.as_ref(), pq.table_id, database);
@@ -179,12 +213,12 @@ pub fn parse_compile_normalize_and_prefilter_with_binds<D: Dialect, DB: Database
 /// Lets callers outside the core compile path (the reexec wrapper) obtain
 /// routing information for queries whose projection the engine does not
 /// support, without re-parsing.
-pub(crate) struct TableAndWhereDeps {
+pub(crate) struct TableAndWhereDeps<B: Backend> {
     pub table_id: TableId,
     /// The WHERE clause compiled to bytecode, so callers can evaluate row
-    /// membership in-process via the VM. A query with no WHERE compiles to an
-    /// always-true program (matches every row).
-    pub where_program: BytecodeProgram,
+    /// membership in-process via the VM. A query with no WHERE compiles to
+    /// an always-true program (matches every row).
+    pub where_program: BytecodeProgram<B>,
     /// Columns the WHERE clause depends on (mirrors
     /// `where_program.dependency_columns`).
     pub where_dependency_columns: Vec<ColumnId>,
@@ -198,18 +232,30 @@ pub(crate) struct TableAndWhereDeps {
 /// projection, so it succeeds for queries (e.g. `MIN`/`MAX`) the core engine
 /// rejects. It still enforces the single-table statement shape (no joins,
 /// subqueries, or set operations) and resolves the table against the catalog.
-pub(crate) fn parse_table_and_where_deps<D: Dialect, DB: DatabaseLike>(
+pub(crate) fn parse_table_and_where_deps<B, DB>(
     sql: &str,
-    dialect: &D,
+    dialect: &B::Dialect,
     database: &DB,
-) -> Result<TableAndWhereDeps, RegisterError> {
-    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+) -> Result<TableAndWhereDeps<B>, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let stmt = sql_shape::parse_single_statement(sql, dialect as &dyn Dialect)?;
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
     let table_id = resolve_table_id(&table_name, database)?;
-    let where_program = match where_clause.as_ref() {
-        Some(expr) => compile_expression(expr, table_id, database)?,
-        // No WHERE clause matches every row.
-        None => BytecodeProgram::new(vec![Instruction::PushLiteral(Cell::Bool(true))]),
+    let where_program: BytecodeProgram<B> = if let Some(expr) = where_clause.as_ref() {
+        compile_expression::<B, DB>(expr, table_id, database)?
+    } else {
+        // No WHERE clause matches every row. Feed the bare `true` literal
+        // through the same wrapper that trailing bare-value predicates use
+        // so the VM sees a Tri-typed result at TOS.
+        let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
+            &SqlValue::Boolean(true),
+            ScalarKind::Bool,
+        )?)];
+        wrap_bare_value_as_tri::<B>(&mut instructions)?;
+        BytecodeProgram::new(instructions)
     };
     let where_dependency_columns = where_program.dependency_columns.clone();
     Ok(TableAndWhereDeps {
@@ -253,23 +299,44 @@ fn extract_table_and_where(
     Ok((SqlTableName::from_object_name(&table_name)?, where_clause))
 }
 
-/// Convert a resolved bind [`Cell`] into a sqlparser literal [`Value`],
-/// preserving the int/float distinction. Floats are formatted with a decimal
-/// point (via `{:?}`) so they round-trip through [`sql_value_to_cell_strict`]
-/// back to [`Cell::Float`] rather than collapsing to an integer.
-fn cell_to_value(cell: &Cell) -> Result<Value, RegisterError> {
-    Ok(match cell {
-        Cell::Null => Value::Null,
-        Cell::Bool(b) => Value::Boolean(*b),
-        Cell::Int(i) => Value::Number(i.to_string(), false),
-        Cell::Float(f) => Value::Number(format!("{f:?}"), false),
-        Cell::String(s) => Value::SingleQuotedString(s.to_string()),
-        Cell::Missing => {
-            return Err(RegisterError::BindResolution(
-                "bind value is Missing (not a concrete value)".to_string(),
-            ))
-        }
-    })
+/// Convert a resolved bind [`Value<B>`] into a sqlparser literal so
+/// placeholder resolution can re-inject it into the AST as if the user
+/// had written the literal inline.
+///
+/// Handles the scalars commonly bound through placeholders (Int, Float,
+/// String, Null). Every other scalar returns
+/// [`RegisterError::BindResolution`] — those bindings are rejected until
+/// a downstream test exercises them and pins a canonical round-trip
+/// format.
+fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterError> {
+    match v {
+        Value::Missing => Err(RegisterError::BindResolution(
+            "bind value is Missing (not a concrete value)".to_string(),
+        )),
+        Value::Null => Ok(SqlValue::Null),
+        Value::Int(i) => Ok(SqlValue::Number(format!("{i:?}"), false)),
+        Value::Float(f) => Ok(SqlValue::Number(format!("{f:?}"), false)),
+        Value::String(s) => Ok(SqlValue::SingleQuotedString(s.as_ref().to_string())),
+        // Boolean binds are backend-specific (`Postgres::Bool = bool`,
+        // `SQLite::Bool = i64`) and don't have a uniform sqlparser
+        // spelling under a generic `B`. Reject at placeholder-injection
+        // time; callers writing SQL should pass the literal `true` /
+        // `false` inline (which the compiler routes through
+        // `SqlLiteralParse::parse_literal` with the right coercion).
+        Value::Bool(_)
+        | Value::Bytes(_)
+        | Value::Uuid(_)
+        | Value::Timestamp(_)
+        | Value::TimestampTz(_)
+        | Value::Date(_)
+        | Value::Time(_)
+        | Value::Decimal(_)
+        | Value::Json(_)
+        | Value::Jsonb(_) => Err(RegisterError::BindResolution(format!(
+            "bind value of {kind:?} scalar not yet supported through placeholder resolution",
+            kind = v.scalar_kind(),
+        ))),
+    }
 }
 
 /// Map a placeholder token to a bind index: `$N` (1-based) by number, `?` by
@@ -305,16 +372,16 @@ fn placeholder_index(
 /// values, in placeholder order. Walks only the expression shapes the compiler
 /// supports; a placeholder in an unsupported position is left untouched and
 /// rejected later by the compiler.
-fn resolve_expr_placeholders(
+fn resolve_expr_placeholders<B: Backend>(
     expr: &mut Expr,
-    binds: &[Cell],
+    binds: &[Value<B>],
     next_positional: &mut usize,
 ) -> Result<(), RegisterError> {
     match expr {
         Expr::Value(val) => {
-            if let Value::Placeholder(token) = &val.value {
+            if let SqlValue::Placeholder(token) = &val.value {
                 let idx = placeholder_index(token, binds.len(), next_positional)?;
-                val.value = cell_to_value(&binds[idx])?;
+                val.value = value_to_sql_value(&binds[idx])?;
             }
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -352,10 +419,11 @@ fn resolve_expr_placeholders(
 /// Resolve `$N`/`?` placeholders in the optional WHERE clause against `binds`.
 ///
 /// A no-op when `binds` is empty, so plain literal SQL (and the existing
-/// rejection of stray placeholders at compile time) is byte-for-byte unchanged.
-fn resolve_where_placeholders(
+/// rejection of stray placeholders at compile time) is byte-for-byte
+/// unchanged.
+fn resolve_where_placeholders<B: Backend>(
     where_clause: Option<Expr>,
-    binds: &[Cell],
+    binds: &[Value<B>],
 ) -> Result<Option<Expr>, RegisterError> {
     if binds.is_empty() {
         return Ok(where_clause);
@@ -370,11 +438,11 @@ fn resolve_where_placeholders(
     }
 }
 
-/// Build the projection-disambiguated hash input from a normalized WHERE clause
-/// and a projection kind.
+/// Build the projection-disambiguated hash input from a normalized WHERE
+/// clause and a projection kind.
 ///
-/// Same WHERE clause with different projection (e.g. `SELECT *` vs `SELECT COUNT(*)`)
-/// must hash to distinct predicates.
+/// Same WHERE clause with different projection (e.g. `SELECT *` vs
+/// `SELECT COUNT(*)`) must hash to distinct predicates.
 pub(crate) fn projection_hash_input(normalized: &str, projection: &QueryProjection) -> String {
     match projection {
         QueryProjection::Rows => normalized.to_owned(),
@@ -409,12 +477,16 @@ pub(crate) fn projection_hash_input(normalized: &str, projection: &QueryProjecti
 /// without compiling bytecode or building a prefilter plan.
 ///
 /// Used by `unregister_query` to find matching predicates by hash.
-pub fn parse_and_resolve_hash<D: Dialect, DB: DatabaseLike>(
+pub fn parse_and_resolve_hash<B, DB>(
     sql: &str,
-    dialect: &D,
+    dialect: &B::Dialect,
     database: &DB,
-) -> Result<(TableId, PredicateHash), RegisterError> {
-    let pq = parse_query_front_half(sql, dialect, database, &[])?;
+) -> Result<(TableId, PredicateHash), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let pq = parse_query_front_half::<B, DB>(sql, dialect, database, &[])?;
     let hash_input = projection_hash_input(&pq.normalized, &pq.projection);
     let hash = canonicalize::hash_sql(&hash_input);
 
@@ -423,10 +495,14 @@ pub fn parse_and_resolve_hash<D: Dialect, DB: DatabaseLike>(
 
 /// Derive the follow-subscription SELECT for an UPDATE statement.
 ///
-/// Parses `sql` and returns `SELECT * FROM t WHERE <the UPDATE's WHERE>` (see
-/// `sql_shape::derive_update_follow_sql`), so the caller can register it as a
-/// standing subscription. Any `$N`/`?` placeholders in the WHERE are preserved
-/// and resolved later against the request's binds.
+/// Parses `sql` and returns `SELECT * FROM t WHERE <the UPDATE's WHERE>`
+/// (see `sql_shape::derive_update_follow_sql`), so the caller can register
+/// it as a standing subscription. Any `$N`/`?` placeholders in the WHERE
+/// are preserved and resolved later against the request's binds.
+///
+/// This function stays generic over `D: Dialect` rather than `B: Backend`
+/// because it produces SQL text, not bytecode — no literal coercion is
+/// involved.
 pub fn derive_update_follow_select<D: Dialect>(
     sql: &str,
     dialect: &D,
@@ -435,31 +511,134 @@ pub fn derive_update_follow_select<D: Dialect>(
     sql_shape::derive_update_follow_sql(&stmt)
 }
 
-/// Compile SQL expression to bytecode
+/// Like [`derive_update_follow_select`], but additionally reports the number
+/// of bind placeholders (`$N` / `?`) that the discarded SET clause consumed.
 ///
-/// Recursively compiles an SQL expression into a sequence of VM instructions.
-/// Handles all supported expression types with proper NULL propagation.
-fn compile_expression<DB: DatabaseLike>(
+/// The caller uses that count to trim SET binds from a diesel-collected bind
+/// list before compiling the follow SELECT. `$N` placeholders in the returned
+/// SELECT are already renumbered so the first surviving one is `$1`.
+pub fn derive_update_follow_select_with_set_binds<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+) -> Result<(String, usize), RegisterError> {
+    let stmt = sql_shape::parse_single_statement(sql, dialect)?;
+    sql_shape::derive_update_follow_sql_and_set_binds(&stmt)
+}
+
+// ============================================================================
+// Compilation helpers
+// ============================================================================
+
+/// If `expr` is a bare column reference, return the [`ScalarKind`] of that
+/// column via the catalog. Otherwise `None`. Used to derive the target
+/// type for a paired literal in a comparison or an IN list.
+fn column_scalar_of<DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
-) -> Result<BytecodeProgram, RegisterError> {
-    let mut instructions = Vec::new();
-    compile_expr_recursive(expr, table_id, database, &mut instructions, 0)?;
+) -> Option<ScalarKind> {
+    let col = resolve_column_ref(expr, table_id, database)?;
+    crate::catalog_helpers::column_scalar_kind(database, table_id, col)
+}
+
+/// Return `true` if `instr` produces a [`crate::compiler::Tri`] on the
+/// stack. Used to detect whether a top-level WHERE program leaves a
+/// boolean at TOS or needs to be wrapped with `= true`.
+const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
+    matches!(
+        instr,
+        Instruction::Equal
+            | Instruction::NotEqual
+            | Instruction::LessThan
+            | Instruction::LessThanOrEqual
+            | Instruction::GreaterThan
+            | Instruction::GreaterThanOrEqual
+            | Instruction::IsNull
+            | Instruction::IsNotNull
+            | Instruction::And
+            | Instruction::Or
+            | Instruction::Not
+            | Instruction::In(_)
+            | Instruction::Between
+            | Instruction::Like { .. }
+            | Instruction::JumpIfFalse(_)
+            | Instruction::JumpIfTrue(_)
+    )
+}
+
+/// Wrap the tail of a WHERE program that finishes with a `Value<B>`
+/// (bare column ref, arithmetic result, bare literal) in an explicit
+/// `= true` comparison so the VM's final-result contract holds.
+///
+/// A no-op when the trailing instruction already produces a Tri.
+fn wrap_bare_value_as_tri<B>(instructions: &mut Vec<Instruction<B>>) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+{
+    match instructions.last() {
+        Some(instr) if instruction_is_tri_typed(instr) => Ok(()),
+        Some(_) => {
+            instructions.push(Instruction::PushLiteral(B::parse_literal(
+                &SqlValue::Boolean(true),
+                ScalarKind::Bool,
+            )?));
+            instructions.push(Instruction::Equal);
+            Ok(())
+        }
+        None => Err(RegisterError::UnsupportedSql(
+            "empty WHERE clause after compilation".to_string(),
+        )),
+    }
+}
+
+/// Compile a SQL expression into bytecode.
+///
+/// Recursively compiles an SQL expression into a sequence of VM
+/// instructions. Handles all supported expression types with proper NULL
+/// propagation. Appends the bare-value rescue at the end so the VM's
+/// final-result contract holds even for `WHERE bool_col` and similar.
+fn compile_expression<B, DB>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+) -> Result<BytecodeProgram<B>, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let mut instructions: Vec<Instruction<B>> = Vec::new();
+    compile_expr_recursive::<B, DB>(
+        expr,
+        table_id,
+        database,
+        &mut instructions,
+        0,
+        ScalarKind::String,
+    )?;
+    wrap_bare_value_as_tri::<B>(&mut instructions)?;
     Ok(BytecodeProgram::new(instructions))
 }
 
-/// Recursive helper for expression compilation
+/// Recursive helper for expression compilation.
 ///
-/// Compiles expression to leave result on top of stack.
-#[allow(clippy::too_many_lines)]
-fn compile_expr_recursive<DB: DatabaseLike>(
+/// Compiles an expression to leave its result on top of stack. The
+/// `target_kind` argument names the [`ScalarKind`] a standalone literal
+/// leaf should coerce to; comparison / arithmetic / IN / BETWEEN /
+/// LIKE arms override this per-child by peeking at whichever sibling is
+/// a column reference.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn compile_expr_recursive<B, DB>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
-    out: &mut Vec<Instruction>,
+    out: &mut Vec<Instruction<B>>,
     depth: usize,
-) -> Result<(), RegisterError> {
+    target_kind: ScalarKind,
+) -> Result<(), RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
     use sqlparser::ast::{BinaryOperator, UnaryOperator};
 
     if depth > sql_shape::MAX_EXPR_DEPTH {
@@ -474,42 +653,88 @@ fn compile_expr_recursive<DB: DatabaseLike>(
         // ====================================================================
         Expr::BinaryOp { left, op, right } => {
             match op {
-                // Short-circuit logical operators
+                // Short-circuit logical operators.
                 BinaryOperator::And => {
-                    compile_expr_recursive(left, table_id, database, out, depth + 1)?;
+                    compile_expr_recursive::<B, DB>(
+                        left,
+                        table_id,
+                        database,
+                        out,
+                        depth + 1,
+                        ScalarKind::String,
+                    )?;
 
                     let jump_idx = out.len();
                     out.push(Instruction::JumpIfFalse(0)); // placeholder, patched below
 
                     let rhs_start = out.len();
-                    compile_expr_recursive(right, table_id, database, out, depth + 1)?;
+                    compile_expr_recursive::<B, DB>(
+                        right,
+                        table_id,
+                        database,
+                        out,
+                        depth + 1,
+                        ScalarKind::String,
+                    )?;
                     out.push(Instruction::And);
 
-                    // Offset skips the rhs instructions plus the And.
                     let rhs_len = out.len() - rhs_start;
                     out[jump_idx] = Instruction::JumpIfFalse(rhs_len + 1);
                 }
                 BinaryOperator::Or => {
-                    compile_expr_recursive(left, table_id, database, out, depth + 1)?;
+                    compile_expr_recursive::<B, DB>(
+                        left,
+                        table_id,
+                        database,
+                        out,
+                        depth + 1,
+                        ScalarKind::String,
+                    )?;
 
                     let jump_idx = out.len();
                     out.push(Instruction::JumpIfTrue(0)); // placeholder, patched below
 
                     let rhs_start = out.len();
-                    compile_expr_recursive(right, table_id, database, out, depth + 1)?;
+                    compile_expr_recursive::<B, DB>(
+                        right,
+                        table_id,
+                        database,
+                        out,
+                        depth + 1,
+                        ScalarKind::String,
+                    )?;
                     out.push(Instruction::Or);
 
-                    // Offset skips the rhs instructions plus the Or.
                     let rhs_len = out.len() - rhs_start;
                     out[jump_idx] = Instruction::JumpIfTrue(rhs_len + 1);
                 }
                 _ => {
-                    // Non-short-circuit operators: compile both sides, emit op.
-                    compile_expr_recursive(left, table_id, database, out, depth + 1)?;
-                    compile_expr_recursive(right, table_id, database, out, depth + 1)?;
+                    // Non-short-circuit operators: compile both sides,
+                    // then emit the op. Target-typed literal inference
+                    // picks whichever sibling is a column reference and
+                    // uses its ScalarKind for the other side's literal.
+                    let child_target = column_scalar_of(left, table_id, database)
+                        .or_else(|| column_scalar_of(right, table_id, database))
+                        .unwrap_or(ScalarKind::String);
+
+                    compile_expr_recursive::<B, DB>(
+                        left,
+                        table_id,
+                        database,
+                        out,
+                        depth + 1,
+                        child_target,
+                    )?;
+                    compile_expr_recursive::<B, DB>(
+                        right,
+                        table_id,
+                        database,
+                        out,
+                        depth + 1,
+                        child_target,
+                    )?;
 
                     match op {
-                        // Comparison operators
                         BinaryOperator::Eq => out.push(Instruction::Equal),
                         BinaryOperator::NotEq => out.push(Instruction::NotEqual),
                         BinaryOperator::Lt => out.push(Instruction::LessThan),
@@ -517,7 +742,6 @@ fn compile_expr_recursive<DB: DatabaseLike>(
                         BinaryOperator::Gt => out.push(Instruction::GreaterThan),
                         BinaryOperator::GtEq => out.push(Instruction::GreaterThanOrEqual),
 
-                        // Arithmetic operators
                         BinaryOperator::Plus => out.push(Instruction::Add),
                         BinaryOperator::Minus => out.push(Instruction::Subtract),
                         BinaryOperator::Multiply => out.push(Instruction::Multiply),
@@ -543,7 +767,7 @@ fn compile_expr_recursive<DB: DatabaseLike>(
             )));
         }
 
-        ref col_expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
+        col_expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
             let col_id = resolve_column_ref(col_expr, table_id, database).ok_or_else(|| {
                 let col_name = match col_expr {
                     Expr::Identifier(ident) => ident.value.clone(),
@@ -555,6 +779,15 @@ fn compile_expr_recursive<DB: DatabaseLike>(
                     column: col_name,
                 }
             })?;
+            // Reject a column whose declared type the runtime decoder cannot
+            // resolve against the catalog (an unsupported SQL type).
+            crate::catalog_helpers::column_scalar_kind(database, table_id, col_id).ok_or_else(
+                || {
+                    RegisterError::UnsupportedSql(format!(
+                        "Column {col_id} of table {table_id} has an unsupported SQL type for the compiler"
+                    ))
+                },
+            )?;
             out.push(Instruction::LoadColumn(col_id));
         }
 
@@ -562,8 +795,8 @@ fn compile_expr_recursive<DB: DatabaseLike>(
         // Literals
         // ====================================================================
         Expr::Value(val) => {
-            let cell = sql_value_to_cell_strict(&val.value)?;
-            out.push(Instruction::PushLiteral(cell));
+            let value = B::parse_literal(&val.value, target_kind)?;
+            out.push(Instruction::PushLiteral(value));
         }
 
         // ====================================================================
@@ -574,19 +807,22 @@ fn compile_expr_recursive<DB: DatabaseLike>(
             list,
             negated,
         } => {
-            // Compile the expression being tested
-            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
+            // Derive target from the tested expression if it's a column
+            // reference; fall back to String otherwise (best-effort).
+            let list_target =
+                column_scalar_of(expr, table_id, database).unwrap_or(ScalarKind::String);
 
-            // Convert list values to cells
-            let mut literals = Vec::with_capacity(list.len());
+            compile_expr_recursive::<B, DB>(expr, table_id, database, out, depth + 1, list_target)?;
+
+            let mut literals: Vec<Value<B>> = Vec::with_capacity(list.len());
             for item in list {
                 if let Expr::Value(val) = item {
-                    literals.push(sql_value_to_cell_strict(&val.value)?);
+                    literals.push(B::parse_literal(&val.value, list_target)?);
                 } else {
                     return Err(RegisterError::UnsupportedSql(
                         "IN with subqueries not supported - SubQL only supports IN with literal lists like IN ('a', 'b', 'c'). \
                          For IN with subqueries, run this as a regular SQL query in your database."
-                            .to_string()
+                            .to_string(),
                     ));
                 }
             }
@@ -607,10 +843,27 @@ fn compile_expr_recursive<DB: DatabaseLike>(
             high,
             negated,
         } => {
-            // Stack order: value, lower, upper
-            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
-            compile_expr_recursive(low, table_id, database, out, depth + 1)?;
-            compile_expr_recursive(high, table_id, database, out, depth + 1)?;
+            let range_target =
+                column_scalar_of(expr, table_id, database).unwrap_or(ScalarKind::String);
+
+            // Stack order: value, lower, upper.
+            compile_expr_recursive::<B, DB>(
+                expr,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                range_target,
+            )?;
+            compile_expr_recursive::<B, DB>(low, table_id, database, out, depth + 1, range_target)?;
+            compile_expr_recursive::<B, DB>(
+                high,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                range_target,
+            )?;
 
             out.push(Instruction::Between);
 
@@ -622,26 +875,47 @@ fn compile_expr_recursive<DB: DatabaseLike>(
         // ====================================================================
         // NULL Checks
         // ====================================================================
-        Expr::IsNull(expr) => {
-            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
+        Expr::IsNull(inner) => {
+            compile_expr_recursive::<B, DB>(
+                inner,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                ScalarKind::String,
+            )?;
             out.push(Instruction::IsNull);
         }
 
-        Expr::IsNotNull(expr) => {
-            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
+        Expr::IsNotNull(inner) => {
+            compile_expr_recursive::<B, DB>(
+                inner,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                ScalarKind::String,
+            )?;
             out.push(Instruction::IsNotNull);
         }
 
         // ====================================================================
         // Unary Operations
         // ====================================================================
-        Expr::UnaryOp { op, expr } => {
-            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
+        Expr::UnaryOp { op, expr: inner } => {
+            compile_expr_recursive::<B, DB>(
+                inner,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                target_kind,
+            )?;
 
             match op {
                 UnaryOperator::Not => out.push(Instruction::Not),
                 UnaryOperator::Plus => {
-                    // Unary + is no-op
+                    // Unary + is no-op.
                 }
                 UnaryOperator::Minus => {
                     out.push(Instruction::Negate);
@@ -670,11 +944,23 @@ fn compile_expr_recursive<DB: DatabaseLike>(
                 ));
             }
 
-            // Compile string and pattern
-            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
-            compile_expr_recursive(pattern, table_id, database, out, depth + 1)?;
+            compile_expr_recursive::<B, DB>(
+                expr,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                ScalarKind::String,
+            )?;
+            compile_expr_recursive::<B, DB>(
+                pattern,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                ScalarKind::String,
+            )?;
 
-            // Case-sensitive LIKE by default
             out.push(Instruction::Like {
                 case_sensitive: true,
             });
@@ -697,11 +983,23 @@ fn compile_expr_recursive<DB: DatabaseLike>(
                 ));
             }
 
-            // Compile string and pattern
-            compile_expr_recursive(expr, table_id, database, out, depth + 1)?;
-            compile_expr_recursive(pattern, table_id, database, out, depth + 1)?;
+            compile_expr_recursive::<B, DB>(
+                expr,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                ScalarKind::String,
+            )?;
+            compile_expr_recursive::<B, DB>(
+                pattern,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                ScalarKind::String,
+            )?;
 
-            // Case-insensitive LIKE
             out.push(Instruction::Like {
                 case_sensitive: false,
             });
@@ -715,1762 +1013,30 @@ fn compile_expr_recursive<DB: DatabaseLike>(
         // Nested Expressions (parentheses)
         // ====================================================================
         Expr::Nested(inner) => {
-            compile_expr_recursive(inner, table_id, database, out, depth + 1)?;
+            compile_expr_recursive::<B, DB>(
+                inner,
+                table_id,
+                database,
+                out,
+                depth + 1,
+                target_kind,
+            )?;
         }
 
         // ====================================================================
         // Unsupported
         // ====================================================================
         _ => {
-            return Err(RegisterError::UnsupportedSql(
-                format!("Expression {expr:?} not supported - SubQL supports basic WHERE clause predicates (comparisons, AND/OR/NOT, IN lists, BETWEEN, NULL checks, LIKE). \
-                         For complex expressions, aggregates, or functions, run this as a regular SQL query in your database.")
-            ));
+            return Err(RegisterError::UnsupportedSql(format!(
+                "Expression {expr:?} not supported - SubQL supports basic WHERE clause predicates \
+                 (comparisons, AND/OR/NOT, IN lists, BETWEEN, NULL checks, LIKE). For complex \
+                 expressions, aggregates, or functions, run this as a regular SQL query in your \
+                 database."
+            )));
         }
     }
 
     Ok(())
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::uninlined_format_args)]
-mod tests {
-    use super::*;
-    use crate::catalog_helpers;
-    use sql_traits::structs::ParserDB;
-    use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
-
-    fn make_catalog() -> ParserDB {
-        ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE users (id INT PRIMARY KEY, age INT, email TEXT, name TEXT, joined TIMESTAMP);\n\
-             CREATE TABLE orders (id INT PRIMARY KEY, price DOUBLE PRECISION, quantity INT, user_id INT, status TEXT, created TIMESTAMP, notes TEXT);\n\
-             CREATE TABLE job_history (end_date TIMESTAMP, start_date TIMESTAMP, employee_id INT, role TEXT, department TEXT);\n\
-             CREATE TABLE airports (elevation INT, name TEXT, code TEXT, country TEXT, lat DOUBLE PRECISION);\n\
-             CREATE TABLE brands (products_this_year INT, products_last_year INT, name TEXT, ceo TEXT, country TEXT);\n\
-             CREATE TABLE stats (total INT, count INT, average DOUBLE PRECISION, max INT, min INT);\n\
-             CREATE TABLE data (id INT PRIMARY KEY, payload TEXT, created TIMESTAMP, updated TIMESTAMP, owner TEXT);",
-        )
-        .expect("compiler fixture DDL parses")
-    }
-
-    fn tid(catalog: &ParserDB, name: &str) -> crate::TableId {
-        catalog_helpers::table_id(catalog, name)
-            .unwrap_or_else(|| panic!("table {name} should resolve"))
-    }
-
-    #[test]
-    fn test_parse_postgresql_dialect() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE age > 18";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (table_id, _program) = result.unwrap();
-        assert_eq!(table_id, tid(&catalog, "users"));
-    }
-
-    #[test]
-    fn test_parse_mysql_dialect() {
-        let catalog = make_catalog();
-        let dialect = MySqlDialect {};
-
-        // MySQL allows backticks
-        let sql = "SELECT * FROM `users` WHERE `age` > 18";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_parse_sqlite_dialect() {
-        let catalog = make_catalog();
-        let dialect = SQLiteDialect {};
-
-        let sql = "SELECT * FROM users WHERE age > 18";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_schema_qualified_table_name_falls_back_to_unqualified() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM public.orders WHERE price > 10";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (table_id, _) = result.unwrap();
-        assert_eq!(table_id, tid(&catalog, "orders"));
-    }
-
-    // Removed `test_schema_qualified_table_name_ambiguity_errors`: this test
-    // relied on a `MockCatalog` storing both `orders` and `public.orders` as
-    // distinct entries with different table ids. `ParserDB` rejects this
-    // shape at DDL parse time (a bare `orders` is treated as `public.orders`
-    // implicitly, so the two collide). The `AmbiguousTable` error path is
-    // still exercised in `src/wal/mod.rs::test_resolve_table_conflicting_matches_errors`.
-
-    #[test]
-    fn test_reject_joins() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    #[test]
-    fn test_reject_unknown_table() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM unknown_table WHERE id = 1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-
-        assert!(matches!(result, Err(RegisterError::UnknownTable(_))));
-    }
-
-    #[test]
-    fn test_no_where_clause() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (table_id, program) = result.unwrap();
-        assert_eq!(table_id, tid(&catalog, "users"));
-        // Should have trivial "always match" program
-        assert!(!program.instructions.is_empty());
-    }
-
-    // ========================================================================
-    // Expression Compiler Tests
-    // ========================================================================
-
-    #[test]
-    fn test_simple_comparison_greater_than() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE age > 18";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1), // age column
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::GreaterThan,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_simple_comparison_equal() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE id = 42";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(0), // id column
-                Instruction::PushLiteral(Cell::Int(42)),
-                Instruction::Equal,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_compound_and() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE age > 18 AND id = 42";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1), // age
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::GreaterThan,
-                Instruction::JumpIfFalse(5), // skip rhs (3 instr) + And + jump itself
-                Instruction::LoadColumn(0),  // id
-                Instruction::PushLiteral(Cell::Int(42)),
-                Instruction::Equal,
-                Instruction::And,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_compound_or() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE age < 18 OR age > 65";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1), // age
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::LessThan,
-                Instruction::JumpIfTrue(5), // skip rhs (3 instr) + Or + jump itself
-                Instruction::LoadColumn(1), // age again
-                Instruction::PushLiteral(Cell::Int(65)),
-                Instruction::GreaterThan,
-                Instruction::Or,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_in_list() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE id IN (1, 2, 3)";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(0), // id
-                Instruction::In(vec![Cell::Int(1), Cell::Int(2), Cell::Int(3),]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_in_list_negated() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE id NOT IN (1, 2, 3)";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(0),
-                Instruction::In(vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]),
-                Instruction::Not,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_between() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE age BETWEEN 18 AND 65";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1), // age
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::PushLiteral(Cell::Int(65)),
-                Instruction::Between,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_between_negated() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE age NOT BETWEEN 18 AND 65";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::PushLiteral(Cell::Int(65)),
-                Instruction::Between,
-                Instruction::Not,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_is_null() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email IS NULL";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(2), // email
-                Instruction::IsNull,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_is_not_null() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email IS NOT NULL";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![Instruction::LoadColumn(2), Instruction::IsNotNull,]
-        );
-    }
-
-    #[test]
-    fn test_like_pattern() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email LIKE '%@example.com'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(2), // email
-                Instruction::PushLiteral(Cell::String("%@example.com".into())),
-                Instruction::Like {
-                    case_sensitive: true
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn test_like_negated() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email NOT LIKE '%@example.com'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(2),
-                Instruction::PushLiteral(Cell::String("%@example.com".into())),
-                Instruction::Like {
-                    case_sensitive: true
-                },
-                Instruction::Not,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_not_operator() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE NOT (age < 18)";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::LessThan,
-                Instruction::Not,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_complex_expression() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // (age > 18 OR age IS NULL) AND email IS NOT NULL
-        let sql = "SELECT * FROM users WHERE (age > 18 OR age IS NULL) AND email IS NOT NULL";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1), // age
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::GreaterThan,
-                Instruction::JumpIfTrue(4), // skip IsNull + Or (2 instr) + jump itself
-                Instruction::LoadColumn(1), // age
-                Instruction::IsNull,
-                Instruction::Or,
-                Instruction::JumpIfFalse(4), // skip IsNotNull + And (2 instr) + jump itself
-                Instruction::LoadColumn(2),  // email
-                Instruction::IsNotNull,
-                Instruction::And,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_all_comparison_operators() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let tests = vec![
-            ("age = 18", Instruction::Equal),
-            ("age != 18", Instruction::NotEqual),
-            ("age < 18", Instruction::LessThan),
-            ("age <= 18", Instruction::LessThanOrEqual),
-            ("age > 18", Instruction::GreaterThan),
-            ("age >= 18", Instruction::GreaterThanOrEqual),
-        ];
-
-        for (where_clause, expected_op) in tests {
-            let sql = format!("SELECT * FROM users WHERE {}", where_clause);
-            let result = parse_and_compile(&sql, &dialect, &catalog);
-            assert!(result.is_ok(), "Failed to parse: {}", where_clause);
-
-            let (_, program) = result.unwrap();
-            assert_eq!(
-                program.instructions[2], expected_op,
-                "Wrong operator for: {}",
-                where_clause
-            );
-        }
-    }
-
-    #[test]
-    fn test_string_literals() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email = 'test@example.com'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(2),
-                Instruction::PushLiteral(Cell::String("test@example.com".into())),
-                Instruction::Equal,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_null_literal() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Note: age = NULL is syntactically valid but semantically wrong
-        // (should use IS NULL). But we compile it correctly.
-        let sql = "SELECT * FROM users WHERE age = NULL";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(Cell::Null),
-                Instruction::Equal,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_reject_unknown_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE unknown_column = 42";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-
-        assert!(matches!(result, Err(RegisterError::UnknownColumn { .. })));
-    }
-
-    #[test]
-    fn test_dependency_extraction() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Uses columns 1 (age) and 2 (email)
-        let sql = "SELECT * FROM users WHERE age > 18 AND email IS NOT NULL";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(program.dependency_columns, vec![1, 2]);
-    }
-
-    #[test]
-    fn test_nested_parentheses() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE ((age > 18))";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::GreaterThan,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_float_literal() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE age > 18.5";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(Cell::Float(18.5)),
-                Instruction::GreaterThan,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_arithmetic_add() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM orders WHERE price + quantity > 100";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1), // price
-                Instruction::LoadColumn(2), // quantity
-                Instruction::Add,
-                Instruction::PushLiteral(Cell::Int(100)),
-                Instruction::GreaterThan,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_arithmetic_subtract() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Real-world example from benchmark
-        let sql = "SELECT * FROM job_history WHERE end_date - start_date > 300";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert!(program.instructions.contains(&Instruction::Subtract));
-    }
-
-    #[test]
-    fn test_arithmetic_multiply() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM orders WHERE price * quantity > 1000";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert!(program.instructions.contains(&Instruction::Multiply));
-    }
-
-    #[test]
-    fn test_arithmetic_divide() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM stats WHERE total / count > 50.0";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert!(program.instructions.contains(&Instruction::Divide));
-    }
-
-    #[test]
-    fn test_arithmetic_modulo() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM data WHERE id % 10 = 0";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert!(program.instructions.contains(&Instruction::Modulo));
-    }
-
-    #[test]
-    fn test_unary_minus() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Real-world example from benchmark
-        let sql = "SELECT * FROM airports WHERE elevation BETWEEN -50 AND 50";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert!(program.instructions.contains(&Instruction::Negate));
-    }
-
-    #[test]
-    fn test_complex_arithmetic() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Real-world example from benchmark
-        let sql = "SELECT * FROM brands WHERE (products_this_year - products_last_year) > 0.5 * products_last_year";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert!(program.instructions.contains(&Instruction::Subtract));
-        assert!(program.instructions.contains(&Instruction::Multiply));
-    }
-
-    // Error path tests for comprehensive coverage
-    #[test]
-    fn test_no_where_clause_accepted() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // No WHERE clause is valid (matches everything)
-        let sql = "SELECT * FROM users";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        // Should compile to "push true"
-        assert_eq!(program.instructions.len(), 1);
-    }
-
-    #[test]
-    fn test_error_unknown_table() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM nonexistent WHERE id > 1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnknownTable(_))));
-    }
-
-    #[test]
-    fn test_error_unknown_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE nonexistent > 1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnknownColumn { .. })));
-    }
-
-    #[test]
-    fn test_error_complex_identifier() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // 3-part identifier not supported
-        let sql = "SELECT * FROM users WHERE schema.table.column > 1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    #[test]
-    fn test_error_in_with_expression() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // IN with expression (not literal) not supported
-        let sql = "SELECT * FROM users WHERE id IN (age + 1)";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    #[test]
-    fn test_error_unsupported_value_type() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Placeholder values not supported without binds (typed API supplies binds).
-        let sql = "SELECT * FROM users WHERE id = $1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    // ---- Bind placeholder resolution (typed diesel API path) -------------
-
-    fn normalized_with_binds(sql: &str, binds: &[Cell]) -> String {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-        parse_compile_normalize_and_prefilter_with_binds(sql, &dialect, &catalog, binds)
-            .expect("binds should resolve")
-            .2
-    }
-
-    fn normalized_literal(sql: &str) -> String {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-        parse_compile_normalize_and_prefilter(sql, &dialect, &catalog)
-            .expect("literal SQL should compile")
-            .2
-    }
-
-    #[test]
-    fn bind_int_matches_literal() {
-        assert_eq!(
-            normalized_with_binds("SELECT * FROM users WHERE id = $1", &[Cell::Int(5)]),
-            normalized_literal("SELECT * FROM users WHERE id = 5"),
-        );
-    }
-
-    #[test]
-    fn bind_string_matches_literal() {
-        assert_eq!(
-            normalized_with_binds(
-                "SELECT * FROM users WHERE name = $1",
-                &[Cell::String("ann".into())]
-            ),
-            normalized_literal("SELECT * FROM users WHERE name = 'ann'"),
-        );
-    }
-
-    #[test]
-    fn bind_float_preserves_float() {
-        // A float bind must round-trip as a float literal (decimal point kept),
-        // matching the equivalent literal SQL rather than collapsing to an int.
-        assert_eq!(
-            normalized_with_binds("SELECT * FROM orders WHERE price = $1", &[Cell::Float(3.0)]),
-            normalized_literal("SELECT * FROM orders WHERE price = 3.0"),
-        );
-    }
-
-    #[test]
-    fn bind_in_list_resolves() {
-        assert_eq!(
-            normalized_with_binds(
-                "SELECT * FROM users WHERE id IN ($1, $2, $3)",
-                &[Cell::Int(1), Cell::Int(2), Cell::Int(3)]
-            ),
-            normalized_literal("SELECT * FROM users WHERE id IN (1, 2, 3)"),
-        );
-    }
-
-    #[test]
-    fn bind_positional_question_marks() {
-        let catalog = make_catalog();
-        let dialect = MySqlDialect {};
-        let out = parse_compile_normalize_and_prefilter_with_binds(
-            "SELECT * FROM users WHERE id = ? AND age = ?",
-            &dialect,
-            &catalog,
-            &[Cell::Int(1), Cell::Int(2)],
-        )
-        .expect("positional binds resolve")
-        .2;
-        let lit = parse_compile_normalize_and_prefilter(
-            "SELECT * FROM users WHERE id = 1 AND age = 2",
-            &dialect,
-            &catalog,
-        )
-        .unwrap()
-        .2;
-        assert_eq!(out, lit);
-    }
-
-    #[test]
-    fn bind_distinct_values_distinct_normalized() {
-        // Same skeleton, different binds must produce different normalized forms
-        // so they hash to distinct predicates and do not dedup.
-        let a = normalized_with_binds("SELECT * FROM users WHERE id = $1", &[Cell::Int(1)]);
-        let b = normalized_with_binds("SELECT * FROM users WHERE id = $1", &[Cell::Int(2)]);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn bind_index_out_of_range_errors() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-        let result = parse_compile_normalize_and_prefilter_with_binds(
-            "SELECT * FROM users WHERE id = $2",
-            &dialect,
-            &catalog,
-            &[Cell::Int(1)],
-        );
-        assert!(matches!(result, Err(RegisterError::BindResolution(_))));
-    }
-
-    // ---- Complete column-list projection == SELECT * (diesel renders these) ---
-
-    fn projection_of(sql: &str) -> Result<QueryProjection, RegisterError> {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-        parse_compile_normalize_and_prefilter(sql, &dialect, &catalog).map(|t| t.4)
-    }
-
-    #[test]
-    fn complete_column_list_is_rows() {
-        assert_eq!(
-            projection_of("SELECT id, age, email, name, joined FROM users").unwrap(),
-            QueryProjection::Rows,
-        );
-    }
-
-    #[test]
-    fn qualified_complete_column_list_is_rows() {
-        // How diesel renders a row query: fully qualified, all columns.
-        assert_eq!(
-            projection_of(
-                "SELECT users.id, users.age, users.email, users.name, users.joined FROM users"
-            )
-            .unwrap(),
-            QueryProjection::Rows,
-        );
-    }
-
-    #[test]
-    fn partial_column_list_unsupported() {
-        assert!(matches!(
-            projection_of("SELECT id, age FROM users"),
-            Err(RegisterError::UnsupportedSql(_))
-        ));
-    }
-
-    #[test]
-    fn duplicate_column_list_unsupported() {
-        assert!(matches!(
-            projection_of("SELECT id, id, age, email, name, joined FROM users"),
-            Err(RegisterError::UnsupportedSql(_))
-        ));
-    }
-
-    #[test]
-    fn test_error_set_operations() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE id = 1 UNION SELECT * FROM users WHERE id = 2";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    #[test]
-    fn test_error_ddl_statement() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "INSERT INTO users VALUES (1, 'test')";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    #[test]
-    fn test_error_unsupported_expression() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // CASE expression not yet supported
-        let sql = "SELECT * FROM users WHERE CASE WHEN age > 18 THEN true ELSE false END";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    #[test]
-    fn test_error_unsupported_binary_operator() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // BitwiseAnd not supported
-        let sql = "SELECT * FROM users WHERE id & 1 = 1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    #[test]
-    fn test_error_unsupported_unary_operator() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // PGBitwiseNot not supported
-        let sql = "SELECT * FROM users WHERE ~id = 1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-    }
-
-    #[test]
-    fn test_error_invalid_number() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // This should parse but might fail type conversion
-        let sql = "SELECT * FROM users WHERE age > 999999999999999999999999999999999";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        // Either succeeds or fails with TypeError
-        if result.is_err() {
-            assert!(matches!(result, Err(RegisterError::TypeError(_))));
-        }
-    }
-
-    #[test]
-    fn test_error_parse_failure() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let invalid_sql = "NOT VALID SQL ;;;"; // Malformed SQL
-        let result = parse_and_compile(invalid_sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::ParseError { .. })));
-    }
-
-    #[test]
-    fn test_error_multiple_statements() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE id = 1; SELECT * FROM users WHERE id = 2";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-        if let Err(RegisterError::UnsupportedSql(msg)) = result {
-            assert!(msg.contains("exactly one"));
-        }
-    }
-
-    #[test]
-    fn test_error_multiple_tables_no_join() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users, orders WHERE users.id = 1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-        if let Err(RegisterError::UnsupportedSql(msg)) = result {
-            assert!(msg.contains("Exactly one table"));
-        }
-    }
-
-    #[test]
-    fn test_error_subquery() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM (SELECT * FROM users) AS u WHERE id = 1";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-        if let Err(RegisterError::UnsupportedSql(msg)) = result {
-            assert!(msg.contains("Subqueries"));
-        }
-    }
-
-    #[test]
-    fn test_compound_identifier_two_parts() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Two-part identifier (table.column) should work
-        let sql = "SELECT * FROM users WHERE users.age > 18";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1), // age column
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::GreaterThan,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_error_like_escape() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email LIKE '%test%' ESCAPE '\\'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-        if let Err(RegisterError::UnsupportedSql(msg)) = result {
-            assert!(msg.contains("ESCAPE"));
-        }
-    }
-
-    #[test]
-    fn test_error_ilike_escape() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email ILIKE '%test%' ESCAPE '\\'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnsupportedSql(_))));
-        if let Err(RegisterError::UnsupportedSql(msg)) = result {
-            assert!(msg.contains("ESCAPE"));
-        }
-    }
-
-    #[test]
-    fn test_ilike_case_insensitive() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email ILIKE '%TEST%'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(2), // email
-                Instruction::PushLiteral(Cell::String("%TEST%".into())),
-                Instruction::Like {
-                    case_sensitive: false
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn test_ilike_negated() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE email NOT ILIKE '%spam%'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(2),
-                Instruction::PushLiteral(Cell::String("%spam%".into())),
-                Instruction::Like {
-                    case_sensitive: false
-                },
-                Instruction::Not,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_unary_plus_operator() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE +age = 18";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        // Unary + is a no-op, should just load column
-        assert_eq!(
-            program.instructions,
-            vec![
-                Instruction::LoadColumn(1), // age
-                Instruction::PushLiteral(Cell::Int(18)),
-                Instruction::Equal,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_double_quoted_string() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = r#"SELECT * FROM users WHERE email = "test@example.com""#;
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        // Note: PostgreSQL treats double quotes as identifiers, not strings
-        // This might fail or succeed depending on dialect behavior
-        let _ = result; // Just test it doesn't panic
-    }
-
-    #[test]
-    fn test_boolean_literal() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM users WHERE age > 18 AND true";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-
-        let (_, program) = result.unwrap();
-        // Should compile the boolean literal
-        assert!(program
-            .instructions
-            .contains(&Instruction::PushLiteral(Cell::Bool(true))));
-    }
-
-    #[test]
-    fn test_compound_identifier_unknown_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Two-part identifier with unknown column
-        let sql = "SELECT * FROM users WHERE users.unknown_column > 18";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(matches!(result, Err(RegisterError::UnknownColumn { .. })));
-    }
-
-    #[test]
-    fn test_error_invalid_number_literal() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // Very large number that can't be parsed as i64 or f64
-        // Note: Most large numbers will parse as f64, so this is hard to trigger
-        // The TypeError path is mostly defensive
-        let sql = "SELECT * FROM users WHERE age > 18";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        // This should succeed, but documents the TypeError path exists
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_value_to_cell_unparseable_number() {
-        use sqlparser::ast::Value;
-
-        // Construct a Value::Number with a string that can't parse as i64 or f64
-        // Defensive: sqlparser normally validates numbers, but we test it directly
-        let val = Value::Number("not_a_number".to_string(), false);
-        let result = sql_value_to_cell_strict(&val);
-        assert!(matches!(result, Err(RegisterError::TypeError(_))));
-    }
-
-    #[test]
-    fn test_national_string_literal() {
-        let catalog = make_catalog();
-        let dialect = MySqlDialect {};
-
-        // MySQL supports N'...' for national character strings
-        let sql = "SELECT * FROM users WHERE email = N'test@example.com'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_hex_string_literal() {
-        let catalog = make_catalog();
-        let dialect = MySqlDialect {};
-
-        // MySQL supports X'...' for hex string literals
-        let sql = "SELECT * FROM users WHERE email = X'CAFE'";
-        let result = parse_and_compile(sql, &dialect, &catalog);
-        assert!(result.is_ok());
-    }
-
-    // --- Projection tests ---
-
-    #[test]
-    fn test_projection_count_star() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT COUNT(*) FROM orders WHERE price > 10";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(
-            projection,
-            QueryProjection::Aggregate(crate::compiler::sql_shape::AggSpec::CountStar)
-        );
-    }
-
-    #[test]
-    fn test_projection_select_star() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT * FROM orders WHERE price > 10";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(projection, QueryProjection::Rows);
-    }
-
-    #[test]
-    fn test_projection_count_star_with_alias() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT COUNT(*) AS total FROM orders WHERE price > 10";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(
-            projection,
-            QueryProjection::Aggregate(crate::compiler::sql_shape::AggSpec::CountStar)
-        );
-    }
-
-    #[test]
-    fn test_projection_sum_known_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // orders table: id=0, price=1, quantity=2
-        let sql = "SELECT SUM(price) FROM orders WHERE price > 10";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(result.is_ok(), "SUM(price) should succeed, got: {result:?}");
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(
-            projection,
-            crate::compiler::sql_shape::QueryProjection::Aggregate(
-                crate::compiler::sql_shape::AggSpec::Sum { column: 1 }
-            )
-        );
-    }
-
-    #[test]
-    fn test_projection_sum_with_alias() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT SUM(price) AS revenue FROM orders WHERE price > 10";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            result.is_ok(),
-            "SUM(price) AS alias should succeed, got: {result:?}"
-        );
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(
-            projection,
-            crate::compiler::sql_shape::QueryProjection::Aggregate(
-                crate::compiler::sql_shape::AggSpec::Sum { column: 1 }
-            )
-        );
-    }
-
-    #[test]
-    fn test_projection_sum_unknown_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT SUM(nonexistent) FROM orders WHERE price > 10";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnknownColumn { .. })),
-            "expected UnknownColumn for unknown SUM column, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_sum_star_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT SUM(*) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for SUM(*), got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_sum_distinct_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT SUM(DISTINCT price) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for SUM(DISTINCT ...), got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_sum_expression_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT SUM(price * 2) FROM orders WHERE price > 10";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for SUM(expression), got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_projection_count_distinct_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT COUNT(DISTINCT id) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_projection_count_column_known_column() {
-        // COUNT(col) is now supported: counts non-NULL values
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        // orders table: id=0, price=1, quantity=2
-        let sql = "SELECT COUNT(price) FROM orders WHERE price > 10";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            result.is_ok(),
-            "COUNT(price) should succeed, got: {result:?}"
-        );
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(
-            projection,
-            crate::compiler::sql_shape::QueryProjection::Aggregate(
-                crate::compiler::sql_shape::AggSpec::CountColumn { column: 1 }
-            )
-        );
-    }
-
-    #[test]
-    fn test_projection_count_column_unknown_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT COUNT(nonexistent) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnknownColumn { .. })),
-            "expected UnknownColumn for unknown COUNT column, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_count_column_distinct_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT COUNT(DISTINCT price) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for COUNT(DISTINCT ...), got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_avg_known_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT AVG(price) FROM orders WHERE price > 0";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(result.is_ok(), "AVG(price) should succeed, got: {result:?}");
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(
-            projection,
-            crate::compiler::sql_shape::QueryProjection::Aggregate(
-                crate::compiler::sql_shape::AggSpec::Avg { column: 1 }
-            )
-        );
-    }
-
-    #[test]
-    fn test_projection_avg_with_alias() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT AVG(price) AS mean_price FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            result.is_ok(),
-            "AVG(price) AS alias should succeed, got: {result:?}"
-        );
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(
-            projection,
-            crate::compiler::sql_shape::QueryProjection::Aggregate(
-                crate::compiler::sql_shape::AggSpec::Avg { column: 1 }
-            )
-        );
-    }
-
-    #[test]
-    fn test_projection_avg_unknown_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT AVG(nonexistent) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnknownColumn { .. })),
-            "expected UnknownColumn, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_avg_expression_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT AVG(price * 2) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for AVG(expression), got: {result:?}"
-        );
-    }
-
-    // Typed catalog for column_type() tests: id is unspecified (Unknown),
-    // amount is INT, status is TEXT (String).
-    fn make_typed_catalog() -> ParserDB {
-        ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
-        )
-        .expect("typed orders DDL parses")
-    }
-
-    #[test]
-    fn test_projection_sum_non_numeric_type_rejected() {
-        let catalog = make_typed_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT SUM(status) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for SUM on String column, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_avg_non_numeric_type_rejected() {
-        let catalog = make_typed_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT AVG(status) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for AVG on String column, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_sum_numeric_type_accepted() {
-        let catalog = make_typed_catalog();
-        let dialect = PostgreSqlDialect {};
-
-        let sql = "SELECT SUM(amount) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            result.is_ok(),
-            "SUM on Int column should be accepted, got: {result:?}"
-        );
-    }
-
-    // --- VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP projection tests ---
-
-    fn expect_agg_spec(
-        sql: &str,
-        expected: crate::compiler::sql_shape::AggSpec,
-        catalog: &ParserDB,
-    ) {
-        let dialect = PostgreSqlDialect {};
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, catalog);
-        assert!(result.is_ok(), "{sql:?} should parse, got: {result:?}");
-        let (_, _, _, _, projection) = result.unwrap();
-        assert_eq!(
-            projection,
-            crate::compiler::sql_shape::QueryProjection::Aggregate(expected),
-            "projection mismatch for {sql:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_var_pop_known_column() {
-        let catalog = make_catalog();
-        // orders: id=0, price=1, quantity=2
-        expect_agg_spec(
-            "SELECT VAR_POP(price) FROM orders",
-            crate::compiler::sql_shape::AggSpec::VarPop { column: 1 },
-            &catalog,
-        );
-    }
-
-    #[test]
-    fn test_projection_var_samp_known_column() {
-        let catalog = make_catalog();
-        expect_agg_spec(
-            "SELECT VAR_SAMP(price) FROM orders",
-            crate::compiler::sql_shape::AggSpec::VarSamp { column: 1 },
-            &catalog,
-        );
-    }
-
-    #[test]
-    fn test_projection_variance_alias_maps_to_var_samp() {
-        let catalog = make_catalog();
-        expect_agg_spec(
-            "SELECT VARIANCE(price) FROM orders",
-            crate::compiler::sql_shape::AggSpec::VarSamp { column: 1 },
-            &catalog,
-        );
-    }
-
-    #[test]
-    fn test_projection_stddev_pop_known_column() {
-        let catalog = make_catalog();
-        expect_agg_spec(
-            "SELECT STDDEV_POP(price) FROM orders",
-            crate::compiler::sql_shape::AggSpec::StddevPop { column: 1 },
-            &catalog,
-        );
-    }
-
-    #[test]
-    fn test_projection_stddev_samp_known_column() {
-        let catalog = make_catalog();
-        expect_agg_spec(
-            "SELECT STDDEV_SAMP(price) FROM orders",
-            crate::compiler::sql_shape::AggSpec::StddevSamp { column: 1 },
-            &catalog,
-        );
-    }
-
-    #[test]
-    fn test_projection_stddev_alias_maps_to_stddev_samp() {
-        let catalog = make_catalog();
-        expect_agg_spec(
-            "SELECT STDDEV(price) FROM orders",
-            crate::compiler::sql_shape::AggSpec::StddevSamp { column: 1 },
-            &catalog,
-        );
-    }
-
-    #[test]
-    fn test_projection_var_pop_with_alias() {
-        let catalog = make_catalog();
-        expect_agg_spec(
-            "SELECT VAR_POP(price) AS spread FROM orders WHERE price > 0",
-            crate::compiler::sql_shape::AggSpec::VarPop { column: 1 },
-            &catalog,
-        );
-    }
-
-    #[test]
-    fn test_projection_var_pop_unknown_column() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-        let sql = "SELECT VAR_POP(nonexistent) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnknownColumn { .. })),
-            "expected UnknownColumn, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_stddev_distinct_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-        let sql = "SELECT STDDEV(DISTINCT price) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for STDDEV(DISTINCT ...), got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_var_samp_wildcard_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-        let sql = "SELECT VAR_SAMP(*) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for VAR_SAMP(*), got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_var_pop_expression_unsupported() {
-        let catalog = make_catalog();
-        let dialect = PostgreSqlDialect {};
-        let sql = "SELECT VAR_POP(price * 2) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for VAR_POP(expr), got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_stddev_non_numeric_type_rejected() {
-        let catalog = make_typed_catalog();
-        let dialect = PostgreSqlDialect {};
-        let sql = "SELECT STDDEV(status) FROM orders";
-        let result = parse_compile_normalize_and_prefilter(sql, &dialect, &catalog);
-        assert!(
-            matches!(result, Err(RegisterError::UnsupportedSql(_))),
-            "expected UnsupportedSql for STDDEV on String column, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_projection_hash_input_distinguishes_var_flavors() {
-        // VAR_POP, VAR_SAMP, STDDEV_POP, STDDEV_SAMP on the same WHERE clause
-        // must hash to four distinct predicates.
-        use crate::compiler::sql_shape::{AggSpec, QueryProjection};
-        let where_clause = "price > 10";
-        let inputs = [
-            projection_hash_input(
-                where_clause,
-                &QueryProjection::Aggregate(AggSpec::VarPop { column: 1 }),
-            ),
-            projection_hash_input(
-                where_clause,
-                &QueryProjection::Aggregate(AggSpec::VarSamp { column: 1 }),
-            ),
-            projection_hash_input(
-                where_clause,
-                &QueryProjection::Aggregate(AggSpec::StddevPop { column: 1 }),
-            ),
-            projection_hash_input(
-                where_clause,
-                &QueryProjection::Aggregate(AggSpec::StddevSamp { column: 1 }),
-            ),
-        ];
-        let unique: std::collections::HashSet<_> = inputs.iter().collect();
-        assert_eq!(unique.len(), 4, "hash inputs collide: {inputs:?}");
-    }
-
-    /// Both the compile path and the canonicalize path use `sql_shape::MAX_EXPR_DEPTH`
-    /// to bound recursion. Verify they reject the same depth.
-    #[test]
-    fn both_paths_reject_same_excessive_depth() {
-        let dialect = PostgreSqlDialect {};
-        let catalog = make_catalog();
-
-        // Build deeply nested parenthesized expression that exceeds MAX_EXPR_DEPTH
-        let depth = sql_shape::MAX_EXPR_DEPTH + 2;
-        let open = "(".repeat(depth);
-        let close = ")".repeat(depth);
-        let sql = format!("SELECT * FROM users WHERE {open}age > 18{close}");
-
-        let compile_result = parse_compile_normalize_and_prefilter(&sql, &dialect, &catalog);
-        let hash_result = parse_and_resolve_hash(&sql, &dialect, &catalog);
-
-        assert!(
-            compile_result.is_err(),
-            "compile path must reject depth > MAX_EXPR_DEPTH"
-        );
-        assert!(
-            hash_result.is_err(),
-            "hash path must reject depth > MAX_EXPR_DEPTH"
-        );
-    }
-
-    #[test]
-    fn parse_table_and_where_deps_surfaces_compiled_program() {
-        use crate::compiler::tristate::Tri;
-        use crate::compiler::vm::Vm;
-        use crate::types::RowImage;
-        use alloc::sync::Arc;
-
-        let dialect = PostgreSqlDialect {};
-        let catalog = make_catalog();
-
-        // With a WHERE clause: the program carries dependency columns, mirrored
-        // by `where_dependency_columns`.
-        let with_where = parse_table_and_where_deps(
-            "SELECT MIN(price) FROM orders WHERE quantity > 5",
-            &dialect,
-            &catalog,
-        )
-        .unwrap();
-        assert!(!with_where.where_program.dependency_columns.is_empty());
-        assert_eq!(
-            with_where.where_dependency_columns,
-            with_where.where_program.dependency_columns
-        );
-
-        // No WHERE clause: always-true program, no dependencies, evaluates to
-        // Tri::True against any row.
-        let no_where =
-            parse_table_and_where_deps("SELECT MAX(price) FROM orders", &dialect, &catalog)
-                .unwrap();
-        assert!(no_where.where_program.dependency_columns.is_empty());
-        assert!(no_where.where_dependency_columns.is_empty());
-
-        let mut vm = Vm::new();
-        let row = RowImage {
-            cells: Arc::from([Cell::Int(0)]),
-        };
-        assert_eq!(vm.eval(&no_where.where_program, &row).unwrap(), Tri::True);
-    }
-}
+// Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.

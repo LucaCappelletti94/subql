@@ -13,6 +13,7 @@ use std::time::Duration;
 use diesel::{sql_query, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::CdcEvent;
 use subql::{CdcSource, EventKind, PollingPgCdcConfig, PollingPgCdcSource};
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT);";

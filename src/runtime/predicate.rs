@@ -2,6 +2,7 @@
 
 use super::ids::{ConsumerOrdinal, PredicateHash, PredicateId};
 use super::indexes::IndexableAtom;
+use crate::backend::Backend;
 use crate::{
     compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
     ColumnId, IdTypes, SubscriptionId, SubscriptionScope,
@@ -12,18 +13,21 @@ use hashbrown::{HashMap, HashSet};
 use roaring::RoaringBitmap;
 use slab::Slab;
 
-/// Compiled predicate with metadata
-#[derive(Clone, Debug)]
-pub struct Predicate {
-    /// Stable predicate ID (slab index)
+/// Compiled predicate with metadata.
+///
+/// Storage-shaped type parameterised on the observed [`Backend`]. The
+/// bytecode program pins the backend it was compiled against; the runtime
+/// re-executes it via `Vm<B>` in response to every `E: CdcEvent<Backend = B>`.
+pub struct Predicate<B: Backend> {
+    /// Stable predicate ID (slab index).
     pub id: PredicateId,
-    /// Hash of normalized SQL (for deduplication)
+    /// Hash of normalized SQL (for deduplication).
     pub hash: PredicateHash,
-    /// Normalized/canonicalized SQL WHERE clause
+    /// Normalized / canonicalised SQL WHERE clause.
     pub normalized_sql: Arc<str>,
-    /// Compiled bytecode for VM evaluation
-    pub bytecode: Arc<BytecodeProgram>,
-    /// Columns referenced by this predicate (for UPDATE optimization)
+    /// Compiled bytecode for VM evaluation.
+    pub bytecode: Arc<BytecodeProgram<B>>,
+    /// Columns referenced by this predicate (for UPDATE optimization).
     pub dependency_columns: Arc<[ColumnId]>,
     /// Precomputed indexable atoms for this predicate.
     pub index_atoms: Arc<[IndexableAtom]>,
@@ -31,10 +35,50 @@ pub struct Predicate {
     pub prefilter_plan: Arc<PrefilterPlan>,
     /// Projection kind: row events or aggregate deltas.
     pub projection: QueryProjection,
-    /// Reference count (number of subscriptions using this predicate)
+    /// Reference count (number of subscriptions using this predicate).
     pub refcount: u32,
-    /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch)
+    /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch).
     pub updated_at_unix_ms: u64,
+}
+
+// `Clone` and `Debug` are hand-implemented so their bounds fall on the
+// `Arc<BytecodeProgram<B>>` field (which is always `Clone + Debug`
+// regardless of `B`) rather than on `B` itself. `#[derive(...)]` would
+// defensively add `B: Clone` / `B: Debug`, which is not implied by
+// `Backend`.
+
+impl<B: Backend> Clone for Predicate<B> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            hash: self.hash,
+            normalized_sql: Arc::clone(&self.normalized_sql),
+            bytecode: Arc::clone(&self.bytecode),
+            dependency_columns: Arc::clone(&self.dependency_columns),
+            index_atoms: Arc::clone(&self.index_atoms),
+            prefilter_plan: Arc::clone(&self.prefilter_plan),
+            projection: self.projection.clone(),
+            refcount: self.refcount,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+        }
+    }
+}
+
+impl<B: Backend> core::fmt::Debug for Predicate<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Predicate")
+            .field("id", &self.id)
+            .field("hash", &self.hash)
+            .field("normalized_sql", &self.normalized_sql)
+            .field("bytecode", &self.bytecode)
+            .field("dependency_columns", &self.dependency_columns)
+            .field("index_atoms", &self.index_atoms)
+            .field("prefilter_plan", &self.prefilter_plan)
+            .field("projection", &self.projection)
+            .field("refcount", &self.refcount)
+            .field("updated_at_unix_ms", &self.updated_at_unix_ms)
+            .finish()
+    }
 }
 
 /// Subscription binding (consumer -> predicate -> subscription)
@@ -62,32 +106,34 @@ impl<I: IdTypes> Clone for SubscriptionBinding<I> {
 
 impl<I: IdTypes> Copy for SubscriptionBinding<I> {}
 
-/// Predicate storage with deduplication
+/// Predicate storage with deduplication.
 ///
 /// Manages predicates with slab allocation and hash-based deduplication.
-/// Tracks refcounts and automatically removes predicates when refcount reaches 0.
-pub struct PredicateStore<I: IdTypes> {
-    /// Slab-allocated predicates (stable IDs)
-    pub predicates: Slab<Predicate>,
-    /// Hash -> candidate PredicateIds (for deduplication with collision checks)
+/// Tracks refcounts and automatically removes predicates when refcount
+/// reaches 0.
+pub struct PredicateStore<I: IdTypes, B: Backend> {
+    /// Slab-allocated predicates (stable IDs).
+    pub predicates: Slab<Predicate<B>>,
+    /// Hash -> candidate PredicateIds (for deduplication with collision checks).
     pub hash_index: HashMap<PredicateHash, Vec<PredicateId>>,
-    /// SubscriptionId -> SubscriptionBinding
+    /// SubscriptionId -> SubscriptionBinding.
     pub bindings: HashMap<SubscriptionId, SubscriptionBinding<I>>,
-    /// SessionId -> `Vec<SubscriptionId>` (for session cleanup)
+    /// SessionId -> `Vec<SubscriptionId>` (for session cleanup).
     pub scope_index: HashMap<I::SessionId, Vec<SubscriptionId>>,
-    /// PredicateId -> `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate)
+    /// PredicateId -> `RoaringBitmap<ConsumerOrdinal>` (consumers interested in this predicate).
     pub predicate_consumers: HashMap<PredicateId, RoaringBitmap>,
     /// (PredicateId, ConsumerOrdinal) -> SubscriptionIds bound to that pair.
     ///
     /// A single (predicate, consumer) pair may carry multiple subscription
     /// ids when the same consumer subscribes under different scopes (e.g.
-    /// one durable and one session-scoped). Used by activity-aware eviction
-    /// policies to stamp the matched subscriptions after dispatch in O(1)
-    /// per matched pair instead of an O(B) scan over `bindings`.
+    /// one durable and one session-scoped). Used by activity-aware
+    /// eviction policies to stamp the matched subscriptions after
+    /// dispatch in O(1) per matched pair instead of an O(B) scan over
+    /// `bindings`.
     pub binding_lookup: HashMap<(PredicateId, ConsumerOrdinal), Vec<SubscriptionId>>,
 }
 
-impl<I: IdTypes> Clone for PredicateStore<I> {
+impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
     fn clone(&self) -> Self {
         Self {
             predicates: self.predicates.clone(),
@@ -100,7 +146,7 @@ impl<I: IdTypes> Clone for PredicateStore<I> {
     }
 }
 
-impl<I: IdTypes> PredicateStore<I> {
+impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
     /// Create new empty predicate store
     #[must_use]
     pub fn new() -> Self {
@@ -138,20 +184,20 @@ impl<I: IdTypes> PredicateStore<I> {
 
     /// Get predicate by ID
     #[must_use]
-    pub fn get_predicate(&self, id: PredicateId) -> Option<&Predicate> {
+    pub fn get_predicate(&self, id: PredicateId) -> Option<&Predicate<B>> {
         self.predicates.get(id.to_slab_index())
     }
 
     /// Get mutable predicate by ID
     #[must_use]
-    pub fn get_predicate_mut(&mut self, id: PredicateId) -> Option<&mut Predicate> {
+    pub fn get_predicate_mut(&mut self, id: PredicateId) -> Option<&mut Predicate<B>> {
         self.predicates.get_mut(id.to_slab_index())
     }
 
     /// Add new predicate
     ///
     /// Returns allocated `PredicateId` from slab insertion.
-    pub fn add_predicate(&mut self, mut predicate: Predicate) -> PredicateId {
+    pub fn add_predicate(&mut self, mut predicate: Predicate<B>) -> PredicateId {
         let entry = self.predicates.vacant_entry();
         let id = PredicateId::from_slab_index(entry.key());
         let hash = predicate.hash;
@@ -310,7 +356,7 @@ impl<I: IdTypes> PredicateStore<I> {
     }
 }
 
-impl<I: IdTypes> Default for PredicateStore<I> {
+impl<I: IdTypes, B: Backend> Default for PredicateStore<I, B> {
     fn default() -> Self {
         Self::new()
     }
@@ -320,10 +366,11 @@ impl<I: IdTypes> Default for PredicateStore<I> {
 #[allow(clippy::unwrap_used, clippy::clone_on_copy)]
 mod tests {
     use super::*;
+    use crate::backend::Postgres;
     use crate::compiler::{Instruction, PrefilterPlan};
     use crate::DefaultIds;
 
-    fn make_predicate(id: usize, hash: u128, refcount: u32) -> Predicate {
+    fn make_predicate(id: usize, hash: u128, refcount: u32) -> Predicate<Postgres> {
         Predicate {
             id: PredicateId::from_slab_index(id),
             hash,
@@ -340,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_add_and_find_predicate() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0x1234, 1);
         let id = store.add_predicate(pred);
@@ -351,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_refcount_increment() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0x1234, 1);
         let id = store.add_predicate(pred);
@@ -364,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_refcount_decrement() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0x1234, 2);
         let id = store.add_predicate(pred);
@@ -380,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_binding_lifecycle() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let binding = SubscriptionBinding {
             subscription_id: 100,
@@ -403,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_predicate_consumers_bitmap() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred_id = PredicateId::from_slab_index(0);
 
@@ -436,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_add_binding_overwrite_cleans_secondary_indexes() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred1 = make_predicate(0, 0x1111, 0);
         let pred2 = make_predicate(1, 0x2222, 0);
@@ -474,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_remove_binding_keeps_bitmap_when_same_consumer_has_another_binding() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0x3333, 0);
         let pred_id = store.add_predicate(pred);
@@ -512,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_increment_refcount_nonexistent() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         // Try to increment refcount of non-existent predicate
         let fake_id = PredicateId::from_slab_index(999);
@@ -522,7 +569,7 @@ mod tests {
 
     #[test]
     fn test_decrement_refcount_nonexistent() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         // Try to decrement refcount of non-existent predicate
         let fake_id = PredicateId::from_slab_index(999);
@@ -532,13 +579,13 @@ mod tests {
 
     #[test]
     fn test_predicate_store_default() {
-        let store = PredicateStore::<DefaultIds>::default();
+        let store = PredicateStore::<DefaultIds, Postgres>::default();
         assert!(store.predicates.is_empty());
     }
 
     #[test]
     fn test_predicate_store_rejects_or_normalizes_mismatched_predicate_id() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         // Intentionally provide an ID that does not match the first free slab slot.
         let pred = make_predicate(99, 0xBEEF, 1);
@@ -560,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_hash_collision_lookup_uses_normalized_sql() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let mut pred1 = make_predicate(0, 0x00C0_FFEE, 1);
         pred1.normalized_sql = "amount > 100".into();
@@ -587,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_is_consumer_referenced() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0xAABB, 1);
         let pred_id = store.add_predicate(pred);
@@ -613,7 +660,7 @@ mod tests {
     /// after dispatch matches a predicate.
     #[test]
     fn test_binding_lookup_resolves_subscription_id() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
         let pred = make_predicate(0, 0xBEEF, 1);
         let pred_id = store.add_predicate(pred);
         let ord = ConsumerOrdinal::new(7);
@@ -644,7 +691,7 @@ mod tests {
     /// surface from `binding_lookup`.
     #[test]
     fn test_binding_lookup_handles_multiple_scopes_per_pair() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
         let pred = make_predicate(0, 0xCAFE, 1);
         let pred_id = store.add_predicate(pred);
         let ord = ConsumerOrdinal::new(0);
@@ -684,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_active_consumer_ids() {
-        let mut store = PredicateStore::<DefaultIds>::new();
+        let mut store = PredicateStore::<DefaultIds, Postgres>::new();
 
         let pred = make_predicate(0, 0xCCDD, 1);
         let pred_id = store.add_predicate(pred);

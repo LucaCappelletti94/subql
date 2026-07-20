@@ -39,6 +39,8 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::Postgres;
+use subql::testing::TestEvent;
 use subql::{
     DefaultIds, EvictionPolicy, RegisterError, RegisterResult, SubscriptionEngine,
     SubscriptionRequest, SubscriptionScope, SubscriptionsView,
@@ -46,7 +48,7 @@ use subql::{
 
 const CATALOG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
 
-type Engine = SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
+type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn fresh(cap: Option<usize>, policy: Option<EvictionPolicy>) -> Engine {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap();
@@ -74,7 +76,7 @@ fn spec_sql(consumer_id: u64, tag: u32) -> String {
     )
 }
 
-fn build_spec(consumer_id: u64, tag: u32) -> SubscriptionRequest<DefaultIds> {
+fn build_spec(consumer_id: u64, tag: u32) -> SubscriptionRequest<DefaultIds, Postgres> {
     SubscriptionRequest::new(consumer_id, spec_sql(consumer_id, tag))
 }
 
@@ -82,7 +84,7 @@ fn arb_spec_pairs() -> impl Strategy<Value = Vec<(u64, u32)>> {
     vec((0u64..6, 0u32..32), 0..16)
 }
 
-fn materialise(pairs: &[(u64, u32)]) -> Vec<SubscriptionRequest<DefaultIds>> {
+fn materialise(pairs: &[(u64, u32)]) -> Vec<SubscriptionRequest<DefaultIds, Postgres>> {
     pairs.iter().map(|(c, t)| build_spec(*c, *t)).collect()
 }
 
@@ -101,7 +103,9 @@ fn arb_scoped_spec_triples() -> impl Strategy<Value = Vec<(u64, u32, ScopeChoice
     )
 }
 
-fn materialise_scoped(triples: &[(u64, u32, ScopeChoice)]) -> Vec<SubscriptionRequest<DefaultIds>> {
+fn materialise_scoped(
+    triples: &[(u64, u32, ScopeChoice)],
+) -> Vec<SubscriptionRequest<DefaultIds, Postgres>> {
     triples
         .iter()
         .map(|(c, t, scope)| {
@@ -223,7 +227,7 @@ fn assert_engine_state_match(
 
 fn run_sequential(
     engine: &mut Engine,
-    specs: Vec<SubscriptionRequest<DefaultIds>>,
+    specs: Vec<SubscriptionRequest<DefaultIds, Postgres>>,
 ) -> Vec<Result<RegisterResult, RegisterError>> {
     specs.into_iter().map(|s| engine.register(s)).collect()
 }

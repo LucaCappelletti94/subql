@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fa_solid_icons::FaTable, Icon};
 
-use subql::Cell;
+use subql::backend::{Postgres, Value};
 
 use super::{SharedState, TickSignal};
 
@@ -66,13 +66,13 @@ pub fn SchemaView() -> Element {
     }
 }
 
-fn cell_display(cell: &Cell) -> String {
+fn cell_display(cell: &Value<Postgres>) -> String {
     match cell {
-        Cell::Null | Cell::Missing => "NULL".into(),
-        Cell::Bool(b) => b.to_string(),
-        Cell::Int(i) => i.to_string(),
-        Cell::Float(f) => format!("{f:.3}"),
-        Cell::String(s) => format!("'{s}'"),
+        Value::Null | Value::Missing => "NULL".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => format!("{f:.3}"),
+        Value::String(s) => format!("'{s}'"),
         _ => "?".into(),
     }
 }

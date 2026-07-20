@@ -4,10 +4,13 @@
 #![allow(clippy::unwrap_used, clippy::unreadable_literal)]
 #![allow(clippy::print_stdout, clippy::unnecessary_cast)]
 
-use crate::{Cell, DefaultIds, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent};
-use alloc::sync::Arc;
+use alloc::vec::Vec;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+
+use crate::backend::{Postgres, Value};
+use crate::testing::TestEvent;
+use crate::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 const STATUS_BUCKETS: [&str; 7] = [
     "pending",
@@ -149,7 +152,7 @@ const fn realistic_workload_seed(subscription_ix: u64) -> u64 {
 
 /// Build the bench fixture catalog as a [`ParserDB`]. A placeholder table
 /// before `orders` keeps the orders table id stable at 1 (matching the
-/// hardcoded `WalEvent::builder(1)` in `make_test_event`).
+/// hardcoded `TestEvent::<Postgres>::insert(1, ...)` in `make_test_event`).
 fn bench_catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE _bench_pad (id INT);\n\
@@ -162,41 +165,38 @@ fn bench_catalog() -> ParserDB {
     .expect("bench fixture DDL parses")
 }
 
-fn make_test_event(seed: u64) -> WalEvent {
+fn make_test_event(seed: u64) -> TestEvent<Postgres> {
     let id = 1 + bounded_i64(seed ^ 0x1A2A, 500_000);
     let user_id = bounded_i64(seed ^ 0x2B3B, 20_000);
     let amount = 30 + bounded_i64(seed ^ 0x3C4C, 3_500);
     let priority = 1 + bounded_i64(seed ^ 0x4D5D, 9);
     let quantity = 1 + bounded_i64(seed ^ 0x5E6E, 40);
     let discount = if mix_seed(seed ^ 0x6F7F).is_multiple_of(5) {
-        Cell::Null
+        Value::<Postgres>::Null
     } else {
-        Cell::Int(bounded_i64(seed ^ 0x7A8A, 18))
+        Value::<Postgres>::Int(bounded_i64(seed ^ 0x7A8A, 18))
     };
     let tax = 2 + bounded_i64(seed ^ 0x8B9B, 40);
     let shipping = 4 + bounded_i64(seed ^ 0x9CAC, 30);
     let created_at = 1_699_500_000 + bounded_i64(seed ^ 0xADBD, 240 * 24 * 3600);
     let status = status_for(seed ^ 0xBECF);
 
-    WalEvent::builder(1)
-        .insert()
-        .pk_cell(0, Cell::Int(id))
-        .new_row(RowImage {
-            cells: Arc::from([
-                Cell::Int(id),
-                Cell::Int(user_id),
-                Cell::Int(amount),
-                Cell::String(status.into()),
-                Cell::Int(priority),
-                Cell::Int(quantity),
-                discount,
-                Cell::Int(tax),
-                Cell::Int(shipping),
-                Cell::Int(created_at),
-            ]),
-        })
-        .build()
-        .expect("insert event builder should be valid")
+    TestEvent::<Postgres>::insert(
+        1,
+        vec![
+            Value::Int(id),
+            Value::Int(user_id),
+            Value::Int(amount),
+            Value::String(status.into()),
+            Value::Int(priority),
+            Value::Int(quantity),
+            discount,
+            Value::Int(tax),
+            Value::Int(shipping),
+            Value::Int(created_at),
+        ],
+    )
+    .with_pk_columns([0u16])
 }
 
 pub fn run_memory_profile(show_progress: bool) {
@@ -204,8 +204,10 @@ pub fn run_memory_profile(show_progress: bool) {
     println!("======================");
     println!();
 
-    let mut engine =
-        SubscriptionEngine::<_, DefaultIds, ParserDB>::new(bench_catalog(), PostgreSqlDialect {});
+    let mut engine = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+        bench_catalog(),
+        PostgreSqlDialect {},
+    );
 
     println!("Registering 100,000 predicates with realistic tree shapes...");
     if !show_progress {
@@ -225,7 +227,7 @@ pub fn run_memory_profile(show_progress: bool) {
     println!();
     println!("Dispatching 1,000 events from a rotating event corpus...");
 
-    let event_corpus: Vec<WalEvent> = (0_u64..32)
+    let event_corpus: Vec<TestEvent<Postgres>> = (0_u64..32)
         .map(|seed| make_test_event(seed ^ 0x1234_5678_9ABC_DEF0))
         .collect();
     let event_corpus_len_u64 = u64::try_from(event_corpus.len()).unwrap_or(1);
@@ -279,21 +281,9 @@ mod tests {
     fn make_test_event_is_deterministic_for_seed() {
         let event_a = make_test_event(1234);
         let event_b = make_test_event(1234);
-        assert_eq!(event_a.kind(), EventKind::Insert);
-        assert_eq!(event_a.table_id(), 1);
-        assert_eq!(event_a.pk().columns.as_ref(), event_b.pk().columns.as_ref());
-        assert_eq!(event_a.pk().values.as_ref(), event_b.pk().values.as_ref());
-        assert_eq!(
-            event_a
-                .new_row()
-                .as_ref()
-                .expect("event should have new row")
-                .cells,
-            event_b
-                .new_row()
-                .as_ref()
-                .expect("event should have new row")
-                .cells
-        );
+        assert_eq!(event_a.kind, EventKind::Insert);
+        assert_eq!(event_a.table_id, 1);
+        assert_eq!(event_a.pk_columns, event_b.pk_columns);
+        assert_eq!(event_a.new_row, event_b.new_row);
     }
 }

@@ -9,6 +9,8 @@ extern crate alloc;
 // Re-export public API
 pub use compiler::{AggSpec, QueryProjection};
 pub use errors::*;
+#[cfg(feature = "pg-sqlite-emu")]
+pub use pg_sqlite_emu::{PgSqliteEmuError, PgSqliteEmuSource};
 #[cfg(feature = "pg-streaming")]
 pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
 pub use runtime::{
@@ -16,13 +18,14 @@ pub use runtime::{
     SumKernel,
 };
 #[cfg(feature = "sqlite-cdc")]
-pub use sqlite_cdc::{PgOutputBridge, SqliteCdcConfig, SqliteCdcError, SqliteCdcSource};
+pub use sqlite_cdc::{SqliteCdcError, SqliteCdcSource};
+pub use sqlite_cdc::{SqliteChangesetEvent, SqliteChangesetParser};
 pub use types::*;
 #[cfg(feature = "std")]
 pub use wal::CdcSource;
 pub use wal::{
-    DebeziumParser, MaxwellParser, PgOutputParser, Wal2JsonV1Parser, Wal2JsonV2Parser,
-    WalParseError, WalParser,
+    parse_maxwell, parse_wal2json_v1, parse_wal2json_v2, ChangeEvent, ChangeV1, MaxwellMessage,
+    MessageV2, WalParseError, WalParser,
 };
 #[cfg(feature = "pg-streaming")]
 pub use wal::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
@@ -34,7 +37,7 @@ pub use checkpoint::{Checkpoint, MysqlBinlogPos, NoCheckpoint, OpaqueCheckpoint,
 #[cfg(feature = "std")]
 pub use clock::StdClock;
 pub use clock::{Clock, ClockHandle, ManualClock};
-pub use row_set::{row_set_delta, RowSetDelta};
+pub use row_set::{row_set_delta, Row, RowSetDelta};
 pub use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{AlgorithmId, FingerprintError, ParserDB, SchemaFingerprint},
@@ -45,28 +48,47 @@ mod errors;
 mod table_resolution;
 mod types;
 
+pub mod backend;
 pub mod catalog_helpers;
 pub mod checkpoint;
 pub mod clock;
 pub mod compiler;
 #[cfg(feature = "std")]
 pub mod config;
-#[cfg(feature = "diesel-typed")]
-pub mod diesel_api;
+pub mod emit;
+pub mod testing;
+// Memory profiling harness driven by the `dhat-heap` feature. Not part of
+// the shipping API surface.
 #[cfg(feature = "dhat-heap")]
 pub mod memory_profile_workload;
+#[cfg(any(
+    feature = "apply-patchset-postgres",
+    feature = "apply-patchset-mysql",
+    feature = "apply-patchset-sqlite"
+))]
+pub mod patchset;
 #[cfg(feature = "std")]
 pub mod persistence;
+#[cfg(feature = "pg-sqlite-emu")]
+pub mod pg_sqlite_emu;
 #[cfg(feature = "pg-streaming")]
 pub mod polling;
 pub mod reexec;
 pub mod row_set;
 pub mod runtime;
-#[cfg(feature = "sqlite-cdc")]
 pub mod sqlite_cdc;
 pub mod wal;
 
-#[cfg(any(feature = "testing", test))]
+// Diesel-typed subscription and follow API. Only compiles when the
+// `diesel-typed` family of features pulls in `diesel` with the third-party
+// backend hooks its `BindDecode` impls need.
+#[cfg(feature = "diesel-typed")]
+pub mod diesel_api;
+
+// Shared fuzz harness functions. Feature-gated behind `testing`
+// (not part of the production build; enabled by the `subql-fuzz`
+// workspace and by `cargo test --features testing`).
+#[cfg(feature = "testing")]
 pub mod test_harnesses;
 
 // Version and metadata

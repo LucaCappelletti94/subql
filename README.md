@@ -14,19 +14,19 @@ SQL subscription dispatch engine for Change Data Capture fanout.
 ## Quick Start
 
 ```rust
-use std::sync::Arc;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{Postgres, Value};
+use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, Cell, DefaultIds, EventKind, PrimaryKey, RowImage,
-    SubscriptionEngine, SubscriptionRequest, WalEvent,
+    catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest,
 };
 
 let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
 )?;
 let orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
-let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 engine.register(
@@ -34,13 +34,11 @@ engine.register(
         .updated_at_unix_ms(1_704_067_200_000),
 )?;
 
-let event = WalEvent::builder(orders_id)
-    .insert()
-    .pk_cell(0, Cell::Int(1))
-    .new_row(RowImage {
-        cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("paid".into())]),
-    })
-    .build()?;
+let event = TestEvent::<Postgres>::insert(
+    orders_id,
+    vec![Value::Int(1), Value::Int(250), Value::String("paid".into())],
+)
+.with_pk_columns([0u16]);
 
 let notifs = engine.consumers(&event)?;
 assert_eq!(notifs.inserted(), vec![42]);
@@ -55,19 +53,19 @@ Alongside row-match subscriptions, register a `SELECT COUNT(*)`, `COUNT(col)`, `
 Aggregate subscribers never appear in `consumers()` output, and vice versa. `UPDATE` deltas need both old and new row images. If a source omits old images (`before` / `old`), `aggregate_deltas()` returns an error for update events.
 
 ```rust
-use std::sync::Arc;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{Postgres, Value};
+use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds,
-    PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
+    catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest,
 };
 
 let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
 )?;
 let orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
-let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 // Live count of active orders for consumer 42.
@@ -80,13 +78,11 @@ engine.register(SubscriptionRequest::new(
     42, "SELECT SUM(amount) FROM orders WHERE status = 'active'",
 ))?;
 
-let event = WalEvent::builder(orders_id)
-    .insert()
-    .pk_cell(0, Cell::Int(1))
-    .new_row(RowImage {
-        cells: Arc::from([Cell::Int(1), Cell::Int(250), Cell::String("active".into())]),
-    })
-    .build()?;
+let event = TestEvent::<Postgres>::insert(
+    orders_id,
+    vec![Value::Int(1), Value::Int(250), Value::String("active".into())],
+)
+.with_pk_columns([0u16]);
 
 let mut deltas: Vec<(u64, AggDelta)> = engine.aggregate_deltas(&event)?;
 // Sort for deterministic comparison (Count before Sum).
@@ -117,32 +113,30 @@ assert_eq!(deltas, vec![
 For `AVG`, the caller accumulates `running_sum` and `running_count` separately, then computes the average as `running_sum / running_count` on demand:
 
 ```rust
-use std::sync::Arc;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{Postgres, Value};
+use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggDelta, AggregateDispatch, Cell, ColumnType, DefaultIds,
-    PrimaryKey, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
+    catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest,
 };
 
 let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE scores (id INT PRIMARY KEY, value INT);",
 )?;
 let scores_id = catalog_helpers::table_id(&catalog, "scores").unwrap();
-let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 engine.register(SubscriptionRequest::new(
     7, "SELECT AVG(value) FROM scores WHERE id > 0",
 ))?;
 
-let event = WalEvent::builder(scores_id)
-    .insert()
-    .pk_cell(0, Cell::Int(1))
-    .new_row(RowImage {
-        cells: Arc::from([Cell::Int(1), Cell::Int(100)]),
-    })
-    .build()?;
+let event = TestEvent::<Postgres>::insert(
+    scores_id,
+    vec![Value::Int(1), Value::Int(100)],
+)
+.with_pk_columns([0u16]);
 
 let deltas = engine.aggregate_deltas(&event)?;
 let (_, delta) = &deltas[0];
@@ -168,12 +162,14 @@ Column types come from the SQL DDL parsed into `ParserDB`. When a column's type 
 ```rust
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::Postgres;
+use subql::testing::TestEvent;
 use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE products (price REAL, name TEXT, id INT PRIMARY KEY);",
 )?;
-let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
+let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
 // Accepted, price is Float:

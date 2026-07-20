@@ -1,12 +1,12 @@
 use rand::rngs::SmallRng;
 
-use subql::Cell;
+use subql::backend::{Postgres, Value};
 
 pub mod orders;
 pub mod readings;
 pub mod users;
 
-pub type Row = Vec<Cell>;
+pub type Row = Vec<Value<Postgres>>;
 
 pub struct PresetSchema {
     pub name: &'static str,

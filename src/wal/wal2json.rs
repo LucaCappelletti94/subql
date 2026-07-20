@@ -1,1624 +1,459 @@
-//! wal2json v1 and v2 WAL parsers.
+//! [`CdcEvent`] for the `sqlite-diff-rs` wal2json message types.
 //!
-//! [wal2json](https://github.com/eulerto/wal2json) is a PostgreSQL logical
-//! decoding output plugin that emits changes as JSON. Version 1 batches all
-//! changes in a transaction into a single message. Version 2 emits one
-//! message per change.
+//! subql parses wal2json JSON with `sqlite_diff_rs::wal2json::{parse_v2,
+//! parse_v1}` and views the resulting [`MessageV2`] and [`ChangeV1`] as
+//! [`CdcEvent`]s, resolving table and column names to catalog ordinals and
+//! decoding each cell against the catalog on demand. This replaces the former
+//! bespoke `Wal2JsonV{1,2}Parser` and `Wal2JsonV{1,2}Event`.
+//!
+//! v2 carries the stream LSN (with `include-lsn=true`) and surfaces it as a
+//! [`PgLsn`](crate::PgLsn) checkpoint. v1 batches a transaction and has no
+//! per-change LSN, so it uses [`NoCheckpoint`](crate::NoCheckpoint).
 
-use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use serde::Deserialize;
-
-use super::map_cdc::parse_event_kind;
-use super::pg_type::json_value_to_cell_strict;
-use super::row_build::{
-    build_pk_from_typed_arrays_with, build_row_from_named_typed_values_with,
-    build_row_from_typed_arrays_with,
-};
-use super::{
-    build_event_from_rows, build_pk_from_resolved, pk_from_catalog_or_empty, resolve_table,
-    strict_pk_column_ids_from_names, truncate_event, WalParseError, WalParser,
-};
-use crate::{Cell, ColumnId, EventKind, PrimaryKey, RowImage, TableId, WalEvent};
 use sql_traits::prelude::DatabaseLike;
+use sqlite_diff_rs::wal2json::{Action, ChangeV1, Column, MessageV2};
 
-// ============================================================================
-// Serde structs: v1
-// ============================================================================
+use super::pg_type::json_value_to_pg_value_by_kind;
+use super::{resolve_table, WalParseError};
+use crate::backend::{CdcEvent, Postgres, RowKind, Value};
+use crate::catalog_helpers;
+use crate::types::{ColumnId, EventKind, TableId};
 
-#[derive(Deserialize)]
-struct Wal2JsonV1Message {
-    #[allow(dead_code)]
-    pub xid: Option<u64>,
-    pub change: Vec<Wal2JsonV1Change>,
-}
+// ---------------------------------------------------------------------------
+// Parse helpers
+// ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct Wal2JsonV1Change {
-    pub kind: String,
-    pub schema: String,
-    pub table: String,
-    #[serde(default)]
-    pub columnnames: Vec<String>,
-    #[serde(default)]
-    pub columntypes: Vec<String>,
-    #[serde(default)]
-    pub columnvalues: Vec<serde_json::Value>,
-    pub oldkeys: Option<Wal2JsonV1OldKeys>,
-}
-
-#[derive(Deserialize)]
-struct Wal2JsonV1OldKeys {
-    pub keynames: Vec<String>,
-    pub keytypes: Vec<String>,
-    pub keyvalues: Vec<serde_json::Value>,
-}
-
-// ============================================================================
-// Serde structs: v2
-// ============================================================================
-
-#[derive(Deserialize)]
-struct Wal2JsonV2Message {
-    pub action: String,
-    /// Schema name (absent on transaction boundary messages: B, C, M).
-    #[serde(default)]
-    pub schema: Option<String>,
-    /// Table name (absent on transaction boundary messages: B, C, M).
-    #[serde(default)]
-    pub table: Option<String>,
-    #[serde(default)]
-    pub columns: Option<Vec<Wal2JsonV2Column>>,
-    #[serde(default)]
-    pub identity: Option<Vec<Wal2JsonV2Column>>,
-    #[serde(default)]
-    pub pk: Option<Vec<Wal2JsonV2PkColumn>>,
-    /// PostgreSQL LSN in `"hi/lo"` hex notation when wal2json was invoked
-    /// with `include-lsn=true`. Absent otherwise. `convert_v2_message`
-    /// surfaces `Some(PgLsn)` when present and parsable.
-    #[serde(default)]
-    pub lsn: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Wal2JsonV2Column {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub type_name: String,
-    pub value: serde_json::Value,
-}
-
-/// v2 PK column entry: `{"name": "col_name", "type": "col_type"}`
-#[derive(Deserialize)]
-struct Wal2JsonV2PkColumn {
-    pub name: String,
-    #[allow(dead_code)]
-    #[serde(rename = "type")]
-    pub type_name: String,
-}
-
-// ============================================================================
-// Parsers
-// ============================================================================
-
-/// wal2json **v1** parser (batched: one message per transaction).
-pub struct Wal2JsonV1Parser;
-
-/// wal2json **v2** parser (per-change: one message per row change).
-pub struct Wal2JsonV2Parser;
-
-impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV1Parser {
-    type Checkpoint = crate::NoCheckpoint;
-
-    fn parse_wal_message(
-        &self,
-        data: &[u8],
-        database: &DB,
-    ) -> Result<Vec<WalEvent>, WalParseError> {
-        let msg: Option<Wal2JsonV1Message> = super::parse_json_message_or_tombstone(data)?;
-        let Some(msg) = msg else {
-            // wal2json topics may emit tombstone messages ("null") for compaction.
-            return Ok(Vec::new());
-        };
-
-        let mut events = Vec::with_capacity(msg.change.len());
-        for change in &msg.change {
-            if let Some(event) = super::skip_unknown_event_kind(
-                convert_v1_change(change, database),
-                "wal2json v1",
-                "kind",
-            )? {
-                events.push(event);
-            }
-        }
-        Ok(events)
+const fn v2_row_kind(action: Action) -> Option<EventKind> {
+    match action {
+        Action::I => Some(EventKind::Insert),
+        Action::U => Some(EventKind::Update),
+        Action::D => Some(EventKind::Delete),
+        Action::T => Some(EventKind::Truncate),
+        // Begin, Commit, and Message are transaction boundaries, not rows.
+        Action::B | Action::C | Action::M => None,
     }
 }
 
-impl<DB: DatabaseLike> WalParser<DB> for Wal2JsonV2Parser {
+fn v1_row_kind(kind: &str) -> Option<EventKind> {
+    match kind {
+        "insert" => Some(EventKind::Insert),
+        "update" => Some(EventKind::Update),
+        "delete" => Some(EventKind::Delete),
+        "truncate" => Some(EventKind::Truncate),
+        _ => None,
+    }
+}
+
+/// Parse one wal2json v2 line into the row events subql dispatches.
+///
+/// Returns an empty vector for a transaction boundary (`B`, `C`, `M`) and a
+/// single [`MessageV2`] for a row action (`I`, `U`, `D`, `T`).
+///
+/// # Errors
+///
+/// [`WalParseError::InvalidUtf8`] for non-UTF-8 input and
+/// [`WalParseError::JsonError`] for malformed JSON.
+pub fn parse_wal2json_v2(bytes: &[u8]) -> Result<Vec<MessageV2>, WalParseError> {
+    let text =
+        core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
+    let msg = sqlite_diff_rs::wal2json::parse_v2(text)
+        .map_err(|e| WalParseError::JsonError(e.to_string()))?;
+    Ok(if v2_row_kind(msg.action).is_some() {
+        alloc::vec![msg]
+    } else {
+        Vec::new()
+    })
+}
+
+/// Parse a wal2json v1 transaction into one [`ChangeV1`] per row change.
+///
+/// Non-row changes are dropped.
+///
+/// # Errors
+///
+/// [`WalParseError::InvalidUtf8`] for non-UTF-8 input and
+/// [`WalParseError::JsonError`] for malformed JSON.
+pub fn parse_wal2json_v1(bytes: &[u8]) -> Result<Vec<ChangeV1>, WalParseError> {
+    let text =
+        core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
+    let txn = sqlite_diff_rs::wal2json::parse_v1(text)
+        .map_err(|e| WalParseError::JsonError(e.to_string()))?;
+    Ok(txn
+        .change
+        .into_iter()
+        .filter(|c| v1_row_kind(&c.kind).is_some())
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Shared decode helpers
+// ---------------------------------------------------------------------------
+
+/// Decode one wal2json JSON cell against the catalog's declared type.
+/// `None` (the wire did not carry the column) yields `Ok(Value::Missing)`,
+/// a JSON null yields `Ok(Value::Null)`, and a carried cell of a known
+/// kind that will not decode yields `Err`.
+fn decode_cell<DB: DatabaseLike>(
+    value: Option<&serde_json::Value>,
+    db: &DB,
+    table_id: TableId,
+    col: ColumnId,
+) -> Result<Value<Postgres>, crate::ValueError> {
+    match value {
+        None => Ok(Value::Missing),
+        Some(v) if v.is_null() => Ok(Value::Null),
+        Some(v) => catalog_helpers::column_scalar_kind(db, table_id, col).map_or(
+            Ok(Value::Missing),
+            |kind| match json_value_to_pg_value_by_kind(v, kind) {
+                Value::Missing => Err(crate::ValueError { column: col, kind }),
+                decoded => Ok(decoded),
+            },
+        ),
+    }
+}
+
+fn column_value<'a>(columns: &'a [Column], name: &str) -> Option<&'a serde_json::Value> {
+    columns.iter().find(|c| c.name == name).map(|c| &c.value)
+}
+
+// ---------------------------------------------------------------------------
+// wal2json v2
+// ---------------------------------------------------------------------------
+
+fn v2_image(msg: &MessageV2, row: RowKind) -> Option<&[Column]> {
+    match (msg.action, row) {
+        (Action::I, RowKind::New | RowKind::Pk) | (Action::U, RowKind::New) => {
+            msg.columns.as_deref()
+        }
+        (Action::D | Action::U, RowKind::Old | RowKind::Pk) => msg.identity.as_deref(),
+        _ => None,
+    }
+}
+
+fn v2_table_id<DB: DatabaseLike>(msg: &MessageV2, db: &DB) -> Option<TableId> {
+    let schema = msg.schema.as_deref().unwrap_or("");
+    let table = msg.table.as_deref()?;
+    resolve_table(schema, table, db).ok()
+}
+
+impl CdcEvent for MessageV2 {
+    type Backend = Postgres;
     type Checkpoint = crate::PgLsn;
 
-    fn parse_wal_message(
+    fn kind(&self) -> EventKind {
+        v2_row_kind(self.action).expect(
+            "CdcEvent::kind called on a non-row wal2json v2 message. Filter with parse_wal2json_v2 first",
+        )
+    }
+
+    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+        v2_table_id(self, db).unwrap_or(TableId::MAX)
+    }
+
+    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+        self.lsn.as_deref().and_then(crate::PgLsn::parse)
+    }
+
+    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        if self.action == Action::T {
+            return Vec::new();
+        }
+        v2_table_id(self, db)
+            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id))
+            .unwrap_or_default()
+    }
+
+    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        if self.action != Action::U {
+            return Vec::new();
+        }
+        let (Some(new_cols), Some(old_cols)) = (self.columns.as_deref(), self.identity.as_deref())
+        else {
+            return Vec::new();
+        };
+        let Some(table_id) = v2_table_id(self, db) else {
+            return Vec::new();
+        };
+        let Some(arity) = catalog_helpers::table_arity(db, table_id) else {
+            return Vec::new();
+        };
+        // Derive only when both images cover every column (REPLICA IDENTITY
+        // FULL). A sparser identity leaves the result empty.
+        if new_cols.len() != arity || old_cols.len() != arity {
+            return Vec::new();
+        }
+        changed_by_name(db, table_id, arity, |name| {
+            (column_value(new_cols, name), column_value(old_cols, name))
+        })
+    }
+
+    fn value_at<DB: DatabaseLike>(
         &self,
-        data: &[u8],
-        database: &DB,
-    ) -> Result<Vec<WalEvent<Self::Checkpoint>>, WalParseError> {
-        super::parse_single_json_event::<Wal2JsonV2Message, _, crate::PgLsn>(data, |msg| {
-            // Skip non-row transactional metadata messages.
-            if matches!(msg.action.as_str(), "B" | "C" | "M") {
-                return Ok(None);
-            }
-            super::skip_unknown_event_kind(
-                convert_v2_message(msg, database),
-                "wal2json v2",
-                "action",
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
+        let Some(table_id) = v2_table_id(self, db) else {
+            return Ok(Value::Missing);
+        };
+        if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
+            return Ok(Value::Missing);
+        }
+        let Some(columns) = v2_image(self, row) else {
+            return Ok(Value::Missing);
+        };
+        let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
+            return Ok(Value::Missing);
+        };
+        decode_cell(column_value(columns, &name), db, table_id, col)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wal2json v1
+// ---------------------------------------------------------------------------
+
+/// The `(names, values)` parallel arrays `row` selects for `change`, or
+/// `None` when the change does not carry that image.
+fn v1_image(
+    change: &ChangeV1,
+    row: RowKind,
+) -> Option<(&[alloc::string::String], &[serde_json::Value])> {
+    let kind = v1_row_kind(&change.kind)?;
+    match (kind, row) {
+        (EventKind::Insert, RowKind::New | RowKind::Pk) | (EventKind::Update, RowKind::New) => {
+            Some((&change.columnnames, &change.columnvalues))
+        }
+        (EventKind::Delete | EventKind::Update, RowKind::Old | RowKind::Pk) => change
+            .oldkeys
+            .as_ref()
+            .map(|ok| (ok.keynames.as_slice(), ok.keyvalues.as_slice())),
+        _ => None,
+    }
+}
+
+fn v1_value<'a>(
+    names: &[alloc::string::String],
+    values: &'a [serde_json::Value],
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    names
+        .iter()
+        .position(|n| n == name)
+        .and_then(|i| values.get(i))
+}
+
+impl CdcEvent for ChangeV1 {
+    type Backend = Postgres;
+    type Checkpoint = crate::NoCheckpoint;
+
+    fn kind(&self) -> EventKind {
+        v1_row_kind(&self.kind).expect(
+            "CdcEvent::kind called on a non-row wal2json v1 change. Filter with parse_wal2json_v1 first",
+        )
+    }
+
+    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+        resolve_table(&self.schema, &self.table, db).unwrap_or(TableId::MAX)
+    }
+
+    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+        None
+    }
+
+    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        if v1_row_kind(&self.kind) == Some(EventKind::Truncate) {
+            return Vec::new();
+        }
+        resolve_table(&self.schema, &self.table, db)
+            .ok()
+            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id))
+            .unwrap_or_default()
+    }
+
+    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        if v1_row_kind(&self.kind) != Some(EventKind::Update) {
+            return Vec::new();
+        }
+        let Some(oldkeys) = self.oldkeys.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(table_id) = resolve_table(&self.schema, &self.table, db) else {
+            return Vec::new();
+        };
+        let Some(arity) = catalog_helpers::table_arity(db, table_id) else {
+            return Vec::new();
+        };
+        if self.columnnames.len() != arity || oldkeys.keynames.len() != arity {
+            return Vec::new();
+        }
+        changed_by_name(db, table_id, arity, |name| {
+            (
+                v1_value(&self.columnnames, &self.columnvalues, name),
+                v1_value(&oldkeys.keynames, &oldkeys.keyvalues, name),
             )
         })
     }
-}
 
-// ============================================================================
-// Shared helpers
-// ============================================================================
-
-/// Parse event kind from v1 string.
-fn parse_v1_kind(kind: &str) -> Result<EventKind, WalParseError> {
-    parse_event_kind(kind, &["insert"], &["update"], &["delete"], &["truncate"])
-}
-
-/// Parse event kind from v2 single-char action.
-fn parse_v2_kind(action: &str) -> Result<EventKind, WalParseError> {
-    parse_event_kind(action, &["I"], &["U"], &["D"], &["T"])
-}
-
-/// Build a [`RowImage`] from parallel name/type/value arrays.
-///
-/// Returns `(row_image, Vec<(ColumnId, Cell)>)`. The vec is used for PK
-/// extraction.
-fn build_row_from_arrays<DB: DatabaseLike>(
-    names: &[String],
-    types: &[String],
-    values: &[serde_json::Value],
-    table_id: TableId,
-    database: &DB,
-) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    build_row_from_typed_arrays_with(
-        names,
-        types,
-        values,
-        table_id,
-        database,
-        "column",
-        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.column.{name}")),
-    )
-}
-
-/// Build a [`RowImage`] from v2 column structs.
-fn build_row_from_v2_columns<DB: DatabaseLike>(
-    columns: &[Wal2JsonV2Column],
-    table_id: TableId,
-    database: &DB,
-) -> Result<(RowImage, Vec<(ColumnId, Cell)>), WalParseError> {
-    let typed_columns: Vec<(&str, &str, &serde_json::Value)> = columns
-        .iter()
-        .map(|col| (col.name.as_str(), col.type_name.as_str(), &col.value))
-        .collect();
-    build_row_from_named_typed_values_with(
-        &typed_columns,
-        table_id,
-        database,
-        "v2 columns",
-        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.column.{name}")),
-    )
-}
-
-/// Build a [`PrimaryKey`] from the old-keys section (names resolved through database).
-fn build_pk_from_key_arrays<DB: DatabaseLike>(
-    names: &[String],
-    types: &[String],
-    values: &[serde_json::Value],
-    table_id: TableId,
-    database: &DB,
-) -> Result<PrimaryKey, WalParseError> {
-    build_pk_from_typed_arrays_with(
-        names,
-        types,
-        values,
-        table_id,
-        database,
-        "oldkeys",
-        |value, ty, name| json_value_to_cell_strict(value, ty, &format!("wal2json.oldkeys.{name}")),
-    )
-}
-
-// ============================================================================
-// v1 conversion
-// ============================================================================
-
-fn convert_v1_change<DB: DatabaseLike>(
-    change: &Wal2JsonV1Change,
-    database: &DB,
-) -> Result<WalEvent, WalParseError> {
-    let kind = parse_v1_kind(&change.kind)?;
-    let table_id = resolve_table(&change.schema, &change.table, database)?;
-
-    if kind == EventKind::Truncate {
-        return truncate_event(table_id, None);
-    }
-
-    if matches!(kind, EventKind::Insert | EventKind::Update)
-        && change.columnnames.is_empty()
-        && change.columntypes.is_empty()
-        && change.columnvalues.is_empty()
-    {
-        return Err(WalParseError::MissingField(
-            "columnnames/columntypes/columnvalues".to_string(),
-        ));
-    }
-
-    if kind == EventKind::Delete && change.oldkeys.is_none() {
-        return Err(WalParseError::MissingField("oldkeys".to_string()));
-    }
-
-    let (new_row, new_resolved) = if kind == EventKind::Insert || kind == EventKind::Update {
-        let (row, resolved) = build_row_from_arrays(
-            &change.columnnames,
-            &change.columntypes,
-            &change.columnvalues,
-            table_id,
-            database,
-        )?;
-        (Some(row), resolved)
-    } else {
-        (None, Vec::new())
-    };
-
-    let (old_row, pk) = if let Some(ref oldkeys) = change.oldkeys {
-        // Build old row from oldkeys (sparse: only key columns)
-        let (row, _) = build_row_from_arrays(
-            &oldkeys.keynames,
-            &oldkeys.keytypes,
-            &oldkeys.keyvalues,
-            table_id,
-            database,
-        )?;
-
-        let pk = build_pk_from_key_arrays(
-            &oldkeys.keynames,
-            &oldkeys.keytypes,
-            &oldkeys.keyvalues,
-            table_id,
-            database,
-        )?;
-
-        (Some(row), pk)
-    } else {
-        // INSERT without oldkeys: extract PK from new row using database metadata
-        let pk = pk_from_catalog_or_empty(&new_resolved, table_id, database)?;
-        (None, pk)
-    };
-    let old_row_complete = super::old_row_is_complete(old_row.as_ref());
-    build_event_from_rows(
-        kind,
-        table_id,
-        pk,
-        old_row,
-        new_row,
-        old_row_complete,
-        "columnnames/columntypes/columnvalues",
-        "oldkeys",
-        None,
-    )
-}
-
-// ============================================================================
-// v2 conversion
-// ============================================================================
-
-fn convert_v2_message<DB: DatabaseLike>(
-    msg: &Wal2JsonV2Message,
-    database: &DB,
-) -> Result<WalEvent<crate::PgLsn>, WalParseError> {
-    let kind = parse_v2_kind(&msg.action)?;
-
-    let schema = msg.schema.as_deref().unwrap_or("");
-    let table = msg.table.as_deref().ok_or_else(|| {
-        WalParseError::JsonError("data message (I/U/D) missing 'table' field".to_string())
-    })?;
-    let table_id = resolve_table(schema, table, database)?;
-
-    // Parse PG LSN if wal2json was invoked with include-lsn=true. Malformed
-    // strings are dropped silently (the parser does not gate event emission
-    // on a present checkpoint - oplog / replay can fall back to None).
-    let checkpoint = msg.lsn.as_deref().and_then(crate::PgLsn::parse);
-
-    let (new_row, new_resolved) = match kind {
-        EventKind::Insert | EventKind::Update => {
-            let columns = msg
-                .columns
-                .as_ref()
-                .filter(|columns| !columns.is_empty())
-                .ok_or_else(|| WalParseError::MissingField("columns".to_string()))?;
-            let (row, resolved) = build_row_from_v2_columns(columns, table_id, database)?;
-            (Some(row), resolved)
+    fn value_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
+        let Ok(table_id) = resolve_table(&self.schema, &self.table, db) else {
+            return Ok(Value::Missing);
+        };
+        if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
+            return Ok(Value::Missing);
         }
-        EventKind::Delete | EventKind::Truncate => (None, Vec::new()),
-    };
+        let Some((names, values)) = v1_image(self, row) else {
+            return Ok(Value::Missing);
+        };
+        let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
+            return Ok(Value::Missing);
+        };
+        decode_cell(v1_value(names, values, &name), db, table_id, col)
+    }
+}
 
-    let (old_row, identity_resolved) = match kind {
-        EventKind::Delete => {
-            let identity = msg
-                .identity
-                .as_ref()
-                .filter(|identity| !identity.is_empty())
-                .ok_or_else(|| WalParseError::MissingField("identity".to_string()))?;
-            let (row, resolved) = build_row_from_v2_columns(identity, table_id, database)?;
-            (Some(row), resolved)
-        }
-        EventKind::Update => {
-            if let Some(identity) = msg
-                .identity
-                .as_ref()
-                .filter(|identity| !identity.is_empty())
-            {
-                let (row, resolved) = build_row_from_v2_columns(identity, table_id, database)?;
-                (Some(row), resolved)
-            } else {
-                (None, Vec::new())
+/// Derive changed columns by comparing the new and old JSON value for each
+/// catalog column, listing those that differ. `lookup` returns the
+/// `(new, old)` value pair for a column name.
+fn changed_by_name<'a, DB, F>(db: &DB, table_id: TableId, arity: usize, lookup: F) -> Vec<ColumnId>
+where
+    DB: DatabaseLike,
+    F: Fn(&str) -> (Option<&'a serde_json::Value>, Option<&'a serde_json::Value>),
+{
+    let mut changed = Vec::new();
+    for idx in 0..arity {
+        let Ok(col) = ColumnId::try_from(idx) else {
+            break;
+        };
+        let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
+            continue;
+        };
+        if let (Some(new_v), Some(old_v)) = lookup(&name) {
+            if new_v != old_v {
+                changed.push(col);
             }
         }
-        EventKind::Insert | EventKind::Truncate => (None, Vec::new()),
-    };
-    let old_row_complete = super::old_row_is_complete(old_row.as_ref());
-
-    // Build PK: prefer identity columns, then pk metadata, then database.
-    // The three-way branching is clearer as if-let chains than map_or_else.
-    #[allow(clippy::option_if_let_else)]
-    let pk = if kind == EventKind::Truncate {
-        PrimaryKey::empty()
-    } else if !identity_resolved.is_empty() {
-        // Use identity columns as PK source (UPDATE/DELETE)
-        if let Some(ref pk_cols) = msg.pk {
-            let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
-            let pk_col_ids = strict_pk_column_ids_from_names(
-                table_id,
-                &pk_names,
-                &identity_resolved,
-                database,
-                "pk",
-            )?;
-            build_pk_from_resolved(&identity_resolved, &pk_col_ids)
-        } else {
-            // No pk metadata: use all identity columns as PK
-            let cols: Vec<ColumnId> = identity_resolved.iter().map(|(c, _)| *c).collect();
-            let vals: Vec<Cell> = identity_resolved.iter().map(|(_, v)| v.clone()).collect();
-            PrimaryKey::new(Arc::from(cols), Arc::from(vals))
-                .expect("identity columns and values are built in lockstep")
-        }
-    } else if let Some(ref pk_cols) = msg.pk {
-        // INSERT: extract PK from new row using pk metadata
-        let pk_names: Vec<String> = pk_cols.iter().map(|c| c.name.clone()).collect();
-        let pk_col_ids =
-            strict_pk_column_ids_from_names(table_id, &pk_names, &new_resolved, database, "pk")?;
-        build_pk_from_resolved(&new_resolved, &pk_col_ids)
-    } else {
-        pk_from_catalog_or_empty(&new_resolved, table_id, database)?
-    };
-
-    build_event_from_rows(
-        kind,
-        table_id,
-        pk,
-        old_row,
-        new_row,
-        old_row_complete,
-        "columns",
-        "identity",
-        checkpoint,
-    )
+    }
+    changed
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::test_support::{
-        orders_customer_catalog as orders_catalog,
-        orders_customer_no_pk_catalog as orders_no_pk_catalog,
-    };
     use super::*;
+    use crate::PgLsn;
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
 
-    // NOTE: Tests `error_no_arity_v1`/`v2` were removed in the migration from
-    // the `SchemaCatalog` trait to `DatabaseLike`. With `DatabaseLike` a
-    // resolved table always exposes its column count, so the "arity missing"
-    // failure mode is no longer reachable.
+    fn orders() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer INT, amount INT, status TEXT);",
+        )
+        .expect("parse DDL")
+    }
 
-    // -- v1 INSERT -----------------------------------------------------------
+    fn one_v2(bytes: &[u8]) -> MessageV2 {
+        let mut msgs = parse_wal2json_v2(bytes).expect("parse succeeds");
+        assert_eq!(msgs.len(), 1);
+        msgs.remove(0)
+    }
 
     #[test]
-    fn v1_insert() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "xid": 100,
-            "change": [{
-                "kind": "insert",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [1, "alice", 99.95, "pending"]
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
+    fn v2_insert_pk_and_cells_and_lsn() {
+        let db = orders();
+        let ev = one_v2(
+            br#"{"action":"I","schema":"public","table":"orders","lsn":"0/16B2270",
+                 "columns":[{"name":"id","type":"integer","value":7},
+                            {"name":"amount","type":"integer","value":250},
+                            {"name":"status","type":"text","value":"paid"}]}"#,
+        );
         assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.table_id(), 1);
-
-        // New row present
-        let new = ev.new_row().expect("INSERT should have new_row");
-        assert_eq!(new.get(0), Some(&Cell::Int(1)));
-        assert_eq!(new.get(1), Some(&Cell::String(Arc::from("alice"))));
-        assert_eq!(new.get(2), Some(&Cell::Float(99.95)));
-        assert_eq!(new.get(3), Some(&Cell::String(Arc::from("pending"))));
-
-        // No old row
-        assert!(ev.old_row().is_none());
-
-        // PK extracted from new row via catalog
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-
-        // No changed columns for INSERT
-        assert!(ev.changed_columns().is_empty());
+        assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
+        assert_eq!(ev.checkpoint(), PgLsn::parse("0/16B2270"));
+        assert!(ev.checkpoint().is_some());
+        assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Int(250));
+        assert_eq!(
+            ev.value_at(&db, RowKind::New, 3).unwrap(),
+            Value::String("paid".into())
+        );
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 2).unwrap(), Value::Missing);
     }
 
-    // -- v1 UPDATE -----------------------------------------------------------
-
     #[test]
-    fn v1_update() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "xid": 101,
-            "change": [{
-                "kind": "update",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [1, "alice", 149.95, "shipped"],
-                "oldkeys": {
-                    "keynames": ["id"],
-                    "keytypes": ["integer"],
-                    "keyvalues": [1]
-                }
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-
-        // New row
-        let new = ev.new_row().expect("UPDATE should have new_row");
-        assert_eq!(new.get(2), Some(&Cell::Float(149.95)));
-        assert_eq!(new.get(3), Some(&Cell::String(Arc::from("shipped"))));
-
-        // Old row (sparse: only key columns)
-        let old = ev.old_row().expect("UPDATE should have old_row");
-        assert_eq!(old.get(0), Some(&Cell::Int(1)));
-        assert_eq!(old.get(1), Some(&Cell::Missing)); // not in oldkeys
-
-        // PK from oldkeys
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
+    fn v2_full_identity_derives_changed_columns() {
+        let db = orders();
+        let ev = one_v2(
+            br#"{"action":"U","schema":"public","table":"orders",
+                 "columns":[{"name":"id","type":"integer","value":7},
+                            {"name":"customer","type":"integer","value":3},
+                            {"name":"amount","type":"integer","value":250},
+                            {"name":"status","type":"text","value":"paid"}],
+                 "identity":[{"name":"id","type":"integer","value":7},
+                             {"name":"customer","type":"integer","value":3},
+                             {"name":"amount","type":"integer","value":100},
+                             {"name":"status","type":"text","value":"pending"}]}"#,
+        );
+        let mut changed = ev.changed_columns(&db);
+        changed.sort_unstable();
+        assert_eq!(changed, alloc::vec![2u16, 3u16]);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 2).unwrap(), Value::Int(100));
+        assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Int(250));
     }
 
-    // -- v1 DELETE -----------------------------------------------------------
+    #[test]
+    fn v2_boundary_messages_drop() {
+        assert!(parse_wal2json_v2(br#"{"action":"B"}"#).unwrap().is_empty());
+        assert!(parse_wal2json_v2(br#"{"action":"C"}"#).unwrap().is_empty());
+    }
 
     #[test]
-    fn v1_delete() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "xid": 102,
-            "change": [{
-                "kind": "delete",
-                "schema": "public",
-                "table": "orders",
-                "oldkeys": {
-                    "keynames": ["id"],
-                    "keytypes": ["integer"],
-                    "keyvalues": [42]
-                }
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
+    fn v1_delete_reads_oldkeys() {
+        let db = orders();
+        let mut changes = parse_wal2json_v1(
+            br#"{"change":[{"kind":"delete","schema":"public","table":"orders",
+                 "oldkeys":{"keynames":["id"],"keytypes":["integer"],"keyvalues":[42]}}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(changes.len(), 1);
+        let ev = changes.remove(0);
         assert_eq!(ev.kind(), EventKind::Delete);
-        assert!(ev.new_row().is_none());
-        assert!(ev.old_row().is_some());
-
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(42)]);
-
-        assert!(ev.changed_columns().is_empty());
-    }
-
-    // -- v1 multi-change transaction -----------------------------------------
-
-    #[test]
-    fn v1_multi_change() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "xid": 200,
-            "change": [
-                {
-                    "kind": "insert",
-                    "schema": "public",
-                    "table": "orders",
-                    "columnnames": ["id", "customer", "amount", "status"],
-                    "columntypes": ["integer", "text", "numeric", "text"],
-                    "columnvalues": [10, "bob", 50.0, "new"]
-                },
-                {
-                    "kind": "update",
-                    "schema": "public",
-                    "table": "orders",
-                    "columnnames": ["id", "customer", "amount", "status"],
-                    "columntypes": ["integer", "text", "numeric", "text"],
-                    "columnvalues": [11, "carol", 75.0, "confirmed"],
-                    "oldkeys": {
-                        "keynames": ["id"],
-                        "keytypes": ["integer"],
-                        "keyvalues": [11]
-                    }
-                },
-                {
-                    "kind": "delete",
-                    "schema": "public",
-                    "table": "orders",
-                    "oldkeys": {
-                        "keynames": ["id"],
-                        "keytypes": ["integer"],
-                        "keyvalues": [12]
-                    }
-                }
-            ]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].kind(), EventKind::Insert);
-        assert_eq!(events[1].kind(), EventKind::Update);
-        assert_eq!(events[2].kind(), EventKind::Delete);
-    }
-
-    // -- v2 INSERT -----------------------------------------------------------
-
-    #[test]
-    fn v2_insert() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 1},
-                {"name": "customer", "type": "text", "value": "alice"},
-                {"name": "amount", "type": "numeric", "value": 99.95},
-                {"name": "status", "type": "text", "value": "pending"}
-            ],
-            "pk": [
-                {"name": "id", "type": "integer"}
-            ]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Insert);
-        assert_eq!(ev.table_id(), 1);
-
-        let new = ev.new_row().expect("INSERT should have new_row");
-        assert_eq!(new.get(0), Some(&Cell::Int(1)));
-        assert_eq!(new.get(1), Some(&Cell::String(Arc::from("alice"))));
-
-        assert!(ev.old_row().is_none());
-
-        // PK from pk metadata + new row
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
+        assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
+        assert_eq!(ev.value_at(&db, RowKind::Old, 0).unwrap(), Value::Int(42));
+        assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(42));
+        assert_eq!(ev.checkpoint(), None);
     }
 
     #[test]
-    fn v2_insert_duplicate_columns_returns_error() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 1},
-                {"name": "id", "type": "integer", "value": 2}
-            ],
-            "pk": [
-                {"name": "id", "type": "integer"}
-            ]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("duplicate v2 columns should fail");
-        assert!(matches!(err, WalParseError::MalformedPayload(_)));
-    }
-
-    // -- v2 UPDATE -----------------------------------------------------------
-
-    #[test]
-    fn v2_update() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "U",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 1},
-                {"name": "customer", "type": "text", "value": "alice"},
-                {"name": "amount", "type": "numeric", "value": 149.95},
-                {"name": "status", "type": "text", "value": "shipped"}
-            ],
-            "identity": [
-                {"name": "id", "type": "integer", "value": 1}
-            ],
-            "pk": [
-                {"name": "id", "type": "integer"}
-            ]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-
-        assert!(ev.new_row().is_some());
-        assert!(ev.old_row().is_some());
-
-        // PK from identity
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-    }
-
-    // -- v2 DELETE -----------------------------------------------------------
-
-    #[test]
-    fn v2_delete() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "D",
-            "schema": "public",
-            "table": "orders",
-            "identity": [
-                {"name": "id", "type": "integer", "value": 42}
-            ],
-            "pk": [
-                {"name": "id", "type": "integer"}
-            ]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Delete);
-        assert!(ev.new_row().is_none());
-        assert!(ev.old_row().is_some());
-
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(42)]);
-    }
-
-    // -- Error paths ---------------------------------------------------------
-
-    #[test]
-    fn error_invalid_utf8() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-        let bad_bytes: &[u8] = &[0xFF, 0xFE, 0xFD];
-
-        let err = parser
-            .parse_wal_message(bad_bytes, &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::InvalidUtf8(_)));
-    }
-
-    #[test]
-    fn error_malformed_json() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let err = parser
-            .parse_wal_message(b"not json at all", &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::JsonError(_)));
-    }
-
-    #[test]
-    fn error_unknown_table() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "insert",
-                "schema": "public",
-                "table": "nonexistent",
-                "columnnames": ["id"],
-                "columntypes": ["integer"],
-                "columnvalues": [1]
-            }]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownTable { .. }));
-    }
-
-    #[test]
-    fn error_unknown_column() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "insert",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "nonexistent_col"],
-                "columntypes": ["integer", "text"],
-                "columnvalues": [1, "value"]
-            }]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
-    }
-
-    #[test]
-    fn v1_truncate_kind_emits_truncate_event() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "truncate",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": [],
-                "columntypes": [],
-                "columnvalues": []
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("truncate should parse");
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Truncate);
-        assert_eq!(ev.table_id(), 1);
-        assert!(ev.pk().is_empty());
-        assert!(ev.old_row().is_none());
-        assert!(ev.new_row().is_none());
-        assert!(ev.changed_columns().is_empty());
-    }
-
-    #[test]
-    fn v2_non_data_actions_skipped() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        // Begin (B), Commit (C), Message (M) are silently skipped.
-        for action in &["B", "C", "M"] {
-            let json = format!(r#"{{"action": "{action}"}}"#);
-            let events = parser
-                .parse_wal_message(json.as_bytes(), &catalog)
-                .expect("non-data messages should not error");
-            assert!(
-                events.is_empty(),
-                "action '{action}' should return empty vec"
-            );
-        }
-    }
-
-    #[test]
-    fn v2_truncate_action_emits_truncate_event() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "T",
-            "schema": "public",
-            "table": "orders"
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("truncate action should parse");
-        assert_eq!(events.len(), 1);
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Truncate);
-        assert_eq!(ev.table_id(), 1);
-        assert!(ev.pk().is_empty());
-        assert!(ev.old_row().is_none());
-        assert!(ev.new_row().is_none());
-        assert!(ev.changed_columns().is_empty());
-    }
-
-    #[test]
-    fn v1_tombstone_null_is_ignored() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-        let events = parser
-            .parse_wal_message(b"null", &catalog)
-            .expect("tombstone should be ignored");
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn v2_tombstone_null_is_ignored() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-        let events = parser
-            .parse_wal_message(b"null", &catalog)
-            .expect("tombstone should be ignored");
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn v2_unknown_action_is_skipped() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        // "X" is not a known v2 action. It must be skipped, not error.
-        let json = r#"{"action":"X","schema":"public","table":"orders"}"#;
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("unknown action should be skipped, not error");
-        assert!(events.is_empty(), "unknown action should produce no output");
-    }
-
-    // -- B1: v1 unknown kind is skipped -------------------------------------
-
-    #[test]
-    fn v1_unknown_kind_is_skipped() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-        // "schema_change" is not insert/update/delete. It must be skipped, not error.
-        let json = r#"{"change":[{"kind":"schema_change","schema":"public","table":"orders","columnnames":["id"],"columntypes":["integer"],"columnvalues":[1]}]}"#;
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("unknown kind should be skipped, not error");
-        assert!(events.is_empty(), "unknown kind should produce no output");
-    }
-
-    // -- v1 unknown kind in multi-change transaction is isolated skip --------
-
-    #[test]
-    fn v1_unknown_kind_in_multi_change_skips_only_that_change() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-        // Two changes: the first is unknown (skipped), the second is a valid insert.
-        let json = r#"{
-            "change": [
-                {"kind":"schema_change","schema":"public","table":"orders","columnnames":["id"],"columntypes":["integer"],"columnvalues":[1]},
-                {"kind":"insert","schema":"public","table":"orders","columnnames":["id","customer","amount","status"],"columntypes":["integer","text","numeric","text"],"columnvalues":[42,"alice",99.0,"new"]}
-            ]
-        }"#;
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("mixed changes should not error");
-        assert_eq!(events.len(), 1, "only the valid insert should be emitted");
-        assert_eq!(events[0].kind(), EventKind::Insert);
-    }
-
-    // -- B2: v2 missing table on data action ---------------------------------
-
-    #[test]
-    fn v2_missing_table_on_data_action() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-        // "action": "I" with no table should fail
-        let json = r#"{"action":"I","schema":"public","columnnames":["id"],"columntypes":["integer"],"columnvalues":[1]}"#;
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("missing table should fail");
-        assert!(
-            matches!(err, WalParseError::MissingField(_))
-                || matches!(err, WalParseError::JsonError(_))
-                || matches!(err, WalParseError::UnknownTable { .. }),
-            "Expected error for missing table, got: {err:?}"
+    fn v1_multi_change_transaction_splits() {
+        let db = orders();
+        let changes = parse_wal2json_v1(
+            br#"{"change":[
+                 {"kind":"insert","schema":"public","table":"orders",
+                  "columnnames":["id","amount"],"columntypes":["integer","integer"],
+                  "columnvalues":[7,250]},
+                 {"kind":"delete","schema":"public","table":"orders",
+                  "oldkeys":{"keynames":["id"],"keytypes":["integer"],"keyvalues":[9]}}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].kind(), EventKind::Insert);
+        assert_eq!(
+            changes[0].value_at(&db, RowKind::New, 0).unwrap(),
+            Value::Int(7)
         );
-    }
-
-    // -- Trait object safety --------------------------------------------------
-
-    #[test]
-    fn trait_object_compiles() {
-        let catalog = orders_catalog();
-        let parser: &dyn WalParser<
-            sql_traits::structs::ParserDB,
-            Checkpoint = crate::NoCheckpoint,
-        > = &Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "insert",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [1, "test", 10.0, "new"]
-            }]
-        }"#;
-
-        let result = parser.parse_wal_message(json.as_bytes(), &catalog);
-        assert!(result.is_ok());
-    }
-
-    // -- v1 UPDATE with full old row (REPLICA IDENTITY FULL) ----------------
-
-    #[test]
-    fn v1_update_with_changed_columns() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        // Simulate REPLICA IDENTITY FULL: oldkeys contains all columns
-        let json = r#"{
-            "change": [{
-                "kind": "update",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [1, "alice", 149.95, "shipped"],
-                "oldkeys": {
-                    "keynames": ["id", "customer", "amount", "status"],
-                    "keytypes": ["integer", "text", "numeric", "text"],
-                    "keyvalues": [1, "alice", 99.95, "pending"]
-                }
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-
-        // amount (col 2) and status (col 3) changed
-        let changed: Vec<ColumnId> = ev.changed_columns().to_vec();
-        assert!(changed.contains(&2), "amount should be changed");
-        assert!(changed.contains(&3), "status should be changed");
-        assert!(!changed.contains(&0), "id should NOT be changed");
-        assert!(!changed.contains(&1), "customer should NOT be changed");
-    }
-
-    // -- v1 UPDATE without oldkeys (changed_columns branch: None old_row) ----
-
-    #[test]
-    fn v1_update_without_oldkeys() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "update",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [1, "alice", 149.95, "shipped"]
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-        // No oldkeys, no old_row, changed_columns is empty
-        assert!(ev.old_row().is_none());
-        assert!(ev.changed_columns().is_empty());
-    }
-
-    #[test]
-    fn v1_update_with_partial_oldkeys_keeps_changed_columns_empty_for_safety() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        // oldkeys includes only the PK. New row changes both PK and amount.
-        // The old row is partial, so changed-columns must be treated as unknown.
-        let json = r#"{
-            "change": [{
-                "kind": "update",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [2, "alice", 149.95, "shipped"],
-                "oldkeys": {
-                    "keynames": ["id"],
-                    "keytypes": ["integer"],
-                    "keyvalues": [1]
-                }
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-        assert!(ev.old_row().is_some());
-        assert!(
-            ev.changed_columns().is_empty(),
-            "partial oldkeys must disable changed-columns pruning"
-        );
-    }
-
-    // -- v1 INSERT without catalog PK columns --------------------------------
-
-    #[test]
-    fn v1_insert_no_catalog_pk() {
-        let catalog = orders_no_pk_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "insert",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [1, "alice", 99.95, "pending"]
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        // No oldkeys and no catalog PK: empty PK
-        assert!(ev.pk().columns.is_empty());
-        assert!(ev.pk().values.is_empty());
-    }
-
-    // -- v2 UPDATE with identity but no pk metadata --------------------------
-
-    #[test]
-    fn v2_update_identity_no_pk_metadata() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "U",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 1},
-                {"name": "customer", "type": "text", "value": "alice"},
-                {"name": "amount", "type": "numeric", "value": 149.95},
-                {"name": "status", "type": "text", "value": "shipped"}
-            ],
-            "identity": [
-                {"name": "id", "type": "integer", "value": 1}
-            ]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-        // PK from all identity columns (no pk metadata to filter)
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(1)]);
-    }
-
-    // -- v2 INSERT without pk metadata AND without catalog PK ----------------
-
-    #[test]
-    fn v2_insert_no_pk_no_catalog() {
-        let catalog = orders_no_pk_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 5},
-                {"name": "customer", "type": "text", "value": "eve"},
-                {"name": "amount", "type": "numeric", "value": 10.0},
-                {"name": "status", "type": "text", "value": "new"}
-            ]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        // No pk metadata and no catalog PK: empty PK
-        assert!(ev.pk().columns.is_empty());
-        assert!(ev.pk().values.is_empty());
-    }
-
-    // -- v2 UPDATE without identity (changed_columns branch: None old_row) ---
-
-    #[test]
-    fn v2_update_without_identity() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "U",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 1},
-                {"name": "customer", "type": "text", "value": "alice"},
-                {"name": "amount", "type": "numeric", "value": 149.95},
-                {"name": "status", "type": "text", "value": "shipped"}
-            ],
-            "pk": [
-                {"name": "id", "type": "integer"}
-            ]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        assert_eq!(ev.kind(), EventKind::Update);
-        // No identity, no old_row, changed_columns empty
-        assert!(ev.old_row().is_none());
-        assert!(ev.changed_columns().is_empty());
-    }
-
-    // -- v2 unknown column error ---------------------------------------------
-
-    #[test]
-    fn error_unknown_column_v2() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 1},
-                {"name": "bogus_col", "type": "text", "value": "x"}
-            ]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
-    }
-
-    // -- Null handling -------------------------------------------------------
-
-    #[test]
-    fn v1_null_values() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "insert",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [1, null, null, "active"]
-            }]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let new = events[0].new_row().expect("should have new_row");
-        assert_eq!(new.get(0), Some(&Cell::Int(1)));
-        assert_eq!(new.get(1), Some(&Cell::Null));
-        assert_eq!(new.get(2), Some(&Cell::Null));
-        assert_eq!(new.get(3), Some(&Cell::String(Arc::from("active"))));
-    }
-
-    // -- INSERT without PK metadata (catalog fallback) -----------------------
-
-    #[test]
-    fn v2_insert_no_pk_metadata() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 7},
-                {"name": "customer", "type": "text", "value": "dave"},
-                {"name": "amount", "type": "numeric", "value": 25.0},
-                {"name": "status", "type": "text", "value": "new"}
-            ]
-        }"#;
-
-        let events = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect("parse should succeed");
-
-        let ev = &events[0];
-        // PK should come from catalog.primary_key_columns()
-        assert_eq!(ev.pk().columns.as_ref(), &[0]);
-        assert_eq!(ev.pk().values.as_ref(), &[Cell::Int(7)]);
-    }
-
-    // -- Error: unknown column in oldkeys ------------------------------------
-
-    #[test]
-    fn error_unknown_column_in_oldkeys() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "delete",
-                "schema": "public",
-                "table": "orders",
-                "oldkeys": {
-                    "keynames": ["nonexistent_key"],
-                    "keytypes": ["integer"],
-                    "keyvalues": [1]
-                }
-            }]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
-    }
-
-    #[test]
-    fn error_v1_delete_missing_oldkeys() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "delete",
-                "schema": "public",
-                "table": "orders"
-            }]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("delete without oldkeys should fail");
-        assert!(matches!(err, WalParseError::MissingField(field) if field == "oldkeys"));
-    }
-
-    #[test]
-    fn error_v2_insert_missing_columns() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders"
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("insert without columns should fail");
-        assert!(matches!(err, WalParseError::MissingField(field) if field == "columns"));
-    }
-
-    #[test]
-    fn error_v2_update_missing_columns() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "U",
-            "schema": "public",
-            "table": "orders",
-            "identity": [
-                {"name": "id", "type": "integer", "value": 1}
-            ]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("update without columns should fail");
-        assert!(matches!(err, WalParseError::MissingField(field) if field == "columns"));
-    }
-
-    #[test]
-    fn error_v2_delete_missing_identity() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "D",
-            "schema": "public",
-            "table": "orders"
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("delete without identity should fail");
-        assert!(matches!(err, WalParseError::MissingField(field) if field == "identity"));
-    }
-
-    #[test]
-    fn error_v2_numeric_overflow() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "bigint", "value": 18446744073709551615}
-            ]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("overflow should fail");
-        assert!(matches!(err, WalParseError::NumericOverflow { .. }));
-    }
-
-    #[test]
-    fn error_v2_pk_metadata_unknown_column() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "bigint", "value": 1},
-                {"name": "amount", "type": "numeric", "value": 12.5}
-            ],
-            "pk": [
-                {"name": "id", "type": "bigint"},
-                {"name": "missing_pk_col", "type": "bigint"}
-            ]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("unknown PK metadata column should fail");
-        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
-    }
-
-    #[test]
-    fn error_v2_pk_metadata_column_missing_in_row() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV2Parser;
-
-        let json = r#"{
-            "action": "I",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "amount", "type": "numeric", "value": 12.5}
-            ],
-            "pk": [
-                {"name": "id", "type": "bigint"}
-            ]
-        }"#;
-
-        let err = parser
-            .parse_wal_message(json.as_bytes(), &catalog)
-            .expect_err("missing PK value in row should fail");
-        assert!(matches!(err, WalParseError::MalformedPayload(_)));
-    }
-
-    // -- Direct test: build_pk_from_key_arrays with unknown column -----------
-
-    #[test]
-    fn error_build_pk_unknown_column() {
-        // Exercise build_pk_from_key_arrays directly (normally preempted
-        // by build_row_from_arrays checking the same columns first).
-        let catalog = orders_catalog();
-        let names = vec!["nonexistent".to_string()];
-        let types = vec!["integer".to_string()];
-        let values = vec![serde_json::json!(1)];
-
-        let err = build_pk_from_key_arrays(&names, &types, &values, 1, &catalog)
-            .expect_err("should fail");
-        assert!(matches!(err, WalParseError::UnknownColumn { .. }));
-    }
-
-    #[test]
-    fn error_mismatched_column_array_lengths_v1_does_not_panic() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "insert",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer"],
-                "columntypes": ["integer"],
-                "columnvalues": [1, "alice"]
-            }]
-        }"#;
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            parser.parse_wal_message(json.as_bytes(), &catalog)
-        }));
-
-        assert!(result.is_ok(), "parser must not panic on malformed payload");
-        let parse_result = result.expect("catch_unwind should be Ok");
-        assert!(
-            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
-            "parser should return MalformedPayload"
-        );
-    }
-
-    #[test]
-    fn error_mismatched_oldkeys_array_lengths_v1_does_not_panic() {
-        let catalog = orders_catalog();
-        let parser = Wal2JsonV1Parser;
-
-        let json = r#"{
-            "change": [{
-                "kind": "delete",
-                "schema": "public",
-                "table": "orders",
-                "oldkeys": {
-                    "keynames": ["id", "customer"],
-                    "keytypes": ["integer"],
-                    "keyvalues": [1, "alice"]
-                }
-            }]
-        }"#;
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            parser.parse_wal_message(json.as_bytes(), &catalog)
-        }));
-
-        assert!(result.is_ok(), "parser must not panic on malformed payload");
-        let parse_result = result.expect("catch_unwind should be Ok");
-        assert!(
-            matches!(parse_result, Err(WalParseError::MalformedPayload(_))),
-            "parser should return MalformedPayload"
-        );
-    }
-
-    #[test]
-    fn update_partial_old_rows_keep_changed_columns_empty_in_v1_and_v2() {
-        let catalog = orders_catalog();
-        let v1 = Wal2JsonV1Parser;
-        let v2 = Wal2JsonV2Parser;
-
-        let v1_json = r#"{
-            "change": [{
-                "kind": "update",
-                "schema": "public",
-                "table": "orders",
-                "columnnames": ["id", "customer", "amount", "status"],
-                "columntypes": ["integer", "text", "numeric", "text"],
-                "columnvalues": [1, "alice", 75.0, "open"],
-                "oldkeys": {
-                    "keynames": ["id"],
-                    "keytypes": ["integer"],
-                    "keyvalues": [1]
-                }
-            }]
-        }"#;
-        let v1_events = v1
-            .parse_wal_message(v1_json.as_bytes(), &catalog)
-            .expect("v1 update should parse");
-        assert_eq!(v1_events.len(), 1);
-        assert_eq!(v1_events[0].kind(), EventKind::Update);
-        assert!(v1_events[0].old_row().is_some());
-        assert!(
-            v1_events[0].changed_columns().is_empty(),
-            "v1 partial old row must not compute changed_columns"
-        );
-
-        let v2_json = r#"{
-            "action": "U",
-            "schema": "public",
-            "table": "orders",
-            "columns": [
-                {"name": "id", "type": "integer", "value": 1},
-                {"name": "customer", "type": "text", "value": "alice"},
-                {"name": "amount", "type": "numeric", "value": 75.0},
-                {"name": "status", "type": "text", "value": "open"}
-            ],
-            "identity": [
-                {"name": "id", "type": "integer", "value": 1}
-            ],
-            "pk": [
-                {"name": "id", "type": "integer"}
-            ]
-        }"#;
-        let v2_events = v2
-            .parse_wal_message(v2_json.as_bytes(), &catalog)
-            .expect("v2 update should parse");
-        assert_eq!(v2_events.len(), 1);
-        assert_eq!(v2_events[0].kind(), EventKind::Update);
-        assert!(v2_events[0].old_row().is_some());
-        assert!(
-            v2_events[0].changed_columns().is_empty(),
-            "v2 partial old row must not compute changed_columns"
+        assert_eq!(changes[1].kind(), EventKind::Delete);
+        assert_eq!(
+            changes[1].value_at(&db, RowKind::Old, 0).unwrap(),
+            Value::Int(9)
         );
     }
 }

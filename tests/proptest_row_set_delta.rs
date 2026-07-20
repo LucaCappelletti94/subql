@@ -35,7 +35,8 @@ use std::sync::Arc;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use subql::{row_set_delta, Cell, ColumnId, RowImage};
+use subql::backend::{Postgres, Value};
+use subql::{row_set_delta, ColumnId, Row};
 
 /// Two-column rows: `(id INT PK, value INT)`. Enough surface to exercise
 /// the "same PK, different cells = update" path without dragging in
@@ -46,22 +47,18 @@ const PK_COLS_SINGLE: &[ColumnId] = &[0];
 /// `(a, b)`. Used to verify the function honours multi-column PKs.
 const PK_COLS_COMPOSITE: &[ColumnId] = &[0, 1];
 
-fn single_pk_row(id: i64, value: i64) -> RowImage {
-    RowImage {
-        cells: Arc::from([Cell::Int(id), Cell::Int(value)]),
-    }
+fn single_pk_row(id: i64, value: i64) -> Row<Postgres> {
+    Arc::from([Value::Int(id), Value::Int(value)])
 }
 
-fn composite_pk_row(a: i64, b: i64, value: i64) -> RowImage {
-    RowImage {
-        cells: Arc::from([Cell::Int(a), Cell::Int(b), Cell::Int(value)]),
-    }
+fn composite_pk_row(a: i64, b: i64, value: i64) -> Row<Postgres> {
+    Arc::from([Value::Int(a), Value::Int(b), Value::Int(value)])
 }
 
 /// A PK-unique row set generator. `BTreeMap` keys on the PK ints so the
-/// final `Vec<RowImage>` is guaranteed to have no PK collisions, which
-/// is the documented input contract.
-fn arb_single_pk_set() -> impl Strategy<Value = Vec<RowImage>> {
+/// final `Vec<Row<Postgres>>` is guaranteed to have no PK collisions,
+/// which is the documented input contract.
+fn arb_single_pk_set() -> impl Strategy<Value = Vec<Row<Postgres>>> {
     vec((0i64..16, 0i64..32), 0..16).prop_map(|pairs| {
         let by_pk: BTreeMap<i64, i64> = pairs.into_iter().collect();
         by_pk
@@ -71,7 +68,7 @@ fn arb_single_pk_set() -> impl Strategy<Value = Vec<RowImage>> {
     })
 }
 
-fn arb_composite_pk_set() -> impl Strategy<Value = Vec<RowImage>> {
+fn arb_composite_pk_set() -> impl Strategy<Value = Vec<Row<Postgres>>> {
     vec((0i64..4, 0i64..4, 0i64..16), 0..16).prop_map(|tuples| {
         let by_pk: BTreeMap<(i64, i64), i64> =
             tuples.into_iter().map(|(a, b, v)| ((a, b), v)).collect();
@@ -83,32 +80,33 @@ fn arb_composite_pk_set() -> impl Strategy<Value = Vec<RowImage>> {
 }
 
 /// Project the PK cells out of `row` as a sortable / hashable tuple. We
-/// know every row in these tests stores `Cell::Int` in the PK slot, so
-/// extracting via `Cell::Int` is total. Anything else is a test bug.
-fn pk_of(row: &RowImage, pk_cols: &[ColumnId]) -> Vec<i64> {
+/// know every row in these tests stores `Value::Int` in the PK slot, so
+/// extracting via `Value::Int` is total. Anything else is a test bug.
+fn pk_of(row: &Row<Postgres>, pk_cols: &[ColumnId]) -> Vec<i64> {
     pk_cols
         .iter()
-        .map(|&c| match row.get(c).unwrap() {
-            Cell::Int(n) => *n,
+        .map(|&c| match row.get(c as usize).unwrap() {
+            Value::Int(n) => *n,
             other => panic!("non-Int PK cell in test input: {other:?}"),
         })
         .collect()
 }
 
-fn cells_eq(a: &RowImage, b: &RowImage) -> bool {
-    a.cells.len() == b.cells.len() && a.cells.iter().zip(b.cells.iter()).all(|(x, y)| x == y)
+fn cells_eq(a: &Row<Postgres>, b: &Row<Postgres>) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
 }
 
-/// Apply a [`RowSetDelta`] to `prev` and return the rebuilt set, keyed
-/// by PK so callers can compare to `next` regardless of bucket order.
+/// Apply a [`subql::RowSetDelta`] to `prev` and return the rebuilt set,
+/// keyed by PK so callers can compare to `next` regardless of bucket
+/// order.
 fn apply_delta(
-    prev: &[RowImage],
-    delta: &subql::RowSetDelta,
+    prev: &[Row<Postgres>],
+    delta: &subql::RowSetDelta<Postgres>,
     pk_cols: &[ColumnId],
-) -> BTreeMap<Vec<i64>, RowImage> {
-    let mut out: BTreeMap<Vec<i64>, RowImage> = prev
+) -> BTreeMap<Vec<i64>, Row<Postgres>> {
+    let mut out: BTreeMap<Vec<i64>, Row<Postgres>> = prev
         .iter()
-        .map(|r| (pk_of(r, pk_cols), r.clone()))
+        .map(|r| (pk_of(r, pk_cols), Arc::clone(r)))
         .collect();
     for d in &delta.deleted {
         out.remove(&pk_of(d, pk_cols));
@@ -117,10 +115,10 @@ fn apply_delta(
         let pk_old = pk_of(old, pk_cols);
         let pk_new = pk_of(new, pk_cols);
         assert_eq!(pk_old, pk_new, "updated entry changed its PK");
-        out.insert(pk_new, new.clone());
+        out.insert(pk_new, Arc::clone(new));
     }
     for i in &delta.inserted {
-        out.insert(pk_of(i, pk_cols), i.clone());
+        out.insert(pk_of(i, pk_cols), Arc::clone(i));
     }
     out
 }
@@ -147,7 +145,6 @@ proptest! {
         prop_assert_eq!(delta.inserted.len(), set.len(), "insert count must equal next set size");
         prop_assert!(delta.deleted.is_empty(), "empty-prev delta produced deletes: {:?}", delta.deleted);
         prop_assert!(delta.updated.is_empty(), "empty-prev delta produced updates: {:?}", delta.updated);
-        // Every row in `set` is in `inserted`, by PK.
         let inserted_pks: BTreeSet<Vec<i64>> =
             delta.inserted.iter().map(|r| pk_of(r, PK_COLS_SINGLE)).collect();
         let expected_pks: BTreeSet<Vec<i64>> =
@@ -169,8 +166,7 @@ proptest! {
         prop_assert_eq!(deleted_pks, expected_pks);
     }
 
-    /// Bucket disjointness + completeness: every PK in `prev` or `next`
-    /// lands in exactly one of {inserted, deleted, updated, unchanged}.
+    /// Bucket disjointness + completeness.
     #[test]
     fn buckets_disjoint_and_complete(
         prev in arb_single_pk_set(),
@@ -185,7 +181,6 @@ proptest! {
         let updated_pks: BTreeSet<Vec<i64>> =
             delta.updated.iter().map(|(p, _)| pk_of(p, PK_COLS_SINGLE)).collect();
 
-        // Pairwise disjoint.
         prop_assert!(
             inserted_pks.is_disjoint(&deleted_pks),
             "inserted and deleted not disjoint: {:?}",
@@ -202,26 +197,21 @@ proptest! {
             deleted_pks.intersection(&updated_pks).collect::<Vec<_>>(),
         );
 
-        // `inserted` is next minus prev (by PK).
         let prev_pks: BTreeSet<Vec<i64>> = prev.iter().map(|r| pk_of(r, PK_COLS_SINGLE)).collect();
         let next_pks: BTreeSet<Vec<i64>> = next.iter().map(|r| pk_of(r, PK_COLS_SINGLE)).collect();
         let expected_inserts: BTreeSet<Vec<i64>> = next_pks.difference(&prev_pks).cloned().collect();
         prop_assert_eq!(&inserted_pks, &expected_inserts);
 
-        // `deleted` is prev minus next.
         let expected_deletes: BTreeSet<Vec<i64>> = prev_pks.difference(&next_pks).cloned().collect();
         prop_assert_eq!(&deleted_pks, &expected_deletes);
 
-        // `updated` is a subset of prev intersect next.
         let intersection: BTreeSet<Vec<i64>> =
             prev_pks.intersection(&next_pks).cloned().collect();
         prop_assert!(updated_pks.is_subset(&intersection));
 
-        // For every "in both" PK, either it appears in `updated` (cells
-        // changed) or it does not appear at all (cells unchanged).
-        let prev_by_pk: BTreeMap<Vec<i64>, &RowImage> =
+        let prev_by_pk: BTreeMap<Vec<i64>, &Row<Postgres>> =
             prev.iter().map(|r| (pk_of(r, PK_COLS_SINGLE), r)).collect();
-        let next_by_pk: BTreeMap<Vec<i64>, &RowImage> =
+        let next_by_pk: BTreeMap<Vec<i64>, &Row<Postgres>> =
             next.iter().map(|r| (pk_of(r, PK_COLS_SINGLE), r)).collect();
         for pk in &intersection {
             let p = prev_by_pk[pk];
@@ -248,9 +238,9 @@ proptest! {
     ) {
         let delta = row_set_delta(&prev, &next, PK_COLS_SINGLE);
         let rebuilt = apply_delta(&prev, &delta, PK_COLS_SINGLE);
-        let expected: BTreeMap<Vec<i64>, RowImage> = next
+        let expected: BTreeMap<Vec<i64>, Row<Postgres>> = next
             .iter()
-            .map(|r| (pk_of(r, PK_COLS_SINGLE), r.clone()))
+            .map(|r| (pk_of(r, PK_COLS_SINGLE), Arc::clone(r)))
             .collect();
 
         prop_assert_eq!(rebuilt.len(), expected.len());
@@ -274,9 +264,9 @@ proptest! {
     ) {
         let delta = row_set_delta(&prev, &next, PK_COLS_COMPOSITE);
         let rebuilt = apply_delta(&prev, &delta, PK_COLS_COMPOSITE);
-        let expected: BTreeMap<Vec<i64>, RowImage> = next
+        let expected: BTreeMap<Vec<i64>, Row<Postgres>> = next
             .iter()
-            .map(|r| (pk_of(r, PK_COLS_COMPOSITE), r.clone()))
+            .map(|r| (pk_of(r, PK_COLS_COMPOSITE), Arc::clone(r)))
             .collect();
 
         prop_assert_eq!(rebuilt.len(), expected.len());

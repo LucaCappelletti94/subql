@@ -11,8 +11,10 @@
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::PostgreSqlDialect;
-use subql::{Cell, DefaultIds, SubscriptionEngine};
+use sqlparser::dialect::SQLiteDialect;
+use subql::backend::{SQLite, Value};
+use subql::testing::TestEvent;
+use subql::{DefaultIds, SubscriptionEngine};
 
 diesel::table! {
     users (id) {
@@ -29,9 +31,10 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
         .expect("CREATE TABLE users");
 
     let catalog =
-        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE users (id INT PRIMARY KEY, name TEXT);")
+        ParserDB::parse::<SQLiteDialect>("CREATE TABLE users (id INT PRIMARY KEY, name TEXT);")
             .expect("catalog");
-    let mut engine = SubscriptionEngine::<_, DefaultIds, _>::new(catalog, PostgreSqlDialect {});
+    let mut engine =
+        SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, _>::new(catalog, SQLiteDialect {});
 
     // Execute INSERT ... RETURNING id on SQLite; the DB mints id=1; subql reads
     // the returned SqliteValue, decodes the key, and follows it.
@@ -43,7 +46,7 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
         )
         .expect("follow insert ann");
     assert_eq!(ann.len(), 1);
-    let ann_pk = engine.follow_row(1, "users", vec![Cell::Int(1)]).unwrap();
+    let ann_pk = engine.follow_row(1, "users", vec![Value::Int(1)]).unwrap();
     assert_eq!(ann[0].subscription_id, ann_pk.subscription_id);
 
     let bob = engine
@@ -54,7 +57,7 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
         )
         .expect("follow insert bob");
     assert_eq!(bob.len(), 1);
-    let bob_pk = engine.follow_row(1, "users", vec![Cell::Int(2)]).unwrap();
+    let bob_pk = engine.follow_row(1, "users", vec![Value::Int(2)]).unwrap();
     assert_eq!(bob[0].subscription_id, bob_pk.subscription_id);
 
     assert_ne!(ann[0].subscription_id, bob[0].subscription_id);

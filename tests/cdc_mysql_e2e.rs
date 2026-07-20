@@ -2,7 +2,7 @@
 //!
 //! Applies a deterministic DML stream (two INSERTs, an UPDATE, a DELETE) to a
 //! live MySQL 8.0, reads Maxwell's JSONL file output, parses each line with
-//! [`subql::MaxwellParser`], dispatches through a [`SubscriptionEngine`] with a
+//! [`subql::parse_maxwell`], dispatches through a [`SubscriptionEngine`] with a
 //! single registered subscription, and asserts the per-consumer notifications
 //! directly (an INSERT matching the WHERE lands in `inserted()`, the DELETE in
 //! `deleted()`).
@@ -20,13 +20,14 @@
 use std::time::Duration;
 
 use diesel::prelude::*;
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::MySqlDialect;
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use sql_traits::structs::ParserDB;
-use subql::{DefaultIds, MaxwellParser, SubscriptionEngine, SubscriptionRequest, WalParser};
+use subql::backend::MySql;
+use subql::{parse_maxwell, DefaultIds, MaxwellMessage, SubscriptionEngine, SubscriptionRequest};
 
 const MAXWELL_IMAGE: &str = "zendesk/maxwell";
 const MAXWELL_TAG: &str = "v1.44.0";
@@ -36,7 +37,7 @@ const MAXWELL_TAG: &str = "v1.44.0";
 /// `schema="testdb"`; with no `testdb.events` in the catalog, table resolution
 /// falls back to the unqualified lookup that hits this bare table.
 fn events_catalog() -> ParserDB {
-    ParserDB::parse::<PostgreSqlDialect>(
+    ParserDB::parse::<MySqlDialect>(
         "CREATE TABLE events (id INT PRIMARY KEY, amount DOUBLE PRECISION, label TEXT);",
     )
     .expect("events DDL parses")
@@ -233,12 +234,11 @@ fn mysql_maxwell_cdc_e2e() {
         messages.len()
     );
 
-    let catalog = events_catalog();
     let consumer: u64 = 1;
-    let mut engine: SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(events_catalog(), PostgreSqlDialect {});
+    let mut engine: SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(events_catalog(), MySqlDialect {});
     engine
-        .register(SubscriptionRequest::new(
+        .register(SubscriptionRequest::<DefaultIds, MySql>::new(
             consumer,
             "SELECT * FROM events WHERE amount > 10",
         ))
@@ -250,8 +250,7 @@ fn mysql_maxwell_cdc_e2e() {
     let mut deleted: Vec<Vec<u64>> = Vec::new();
 
     for (i, msg) in messages.iter().enumerate() {
-        let events = MaxwellParser
-            .parse_wal_message(msg.as_bytes(), &catalog)
+        let events = parse_maxwell(msg.as_bytes())
             .unwrap_or_else(|e| panic!("Maxwell parse failed for message {i}: {e}"));
         for event in &events {
             let notifs = engine

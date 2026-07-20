@@ -18,11 +18,10 @@ use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use subql::backend::{Postgres, Value};
 use subql::reexec::{ReExecEngine, Registered};
-use subql::{
-    Cell, ColumnId, DefaultIds, RowImage, SubscriptionEngine, SubscriptionRequest, WalEvent,
-};
+use subql::testing::TestEvent;
+use subql::{ColumnId, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
 
 const PRICE: ColumnId = 1;
 const STATUS: ColumnId = 3;
@@ -34,45 +33,38 @@ fn catalog() -> ParserDB {
     .unwrap()
 }
 
+fn orders_id(database: &ParserDB) -> TableId {
+    subql::catalog_helpers::table_id(database, "orders").expect("orders table")
+}
+
 // orders columns: id=0, price=1, quantity=2, status=3.
-fn row(id: i64, price: i64, status: &str) -> RowImage {
-    RowImage {
-        cells: Arc::from([
-            Cell::Int(id),
-            Cell::Float(price as f64),
-            Cell::Int(1),
-            Cell::String(Arc::from(status)),
-        ]),
-    }
+fn row(id: i64, price: i64) -> Vec<Value<Postgres>> {
+    vec![
+        Value::Int(id),
+        Value::Float(price as f64),
+        Value::Int(1),
+        Value::String("x".into()),
+    ]
 }
 
-fn insert_event(id: i64, price: i64) -> WalEvent {
-    WalEvent::builder(0)
-        .insert()
-        .pk_cell(0, Cell::Int(id))
-        .new_row(row(id, price, "x"))
-        .build()
-        .unwrap()
+fn insert_event(tid: TableId, id: i64, price: i64) -> TestEvent<Postgres> {
+    TestEvent::<Postgres>::insert(tid, row(id, price)).with_pk_columns([0u16])
 }
 
-fn delete_event(id: i64, price: i64) -> WalEvent {
-    WalEvent::builder(0)
-        .delete()
-        .pk_cell(0, Cell::Int(id))
-        .old_row(row(id, price, "x"))
-        .build()
-        .unwrap()
+fn delete_event(tid: TableId, id: i64, price: i64) -> TestEvent<Postgres> {
+    TestEvent::<Postgres>::delete(tid, row(id, price)).with_pk_columns([0u16])
 }
 
-fn update_event(id: i64, old_price: i64, new_price: i64, changed: &[ColumnId]) -> WalEvent {
-    WalEvent::builder(0)
-        .update()
-        .new_row(row(id, new_price, "x"))
-        .pk_cell(0, Cell::Int(id))
-        .maybe_old_row(Some(row(id, old_price, "x")))
-        .changed_columns(Arc::from(changed))
-        .build()
-        .unwrap()
+fn update_event(
+    tid: TableId,
+    id: i64,
+    old_price: i64,
+    new_price: i64,
+    changed: &[ColumnId],
+) -> TestEvent<Postgres> {
+    TestEvent::<Postgres>::update(tid, row(id, old_price), row(id, new_price))
+        .with_pk_columns([0u16])
+        .with_changed_columns(changed.iter().copied())
 }
 
 #[derive(Clone, Debug)]
@@ -94,23 +86,23 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
-type Engine = ReExecEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
+type Engine = ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
-const fn cell(price: i64) -> Cell {
-    Cell::Float(price as f64)
+const fn value(price: i64) -> Value<Postgres> {
+    Value::Float(price as f64)
 }
 
-fn extremum(model: &BTreeMap<i64, i64>, is_min: bool) -> Cell {
+fn extremum(model: &BTreeMap<i64, i64>, is_min: bool) -> Value<Postgres> {
     let v = if is_min {
         model.values().min()
     } else {
         model.values().max()
     };
-    v.map_or(Cell::Null, |&p| cell(p))
+    v.map_or(Value::Null, |&p| value(p))
 }
 
 /// Register a `MIN(price)` (or `MAX(price)`) subscription, bootstrapping the
-/// initial value from the empty model (= `Cell::Null`).
+/// initial value from the empty model (= `Value::Null`).
 fn register(engine: &mut Engine, is_min: bool) -> u64 {
     let sql = if is_min {
         "SELECT MIN(price) FROM orders"
@@ -124,7 +116,7 @@ fn register(engine: &mut Engine, is_min: bool) -> u64 {
         panic!("expected ReExec");
     };
     // Bootstrap against the empty model.
-    assert!(engine.install(query_id, Cell::Null));
+    assert!(engine.install(query_id, Value::Null));
     query_id
 }
 
@@ -134,10 +126,10 @@ fn register(engine: &mut Engine, is_min: bool) -> u64 {
 fn dispatch_and_service(
     engine: &mut Engine,
     qid: u64,
-    event: &WalEvent,
+    event: &TestEvent<Postgres>,
     model: &BTreeMap<i64, i64>,
     is_min: bool,
-    current: &mut Cell,
+    current: &mut Value<Postgres>,
 ) -> (usize, usize) {
     let n = engine.consumers(event).unwrap();
     let mut updates = 0;
@@ -159,33 +151,35 @@ proptest! {
     /// MIN: correctness + triggers fire iff the op removed/displaced the extreme.
     #[test]
     fn min_partial(ops in prop::collection::vec(op_strategy(), 0..40)) {
-        let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            catalog(),
+        let database = catalog();
+        let tid = orders_id(&database);
+        let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+            database,
             PostgreSqlDialect {},
         );
         let mut engine = ReExecEngine::new(inner);
         let qid = register(&mut engine, true);
-        let mut current = Cell::Null;
+        let mut current: Value<Postgres> = Value::Null;
         let mut model: BTreeMap<i64, i64> = BTreeMap::new();
         prop_assert_eq!(&current, &extremum(&model, true));
 
         for op in ops {
             let cur = current.clone();
-            let displaces = |p: i64| cur == cell(p);
+            let displaces = |p: i64| cur == value(p);
 
             match op {
                 Op::Insert { id, price } => {
                     if model.contains_key(&id) { continue; }
                     model.insert(id, price);
                     let (_u, t) = dispatch_and_service(
-                        &mut engine, qid, &insert_event(id, price), &model, true, &mut current);
+                        &mut engine, qid, &insert_event(tid, id, price), &model, true, &mut current);
                     prop_assert_eq!(t, 0, "insert must not trigger");
                 }
                 Op::Delete { id } => {
                     let Some(p) = model.remove(&id) else { continue };
                     let expect_trigger = displaces(p);
                     let (_u, t) = dispatch_and_service(
-                        &mut engine, qid, &delete_event(id, p), &model, true, &mut current);
+                        &mut engine, qid, &delete_event(tid, id, p), &model, true, &mut current);
                     prop_assert_eq!(t, usize::from(expect_trigger),
                         "delete triggers iff it removes the current extreme");
                 }
@@ -194,7 +188,7 @@ proptest! {
                     let expect_trigger = displaces(old);
                     model.insert(id, price);
                     let (_u, t) = dispatch_and_service(
-                        &mut engine, qid, &update_event(id, old, price, &[PRICE]),
+                        &mut engine, qid, &update_event(tid, id, old, price, &[PRICE]),
                         &model, true, &mut current);
                     prop_assert_eq!(t, usize::from(expect_trigger),
                         "price update triggers iff it displaces the extreme");
@@ -204,7 +198,7 @@ proptest! {
                     // changed_columns = [status] disjoint from deps = [price]:
                     // skip optimization must hold (no update, no trigger).
                     let (u, t) = dispatch_and_service(
-                        &mut engine, qid, &update_event(id, p, p, &[STATUS]),
+                        &mut engine, qid, &update_event(tid, id, p, p, &[STATUS]),
                         &model, true, &mut current);
                     prop_assert_eq!(u, 0);
                     prop_assert_eq!(t, 0, "unrelated-column update must not trigger");
@@ -217,33 +211,35 @@ proptest! {
     /// MAX mirror.
     #[test]
     fn max_partial(ops in prop::collection::vec(op_strategy(), 0..40)) {
-        let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            catalog(),
+        let database = catalog();
+        let tid = orders_id(&database);
+        let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+            database,
             PostgreSqlDialect {},
         );
         let mut engine = ReExecEngine::new(inner);
         let qid = register(&mut engine, false);
-        let mut current = Cell::Null;
+        let mut current: Value<Postgres> = Value::Null;
         let mut model: BTreeMap<i64, i64> = BTreeMap::new();
         prop_assert_eq!(&current, &extremum(&model, false));
 
         for op in ops {
             let cur = current.clone();
-            let displaces = |p: i64| cur == cell(p);
+            let displaces = |p: i64| cur == value(p);
 
             match op {
                 Op::Insert { id, price } => {
                     if model.contains_key(&id) { continue; }
                     model.insert(id, price);
                     let (_u, t) = dispatch_and_service(
-                        &mut engine, qid, &insert_event(id, price), &model, false, &mut current);
+                        &mut engine, qid, &insert_event(tid, id, price), &model, false, &mut current);
                     prop_assert_eq!(t, 0);
                 }
                 Op::Delete { id } => {
                     let Some(p) = model.remove(&id) else { continue };
                     let expect_trigger = displaces(p);
                     let (_u, t) = dispatch_and_service(
-                        &mut engine, qid, &delete_event(id, p), &model, false, &mut current);
+                        &mut engine, qid, &delete_event(tid, id, p), &model, false, &mut current);
                     prop_assert_eq!(t, usize::from(expect_trigger));
                 }
                 Op::UpdatePrice { id, price } => {
@@ -251,14 +247,14 @@ proptest! {
                     let expect_trigger = displaces(old);
                     model.insert(id, price);
                     let (_u, t) = dispatch_and_service(
-                        &mut engine, qid, &update_event(id, old, price, &[PRICE]),
+                        &mut engine, qid, &update_event(tid, id, old, price, &[PRICE]),
                         &model, false, &mut current);
                     prop_assert_eq!(t, usize::from(expect_trigger));
                 }
                 Op::UpdateStatus { id } => {
                     let Some(p) = model.get(&id).copied() else { continue };
                     let (u, t) = dispatch_and_service(
-                        &mut engine, qid, &update_event(id, p, p, &[STATUS]),
+                        &mut engine, qid, &update_event(tid, id, p, p, &[STATUS]),
                         &model, false, &mut current);
                     prop_assert_eq!(u, 0);
                     prop_assert_eq!(t, 0);

@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 //! Auto-resolving re-execution engine: wraps [`ReExecEngine`] with a
 //! [`Connector`] and converts in-flight [`ReExecutionTrigger`]s into
 //! [`ScalarUpdate`]s inline.
@@ -18,18 +19,15 @@ use super::engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     Registered, ScalarUpdate,
 };
+use crate::backend::{Backend, CdcEvent, ScalarKind, Value};
 use crate::clock::{duration_between, ClockHandle};
-use crate::RowImage;
-use crate::{
-    Cell, ColumnType, IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope,
-    UnregisterReport, WalEvent,
-};
+use crate::compiler::literals::SqlLiteralParse;
+use crate::{IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
 use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::dialect::Dialect;
 
 /// Result of [`AutoResolvingEngine::snapshot`]: the captured query's
 /// current value at a known position in the source stream.
@@ -39,12 +37,9 @@ use sqlparser::dialect::Dialect;
 /// engine method's signature.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub enum SnapshotResult<C: crate::Checkpoint> {
+pub enum SnapshotResult<B: Backend, C: crate::Checkpoint> {
     /// Single-table scalar (today's only flavor): a `MIN`/`MAX` value.
-    Scalar(Cell, Option<C>),
-    /// Reserved: a single-table row set. Will surface when total row
-    /// re-execution lands.
-    Rows(Vec<RowImage>, Option<C>),
+    Scalar(Value<B>, Option<C>),
 }
 
 /// Per-query state needed to drive an automatic re-execution.
@@ -54,8 +49,8 @@ pub enum SnapshotResult<C: crate::Checkpoint> {
 pub(super) struct ResolveContext<I: IdTypes, A> {
     /// Re-execution SQL produced by the plan.
     pub(super) sql: String,
-    /// Decode type for the scalar result.
-    pub(super) column_type: ColumnType,
+    /// Decode kind for the scalar result.
+    pub(super) column_kind: ScalarKind,
     /// Session owning the query, used to drop contexts on
     /// [`unregister_session`](AutoResolvingEngine::unregister_session).
     pub(super) session: Option<I::SessionId>,
@@ -69,7 +64,7 @@ pub(super) struct ResolveContext<I: IdTypes, A> {
 /// Behavior contract:
 /// * `register` delegates to the inner [`ReExecEngine`] and stores the
 ///   per-subscription [`Connector::AuthContext`] alongside the SQL and
-///   decode type returned via [`Registered::ReExec`].
+///   decode kind returned via [`Registered::ReExec`].
 /// * `consumers` delegates to the inner engine for filtering, then drains
 ///   each emitted trigger: for each, the connector is called with the
 ///   stored auth context, the returned value is installed via the inner
@@ -77,14 +72,15 @@ pub(super) struct ResolveContext<I: IdTypes, A> {
 ///   returned [`ReExecNotifications::triggers`] is always empty.
 /// * A single connector failure aborts the rest of the batch and returns
 ///   [`ReExecError::Connector`].
-pub struct AutoResolvingEngine<D, I, DB, X>
+pub struct AutoResolvingEngine<E, I, DB, X>
 where
-    D: Dialect,
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
     I: IdTypes,
     DB: DatabaseLike,
-    X: Connector,
+    X: Connector<Backend = E::Backend>,
 {
-    inner: ReExecEngine<D, I, DB>,
+    inner: ReExecEngine<E, I, DB>,
     connector: X,
     contexts: HashMap<ReExecQueryId, ResolveContext<I, X::AuthContext>>,
     /// Optional [`Clock`](crate::Clock) used for per-query debounce.
@@ -97,15 +93,16 @@ where
     last_reexec_at: HashMap<ReExecQueryId, u64>,
 }
 
-impl<D, I, DB, X> AutoResolvingEngine<D, I, DB, X>
+impl<E, I, DB, X> AutoResolvingEngine<E, I, DB, X>
 where
-    D: Dialect,
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
     I: IdTypes,
     DB: DatabaseLike + 'static,
-    X: Connector,
+    X: Connector<Backend = E::Backend>,
 {
     /// Wrap an existing [`ReExecEngine`] with the given [`Connector`].
-    pub fn new(inner: ReExecEngine<D, I, DB>, connector: X) -> Self {
+    pub fn new(inner: ReExecEngine<E, I, DB>, connector: X) -> Self {
         Self {
             inner,
             connector,
@@ -141,7 +138,7 @@ where
     }
 
     /// The wrapped trigger-emitting engine.
-    pub const fn inner(&self) -> &ReExecEngine<D, I, DB> {
+    pub const fn inner(&self) -> &ReExecEngine<E, I, DB> {
         &self.inner
     }
 
@@ -182,7 +179,7 @@ where
     /// Engine-supported queries pass through unchanged (no auth stored).
     pub fn register(
         &mut self,
-        spec: SubscriptionRequest<I>,
+        spec: SubscriptionRequest<I, E::Backend>,
         auth: X::AuthContext,
     ) -> Result<Registered, RegisterError> {
         let session = match &spec.scope {
@@ -193,14 +190,14 @@ where
         if let Registered::ReExec {
             query_id,
             sql,
-            column_type,
+            column_kind,
         } = &result
         {
             self.contexts.insert(
                 *query_id,
                 ResolveContext {
                     sql: sql.clone(),
-                    column_type: *column_type,
+                    column_kind: *column_kind,
                     session,
                     auth,
                 },
@@ -212,7 +209,7 @@ where
     /// Install a value directly, bypassing the connector. Mirrors
     /// [`ReExecEngine::install`] for callers that occasionally need to seed
     /// or override a captured query's state (e.g. a snapshot bootstrap).
-    pub fn install(&mut self, query_id: ReExecQueryId, value: Cell) -> bool {
+    pub fn install(&mut self, query_id: ReExecQueryId, value: Value<E::Backend>) -> bool {
         self.inner.install(query_id, value)
     }
 
@@ -239,13 +236,13 @@ where
     pub fn snapshot(
         &mut self,
         query_id: ReExecQueryId,
-    ) -> Result<Option<SnapshotResult<X::Checkpoint>>, ReExecError<X::Error>> {
+    ) -> Result<Option<SnapshotResult<E::Backend, X::Checkpoint>>, ReExecError<X::Error>> {
         let Some(ctx) = self.contexts.get(&query_id) else {
             return Ok(None);
         };
         let (value, checkpoint) = self
             .connector
-            .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
+            .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
             .map_err(ReExecError::Connector)?;
         self.inner.install(query_id, value.clone());
         Ok(Some(SnapshotResult::Scalar(value, checkpoint)))
@@ -255,7 +252,7 @@ where
     ///
     /// For every [`ReExecutionTrigger`] the inner engine emits, this method
     /// looks up the captured query's auth context, calls
-    /// [`Connector::execute_scalar`] with the plan's SQL and decode type,
+    /// [`Connector::execute_scalar`] with the plan's SQL and decode kind,
     /// installs the result via [`ReExecEngine::install`], and pushes a
     /// [`ScalarUpdate`] in the trigger's place. The returned
     /// [`ReExecNotifications::triggers`] is always empty under this engine.
@@ -264,36 +261,36 @@ where
     /// surfaced as [`ReExecError::Connector`].
     ///
     /// [`ReExecutionTrigger`]: super::ReExecutionTrigger
-    pub fn consumers<C: crate::Checkpoint>(
+    pub fn consumers(
         &mut self,
-        event: &WalEvent<C>,
-    ) -> Result<ReExecNotifications<I, C>, ReExecError<X::Error>> {
+        event: &E,
+    ) -> Result<ReExecNotifications<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
         let ReExecNotifications {
             engine,
             mut scalar_updates,
             triggers,
-        } = self.inner.consumers(event)?;
+        } = self.inner.consumers(event).map_err(ReExecError::Dispatch)?;
 
         for trigger in triggers {
             // Debounce: drop the trigger if we re-executed this query
             // within the configured window. The engine's installed value
-            // (set by the prior re-exec) stays the current view; no
+            // (set by the prior re-exec) stays the current view, no
             // ScalarUpdate emitted.
             if self.debounce_skip(trigger.query_id) {
                 continue;
             }
             let ctx = self.contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time; \
+                "every captured query stores its resolve context at register time, \
                  trigger.query_id must exist in `contexts`",
             );
             // The connector also reports the position at which it took
-            // the read (in `_db_checkpoint`); we ignore it here because
+            // the read (in `_db_checkpoint`), we ignore it here because
             // the ScalarUpdate is correlated with the *event* that
             // triggered the re-execution, not the DB-side read position.
             // Snapshots use the DB-side checkpoint instead (see `snapshot`).
             let (value, _db_checkpoint) = self
                 .connector
-                .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
+                .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
                 .map_err(ReExecError::Connector)?;
             self.inner.install(trigger.query_id, value.clone());
             self.stamp_reexec(trigger.query_id);
@@ -324,27 +321,30 @@ where
     /// The first connector failure aborts the whole batch. Partial
     /// notifications are dropped. The caller is expected to retry the
     /// batch.
-    pub fn consumers_batch<C: crate::Checkpoint>(
+    pub fn consumers_batch(
         &mut self,
-        events: &[WalEvent<C>],
-    ) -> Result<BatchOutcome<I, C>, ReExecError<X::Error>> {
+        events: &[E],
+    ) -> Result<BatchOutcome<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
         let BatchOutcome {
             per_event,
             mut scalar_updates,
             triggers,
-        } = self.inner.consumers_batch(events)?;
+        } = self
+            .inner
+            .consumers_batch(events)
+            .map_err(ReExecError::Dispatch)?;
 
         for trigger in triggers {
             if self.debounce_skip(trigger.query_id) {
                 continue;
             }
             let ctx = self.contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time; \
+                "every captured query stores its resolve context at register time, \
                  trigger.query_id must exist in `contexts`",
             );
             let (value, _db_checkpoint) = self
                 .connector
-                .execute_scalar(&ctx.sql, ctx.column_type, &ctx.auth)
+                .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
                 .map_err(ReExecError::Connector)?;
             self.inner.install(trigger.query_id, value.clone());
             self.stamp_reexec(trigger.query_id);
@@ -393,21 +393,20 @@ where
     }
 }
 
-impl<D, I, DB, X> crate::SubscriptionDispatch<I> for AutoResolvingEngine<D, I, DB, X>
+impl<E, I, DB, X> crate::SubscriptionDispatch<I, E> for AutoResolvingEngine<E, I, DB, X>
 where
-    D: Dialect + Send + Sync,
+    E: CdcEvent + Send,
+    E::Backend: SqlLiteralParse,
+    <E::Backend as Backend>::Dialect: Send + Sync,
     I: IdTypes,
-    DB: DatabaseLike + 'static,
-    X: Connector + Send,
+    DB: DatabaseLike + Send + 'static,
+    X: Connector<Backend = E::Backend> + Send,
     X::AuthContext: Send,
 {
-    type Notifications<C: crate::Checkpoint> = ReExecNotifications<I, C>;
+    type Notifications = ReExecNotifications<I, E::Backend, E::Checkpoint>;
     type Error = ReExecError<X::Error>;
 
-    fn consumers<C: crate::Checkpoint>(
-        &mut self,
-        event: &WalEvent<C>,
-    ) -> Result<Self::Notifications<C>, Self::Error> {
+    fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error> {
         Self::consumers(self, event)
     }
 }
@@ -416,8 +415,10 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::{ColumnId, DefaultIds, RowImage, SubscriptionEngine};
-    use alloc::sync::Arc;
+    use crate::backend::Postgres;
+    use crate::testing::TestEvent;
+    use crate::TableId;
+    use crate::{DefaultIds, SubscriptionEngine};
     use core::cell::RefCell;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
@@ -432,12 +433,12 @@ mod tests {
     /// Records every call and serves a programmed value queue. Errors are
     /// modeled by leaving the queue empty when `panic_on_empty` is false.
     struct MockConnector {
-        values: RefCell<alloc::vec::Vec<Cell>>,
-        calls: RefCell<alloc::vec::Vec<(String, ColumnType)>>,
+        values: RefCell<alloc::vec::Vec<Value<Postgres>>>,
+        calls: RefCell<alloc::vec::Vec<(String, ScalarKind)>>,
     }
 
     impl MockConnector {
-        fn new(values: alloc::vec::Vec<Cell>) -> Self {
+        fn new(values: alloc::vec::Vec<Value<Postgres>>) -> Self {
             Self {
                 values: RefCell::new(values),
                 calls: RefCell::new(alloc::vec::Vec::new()),
@@ -461,30 +462,33 @@ mod tests {
         type AuthContext = ();
         type Error = MockError;
         type Checkpoint = crate::NoCheckpoint;
+        type Backend = Postgres;
 
         fn execute_scalar(
             &self,
             sql: &str,
-            column_type: ColumnType,
+            column_kind: ScalarKind,
             _auth: &(),
-        ) -> Result<(Cell, Option<Self::Checkpoint>), Self::Error> {
+        ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
             self.calls
                 .borrow_mut()
-                .push((String::from(sql), column_type));
-            let cell = self
+                .push((String::from(sql), column_kind));
+            let value = self
                 .values
                 .borrow_mut()
                 .pop()
                 .ok_or(MockError("queue empty"))?;
-            Ok((cell, None))
+            Ok((value, None))
         }
 
         fn execute_rows(
             &self,
             _sql: &str,
             _auth: &(),
-        ) -> Result<super::super::connector::Snapshot<Vec<RowImage>, Self::Checkpoint>, Self::Error>
-        {
+        ) -> Result<
+            super::super::connector::Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>,
+            Self::Error,
+        > {
             #[allow(clippy::unimplemented)]
             {
                 unimplemented!("MockConnector::execute_rows is not exercised in v1 tests")
@@ -493,54 +497,46 @@ mod tests {
     }
 
     /// orders columns: id=0, price=1, quantity=2, status=3.
-    fn row(price: f64) -> RowImage {
-        RowImage {
-            cells: Arc::from([
-                Cell::Int(0),
-                Cell::Float(price),
-                Cell::Int(1),
-                Cell::String(Arc::from("paid")),
-            ]),
-        }
+    fn row(id: i64, price: f64) -> Vec<Value<Postgres>> {
+        alloc::vec![
+            Value::Int(id),
+            Value::Float(price),
+            Value::Int(1),
+            Value::String("paid".into()),
+        ]
     }
 
-    fn insert_event(id: i64, price: f64) -> WalEvent {
-        WalEvent::builder(0)
-            .insert()
-            .pk_cell(0, Cell::Int(id))
-            .new_row(row(price))
-            .build()
-            .unwrap()
+    fn insert_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::insert(table_id, row(id, price)).with_pk_columns([0u16])
     }
 
-    fn delete_event(id: i64, price: f64) -> WalEvent {
-        WalEvent::builder(0)
-            .delete()
-            .pk_cell(0, Cell::Int(id))
-            .old_row(row(price))
-            .build()
-            .unwrap()
+    fn delete_event(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::delete(table_id, row(id, price)).with_pk_columns([0u16])
     }
 
-    fn update_status_only(id: i64, price: f64) -> WalEvent {
-        WalEvent::builder(0)
-            .update()
-            .new_row(row(price))
-            .pk_cell(0, Cell::Int(id))
-            .maybe_old_row(Some(row(price)))
-            .changed_columns(Arc::from([3 as ColumnId]))
-            .build()
-            .unwrap()
+    fn update_status_only(table_id: TableId, id: i64, price: f64) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::update(table_id, row(id, price), row(id, price))
+            .with_pk_columns([0u16])
+            .with_changed_columns([3u16])
     }
 
     fn engine_with_values(
-        values: alloc::vec::Vec<Cell>,
-    ) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, MockConnector> {
-        let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-            catalog(),
+        values: alloc::vec::Vec<Value<Postgres>>,
+    ) -> (
+        AutoResolvingEngine<TestEvent<Postgres>, DefaultIds, ParserDB, MockConnector>,
+        TableId,
+    ) {
+        let database = catalog();
+        let orders_id =
+            crate::catalog_helpers::table_id(&database, "orders").expect("orders table exists");
+        let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+            database,
             PostgreSqlDialect {},
         );
-        AutoResolvingEngine::new(ReExecEngine::new(inner), MockConnector::new(values))
+        (
+            AutoResolvingEngine::new(ReExecEngine::new(inner), MockConnector::new(values)),
+            orders_id,
+        )
     }
 
     /// Full path: register, bootstrap install, insert that does not displace
@@ -550,7 +546,7 @@ mod tests {
     #[test]
     fn delete_of_extreme_resolves_via_connector() {
         // Connector returns 7.0 when re-run after the extreme is removed.
-        let mut e = engine_with_values(alloc::vec![Cell::Float(7.0)]);
+        let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(7.0)]);
 
         let qid = match e
             .register(
@@ -563,32 +559,32 @@ mod tests {
             Registered::Engine(_) => panic!("expected ReExec, got Engine"),
         };
         // Bootstrap: model = {1=>5.0}. Current MIN = 5.0.
-        assert!(e.install(qid, Cell::Float(5.0)));
+        assert!(e.install(qid, Value::Float(5.0)));
 
         // Insert price=9.0 (>5.0): in-process Unchanged, no scalar update, no trigger.
-        let n = e.consumers(&insert_event(2, 9.0)).unwrap();
+        let n = e.consumers(&insert_event(tid, 2, 9.0)).unwrap();
         assert!(n.scalar_updates.is_empty(), "insert above extreme");
         assert!(n.triggers.is_empty(), "auto-resolving never emits triggers");
         assert_eq!(e.connector().call_count(), 0, "no re-execution yet");
 
         // Delete id=1, price=5.0 (the current extreme): trigger -> connector -> 7.0.
-        let n = e.consumers(&delete_event(1, 5.0)).unwrap();
+        let n = e.consumers(&delete_event(tid, 1, 5.0)).unwrap();
         assert_eq!(n.scalar_updates.len(), 1);
         assert_eq!(n.scalar_updates[0].query_id, qid);
-        assert_eq!(n.scalar_updates[0].value, Cell::Float(7.0));
+        assert_eq!(n.scalar_updates[0].value, Value::Float(7.0));
         assert!(
             n.triggers.is_empty(),
             "AutoResolvingEngine consumes triggers internally"
         );
         assert_eq!(e.connector().call_count(), 1);
-        let (sql, ct) = e.connector().calls.borrow()[0].clone();
+        let (sql, kind) = e.connector().calls.borrow()[0].clone();
         assert!(sql.contains("MIN"));
-        assert_eq!(ct, ColumnType::Float);
+        assert_eq!(kind, ScalarKind::Float);
     }
 
     #[test]
     fn unrelated_column_update_does_not_call_connector() {
-        let mut e = engine_with_values(alloc::vec![]);
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MAX(price) FROM orders"),
@@ -599,9 +595,9 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec, got Engine"),
         };
-        assert!(e.install(qid, Cell::Float(10.0)));
+        assert!(e.install(qid, Value::Float(10.0)));
 
-        let n = e.consumers(&update_status_only(1, 10.0)).unwrap();
+        let n = e.consumers(&update_status_only(tid, 1, 10.0)).unwrap();
         assert!(n.scalar_updates.is_empty());
         assert!(n.triggers.is_empty());
         assert_eq!(e.connector().call_count(), 0);
@@ -610,7 +606,7 @@ mod tests {
     #[test]
     fn connector_error_aborts_batch() {
         // Empty queue: the connector errors on first call.
-        let mut e = engine_with_values(alloc::vec![]);
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -621,9 +617,9 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec, got Engine"),
         };
-        assert!(e.install(qid, Cell::Float(5.0)));
+        assert!(e.install(qid, Value::Float(5.0)));
 
-        match e.consumers(&delete_event(1, 5.0)) {
+        match e.consumers(&delete_event(tid, 1, 5.0)) {
             Ok(_) => panic!("expected Connector error, got Ok"),
             Err(ReExecError::Connector(MockError(msg))) => assert_eq!(msg, "queue empty"),
             Err(other) => panic!("expected Connector error, got {other:?}"),
@@ -634,7 +630,7 @@ mod tests {
     /// value so subsequent dispatches see it as the current state.
     #[test]
     fn snapshot_installs_via_connector() {
-        let mut e = engine_with_values(alloc::vec![Cell::Float(12.5)]);
+        let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(12.5)]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -650,19 +646,18 @@ mod tests {
         let snap = e.snapshot(qid).unwrap().expect("query_id exists");
         match snap {
             SnapshotResult::Scalar(value, checkpoint) => {
-                assert_eq!(value, Cell::Float(12.5));
+                assert_eq!(value, Value::Float(12.5));
                 // MockConnector returns checkpoint = None.
                 assert!(checkpoint.is_none());
             }
-            SnapshotResult::Rows(_, _) => panic!("expected Scalar"),
         }
         assert_eq!(e.connector().call_count(), 1);
 
         // After snapshot, the engine treats 12.5 as the current MIN.
         // An insert below it (e.g. 9.0) becomes the new in-process MIN.
-        let n = e.consumers(&insert_event(2, 9.0)).unwrap();
+        let n = e.consumers(&insert_event(tid, 2, 9.0)).unwrap();
         assert_eq!(n.scalar_updates.len(), 1);
-        assert_eq!(n.scalar_updates[0].value, Cell::Float(9.0));
+        assert_eq!(n.scalar_updates[0].value, Value::Float(9.0));
         // No additional connector call: the insert was resolved in-process.
         assert_eq!(e.connector().call_count(), 1);
     }
@@ -671,7 +666,7 @@ mod tests {
     /// than panicking so callers can race snapshot against unregister.
     #[test]
     fn snapshot_unknown_query_returns_none() {
-        let mut e = engine_with_values(alloc::vec![]);
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
         assert!(e.snapshot(99999).unwrap().is_none());
         // Connector was never called.
         assert_eq!(e.connector().call_count(), 0);
@@ -684,7 +679,7 @@ mod tests {
     fn consumers_batch_coalesces_repeated_triggers() {
         // Connector serves a single value, which is what we expect since
         // the trigger should be deduplicated to one call.
-        let mut e = engine_with_values(alloc::vec![Cell::Float(99.0)]);
+        let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(99.0)]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -696,14 +691,14 @@ mod tests {
             Registered::Engine(_) => panic!("expected ReExec, got Engine"),
         };
         // Bootstrap: extreme is 5.0.
-        assert!(e.install(qid, Cell::Float(5.0)));
+        assert!(e.install(qid, Value::Float(5.0)));
 
         // Three DELETEs of the current extreme. Each one in isolation
-        // would emit a trigger; the batch should collapse them.
+        // would emit a trigger, the batch should collapse them.
         let events = alloc::vec![
-            delete_event(1, 5.0),
-            delete_event(2, 5.0),
-            delete_event(3, 5.0),
+            delete_event(tid, 1, 5.0),
+            delete_event(tid, 2, 5.0),
+            delete_event(tid, 3, 5.0),
         ];
 
         let outcome = e.consumers_batch(&events).unwrap();
@@ -718,7 +713,7 @@ mod tests {
             "three displacing events must collapse to one connector call"
         );
         assert_eq!(outcome.scalar_updates.len(), 1);
-        assert_eq!(outcome.scalar_updates[0].value, Cell::Float(99.0));
+        assert_eq!(outcome.scalar_updates[0].value, Value::Float(99.0));
         assert!(
             outcome.triggers.is_empty(),
             "auto-resolving drains triggers"
@@ -730,7 +725,7 @@ mod tests {
     #[test]
     fn consumers_batch_connector_error_aborts() {
         // Empty value queue: connector errors on first call.
-        let mut e = engine_with_values(alloc::vec![]);
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -741,9 +736,9 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec, got Engine"),
         };
-        assert!(e.install(qid, Cell::Float(5.0)));
+        assert!(e.install(qid, Value::Float(5.0)));
 
-        let events = alloc::vec![delete_event(1, 5.0)];
+        let events = alloc::vec![delete_event(tid, 1, 5.0)];
 
         match e.consumers_batch(&events) {
             Ok(_) => panic!("expected Connector error, got Ok"),
@@ -761,7 +756,7 @@ mod tests {
         // (popped first) for one and 22.0 (popped second) for the other.
         // MockConnector pops from the back, so push values in reverse:
         // first pop = 22.0, second pop = 11.0.
-        let mut e = engine_with_values(alloc::vec![Cell::Float(22.0), Cell::Float(11.0)]);
+        let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(22.0), Value::Float(11.0)]);
         let qid1 = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
@@ -783,10 +778,10 @@ mod tests {
             Registered::Engine(_) => panic!("expected ReExec for MAX"),
         };
         // Bootstrap both at 7.0 so deleting price=7.0 displaces both.
-        assert!(e.install(qid1, Cell::Float(7.0)));
-        assert!(e.install(qid2, Cell::Float(7.0)));
+        assert!(e.install(qid1, Value::Float(7.0)));
+        assert!(e.install(qid2, Value::Float(7.0)));
 
-        let events = alloc::vec![delete_event(1, 7.0)];
+        let events = alloc::vec![delete_event(tid, 1, 7.0)];
         let outcome = e.consumers_batch(&events).unwrap();
         assert_eq!(e.connector().call_count(), 2, "one call per distinct query");
         assert_eq!(outcome.scalar_updates.len(), 2);
@@ -802,7 +797,7 @@ mod tests {
     /// next trigger fires normally.
     #[test]
     // The `.clone()` below needs the Arc<ManualClock> -> Arc<dyn Clock>
-    // unsize coercion at the assignment site; `Arc::clone(&clock)` would
+    // unsize coercion at the assignment site. `Arc::clone(&clock)` would
     // need an already-coerced source. Allow the clippy lint here.
     #[allow(clippy::clone_on_ref_ptr)]
     fn debounce_skips_within_window_and_fires_after() {
@@ -811,7 +806,8 @@ mod tests {
         // Two values in the connector queue: one for the first re-exec,
         // one for the post-window re-exec. The "within window" re-exec
         // is debounced and never reaches the connector.
-        let mut e = engine_with_values(alloc::vec![Cell::Float(20.0), Cell::Float(7.0)])
+        let (e0, tid) = engine_with_values(alloc::vec![Value::Float(20.0), Value::Float(7.0)]);
+        let mut e = e0
             .with_clock(engine_clock)
             .with_debounce_per_query(core::time::Duration::from_millis(100));
 
@@ -825,19 +821,19 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec"),
         };
-        assert!(e.install(qid, Cell::Float(5.0)));
+        assert!(e.install(qid, Value::Float(5.0)));
 
         // First displacing event: re-exec proceeds (no prior stamp).
-        let n = e.consumers(&delete_event(1, 5.0)).unwrap();
+        let n = e.consumers(&delete_event(tid, 1, 5.0)).unwrap();
         assert_eq!(n.scalar_updates.len(), 1);
-        assert_eq!(n.scalar_updates[0].value, Cell::Float(7.0));
+        assert_eq!(n.scalar_updates[0].value, Value::Float(7.0));
         assert_eq!(e.connector().call_count(), 1);
 
         // Second displacing event within 50ms (window is 100ms): skipped.
         clock.advance(core::time::Duration::from_millis(50));
         // The engine's MIN is currently 7.0 from the prior re-exec. To
         // force a second trigger we delete a row matching 7.0.
-        let n = e.consumers(&delete_event(2, 7.0)).unwrap();
+        let n = e.consumers(&delete_event(tid, 2, 7.0)).unwrap();
         assert!(
             n.scalar_updates.is_empty(),
             "debounced trigger must not emit a ScalarUpdate"
@@ -851,12 +847,12 @@ mod tests {
         // Past the window now: 50ms + 100ms = 150ms total since first.
         clock.advance(core::time::Duration::from_millis(100));
         // Reinstall the value the engine thinks is current so the next
-        // displacement is well-defined; the test exercises debounce,
+        // displacement is well-defined. The test exercises debounce,
         // not the state machine.
-        assert!(e.install(qid, Cell::Float(7.0)));
-        let n = e.consumers(&delete_event(3, 7.0)).unwrap();
+        assert!(e.install(qid, Value::Float(7.0)));
+        let n = e.consumers(&delete_event(tid, 3, 7.0)).unwrap();
         assert_eq!(n.scalar_updates.len(), 1, "post-window trigger must fire");
-        assert_eq!(n.scalar_updates[0].value, Cell::Float(20.0));
+        assert_eq!(n.scalar_updates[0].value, Value::Float(20.0));
         assert_eq!(e.connector().call_count(), 2);
     }
 
@@ -864,8 +860,8 @@ mod tests {
     /// triggers fire as normal.
     #[test]
     fn debounce_without_clock_is_a_noop() {
-        let mut e = engine_with_values(alloc::vec![Cell::Float(9.0), Cell::Float(7.0)])
-            .with_debounce_per_query(core::time::Duration::from_secs(3600));
+        let (e0, tid) = engine_with_values(alloc::vec![Value::Float(9.0), Value::Float(7.0)]);
+        let mut e = e0.with_debounce_per_query(core::time::Duration::from_secs(3600));
 
         let qid = match e
             .register(
@@ -877,23 +873,23 @@ mod tests {
             Registered::ReExec { query_id, .. } => query_id,
             Registered::Engine(_) => panic!("expected ReExec"),
         };
-        assert!(e.install(qid, Cell::Float(5.0)));
+        assert!(e.install(qid, Value::Float(5.0)));
 
         assert!(!e
-            .consumers(&delete_event(1, 5.0))
+            .consumers(&delete_event(tid, 1, 5.0))
             .unwrap()
             .scalar_updates
             .is_empty());
         // The engine now has 7.0 installed. Deleting it again fires another
-        // trigger - the debounce-without-clock case must NOT skip it.
-        let n = e.consumers(&delete_event(2, 7.0)).unwrap();
+        // trigger. The debounce-without-clock case must NOT skip it.
+        let n = e.consumers(&delete_event(tid, 2, 7.0)).unwrap();
         assert_eq!(n.scalar_updates.len(), 1, "no clock -> no debounce");
         assert_eq!(e.connector().call_count(), 2);
     }
 
     #[test]
     fn unregister_drops_auth_context() {
-        let mut e = engine_with_values(alloc::vec![]);
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
         let qid = match e
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),

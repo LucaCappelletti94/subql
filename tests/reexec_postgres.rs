@@ -6,7 +6,7 @@
 //!   coexist on one engine. Each gets the right kind of notification when
 //!   the corresponding WAL event arrives.
 //! * The [`DieselConnector`] re-executes the captured query's SQL against
-//!   real Postgres and decodes a scalar [`Cell`] correctly.
+//!   real Postgres and decodes a scalar [`Value<Postgres>`] correctly.
 //!
 //! Requires Docker. Tests are `#[ignore]`d so default `cargo test` does
 //! not spin up containers. Run with:
@@ -29,13 +29,11 @@ mod common;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{Postgres, Value};
 use subql::reexec::{
     AutoResolvingEngine, Connector, PgDieselConnector, ReExecEngine, Registered, SnapshotResult,
 };
-use subql::{
-    Cell, DefaultIds, SubscriptionEngine, SubscriptionRequest, Wal2JsonV2Parser, WalEvent,
-    WalParser,
-};
+use subql::{parse_wal2json_v2, DefaultIds, MessageV2, SubscriptionEngine, SubscriptionRequest};
 
 const SLOT: &str = "subql_test";
 const DDL: &str =
@@ -79,26 +77,17 @@ fn catalog() -> ParserDB {
 fn build_engine(
     catalog: ParserDB,
     conn_exec: PgConnection,
-) -> AutoResolvingEngine<PostgreSqlDialect, DefaultIds, ParserDB, PgDieselConnector> {
-    let inner = SubscriptionEngine::<PostgreSqlDialect, DefaultIds, ParserDB>::new(
-        catalog,
-        PostgreSqlDialect {},
-    );
+) -> AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, PgDieselConnector> {
+    let inner =
+        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
     AutoResolvingEngine::new(ReExecEngine::new(inner), PgDieselConnector::new(conn_exec))
 }
 
-/// Parse one wal2json v2 message into zero or more [`WalEvent`]s. The parser
-/// emits 0 events for relation-only messages (begin/commit/relation), which
-/// the test must tolerate.
-#[allow(dead_code)] // used by the step-3 / step-4 tests
-fn parse_message(
-    parser: &Wal2JsonV2Parser,
-    catalog: &ParserDB,
-    msg: &str,
-) -> Vec<WalEvent<subql::PgLsn>> {
-    parser
-        .parse_wal_message(msg.as_bytes(), catalog)
-        .expect("wal2json parse")
+/// Parse one wal2json v2 message into zero or more [`MessageV2`]s.
+/// The parser emits 0 events for relation-only messages (begin/commit/
+/// relation), which the test must tolerate.
+fn parse_message(msg: &str) -> Vec<MessageV2> {
+    parse_wal2json_v2(msg.as_bytes()).expect("wal2json parse")
 }
 
 /// Harness health check: container starts, three PG connections, catalog
@@ -122,7 +111,10 @@ fn scaffold_registers_both_subscription_kinds() {
 
     let engine_reg = engine
         .register(
-            SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE price > 8.0"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT * FROM orders WHERE price > 8.0",
+            ),
             (),
         )
         .expect("engine-supported registration");
@@ -133,13 +125,13 @@ fn scaffold_registers_both_subscription_kinds() {
 
     let captured_reg = engine
         .register(
-            SubscriptionRequest::new(2u64, "SELECT MIN(price) FROM orders"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(2u64, "SELECT MIN(price) FROM orders"),
             (),
         )
         .expect("captured registration");
     match captured_reg {
         Registered::ReExec { query_id, .. } => {
-            assert!(engine.install(query_id, Cell::Float(5.0)));
+            assert!(engine.install(query_id, Value::Float(5.0)));
         }
         Registered::Engine(_) => panic!("expected ReExec variant"),
     }
@@ -150,7 +142,7 @@ fn scaffold_registers_both_subscription_kinds() {
         .connector()
         .execute_scalar(
             "SELECT MIN(price) AS v FROM orders",
-            subql::ColumnType::Float,
+            subql::backend::ScalarKind::Float,
             &(),
         )
         .expect("connector executes");
@@ -186,7 +178,10 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     let engine_consumer: u64 = 1;
     let engine_reg = engine
         .register(
-            SubscriptionRequest::new(engine_consumer, "SELECT * FROM orders WHERE price > 8.0"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                engine_consumer,
+                "SELECT * FROM orders WHERE price > 8.0",
+            ),
             (),
         )
         .expect("engine registration");
@@ -194,7 +189,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
 
     let captured_qid = match engine
         .register(
-            SubscriptionRequest::new(2u64, "SELECT MIN(price) FROM orders"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(2u64, "SELECT MIN(price) FROM orders"),
             (),
         )
         .expect("captured registration")
@@ -202,7 +197,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         Registered::ReExec { query_id, .. } => query_id,
         Registered::Engine(_) => panic!("expected ReExec"),
     };
-    assert!(engine.install(captured_qid, Cell::Float(5.0)));
+    assert!(engine.install(captured_qid, Value::Float(5.0)));
 
     // The replication slot was created after the seed inserts, so it's
     // already empty. No pre-drain needed.
@@ -222,10 +217,9 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         "expected at least one wal2json message after INSERT+DELETE"
     );
 
-    let parser = Wal2JsonV2Parser;
-    let mut events: Vec<WalEvent<subql::PgLsn>> = Vec::new();
+    let mut events: Vec<MessageV2> = Vec::new();
     for msg in &msgs {
-        events.extend(parse_message(&parser, &catalog(), msg));
+        events.extend(parse_message(msg));
     }
     assert_eq!(
         events.len(),
@@ -269,7 +263,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         total_scalar_updates.len()
     );
     assert_eq!(total_scalar_updates[0].query_id, captured_qid);
-    assert_eq!(total_scalar_updates[0].value, Cell::Float(9.0));
+    assert_eq!(total_scalar_updates[0].value, Value::Float(9.0));
     assert_eq!(total_triggers, 0, "auto-resolving engine drains triggers");
 }
 
@@ -298,7 +292,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
 
     let captured_qid = match engine
         .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, "SELECT MIN(price) FROM orders"),
             (),
         )
         .expect("captured registration")
@@ -306,24 +300,23 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
         Registered::ReExec { query_id, .. } => query_id,
         Registered::Engine(_) => panic!("expected ReExec"),
     };
-    assert!(engine.install(captured_qid, Cell::Float(5.0)));
+    assert!(engine.install(captured_qid, Value::Float(5.0)));
 
     sql_query("UPDATE orders SET price = 20.0 WHERE id = 1")
         .execute(&mut conn_dml)
         .expect("update id=1 price=20.0");
 
     let msgs = common::drain_slot(&mut conn_setup, SLOT);
-    let parser = Wal2JsonV2Parser;
-    let mut events: Vec<WalEvent<subql::PgLsn>> = Vec::new();
+    let mut events: Vec<MessageV2> = Vec::new();
     for msg in &msgs {
-        events.extend(parse_message(&parser, &catalog(), msg));
+        events.extend(parse_message(msg));
     }
     assert_eq!(events.len(), 1, "expected exactly one UPDATE event");
 
     let notifs = engine.consumers(&events[0]).expect("consumers dispatch");
     assert_eq!(notifs.scalar_updates.len(), 1, "expected one ScalarUpdate");
     assert_eq!(notifs.scalar_updates[0].query_id, captured_qid);
-    assert_eq!(notifs.scalar_updates[0].value, Cell::Float(20.0));
+    assert_eq!(notifs.scalar_updates[0].value, Value::Float(20.0));
     assert!(notifs.triggers.is_empty());
 }
 
@@ -331,7 +324,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
 ///
 /// Seeds the table with `(1, 5.0), (2, 9.0)`, registers `MIN(price)`, then
 /// calls `engine.snapshot(qid)` BEFORE any CDC events. The result should be
-/// `SnapshotResult::Scalar(Cell::Float(5.0), Some(PgLsn(_)))` where the
+/// `SnapshotResult::Scalar(Value::Float(5.0), Some(PgLsn(_)))` where the
 /// LSN is non-zero (PG always has a position). Subsequent dispatches then
 /// see 5.0 as the current MIN without any further connector calls because
 /// `snapshot` already installed the value.
@@ -351,7 +344,7 @@ fn snapshot_reads_value_and_lsn_from_pg() {
 
     let captured_qid = match engine
         .register(
-            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+            SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, "SELECT MIN(price) FROM orders"),
             (),
         )
         .expect("captured registration")
@@ -367,10 +360,9 @@ fn snapshot_reads_value_and_lsn_from_pg() {
         .expect("query_id exists");
     let (value, checkpoint) = match snap {
         SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
-        SnapshotResult::Rows(_, _) => panic!("expected Scalar variant"),
         other => panic!("unexpected snapshot variant: {other:?}"),
     };
-    assert_eq!(value, Cell::Float(5.0), "MIN(price) snapshot value");
+    assert_eq!(value, Value::Float(5.0), "MIN(price) snapshot value");
 
     let lsn = checkpoint.expect("PgDieselConnector must report a checkpoint");
     assert!(

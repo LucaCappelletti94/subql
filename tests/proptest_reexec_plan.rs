@@ -17,9 +17,9 @@
 //!    every cell type, so neither the classifier nor the engine has
 //!    grounds to reject them.
 //! 2. **The reported `column_type` matches the column's declared type.**
-//!    `MIN(price)` returns `ColumnType::Float`. `MIN(quantity)`
-//!    returns `ColumnType::Int`. `MIN(status)` returns
-//!    `ColumnType::String`.
+//!    `MIN(price)` returns `ScalarKind::Float`. `MIN(quantity)`
+//!    returns `ScalarKind::Int`. `MIN(status)` returns
+//!    `ScalarKind::String`.
 //! 3. **The returned SQL carries the canonical projection alias `v`.**
 //!    Materializers load the scalar back by that alias.
 //! 4. **Distinct queries get distinct `query_id`s within one engine.**
@@ -31,13 +31,15 @@ use std::collections::HashSet;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::{Postgres, ScalarKind};
 use subql::reexec::{ReExecEngine, Registered};
-use subql::{ColumnType, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use subql::testing::TestEvent;
+use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 const CATALOG_DDL: &str = "CREATE TABLE orders (\
     id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 
-type Engine = ReExecEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
+type Engine = ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn fresh_engine() -> Engine {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap();
@@ -60,11 +62,11 @@ impl AggCol {
         }
     }
 
-    const fn column_type(self) -> ColumnType {
+    const fn scalar_kind(self) -> ScalarKind {
         match self {
-            Self::Price => ColumnType::Float,
-            Self::Quantity => ColumnType::Int,
-            Self::Status => ColumnType::String,
+            Self::Price => ScalarKind::Float,
+            Self::Quantity => ScalarKind::Int,
+            Self::Status => ScalarKind::String,
         }
     }
 }
@@ -198,19 +200,19 @@ proptest! {
     ) {
         let mut engine = fresh_engine();
         let registered = engine
-            .register(SubscriptionRequest::new(consumer, &sql))
+            .register(SubscriptionRequest::<DefaultIds, Postgres>::new(consumer, sql.clone()))
             .unwrap_or_else(|e| panic!("`{sql}` should classify as ReExec, got error: {e:?}"));
 
         match registered {
             Registered::ReExec {
-                column_type,
+                column_kind,
                 sql: reexec_sql,
                 ..
             } => {
                 prop_assert_eq!(
-                    column_type,
-                    col.column_type(),
-                    "agg={:?} col={:?}: column_type drift",
+                    column_kind,
+                    col.scalar_kind(),
+                    "agg={:?} col={:?}: column_kind drift",
                     agg,
                     col.name(),
                 );
@@ -248,7 +250,7 @@ proptest! {
             let Some(_) = seen_sql.get(sql) else {
                 seen_sql.insert(sql.clone());
                 let registered = engine
-                    .register(SubscriptionRequest::new(i as u64, sql))
+                    .register(SubscriptionRequest::<DefaultIds, Postgres>::new(i as u64, sql.clone()))
                     .unwrap();
                 if let Registered::ReExec { query_id, .. } = registered {
                     prop_assert!(

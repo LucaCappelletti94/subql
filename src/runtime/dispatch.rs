@@ -1,19 +1,31 @@
+#![allow(clippy::type_complexity)]
 //! Event dispatch pipeline
 
 use super::{
-    agg::agg_delta_for_row,
+    agg::{agg_delta_for_row, AggCellRead},
     ids::{ConsumerOrdinal, PredicateId},
-    partition::TablePartition,
+    partition::{ColumnProbe, TablePartition},
     predicate::{Predicate, PredicateStore},
 };
+use crate::backend::{Backend, CdcEvent, RowKind, Value};
+use crate::runtime::indexes::IndexableCell;
 use crate::{
-    compiler::{sql_shape::QueryProjection, Tri, Vm},
-    AggDelta, Cell, Checkpoint, ConsumerNotifications, DispatchError, EventKind, IdTypes, RowImage,
-    SubscriptionId, WalEvent,
+    compiler::{sql_shape::QueryProjection, Tri, Vm, VmError},
+    AggDelta, ConsumerNotifications, DispatchError, EventKind, IdTypes, SubscriptionId,
 };
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 use roaring::RoaringBitmap;
+use sql_traits::prelude::DatabaseLike;
+
+/// Map a [`VmError`] surfaced during evaluation into a [`DispatchError`],
+/// preserving a structured cell-decode failure as [`DispatchError::Value`].
+fn dispatch_vm_error(error: VmError) -> DispatchError {
+    match error {
+        VmError::Value(inner) => DispatchError::Value(inner),
+        other => DispatchError::VmError(format!("{other:?}")),
+    }
+}
 
 /// Consumer dictionary translating between ordinals and ConsumerIds.
 ///
@@ -150,43 +162,14 @@ impl<I: IdTypes> Iterator for MatchedConsumers<'_, I> {
     }
 }
 
-/// Select the row image used for dispatch based on event kind.
-fn require_new_row<'a, C: Checkpoint>(
-    event: &'a WalEvent<C>,
-    message: &'static str,
-) -> Result<&'a RowImage, DispatchError> {
-    event
-        .new_row()
-        .ok_or(DispatchError::MissingRequiredRowImage(message))
-}
-
-fn require_old_row<'a, C: Checkpoint>(
-    event: &'a WalEvent<C>,
-    message: &'static str,
-) -> Result<&'a RowImage, DispatchError> {
-    event
-        .old_row()
-        .ok_or(DispatchError::MissingRequiredRowImage(message))
-}
-
-pub(crate) fn select_event_row<C: Checkpoint>(
-    event: &WalEvent<C>,
-) -> Result<&RowImage, DispatchError> {
-    match event.kind() {
-        EventKind::Insert => require_new_row(event, "INSERT requires new_row"),
-        EventKind::Update => require_new_row(event, "UPDATE requires new_row"),
-        EventKind::Delete => require_old_row(event, "DELETE requires old_row"),
-        EventKind::Truncate => Err(DispatchError::MissingRequiredRowImage(
-            "TRUNCATE has no row image",
-        )),
-    }
-}
-
-fn notifications_for_truncate_with_stamps<I: IdTypes, C: Checkpoint>(
-    partition: &TablePartition<I>,
+fn notifications_for_truncate_with_stamps<I: IdTypes, B: Backend, C>(
+    partition: &TablePartition<I, B>,
     consumer_dict: &ConsumerDictionary<I>,
     stamps: &mut Vec<SubscriptionId>,
-) -> ConsumerNotifications<I, C> {
+) -> ConsumerNotifications<I, C>
+where
+    C: crate::Checkpoint,
+{
     let snapshot = partition.load_snapshot();
     let mut ordinals = RoaringBitmap::new();
     for (pred_id, consumers) in &snapshot.predicates.predicate_consumers {
@@ -222,47 +205,71 @@ fn resolve_ordinals<I: IdTypes>(
     result
 }
 
-/// Dispatch event to interested consumers, returning view-relative notifications.
+/// Dispatch an event to interested consumers, returning view-relative
+/// notifications.
 ///
-/// Routes by event kind:
-/// - INSERT: single-eval against new_row, all matches to `inserted`
-/// - DELETE: single-eval against old_row, all matches to `deleted`
-/// - UPDATE: dual-eval (old_row + new_row), three-way split
-/// - TRUNCATE: all row subscribers to `deleted`
-pub fn dispatch_consumers<I: IdTypes, C: Checkpoint>(
-    event: &WalEvent<C>,
-    partition: &TablePartition<I>,
+/// Routes by [`EventKind`]:
+/// * `Insert` -> single-eval on [`RowKind::New`], all matches to `inserted`.
+/// * `Delete` -> single-eval on [`RowKind::Old`], all matches to `deleted`.
+/// * `Update` -> dual-eval (old + new), three-way split.
+/// * `Truncate` -> all row subscribers to `deleted`.
+///
+/// `arity` is the target table's column count, used to bound index
+/// candidate selection.
+pub fn dispatch_consumers<I, E, DB>(
+    event: &E,
+    partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
-    vm: &mut Vm,
-) -> Result<ConsumerNotifications<I, C>, DispatchError> {
-    let (notifs, _) = dispatch_consumers_with_stamps(event, partition, consumer_dict, vm)?;
+    vm: &mut Vm<E::Backend>,
+    arity: usize,
+    db: &DB,
+) -> Result<ConsumerNotifications<I, E::Checkpoint>, DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    let (notifs, _) =
+        dispatch_consumers_with_stamps(event, partition, consumer_dict, vm, arity, db)?;
     Ok(notifs)
 }
 
-/// Like [`dispatch_consumers`] but also returns the `SubscriptionId`s whose
-/// bindings contributed to a match.
+/// Like [`dispatch_consumers`] but also returns the `SubscriptionId`s
+/// whose bindings contributed to a match.
 ///
-/// Used by activity-aware eviction policies (`EvictLeastActive`, `EvictColdest`,
-/// and custom policies reading activity stats) to stamp matched subscriptions in
-/// O(1) per matched pair via the `binding_lookup` index on `PredicateStore`.
-/// Callers that do not need stamps should use [`dispatch_consumers`].
-pub fn dispatch_consumers_with_stamps<I: IdTypes, C: Checkpoint>(
-    event: &WalEvent<C>,
-    partition: &TablePartition<I>,
+/// Used by activity-aware eviction policies to stamp matched
+/// subscriptions in O(1) per matched pair via the `binding_lookup` index
+/// on `PredicateStore`.
+pub fn dispatch_consumers_with_stamps<I, E, DB>(
+    event: &E,
+    partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
-    vm: &mut Vm,
-) -> Result<(ConsumerNotifications<I, C>, Vec<SubscriptionId>), DispatchError> {
-    let checkpoint = event.checkpoint().cloned();
+    vm: &mut Vm<E::Backend>,
+    arity: usize,
+    db: &DB,
+) -> Result<(ConsumerNotifications<I, E::Checkpoint>, Vec<SubscriptionId>), DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    let checkpoint = event.checkpoint();
     let mut stamps: Vec<SubscriptionId> = Vec::new();
-    let notifs: ConsumerNotifications<I, C> = match event.kind() {
+    let notifs: ConsumerNotifications<I, E::Checkpoint> = match event.kind() {
         EventKind::Truncate => {
             let _ = vm;
             notifications_for_truncate_with_stamps(partition, consumer_dict, &mut stamps)
         }
         EventKind::Insert => {
-            let row = require_new_row(event, "INSERT requires new_row")?;
-            let bitmap =
-                dispatch_single_eval_bitmap_with_stamps(event, row, partition, vm, &mut stamps)?;
+            let bitmap = dispatch_single_eval_bitmap_with_stamps(
+                event,
+                RowKind::New,
+                partition,
+                vm,
+                arity,
+                db,
+                &mut stamps,
+            )?;
             ConsumerNotifications::from_parts(
                 resolve_ordinals(bitmap, consumer_dict),
                 Vec::new(),
@@ -270,24 +277,36 @@ pub fn dispatch_consumers_with_stamps<I: IdTypes, C: Checkpoint>(
             )
         }
         EventKind::Delete => {
-            let row = require_old_row(event, "DELETE requires old_row")?;
-            let bitmap =
-                dispatch_single_eval_bitmap_with_stamps(event, row, partition, vm, &mut stamps)?;
+            let bitmap = dispatch_single_eval_bitmap_with_stamps(
+                event,
+                RowKind::Old,
+                partition,
+                vm,
+                arity,
+                db,
+                &mut stamps,
+            )?;
             ConsumerNotifications::from_parts(
                 Vec::new(),
                 resolve_ordinals(bitmap, consumer_dict),
                 Vec::new(),
             )
         }
-        EventKind::Update => {
-            dispatch_update_with_stamps(event, partition, consumer_dict, vm, &mut stamps)?
-        }
+        EventKind::Update => dispatch_update_with_stamps(
+            event,
+            partition,
+            consumer_dict,
+            vm,
+            arity,
+            db,
+            &mut stamps,
+        )?,
     };
     Ok((notifs.with_checkpoint(checkpoint), stamps))
 }
 
-fn collect_stamps_for_predicate<I: IdTypes>(
-    predicates: &PredicateStore<I>,
+fn collect_stamps_for_predicate<I: IdTypes, B: Backend>(
+    predicates: &PredicateStore<I, B>,
     pred_id: PredicateId,
     consumers: &RoaringBitmap,
     out: &mut Vec<SubscriptionId>,
@@ -300,48 +319,37 @@ fn collect_stamps_for_predicate<I: IdTypes>(
     }
 }
 
-/// Returns `true` when `old_row` is present and complete (no `Cell::Missing`),
-/// meaning dual-eval is possible for view-relative UPDATE dispatch.
-fn old_row_is_complete<C: Checkpoint>(event: &WalEvent<C>) -> bool {
-    event
-        .old_row()
-        .is_some_and(|row| !row.cells.iter().any(Cell::is_missing))
-}
-
-/// Dual-eval dispatch for UPDATE events: evaluates both old and new rows to
-/// produce view-relative `inserted` / `deleted` / `updated` sets.
+/// Dual-eval dispatch for UPDATE events: evaluates both old and new rows
+/// to produce view-relative `inserted` / `deleted` / `updated` sets.
 ///
-/// When a complete `old_row` is available (REPLICA IDENTITY FULL), the three-way
-/// split is exact. When `old_row` is absent or partial, falls back to single-eval
-/// on `new_row`, sending all matches to `updated` (conservative: we cannot prove
-/// they are new entries).
-fn dispatch_update_with_stamps<I: IdTypes, C: Checkpoint>(
-    event: &WalEvent<C>,
-    partition: &TablePartition<I>,
+/// Callers whose source cannot provide a complete old row (Postgres
+/// REPLICA IDENTITY DEFAULT for example) will see `Value::Missing` on
+/// old-row accessors, causing the VM to return `Tri::Unknown`. Unknown
+/// verdicts collapse to "did not match" in this splitter — that is
+/// conservative-safe but may misclassify view membership. A future
+/// enhancement would surface the incompleteness through a
+/// `CdcEvent::has_complete_row` method and fall back to single-eval on
+/// the new row (matches to `updated`, matching pre-Phase-5 behaviour).
+fn dispatch_update_with_stamps<I, E, DB>(
+    event: &E,
+    partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
-    vm: &mut Vm,
+    vm: &mut Vm<E::Backend>,
+    arity: usize,
+    db: &DB,
     stamps: &mut Vec<SubscriptionId>,
-) -> Result<ConsumerNotifications<I, C>, DispatchError> {
-    let new_row = require_new_row(event, "UPDATE requires new_row")?;
-
-    // When old_row is missing or partial, fall back to single-eval on new_row.
-    // All matches go to `updated` (we can't distinguish entered vs stayed).
-    if !old_row_is_complete(event) {
-        let bitmap =
-            dispatch_single_eval_bitmap_with_stamps(event, new_row, partition, vm, stamps)?;
-        return Ok(ConsumerNotifications::from_parts(
-            Vec::new(),
-            Vec::new(),
-            resolve_ordinals(bitmap, consumer_dict),
-        ));
-    }
-
-    // Safety: old_row_is_complete guarantees old_row is Some with no Cell::Missing.
-    let old_row = event.old_row().expect("checked by old_row_is_complete");
-
-    // Use the UPDATE candidate set (dependency-aware).
-    let candidates =
-        partition.select_candidates(new_row, EventKind::Update, event.changed_columns());
+) -> Result<ConsumerNotifications<I, E::Checkpoint>, DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    let candidates = partition.select_candidates(
+        arity,
+        |col| probe_column_for_index(event, RowKind::New, col, arity, db),
+        EventKind::Update,
+        &event.changed_columns(db),
+    );
     let snapshot = partition.load_snapshot();
 
     let mut inserted_ordinals = RoaringBitmap::new();
@@ -362,33 +370,15 @@ fn dispatch_update_with_stamps<I: IdTypes, C: Checkpoint>(
             continue;
         }
 
-        // Evaluate new_row.
-        let new_match = {
-            if pred.prefilter_plan.requires_prefilter_eval
-                && !pred.prefilter_plan.may_match(new_row)
-            {
-                false
-            } else {
-                let result = vm
-                    .eval(&pred.bytecode, new_row)
-                    .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
-                result == Tri::True
-            }
-        };
+        let new_match = vm
+            .eval(&pred.bytecode, event, RowKind::New, db)
+            .map_err(dispatch_vm_error)?
+            == Tri::True;
 
-        // Evaluate old_row.
-        let old_match = {
-            if pred.prefilter_plan.requires_prefilter_eval
-                && !pred.prefilter_plan.may_match(old_row)
-            {
-                false
-            } else {
-                let result = vm
-                    .eval(&pred.bytecode, old_row)
-                    .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
-                result == Tri::True
-            }
-        };
+        let old_match = vm
+            .eval(&pred.bytecode, event, RowKind::Old, db)
+            .map_err(dispatch_vm_error)?
+            == Tri::True;
 
         if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
             match (new_match, old_match) {
@@ -416,25 +406,39 @@ fn dispatch_update_with_stamps<I: IdTypes, C: Checkpoint>(
     ))
 }
 
-/// Single-eval dispatch: evaluate one row, return the matching ordinals bitmap
-/// and accumulate matched subscription ids into `stamps`.
-/// Used for INSERT (new_row) and DELETE (old_row).
-fn dispatch_single_eval_bitmap_with_stamps<I: IdTypes, C: Checkpoint>(
-    event: &WalEvent<C>,
-    row: &RowImage,
-    partition: &TablePartition<I>,
-    vm: &mut Vm,
+/// Single-eval dispatch: evaluate one row_kind, return the matching
+/// ordinals bitmap and accumulate matched subscription ids into `stamps`.
+/// Used for INSERT (New) and DELETE (Old).
+fn dispatch_single_eval_bitmap_with_stamps<I, E, DB>(
+    event: &E,
+    row: RowKind,
+    partition: &TablePartition<I, E::Backend>,
+    vm: &mut Vm<E::Backend>,
+    arity: usize,
+    db: &DB,
     stamps: &mut Vec<SubscriptionId>,
-) -> Result<RoaringBitmap, DispatchError> {
-    let candidates = partition.select_candidates(row, event.kind(), event.changed_columns());
+) -> Result<RoaringBitmap, DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    let candidates = partition.select_candidates(
+        arity,
+        |col| probe_column_for_index(event, row, col, arity, db),
+        event.kind(),
+        &event.changed_columns(db),
+    );
     let snapshot = partition.load_snapshot();
     let mut matching_ordinals = RoaringBitmap::new();
 
     for_each_matching_predicate(
         &candidates,
         &snapshot.predicates,
+        event,
         row,
         vm,
+        db,
         |pred, consumers| {
             if matches!(pred.projection, QueryProjection::Rows) {
                 matching_ordinals |= consumers;
@@ -447,21 +451,20 @@ fn dispatch_single_eval_bitmap_with_stamps<I: IdTypes, C: Checkpoint>(
     Ok(matching_ordinals)
 }
 
-/// Iterate over candidate predicates, evaluate each against a row, and invoke
-/// the callback for every match.
-///
-/// This is the inner hot-loop shared by both row dispatch
-/// and `compute_agg_deltas` (aggregate subscriptions).
-fn for_each_matching_predicate<I, F>(
+fn for_each_matching_predicate<I, E, F, DB>(
     candidates: &RoaringBitmap,
-    store: &PredicateStore<I>,
-    row: &RowImage,
-    vm: &mut Vm,
+    store: &PredicateStore<I, E::Backend>,
+    event: &E,
+    row: RowKind,
+    vm: &mut Vm<E::Backend>,
+    db: &DB,
     mut on_match: F,
 ) -> Result<(), DispatchError>
 where
     I: IdTypes,
-    F: FnMut(&Predicate, &RoaringBitmap) -> Result<(), DispatchError>,
+    E: CdcEvent,
+    DB: DatabaseLike,
+    F: FnMut(&Predicate<E::Backend>, &RoaringBitmap) -> Result<(), DispatchError>,
 {
     for pred_id_u32 in candidates {
         let Some(pred_id) = super::ids::PredicateId::try_from_u32(pred_id_u32) else {
@@ -472,15 +475,9 @@ where
             continue;
         };
 
-        // Prefilter: skip VM when the plan can statically rule out the row.
-        if pred.prefilter_plan.requires_prefilter_eval && !pred.prefilter_plan.may_match(row) {
-            continue;
-        }
-
-        // VM evaluation
         let result = vm
-            .eval(&pred.bytecode, row)
-            .map_err(|e| DispatchError::VmError(format!("{e:?}")))?;
+            .eval(&pred.bytecode, event, row, db)
+            .map_err(dispatch_vm_error)?;
 
         if result == Tri::True {
             if let Some(bitmap) = store.predicate_consumers.get(&pred_id) {
@@ -491,113 +488,126 @@ where
     Ok(())
 }
 
-fn weighted_rows_for_agg<C: Checkpoint>(
-    event: &WalEvent<C>,
-) -> Result<Vec<(i64, &RowImage)>, DispatchError> {
+/// Weighted-row pairs for aggregate delta computation.
+///
+/// Delta normalization per event kind:
+/// * `Insert`   -> `[(+1, RowKind::New)]`
+/// * `Delete`   -> `[(-1, RowKind::Old)]`
+/// * `Update`   -> `[(-1, RowKind::Old), (+1, RowKind::New)]`
+/// * `Truncate` -> `Err(TruncateRequiresReset)`
+fn weighted_rows_for_agg<E: CdcEvent, DB: DatabaseLike>(
+    event: &E,
+    db: &DB,
+) -> Result<Vec<(i64, RowKind)>, DispatchError> {
     match event.kind() {
-        EventKind::Insert => Ok(vec![(
-            1,
-            require_new_row(event, "INSERT requires new_row")?,
-        )]),
-        EventKind::Delete => Ok(vec![(
-            -1,
-            require_old_row(event, "DELETE requires old_row")?,
-        )]),
-        EventKind::Update => {
-            let old_row = event
-                .old_row()
-                .ok_or_else(|| DispatchError::AggregateUpdateRequiresOldRow(event.table_id()))?;
-            // Reject partial old rows: Cell::Missing would produce unsound deltas
-            if old_row.cells.iter().any(Cell::is_missing) {
-                return Err(DispatchError::AggregateUpdateRequiresOldRow(
-                    event.table_id(),
-                ));
-            }
-            let new_row = require_new_row(event, "UPDATE requires new_row")?;
-            Ok(vec![(-1, old_row), (1, new_row)])
-        }
-        EventKind::Truncate => Err(DispatchError::TruncateRequiresReset(event.table_id())),
+        EventKind::Insert => Ok(vec![(1, RowKind::New)]),
+        EventKind::Delete => Ok(vec![(-1, RowKind::Old)]),
+        EventKind::Update => Ok(vec![(-1, RowKind::Old), (1, RowKind::New)]),
+        EventKind::Truncate => Err(DispatchError::TruncateRequiresReset(event.table_id(db))),
     }
 }
 
-/// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), ...).
+/// Compute typed signed deltas for aggregate subscriptions
+/// (`COUNT(*)`, `SUM(col)`, `AVG(col)`, ...).
 ///
-/// Delta normalization per event kind:
-/// - `Insert`   -> `[(+1, new_row)]`
-/// - `Delete`   -> `[(-1, old_row)]`
-/// - `Update`   -> `[(-1, old_row), (+1, new_row)]`
-/// - `Truncate` -> `Err(TruncateRequiresReset)`
-///
-/// For each `(weight, row)` pair, selects agg candidate predicates, prefilters,
-/// VM-evaluates, and accumulates weight per user. Zero-net entries are filtered
-/// out. The same user may appear multiple times (once per aggregate kind).
+/// See [`weighted_rows_for_agg`] for the per-event-kind normalization.
+/// For each `(weight, row_kind)` pair, selects agg candidate predicates,
+/// VM-evaluates them, and accumulates weight per user through the
+/// appropriate [`AggDelta`] variant. Zero-net entries are filtered out.
+/// The same user may appear multiple times in the result (once per
+/// aggregate kind).
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-pub(crate) fn compute_agg_deltas<I: IdTypes, C: Checkpoint>(
-    event: &WalEvent<C>,
-    partition: &TablePartition<I>,
+pub(crate) fn compute_agg_deltas<I, E, DB>(
+    event: &E,
+    partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
-    vm: &mut Vm,
-) -> Result<Vec<(I::ConsumerId, AggDelta)>, DispatchError> {
-    let weighted_rows = weighted_rows_for_agg(event)?;
+    vm: &mut Vm<E::Backend>,
+    arity: usize,
+    db: &DB,
+) -> Result<Vec<(I::ConsumerId, AggDelta)>, DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    let weighted_rows = weighted_rows_for_agg(event, db)?;
 
     // Separate accumulators for each aggregate kind (avoids mixed-type confusion).
     let mut count_weights: HashMap<ConsumerOrdinal, i64> = HashMap::new();
     let mut sum_weights: HashMap<ConsumerOrdinal, f64> = HashMap::new();
-    // AVG accumulator: (sum_delta, count_delta)
+    // AVG accumulator: (sum_delta, count_delta).
     let mut avg_accum: HashMap<ConsumerOrdinal, (f64, i64)> = HashMap::new();
-    // VAR/STDDEV accumulator: (sum_delta, sum_sq_delta, count_delta)
+    // VAR / STDDEV accumulator: (sum_delta, sum_sq_delta, count_delta).
     let mut stats_accum: HashMap<ConsumerOrdinal, (f64, f64, i64)> = HashMap::new();
 
     let snapshot = partition.load_snapshot();
 
-    // For UPDATE, use dependency-aware candidate selection; for INSERT/DELETE
-    // pass empty changed_cols to get all agg candidates.
-    let changed_cols = if event.kind() == EventKind::Update {
-        event.changed_columns()
+    // For UPDATE, use dependency-aware candidate selection; for INSERT /
+    // DELETE pass empty changed_cols to get all agg candidates.
+    let changed_cols: Vec<crate::ColumnId> = if event.kind() == EventKind::Update {
+        event.changed_columns(db)
     } else {
-        &[]
+        Vec::new()
     };
-    let candidates = partition.select_agg_candidates(event.kind(), changed_cols);
+    let candidates = partition.select_agg_candidates(event.kind(), &changed_cols);
 
     for (weight, row) in weighted_rows {
         for_each_matching_predicate(
             &candidates,
             &snapshot.predicates,
+            event,
             row,
             vm,
+            db,
             |pred, consumers| {
-                let QueryProjection::Aggregate(ref spec) = pred.projection else {
+                let QueryProjection::Aggregate(spec) = &pred.projection else {
                     return Ok(());
                 };
 
-                if let Some(delta) = agg_delta_for_row(spec, row, weight) {
-                    for ord_u32 in consumers {
-                        let ord = ConsumerOrdinal::new(ord_u32);
-                        match &delta {
-                            AggDelta::Count(n) => {
-                                *count_weights.entry(ord).or_default() += *n;
+                let mut decode_err: Option<crate::ValueError> = None;
+                let maybe_delta =
+                    agg_delta_for_row(spec, weight, |col| {
+                        match probe_column_for_agg(event, row, col, arity, db) {
+                            Ok(read) => read,
+                            Err(error) => {
+                                decode_err = Some(error);
+                                AggCellRead::Missing
                             }
-                            AggDelta::Sum(v) => {
-                                *sum_weights.entry(ord).or_default() += *v;
-                            }
-                            AggDelta::Avg {
-                                sum_delta,
-                                count_delta,
-                            } => {
-                                let entry = avg_accum.entry(ord).or_default();
-                                entry.0 += *sum_delta;
-                                entry.1 += *count_delta;
-                            }
-                            AggDelta::Stats {
-                                sum_delta,
-                                sum_sq_delta,
-                                count_delta,
-                            } => {
-                                let entry = stats_accum.entry(ord).or_default();
-                                entry.0 += *sum_delta;
-                                entry.1 += *sum_sq_delta;
-                                entry.2 += *count_delta;
-                            }
+                        }
+                    });
+                if let Some(error) = decode_err {
+                    return Err(DispatchError::Value(error));
+                }
+                let Some(delta) = maybe_delta else {
+                    return Ok(());
+                };
+
+                for ord_u32 in consumers {
+                    let ord = ConsumerOrdinal::new(ord_u32);
+                    match &delta {
+                        AggDelta::Count(n) => {
+                            *count_weights.entry(ord).or_default() += *n;
+                        }
+                        AggDelta::Sum(v) => {
+                            *sum_weights.entry(ord).or_default() += *v;
+                        }
+                        AggDelta::Avg {
+                            sum_delta,
+                            count_delta,
+                        } => {
+                            let entry = avg_accum.entry(ord).or_default();
+                            entry.0 += *sum_delta;
+                            entry.1 += *count_delta;
+                        }
+                        AggDelta::Stats {
+                            sum_delta,
+                            sum_sq_delta,
+                            count_delta,
+                        } => {
+                            let entry = stats_accum.entry(ord).or_default();
+                            entry.0 += *sum_delta;
+                            entry.1 += *sum_sq_delta;
+                            entry.2 += *count_delta;
                         }
                     }
                 }
@@ -608,7 +618,6 @@ pub(crate) fn compute_agg_deltas<I: IdTypes, C: Checkpoint>(
     }
 
     // Translate ordinals to user IDs; filter out zero-net entries.
-    // Same user may appear multiple times (once per AggDelta variant).
     let mut result: Vec<(I::ConsumerId, AggDelta)> = Vec::new();
     for (ord, n) in count_weights.into_iter().filter(|(_, n)| *n != 0) {
         if let Some(uid) = consumer_dict.get_consumer(ord) {
@@ -653,1134 +662,78 @@ pub(crate) fn compute_agg_deltas<I: IdTypes, C: Checkpoint>(
     Ok(result)
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::needless_collect)]
-mod tests {
-    use super::*;
-    use crate::{DefaultIds, SubscriptionScope};
-    use std::sync::Arc;
+// ============================================================================
+// Per-column probes (event -> ColumnProbe / AggCellRead)
+// ============================================================================
 
-    #[test]
-    fn test_consumer_dictionary_get_or_create() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-
-        let ord1 = dict.get_or_create(100);
-        assert_eq!(ord1.get(), 0);
-
-        let ord2 = dict.get_or_create(200);
-        assert_eq!(ord2.get(), 1);
-
-        // Same consumer returns same ordinal
-        let ord1_again = dict.get_or_create(100);
-        assert_eq!(ord1_again.get(), 0);
+/// Probe column `col` at the `row` view of `event` for the equality /
+/// range / null indexes tracked by [`TablePartition::select_candidates`].
+///
+/// Values whose scalar payload downcasts to one of the four indexable
+/// primitives (`bool` / `i64` / `f64` / `String`) become
+/// [`IndexableCell`] variants. Every other scalar returns
+/// [`ColumnProbe::present`] with `value: None`, causing the caller to
+/// consult only the fallback index for that column.
+fn probe_column_for_index<E: CdcEvent, DB: DatabaseLike>(
+    event: &E,
+    row: RowKind,
+    col: crate::ColumnId,
+    arity: usize,
+    db: &DB,
+) -> ColumnProbe {
+    if col as usize >= arity {
+        return ColumnProbe::missing();
     }
-
-    #[test]
-    fn test_consumer_dictionary_next_ordinal_overflow_errors() {
-        let err = ConsumerDictionary::<DefaultIds>::next_ordinal_for_len(u64::from(u32::MAX) + 1)
-            .expect_err("ordinal allocation beyond u32::MAX should fail");
-        assert!(err.contains("ordinal capacity exceeded"));
-    }
-
-    #[test]
-    fn test_consumer_dictionary_try_get_or_create_success() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-        let ord = dict
-            .try_get_or_create(123)
-            .expect("small dictionaries should allocate ordinals");
-        assert_eq!(ord.get(), 0);
-    }
-
-    #[test]
-    fn test_consumer_dictionary_get() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-
-        dict.get_or_create(42);
-
-        assert_eq!(dict.get(42), Some(ConsumerOrdinal::new(0)));
-        assert_eq!(dict.get(99), None);
-    }
-
-    #[test]
-    fn test_dispatch_insert_valid_event() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let partition = TablePartition::<DefaultIds>::new(1);
-        let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk_cell(0, crate::Cell::Int(1))
-            .new_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(100)]),
-            })
-            .build()
-            .expect("event builder should be valid");
-
-        assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
-    }
-
-    #[test]
-    fn test_insert_event_is_valid_by_construction() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let partition = TablePartition::<DefaultIds>::new(1);
-        let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk_cell(0, crate::Cell::Int(1))
-            .new_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(100)]),
-            })
-            .build()
-            .expect("event builder should be valid");
-
-        assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
-    }
-
-    #[test]
-    fn test_consumer_dictionary_remove() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-
-        let ord = dict.get_or_create(42);
-        assert_eq!(dict.get(42), Some(ord));
-
-        dict.remove(42);
-        assert_eq!(dict.get(42), None);
-    }
-
-    #[test]
-    fn test_consumer_dictionary_remove_clears_ordinal_lookup() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-
-        let ord = dict.get_or_create(42);
-        assert_eq!(dict.get_consumer(ord), Some(42));
-
-        dict.remove(42);
-        assert_eq!(dict.get_consumer(ord), None);
-    }
-
-    #[test]
-    fn test_consumer_dictionary_get_consumer() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-
-        let ord = dict.get_or_create(100);
-        assert_eq!(dict.get_consumer(ord), Some(100));
-
-        // Invalid ordinal
-        assert_eq!(dict.get_consumer(ConsumerOrdinal::new(999)), None);
-    }
-
-    #[test]
-    fn test_consumer_dictionary_default() {
-        let dict = ConsumerDictionary::<DefaultIds>::default();
-        assert_eq!(dict.get(42), None);
-    }
-
-    #[test]
-    fn test_update_event_requires_no_missing_row_checks() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let partition = TablePartition::<DefaultIds>::new(1);
-        let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(100)]),
-            })
-            .pk_cell(0, crate::Cell::Int(1))
-            .old_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(99)]),
-            })
-            .changed_columns(Arc::from([0u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
-    }
-
-    #[test]
-    fn test_delete_event_is_valid_by_construction() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let partition = TablePartition::<DefaultIds>::new(1);
-        let consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        let event = WalEvent::builder(1)
-            .delete()
-            .pk_cell(0, crate::Cell::Int(1))
-            .old_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(100)]),
-            })
-            .build()
-            .expect("event builder should be valid");
-
-        assert!(dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).is_ok());
-    }
-
-    #[test]
-    fn test_dispatch_truncate_requires_no_row_and_returns_only_row_subscribers() {
-        use super::super::indexes::IndexableAtom;
-        use super::super::partition::TablePartition;
-        use super::super::predicate::{Predicate, SubscriptionBinding};
-        use crate::compiler::sql_shape::QueryProjection;
-        use crate::compiler::Vm;
-        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-
-        // Row predicate bound to consumer 42.
-        let row_pred = Predicate {
-            id: super::super::ids::PredicateId::from_slab_index(0),
-            hash: 0xABCD,
-            normalized_sql: "true".into(),
-            bytecode: Arc::new(BytecodeProgram::new(vec![Instruction::PushLiteral(
-                crate::Cell::Bool(true),
-            )])),
-            dependency_columns: Arc::from([]),
-            projection: QueryProjection::Rows,
-            index_atoms: Arc::from([IndexableAtom::Fallback]),
-            prefilter_plan: Arc::new(PrefilterPlan::default()),
-            refcount: 1,
-            updated_at_unix_ms: 1000,
-        };
-        let row_pred_id = row_pred.id;
-        partition.add_predicate(row_pred, vec![IndexableAtom::Fallback]);
-
-        let row_ord = consumer_dict.get_or_create(42);
-        partition.add_binding(
-            SubscriptionBinding {
-                subscription_id: 100,
-                predicate_id: row_pred_id,
-                consumer_id: 42,
-                consumer_ordinal: row_ord,
-                scope: SubscriptionScope::Durable,
-                updated_at_unix_ms: 1000,
-            },
-            row_pred_id,
-        );
-
-        // Aggregate predicate bound to consumer 77 must not leak into consumers().
-        make_count_pred_and_binding(1, 101, 77, &mut partition, &mut consumer_dict);
-        let mut vm = Vm::new();
-
-        let event = WalEvent::builder(1)
-            .truncate()
-            .build()
-            .expect("truncate event builder should be valid");
-
-        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
-            .expect("truncate should dispatch without row image");
-        assert!(notifs.inserted().is_empty());
-        assert!(notifs.updated().is_empty());
-        let mut deleted = notifs.deleted().to_vec();
-        deleted.sort_unstable();
-        assert_eq!(deleted, vec![42]);
-    }
-
-    #[test]
-    fn test_consumer_dictionary_ordinal_to_consumer_vec() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-        dict.get_or_create(10);
-        dict.get_or_create(20);
-        dict.get_or_create(30);
-
-        let vec = dict.ordinal_to_consumer_vec();
-        assert_eq!(vec, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn test_consumer_dictionary_ordinal_to_consumer_vec_excludes_removed_users() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-        dict.get_or_create(10);
-        dict.get_or_create(20);
-        dict.get_or_create(30);
-
-        dict.remove(20);
-
-        let vec = dict.ordinal_to_consumer_vec();
-        assert_eq!(vec, vec![10, 30]);
-    }
-
-    #[test]
-    fn test_matched_consumers_iterator() {
-        let mut dict = ConsumerDictionary::<DefaultIds>::new();
-        dict.get_or_create(10);
-        dict.get_or_create(20);
-        dict.get_or_create(30);
-
-        let mut bitmap = RoaringBitmap::new();
-        bitmap.insert(0); // Consumer 10
-        bitmap.insert(2); // Consumer 30
-
-        let consumers: Vec<_> = (MatchedConsumers {
-            bitmap_iter: bitmap.into_iter(),
-            dict: &dict,
-        })
-        .collect();
-        assert_eq!(consumers, vec![10, 30]);
-    }
-
-    #[test]
-    fn test_dispatch_consumers_update_event_matching() {
-        use super::super::indexes::IndexableAtom;
-        use super::super::partition::TablePartition;
-        use super::super::predicate::Predicate;
-        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        let pred = Predicate {
-            id: super::super::ids::PredicateId::from_slab_index(0),
-            hash: 0x1234,
-            normalized_sql: "age > 18".into(),
-            bytecode: Arc::new(BytecodeProgram::new(vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(crate::Cell::Int(18)),
-                Instruction::GreaterThan,
-            ])),
-            dependency_columns: Arc::from([1u16]),
-            projection: crate::compiler::sql_shape::QueryProjection::Rows,
-            index_atoms: Arc::from([IndexableAtom::Fallback]),
-            prefilter_plan: Arc::new(PrefilterPlan::default()),
-            refcount: 1,
-            updated_at_unix_ms: 1000,
-        };
-
-        let pred_id = pred.id;
-        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
-
-        let ord = consumer_dict.get_or_create(42);
-        let binding = super::super::predicate::SubscriptionBinding {
-            subscription_id: 100,
-            predicate_id: pred_id,
-            consumer_id: 42,
-            consumer_ordinal: ord,
-            scope: SubscriptionScope::Durable,
-            updated_at_unix_ms: 1000,
-        };
-        partition.add_binding(binding, pred_id);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(25)]),
-            })
-            .pk_cell(0, crate::Cell::Int(1))
-            .maybe_old_row(Some(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(17)]),
-            }))
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        // old_row age=17 (no match), new_row age=25 (match): consumer enters (inserted)
-        assert!(
-            notifs.inserted().contains(&42),
-            "Consumer 42 should be inserted (age > 18 with new age=25, old age=17)"
-        );
-        assert!(notifs.deleted().is_empty());
-        assert!(notifs.updated().is_empty());
-    }
-
-    #[test]
-    fn test_dispatch_consumers_delete_event_matching() {
-        use super::super::indexes::IndexableAtom;
-        use super::super::partition::TablePartition;
-        use super::super::predicate::Predicate;
-        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        let pred = Predicate {
-            id: super::super::ids::PredicateId::from_slab_index(0),
-            hash: 0x5678,
-            normalized_sql: "age < 30".into(),
-            bytecode: Arc::new(BytecodeProgram::new(vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(crate::Cell::Int(30)),
-                Instruction::LessThan,
-            ])),
-            dependency_columns: Arc::from([1u16]),
-            projection: crate::compiler::sql_shape::QueryProjection::Rows,
-            index_atoms: Arc::from([IndexableAtom::Fallback]),
-            prefilter_plan: Arc::new(PrefilterPlan::default()),
-            refcount: 1,
-            updated_at_unix_ms: 1000,
-        };
-
-        let pred_id = pred.id;
-        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
-
-        let ord = consumer_dict.get_or_create(99);
-        let binding = super::super::predicate::SubscriptionBinding {
-            subscription_id: 200,
-            predicate_id: pred_id,
-            consumer_id: 99,
-            consumer_ordinal: ord,
-            scope: SubscriptionScope::Durable,
-            updated_at_unix_ms: 1000,
-        };
-        partition.add_binding(binding, pred_id);
-
-        let event = WalEvent::builder(1)
-            .delete()
-            .pk_cell(0, crate::Cell::Int(1))
-            .old_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(25)]),
-            })
-            .build()
-            .expect("event builder should be valid");
-
-        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(
-            notifs.deleted().contains(&99),
-            "Consumer 99 should see deletion (age < 30 with age=25)"
-        );
-        assert!(notifs.inserted().is_empty());
-        assert!(notifs.updated().is_empty());
-    }
-
-    // --- Aggregate dispatch tests ---
-
-    fn make_count_pred_and_binding(
-        pred_slab: usize,
-        sub_id: u64,
-        consumer_id: u64,
-        partition: &mut super::super::partition::TablePartition<DefaultIds>,
-        consumer_dict: &mut ConsumerDictionary<DefaultIds>,
-    ) -> super::super::ids::PredicateId {
-        use super::super::indexes::IndexableAtom;
-        use super::super::predicate::{Predicate, SubscriptionBinding};
-        use crate::compiler::sql_shape::{AggSpec, QueryProjection};
-        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
-
-        // WHERE amount > 10
-        let pred = Predicate {
-            id: super::super::ids::PredicateId::from_slab_index(pred_slab),
-            hash: 0xCCCC + pred_slab as u128,
-            normalized_sql: "amount > 10".into(),
-            bytecode: Arc::new(BytecodeProgram::new(vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(crate::Cell::Int(10)),
-                Instruction::GreaterThan,
-            ])),
-            dependency_columns: Arc::from([1u16]),
-            projection: QueryProjection::Aggregate(AggSpec::CountStar),
-            index_atoms: Arc::from([IndexableAtom::Fallback]),
-            prefilter_plan: Arc::new(PrefilterPlan::default()),
-            refcount: 1,
-            updated_at_unix_ms: 1000,
-        };
-        let pred_id = pred.id;
-        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
-
-        let ord = consumer_dict.get_or_create(consumer_id);
-        partition.add_binding(
-            SubscriptionBinding {
-                subscription_id: sub_id,
-                predicate_id: pred_id,
-                consumer_id,
-                consumer_ordinal: ord,
-                scope: SubscriptionScope::Durable,
-                updated_at_unix_ms: 1000,
-            },
-            pred_id,
-        );
-        pred_id
-    }
-
-    /// Helper: row with cells [id=1, amount=value]
-    fn make_row(amount: i64) -> crate::RowImage {
-        crate::RowImage {
-            cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(amount)]),
-        }
-    }
-
-    /// Helper: primary key on id column.
-    fn make_pk(id: i64) -> crate::PrimaryKey {
-        crate::PrimaryKey::new(Arc::from([0u16]), Arc::from([crate::Cell::Int(id)]))
-            .expect("single PK column/value is valid")
-    }
-
-    #[test]
-    fn test_agg_insert_matching_gives_plus_one() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(make_row(20))
-            .build()
-            .expect("event builder should be valid"); // 20 > 10, matches
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(
-            deltas,
-            vec![(42, crate::AggDelta::Count(1))],
-            "INSERT matching predicate should yield delta +1"
-        );
-    }
-
-    #[test]
-    fn test_agg_insert_non_matching_gives_no_delta() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(make_row(5))
-            .build()
-            .expect("event builder should be valid"); // 5 <= 10, no match
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(
-            deltas.is_empty(),
-            "INSERT not matching predicate should yield no delta"
-        );
-    }
-
-    #[test]
-    fn test_agg_delete_matching_gives_minus_one() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .delete()
-            .pk(make_pk(1))
-            .old_row(make_row(20))
-            .build()
-            .expect("event builder should be valid"); // was matching
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(
-            deltas,
-            vec![(42, crate::AggDelta::Count(-1))],
-            "DELETE of matching row should yield delta -1"
-        );
-    }
-
-    #[test]
-    fn test_agg_update_old_matches_new_does_not_gives_minus_one() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_row(20))
-            .pk(make_pk(1))
-            .build()
-            .expect("event builder should be valid");
-
-        let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
-            .expect_err("UPDATE without old_row must be rejected for aggregates");
-        assert!(matches!(
-            err,
-            DispatchError::AggregateUpdateRequiresOldRow(1)
-        ));
-    }
-
-    #[test]
-    fn test_agg_update_partial_old_row_returns_error() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        // old_row has Cell::Missing at column 1: partial image
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_row(20))
-            .pk(make_pk(1))
-            .old_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(1), crate::Cell::Missing]),
-            })
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
-            .expect_err("UPDATE with partial old_row must be rejected for aggregates");
-        assert!(matches!(
-            err,
-            DispatchError::AggregateUpdateRequiresOldRow(1)
-        ));
-    }
-
-    #[test]
-    fn test_agg_update_old_does_not_match_new_does_gives_plus_one() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_row(20))
-            .pk(make_pk(1))
-            .maybe_old_row(Some(make_row(5))) // was not matching
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(
-            deltas,
-            vec![(42, crate::AggDelta::Count(1))],
-            "UPDATE entering predicate should yield delta +1"
-        );
-    }
-
-    #[test]
-    fn test_agg_update_both_match_gives_zero_net_no_entry() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_row(20))
-            .pk(make_pk(1))
-            .maybe_old_row(Some(make_row(15))) // matches (15 > 10)
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(
-            deltas.is_empty(),
-            "UPDATE where both old and new match should yield zero net delta (no entry)"
-        );
-    }
-
-    #[test]
-    fn test_agg_update_missing_old_row_returns_strict_error() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_row(20))
-            .pk(make_pk(1))
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
-            .expect_err("UPDATE with partial old_row must be rejected for aggregates");
-        assert!(matches!(
-            err,
-            DispatchError::AggregateUpdateRequiresOldRow(1)
-        ));
-    }
-
-    // --- SUM aggregate dispatch tests ---
-
-    /// Helper: create a SUM predicate (WHERE amount > 10, SUM on column 1) and bind consumer.
-    fn make_sum_pred_and_binding(
-        pred_slab: usize,
-        sub_id: u64,
-        consumer_id: u64,
-        sum_col: u16,
-        partition: &mut super::super::partition::TablePartition<DefaultIds>,
-        consumer_dict: &mut ConsumerDictionary<DefaultIds>,
-    ) -> super::super::ids::PredicateId {
-        use super::super::indexes::IndexableAtom;
-        use super::super::predicate::{Predicate, SubscriptionBinding};
-        use crate::compiler::sql_shape::{AggSpec, QueryProjection};
-        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
-
-        // WHERE amount > 10 (column 1), SUM on sum_col
-        let pred = Predicate {
-            id: super::super::ids::PredicateId::from_slab_index(pred_slab),
-            hash: 0xDDDD + pred_slab as u128,
-            normalized_sql: "amount > 10".into(),
-            bytecode: Arc::new(BytecodeProgram::new(vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(crate::Cell::Int(10)),
-                Instruction::GreaterThan,
-            ])),
-            dependency_columns: Arc::from([1u16, sum_col]),
-            projection: QueryProjection::Aggregate(AggSpec::Sum { column: sum_col }),
-            index_atoms: Arc::from([IndexableAtom::Fallback]),
-            prefilter_plan: Arc::new(PrefilterPlan::default()),
-            refcount: 1,
-            updated_at_unix_ms: 1000,
-        };
-        let pred_id = pred.id;
-        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
-
-        let ord = consumer_dict.get_or_create(consumer_id);
-        partition.add_binding(
-            SubscriptionBinding {
-                subscription_id: sub_id,
-                predicate_id: pred_id,
-                consumer_id,
-                consumer_ordinal: ord,
-                scope: SubscriptionScope::Durable,
-                updated_at_unix_ms: 1000,
-            },
-            pred_id,
-        );
-        pred_id
-    }
-
-    /// Helper: row with cells [id=1, amount=value]
-    fn make_sum_row(amount: crate::Cell) -> crate::RowImage {
-        crate::RowImage {
-            cells: Arc::from([crate::Cell::Int(1), amount]),
-        }
-    }
-
-    #[test]
-    fn test_sum_insert_matching_gives_value_delta() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(make_sum_row(crate::Cell::Int(20)))
-            .build()
-            .expect("event builder should be valid"); // 20 > 10, matches
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
-    }
-
-    #[test]
-    fn test_sum_insert_non_matching_no_delta() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(make_sum_row(crate::Cell::Int(5)))
-            .build()
-            .expect("event builder should be valid"); // 5 <= 10, no match
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(deltas.is_empty());
-    }
-
-    #[test]
-    fn test_sum_delete_matching_gives_neg_delta() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .delete()
-            .pk(make_pk(1))
-            .old_row(make_sum_row(crate::Cell::Int(20)))
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-20.0))]);
-    }
-
-    #[test]
-    fn test_sum_update_both_match_value_change() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_sum_row(crate::Cell::Int(25)))
-            .pk(make_pk(1))
-            .maybe_old_row(Some(make_sum_row(crate::Cell::Int(15)))) // matches, contributes -15
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(10.0))]);
-    }
-
-    #[test]
-    fn test_sum_update_same_value_zero_net() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_sum_row(crate::Cell::Int(20)))
-            .pk(make_pk(1))
-            .maybe_old_row(Some(make_sum_row(crate::Cell::Int(20))))
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(
-            deltas.is_empty(),
-            "zero net SUM delta should be filtered out"
-        );
-    }
-
-    #[test]
-    fn test_sum_update_old_match_new_no_match() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_sum_row(crate::Cell::Int(5)))
-            .pk(make_pk(1))
-            .maybe_old_row(Some(make_sum_row(crate::Cell::Int(20)))) // matches -> -20
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(-20.0))]);
-    }
-
-    #[test]
-    fn test_sum_update_old_no_match_new_match() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .update()
-            .new_row(make_sum_row(crate::Cell::Int(20)))
-            .pk(make_pk(1))
-            .maybe_old_row(Some(make_sum_row(crate::Cell::Int(5)))) // no match
-            .changed_columns(Arc::from([1u16]))
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert_eq!(deltas, vec![(42, crate::AggDelta::Sum(20.0))]);
-    }
-
-    #[test]
-    fn test_sum_null_cell_gives_no_delta() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        // WHERE amount > 10 won't match NULL, so no delta
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(make_sum_row(crate::Cell::Null))
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(deltas.is_empty());
-    }
-
-    #[test]
-    fn test_sum_missing_cell_gives_no_delta() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        // Row too short: column 1 (amount) is missing
-        // WHERE amount > 10 evaluates to Unknown, no match
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(1)]), // only col 0, col 1 missing
-            })
-            .build()
-            .expect("event builder should be valid");
-
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(deltas.is_empty());
-    }
-
-    #[test]
-    fn test_sum_float_cell_value() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_sum_pred_and_binding(0, 1, 42, 1, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(make_sum_row(crate::Cell::Float(2.5)))
-            .build()
-            .expect("event builder should be valid");
-
-        // WHERE amount > 10 won't match 2.5, so no delta
-        let deltas = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        assert!(deltas.is_empty(), "2.5 <= 10, so WHERE does not match");
-    }
-
-    #[test]
-    fn test_agg_truncate_returns_requires_reset_error() {
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        let event = WalEvent::builder(1)
-            .truncate()
-            .build()
-            .expect("truncate event builder should be valid");
-
-        let err = compute_agg_deltas(&event, &partition, &consumer_dict, &mut vm)
-            .expect_err("TRUNCATE should return TruncateRequiresReset");
-        assert!(
-            matches!(err, DispatchError::TruncateRequiresReset(1)),
-            "expected TruncateRequiresReset(1), got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_agg_consumers_dispatch_skips_count_predicates() {
-        use super::super::indexes::IndexableAtom;
-        use super::super::partition::TablePartition;
-        use crate::compiler::Vm;
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        // Register a COUNT predicate for consumer 42
-        make_count_pred_and_binding(0, 1, 42, &mut partition, &mut consumer_dict);
-
-        // Also register a Rows predicate for consumer 99 (to ensure dispatch still works)
-        {
-            use super::super::predicate::{Predicate, SubscriptionBinding};
-            use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan};
-            let pred = Predicate {
-                id: super::super::ids::PredicateId::from_slab_index(1),
-                hash: 0xAAAA,
-                normalized_sql: "amount > 5".into(),
-                bytecode: Arc::new(BytecodeProgram::new(vec![
-                    Instruction::LoadColumn(1),
-                    Instruction::PushLiteral(crate::Cell::Int(5)),
-                    Instruction::GreaterThan,
-                ])),
-                dependency_columns: Arc::from([1u16]),
-                projection: crate::compiler::sql_shape::QueryProjection::Rows,
-                index_atoms: Arc::from([IndexableAtom::Fallback]),
-                prefilter_plan: Arc::new(PrefilterPlan::default()),
-                refcount: 1,
-                updated_at_unix_ms: 1000,
-            };
-            let pred_id = pred.id;
-            partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
-            let ord = consumer_dict.get_or_create(99);
-            partition.add_binding(
-                SubscriptionBinding {
-                    subscription_id: 2,
-                    predicate_id: pred_id,
-                    consumer_id: 99,
-                    consumer_ordinal: ord,
-                    scope: SubscriptionScope::Durable,
-                    updated_at_unix_ms: 1000,
-                },
-                pred_id,
-            );
-        }
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(make_row(20))
-            .build()
-            .expect("event builder should be valid"); // matches both predicates
-
-        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm)
-            .expect("dispatch_consumers should succeed");
-
-        // Consumer 99 (Rows predicate) should appear as inserted; consumer 42 (COUNT) must NOT
-        assert!(
-            notifs.inserted().contains(&99),
-            "Rows subscriber should be dispatched"
-        );
-        let all: Vec<_> = notifs.into_iter().collect();
-        assert!(
-            !all.contains(&42),
-            "COUNT subscriber must not appear in consumers() dispatch"
-        );
-    }
-
-    #[test]
-    fn test_dispatch_consumers_no_match() {
-        use super::super::indexes::IndexableAtom;
-        use super::super::partition::TablePartition;
-        use super::super::predicate::Predicate;
-        use crate::compiler::{BytecodeProgram, Instruction, PrefilterPlan, Vm};
-
-        let mut partition = TablePartition::<DefaultIds>::new(1);
-        let mut consumer_dict = ConsumerDictionary::<DefaultIds>::new();
-        let mut vm = Vm::new();
-
-        let pred = Predicate {
-            id: super::super::ids::PredicateId::from_slab_index(0),
-            hash: 0xABCD,
-            normalized_sql: "age > 50".into(),
-            bytecode: Arc::new(BytecodeProgram::new(vec![
-                Instruction::LoadColumn(1),
-                Instruction::PushLiteral(crate::Cell::Int(50)),
-                Instruction::GreaterThan,
-            ])),
-            dependency_columns: Arc::from([1u16]),
-            projection: crate::compiler::sql_shape::QueryProjection::Rows,
-            index_atoms: Arc::from([IndexableAtom::Fallback]),
-            prefilter_plan: Arc::new(PrefilterPlan::default()),
-            refcount: 1,
-            updated_at_unix_ms: 1000,
-        };
-
-        let pred_id = pred.id;
-        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
-
-        let ord = consumer_dict.get_or_create(42);
-        let binding = super::super::predicate::SubscriptionBinding {
-            subscription_id: 300,
-            predicate_id: pred_id,
-            consumer_id: 42,
-            consumer_ordinal: ord,
-            scope: SubscriptionScope::Durable,
-            updated_at_unix_ms: 1000,
-        };
-        partition.add_binding(binding, pred_id);
-
-        let event = WalEvent::builder(1)
-            .insert()
-            .pk(make_pk(1))
-            .new_row(crate::RowImage {
-                cells: Arc::from([crate::Cell::Int(1), crate::Cell::Int(25)]),
-            })
-            .build()
-            .expect("event builder should be valid");
-
-        let notifs = dispatch_consumers(&event, &partition, &consumer_dict, &mut vm).unwrap();
-        let all: Vec<_> = notifs.into_iter().collect();
-        assert!(
-            all.is_empty(),
-            "No consumers should match age > 50 with age=25"
-        );
+    match event.value_at(db, row, col) {
+        Ok(Value::Missing) => ColumnProbe::missing(),
+        Ok(Value::Null) => ColumnProbe::null(),
+        Ok(v) => ColumnProbe::present(IndexableCell::from_value::<E::Backend>(&v)),
+        Err(_) => ColumnProbe::undecodable(),
     }
 }
+
+/// Probe column `col` at the `row` view of `event` for aggregate delta
+/// computation.
+///
+/// Downcasts the scalar payload to `f64` when the column carries a
+/// numeric type (`Value::Int` or `Value::Float`). Every other scalar is
+/// reported as [`AggCellRead::NonNumeric`] when present.
+fn probe_column_for_agg<E: CdcEvent, DB: DatabaseLike>(
+    event: &E,
+    row: RowKind,
+    col: crate::ColumnId,
+    arity: usize,
+    db: &DB,
+) -> Result<AggCellRead, crate::ValueError> {
+    use core::any::Any;
+    if usize::from(col) >= arity {
+        return Ok(AggCellRead::Missing);
+    }
+    let value = event.value_at(db, row, col)?;
+    Ok(match &value {
+        Value::Missing => AggCellRead::Missing,
+        Value::Null => AggCellRead::Null,
+        Value::Int(i) => {
+            (i as &dyn Any)
+                .downcast_ref::<i64>()
+                .map_or(AggCellRead::NonNumeric, |i64_ref| {
+                    #[allow(clippy::cast_precision_loss)]
+                    AggCellRead::Numeric(*i64_ref as f64)
+                })
+        }
+        Value::Float(f) => {
+            (f as &dyn Any)
+                .downcast_ref::<f64>()
+                .map_or(AggCellRead::NonNumeric, |f64_ref| {
+                    if f64_ref.is_finite() {
+                        AggCellRead::Numeric(*f64_ref)
+                    } else {
+                        AggCellRead::NonNumeric
+                    }
+                })
+        }
+        _ => AggCellRead::NonNumeric,
+    })
+}
+
+// Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.

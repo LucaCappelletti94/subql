@@ -26,6 +26,17 @@ diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future
 # ships.
 sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
 sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+# Unify pg_walstream across subql and sqlite-diff-rs on subql's fork
+# branch (0.8.0 plus the `PgOutputDecoder`), so the `EventType` the
+# crate's pg `Digestable` consumes is the same type subql's sources
+# produce. This also lets `pg-sqlite-emu` encode through pg_walstream 0.8.
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder" }
+
+# diesel-sqlite-session depends on diesel via git (not crates.io), so
+# `[patch.crates-io]` above does not reach that graph. Route the git
+# dep to the same LucaCappelletti94 fork used by the crates-io patch.
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 
 [package]
 name = "subql"
@@ -39,6 +50,13 @@ repository = "https://github.com/luca/subql"
 readme = "README.md"
 keywords = ["sql", "cdc", "subscription", "postgres", "streaming"]
 categories = ["database", "parser-implementations"]
+
+[package.metadata.cargo-udeps.ignore]
+# `arbitrary` is a dev-dependency used only by feature-gated integration
+# tests (the pg-sqlite-emu proptests and the sqlite patchset e2e). udeps
+# runs with default features and never compiles those targets, so it
+# false-positives the dev-dependency as unused.
+development = ["arbitrary"]
 
 [lib]
 name = "subql"
@@ -75,41 +93,6 @@ required-features = ["testing"]
 name = "reexec_diesel"
 required-features = ["executor-diesel"]
 
-# Smoke test for the in-process SQLite-backed `CdcSource`. Gated behind
-# the `sqlite-cdc` feature so default `cargo test` skips it.
-[[test]]
-name = "sqlite_cdc_smoke"
-required-features = ["sqlite-cdc"]
-
-# Full DML coverage (INSERT/UPDATE/DELETE on single-PK and composite-PK
-# tables) for the in-process SQLite-backed `CdcSource`.
-[[test]]
-name = "sqlite_cdc_dml"
-required-features = ["sqlite-cdc"]
-
-# Property test: arbitrary DML sequences against a reference model for
-# the in-process SQLite-backed `CdcSource`.
-[[test]]
-name = "proptest_sqlite_cdc"
-required-features = ["sqlite-cdc"]
-
-# End-to-end dispatch property test (in-process dispatch and pgoutput
-# round-trip paths): drives the source plus the real `SubscriptionEngine`
-# and a fixed query set, verifies dispatched `ConsumerNotifications`
-# against a Rust-side oracle. The pgoutput round-trip path also encodes
-# events through `PgOutputBridge` and decodes them back through
-# `PgOutputParser`.
-[[test]]
-name = "proptest_sqlite_dispatch"
-required-features = ["sqlite-cdc"]
-
-# pgoutput round-trip property test for `PgOutputBridge`: arbitrary
-# `WalEvent` shapes encoded through the bridge must round trip back
-# through `PgOutputParser` unchanged.
-[[test]]
-name = "proptest_pgoutput_bridge"
-required-features = ["sqlite-cdc"]
-
 # Docker-backed integration test for AutoResolvingEngine + DieselConnector
 # against a real Postgres with logical replication. Tests are #[ignore]d;
 # run explicitly via:
@@ -126,9 +109,36 @@ required-features = ["diesel-typed"]
 name = "follow_insert_sqlite"
 required-features = ["diesel-typed-sqlite"]
 
+# Smoke integration test for the fake-Postgres-over-SQLite CDC source.
+# Gated behind `pg-sqlite-emu` so default `cargo test` skips it.
 [[test]]
-name = "follow_cdc_sqlite"
-required-features = ["sqlite-cdc", "diesel-typed-sqlite"]
+name = "pg_sqlite_emu_smoke"
+required-features = ["pg-sqlite-emu"]
+
+# INSERT / UPDATE / DELETE coverage for the emulator on single-PK and
+# composite-PK tables. Composite PK is not exercised anywhere else.
+[[test]]
+name = "pg_sqlite_emu_dml"
+required-features = ["pg-sqlite-emu"]
+
+# End-to-end dispatch proptest for the emulator: arbitrary DML,
+# reference oracle, engine notifications must match per event.
+[[test]]
+name = "proptest_pg_sqlite_emu_dispatch"
+required-features = ["pg-sqlite-emu"]
+
+# `follow_row` + emulator integration: PK-scoped follows observe
+# INSERT / DELETE events routed through the pgoutput wire.
+[[test]]
+name = "follow_pg_sqlite_emu"
+required-features = ["pg-sqlite-emu"]
+
+# Structural CDC proptest: per-event shape assertions against a
+# reference model. Distinct from proptest_pg_sqlite_emu_dispatch,
+# which only checks oracle notifications.
+[[test]]
+name = "proptest_pg_sqlite_emu_cdc"
+required-features = ["pg-sqlite-emu"]
 
 # Docker-backed integration test for PgR2D2DieselConnector (pool-backed
 # PG connector). Run with:
@@ -177,6 +187,36 @@ required-features = ["pg-streaming"]
 name = "polling_vs_push_benchmark"
 required-features = ["pg-streaming"]
 
+# Docker-backed full CDC round-trip test on the wal2json vehicle:
+# Postgres DML to wal2json CDC to emitted patchset, applied to a SQLite
+# replica via `SqliteAdapter`, session patchset captured and re-applied
+# to Postgres via `PgAdapter`, asserting row parity across the cycle.
+# Run with:
+#   cargo test --test round_trip_pg_wal2json_e2e \
+#       --features "apply-patchset-postgres apply-patchset-sqlite sqlite-cdc" -- --ignored --nocapture
+[[test]]
+name = "round_trip_pg_wal2json_e2e"
+required-features = [
+    "apply-patchset-postgres",
+    "apply-patchset-sqlite",
+    "sqlite-cdc",
+]
+
+# Docker-backed full CDC round-trip test on the pgoutput vehicle: the
+# same four-type loop as the wal2json test, but driven by real pgoutput
+# binary changes decoded to `ChangeEvent` and emitted via
+# `pgoutput_patchset_builder`. Run with:
+#   cargo test --test round_trip_pg_pgoutput_e2e \
+#       --features "pgoutput-emit apply-patchset-postgres apply-patchset-sqlite sqlite-cdc" -- --ignored --nocapture
+[[test]]
+name = "round_trip_pg_pgoutput_e2e"
+required-features = [
+    "pgoutput-emit",
+    "apply-patchset-postgres",
+    "apply-patchset-sqlite",
+    "sqlite-cdc",
+]
+
 [dependencies]
 # SQL parsing (supports multiple dialects).
 sqlparser = { version = "0.62", default-features = false }
@@ -196,12 +236,6 @@ slab = "0.4"
 # Atomic pointer swap for immutable snapshots
 arc-swap = "1.7"
 
-# `spin::Mutex` for the relation cache in the pgoutput parser. We pick spin
-# because it's the standard no_std Mutex (works under WASM where OS threads
-# are absent) and the relation cache is a low-contention surface where
-# spin-wait overhead vs std Mutex is irrelevant.
-spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex", "once", "lazy"] }
-
 # Fast hashing. `hashbrown` is no_std-friendly and ships its own default
 # hasher (foldhash) via the `default-hasher` feature — no direct ahash dep
 # required.
@@ -212,6 +246,13 @@ seahash = "4.1"        # Deterministic hashing for canonicalization
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+
+# Backend scalar type dependencies. `chrono` covers Timestamp / TimestampTz /
+# Date / Time; `bigdecimal` covers arbitrary-precision NUMERIC / DECIMAL. Both
+# are pinned no-default-features to keep subql's `no_std + alloc` posture.
+chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
+bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
+uuid = { version = "1", default-features = false, features = ["serde"] }
 
 # Error handling
 thiserror = { version = "2.0", default-features = false }
@@ -227,14 +268,17 @@ tracing = { version = "0.1", default-features = false, optional = true }
 dhat = { version = "0.3", optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
-# PostgreSQL logical-replication (`pgoutput`) parser. Backs the
-# `PgOutputParser` adapter in `src/wal/pgoutput.rs`. Pinned to the
-# `no-std` branch of the maintainer's fork while PR #74 is under review;
-# upstream main already carries the `pgoutput-encoder` and optional-`tokio`
-# features that `no-std` builds on top of. Default features are off so
-# subql's `--no-default-features` build stays `no_std + alloc` with no
-# `tokio` and no C deps. The `std` feature below propagates `std` through.
-pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "no-std", default-features = false }
+# PostgreSQL logical-replication decoder plus low-level parser.
+# Temporarily pinned to the `feat/pgoutput-decoder` branch of the
+# LucaCappelletti94 fork, which adds a connection-independent
+# `PgOutputDecoder` (pgoutput bytes to `ChangeEvent`) so subql can drop
+# its bespoke pgoutput parser. Repoint at a crates.io release once the
+# decoder lands upstream. Default features (`std`, `rustls-tls`) are off
+# so the base `--no-default-features` build stays `no_std + alloc` with
+# no `tokio`. The `std` feature below propagates `pg_walstream/std`, and
+# `pg-streaming` opts into `pg_walstream/rustls-tls` for the pure-Rust
+# replication client.
+pg_walstream = { git = "https://github.com/LucaCappelletti94/pg-walstream", branch = "feat/pgoutput-decoder", default-features = false }
 
 # Optional diesel-backed Connector for the auto-resolving re-execution
 # engine. Off by default - the lib's no_std + alloc / wasm32 surface stays
@@ -249,10 +293,26 @@ diesel = { version = "2", optional = true }
 # `executor-diesel-postgres-r2d2` feature. Ignored otherwise.
 r2d2 = { version = "0.8", optional = true }
 
-# PG-DDL to SQLite-DDL translator used by the in-process `SqliteCdcSource`
-# (`sqlite-cdc` feature). Gated on the feature so default builds do not
-# pull it in. `default-features = false` drops git2 and the libssh2 +
-# libz C deps it transitively pulls.
+
+# SQLite session-extension binary formats (changeset / patchset) plus the
+# wal2json and Maxwell parsers subql implements `CdcEvent` on. Backs the
+# `SqliteChangesetParser` and the Postgres/MySQL JSON CDC paths. `no_std +
+# alloc` posture, no C deps (the `wal2json` and `maxwell` features pull only
+# serde). `default-features = false` drops the `diesel` and `pg-walstream`
+# reverse adapters, which the feature gates below opt into when needed.
+sqlite-diff-rs = { version = "0.6.1", default-features = false, features = ["wal2json", "maxwell"] }
+
+# Diesel wrapper around SQLite's session extension. Backs the Phase 8
+# `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables
+# to a session, and calls `.changeset()` to surface accumulated change
+# bytes for `SqliteChangesetParser` to decode. Requires the diesel
+# `future` branch already pinned via the top-level `[patch]` blocks.
+diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session", optional = true }
+
+# PG-DDL -> SQLite-DDL translator used by the `pg-sqlite-emu` feature
+# (a fake Postgres CDC source layered on SQLite for doctests and fuzz).
+# `default-features = false` drops the git2 + libssh2 + libz native
+# deps so the emulator stays a pure-Rust addition.
 pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
 
 # Future-combinator helpers (FuturesUnordered + StreamExt) used by the
@@ -276,7 +336,7 @@ async-lock = { version = "3", default-features = false }
 # `tokio-util` is what its `CancellationToken` lives in.
 tokio = { version = "1", optional = true, features = ["sync", "rt", "macros", "time"] }
 tokio-util = { version = "0.7", optional = true }
-bytes = { version = "1", optional = true }
+bytes = { version = "1", default-features = false }
 
 [dev-dependencies]
 # Benchmarking
@@ -290,8 +350,13 @@ arbitrary = { version = "1", features = ["derive"] }
 
 # Cross-DB CDC integration test (`tests/cdc_cross_db.rs`) plus the
 # DieselConnector integration test (`tests/reexec_diesel.rs`) which uses
-# in-memory SQLite.
-diesel = { version = "2", features = ["postgres", "mysql", "sqlite"] }
+# in-memory SQLite. `numeric`, `chrono`, and `serde_json` let the
+# round-trip tests load a `NUMERIC` / `DECIMAL` column back as
+# `bigdecimal::BigDecimal`, the temporal columns back as `chrono` types,
+# and the `JSON` / `JSONB` columns back as `serde_json::Value` for the
+# parity assertions, regardless of which apply feature a given test
+# enables.
+diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "numeric", "chrono", "serde_json"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 
 # Property-based testing
@@ -302,10 +367,10 @@ proptest = "1"
 # calls during a batch). Just enough features to spawn tasks and sleep.
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 
-# UUID-keyed `IdTypes` guard tests (`tests/uuid_id_types.rs`): proves the
-# engine's consumer/session id generic works with a non-`u64` type and that
-# such ids survive the snapshot/restore serde path.
-uuid = { version = "1", features = ["serde"] }
+# Non-poisoning locks in test fixtures. Matches the workspace rs-parking-lot
+# rule that bans `std::sync::Mutex/RwLock` where the guard is unwrapped.
+parking_lot = "0.12"
+
 
 [features]
 default = ["std"]
@@ -332,11 +397,12 @@ observability = ["dep:tracing", "tracing/std"]
 # backend on their own diesel dep.
 executor-diesel = ["std", "dep:diesel"]
 # Opt-in: the diesel-typed subscription/follow API. Renders a typed diesel
-# query to placeholder SQL + a list of bind `Cell`s and registers it via the
-# string+binds core. This base feature is the Postgres backend (byte-decoded
-# from Pg's binary wire format via `postgres_backend`, pure Rust, no libpq, plus
-# the opt-in-unstable collector fields to read the serialized binds). SQLite and
-# MySQL extend it via `diesel-typed-sqlite` / `diesel-typed-mysql`.
+# query to placeholder SQL plus a list of bind `Value<B>`s and registers it
+# via the string+binds core. This base feature covers the Postgres backend
+# (byte-decoded from Pg's binary wire format via `postgres_backend`, pure Rust,
+# no libpq, plus the opt-in-unstable collector fields to read the serialized
+# binds). SQLite and MySQL extend it via `diesel-typed-sqlite` /
+# `diesel-typed-mysql`.
 diesel-typed = [
     "dep:diesel",
     "diesel?/postgres_backend",
@@ -378,11 +444,51 @@ executor-diesel-postgres-r2d2 = [
     "dep:r2d2",
     "diesel?/r2d2",
 ]
+# Opt-in: ship the `patchset::PgAdapter` and the
+# `SubscriptionEngine::apply_patchset` entry point for executing a
+# client-uploaded SQLite session patchset against a Postgres target via
+# the diesel connection. Enables `sqlite-diff-rs`'s `diesel` feature,
+# pulls in diesel's `postgres` backend, turns on diesel's `uuid` feature
+# for native `UUID` binds, `numeric` for native `NUMERIC` / `DECIMAL`
+# binds through `bigdecimal`, `chrono` for native temporal binds
+# (`TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, `TIME`), and `serde_json` for
+# native `JSON` / `JSONB` binds. Dispatches `BOOLEAN`, `UUID`, `NUMERIC` /
+# `DECIMAL`, the temporals, and `JSON` / `JSONB` today; other native PG
+# types land as follow-up work.
+apply-patchset-postgres = [
+    "executor-diesel-postgres",
+    "sqlite-diff-rs/diesel",
+    "diesel?/uuid",
+    "diesel?/numeric",
+    "diesel?/chrono",
+    "diesel?/serde_json",
+]
 # Opt-in: ship `MysqlDieselConnector`, a binlog-position-aware sync connector
 # built on `executor-diesel` + diesel's `mysql` feature. Snapshots taken through
 # it carry a `MysqlBinlogPos` read from `SHOW MASTER STATUS` inside the same
 # transaction as the user query. Requires `libmysqlclient` at build time.
 executor-diesel-mysql = ["executor-diesel", "diesel?/mysql"]
+# Opt-in: ship the `patchset::MysqlAdapter` for executing a
+# client-uploaded SQLite session patchset against a MySQL target via
+# the diesel connection. Enables `sqlite-diff-rs`'s `diesel` feature
+# and pulls in diesel's `mysql` backend. Bool (`TINYINT(1)`) is the
+# MVP dispatch; other native MySQL types land as follow-up work.
+apply-patchset-mysql = [
+    "executor-diesel-mysql",
+    "sqlite-diff-rs/diesel",
+]
+# Opt-in: ship the `patchset::SqliteAdapter` for executing a
+# client-uploaded SQLite session patchset against another SQLite
+# database via the diesel connection. The trivial case: source and
+# target speak the same affinity-based type system, so every column
+# falls through to `sqlite_diff_rs::DefaultBinder` and no per-type
+# dispatch is needed. The adapter still exists so callers can resolve
+# column names against a subql catalog.
+apply-patchset-sqlite = [
+    "dep:diesel",
+    "diesel?/sqlite",
+    "sqlite-diff-rs/diesel",
+]
 # Opt-in: ship the push-based PG CDC source. Activates `pg_walstream`'s
 # `rustls-tls` native backend (pure-Rust, no libpq, no C deps beyond
 # `cmake` for `aws-lc-rs`) and a `tokio` runtime surface for channels +
@@ -394,26 +500,50 @@ pg-streaming = [
     "pg_walstream/rustls-tls",
     "dep:tokio",
     "dep:tokio-util",
-    "dep:bytes",
 ]
 
-# Opt-in: ship the in-process SQLite-backed CDC source for the in-process
-# dispatch and pgoutput round-trip tests. Installs triggers on a Diesel
-# `SqliteConnection` and surfaces
-# row mutations as `WalEvent`s through the same `CdcSource` trait the PG
-# transports implement. The `PgOutputBridge` encodes `WalEvent`s as
-# `pgoutput` bytes via `pg_walstream`'s encoder so the production
-# `PgOutputParser` decodes them back inside `cargo test` (no Docker).
-# Activates Diesel's `sqlite` backend and pulls in `pg2sqlite` for
-# translating PG `CREATE TABLE` DDL onto SQLite. Test-only feature, off
-# by default, never appears in production builds.
+# Opt-in: the live SqliteCdcSource that owns a diesel SqliteConnection
+# with the session extension attached (via `diesel-sqlite-session`),
+# generates changesets on demand, and feeds them to
+# `SqliteChangesetParser` to emit typed `CdcEvent`s through the
+# [`CdcSource`] trait. Base changeset parsing (`SqliteChangesetParser`)
+# stays unconditional alongside the wal-format parsers; this feature
+# only adds the live connection wrapper. Mirrors how `pg-streaming`
+# gates `PgStreamingCdcSource` while `PgOutputParser` is unconditional.
 sqlite-cdc = [
     "std",
-    "executor-diesel",
+    "dep:diesel",
     "diesel?/sqlite",
-    "dep:pg2sqlite",
-    "dep:bytes",
+    "dep:diesel-sqlite-session",
 ]
+
+# Opt-in: a fake Postgres CDC source layered on SQLite. Owns a diesel
+# `SqliteConnection` with the session extension attached (via
+# `diesel-sqlite-session`), translates the caller's PG DDL to SQLite
+# DDL via `pg2sqlite`, applies it to the local database, and each poll
+# drains a fresh session `changeset()`, re-encodes each row change as
+# `pgoutput` wire bytes (via `sqlite-diff-rs`, which tracks `pg_walstream`
+# 0.7), decodes them with the 0.8 `PgOutputDecoder`, and surfaces the
+# resulting `ChangeEvent` values. They look identical to a real Postgres
+# logical replication stream (`Backend = Postgres`), which lets doctests
+# and fuzz harnesses
+# exercise the pgoutput pipeline end-to-end without Docker. Distinct
+# from `sqlite-cdc` (which is the honest `Backend = SQLite` source).
+pg-sqlite-emu = [
+    "std",
+    "dep:diesel",
+    "diesel?/sqlite",
+    "dep:diesel-sqlite-session",
+    "dep:pg2sqlite",
+    "sqlite-diff-rs/pg-walstream",
+]
+
+# Opt-in: outbound patchset emission from pgoutput `ChangeEvent`s. Turns
+# on sqlite-diff-rs's pg-walstream digest surface so subql's pg_walstream
+# 0.8 events fold through `DiffSetBuilder::digest`. The wal2json and
+# Maxwell emission paths need no feature (their digest surface is
+# unconditional in `sqlite-diff-rs`), only the pg path does.
+pgoutput-emit = ["sqlite-diff-rs/pg-walstream"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]

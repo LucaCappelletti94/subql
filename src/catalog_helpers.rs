@@ -9,7 +9,7 @@
 //! identifier-resolution rules so call sites never reinvent them.
 //!
 //! Functions: [`table_id`], [`column_id`], [`resolve_table`], [`table_arity`],
-//! [`schema_fingerprint`], [`primary_key_columns`], [`column_type`],
+//! [`schema_fingerprint`], [`primary_key_columns`], [`column_scalar_kind`],
 //! [`table_has_rls`].
 
 use alloc::vec::Vec;
@@ -21,8 +21,10 @@ use sql_traits::{
         identifier_resolution::stored_identifier_matches_lookup,
     },
 };
+use sqlite_diff_rs::SimpleTable;
 
-use crate::types::{ColumnId, ColumnType, TableId};
+use crate::backend::ScalarKind;
+use crate::types::{ColumnId, TableId};
 
 /// Resolve a table name (unquoted or quoted form) to subql's compact
 /// [`TableId`].
@@ -157,6 +159,35 @@ pub fn column_name<DB: DatabaseLike>(
         .map(|col| col.column_name().to_string())
 }
 
+/// Build a [`SimpleTable`] from the catalog for `table_id`.
+///
+/// Reads the column names in order and the primary-key indices from the
+/// catalog, so the catalog is the authoritative source for both. Returns
+/// `None` when the table id or any of its columns cannot be resolved. The
+/// outbound emit path and the inbound patchset apply path both build their
+/// table shape through this one helper, so a single catalog is the source
+/// of truth for the column order and the primary key on both sides.
+#[must_use]
+pub fn simple_table<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<SimpleTable> {
+    use alloc::string::{String, ToString};
+
+    let arity = table_arity(database, table_id)?;
+    let mut column_names: Vec<String> = Vec::with_capacity(arity);
+    for ordinal in 0..arity {
+        let column_id = ColumnId::try_from(ordinal).ok()?;
+        column_names.push(column_name(database, table_id, column_id)?);
+    }
+    let index = usize::try_from(table_id).ok()?;
+    let table_name = database.table_by_id(index)?.table_name().to_string();
+    let pk_indices: Vec<usize> = primary_key_columns(database, table_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(usize::from)
+        .collect();
+    let column_refs: Vec<&str> = column_names.iter().map(String::as_str).collect();
+    Some(SimpleTable::new(table_name, &column_refs, &pk_indices))
+}
+
 /// A table resolved to subql's compact ids, returned by [`resolve_table`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedTable {
@@ -206,22 +237,48 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
     })
 }
 
-/// Resolve a column's type into subql's [`ColumnType`] enum.
+/// Resolve a column's declared SQL type into a backend-neutral
+/// [`ScalarKind`].
 ///
-/// Maps the canonical sql-traits type token onto subql's coarse type
-/// taxonomy (`Int`/`Float`/`Bool`/`String`/`Unknown`). Returns `None`
-/// when the table or column id is unknown.
+/// Distinguishes every scalar subql cares about (`JSONB` vs `JSON`,
+/// `TIMESTAMPTZ` vs `TIMESTAMP`, and so on) via
+/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token).
+/// The compiler coerces comparison literals to the column's kind with it,
+/// and the WAL decoders route each wire cell to its typed value against it.
+///
+/// Returns `None` when the table / column id is unknown or when the
+/// declared type doesn't match any supported scalar (compiler surfaces
+/// this as [`crate::RegisterError::UnsupportedSql`]).
 #[must_use]
-pub fn column_type<DB: DatabaseLike>(
+pub fn column_scalar_kind<DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_id: ColumnId,
-) -> Option<ColumnType> {
+) -> Option<ScalarKind> {
     let table = database.table_by_id(table_id as usize)?;
     let column = table.column_by_id(column_id as usize, database)?;
-    Some(column_type_from_token(
-        canonical_type_token(column.data_type(database)).as_str(),
-    ))
+    scalar_kind_from_raw(column.data_type(database))
+}
+
+/// Map a raw SQL declared type string to its [`ScalarKind`] via
+/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token).
+fn scalar_kind_from_raw(raw: &str) -> Option<ScalarKind> {
+    match canonical_type_token(raw).as_str() {
+        "INT" => Some(ScalarKind::Int),
+        "FLOAT" => Some(ScalarKind::Float),
+        "DECIMAL" => Some(ScalarKind::Decimal),
+        "BOOL" => Some(ScalarKind::Bool),
+        "STRING" => Some(ScalarKind::String),
+        "BYTES" => Some(ScalarKind::Bytes),
+        "UUID" => Some(ScalarKind::Uuid),
+        "DATE" => Some(ScalarKind::Date),
+        "TIME" => Some(ScalarKind::Time),
+        "TIMESTAMP" => Some(ScalarKind::Timestamp),
+        "TIMESTAMPTZ" => Some(ScalarKind::TimestampTz),
+        "JSON" => Some(ScalarKind::Json),
+        "JSONB" => Some(ScalarKind::Jsonb),
+        _ => None,
+    }
 }
 
 /// Whether the table has row-level security enabled (per
@@ -236,23 +293,6 @@ pub fn column_type<DB: DatabaseLike>(
 pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<bool> {
     let table = database.table_by_id(table_id as usize)?;
     Some(table.has_row_level_security(database))
-}
-
-/// Map a canonical sql-traits type token onto subql's [`ColumnType`].
-///
-/// `INT` -> `Int`, `FLOAT`/`DECIMAL` -> `Float` (both numeric for
-/// SUM/AVG validation), `BOOL` -> `Bool`, `STRING` -> `String`. Everything
-/// else (`BYTES`, `DATE`, `TIME`, `TIMESTAMP`, `UUID`, `JSON`, `OTHER:*`)
-/// maps to `Unknown` so SUM/AVG over such columns is permitted without
-/// the engine asserting a numeric type.
-fn column_type_from_token(token: &str) -> ColumnType {
-    match token {
-        "INT" => ColumnType::Int,
-        "FLOAT" | "DECIMAL" => ColumnType::Float,
-        "BOOL" => ColumnType::Bool,
-        "STRING" => ColumnType::String,
-        _ => ColumnType::Unknown,
-    }
 }
 
 #[cfg(test)]
@@ -321,21 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn column_type_maps_known_tokens() {
-        let db = ParserDB::parse::<GenericDialect>(
-            "CREATE TABLE t (i INT, f REAL, d DECIMAL, b BOOLEAN, s TEXT, j JSON);",
-        )
-        .expect("DDL parses");
-        let tid = table_id(&db, "t").unwrap();
-        assert_eq!(column_type(&db, tid, 0), Some(ColumnType::Int));
-        assert_eq!(column_type(&db, tid, 1), Some(ColumnType::Float));
-        assert_eq!(column_type(&db, tid, 2), Some(ColumnType::Float)); // DECIMAL -> Float
-        assert_eq!(column_type(&db, tid, 3), Some(ColumnType::Bool));
-        assert_eq!(column_type(&db, tid, 4), Some(ColumnType::String));
-        assert_eq!(column_type(&db, tid, 5), Some(ColumnType::Unknown)); // JSON
-    }
-
-    #[test]
     fn schema_fingerprint_round_trips_for_same_schema() {
         let db_a = make_db();
         let db_b = make_db();
@@ -364,5 +389,92 @@ mod tests {
     fn schema_fingerprint_none_for_unknown_table() {
         let db = make_db();
         assert!(schema_fingerprint(&db, 9_999).unwrap().is_none());
+    }
+    #[test]
+    fn scalar_kind_from_raw_distinguishes_timestamp_variants() {
+        assert_eq!(
+            scalar_kind_from_raw("TIMESTAMP"),
+            Some(ScalarKind::Timestamp)
+        );
+        assert_eq!(
+            scalar_kind_from_raw("TIMESTAMPTZ"),
+            Some(ScalarKind::TimestampTz)
+        );
+        assert_eq!(
+            scalar_kind_from_raw("TIMESTAMP WITH TIME ZONE"),
+            Some(ScalarKind::TimestampTz)
+        );
+        // Case-insensitive.
+        assert_eq!(
+            scalar_kind_from_raw("timestamptz"),
+            Some(ScalarKind::TimestampTz)
+        );
+    }
+
+    #[test]
+    fn scalar_kind_from_raw_distinguishes_json_variants() {
+        assert_eq!(scalar_kind_from_raw("JSON"), Some(ScalarKind::Json));
+        assert_eq!(scalar_kind_from_raw("JSONB"), Some(ScalarKind::Jsonb));
+        assert_eq!(scalar_kind_from_raw("jsonb"), Some(ScalarKind::Jsonb));
+    }
+
+    #[test]
+    fn scalar_kind_from_raw_maps_canonical_tokens() {
+        // Every string here mirrors what `normalize_sqlparser_type`
+        // hands back for the corresponding `sqlparser::ast::DataType`
+        // (parens already stripped). Values that are not one of the
+        // canonical spellings fall through to `OTHER:...` upstream and
+        // resolve to `None` here.
+        assert_eq!(scalar_kind_from_raw("BIGINT"), Some(ScalarKind::Int));
+        assert_eq!(
+            scalar_kind_from_raw("DOUBLE PRECISION"),
+            Some(ScalarKind::Float)
+        );
+        assert_eq!(scalar_kind_from_raw("NUMERIC"), Some(ScalarKind::Decimal));
+        assert_eq!(scalar_kind_from_raw("BOOLEAN"), Some(ScalarKind::Bool));
+        assert_eq!(scalar_kind_from_raw("VARCHAR"), Some(ScalarKind::String));
+        assert_eq!(scalar_kind_from_raw("BYTEA"), Some(ScalarKind::Bytes));
+        assert_eq!(scalar_kind_from_raw("UUID"), Some(ScalarKind::Uuid));
+        assert_eq!(scalar_kind_from_raw("DATE"), Some(ScalarKind::Date));
+        assert_eq!(scalar_kind_from_raw("TIME"), Some(ScalarKind::Time));
+    }
+
+    #[test]
+    fn scalar_kind_from_raw_returns_none_for_unknown() {
+        assert_eq!(scalar_kind_from_raw("SOME_UNKNOWN_TYPE"), None);
+    }
+
+    #[test]
+    fn column_scalar_kind_classifies_temporal_columns_through_ddl() {
+        // Postgres spellings must classify precisely, because `PgAdapter`
+        // dispatches native temporal binds off the resolved `ScalarKind`.
+        let pg = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE TABLE e (id INT PRIMARY KEY, ts TIMESTAMP, tstz TIMESTAMPTZ, d DATE, t TIME);",
+        )
+        .unwrap();
+        let tid = table_id(&pg, "e").unwrap();
+        assert_eq!(column_scalar_kind(&pg, tid, 1), Some(ScalarKind::Timestamp));
+        assert_eq!(
+            column_scalar_kind(&pg, tid, 2),
+            Some(ScalarKind::TimestampTz)
+        );
+        assert_eq!(column_scalar_kind(&pg, tid, 3), Some(ScalarKind::Date));
+        assert_eq!(column_scalar_kind(&pg, tid, 4), Some(ScalarKind::Time));
+
+        // MySQL spellings, including `DATETIME` and `BIGINT UNSIGNED`,
+        // both unblocked by the sql-traits normalization fix (see
+        // `docs/uphill-sql-traits-phase3-scalar-normalization.md`).
+        // `DATETIME` classifies as a wall-clock `Timestamp`, and `BIGINT
+        // UNSIGNED` folds into the integer family.
+        let my = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+            "CREATE TABLE e (id INT PRIMARY KEY, dt DATETIME, ts TIMESTAMP, d DATE, t TIME, big BIGINT UNSIGNED);",
+        )
+        .unwrap();
+        let tid = table_id(&my, "e").unwrap();
+        assert_eq!(column_scalar_kind(&my, tid, 1), Some(ScalarKind::Timestamp));
+        assert_eq!(column_scalar_kind(&my, tid, 2), Some(ScalarKind::Timestamp));
+        assert_eq!(column_scalar_kind(&my, tid, 3), Some(ScalarKind::Date));
+        assert_eq!(column_scalar_kind(&my, tid, 4), Some(ScalarKind::Time));
+        assert_eq!(column_scalar_kind(&my, tid, 5), Some(ScalarKind::Int));
     }
 }

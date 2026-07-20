@@ -11,7 +11,9 @@ use rand::SeedableRng;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use subql::{AggAccumulator, DefaultIds, RegisterError, SubscriptionEngine, WalEvent};
+use subql::backend::Postgres;
+use subql::testing::TestEvent;
+use subql::{AggAccumulator, DefaultIds, EventKind, RegisterError, SubscriptionEngine};
 
 use crate::presets::{self, PresetSchema};
 use crate::sqlite::capture::{CapturedHook, EventCapture};
@@ -19,7 +21,7 @@ use crate::sqlite::{HarnessError, SqliteHarness};
 
 const EVENT_LOG_CAP: usize = 50;
 
-pub type DemoEngine = SubscriptionEngine<PostgreSqlDialect, DefaultIds, ParserDB>;
+pub type DemoEngine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DemoError {
@@ -154,7 +156,7 @@ impl DemoState {
         Ok(n)
     }
 
-    fn dispatch_one(&mut self, event: &WalEvent) -> Result<(), DemoError> {
+    fn dispatch_one(&mut self, event: &TestEvent<Postgres>) -> Result<(), DemoError> {
         let out = self.engine.dispatch(event)?;
 
         let notifications = out.notifications();
@@ -209,20 +211,28 @@ impl DemoState {
     }
 }
 
-fn event_kind_label(event: &WalEvent) -> &'static str {
-    match event {
-        WalEvent::Insert { .. } => "INSERT",
-        WalEvent::Update { .. } => "UPDATE",
-        WalEvent::Delete { .. } => "DELETE",
-        WalEvent::Truncate { .. } => "TRUNCATE",
+fn event_kind_label(event: &TestEvent<Postgres>) -> &'static str {
+    match event.kind {
+        EventKind::Insert => "INSERT",
+        EventKind::Update => "UPDATE",
+        EventKind::Delete => "DELETE",
+        EventKind::Truncate => "TRUNCATE",
     }
 }
 
-fn summarize_event(event: &WalEvent) -> String {
-    match event {
-        WalEvent::Insert { pk, .. } => format!("pk={:?}", pk.values()),
-        WalEvent::Update { pk, .. } => format!("pk={:?}", pk.values()),
-        WalEvent::Delete { pk, .. } => format!("pk={:?}", pk.values()),
-        WalEvent::Truncate { .. } => "table wiped".into(),
+fn summarize_event(event: &TestEvent<Postgres>) -> String {
+    if event.kind == EventKind::Truncate {
+        return "table wiped".into();
     }
+    let row = if event.kind == EventKind::Delete {
+        &event.old_row
+    } else {
+        &event.new_row
+    };
+    let pk: Vec<_> = event
+        .pk_columns
+        .iter()
+        .filter_map(|&c| row.get(usize::from(c)))
+        .collect();
+    format!("pk={pk:?}")
 }
