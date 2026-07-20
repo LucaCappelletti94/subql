@@ -27,7 +27,7 @@ jobs:
     env:
       RUSTFLAGS: "-Dwarnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -61,7 +61,7 @@ jobs:
           - name: sqlite-cdc
             args: "--all-targets --features sqlite-cdc"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -85,7 +85,7 @@ jobs:
           # regressions before they reach a downstream consumer.
           - wasm32-wasip1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -109,24 +109,24 @@ jobs:
           - name: all-features
             args: "--all-features"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --lib --tests --locked ${{ matrix.profile.args }}
+      - run: cargo test --workspace --lib --tests --release --locked ${{ matrix.profile.args }}
 
   integration:
     name: integration (Docker e2e)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --test cdc_cross_db --locked -- --ignored --nocapture
-      - run: cargo test --test cdc_mysql_e2e --locked -- --ignored --nocapture
-      - run: cargo test --test reexec_mysql --features executor-diesel-mysql --locked -- --ignored --nocapture
+      - run: cargo test --test cdc_cross_db --release --locked -- --ignored --nocapture
+      - run: cargo test --test cdc_mysql_e2e --release --locked -- --ignored --nocapture
+      - run: cargo test --test reexec_mysql --features executor-diesel-mysql --release --locked -- --ignored --nocapture
 
   docs:
     name: docs + doctests
@@ -135,7 +135,7 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -153,20 +153,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --lib --tests --locked
+      - run: cargo test --workspace --lib --tests --release --locked
 
   bench-check:
     name: bench compile check
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -177,7 +177,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
@@ -188,13 +188,13 @@ jobs:
     needs: [unit-tests]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       - run: cargo llvm-cov --workspace --all-features --locked --codecov --output-path codecov.json
-      - uses: codecov/codecov-action@v4
+      - uses: codecov/codecov-action@v5
         with:
           files: codecov.json
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -204,7 +204,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-deny --locked
@@ -215,7 +215,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-udeps --locked
@@ -226,8 +226,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      # Pinned to commit SHA for supply-chain security (HEAD as of 2025-10-30)
-      - uses: rustsec/audit-check@3ae01282e2311f82d96cc2181b31c4fbe3dd00c0
+      - uses: actions/checkout@v5
+      # Pinned to commit SHA for supply-chain security (master HEAD as of 2026-03-20, Node 24)
+      - uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
