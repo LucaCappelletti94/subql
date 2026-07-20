@@ -26,6 +26,11 @@
 //! digests `sqlite_diff_rs::maxwell` events, and (behind the
 //! `pgoutput-emit` feature) [`pgoutput_patchset`] digests pg_walstream
 //! `ChangeEvent`s. Each differs only in its decoder registry.
+//!
+//! Each vehicle also has a `*_changeset` variant (for example
+//! [`wal2json_changeset`]) that emits the changeset format, which records
+//! the old and new value of every changed column and so can carry a
+//! primary-key-changing UPDATE that a patchset cannot.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -41,9 +46,9 @@ use sqlite_diff_rs::pg_walstream::{
 };
 use sqlite_diff_rs::wal2json::{ConversionError, Wal2Json};
 use sqlite_diff_rs::{
-    ColumnNames, Digestable, DynTable, IndexableValues, NamedColumns, PatchSet, PatchsetFormat,
-    SchemaWithPK, SimpleTable, TypeMap, UuidBlob16Decoder, Value as WireValue, WireColumnTypes,
-    WireSchema, WireType,
+    ChangeSet, ChangesetFormat, ColumnNames, Digestable, DynTable, IndexableValues, NamedColumns,
+    PatchSet, PatchsetFormat, SchemaWithPK, SimpleTable, TypeMap, UuidBlob16Decoder,
+    Value as WireValue, WireColumnTypes, WireSchema, WireType,
 };
 
 use crate::backend::ScalarKind;
@@ -292,6 +297,68 @@ where
     Ok(wal2json_patchset_builder(database, events)?.build())
 }
 
+/// Fold a batch of wal2json CDC events into one [`ChangesetFormat`]
+/// changeset builder over `database`, the changeset counterpart to
+/// [`wal2json_patchset_builder`].
+///
+/// A changeset records the old and new value of every changed column, so
+/// unlike a patchset it can carry a primary-key-changing UPDATE. The old
+/// values come from each event's old-row image (`identity`), so full
+/// fidelity needs `REPLICA IDENTITY FULL`. Accepts either `MessageV2` or
+/// `ChangeV1`.
+///
+/// # Errors
+///
+/// Propagates [`ConversionError`] when an event names a table or column
+/// absent from `database`, or a decoder rejects a column payload.
+pub fn wal2json_changeset_builder<DB, E>(
+    database: &DB,
+    events: &[E],
+) -> Result<ChangeSet<WireTable, String, Vec<u8>>, ConversionError>
+where
+    DB: DatabaseLike,
+    E: Digestable<
+        ChangesetFormat,
+        WireTable,
+        String,
+        Vec<u8>,
+        Src = Wal2Json,
+        Error = ConversionError,
+    >,
+{
+    let catalog = WireCatalog::from_database(database);
+    let adapter = wal2json_adapter();
+    let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
+    for event in events {
+        builder = builder.digest(event, &catalog, &adapter)?;
+    }
+    Ok(builder)
+}
+
+/// Fold a batch of wal2json CDC events into one [`ChangesetFormat`]
+/// changeset over `database`, returning the wire bytes.
+///
+/// A thin wrapper over [`wal2json_changeset_builder`] that serializes with
+/// `build()`.
+///
+/// # Errors
+///
+/// Propagates [`ConversionError`], as [`wal2json_changeset_builder`] does.
+pub fn wal2json_changeset<DB, E>(database: &DB, events: &[E]) -> Result<Vec<u8>, ConversionError>
+where
+    DB: DatabaseLike,
+    E: Digestable<
+        ChangesetFormat,
+        WireTable,
+        String,
+        Vec<u8>,
+        Src = Wal2Json,
+        Error = ConversionError,
+    >,
+{
+    Ok(wal2json_changeset_builder(database, events)?.build())
+}
+
 /// The pgoutput decoder registry subql feeds to `digest`.
 ///
 /// Requires the `pgoutput-emit` feature. Overrides UUID to
@@ -340,6 +407,45 @@ pub fn pgoutput_patchset<DB: DatabaseLike>(
     events: &[PgChangeEvent],
 ) -> Result<Vec<u8>, PgConversionError> {
     Ok(pgoutput_patchset_builder(database, events)?.build())
+}
+
+/// Fold a batch of pgoutput `ChangeEvent`s into one [`ChangesetFormat`]
+/// changeset builder over `database`, the changeset counterpart to
+/// [`pgoutput_patchset_builder`].
+///
+/// A changeset records old and new values, so it can carry a
+/// primary-key-changing UPDATE. The old values come from each event's old
+/// tuple, so full fidelity needs `REPLICA IDENTITY FULL`.
+///
+/// # Errors
+///
+/// Propagates the pg source `ConversionError` when an event names a table
+/// or column absent from `database`, or a decoder rejects a payload.
+#[cfg(feature = "pgoutput-emit")]
+pub fn pgoutput_changeset_builder<DB: DatabaseLike>(
+    database: &DB,
+    events: &[PgChangeEvent],
+) -> Result<ChangeSet<WireTable, String, Vec<u8>>, PgConversionError> {
+    let catalog = WireCatalog::from_database(database);
+    let adapter = pgoutput_adapter();
+    let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
+    for event in events {
+        builder = builder.digest(&event.event_type, &catalog, &adapter)?;
+    }
+    Ok(builder)
+}
+
+/// Serialize [`pgoutput_changeset_builder`] to wire bytes.
+///
+/// # Errors
+///
+/// Propagates the pg source `ConversionError`.
+#[cfg(feature = "pgoutput-emit")]
+pub fn pgoutput_changeset<DB: DatabaseLike>(
+    database: &DB,
+    events: &[PgChangeEvent],
+) -> Result<Vec<u8>, PgConversionError> {
+    Ok(pgoutput_changeset_builder(database, events)?.build())
 }
 
 /// The Maxwell decoder registry subql feeds to `digest`.
@@ -391,13 +497,50 @@ pub fn maxwell_patchset<DB: DatabaseLike>(
     Ok(maxwell_patchset_builder(database, events)?.build())
 }
 
+/// Fold a batch of Maxwell `Message`s into one [`ChangesetFormat`]
+/// changeset builder over `database`, the changeset counterpart to
+/// [`maxwell_patchset_builder`].
+///
+/// A changeset records old and new values, so it can carry a
+/// primary-key-changing UPDATE. The old values come from each message's
+/// `old` field, which MySQL populates for the changed columns.
+///
+/// # Errors
+///
+/// Propagates the Maxwell source `ConversionError` when a message names a
+/// table or column absent from `database`, or a decoder rejects a payload.
+pub fn maxwell_changeset_builder<DB: DatabaseLike>(
+    database: &DB,
+    events: &[MaxwellMessage],
+) -> Result<ChangeSet<WireTable, String, Vec<u8>>, MaxwellConversionError> {
+    let catalog = WireCatalog::from_database(database);
+    let adapter = maxwell_adapter();
+    let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
+    for event in events {
+        builder = builder.digest(event, &catalog, &adapter)?;
+    }
+    Ok(builder)
+}
+
+/// Serialize [`maxwell_changeset_builder`] to wire bytes.
+///
+/// # Errors
+///
+/// Propagates the Maxwell source `ConversionError`.
+pub fn maxwell_changeset<DB: DatabaseLike>(
+    database: &DB,
+    events: &[MaxwellMessage],
+) -> Result<Vec<u8>, MaxwellConversionError> {
+    Ok(maxwell_changeset_builder(database, events)?.build())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use sql_traits::structs::ParserDB;
     use sqlite_diff_rs::wal2json::parse_v2;
-    use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp};
+    use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp};
     use sqlparser::dialect::PostgreSqlDialect;
 
     fn orders_db() -> ParserDB {
@@ -653,6 +796,36 @@ mod tests {
             pk.to_vec(),
             vec![WireValue::Integer(2)],
             "the emitted WHERE targets the new key, so the old key is lost"
+        );
+    }
+
+    /// The changeset emit path records the old and new value of every
+    /// changed column, so a primary-key-changing UPDATE carries both the
+    /// old key (for the WHERE) and the new key (for the SET). A patchset
+    /// emit cannot express this.
+    #[test]
+    fn wal2json_changeset_update_captures_old_and_new() {
+        let db = orders_db();
+        // A pk-changing UPDATE under REPLICA IDENTITY FULL: the new image
+        // (`columns`) carries id 2, the old-row image (`identity`) carries
+        // id 1.
+        let line = r#"{"action":"U","schema":"public","table":"orders","columns":[{"name":"id","type":"integer","value":2},{"name":"amount","type":"integer","value":100},{"name":"status","type":"text","value":"new"}],"identity":[{"name":"id","type":"integer","value":1},{"name":"amount","type":"integer","value":100},{"name":"status","type":"text","value":"new"}]}"#;
+        let msg = parse_v2(line).unwrap();
+
+        let bytes = wal2json_changeset(&db, core::slice::from_ref(&msg)).unwrap();
+        let ParsedDiffSet::Changeset(diff) = ParsedDiffSet::parse(&bytes).unwrap() else {
+            panic!("expected a changeset (marker T)");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        assert_eq!(ops.len(), 1);
+        let ChangesetOp::Update { values, .. } = &ops[0] else {
+            panic!("expected an update op, got {:?}", ops[0]);
+        };
+        // The id column carries the old key (1) and the new key (2), so a
+        // changeset apply relocates the row.
+        assert_eq!(
+            values[0],
+            (Some(WireValue::Integer(1)), Some(WireValue::Integer(2)))
         );
     }
 }
