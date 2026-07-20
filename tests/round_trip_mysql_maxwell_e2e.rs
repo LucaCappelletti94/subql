@@ -485,7 +485,7 @@ fn finish_loop(
     assert_eq!(load_mysql(my), seed_mysql_rows(), "MySQL after re-seed");
 
     my_engine
-        .apply_patchset_bytes(&session_patchset, my, &my_adapter)
+        .apply_diffset_bytes(&session_patchset, my, &my_adapter)
         .unwrap();
     assert_eq!(
         load_mysql(my),

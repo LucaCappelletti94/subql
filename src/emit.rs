@@ -530,4 +530,129 @@ mod tests {
         let err = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap_err();
         assert!(matches!(err, ConversionError::TableNotFound(name) if name == "absent"));
     }
+
+    fn pairs_db() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE pairs (a INT, b INT, v TEXT, PRIMARY KEY (a, b));",
+        )
+        .unwrap()
+    }
+
+    /// Under default replica identity the old-row image an UPDATE carries
+    /// is key-only, and a DELETE carries only the key. The patchset update
+    /// digest builds its WHERE from the primary key in the new image
+    /// (`columns`) and never reads the old image, so a key-only old image
+    /// is sufficient. This pins that the loop does not require
+    /// `REPLICA IDENTITY FULL`.
+    #[test]
+    fn default_replica_identity_key_only_old_image_emits_update_and_delete() {
+        let db = orders_db();
+
+        // UPDATE with a full new image and a key-only identity (default RI).
+        let update = r#"{"action":"U","schema":"public","table":"orders","columns":[{"name":"id","type":"integer","value":1},{"name":"amount","type":"integer","value":250},{"name":"status","type":"text","value":"shipped"}],"identity":[{"name":"id","type":"integer","value":1}]}"#;
+        let msg = parse_v2(update).unwrap();
+        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
+            unreachable!("marker checked above");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        let PatchsetOp::Update { pk, .. } = &ops[0] else {
+            panic!("expected an update op, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            pk.to_vec(),
+            vec![WireValue::Integer(1)],
+            "WHERE key present"
+        );
+        let new_values = ops[0]
+            .update_new_values()
+            .expect("update carries new values");
+        assert!(new_values
+            .iter()
+            .any(|v| matches!(v, Some(WireValue::Text(s)) if s == "shipped")));
+
+        // DELETE with a key-only identity (default RI).
+        let delete = r#"{"action":"D","schema":"public","table":"orders","identity":[{"name":"id","type":"integer","value":1}]}"#;
+        let msg = parse_v2(delete).unwrap();
+        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
+            unreachable!("marker checked above");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        let PatchsetOp::Delete { pk, .. } = &ops[0] else {
+            panic!("expected a delete op, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            pk.to_vec(),
+            vec![WireValue::Integer(1)],
+            "delete matches key"
+        );
+    }
+
+    /// A composite primary key produces an update and a delete whose pk
+    /// carries every key column, in pk-ordinal order, so the apply side
+    /// can match on all of them.
+    #[test]
+    fn composite_pk_update_and_delete_carry_all_key_columns() {
+        let db = pairs_db();
+
+        let update = r#"{"action":"U","schema":"public","table":"pairs","columns":[{"name":"a","type":"integer","value":1},{"name":"b","type":"integer","value":2},{"name":"v","type":"text","value":"y2"}],"identity":[{"name":"a","type":"integer","value":1},{"name":"b","type":"integer","value":2}]}"#;
+        let msg = parse_v2(update).unwrap();
+        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
+            unreachable!("marker checked above");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        let PatchsetOp::Update { pk, .. } = &ops[0] else {
+            panic!("expected an update op, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            pk.to_vec(),
+            vec![WireValue::Integer(1), WireValue::Integer(2)],
+            "both key columns in the update WHERE"
+        );
+
+        let delete = r#"{"action":"D","schema":"public","table":"pairs","identity":[{"name":"a","type":"integer","value":1},{"name":"b","type":"integer","value":2}]}"#;
+        let msg = parse_v2(delete).unwrap();
+        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
+            unreachable!("marker checked above");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        let PatchsetOp::Delete { pk, .. } = &ops[0] else {
+            panic!("expected a delete op, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            pk.to_vec(),
+            vec![WireValue::Integer(1), WireValue::Integer(2)],
+            "both key columns in the delete WHERE"
+        );
+    }
+
+    /// A primary-key-changing UPDATE cannot round-trip through a patchset:
+    /// the digest builds the WHERE from the new image, so the emitted op
+    /// targets the new key and the old key is lost. Applied to a replica
+    /// that still holds the old key, it matches no row, so the replica
+    /// diverges. This pins the documented limitation from the emit side.
+    #[test]
+    fn pk_changing_update_targets_the_new_key_documenting_the_limitation() {
+        let db = orders_db();
+        // UPDATE orders SET id = 2 WHERE id = 1: new image has id = 2, the
+        // old-row identity still has id = 1.
+        let line = r#"{"action":"U","schema":"public","table":"orders","columns":[{"name":"id","type":"integer","value":2},{"name":"amount","type":"integer","value":100},{"name":"status","type":"text","value":"new"}],"identity":[{"name":"id","type":"integer","value":1}]}"#;
+        let msg = parse_v2(line).unwrap();
+        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
+            unreachable!("marker checked above");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        let PatchsetOp::Update { pk, .. } = &ops[0] else {
+            panic!("expected an update op, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            pk.to_vec(),
+            vec![WireValue::Integer(2)],
+            "the emitted WHERE targets the new key, so the old key is lost"
+        );
+    }
 }

@@ -546,7 +546,7 @@ pub fn finish_loop(
     assert_eq!(load_pg(pg), seed_pg_rows(), "Postgres after re-seed");
 
     pg_engine
-        .apply_patchset_bytes(&session_patchset, pg, &pg_adapter)
+        .apply_diffset_bytes(&session_patchset, pg, &pg_adapter)
         .unwrap();
     let round_tripped = load_pg(pg);
     assert_eq!(

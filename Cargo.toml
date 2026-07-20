@@ -299,7 +299,7 @@ r2d2 = { version = "0.8", optional = true }
 # alloc` posture, no C deps (the `wal2json` and `maxwell` features pull only
 # serde). `default-features = false` drops the `diesel` and `pg-walstream`
 # reverse adapters, which the feature gates below opt into when needed.
-sqlite-diff-rs = { version = "0.5.1", default-features = false, features = ["wal2json", "maxwell"] }
+sqlite-diff-rs = { version = "0.6.1", default-features = false, features = ["wal2json", "maxwell"] }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables
