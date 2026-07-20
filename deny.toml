@@ -21,7 +21,16 @@ wildcards = "warn"
 deny = []
 
 [advisories]
-ignore = []
+# RUSTSEC-2026-0138: unsound access to padding bytes when `diesel-async`
+# serializes native date/time values through the MySQL backend. Not
+# reachable from subql. The async MySQL connector only reads scalar
+# re-execution results (it never serializes date/time), and the
+# `apply-patchset-mysql` path binds through `sqlite-diff-rs`'s
+# `DefaultBinder` (Integer/Real/Text/Blob) without enabling diesel's
+# `chrono`, so no native date/time value is ever bound over an async MySQL
+# connection. The upstream fix (`diesel-async` >= 0.9) is blocked on
+# `sqlite-diff-rs` moving off its `diesel-async ^0.7` pin.
+ignore = ["RUSTSEC-2026-0138"]
 
 [sources]
 unknown-registry = "warn"

@@ -60,6 +60,19 @@ jobs:
           # neighbour is also on.
           - name: sqlite-cdc
             args: "--all-targets --features sqlite-cdc"
+          # Async execution features exercised in isolation, same rationale
+          # as the sqlite-cdc row: catch items that should be gated behind
+          # the async features but leak out unconditionally, which the
+          # all-features row would mask. std-only (diesel-async needs a
+          # runtime), so lib + all-targets is fine here.
+          - name: executor-diesel-async-postgres
+            args: "--all-targets --features executor-diesel-async-postgres"
+          - name: executor-diesel-async-mysql
+            args: "--all-targets --features executor-diesel-async-mysql"
+          - name: apply-patchset-postgres-async
+            args: "--all-targets --features apply-patchset-postgres-async"
+          - name: apply-patchset-mysql-async
+            args: "--all-targets --features apply-patchset-mysql-async"
     steps:
       - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
@@ -118,7 +131,7 @@ jobs:
   integration:
     name: integration (Docker e2e)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
@@ -127,6 +140,11 @@ jobs:
       - run: cargo test --test cdc_cross_db --release --locked -- --ignored --nocapture
       - run: cargo test --test cdc_mysql_e2e --release --locked -- --ignored --nocapture
       - run: cargo test --test reexec_mysql --features executor-diesel-mysql --release --locked -- --ignored --nocapture
+      - run: cargo test --test apply_patchset_pg_async_e2e --features apply-patchset-postgres-async --release --locked -- --ignored --nocapture
+      - run: cargo test --test apply_diffset_async_pg_e2e --features apply-patchset-postgres-async --release --locked -- --ignored --nocapture
+      - run: cargo test --test apply_patchset_mysql_async_e2e --features apply-patchset-mysql-async --release --locked -- --ignored --nocapture
+      - run: cargo test --test reexec_postgres_async --features executor-diesel-async-postgres --release --locked -- --ignored --nocapture
+      - run: cargo test --test reexec_mysql_async --features executor-diesel-async-mysql --release --locked -- --ignored --nocapture
 
   docs:
     name: docs + doctests
