@@ -1166,7 +1166,7 @@ pub fn harness_sqlite_pgoutput_e2e(data: &[u8]) {
             // Execute the DML against SQLite. Errors here are
             // adversarial-input territory (constraint violations,
             // syntax we did not anticipate) and skipped.
-            if fixture.execute(&sql).is_err() {
+            if fixture.execute_sql(&sql).is_err() {
                 continue;
             }
             fixture.drain_and_dispatch(&mut |ev| {
@@ -1228,14 +1228,14 @@ impl E2eFixture {
         // The bulk DELETE fires one changeset op per row, which then
         // flows through the drain loop; we discard everything so the
         // next iter starts with an empty stream.
-        let _ = self.source.execute("DELETE FROM orders");
+        let _ = self.source.execute_sql("DELETE FROM orders");
         while let Ok(Some(_)) = self.source.poll_next_event() {
             // Discard residual events from the bulk DELETE.
         }
     }
 
-    fn execute(&mut self, sql: &str) -> Result<usize, crate::PgSqliteEmuError> {
-        self.source.execute(sql)
+    fn execute_sql(&mut self, sql: &str) -> Result<usize, crate::PgSqliteEmuError> {
+        self.source.execute_sql(sql)
     }
 
     fn inject_truncate(&mut self) -> Result<(), crate::PgSqliteEmuError> {

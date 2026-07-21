@@ -24,7 +24,7 @@ fn insert_round_trips_through_the_emulator() {
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("build source");
 
     let rows = source
-        .execute("INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 1, 'paid')")
+        .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (7, 9.5, 1, 'paid')")
         .expect("INSERT succeeds");
     assert_eq!(rows, 1);
 

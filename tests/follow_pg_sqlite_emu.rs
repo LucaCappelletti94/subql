@@ -6,7 +6,7 @@
 //! trigger-installed shadow log would observe the INSERT. The
 //! session-extension emulator only sees writes routed through the
 //! connection it owns, so the follow's INSERT must run through
-//! `source.connection()` (or the [`PgSqliteEmuSource::execute`]
+//! `source.connection()` (or the [`PgSqliteEmuSource::execute_sql`]
 //! helper), and there is no need for a temp file.
 //!
 //! The old test also drove [`SubscriptionEngine::register_follow_insert`]
@@ -49,7 +49,7 @@ fn follow_row_receives_inserted_row_delta() {
     assert_ne!(ann.subscription_id, bob.subscription_id);
 
     source
-        .execute("INSERT INTO users (id, name) VALUES (1, 'ann')")
+        .execute_sql("INSERT INTO users (id, name) VALUES (1, 'ann')")
         .expect("insert ann");
 
     let event = source
@@ -85,14 +85,14 @@ fn follow_row_ignores_unrelated_deletes() {
         .expect("register follow for id=7");
 
     source
-        .execute("INSERT INTO users (id, name) VALUES (7, 'seven')")
+        .execute_sql("INSERT INTO users (id, name) VALUES (7, 'seven')")
         .expect("insert seven");
     let insert_event = source.poll_next_event().unwrap().expect("insert event");
     let notifs = engine.consumers(&insert_event).unwrap();
     assert!(notifs.inserted().contains(&1), "follow observes its INSERT");
 
     source
-        .execute("DELETE FROM users WHERE id = 7")
+        .execute_sql("DELETE FROM users WHERE id = 7")
         .expect("delete seven");
     let delete_event = source.poll_next_event().unwrap().expect("delete event");
     let notifs = engine.consumers(&delete_event).unwrap();
@@ -105,7 +105,7 @@ fn follow_row_ignores_unrelated_deletes() {
     // A subsequent INSERT targeting a different id must not fire the
     // (now-closed) follow.
     source
-        .execute("INSERT INTO users (id, name) VALUES (99, 'other')")
+        .execute_sql("INSERT INTO users (id, name) VALUES (99, 'other')")
         .expect("insert other");
     let event = source.poll_next_event().unwrap().expect("insert event");
     let notifs = engine.consumers(&event).unwrap();
@@ -128,7 +128,7 @@ fn deleting_a_followed_row_auto_closes_the_pk_follow() {
         SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
 
     source
-        .execute("INSERT INTO users (id, name) VALUES (11, 'eleven')")
+        .execute_sql("INSERT INTO users (id, name) VALUES (11, 'eleven')")
         .expect("insert eleven");
     let insert_event = source
         .poll_next_event()
@@ -151,7 +151,7 @@ fn deleting_a_followed_row_auto_closes_the_pk_follow() {
     );
 
     source
-        .execute("DELETE FROM users WHERE id = 11")
+        .execute_sql("DELETE FROM users WHERE id = 11")
         .expect("delete eleven");
     let delete_event = source
         .poll_next_event()
@@ -179,10 +179,10 @@ fn deleting_an_unrelated_row_leaves_the_pk_follow_open() {
         SubscriptionEngine::new(source.pg_catalog().clone(), PostgreSqlDialect {});
 
     source
-        .execute("INSERT INTO users (id, name) VALUES (20, 'twenty')")
+        .execute_sql("INSERT INTO users (id, name) VALUES (20, 'twenty')")
         .expect("insert twenty");
     source
-        .execute("INSERT INTO users (id, name) VALUES (21, 'twentyone')")
+        .execute_sql("INSERT INTO users (id, name) VALUES (21, 'twentyone')")
         .expect("insert twentyone");
     let _ = source.poll_next_event().unwrap().expect("first insert");
     let _ = source.poll_next_event().unwrap().expect("second insert");
@@ -194,7 +194,7 @@ fn deleting_an_unrelated_row_leaves_the_pk_follow_open() {
     assert_eq!(engine.subscription_count(), 1);
 
     source
-        .execute("DELETE FROM users WHERE id = 21")
+        .execute_sql("DELETE FROM users WHERE id = 21")
         .expect("delete twentyone");
     let event = source
         .poll_next_event()
