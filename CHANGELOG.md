@@ -17,3 +17,4 @@ All notable changes to subql are recorded here. The format follows [Keep a Chang
 - `AsyncAutoResolvingEngine::concurrency_cap() -> Option<usize>` reports the configured cap.
 - `async-lock` dependency (runtime-agnostic `Semaphore`, `no_std + alloc`).
 - `tracing::trace!` event on every permit acquire when the `observability` feature is enabled.
+- `patchset::apply_diffset_bytes_with_catalog(...)` and `patchset::apply_diffset_bytes_async_with_catalog(...)` apply a client-uploaded SQLite session diffset given only a catalog (`&DB: DatabaseLike`), with no `SubscriptionEngine` in scope. The async entry returns an `impl Future + Send` that owns its reconstructed batch and never borrows the catalog, so a shared `&catalog` (for a `Sync` catalog such as `ParserDB`) serves concurrent applies on a multi-thread runtime with no per-write allocation. `SubscriptionEngine::apply_diffset_bytes` and `apply_diffset_bytes_async` now delegate to these, behavior unchanged.
