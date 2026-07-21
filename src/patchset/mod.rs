@@ -58,11 +58,10 @@ use sqlite_diff_rs::{
 ))]
 use sqlite_diff_rs::ApplyOpsAsync;
 
-/// Owned reconstructed batch produced by
-/// [`SubscriptionEngine::apply_diffset_bytes_async`] before it hands the
-/// ops to the async execution driver. Owning the batch lets the returned
-/// future borrow only the batch, connection, and adapter, never the
-/// non-`Sync` engine, so the future stays `Send`.
+/// Owned reconstructed batch that
+/// [`apply_diffset_bytes_async_with_catalog`] hands to the async execution
+/// driver. Owning it keeps the returned future from borrowing `catalog`,
+/// so the future stays `Send`.
 #[cfg(any(
     feature = "apply-patchset-postgres-async",
     feature = "apply-patchset-mysql-async"
@@ -224,20 +223,7 @@ where
         str: ToSql<Text, DBend>,
         [u8]: ToSql<Binary, DBend>,
     {
-        match ParsedDiffSet::parse(bytes).map_err(|err| {
-            ingest_error(alloc::format!(
-                "failed to parse uploaded SQLite session diffset bytes: {err}"
-            ))
-        })? {
-            ParsedDiffSet::Patchset(diff) => {
-                let patchset = self.reconstruct_patchset(&diff)?;
-                self.apply_patchset(&patchset, conn, adapter)
-            }
-            ParsedDiffSet::Changeset(diff) => {
-                let changeset = self.reconstruct_changeset(&diff)?;
-                self.apply_changeset(&changeset, conn, adapter)
-            }
-        }
+        apply_diffset_bytes_with_catalog(self.database(), bytes, conn, adapter)
     }
 
     /// Async peer of [`Self::apply_patchset`], driven by
@@ -361,167 +347,253 @@ where
         str: ToSql<Text, DBend>,
         [u8]: ToSql<Binary, DBend>,
     {
-        // Parse and reconstruct against the catalog synchronously up front
-        // (this is the only step that touches the engine), so the returned
-        // future carries only the owned batch, `conn`, and `adapter`.
-        let reconstructed = ParsedDiffSet::parse(bytes)
-            .map_err(|err| {
-                ingest_error(alloc::format!(
-                    "failed to parse uploaded SQLite session diffset bytes: {err}"
-                ))
-            })
-            .and_then(|parsed| match parsed {
-                ParsedDiffSet::Patchset(diff) => self
-                    .reconstruct_patchset(&diff)
-                    .map(ReconstructedDiff::Patchset),
-                ParsedDiffSet::Changeset(diff) => self
-                    .reconstruct_changeset(&diff)
-                    .map(ReconstructedDiff::Changeset),
-            });
-        async move {
-            match reconstructed? {
-                ReconstructedDiff::Patchset(patchset) => {
-                    patchset
-                        .iter()
-                        .map(|op| op.with_adapter::<DBend, _>(adapter))
-                        .apply_transactional_async(conn)
-                        .await
-                }
-                ReconstructedDiff::Changeset(changeset) => {
-                    changeset
-                        .iter()
-                        .map(|op| op.with_adapter::<DBend, _>(adapter))
-                        .apply_transactional_async(conn)
-                        .await
-                }
-            }
+        apply_diffset_bytes_async_with_catalog(self.database(), bytes, conn, adapter)
+    }
+}
+
+// ============================================================================
+// Catalog-only apply surface (no SubscriptionEngine required)
+// ============================================================================
+
+/// Apply a client-uploaded SQLite session diffset from its raw wire bytes
+/// against `conn` using `adapter`, resolving table shapes from `catalog`.
+///
+/// The catalog-only inbound entry point: apply needs a catalog (`&DB`),
+/// not a whole [`SubscriptionEngine`](crate::SubscriptionEngine), which
+/// delegates here. Dispatches on the format marker, so a changeset upload
+/// can apply a primary-key-changing UPDATE a patchset cannot. Table shapes
+/// come from `catalog` by name, never the uploaded flags, so a client
+/// cannot steer the WHERE clause.
+///
+/// # Errors
+///
+/// [`QueryBuilderError`](diesel::result::Error::QueryBuilderError) when the
+/// bytes fail to parse or name an unknown table, else the first bind or
+/// execution error, rolling back the transaction.
+pub fn apply_diffset_bytes_with_catalog<DB, DBend, Conn, A>(
+    catalog: &DB,
+    bytes: &[u8],
+    conn: &mut Conn,
+    adapter: &A,
+) -> QueryResult<usize>
+where
+    DB: DatabaseLike,
+    DBend:
+        Backend + HasSqlType<BigInt> + HasSqlType<Double> + HasSqlType<Text> + HasSqlType<Binary>,
+    Conn: diesel::Connection<Backend = DBend>,
+    A: Adapter<DBend, String, Vec<u8>> + Send + Sync,
+    i64: ToSql<BigInt, DBend>,
+    f64: ToSql<Double, DBend>,
+    str: ToSql<Text, DBend>,
+    [u8]: ToSql<Binary, DBend>,
+{
+    match ParsedDiffSet::parse(bytes).map_err(|err| {
+        ingest_error(alloc::format!(
+            "failed to parse uploaded SQLite session diffset bytes: {err}"
+        ))
+    })? {
+        ParsedDiffSet::Patchset(diff) => {
+            let patchset = reconstruct_patchset(catalog, &diff)?;
+            patchset
+                .iter()
+                .map(|op| op.with_adapter::<DBend, _>(adapter))
+                .apply_transactional(conn)
+        }
+        ParsedDiffSet::Changeset(diff) => {
+            let changeset = reconstruct_changeset(catalog, &diff)?;
+            changeset
+                .iter()
+                .map(|op| op.with_adapter::<DBend, _>(adapter))
+                .apply_transactional(conn)
         }
     }
+}
 
-    /// Reconstruct an applyable [`PatchSet<SimpleTable>`] from a parsed
-    /// patchset, resolving each op's table shape from the catalog.
-    ///
-    /// The op reconstruction mirrors what the SQLite session extension
-    /// records: an insert carries every column value, an update carries
-    /// the primary key plus the new non-key values, and a delete carries
-    /// only the primary key. A patchset stores one value per primary-key
-    /// column, so it cannot express a primary-key change (a changeset
-    /// upload can, see [`Self::apply_diffset_bytes`]).
-    fn reconstruct_patchset(
-        &self,
-        diff: &DiffSet<PatchsetFormat, TableSchema<String>, String, Vec<u8>>,
-    ) -> QueryResult<PatchSet<SimpleTable, String, Vec<u8>>> {
-        let mut builder = PatchSet::<SimpleTable, String, Vec<u8>>::new();
-        for op in diff.iter() {
-            let table = self.catalog_table(op.table().name())?;
-            match op {
-                PatchsetOp::Insert { values, .. } => {
-                    let mut insert = Insert::from(table);
-                    for (index, value) in values.iter().enumerate() {
-                        insert = insert
-                            .set(index, value.clone())
-                            .map_err(|err| op_error(&err))?;
-                    }
-                    builder = builder.insert(insert);
-                }
-                PatchsetOp::Update { pk, entries, .. } => {
-                    let pk_indices = table.pk_indices();
-                    let mut update = Update::<_, PatchsetFormat, String, Vec<u8>>::from(table);
-                    for (value, &col) in pk.iter().zip(pk_indices.iter()) {
-                        update = update
-                            .set(col, value.clone())
-                            .map_err(|err| op_error(&err))?;
-                    }
-                    for (index, (_unit, new)) in entries.iter().enumerate() {
-                        if !pk_indices.contains(&index) {
-                            if let Some(value) = new {
-                                update = update
-                                    .set(index, value.clone())
-                                    .map_err(|err| op_error(&err))?;
-                            }
-                        }
-                    }
-                    builder = builder.update(update);
-                }
-                PatchsetOp::Delete { pk, .. } => {
-                    builder = builder.delete(PatchDelete::new(table, pk.to_vec()));
-                }
-            }
-        }
-        Ok(builder)
-    }
-
-    /// Reconstruct an applyable [`ChangeSet<SimpleTable>`] from a parsed
-    /// changeset, resolving each op's table shape from the catalog.
-    ///
-    /// Unlike [`Self::reconstruct_patchset`], this preserves the old and
-    /// new value of every column, so a primary-key change reconstructs
-    /// with the old key for the WHERE and the new key for the SET. An
-    /// unchanged primary-key column, which the format records as an old
-    /// value with no new value, reconstructs as old equal to new, so the
-    /// render keeps it in the WHERE and out of the SET.
-    fn reconstruct_changeset(
-        &self,
-        diff: &DiffSet<ChangesetFormat, TableSchema<String>, String, Vec<u8>>,
-    ) -> QueryResult<ChangeSet<SimpleTable, String, Vec<u8>>> {
-        let mut builder = ChangeSet::<SimpleTable, String, Vec<u8>>::new();
-        for op in diff.iter() {
-            let table = self.catalog_table(op.table().name())?;
-            match op {
-                ChangesetOp::Insert { values, .. } => {
-                    let mut insert = Insert::from(table);
-                    for (index, value) in values.iter().enumerate() {
-                        insert = insert
-                            .set(index, value.clone())
-                            .map_err(|err| op_error(&err))?;
-                    }
-                    builder = builder.insert(insert);
-                }
-                ChangesetOp::Update { values, .. } => {
-                    let mut update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(table);
-                    for (index, (old, new)) in values.iter().enumerate() {
-                        update = match (old, new) {
-                            (Some(old), Some(new)) => update.set(index, old.clone(), new.clone()),
-                            // An unchanged primary-key column: old present,
-                            // no new. Set old equal to new so it stays in
-                            // the WHERE and out of the SET.
-                            (Some(old), None) => update.set(index, old.clone(), old.clone()),
-                            (None, Some(new)) => update.set_new(index, new.clone()),
-                            // Not part of the diff.
-                            (None, None) => Ok(update),
-                        }
-                        .map_err(|err| op_error(&err))?;
-                    }
-                    builder = builder.update(update);
-                }
-                ChangesetOp::Delete { old_values, .. } => {
-                    let mut delete = ChangeDelete::from(table);
-                    for (index, value) in old_values.iter().enumerate() {
-                        delete = delete
-                            .set(index, value.clone())
-                            .map_err(|err| op_error(&err))?;
-                    }
-                    builder = builder.delete(delete);
-                }
-            }
-        }
-        Ok(builder)
-    }
-
-    /// Resolve a [`SimpleTable`] for `name` from subql's catalog.
-    fn catalog_table(&self, name: &str) -> QueryResult<SimpleTable> {
-        let database = self.database();
-        let table_id = crate::catalog_helpers::table_id(database, name).ok_or_else(|| {
+/// Async peer of [`apply_diffset_bytes_with_catalog`], driven by
+/// [`diesel_async`]. One transaction.
+///
+/// Parse and reconstruction run synchronously up front, so the returned
+/// future owns its batch and never borrows `catalog`: it is `Send`, and a
+/// shared `&catalog` (for a `Sync` catalog such as
+/// [`ParserDB`](sql_traits::structs::ParserDB)) serves concurrent applies
+/// on a multi-thread runtime.
+///
+/// # Errors
+///
+/// As [`apply_diffset_bytes_with_catalog`].
+#[cfg(any(
+    feature = "apply-patchset-postgres-async",
+    feature = "apply-patchset-mysql-async"
+))]
+pub fn apply_diffset_bytes_async_with_catalog<'a, DB, DBend, Conn, A>(
+    catalog: &DB,
+    bytes: &[u8],
+    conn: &'a mut Conn,
+    adapter: &'a A,
+) -> impl core::future::Future<Output = QueryResult<usize>> + Send + 'a
+where
+    DB: DatabaseLike,
+    DBend:
+        Backend + HasSqlType<BigInt> + HasSqlType<Double> + HasSqlType<Text> + HasSqlType<Binary>,
+    Conn: diesel_async::AsyncConnection<Backend = DBend>,
+    A: Adapter<DBend, String, Vec<u8>> + Send + Sync + 'a,
+    i64: ToSql<BigInt, DBend>,
+    f64: ToSql<Double, DBend>,
+    str: ToSql<Text, DBend>,
+    [u8]: ToSql<Binary, DBend>,
+{
+    // Reconstruct synchronously up front so the future owns its batch and
+    // never borrows `catalog`.
+    let reconstructed = ParsedDiffSet::parse(bytes)
+        .map_err(|err| {
             ingest_error(alloc::format!(
-                "uploaded patchset names table `{name}`, which is absent from the catalog"
-            ))
-        })?;
-        crate::catalog_helpers::simple_table(database, table_id).ok_or_else(|| {
-            ingest_error(alloc::format!(
-                "catalog table `{name}` could not be resolved to a schema"
+                "failed to parse uploaded SQLite session diffset bytes: {err}"
             ))
         })
+        .and_then(|parsed| match parsed {
+            ParsedDiffSet::Patchset(diff) => {
+                reconstruct_patchset(catalog, &diff).map(ReconstructedDiff::Patchset)
+            }
+            ParsedDiffSet::Changeset(diff) => {
+                reconstruct_changeset(catalog, &diff).map(ReconstructedDiff::Changeset)
+            }
+        });
+    async move {
+        match reconstructed? {
+            ReconstructedDiff::Patchset(patchset) => {
+                patchset
+                    .iter()
+                    .map(|op| op.with_adapter::<DBend, _>(adapter))
+                    .apply_transactional_async(conn)
+                    .await
+            }
+            ReconstructedDiff::Changeset(changeset) => {
+                changeset
+                    .iter()
+                    .map(|op| op.with_adapter::<DBend, _>(adapter))
+                    .apply_transactional_async(conn)
+                    .await
+            }
+        }
     }
+}
+
+/// Reconstruct an applyable [`PatchSet<SimpleTable>`] from a parsed
+/// patchset, resolving each op's table shape from `catalog`.
+///
+/// A patchset stores one value per primary-key column, so it cannot
+/// express a primary-key change (a changeset can).
+fn reconstruct_patchset<DB: DatabaseLike>(
+    catalog: &DB,
+    diff: &DiffSet<PatchsetFormat, TableSchema<String>, String, Vec<u8>>,
+) -> QueryResult<PatchSet<SimpleTable, String, Vec<u8>>> {
+    let mut builder = PatchSet::<SimpleTable, String, Vec<u8>>::new();
+    for op in diff.iter() {
+        let table = catalog_table(catalog, op.table().name())?;
+        match op {
+            PatchsetOp::Insert { values, .. } => {
+                let mut insert = Insert::from(table);
+                for (index, value) in values.iter().enumerate() {
+                    insert = insert
+                        .set(index, value.clone())
+                        .map_err(|err| op_error(&err))?;
+                }
+                builder = builder.insert(insert);
+            }
+            PatchsetOp::Update { pk, entries, .. } => {
+                let pk_indices = table.pk_indices();
+                let mut update = Update::<_, PatchsetFormat, String, Vec<u8>>::from(table);
+                for (value, &col) in pk.iter().zip(pk_indices.iter()) {
+                    update = update
+                        .set(col, value.clone())
+                        .map_err(|err| op_error(&err))?;
+                }
+                for (index, (_unit, new)) in entries.iter().enumerate() {
+                    if !pk_indices.contains(&index) {
+                        if let Some(value) = new {
+                            update = update
+                                .set(index, value.clone())
+                                .map_err(|err| op_error(&err))?;
+                        }
+                    }
+                }
+                builder = builder.update(update);
+            }
+            PatchsetOp::Delete { pk, .. } => {
+                builder = builder.delete(PatchDelete::new(table, pk.to_vec()));
+            }
+        }
+    }
+    Ok(builder)
+}
+
+/// Reconstruct an applyable [`ChangeSet<SimpleTable>`] from a parsed
+/// changeset, resolving each op's table shape from `catalog`.
+///
+/// Unlike [`reconstruct_patchset`], it keeps the old and new value of
+/// every column, so a primary-key change renders the old key in the WHERE
+/// and the new key in the SET. An unchanged pk column (old present, no
+/// new) becomes old equal to new, staying in the WHERE and out of the SET.
+fn reconstruct_changeset<DB: DatabaseLike>(
+    catalog: &DB,
+    diff: &DiffSet<ChangesetFormat, TableSchema<String>, String, Vec<u8>>,
+) -> QueryResult<ChangeSet<SimpleTable, String, Vec<u8>>> {
+    let mut builder = ChangeSet::<SimpleTable, String, Vec<u8>>::new();
+    for op in diff.iter() {
+        let table = catalog_table(catalog, op.table().name())?;
+        match op {
+            ChangesetOp::Insert { values, .. } => {
+                let mut insert = Insert::from(table);
+                for (index, value) in values.iter().enumerate() {
+                    insert = insert
+                        .set(index, value.clone())
+                        .map_err(|err| op_error(&err))?;
+                }
+                builder = builder.insert(insert);
+            }
+            ChangesetOp::Update { values, .. } => {
+                let mut update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(table);
+                for (index, (old, new)) in values.iter().enumerate() {
+                    update = match (old, new) {
+                        (Some(old), Some(new)) => update.set(index, old.clone(), new.clone()),
+                        // An unchanged primary-key column: old present,
+                        // no new. Set old equal to new so it stays in
+                        // the WHERE and out of the SET.
+                        (Some(old), None) => update.set(index, old.clone(), old.clone()),
+                        (None, Some(new)) => update.set_new(index, new.clone()),
+                        // Not part of the diff.
+                        (None, None) => Ok(update),
+                    }
+                    .map_err(|err| op_error(&err))?;
+                }
+                builder = builder.update(update);
+            }
+            ChangesetOp::Delete { old_values, .. } => {
+                let mut delete = ChangeDelete::from(table);
+                for (index, value) in old_values.iter().enumerate() {
+                    delete = delete
+                        .set(index, value.clone())
+                        .map_err(|err| op_error(&err))?;
+                }
+                builder = builder.delete(delete);
+            }
+        }
+    }
+    Ok(builder)
+}
+
+/// Resolve a [`SimpleTable`] for `name` from `catalog`.
+fn catalog_table<DB: DatabaseLike>(catalog: &DB, name: &str) -> QueryResult<SimpleTable> {
+    let table_id = crate::catalog_helpers::table_id(catalog, name).ok_or_else(|| {
+        ingest_error(alloc::format!(
+            "uploaded patchset names table `{name}`, which is absent from the catalog"
+        ))
+    })?;
+    crate::catalog_helpers::simple_table(catalog, table_id).ok_or_else(|| {
+        ingest_error(alloc::format!(
+            "catalog table `{name}` could not be resolved to a schema"
+        ))
+    })
 }
 
 /// Build a [`diesel::result::Error::QueryBuilderError`] carrying an
@@ -993,6 +1065,93 @@ mod tests {
                 },
             ],
             "row 3 inserted, row 1 qty updated, row 2 deleted"
+        );
+    }
+
+    /// Build a fresh `(ParserDB, SqliteConnection)` pair with no
+    /// `SubscriptionEngine` in scope, so a test can apply through the
+    /// catalog-only entry point holding only the catalog.
+    fn catalog_fixture() -> (ParserDB, SqliteConnection) {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        sql_query(DDL).execute(&mut conn).unwrap();
+        let catalog = ParserDB::parse::<SQLiteDialect>(DDL).unwrap();
+        (catalog, conn)
+    }
+
+    /// `apply_diffset_bytes_with_catalog` applies a patchset given only a
+    /// `&ParserDB` catalog, with no `SubscriptionEngine` allocated. Covers
+    /// the patchset dispatch arm of the catalog-only entry point.
+    #[test]
+    fn apply_diffset_bytes_with_catalog_applies_a_patchset() {
+        let (catalog, mut conn) = catalog_fixture();
+        let adapter = SqliteAdapter::new(&catalog);
+
+        let inserted = super::apply_diffset_bytes_with_catalog(
+            &catalog,
+            &insert_bytes(1, "a", 10),
+            &mut conn,
+            &adapter,
+        )
+        .unwrap();
+        assert_eq!(
+            inserted, 1,
+            "one row inserted through the catalog entry point"
+        );
+
+        super::apply_diffset_bytes_with_catalog(
+            &catalog,
+            &update_qty_bytes(1, 42),
+            &mut conn,
+            &adapter,
+        )
+        .unwrap();
+        assert_eq!(
+            items(&mut conn),
+            vec![Item {
+                id: 1,
+                name: "a".into(),
+                qty: 42,
+            }],
+            "row 1 qty updated via the catalog entry point, name unchanged"
+        );
+    }
+
+    /// `apply_diffset_bytes_with_catalog` applies a primary-key-changing
+    /// changeset update (the case `apply_diffset_bytes` documents a
+    /// patchset cannot represent): the old key matches in the WHERE and
+    /// the new key writes in the SET. Covers the changeset dispatch arm of
+    /// the catalog-only entry point, still with no engine in scope.
+    #[test]
+    fn apply_diffset_bytes_with_catalog_relocates_a_primary_key() {
+        let (catalog, mut conn) = catalog_fixture();
+        let adapter = SqliteAdapter::new(&catalog);
+        super::apply_diffset_bytes_with_catalog(
+            &catalog,
+            &insert_bytes(1, "a", 10),
+            &mut conn,
+            &adapter,
+        )
+        .unwrap();
+
+        let touched = super::apply_diffset_bytes_with_catalog(
+            &catalog,
+            &changeset_relocate_pk_bytes(1, 2, "a", "b"),
+            &mut conn,
+            &adapter,
+        )
+        .unwrap();
+        assert_eq!(
+            touched, 1,
+            "the primary-key-changing update touches one row"
+        );
+        assert_eq!(
+            items(&mut conn),
+            vec![Item {
+                id: 2,
+                name: "b".into(),
+                qty: 10,
+            }],
+            "row relocated from id 1 to id 2 with qty preserved"
         );
     }
 }
