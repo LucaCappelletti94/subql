@@ -224,7 +224,7 @@ proptest! {
                         amount = row.amount,
                         status = quote_status(&row.status),
                     );
-                    source.execute(&sql).unwrap();
+                    source.execute_sql(&sql).unwrap();
                     let e = oracle(&subs, None, Some(row));
                     model.insert(row.id, row.clone());
                     e
@@ -246,7 +246,7 @@ proptest! {
                         amount = row.amount,
                         status = quote_status(&row.status),
                     );
-                    source.execute(&sql).unwrap();
+                    source.execute_sql(&sql).unwrap();
                     let e = oracle(&subs, Some(&old), Some(row));
                     model.insert(row.id, row.clone());
                     e
@@ -256,7 +256,7 @@ proptest! {
                         continue;
                     };
                     let sql = format!("DELETE FROM orders WHERE id = {id}");
-                    source.execute(&sql).unwrap();
+                    source.execute_sql(&sql).unwrap();
                     oracle(&subs, Some(&old), None)
                 }
             };

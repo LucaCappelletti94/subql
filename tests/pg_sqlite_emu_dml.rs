@@ -41,7 +41,7 @@ fn single_pk_insert_update_delete_round_trip() {
         catalog_helpers::table_id(source.pg_catalog(), "orders").expect("orders resolves");
 
     source
-        .execute("INSERT INTO orders (id, price, status) VALUES (1, 5.0, 'paid')")
+        .execute_sql("INSERT INTO orders (id, price, status) VALUES (1, 5.0, 'paid')")
         .unwrap();
     // Drain between DMLs so the session records each op distinctly.
     // Merged (INSERT + UPDATE + DELETE) on the same row would collapse
@@ -76,7 +76,7 @@ fn single_pk_insert_update_delete_round_trip() {
     );
 
     source
-        .execute("UPDATE orders SET price = 9.0, status = 'shipped' WHERE id = 1")
+        .execute_sql("UPDATE orders SET price = 9.0, status = 'shipped' WHERE id = 1")
         .unwrap();
     // UPDATE (both non-PK columns changed, so the changeset carries
     // Some/Some on both sides; no row-lookup fallback needed).
@@ -120,7 +120,9 @@ fn single_pk_insert_update_delete_round_trip() {
         vec![1u16, 2u16],
         "price and status changed, id did not",
     );
-    source.execute("DELETE FROM orders WHERE id = 1").unwrap();
+    source
+        .execute_sql("DELETE FROM orders WHERE id = 1")
+        .unwrap();
 
     // DELETE (full old-image is the whole point of using changesets).
     let delete = drain_one(&mut source);
@@ -165,12 +167,12 @@ fn single_pk_partial_update_uses_row_lookup_fallback() {
     // pre-DML price value.
     let mut source = PgSqliteEmuSource::open_in_memory(SINGLE_PK_PG_DDL).expect("build source");
     source
-        .execute("INSERT INTO orders (id, price, status) VALUES (2, 3.5, 'open')")
+        .execute_sql("INSERT INTO orders (id, price, status) VALUES (2, 3.5, 'open')")
         .unwrap();
     // Consume the insert to keep event assertions per-DML.
     let _ = drain_one(&mut source);
     source
-        .execute("UPDATE orders SET status = 'closed' WHERE id = 2")
+        .execute_sql("UPDATE orders SET status = 'closed' WHERE id = 2")
         .unwrap();
 
     let update = drain_one(&mut source);
@@ -211,7 +213,7 @@ fn composite_pk_insert_update_delete_round_trip() {
     let table_id = catalog_helpers::table_id(source.pg_catalog(), "items").expect("items resolves");
 
     source
-        .execute("INSERT INTO items (region_id, item_id, name) VALUES (1, 100, 'widget')")
+        .execute_sql("INSERT INTO items (region_id, item_id, name) VALUES (1, 100, 'widget')")
         .unwrap();
 
     // INSERT
@@ -248,7 +250,7 @@ fn composite_pk_insert_update_delete_round_trip() {
     );
 
     source
-        .execute("UPDATE items SET name = 'gadget' WHERE region_id = 1 AND item_id = 100")
+        .execute_sql("UPDATE items SET name = 'gadget' WHERE region_id = 1 AND item_id = 100")
         .unwrap();
     // UPDATE: the emulator's row lookup fills the two unchanged PK
     // slots so both old and new images stay complete.
@@ -282,7 +284,7 @@ fn composite_pk_insert_update_delete_round_trip() {
     assert_eq!(update.changed_columns(source.pg_catalog()), &[2u16]);
 
     source
-        .execute("DELETE FROM items WHERE region_id = 1 AND item_id = 100")
+        .execute_sql("DELETE FROM items WHERE region_id = 1 AND item_id = 100")
         .unwrap();
 
     // DELETE

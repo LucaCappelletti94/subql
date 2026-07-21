@@ -53,7 +53,7 @@
 //!     "SELECT * FROM orders WHERE amount > 100",
 //! ))?;
 //!
-//! source.execute("INSERT INTO orders (id, amount, status) VALUES (1, 250, 'paid')")?;
+//! source.execute_sql("INSERT INTO orders (id, amount, status) VALUES (1, 250, 'paid')")?;
 //!
 //! let event = source.poll_next_event()?.expect("insert reaches the queue");
 //! let notifs = engine.consumers(&event)?;

@@ -158,7 +158,7 @@ proptest! {
                     let sql = format!(
                         "INSERT INTO orders (id, price, status) VALUES ({id}, {price}, '{status}')"
                     );
-                    source.execute(&sql).unwrap();
+                    source.execute_sql(&sql).unwrap();
                     let row = Row {
                         id: *id,
                         price: *price,
@@ -183,7 +183,7 @@ proptest! {
                     let sql = format!(
                         "UPDATE orders SET price = {price}, status = '{status}' WHERE id = {id}"
                     );
-                    source.execute(&sql).unwrap();
+                    source.execute_sql(&sql).unwrap();
                     let changed = diff(&old, &new);
                     model.insert(*id, new.clone());
                     ExpectedEvent::Update {
@@ -198,7 +198,7 @@ proptest! {
                         continue;
                     };
                     let sql = format!("DELETE FROM orders WHERE id = {id}");
-                    source.execute(&sql).unwrap();
+                    source.execute_sql(&sql).unwrap();
                     ExpectedEvent::Delete { pk: *id, old }
                 }
             };

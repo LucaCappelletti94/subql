@@ -54,7 +54,7 @@ const PROTOCOL_VERSION: u8 = 1;
 /// let mut source = PgSqliteEmuSource::open_in_memory(
 ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);",
 /// )?;
-/// source.execute("INSERT INTO orders (id, amount) VALUES (7, 250)")?;
+/// source.execute_sql("INSERT INTO orders (id, amount) VALUES (7, 250)")?;
 ///
 /// let event = source.poll_next_event()?.expect("insert reaches the queue");
 /// assert_eq!(event.kind(), EventKind::Insert);
@@ -192,7 +192,7 @@ impl PgSqliteEmuSource {
     /// let mut source = PgSqliteEmuSource::open_in_memory(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
     /// )?;
-    /// source.execute("INSERT INTO orders VALUES (1, 'paid')")?;
+    /// source.execute_sql("INSERT INTO orders VALUES (1, 'paid')")?;
     ///
     /// let event = source.poll_next_event()?.expect("one event pending");
     /// assert_eq!(event.kind(), EventKind::Insert);
@@ -211,6 +211,10 @@ impl PgSqliteEmuSource {
 
     /// Convenience: run `sql` as a single diesel `sql_query` against
     /// the wrapped connection and return the number of rows affected.
+    /// Named `execute_sql` rather than `execute` so it does not clash
+    /// with diesel's `RunQueryDsl::execute`, whose by-value receiver
+    /// would otherwise shadow this method whenever the query DSL is in
+    /// scope.
     ///
     /// Saves doctests and short integration tests from importing
     /// `diesel::{sql_query, RunQueryDsl}` just to drive DML. Use
@@ -229,11 +233,11 @@ impl PgSqliteEmuSource {
     /// let mut source = PgSqliteEmuSource::open_in_memory(
     ///     "CREATE TABLE items (id INT PRIMARY KEY);",
     /// )?;
-    /// let rows = source.execute("INSERT INTO items VALUES (42)")?;
+    /// let rows = source.execute_sql("INSERT INTO items VALUES (42)")?;
     /// assert_eq!(rows, 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn execute(&mut self, sql: &str) -> Result<usize, PgSqliteEmuError> {
+    pub fn execute_sql(&mut self, sql: &str) -> Result<usize, PgSqliteEmuError> {
         Ok(sql_query(sql).execute(&mut self.connection)?)
     }
 
@@ -259,7 +263,7 @@ impl PgSqliteEmuSource {
     ///     "CREATE TABLE items (id INT PRIMARY KEY);",
     /// )?;
     /// for id in 1..=3 {
-    ///     source.execute(&format!("INSERT INTO items VALUES ({id})"))?;
+    ///     source.execute_sql(&format!("INSERT INTO items VALUES ({id})"))?;
     /// }
     /// let events = source.drain()?;
     /// assert_eq!(events.len(), 3);
