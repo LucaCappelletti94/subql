@@ -70,6 +70,9 @@ pub struct PgSqliteEmuSource {
     pending: VecDeque<ChangeEvent>,
     announced: HashSet<Oid>,
     tables: HashMap<String, TableMeta>,
+    /// Monotonic WAL position stamped on each data frame, since
+    /// `pgoutput` data messages carry no body LSN.
+    next_lsn: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +157,7 @@ impl PgSqliteEmuSource {
             pending: VecDeque::new(),
             announced: HashSet::new(),
             tables,
+            next_lsn: 0,
         })
     }
 
@@ -434,7 +438,9 @@ impl PgSqliteEmuSource {
     fn push_frame(&mut self, msg: &LogicalReplicationMessage) -> Result<(), PgSqliteEmuError> {
         let mut buf = BytesMut::new();
         encode_message(msg, PROTOCOL_VERSION, &mut buf);
-        if let Some(decoded) = self.decoder.decode_message(buf, Lsn::new(0))? {
+        // Fresh position per frame, else all events collapse to `Lsn(0)`.
+        self.next_lsn += 1;
+        if let Some(decoded) = self.decoder.decode_message(buf, Lsn::new(self.next_lsn))? {
             self.pending.extend(into_engine_events(decoded));
         }
         Ok(())
@@ -916,5 +922,33 @@ mod tests {
         let ev = src.poll_next_event().unwrap().expect("truncate event");
         assert_eq!(ev.kind(), crate::EventKind::Truncate);
         assert_eq!(ev.table_id(src.pg_catalog()), table_id);
+    }
+
+    #[test]
+    fn events_carry_strictly_increasing_nonzero_lsns() {
+        let mut src = build_source();
+        for id in 1..=3 {
+            sql_query(format!(
+                "INSERT INTO orders (id, amount, status) VALUES ({id}, {id}0, 'paid')"
+            ))
+            .execute(src.connection())
+            .unwrap();
+        }
+        let events = src.drain().unwrap();
+        assert_eq!(events.len(), 3);
+
+        let checkpoints: Vec<crate::PgLsn> = events
+            .iter()
+            .map(|e| e.checkpoint().expect("emulator event carries an LSN"))
+            .collect();
+        assert!(
+            checkpoints[0] > crate::PgLsn(0),
+            "first checkpoint must start above zero, got {:?}",
+            checkpoints[0]
+        );
+        assert!(
+            checkpoints.windows(2).all(|w| w[1] > w[0]),
+            "checkpoints must be strictly increasing, got {checkpoints:?}"
+        );
     }
 }
