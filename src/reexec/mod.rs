@@ -128,7 +128,7 @@ pub use auto::{AutoResolvingEngine, SnapshotResult};
 pub use connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
 pub use connector::PgDieselConnector;
-pub use connector::{Connector, ReExecError, Snapshot};
+pub use connector::{Connector, ReExecError, ScalarRowError, Snapshot};
 #[cfg(feature = "executor-diesel")]
 pub use connector::{DieselBackend, DieselConnector};
 #[cfg(feature = "executor-diesel-postgres-r2d2")]

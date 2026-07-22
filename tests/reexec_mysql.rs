@@ -226,3 +226,50 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
         "auto-resolving engine drains triggers"
     );
 }
+
+/// The multi-column aggregate seed decodes correctly through the real MySQL
+/// connector. MySQL promotes `SUM` over an integer column to `DECIMAL`, so
+/// the connector's `CAST(... AS DOUBLE)` must still decode the sum and
+/// sum-of-squares as `f64` (the case in-memory SQLite cannot exercise).
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn execute_scalar_row_decodes_integer_aggregate_seed() {
+    common::assert_docker_available();
+    let container = common::mysql_8();
+    let port = common::mysql_port(&container);
+
+    let mut setup = common::mysql_connect(port);
+    sql_query("CREATE TABLE nums (id INT PRIMARY KEY, amount INT)")
+        .execute(&mut setup)
+        .expect("CREATE TABLE nums");
+    for (id, amount) in [(1, 2), (2, 4), (3, 6)] {
+        sql_query(format!(
+            "INSERT INTO nums (id, amount) VALUES ({id}, {amount})"
+        ))
+        .execute(&mut setup)
+        .expect("seed insert");
+    }
+
+    let db = ParserDB::parse::<MySqlDialect>("CREATE TABLE nums (id INT PRIMARY KEY, amount INT);")
+        .expect("parse nums DDL");
+    let mut engine =
+        SubscriptionEngine::<TestEvent<MySql>, DefaultIds, ParserDB>::new(db, MySqlDialect {});
+    let bundle = engine
+        .register(SubscriptionRequest::<DefaultIds, MySql>::new(
+            1u64,
+            "SELECT VAR_POP(amount) FROM nums",
+        ))
+        .expect("register aggregate")
+        .aggregate_bootstrap
+        .expect("aggregate carries a bootstrap");
+
+    // MySQL SUM(int) -> DECIMAL, cast to DOUBLE; sum=12, sum_sq=56, count=3.
+    let connector = MysqlDieselConnector::new(common::mysql_connect(port));
+    let (row, _checkpoint) = connector
+        .execute_scalar_row(&bundle.sql, &bundle.kinds, &())
+        .expect("execute_scalar_row");
+    assert_eq!(
+        row,
+        vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
+    );
+}

@@ -11,7 +11,7 @@
 //! a future `executor-sqlx` or `executor-diesel-async` feature can land
 //! additively without a trait-shape change.
 
-use super::connector::Snapshot;
+use super::connector::{ScalarRowError, Snapshot};
 use crate::backend::{Backend, ScalarKind, Value};
 use crate::Checkpoint;
 
@@ -83,4 +83,27 @@ pub trait AsyncConnector: Send + Sync {
             Self::Error,
         >,
     > + Send;
+
+    /// Async peer of
+    /// [`Connector::execute_scalar_row`](super::Connector::execute_scalar_row).
+    /// See it for the contract; the async surface only differs by returning
+    /// a future. The default rejects with [`ScalarRowError::Unsupported`] so
+    /// external impls keep compiling.
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[ScalarKind],
+        auth: &Self::AuthContext,
+    ) -> impl core::future::Future<
+        Output = Result<
+            (
+                alloc::vec::Vec<Value<Self::Backend>>,
+                Option<Self::Checkpoint>,
+            ),
+            ScalarRowError<Self::Error>,
+        >,
+    > + Send {
+        let _ = (sql, kinds, auth);
+        async { Err(ScalarRowError::Unsupported) }
+    }
 }

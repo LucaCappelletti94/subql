@@ -1,8 +1,8 @@
 //! Bootstrap and reset path for in-process delta aggregators.
 //!
-//! `RegisterResult::aggregate_bootstrap_sql` renders a runnable component
-//! seed query per `AggSpec`, and `AggAccumulator::seed_from_row` decodes
-//! the returned component row into a seeded accumulator. Together they let
+//! `RegisterResult::aggregate_bootstrap` bundles a runnable component seed
+//! query per `AggSpec` with its decode kinds, and `AggAccumulator::seed_from_row`
+//! decodes the returned component row into a seeded accumulator. Together they let
 //! a caller obtain the seed for the in-process aggregate family and re-seed
 //! after the resets subql mandates (`TruncateRequiresReset`, RLS/ACL policy
 //! changes), the same courtesy `Registered::ReExec` already gives `MIN`/`MAX`.
@@ -11,10 +11,11 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
+use subql::backend::{Postgres, ScalarKind, Value};
 use subql::testing::TestEvent;
 use subql::{
-    AggAccumulator, AggSpec, AggValue, DefaultIds, SubscriptionEngine, SubscriptionRequest,
+    AggAccumulator, AggSpec, AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine,
+    SubscriptionRequest,
 };
 
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -26,50 +27,50 @@ fn engine() -> Engine {
     SubscriptionEngine::new(db, PostgreSqlDialect {})
 }
 
-fn bootstrap_of(sql: &str) -> Option<String> {
+fn bootstrap_of(sql: &str) -> Option<AggregateBootstrap> {
     engine()
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql))
         .unwrap()
-        .aggregate_bootstrap_sql
+        .aggregate_bootstrap
 }
 
 #[test]
 fn bootstrap_sql_per_aggspec() {
     // (subscription SQL, expected component seed SQL).
     let cases = [
-        ("SELECT COUNT(*) FROM t", "SELECT COUNT(*) AS c FROM t"),
+        ("SELECT COUNT(*) FROM t", "SELECT COUNT(*) AS c0 FROM t"),
         (
             "SELECT COUNT(amount) FROM t",
-            "SELECT COUNT(amount) AS c FROM t",
+            "SELECT COUNT(amount) AS c0 FROM t",
         ),
         (
             "SELECT SUM(amount) FROM t",
-            "SELECT SUM(amount) AS s FROM t",
+            "SELECT SUM(amount) AS c0 FROM t",
         ),
         (
             "SELECT AVG(amount) FROM t",
-            "SELECT SUM(amount) AS s, COUNT(amount) AS c FROM t",
+            "SELECT SUM(amount) AS c0, COUNT(amount) AS c1 FROM t",
         ),
         (
             "SELECT VAR_POP(amount) FROM t",
-            "SELECT SUM(amount) AS s, SUM(amount * amount) AS sq, COUNT(amount) AS c FROM t",
+            "SELECT SUM(amount) AS c0, SUM(amount * 1.0 * amount) AS c1, COUNT(amount) AS c2 FROM t",
         ),
         (
             "SELECT VAR_SAMP(amount) FROM t",
-            "SELECT SUM(amount) AS s, SUM(amount * amount) AS sq, COUNT(amount) AS c FROM t",
+            "SELECT SUM(amount) AS c0, SUM(amount * 1.0 * amount) AS c1, COUNT(amount) AS c2 FROM t",
         ),
         (
             "SELECT STDDEV_POP(amount) FROM t",
-            "SELECT SUM(amount) AS s, SUM(amount * amount) AS sq, COUNT(amount) AS c FROM t",
+            "SELECT SUM(amount) AS c0, SUM(amount * 1.0 * amount) AS c1, COUNT(amount) AS c2 FROM t",
         ),
         (
             "SELECT STDDEV_SAMP(amount) FROM t",
-            "SELECT SUM(amount) AS s, SUM(amount * amount) AS sq, COUNT(amount) AS c FROM t",
+            "SELECT SUM(amount) AS c0, SUM(amount * 1.0 * amount) AS c1, COUNT(amount) AS c2 FROM t",
         ),
     ];
     for (sql, expected) in cases {
         assert_eq!(
-            bootstrap_of(sql).as_deref(),
+            bootstrap_of(sql).map(|b| b.sql).as_deref(),
             Some(expected),
             "bootstrap SQL mismatch for `{sql}`"
         );
@@ -79,13 +80,44 @@ fn bootstrap_sql_per_aggspec() {
 #[test]
 fn bootstrap_sql_preserves_where() {
     assert_eq!(
-        bootstrap_of("SELECT SUM(amount) FROM t WHERE amount > 10").as_deref(),
-        Some("SELECT SUM(amount) AS s FROM t WHERE amount > 10"),
+        bootstrap_of("SELECT SUM(amount) FROM t WHERE amount > 10")
+            .map(|b| b.sql)
+            .as_deref(),
+        Some("SELECT SUM(amount) AS c0 FROM t WHERE amount > 10"),
     );
     assert_eq!(
-        bootstrap_of("SELECT COUNT(*) FROM t WHERE status = 'open'").as_deref(),
-        Some("SELECT COUNT(*) AS c FROM t WHERE status = 'open'"),
+        bootstrap_of("SELECT COUNT(*) FROM t WHERE status = 'open'")
+            .map(|b| b.sql)
+            .as_deref(),
+        Some("SELECT COUNT(*) AS c0 FROM t WHERE status = 'open'"),
     );
+}
+
+/// The per-column decode kinds are a pure function of the AggSpec and line
+/// up one-to-one with the seed SQL columns.
+#[test]
+fn bootstrap_kinds_per_aggspec() {
+    use ScalarKind::{Float, Int};
+    let cases: [(&str, Vec<ScalarKind>); 8] = [
+        ("SELECT COUNT(*) FROM t", vec![Int]),
+        ("SELECT COUNT(amount) FROM t", vec![Int]),
+        ("SELECT SUM(amount) FROM t", vec![Float]),
+        ("SELECT AVG(amount) FROM t", vec![Float, Int]),
+        ("SELECT VAR_POP(amount) FROM t", vec![Float, Float, Int]),
+        ("SELECT VAR_SAMP(amount) FROM t", vec![Float, Float, Int]),
+        ("SELECT STDDEV_POP(amount) FROM t", vec![Float, Float, Int]),
+        ("SELECT STDDEV_SAMP(amount) FROM t", vec![Float, Float, Int]),
+    ];
+    for (sql, expected) in cases {
+        let bundle = bootstrap_of(sql).expect("aggregate registration has a bootstrap");
+        assert_eq!(bundle.kinds, expected, "kinds mismatch for `{sql}`");
+        let column_count = bundle.sql.matches(" AS c").count();
+        assert_eq!(
+            bundle.kinds.len(),
+            column_count,
+            "kinds length must match seed column count for `{sql}`"
+        );
+    }
 }
 
 #[test]

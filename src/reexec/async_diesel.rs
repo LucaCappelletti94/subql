@@ -31,7 +31,7 @@ use super::async_connector::AsyncConnector;
 use super::connector::LogStatusRow;
 #[cfg(feature = "executor-diesel-async-postgres")]
 use super::connector::PgLsnRow;
-use super::connector::{DieselBackend, FloatRow, IntRow, Snapshot, TextRow};
+use super::connector::{DieselBackend, FloatRow, IntRow, ScalarRowError, Snapshot, TextRow};
 use crate::backend::{ScalarKind, Value};
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -110,6 +110,37 @@ where
             .map_or(Value::Null, B::value_from_string),
     };
     Ok(value)
+}
+
+/// Async peer of `load_scalar_row`: run one aliased subquery per component
+/// through [`load_scalar_async`], casting `Float` (`SUM`) components to the
+/// backend's double type. Callers wrap this in a transaction so the
+/// components share one snapshot. Column `i` is projected as `ci`.
+async fn load_scalar_row_async<C, B>(
+    conn: &mut C,
+    sql: &str,
+    kinds: &[ScalarKind],
+) -> diesel::QueryResult<Vec<Value<B>>>
+where
+    B: DieselBackend,
+    C: AsyncConnection,
+    for<'q> SqlQuery: diesel_async::methods::LoadQuery<'q, C, IntRow>
+        + diesel_async::methods::LoadQuery<'q, C, FloatRow>
+        + diesel_async::methods::LoadQuery<'q, C, TextRow>,
+{
+    let mut out = Vec::with_capacity(kinds.len());
+    for (i, kind) in kinds.iter().enumerate() {
+        let wrapped = if matches!(kind, ScalarKind::Float) {
+            alloc::format!(
+                "SELECT CAST(c{i} AS {cast}) AS v FROM ({sql}) AS agg_seed",
+                cast = B::double_cast_type()
+            )
+        } else {
+            alloc::format!("SELECT c{i} AS v FROM ({sql}) AS agg_seed")
+        };
+        out.push(load_scalar_async::<C, B>(conn, &wrapped, *kind).await?);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +232,45 @@ impl AsyncConnector for PgAsyncDieselConnector {
         Output = Result<Snapshot<Vec<Vec<Value<Self::Backend>>>, Self::Checkpoint>, Self::Error>,
     > + Send {
         async move { Err(DieselAsyncError::RowsUnsupported) }
+    }
+
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[ScalarKind],
+        _auth: &(),
+    ) -> impl Future<
+        Output = Result<
+            (Vec<Value<Self::Backend>>, Option<Self::Checkpoint>),
+            ScalarRowError<Self::Error>,
+        >,
+    > + Send {
+        let sql = sql.to_string();
+        let kinds = kinds.to_vec();
+        async move {
+            let mut pooled = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Pool(e)))?;
+            let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
+            conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::PgLsn>), diesel::result::Error, _>(
+                |c| {
+                    async move {
+                        sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
+                            .execute(c)
+                            .await?;
+                        let values =
+                            load_scalar_row_async::<_, Self::Backend>(c, &sql, &kinds).await?;
+                        let lsn = read_current_lsn_async(c).await?;
+                        Ok((values, lsn))
+                    }
+                    .scope_boxed()
+                },
+            )
+            .await
+            .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))
+        }
     }
 }
 
@@ -315,5 +385,41 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
         Output = Result<Snapshot<Vec<Vec<Value<Self::Backend>>>, Self::Checkpoint>, Self::Error>,
     > + Send {
         async move { Err(DieselAsyncError::RowsUnsupported) }
+    }
+
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[ScalarKind],
+        _auth: &(),
+    ) -> impl Future<
+        Output = Result<
+            (Vec<Value<Self::Backend>>, Option<Self::Checkpoint>),
+            ScalarRowError<Self::Error>,
+        >,
+    > + Send {
+        let sql = sql.to_string();
+        let kinds = kinds.to_vec();
+        async move {
+            let mut pooled = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Pool(e)))?;
+            let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
+            conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
+                |c| {
+                    async move {
+                        let values =
+                            load_scalar_row_async::<_, Self::Backend>(c, &sql, &kinds).await?;
+                        let pos = read_binlog_pos_async(c).await;
+                        Ok((values, pos))
+                    }
+                    .scope_boxed()
+                },
+            )
+            .await
+            .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))
+        }
     }
 }

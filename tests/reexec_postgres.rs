@@ -370,3 +370,55 @@ fn snapshot_reads_value_and_lsn_from_pg() {
         "pg_current_wal_lsn() should be non-zero on a live server, got {lsn:?}"
     );
 }
+
+/// The multi-column aggregate seed decodes correctly through the real PG
+/// connector. Uses an INTEGER column so `SUM` promotes to `bigint` (the
+/// cross-backend case in-memory SQLite cannot exercise): the connector's
+/// double cast must still decode the sum and sum-of-squares as `f64`.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn execute_scalar_row_decodes_integer_aggregate_seed() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let mut setup = common::pg_connect(port);
+    sql_query("CREATE TABLE nums (id INT PRIMARY KEY, amount INT)")
+        .execute(&mut setup)
+        .expect("CREATE TABLE nums");
+    for (id, amount) in [(1, 2), (2, 4), (3, 6)] {
+        sql_query(format!(
+            "INSERT INTO nums (id, amount) VALUES ({id}, {amount})"
+        ))
+        .execute(&mut setup)
+        .expect("seed insert");
+    }
+
+    // Register to obtain the seed bundle (sql + kinds).
+    let db =
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE nums (id INT PRIMARY KEY, amount INT);")
+            .expect("parse nums DDL");
+    let mut engine =
+        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(db, PostgreSqlDialect {});
+    let bundle = engine
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
+            1u64,
+            "SELECT VAR_POP(amount) FROM nums",
+        ))
+        .expect("register aggregate")
+        .aggregate_bootstrap
+        .expect("aggregate carries a bootstrap");
+
+    // sum=12 (bigint), sum_sq=56 (bigint), count=3, decoded through the
+    // double cast into (Float, Float, Int).
+    let connector = PgDieselConnector::new(common::pg_connect(port));
+    let (row, checkpoint) = connector
+        .execute_scalar_row(&bundle.sql, &bundle.kinds, &())
+        .expect("execute_scalar_row");
+    assert_eq!(
+        row,
+        vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
+    );
+    // The read is LSN-anchored like execute_scalar.
+    assert!(checkpoint.is_some());
+}

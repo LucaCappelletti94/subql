@@ -147,6 +147,40 @@ pub trait Connector {
         Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
         Self::Error,
     >;
+
+    /// Run a single-row, multi-column scalar seed query and decode each
+    /// column by the matching [`ScalarKind`].
+    ///
+    /// Bootstraps or re-seeds an in-process aggregate accumulator from
+    /// [`RegisterResult::aggregate_bootstrap`](crate::RegisterResult::aggregate_bootstrap):
+    /// run [`AggregateBootstrap::sql`](crate::AggregateBootstrap::sql), typing
+    /// each column by [`AggregateBootstrap::kinds`](crate::AggregateBootstrap::kinds),
+    /// then feed the returned row to
+    /// [`AggAccumulator::seed_from_row`](crate::AggAccumulator::seed_from_row).
+    /// `sql` returns exactly one row (aggregate queries always do, yielding
+    /// the empty-aggregate row over an empty table). Run the components in
+    /// the same read-only repeatable-read transaction
+    /// [`execute_scalar`](Self::execute_scalar) uses so they share one
+    /// snapshot; the single returned checkpoint is the transaction's.
+    ///
+    /// The default rejects the seed with [`ScalarRowError::Unsupported`] so
+    /// existing external impls keep compiling. The shipped diesel connectors
+    /// override it for the full aggregate family.
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[ScalarKind],
+        auth: &Self::AuthContext,
+    ) -> Result<
+        (
+            alloc::vec::Vec<Value<Self::Backend>>,
+            Option<Self::Checkpoint>,
+        ),
+        ScalarRowError<Self::Error>,
+    > {
+        let _ = (sql, kinds, auth);
+        Err(ScalarRowError::Unsupported)
+    }
 }
 
 /// Error returned by [`AutoResolvingEngine::consumers`].
@@ -162,6 +196,23 @@ pub enum ReExecError<E> {
     /// The [`Connector`] failed to execute the re-execution SQL. The whole
     /// batch is aborted. The caller is expected to retry it.
     #[error("connector failed: {0}")]
+    Connector(E),
+}
+
+/// Error from [`Connector::execute_scalar_row`] and its async peer.
+///
+/// Distinguishes "this connector has no multi-column seed support" (the
+/// default) from a genuine execution failure, so a caller can tell an
+/// unsupported connector apart from a database error.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ScalarRowError<E> {
+    /// The connector did not override `execute_scalar_row`; the default
+    /// rejects the multi-column aggregate seed.
+    #[error("this connector does not support multi-column aggregate seeds")]
+    Unsupported,
+    /// The connector failed while running the seed query.
+    #[error("connector failed during multi-column seed: {0}")]
     Connector(E),
 }
 
@@ -187,6 +238,14 @@ pub trait DieselBackend: crate::backend::Backend + Sized {
     fn value_from_f64(x: f64) -> Value<Self>;
     /// Wrap a `String` decoded via `Nullable<Text>` as [`Value::String`].
     fn value_from_string(s: String) -> Value<Self>;
+    /// SQL type name to cast a `SUM` component to double precision in this
+    /// backend's dialect, so `SUM`'s promoted integer type decodes as `f64`
+    /// for the accumulator. Defaults to `DOUBLE PRECISION` (PostgreSQL, and
+    /// SQLite via `REAL` affinity); MySQL overrides to `DOUBLE`.
+    #[must_use]
+    fn double_cast_type() -> &'static str {
+        "DOUBLE PRECISION"
+    }
 }
 
 #[cfg(feature = "executor-diesel")]
@@ -212,6 +271,9 @@ impl DieselBackend for crate::backend::MySql {
     }
     fn value_from_string(s: String) -> Value<Self> {
         Value::String(s)
+    }
+    fn double_cast_type() -> &'static str {
+        "DOUBLE"
     }
 }
 
@@ -337,6 +399,39 @@ where
     Ok(value)
 }
 
+/// Decode a single-row, multi-column aggregate seed by running one aliased
+/// subquery per component through [`load_scalar`], reusing its per-kind
+/// decode. `Float` components (`SUM` / `SUM(x*x)`) are cast to the backend's
+/// double type because `SUM` promotes the source integer type; `Int`
+/// components (counts) are read as-is. Column `i` is projected as `ci` by the
+/// bootstrap SQL. Callers run this inside their own transaction so the
+/// components share one snapshot.
+#[cfg(feature = "executor-diesel")]
+fn load_scalar_row<C, B>(
+    conn: &mut C,
+    sql: &str,
+    kinds: &[ScalarKind],
+) -> QueryResult<alloc::vec::Vec<Value<B>>>
+where
+    B: DieselBackend,
+    for<'q> SqlQuery:
+        LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
+{
+    let mut out = alloc::vec::Vec::with_capacity(kinds.len());
+    for (i, kind) in kinds.iter().enumerate() {
+        let wrapped = if matches!(kind, ScalarKind::Float) {
+            alloc::format!(
+                "SELECT CAST(c{i} AS {cast}) AS v FROM ({sql}) AS agg_seed",
+                cast = B::double_cast_type()
+            )
+        } else {
+            alloc::format!("SELECT c{i} AS v FROM ({sql}) AS agg_seed")
+        };
+        out.push(load_scalar::<C, B>(conn, &wrapped, *kind)?);
+    }
+    Ok(out)
+}
+
 #[cfg(feature = "executor-diesel")]
 impl<C, B> Connector for DieselConnector<C, B>
 where
@@ -384,6 +479,25 @@ where
                  use the scalar path or supply a custom Connector impl"
             )
         }
+    }
+
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[ScalarKind],
+        _auth: &(),
+    ) -> Result<(alloc::vec::Vec<Value<B>>, Option<Self::Checkpoint>), ScalarRowError<Self::Error>>
+    {
+        let mut conn = self.conn.borrow_mut();
+        // Read every component in one transaction so a variance seed's sum,
+        // sum-of-squares, and count come from a single snapshot. This basic
+        // connector uses the connection's default isolation; the LSN-aware
+        // `PgDieselConnector` additionally pins REPEATABLE READ.
+        let values = diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            load_scalar_row::<_, B>(conn, sql, kinds)
+        })
+        .map_err(ScalarRowError::Connector)?;
+        Ok((values, None))
     }
 }
 
@@ -487,6 +601,28 @@ impl Connector for PgDieselConnector {
                  use the scalar path or supply a custom Connector impl"
             )
         }
+    }
+
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[ScalarKind],
+        _auth: &(),
+    ) -> Result<
+        (
+            alloc::vec::Vec<Value<Self::Backend>>,
+            Option<Self::Checkpoint>,
+        ),
+        ScalarRowError<Self::Error>,
+    > {
+        let mut conn = self.conn.borrow_mut();
+        diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
+            let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
+            let lsn = read_current_lsn(conn)?;
+            Ok((values, lsn))
+        })
+        .map_err(ScalarRowError::Connector)
     }
 }
 
@@ -633,6 +769,27 @@ impl Connector for MysqlDieselConnector {
             )
         }
     }
+
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[ScalarKind],
+        _auth: &(),
+    ) -> Result<
+        (
+            alloc::vec::Vec<Value<Self::Backend>>,
+            Option<Self::Checkpoint>,
+        ),
+        ScalarRowError<Self::Error>,
+    > {
+        let mut conn = self.conn.borrow_mut();
+        diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
+            let pos = read_binlog_pos(conn);
+            Ok((values, pos))
+        })
+        .map_err(ScalarRowError::Connector)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -745,5 +902,33 @@ impl Connector for PgR2D2DieselConnector {
                  use the scalar path or supply a custom Connector impl"
             )
         }
+    }
+
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[ScalarKind],
+        _auth: &(),
+    ) -> Result<
+        (
+            alloc::vec::Vec<Value<Self::Backend>>,
+            Option<Self::Checkpoint>,
+        ),
+        ScalarRowError<Self::Error>,
+    > {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| ScalarRowError::Connector(e.into()))?;
+        let result: Result<
+            (alloc::vec::Vec<Value<Self::Backend>>, Option<crate::PgLsn>),
+            diesel::result::Error,
+        > = diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
+            let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
+            let lsn = read_current_lsn(conn)?;
+            Ok((values, lsn))
+        });
+        result.map_err(|e| ScalarRowError::Connector(e.into()))
     }
 }
