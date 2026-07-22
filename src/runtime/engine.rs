@@ -122,6 +122,9 @@ struct CompiledSpec<I: IdTypes, B: Backend> {
     prefilter_plan: PrefilterPlan,
     projection: QueryProjection,
     hash: u128,
+    /// Runnable component-seed SQL for an aggregate registration, `None`
+    /// for row subscriptions. Rendered once at compile time.
+    bootstrap_sql: Option<String>,
 }
 
 #[cfg(feature = "std")]
@@ -320,6 +323,20 @@ where
         let hash_input = crate::compiler::parser::projection_hash_input(&normalized, &projection);
         let hash = canonicalize::hash_sql(&hash_input);
 
+        // For an aggregate registration, render the runnable component
+        // seed query so callers can bootstrap the accumulator and re-seed
+        // after a mandated reset. `None` for row subscriptions.
+        let bootstrap_sql = match &projection {
+            QueryProjection::Aggregate(agg) => {
+                crate::compiler::sql_shape::render_aggregate_bootstrap(
+                    &spec.sql,
+                    agg,
+                    &self.dialect,
+                )
+            }
+            QueryProjection::Rows => None,
+        };
+
         Ok(CompiledSpec {
             spec,
             table_id,
@@ -328,6 +345,7 @@ where
             prefilter_plan,
             projection,
             hash,
+            bootstrap_sql,
         })
     }
 
@@ -721,6 +739,7 @@ where
                 created_new_predicate: false,
                 projection: compiled.projection,
                 evicted: Vec::new(),
+                aggregate_bootstrap_sql: compiled.bootstrap_sql,
             });
         }
 
@@ -801,6 +820,7 @@ where
             created_new_predicate: created_new,
             projection: compiled.projection,
             evicted,
+            aggregate_bootstrap_sql: compiled.bootstrap_sql,
         })
     }
 
@@ -1050,6 +1070,7 @@ where
                             created_new_predicate: false,
                             projection: compiled_spec.projection,
                             evicted: Vec::new(),
+                            aggregate_bootstrap_sql: compiled_spec.bootstrap_sql,
                         }));
                         compiled.push(None); // already handled
                         continue;
@@ -1067,6 +1088,7 @@ where
                             created_new_predicate: false,
                             projection: compiled_spec.projection,
                             evicted: Vec::new(),
+                            aggregate_bootstrap_sql: compiled_spec.bootstrap_sql,
                         }));
                         compiled.push(None);
                         continue;
@@ -1083,6 +1105,7 @@ where
                         created_new_predicate: false, // filled in phase 2
                         projection: compiled_spec.projection.clone(),
                         evicted: Vec::new(),
+                        aggregate_bootstrap_sql: None,
                     }));
                     compiled.push(Some(compiled_spec));
                 }
@@ -1226,6 +1249,7 @@ where
                 result.subscription_id = subscription_id;
                 result.normalized_sql = c.normalized;
                 result.created_new_predicate = created_new;
+                result.aggregate_bootstrap_sql = c.bootstrap_sql;
                 if let Some(ev) = evicted_per_spec.remove(&i) {
                     result.evicted = ev;
                 }
