@@ -50,7 +50,42 @@
 //! [`TableLike::has_row_level_security`](sql_traits::prelude::TableLike::has_row_level_security)
 //! true are rejected at register time with
 //! [`RegisterError::AggregatorOnRlsTable`](crate::RegisterError::AggregatorOnRlsTable).
-//! Total per-consumer re-execution would lift this restriction (see `MILESTONES.md`).
+//! This covers both aggregate families: the in-process delta aggregates
+//! (`COUNT`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`)
+//! the core engine maintains, and the captured `MIN` / `MAX` re-execution
+//! family. Row subscriptions stay accepted, since they are filtered per
+//! viewer at delivery. Total per-consumer re-execution would lift this
+//! restriction (see `MILESTONES.md`).
+//!
+//! ```
+//! use sql_traits::structs::ParserDB;
+//! use sqlparser::dialect::PostgreSqlDialect;
+//! use subql::backend::Postgres;
+//! use subql::reexec::ReExecEngine;
+//! use subql::testing::TestEvent;
+//! use subql::{DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest};
+//!
+//! let database = ParserDB::parse::<PostgreSqlDialect>(
+//!     "CREATE TABLE t (id INT PRIMARY KEY, amount INT); \
+//!      ALTER TABLE t ENABLE ROW LEVEL SECURITY;",
+//! )?;
+//! let mut engine: ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+//!     ReExecEngine::new(SubscriptionEngine::new(database, PostgreSqlDialect {}));
+//!
+//! // An in-process delta aggregate is rejected on the RLS table.
+//! let count = engine.register(SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM t"));
+//! assert!(matches!(count, Err(RegisterError::AggregatorOnRlsTable { .. })));
+//!
+//! // So is the captured MIN / MAX family.
+//! let min = engine.register(SubscriptionRequest::new(2u64, "SELECT MIN(amount) FROM t"));
+//! assert!(matches!(min, Err(RegisterError::AggregatorOnRlsTable { .. })));
+//!
+//! // A row subscription on the same table is still accepted.
+//! let rows =
+//!     engine.register(SubscriptionRequest::new(3u64, "SELECT * FROM t WHERE amount > 1"))?;
+//! # let _ = rows;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 //!
 //! # Known limitations (v1)
 //!

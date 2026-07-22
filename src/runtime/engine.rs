@@ -300,6 +300,21 @@ where
                 &spec.binds,
             )?;
 
+        // Registration policy: under RLS, viewers observe different rows,
+        // so a single in-process aggregate state cannot be shared across
+        // consumers. Reject aggregate registrations on RLS tables here,
+        // the sole choke point for both `register` and `register_batch`,
+        // so the guarantee holds for every caller and any future entry
+        // point. Row subscriptions are filtered per viewer at delivery and
+        // stay accepted. MIN/MAX never reach this branch: they fail the
+        // compile step above with UnsupportedSql and are captured by the
+        // reexec wrapper, which applies its own RLS guard.
+        if matches!(projection, QueryProjection::Aggregate(_))
+            && catalog_helpers::table_has_rls(&self.database, table_id).unwrap_or(false)
+        {
+            return Err(RegisterError::AggregatorOnRlsTable { table_id });
+        }
+
         // Disambiguate hash: same WHERE clause with different projection
         // kind must map to distinct predicates.
         let hash_input = crate::compiler::parser::projection_hash_input(&normalized, &projection);
@@ -2875,5 +2890,125 @@ mod tests {
             batch_engine.subscription_count(),
             seq_engine.subscription_count()
         );
+    }
+
+    const RLS_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT); \
+         ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
+
+    /// The eight in-process delta aggregates the core engine accepts.
+    const INPROCESS_AGGREGATES: &[&str] = &[
+        "SELECT COUNT(*) FROM orders",
+        "SELECT COUNT(amount) FROM orders",
+        "SELECT SUM(amount) FROM orders",
+        "SELECT AVG(amount) FROM orders",
+        "SELECT VAR_POP(amount) FROM orders",
+        "SELECT VAR_SAMP(amount) FROM orders",
+        "SELECT STDDEV_POP(amount) FROM orders",
+        "SELECT STDDEV_SAMP(amount) FROM orders",
+    ];
+
+    fn rls_engine() -> (Engine, TableId) {
+        let db = ParserDB::parse::<PostgreSqlDialect>(RLS_DDL).expect("parse RLS DDL");
+        let table_id = crate::catalog_helpers::table_id(&db, "orders").expect("orders exists");
+        (SubscriptionEngine::new(db, PostgreSqlDialect {}), table_id)
+    }
+
+    /// The core `register` rejects every in-process aggregate on an RLS
+    /// table, so a direct core-engine caller is protected without the
+    /// reexec wrapper. Guards the `compile_spec` choke point.
+    #[test]
+    fn register_rejects_aggregators_on_rls_table() {
+        for sql in INPROCESS_AGGREGATES {
+            let (mut engine, table_id) = rls_engine();
+            match engine.register(SubscriptionRequest::new(1u64, *sql)) {
+                Err(RegisterError::AggregatorOnRlsTable { table_id: got }) => {
+                    assert_eq!(got, table_id, "`{sql}` rejected for the wrong table id");
+                }
+                other => panic!("`{sql}` on RLS table must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// `register_batch`'s bulk path shares the `compile_spec` choke point,
+    /// so it rejects aggregates on RLS tables per element while still
+    /// accepting a row subscription in the same batch. Without this the
+    /// bulk path would bypass the single-`register` guard.
+    #[test]
+    fn register_batch_rejects_aggregators_on_rls_table() {
+        let (mut engine, table_id) = rls_engine();
+        let results = engine.register_batch(vec![
+            SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders"),
+            SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE amount > 1"),
+            SubscriptionRequest::new(3u64, "SELECT SUM(amount) FROM orders"),
+        ]);
+        match &results[0] {
+            Err(RegisterError::AggregatorOnRlsTable { table_id: got }) => {
+                assert_eq!(*got, table_id);
+            }
+            other => panic!("COUNT(*) must be rejected on RLS, got {other:?}"),
+        }
+        let row = results[1]
+            .as_ref()
+            .expect("row subscription accepted on RLS table");
+        assert!(row.aggregate_spec().is_none());
+        match &results[2] {
+            Err(RegisterError::AggregatorOnRlsTable { table_id: got }) => {
+                assert_eq!(*got, table_id);
+            }
+            other => panic!("SUM(amount) must be rejected on RLS, got {other:?}"),
+        }
+    }
+
+    /// The guard keys on the aggregate projection, not the table: a row
+    /// subscription on the RLS table is accepted.
+    #[test]
+    fn register_allows_row_subscription_on_rls_table() {
+        let (mut engine, _) = rls_engine();
+        let result = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE amount > 1",
+            ))
+            .expect("row subscription accepted on RLS table");
+        assert!(result.aggregate_spec().is_none());
+    }
+
+    /// Without RLS the same aggregates all register as aggregate projections.
+    #[test]
+    fn register_allows_aggregators_without_rls() {
+        for sql in INPROCESS_AGGREGATES {
+            let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+            let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+            let result = engine
+                .register(SubscriptionRequest::new(1u64, *sql))
+                .unwrap_or_else(|e| panic!("`{sql}` without RLS must register, got Err({e:?})"));
+            assert!(
+                result.aggregate_spec().is_some(),
+                "`{sql}` should register as an aggregate"
+            );
+        }
+    }
+
+    /// The guard keys on `has_row_level_security` (Postgres `ENABLE`), not
+    /// on `FORCE`. `FORCE ROW LEVEL SECURITY` without `ENABLE` does not
+    /// filter rows (policies apply only when RLS is enabled), so every
+    /// viewer sees the same rows and a shared in-process aggregate is
+    /// safe. Pins that a future change to `table_has_rls` must not
+    /// conflate force with enable.
+    #[test]
+    fn register_allows_aggregators_on_force_only_table() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (id INT PRIMARY KEY, amount INT); \
+             ALTER TABLE orders FORCE ROW LEVEL SECURITY;",
+        )
+        .expect("parse force-only DDL");
+        let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+        let result = engine
+            .register(SubscriptionRequest::new(
+                1u64,
+                "SELECT COUNT(*) FROM orders",
+            ))
+            .expect("aggregate on force-only (RLS-disabled) table must register");
+        assert!(result.aggregate_spec().is_some());
     }
 }
