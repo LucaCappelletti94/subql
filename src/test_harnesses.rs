@@ -726,8 +726,7 @@ std::thread_local! {
 }
 
 /// Bootstrap seed components over the virtual table, mirroring what
-/// [`crate::RegisterResult::aggregate_bootstrap_sql`] projects (`c`, `s`,
-/// `sq`).
+/// [`crate::AggregateBootstrap`] projects (`c0`, `c1`, `c2`).
 struct AggComponents {
     count_star: i64,
     count_col: i64,

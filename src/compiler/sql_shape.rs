@@ -485,36 +485,64 @@ pub(super) fn parse_single_statement(
         .expect("len == 1 checked above"))
 }
 
-/// Render the runnable component-seed query for an in-process aggregate.
+/// Render the runnable component-seed bundle for an in-process aggregate.
 ///
 /// Reuses the parsed statement's FROM and WHERE verbatim and rewrites only
-/// the projection to the accumulator's seed components, aliased so the
-/// caller decodes by position: `c` for COUNT, `s` for SUM, `sq` for the
-/// squared sum. Returns `None` when `sql` is not the single-aggregate
-/// SELECT shape [`extract_projection`] already validated.
+/// the projection to the accumulator's seed components, aliased
+/// positionally (`c0`, `c1`, ...) in the order [`crate::AggAccumulator::seed_from_row`]
+/// consumes them, paired with the per-column decode kinds. Returns `None`
+/// when `sql` is not the single-aggregate SELECT shape
+/// [`extract_projection`] already validated.
 pub(crate) fn render_aggregate_bootstrap(
     sql: &str,
     spec: &AggSpec,
     dialect: &dyn sqlparser::dialect::Dialect,
-) -> Option<String> {
+) -> Option<crate::AggregateBootstrap> {
     let mut stmt = parse_single_statement(sql, dialect).ok()?;
     let col = aggregate_arg_text(&stmt)?;
     let components = match spec {
-        AggSpec::CountStar => "COUNT(*) AS c".to_string(),
-        AggSpec::CountColumn { .. } => format!("COUNT({col}) AS c"),
-        AggSpec::Sum { .. } => format!("SUM({col}) AS s"),
-        AggSpec::Avg { .. } => format!("SUM({col}) AS s, COUNT({col}) AS c"),
+        AggSpec::CountStar => "COUNT(*) AS c0".to_string(),
+        AggSpec::CountColumn { .. } => format!("COUNT({col}) AS c0"),
+        AggSpec::Sum { .. } => format!("SUM({col}) AS c0"),
+        AggSpec::Avg { .. } => format!("SUM({col}) AS c0, COUNT({col}) AS c1"),
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
         | AggSpec::StddevSamp { .. } => {
-            format!("SUM({col}) AS s, SUM({col} * {col}) AS sq, COUNT({col}) AS c")
+            // The `* 1.0 *` forces the squared term into floating/decimal
+            // arithmetic on every backend, so `col * col` cannot overflow
+            // the source integer type before it is summed. Portable across
+            // PostgreSQL (numeric), MySQL (decimal), and SQLite (real),
+            // and it needs no dialect-specific cast keyword.
+            format!("SUM({col}) AS c0, SUM({col} * 1.0 * {col}) AS c1, COUNT({col}) AS c2")
         }
     };
     let template = parse_single_statement(&format!("SELECT {components}"), dialect).ok()?;
     let projection = select_projection(&template)?.to_vec();
     *select_projection_mut(&mut stmt)? = projection;
-    Some(stmt.to_string())
+    Some(crate::AggregateBootstrap {
+        sql: stmt.to_string(),
+        kinds: aggregate_bootstrap_kinds(spec),
+    })
+}
+
+/// Per-column decode kinds for [`render_aggregate_bootstrap`], in column
+/// order. `COUNT` components are exact integers ([`crate::backend::ScalarKind::Int`]);
+/// `SUM` and `SUM(x*x)` components are decoded as double
+/// ([`crate::backend::ScalarKind::Float`]) regardless of the source column
+/// type, matching the `f64` accumulator, since `SUM` promotes to
+/// `bigint`/`numeric`/`DECIMAL` depending on the backend.
+pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::ScalarKind> {
+    use crate::backend::ScalarKind::{Float, Int};
+    match spec {
+        AggSpec::CountStar | AggSpec::CountColumn { .. } => alloc::vec![Int],
+        AggSpec::Sum { .. } => alloc::vec![Float],
+        AggSpec::Avg { .. } => alloc::vec![Float, Int],
+        AggSpec::VarPop { .. }
+        | AggSpec::VarSamp { .. }
+        | AggSpec::StddevPop { .. }
+        | AggSpec::StddevSamp { .. } => alloc::vec![Float, Float, Int],
+    }
 }
 
 /// The column-argument text of the single aggregate projection, or `"*"`

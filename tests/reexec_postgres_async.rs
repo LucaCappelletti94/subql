@@ -30,7 +30,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::reexec::{
-    AsyncAutoResolvingEngine, PgAsyncDieselConnector, ReExecEngine, Registered, SnapshotResult,
+    AsyncAutoResolvingEngine, AsyncConnector, PgAsyncDieselConnector, ReExecEngine, Registered,
+    SnapshotResult,
 };
 use subql::{parse_wal2json_v2, DefaultIds, MessageV2, SubscriptionEngine, SubscriptionRequest};
 
@@ -229,5 +230,56 @@ fn snapshot_reads_value_and_lsn_from_pg_async() {
             lsn > subql::PgLsn(0),
             "pg_current_wal_lsn() should be non-zero on a live server, got {lsn:?}"
         );
+    });
+}
+
+/// The multi-column aggregate seed decodes correctly through the async PG
+/// connector, mirroring the sync path. Integer column, so `SUM` promotes to
+/// `bigint` and the double cast must still yield `f64`.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let mut setup = common::pg_connect(port);
+    sql_query("CREATE TABLE nums (id INT PRIMARY KEY, amount INT)")
+        .execute(&mut setup)
+        .expect("CREATE TABLE nums");
+    for (id, amount) in [(1, 2), (2, 4), (3, 6)] {
+        sql_query(format!(
+            "INSERT INTO nums (id, amount) VALUES ({id}, {amount})"
+        ))
+        .execute(&mut setup)
+        .expect("seed insert");
+    }
+
+    let db =
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE nums (id INT PRIMARY KEY, amount INT);")
+            .expect("parse nums DDL");
+    let mut engine =
+        SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(db, PostgreSqlDialect {});
+    let bundle = engine
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
+            1u64,
+            "SELECT VAR_POP(amount) FROM nums",
+        ))
+        .expect("register aggregate")
+        .aggregate_bootstrap
+        .expect("aggregate carries a bootstrap");
+
+    common::multi_thread_rt().block_on(async move {
+        let pool = pg_async_pool(port).await;
+        let connector = PgAsyncDieselConnector::new(pool);
+        let (row, checkpoint) = connector
+            .execute_scalar_row(&bundle.sql, &bundle.kinds, &())
+            .await
+            .expect("execute_scalar_row");
+        assert_eq!(
+            row,
+            vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
+        );
+        assert!(checkpoint.is_some());
     });
 }

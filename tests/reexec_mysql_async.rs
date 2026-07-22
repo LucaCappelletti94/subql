@@ -30,7 +30,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
 use subql::backend::{MySql, Value};
 use subql::reexec::{
-    AsyncAutoResolvingEngine, MysqlAsyncDieselConnector, ReExecEngine, Registered, SnapshotResult,
+    AsyncAutoResolvingEngine, AsyncConnector, MysqlAsyncDieselConnector, ReExecEngine, Registered,
+    SnapshotResult,
 };
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
@@ -199,6 +200,55 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
         assert!(
             notifs.triggers.is_empty(),
             "auto-resolving engine drains triggers"
+        );
+    });
+}
+
+/// The multi-column aggregate seed decodes correctly through the async
+/// MySQL connector. MySQL promotes `SUM(int)` to `DECIMAL`; the double cast
+/// must still yield `f64`.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
+    common::assert_docker_available();
+    let container = common::mysql_8();
+    let port = common::mysql_port(&container);
+
+    let mut setup = common::mysql_connect(port);
+    sql_query("CREATE TABLE nums (id INT PRIMARY KEY, amount INT)")
+        .execute(&mut setup)
+        .expect("CREATE TABLE nums");
+    for (id, amount) in [(1, 2), (2, 4), (3, 6)] {
+        sql_query(format!(
+            "INSERT INTO nums (id, amount) VALUES ({id}, {amount})"
+        ))
+        .execute(&mut setup)
+        .expect("seed insert");
+    }
+
+    let db = ParserDB::parse::<MySqlDialect>("CREATE TABLE nums (id INT PRIMARY KEY, amount INT);")
+        .expect("parse nums DDL");
+    let mut engine =
+        SubscriptionEngine::<TestEvent<MySql>, DefaultIds, ParserDB>::new(db, MySqlDialect {});
+    let bundle = engine
+        .register(SubscriptionRequest::<DefaultIds, MySql>::new(
+            1u64,
+            "SELECT VAR_POP(amount) FROM nums",
+        ))
+        .expect("register aggregate")
+        .aggregate_bootstrap
+        .expect("aggregate carries a bootstrap");
+
+    common::multi_thread_rt().block_on(async move {
+        let pool = mysql_async_pool(port).await;
+        let connector = MysqlAsyncDieselConnector::new(pool);
+        let (row, _checkpoint) = connector
+            .execute_scalar_row(&bundle.sql, &bundle.kinds, &())
+            .await
+            .expect("execute_scalar_row");
+        assert_eq!(
+            row,
+            vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
         );
     });
 }

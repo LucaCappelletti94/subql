@@ -95,6 +95,13 @@ required-features = ["testing"]
 name = "reexec_diesel"
 required-features = ["executor-diesel"]
 
+# Docker-free connector round-trip for the multi-column aggregate seed
+# (`execute_scalar_row`) over in-memory SQLite. Gated behind
+# `executor-diesel` like `reexec_diesel`.
+[[test]]
+name = "execute_scalar_row_sqlite"
+required-features = ["executor-diesel"]
+
 # Docker-backed integration test for AutoResolvingEngine + DieselConnector
 # against a real Postgres with logical replication. Tests are #[ignore]d;
 # run explicitly via:

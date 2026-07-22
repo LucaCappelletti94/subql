@@ -609,6 +609,25 @@ impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
     }
 }
 
+/// Runnable component-seed query for an aggregate registration, bundling
+/// the SQL with its per-column decode kinds so the two cannot drift apart.
+///
+/// [`sql`](Self::sql) projects the seed components aliased positionally
+/// (`c0`, `c1`, ...) in the order [`AggAccumulator::seed_from_row`]
+/// consumes them, and [`kinds`](Self::kinds) gives the decode kind per
+/// column `ci`. `COUNT` components are [`ScalarKind::Int`](crate::backend::ScalarKind::Int);
+/// `SUM` and `SUM(x*x)` components are
+/// [`ScalarKind::Float`](crate::backend::ScalarKind::Float), decoded as
+/// double to match the `f64` accumulator (since `SUM` promotes to
+/// `bigint`/`numeric`/`DECIMAL` depending on the backend).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggregateBootstrap {
+    /// Runnable single-row seed query with positionally-aliased columns.
+    pub sql: String,
+    /// Per-column decode kinds, in column order.
+    pub kinds: Vec<crate::backend::ScalarKind>,
+}
+
 /// Result of successful subscription registration
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisterResult {
@@ -631,12 +650,11 @@ pub struct RegisterResult {
     /// freed space. The caller may use this to notify the affected
     /// clients (e.g. send an "evicted" signal over their transport).
     pub evicted: Vec<SubscriptionId>,
-    /// Runnable SQL projecting the aggregate's seed components, for
-    /// bootstrap or reset. `None` for a row subscription. Run it and pass
-    /// the decoded row to [`AggAccumulator::seed_from_row`]; the column
-    /// order matches that method (`c` for COUNT, `s` for SUM, `(s, c)` for
-    /// AVG, `(s, sq, c)` for the variance and stddev family).
-    pub aggregate_bootstrap_sql: Option<String>,
+    /// Component-seed query for the aggregate, for bootstrap or reset.
+    /// `None` for a row subscription. Run [`AggregateBootstrap::sql`]
+    /// (typing each column by [`AggregateBootstrap::kinds`]) and pass the
+    /// decoded row to [`AggAccumulator::seed_from_row`].
+    pub aggregate_bootstrap: Option<AggregateBootstrap>,
 }
 
 impl RegisterResult {
@@ -898,7 +916,7 @@ impl AggAccumulator {
     }
 
     /// Seed an accumulator from a bootstrap component row produced by
-    /// [`RegisterResult::aggregate_bootstrap_sql`](crate::RegisterResult::aggregate_bootstrap_sql).
+    /// [`AggregateBootstrap`](crate::AggregateBootstrap).
     ///
     /// Consumes the components in the documented column order: `[c]` for
     /// COUNT, `[s]` for SUM, `[s, c]` for AVG, and `[s, sq, c]` for the
