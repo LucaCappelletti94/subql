@@ -34,9 +34,12 @@ use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
+use crate::reexec::{ReExecEngine, Registered};
 use crate::testing::TestEvent;
 use crate::wal::{parse_maxwell, parse_wal2json_v1, parse_wal2json_v2};
-use crate::{catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use crate::{
+    catalog_helpers, AggDelta, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest,
+};
 use pg_walstream::{Lsn, PgOutputDecoder};
 
 /// Build a permissive fuzz schema as a [`ParserDB`].
@@ -626,6 +629,101 @@ std::thread_local! {
         std::cell::RefCell::new(AggEngineCell::new());
 }
 
+/// Every aggregate flavor spanning both families (in-process delta and
+/// captured `MIN`/`MAX`), used by the RLS-guard invariant in
+/// [`harness_aggregate_consistency`].
+const RLS_GUARD_FLAVORS: &[&str] = &[
+    "SELECT COUNT(*) FROM orders",
+    "SELECT COUNT(amount) FROM orders",
+    "SELECT SUM(amount) FROM orders",
+    "SELECT AVG(amount) FROM orders",
+    "SELECT VAR_POP(amount) FROM orders",
+    "SELECT VAR_SAMP(amount) FROM orders",
+    "SELECT STDDEV_POP(amount) FROM orders",
+    "SELECT STDDEV_SAMP(amount) FROM orders",
+    "SELECT MIN(amount) FROM orders",
+    "SELECT MAX(amount) FROM orders",
+];
+
+/// `agg_catalog()`'s `orders` table with row-level security enabled, so
+/// [`catalog_helpers::table_has_rls`] returns true for it.
+fn rls_agg_catalog() -> ParserDB {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT); \
+         ALTER TABLE orders ENABLE ROW LEVEL SECURITY;",
+    )
+    .expect("rls agg fuzz fixture DDL parses")
+}
+
+/// Pre-built reexec wrappers over an RLS and a non-RLS `orders` catalog,
+/// shared across iterations of [`harness_aggregate_consistency`] so the
+/// invariant check adds no per-call engine allocation (same reasoning as
+/// [`AggEngineCell`]).
+struct RlsGuardCell {
+    rls_engine: ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
+    plain_engine: ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
+    rls_table_id: crate::TableId,
+}
+
+impl RlsGuardCell {
+    fn new() -> Self {
+        let rls_db = rls_agg_catalog();
+        let rls_table_id = catalog_helpers::table_id(&rls_db, "orders")
+            .expect("rls_agg_catalog must expose an `orders` table");
+        let rls_engine = ReExecEngine::new(SubscriptionEngine::new(rls_db, PostgreSqlDialect {}));
+        let plain_engine =
+            ReExecEngine::new(SubscriptionEngine::new(agg_catalog(), PostgreSqlDialect {}));
+        Self {
+            rls_engine,
+            plain_engine,
+            rls_table_id,
+        }
+    }
+
+    /// Assert the RLS guard: every aggregate flavor is rejected on the
+    /// RLS table with `AggregatorOnRlsTable` (never `Registered::Engine`),
+    /// while `plain_flavor` is accepted on the non-RLS table. RLS
+    /// registration errors before mutating engine state, so looping all
+    /// flavors adds no state growth. The non-RLS acceptance is
+    /// register-then-unregister so the plain engine stays bounded.
+    fn check(&mut self, plain_flavor: &str) {
+        let consumer = 1u64;
+        for flavor in RLS_GUARD_FLAVORS {
+            match self
+                .rls_engine
+                .register(SubscriptionRequest::<DefaultIds>::new(consumer, *flavor))
+            {
+                Err(RegisterError::AggregatorOnRlsTable { table_id }) => {
+                    assert_eq!(
+                        table_id, self.rls_table_id,
+                        "`{flavor}` rejected for the wrong table id"
+                    );
+                }
+                other => panic!("`{flavor}` on RLS table must be rejected, got {other:?}"),
+            }
+        }
+        match self
+            .plain_engine
+            .register(SubscriptionRequest::<DefaultIds>::new(
+                consumer,
+                plain_flavor,
+            )) {
+            Ok(Registered::Engine(_)) => {
+                let _ = self.plain_engine.unregister_query(consumer, plain_flavor);
+            }
+            Ok(Registered::ReExec { query_id, .. }) => {
+                assert!(self.plain_engine.unregister_reexec_query(query_id));
+            }
+            Err(e) => panic!("`{plain_flavor}` without RLS must be accepted, got Err({e:?})"),
+        }
+    }
+}
+
+std::thread_local! {
+    static RLS_GUARD: std::cell::RefCell<RlsGuardCell> =
+        std::cell::RefCell::new(RlsGuardCell::new());
+}
+
 /// Drive an arbitrary sequence of insert/update/delete operations against
 /// a fixed agg-only consumer set and assert that the engine's incremental
 /// `aggregate_deltas` output matches a from-scratch oracle.
@@ -642,6 +740,16 @@ std::thread_local! {
 /// Contract: panics are bugs. Assertion failures are bugs.
 #[allow(clippy::too_many_lines)]
 pub fn harness_aggregate_consistency(data: &[u8]) {
+    // RLS guard invariant, independent of the ops stream below so it does
+    // not perturb the aggregate-consistency coverage: registering any
+    // aggregate flavor against an RLS-marked table is rejected with
+    // AggregatorOnRlsTable (never Registered::Engine), while the flavor
+    // chosen from the raw input is accepted on the non-RLS table.
+    RLS_GUARD.with(|cell| {
+        let idx = usize::from(data.first().copied().unwrap_or(0)) % RLS_GUARD_FLAVORS.len();
+        cell.borrow_mut().check(RLS_GUARD_FLAVORS[idx]);
+    });
+
     let mut u = Unstructured::new(data);
     let Ok(ops): arbitrary::Result<Vec<AggOp>> = (|| {
         let n = u.int_in_range(0usize..=64)?;
