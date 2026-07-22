@@ -1802,7 +1802,7 @@ checksum = "ad5208a115eaba24916f7456929832e310a81518c641f93fee4f89aa93aa3675"
 dependencies = [
  "cfg-if",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1917,7 +1917,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3506,9 +3506,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#1a32e144d653d261ea4a84d8e1e48aaef8e7d99a"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#56ff25ec54a27831973b358dd7a8eee27295852c"
 dependencies = [
- "sql-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/sql-traits?rev=858e17e4561c2b80d779674192d242bcb12f8afa)",
+ "sql-traits",
  "sqlparser",
  "thiserror 2.0.18",
 ]
@@ -3862,7 +3862,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4205,7 +4205,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4708,19 +4708,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sql-traits"
-version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?rev=858e17e4561c2b80d779674192d242bcb12f8afa#858e17e4561c2b80d779674192d242bcb12f8afa"
-dependencies = [
- "geometric-traits",
- "sha2 0.10.9",
- "sql_docs",
- "sqlparser",
- "thiserror 2.0.18",
- "unicode-normalization",
-]
-
-[[package]]
 name = "sql_docs"
 version = "1.3.2"
 source = "git+https://github.com/LucaCappelletti94/sql-docs?branch=main#3726103d08c1b213872fdaff274a5e52ff80c843"
@@ -4759,7 +4746,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-rs?rev=306abb569fcb64b84c79ab2284c71d69a4854307#306abb569fcb64b84c79ab2284c71d69a4854307"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#bef86dd6826ea0d87143f59403b12aa3a588bd4f"
 dependencies = [
  "log",
  "recursive",
@@ -4769,7 +4756,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-rs?rev=306abb569fcb64b84c79ab2284c71d69a4854307#306abb569fcb64b84c79ab2284c71d69a4854307"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#bef86dd6826ea0d87143f59403b12aa3a588bd4f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4876,7 +4863,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slab",
- "sql-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main)",
+ "sql-traits",
  "sqlite-diff-rs",
  "sqlparser",
  "tempfile",
@@ -4903,7 +4890,7 @@ dependencies = [
  "log",
  "pg2sqlite",
  "rand 0.9.5",
- "sql-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main)",
+ "sql-traits",
  "sqlite-wasm-rs",
  "sqlparser",
  "subql",
@@ -4989,10 +4976,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5850,7 +5837,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

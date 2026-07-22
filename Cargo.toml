@@ -17,15 +17,11 @@ exclude = ["fuzz"]
 # sqlite-expose-collected-binds accessor, and the mysql execute-returning-id
 # work. Drop once these land in a diesel release.
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
-# sqlparser pinned to the `pathological-combined` branch of the
-# LucaCappelletti94 fork. This branch bundles every unmerged
-# sqlparser-rs fix surfaced by subql's fuzz harness so far, on top of
-# upstream main (which already carries the merged #2343 visitor no_std
-# fix and the merged #2344 compound-chain exponential fix). Repoint at
-# apache main once the bundled PRs land and a sqlparser release > 0.62.0
-# ships.
-sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
-sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+# sqlparser tracked from the apache/datafusion-sqlparser-rs main branch,
+# the canonical upstream (version 0.62.0), which carries the merged
+# visitor no_std fix (#2343) and compound-chain exponential fix (#2344).
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 # Unify pg_walstream across subql and sqlite-diff-rs on subql's fork
 # branch (0.8.0 plus the `PgOutputDecoder`), so the `EventType` the
 # crate's pg `Digestable` consumes is the same type subql's sources
