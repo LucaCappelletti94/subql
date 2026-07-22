@@ -631,6 +631,12 @@ pub struct RegisterResult {
     /// freed space. The caller may use this to notify the affected
     /// clients (e.g. send an "evicted" signal over their transport).
     pub evicted: Vec<SubscriptionId>,
+    /// Runnable SQL projecting the aggregate's seed components, for
+    /// bootstrap or reset. `None` for a row subscription. Run it and pass
+    /// the decoded row to [`AggAccumulator::seed_from_row`]; the column
+    /// order matches that method (`c` for COUNT, `s` for SUM, `(s, c)` for
+    /// AVG, `(s, sq, c)` for the variance and stddev family).
+    pub aggregate_bootstrap_sql: Option<String>,
 }
 
 impl RegisterResult {
@@ -888,6 +894,78 @@ impl AggAccumulator {
             count: 0,
             sum: 0.0,
             sum_sq: 0.0,
+        }
+    }
+
+    /// Seed an accumulator from a bootstrap component row produced by
+    /// [`RegisterResult::aggregate_bootstrap_sql`](crate::RegisterResult::aggregate_bootstrap_sql).
+    ///
+    /// Consumes the components in the documented column order: `[c]` for
+    /// COUNT, `[s]` for SUM, `[s, c]` for AVG, and `[s, sq, c]` for the
+    /// variance and stddev family. A zero-row result (COUNT `0`, NULL
+    /// sum components) seeds the empty-aggregate state, matching the
+    /// "set went empty" semantics of the re-execution family.
+    #[must_use]
+    pub fn seed_from_row<B: crate::backend::Backend>(
+        spec: &crate::AggSpec,
+        row: &[crate::backend::Value<B>],
+    ) -> Self {
+        use crate::AggSpec as S;
+        let mut acc = Self::from_spec(spec);
+        match spec {
+            S::CountStar | S::CountColumn { .. } => {
+                acc.count = row.first().and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+            }
+            S::Sum { .. } => {
+                acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
+            }
+            S::Avg { .. } => {
+                acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
+                acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+            }
+            S::VarPop { .. } | S::VarSamp { .. } | S::StddevPop { .. } | S::StddevSamp { .. } => {
+                acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
+                acc.sum_sq = row.get(1).and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
+                acc.count = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
+            }
+        }
+        acc
+    }
+
+    /// Decode a numeric component cell to `f64`. NULL/Missing/non-numeric
+    /// cells return `None` (the caller defaults them to `0.0`, safe because
+    /// a zero-count accumulator reports the empty state regardless of sum).
+    #[allow(clippy::cast_precision_loss)]
+    fn seed_f64<B: crate::backend::Backend>(v: &crate::backend::Value<B>) -> Option<f64> {
+        use crate::backend::Value;
+        use core::any::Any;
+        match v {
+            // i64 -> f64 loses precision above 2^53; the seed path accepts
+            // the same bounded loss the delta path (`probe_column_for_agg`)
+            // already does for realistic aggregate magnitudes.
+            Value::Int(i) => (i as &dyn Any).downcast_ref::<i64>().map(|x| *x as f64),
+            Value::Float(f) => (f as &dyn Any)
+                .downcast_ref::<f64>()
+                .copied()
+                .filter(|x| x.is_finite()),
+            // NUMERIC/DECIMAL sums (e.g. Postgres `SUM(int_col)`) arrive as
+            // BigDecimal; parse through its decimal string to avoid a
+            // num-traits import.
+            Value::Decimal(d) => (d as &dyn Any)
+                .downcast_ref::<bigdecimal::BigDecimal>()
+                .and_then(|x| x.to_string().parse::<f64>().ok()),
+            _ => None,
+        }
+    }
+
+    /// Decode the COUNT component cell to `i64`. COUNT is exact and integer
+    /// on every backend, so only `Value::Int` is accepted.
+    fn seed_i64<B: crate::backend::Backend>(v: &crate::backend::Value<B>) -> Option<i64> {
+        use crate::backend::Value;
+        use core::any::Any;
+        match v {
+            Value::Int(i) => (i as &dyn Any).downcast_ref::<i64>().copied(),
+            _ => None,
         }
     }
 

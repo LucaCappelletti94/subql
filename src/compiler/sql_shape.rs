@@ -485,6 +485,83 @@ pub(super) fn parse_single_statement(
         .expect("len == 1 checked above"))
 }
 
+/// Render the runnable component-seed query for an in-process aggregate.
+///
+/// Reuses the parsed statement's FROM and WHERE verbatim and rewrites only
+/// the projection to the accumulator's seed components, aliased so the
+/// caller decodes by position: `c` for COUNT, `s` for SUM, `sq` for the
+/// squared sum. Returns `None` when `sql` is not the single-aggregate
+/// SELECT shape [`extract_projection`] already validated.
+pub(crate) fn render_aggregate_bootstrap(
+    sql: &str,
+    spec: &AggSpec,
+    dialect: &dyn sqlparser::dialect::Dialect,
+) -> Option<String> {
+    let mut stmt = parse_single_statement(sql, dialect).ok()?;
+    let col = aggregate_arg_text(&stmt)?;
+    let components = match spec {
+        AggSpec::CountStar => "COUNT(*) AS c".to_string(),
+        AggSpec::CountColumn { .. } => format!("COUNT({col}) AS c"),
+        AggSpec::Sum { .. } => format!("SUM({col}) AS s"),
+        AggSpec::Avg { .. } => format!("SUM({col}) AS s, COUNT({col}) AS c"),
+        AggSpec::VarPop { .. }
+        | AggSpec::VarSamp { .. }
+        | AggSpec::StddevPop { .. }
+        | AggSpec::StddevSamp { .. } => {
+            format!("SUM({col}) AS s, SUM({col} * {col}) AS sq, COUNT({col}) AS c")
+        }
+    };
+    let template = parse_single_statement(&format!("SELECT {components}"), dialect).ok()?;
+    let projection = select_projection(&template)?.to_vec();
+    *select_projection_mut(&mut stmt)? = projection;
+    Some(stmt.to_string())
+}
+
+/// The column-argument text of the single aggregate projection, or `"*"`
+/// for `COUNT(*)`. `None` when `stmt` is not that shape.
+fn aggregate_arg_text(stmt: &Statement) -> Option<String> {
+    let [item] = select_projection(stmt)? else {
+        return None;
+    };
+    let expr = match item {
+        SelectItem::UnnamedExpr(e)
+        | SelectItem::ExprWithAlias { expr: e, .. }
+        | SelectItem::ExprWithAliases { expr: e, .. } => e,
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+    };
+    let Expr::Function(f) = expr else {
+        return None;
+    };
+    match &f.args {
+        FunctionArguments::List(list) if list.args.len() == 1 => match &list.args[0] {
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Some("*".to_string()),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn select_projection(stmt: &Statement) -> Option<&[SelectItem]> {
+    let Statement::Query(query) = stmt else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    Some(&select.projection)
+}
+
+fn select_projection_mut(stmt: &mut Statement) -> Option<&mut Vec<SelectItem>> {
+    let Statement::Query(query) = stmt else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    Some(&mut select.projection)
+}
+
 /// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
 pub(super) const MAX_EXPR_DEPTH: usize = 128;
 

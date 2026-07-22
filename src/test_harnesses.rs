@@ -38,7 +38,8 @@ use crate::reexec::{ReExecEngine, Registered};
 use crate::testing::TestEvent;
 use crate::wal::{parse_maxwell, parse_wal2json_v1, parse_wal2json_v2};
 use crate::{
-    catalog_helpers, AggDelta, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest,
+    catalog_helpers, AggAccumulator, AggDelta, AggSpec, AggValue, DefaultIds, RegisterError,
+    SubscriptionEngine, SubscriptionRequest,
 };
 use pg_walstream::{Lsn, PgOutputDecoder};
 
@@ -724,6 +725,123 @@ std::thread_local! {
         std::cell::RefCell::new(RlsGuardCell::new());
 }
 
+/// Bootstrap seed components over the virtual table, mirroring what
+/// [`crate::RegisterResult::aggregate_bootstrap_sql`] projects (`c`, `s`,
+/// `sq`).
+struct AggComponents {
+    count_star: i64,
+    count_col: i64,
+    sum: i64,
+    sum_sq: i64,
+    numeric: i64,
+}
+
+impl AggComponents {
+    // Amounts originate from `i16`, so the running sums stay well inside
+    // f64's exact-integer range; the precision-loss lint is theoretical.
+    #[allow(clippy::cast_precision_loss)]
+    const fn sum_f64(&self) -> f64 {
+        self.sum as f64
+    }
+    #[allow(clippy::cast_precision_loss)]
+    const fn sum_sq_f64(&self) -> f64 {
+        self.sum_sq as f64
+    }
+    /// SUM / SUM(sq) components read back as NULL when no non-NULL row matched.
+    const fn sum_cell(&self) -> Value<Postgres> {
+        if self.numeric == 0 {
+            Value::Null
+        } else {
+            Value::Int(self.sum)
+        }
+    }
+    const fn sum_sq_cell(&self) -> Value<Postgres> {
+        if self.numeric == 0 {
+            Value::Null
+        } else {
+            Value::Int(self.sum_sq)
+        }
+    }
+}
+
+fn agg_components(virt: &BTreeMap<i64, VirtRow>) -> AggComponents {
+    let mut c = AggComponents {
+        count_star: i64::try_from(virt.len()).unwrap_or(i64::MAX),
+        count_col: 0,
+        sum: 0,
+        sum_sq: 0,
+        numeric: 0,
+    };
+    for a in virt.values().filter_map(|r| r.amount) {
+        c.count_col += 1;
+        c.numeric += 1;
+        c.sum += a;
+        c.sum_sq += a * a;
+    }
+    c
+}
+
+/// Textbook aggregate value over the components, using the same formulas
+/// as [`AggAccumulator::value`], so seeding matches it exactly.
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
+    let n = c.numeric as f64;
+    let sum = c.sum as f64;
+    let sum_sq = c.sum_sq as f64;
+    let var_pop = (c.numeric > 0).then(|| sum_sq / n - (sum / n).powi(2));
+    let var_samp = (c.numeric >= 2).then(|| (sum_sq - sum.powi(2) / n) / (n - 1.0));
+    match spec {
+        AggSpec::CountStar => AggValue::Count(c.count_star),
+        AggSpec::CountColumn { .. } => AggValue::Count(c.count_col),
+        AggSpec::Sum { .. } => AggValue::Sum(sum),
+        AggSpec::Avg { .. } => AggValue::Real((c.numeric > 0).then(|| sum / n)),
+        AggSpec::VarPop { .. } => AggValue::Real(var_pop),
+        AggSpec::VarSamp { .. } => AggValue::Real(var_samp),
+        AggSpec::StddevPop { .. } => AggValue::Real(var_pop.map(f64::sqrt)),
+        AggSpec::StddevSamp { .. } => AggValue::Real(var_samp.map(f64::sqrt)),
+    }
+}
+
+/// Seeding from the bootstrap component row must equal a direct recompute
+/// for every `AggSpec`. Exact: seed and oracle share f64 inputs and math.
+fn assert_seed_matches_oracle(c: &AggComponents) {
+    let cases: [(AggSpec, Vec<Value<Postgres>>); 8] = [
+        (AggSpec::CountStar, alloc::vec![Value::Int(c.count_star)]),
+        (
+            AggSpec::CountColumn { column: 1 },
+            alloc::vec![Value::Int(c.count_col)],
+        ),
+        (AggSpec::Sum { column: 1 }, alloc::vec![c.sum_cell()]),
+        (
+            AggSpec::Avg { column: 1 },
+            alloc::vec![c.sum_cell(), Value::Int(c.numeric)],
+        ),
+        (
+            AggSpec::VarPop { column: 1 },
+            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)],
+        ),
+        (
+            AggSpec::VarSamp { column: 1 },
+            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)],
+        ),
+        (
+            AggSpec::StddevPop { column: 1 },
+            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)],
+        ),
+        (
+            AggSpec::StddevSamp { column: 1 },
+            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)],
+        ),
+    ];
+    for (spec, row) in cases {
+        assert_eq!(
+            AggAccumulator::seed_from_row(&spec, &row).value(),
+            oracle_agg_value(&spec, c),
+            "seed decode drift for {spec:?}",
+        );
+    }
+}
+
 /// Drive an arbitrary sequence of insert/update/delete operations against
 /// a fixed agg-only consumer set and assert that the engine's incremental
 /// `aggregate_deltas` output matches a from-scratch oracle.
@@ -751,9 +869,17 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
     });
 
     let mut u = Unstructured::new(data);
-    let Ok(ops): arbitrary::Result<Vec<AggOp>> = (|| {
+    type PrepopRow = (u8, Option<i16>, Option<u8>);
+    let Ok((prepop, ops)): arbitrary::Result<(Vec<PrepopRow>, Vec<AggOp>)> = (|| {
+        let k = u.int_in_range(0usize..=16)?;
+        let prepop = (0..k)
+            .map(|_| Ok((u.arbitrary()?, u.arbitrary()?, u.arbitrary()?)))
+            .collect::<arbitrary::Result<Vec<PrepopRow>>>()?;
         let n = u.int_in_range(0usize..=64)?;
-        (0..n).map(|_| AggOp::arbitrary(&mut u)).collect()
+        let ops = (0..n)
+            .map(|_| AggOp::arbitrary(&mut u))
+            .collect::<arbitrary::Result<Vec<AggOp>>>()?;
+        Ok((prepop, ops))
     })() else {
         return;
     };
@@ -763,18 +889,30 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
         let table_id = cell.table_id;
         let pk_col = cell.pk_col;
 
-        // Engine-side running state per consumer (fresh each iteration,
-        // because the oracle restarts from an empty virtual table).
-        let mut engine_count: i64 = 0;
-        let mut engine_sum: f64 = 0.0;
+        // Virtual table (id -> row), the source of truth for the oracle.
+        // Pre-populate an arbitrary S0 so the accumulators start from a
+        // bootstrap seed over a non-empty table, not from empty.
+        let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
+        for (id, amount, status) in prepop {
+            virt.entry(i64::from(id))
+                .or_insert_with(|| VirtRow::from_op(amount, status));
+        }
+        let s0 = agg_components(&virt);
+
+        // Exercise the seed decode over the arbitrary S0: seeding from the
+        // bootstrap component row must equal a direct recompute.
+        assert_seed_matches_oracle(&s0);
+
+        // Engine-side running state, seeded from S0 so the delta stream is
+        // folded onto a non-empty bootstrap, then folded per event.
+        let mut engine_count: i64 = s0.count_star;
+        let mut engine_sum: f64 = s0.sum_f64();
         // AVG(amount): running (sum, count) tuple for consumer cid=7.
-        let mut engine_avg: (f64, i64) = (0.0, 0);
+        let mut engine_avg: (f64, i64) = (s0.sum_f64(), s0.numeric);
         // Four running `(sum, sum_sq, count)` tuples, indexed by consumer
         // id - 3 (so cid 3..=6 maps to slots 0..=3).
-        let mut engine_stats: [(f64, f64, i64); 4] = [(0.0, 0.0, 0); 4];
-
-        // Virtual table (id -> row), the source of truth for the oracle.
-        let mut virt: BTreeMap<i64, VirtRow> = BTreeMap::new();
+        let mut engine_stats: [(f64, f64, i64); 4] =
+            [(s0.sum_f64(), s0.sum_sq_f64(), s0.numeric); 4];
 
         for op in ops {
             let (event, mutated): (Option<TestEvent<Postgres>>, bool) = match op {
