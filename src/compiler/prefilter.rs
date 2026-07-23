@@ -473,8 +473,36 @@ fn planner_value_from_sql_value(val: &Value) -> Option<PlannerValue> {
         }),
         Value::SingleQuotedString(s)
         | Value::DoubleQuotedString(s)
-        | Value::NationalStringLiteral(s)
-        | Value::HexStringLiteral(s) => Some(PlannerValue::String(Arc::from(s.as_str()))),
+        | Value::NationalStringLiteral(s) => Some(PlannerValue::String(Arc::from(s.as_str()))),
+        // A hex literal (`X'...'`) only ever targets a BYTEA/BLOB column,
+        // whose runtime cells are `Value::Bytes` and have no
+        // `IndexableCell` (see `IndexableCell::from_value`). Indexing it as
+        // a String equality atom builds an index entry no bytes event can
+        // probe, so the predicate would be silently missed. Return None so
+        // the comparison falls to the scan set and the VM performs the
+        // exact bytewise compare.
         _ => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A hex literal must not become an indexable String equality atom: a
+    /// bytes column has no `IndexableCell`, so an indexed hex atom would be
+    /// unprobeable and the predicate silently missed. It stays unindexed
+    /// (scan set), while ordinary quoted strings keep their String atom.
+    #[test]
+    fn hex_literal_is_not_indexed_as_string() {
+        assert_eq!(
+            planner_value_from_sql_value(&Value::HexStringLiteral("DEADBEEF".to_string())),
+            None,
+        );
+        assert!(matches!(
+            planner_value_from_sql_value(&Value::SingleQuotedString("x".to_string())),
+            Some(PlannerValue::String(_)),
+        ));
     }
 }
