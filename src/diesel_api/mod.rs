@@ -208,34 +208,29 @@ impl BindDecode for diesel::sqlite::Sqlite {
         let data = collector.moveable();
         let mut values = Vec::with_capacity(data.binds().len());
         for (value, _ty) in data.binds() {
-            values.push(owned_sqlite_to_value(value)?);
+            values.push(owned_sqlite_to_value(value));
         }
         Ok((sql, values))
     }
 }
 
 /// Map an owned SQLite bind value to a `Value<SQLite>`. SQLite has no
-/// boolean or uuid storage class (they arrive as integer or text), and
-/// a BLOB has no direct scalar representation in the supported subset,
-/// so it is rejected.
+/// boolean or uuid storage class, so those arrive as integer or text,
+/// and a BLOB maps to [`Value::Bytes`]. The mapping is total over
+/// `OwnedSqliteBindValue`.
 #[cfg(feature = "diesel-typed-sqlite")]
 fn owned_sqlite_to_value(
     value: &diesel::sqlite::OwnedSqliteBindValue,
-) -> Result<Value<crate::backend::SQLite>, RegisterError> {
+) -> Value<crate::backend::SQLite> {
     use diesel::sqlite::OwnedSqliteBindValue as V;
-    Ok(match value {
+    match value {
         V::I32(i) => Value::Int(i64::from(*i)),
         V::I64(i) => Value::Int(*i),
         V::F64(f) => Value::Float(*f),
         V::String(s) => Value::String(s.as_ref().to_string()),
+        V::Binary(b) => Value::Bytes(b.to_vec()),
         V::Null => Value::Null,
-        V::Binary(_) => {
-            return Err(RegisterError::UnsupportedSql(
-                "unsupported SQLite BLOB bind (only integer, float and text are supported)"
-                    .to_string(),
-            ))
-        }
-    })
+    }
 }
 
 #[cfg(feature = "diesel-typed-mysql")]
@@ -634,6 +629,16 @@ mod render_tests {
         }
     }
 
+    // Table with a `Binary` column, used by the SQLite blob-bind tests.
+    #[cfg(feature = "diesel-typed-sqlite")]
+    diesel::table! {
+        blobs (id) {
+            id -> Integer,
+            name -> Text,
+            payload -> Binary,
+        }
+    }
+
     #[test]
     fn render_select_with_binds() {
         let query = users::table
@@ -844,5 +849,195 @@ mod render_tests {
             .register_follow_update_typed::<Mysql, _>(1, &update)
             .expect("mysql update follow again");
         assert_eq!(a.subscription_id, b.subscription_id);
+    }
+
+    /// A blob bind renders to a `?` placeholder plus a `Value::Bytes`, not
+    /// an inlined literal. Empty blobs round-trip too.
+    #[cfg(feature = "diesel-typed-sqlite")]
+    #[test]
+    fn render_blob_bind_sqlite() {
+        use diesel::sqlite::Sqlite;
+
+        let query = blobs::table.filter(blobs::payload.eq(alloc::vec![1u8, 2, 3]));
+        let (sql, binds) = render_typed::<Sqlite, _>(&query).expect("render blob");
+        assert!(sql.contains('?'), "sql: {sql}");
+        // The value rides as a bind, never inlined as a hex literal.
+        assert!(!sql.contains("X'"), "blob must not be inlined: {sql}");
+        assert_eq!(
+            binds,
+            alloc::vec![Value::<crate::backend::SQLite>::Bytes(alloc::vec![1, 2, 3])]
+        );
+
+        let empty = blobs::table.filter(blobs::payload.eq(alloc::vec::Vec::<u8>::new()));
+        let (_, binds) = render_typed::<Sqlite, _>(&empty).expect("render empty blob");
+        assert_eq!(
+            binds,
+            alloc::vec![Value::<crate::backend::SQLite>::Bytes(alloc::vec![])]
+        );
+    }
+
+    /// Bind order follows placeholder order: text, then blob, then integer
+    /// come back in exactly that sequence, so a `?` at position N pairs with
+    /// bind N.
+    #[cfg(feature = "diesel-typed-sqlite")]
+    #[test]
+    fn render_blob_bind_order_sqlite() {
+        use diesel::sqlite::Sqlite;
+
+        let query = blobs::table
+            .filter(blobs::name.eq("ann"))
+            .filter(blobs::payload.eq(alloc::vec![0xaau8, 0xbb]))
+            .filter(blobs::id.eq(7));
+        let (_, binds) = render_typed::<Sqlite, _>(&query).expect("render ordered");
+        assert_eq!(
+            binds,
+            alloc::vec![
+                Value::<crate::backend::SQLite>::String("ann".into()),
+                Value::Bytes(alloc::vec![0xaa, 0xbb]),
+                Value::Int(7),
+            ]
+        );
+    }
+
+    /// Regression guard on the full `OwnedSqliteBindValue` mapping: every
+    /// variant decodes as before, and `Binary` now maps to `Value::Bytes`
+    /// (empty included) rather than being rejected.
+    #[cfg(feature = "diesel-typed-sqlite")]
+    #[test]
+    fn owned_sqlite_to_value_covers_all_variants() {
+        use super::owned_sqlite_to_value;
+        use crate::backend::SQLite;
+        use diesel::sqlite::OwnedSqliteBindValue as V;
+
+        let dec = owned_sqlite_to_value;
+        assert_eq!(dec(&V::Null), Value::<SQLite>::Null);
+        assert_eq!(dec(&V::I32(5)), Value::Int(5));
+        assert_eq!(dec(&V::I64(9)), Value::Int(9));
+        assert_eq!(dec(&V::F64(1.5)), Value::Float(1.5));
+        assert_eq!(dec(&V::String("hi".into())), Value::String("hi".into()));
+        assert_eq!(
+            dec(&V::Binary(alloc::vec![1u8, 2, 3].into())),
+            Value::Bytes(alloc::vec![1, 2, 3])
+        );
+        assert_eq!(
+            dec(&V::Binary(alloc::vec::Vec::<u8>::new().into())),
+            Value::Bytes(alloc::vec![])
+        );
+    }
+
+    /// End to end: a typed diesel query filtering a blob column registers
+    /// through `render_typed` plus placeholder resolution and matches a CDC
+    /// row carrying the same bytes, while a row with different bytes does
+    /// not. Depends on the `Value::Bytes` placeholder-resolution path.
+    #[cfg(feature = "diesel-typed-sqlite")]
+    #[test]
+    fn register_typed_blob_matches_sqlite() {
+        use crate::backend::SQLite;
+        use crate::SubscriptionEngine;
+        use diesel::sqlite::Sqlite;
+        use sql_traits::structs::ParserDB;
+        use sqlparser::dialect::SQLiteDialect;
+
+        let catalog = ParserDB::parse::<SQLiteDialect>(
+            "CREATE TABLE blobs (id INTEGER PRIMARY KEY, name TEXT, payload BLOB);",
+        )
+        .expect("catalog");
+        let table_id = crate::catalog_helpers::table_id(&catalog, "blobs").expect("blobs table");
+        let mut engine = SubscriptionEngine::<TestEvent<SQLite>, crate::DefaultIds, _>::new(
+            catalog,
+            SQLiteDialect {},
+        );
+
+        let bytes = alloc::vec![0xde, 0xad, 0xbe, 0xef];
+        let query = blobs::table.filter(blobs::payload.eq(bytes.clone()));
+        engine
+            .register_select_typed::<Sqlite, _>(1, &query)
+            .expect("register typed blob");
+
+        let hit = TestEvent::<SQLite>::insert(
+            table_id,
+            alloc::vec![Value::Int(1), Value::Null, Value::Bytes(bytes)],
+        )
+        .with_pk_columns([0u16]);
+        assert_eq!(
+            engine.consumers(&hit).expect("dispatch hit").inserted(),
+            &[1u64]
+        );
+
+        let miss = TestEvent::<SQLite>::insert(
+            table_id,
+            alloc::vec![Value::Int(2), Value::Null, Value::Bytes(alloc::vec![0x00])],
+        )
+        .with_pk_columns([0u16]);
+        assert!(engine
+            .consumers(&miss)
+            .expect("dispatch miss")
+            .inserted()
+            .is_empty());
+    }
+
+    /// A typed SQLite UPDATE with a blob predicate follows its target rows.
+    /// The SET bind (`name = 'x'`) is trimmed from the front while the blob
+    /// WHERE bind survives `skip(set_bind_count)` and placeholder
+    /// resolution, so the derived follow SELECT matches a row carrying those
+    /// bytes and rejects one that does not. Also the only SQLite
+    /// update-follow coverage.
+    #[cfg(feature = "diesel-typed-sqlite")]
+    #[test]
+    fn register_typed_update_follow_blob_sqlite() {
+        use crate::backend::SQLite;
+        use crate::SubscriptionEngine;
+        use diesel::sqlite::Sqlite;
+        use sql_traits::structs::ParserDB;
+        use sqlparser::dialect::SQLiteDialect;
+
+        let catalog = ParserDB::parse::<SQLiteDialect>(
+            "CREATE TABLE blobs (id INTEGER PRIMARY KEY, name TEXT, payload BLOB);",
+        )
+        .expect("catalog");
+        let table_id = crate::catalog_helpers::table_id(&catalog, "blobs").expect("blobs table");
+        let mut engine = SubscriptionEngine::<TestEvent<SQLite>, crate::DefaultIds, _>::new(
+            catalog,
+            SQLiteDialect {},
+        );
+
+        let bytes = alloc::vec![0xcau8, 0xfe];
+        // UPDATE blobs SET name = 'x' WHERE payload = ? derives
+        // SELECT * FROM blobs WHERE payload = ?, keeping the blob bind after
+        // the SET text bind is trimmed.
+        let update = diesel::update(blobs::table.filter(blobs::payload.eq(bytes.clone())))
+            .set(blobs::name.eq("x"));
+        engine
+            .register_follow_update_typed::<Sqlite, _>(1, &update)
+            .expect("register update follow");
+
+        let hit = TestEvent::<SQLite>::insert(
+            table_id,
+            alloc::vec![
+                Value::Int(1),
+                Value::String("y".into()),
+                Value::Bytes(bytes)
+            ],
+        )
+        .with_pk_columns([0u16]);
+        assert_eq!(
+            engine.consumers(&hit).expect("dispatch hit").inserted(),
+            &[1u64]
+        );
+
+        let miss = TestEvent::<SQLite>::insert(
+            table_id,
+            alloc::vec![
+                Value::Int(2),
+                Value::String("y".into()),
+                Value::Bytes(alloc::vec![0x00])
+            ],
+        )
+        .with_pk_columns([0u16]);
+        assert!(engine
+            .consumers(&miss)
+            .expect("dispatch miss")
+            .inserted()
+            .is_empty());
     }
 }
