@@ -107,6 +107,21 @@ const fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+/// Encode bytes as uppercase hex, the spelling `SqlValue::HexStringLiteral`
+/// renders as `X'...'`. Inverse of [`parse_hex_bytes`]: the pair round-trips
+/// any byte vector (empty included) losslessly, since `parse_hex_bytes`
+/// accepts either case.
+pub(super) fn hex_upper(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        // u8 -> usize widens losslessly. Nibbles are already 0..=15.
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+    out
+}
+
 fn parse_uuid(s: &str, sql: &SqlValue) -> Result<uuid::Uuid, RegisterError> {
     uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, ScalarKind::Uuid, e))
 }

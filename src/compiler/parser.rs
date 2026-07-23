@@ -10,7 +10,7 @@
 
 use super::{
     canonicalize,
-    literals::{resolve_column_ref, SqlLiteralParse},
+    literals::{hex_upper, resolve_column_ref, SqlLiteralParse},
     prefilter::build_prefilter_plan,
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
@@ -304,10 +304,10 @@ fn extract_table_and_where(
 /// had written the literal inline.
 ///
 /// Handles the scalars commonly bound through placeholders (Int, Float,
-/// String, Null). Every other scalar returns
-/// [`RegisterError::BindResolution`] — those bindings are rejected until
-/// a downstream test exercises them and pins a canonical round-trip
-/// format.
+/// String, Null) plus Bytes, whose canonical `X'...'` hex spelling round
+/// trips through [`SqlLiteralParse::parse_literal`]. Every other scalar
+/// returns [`RegisterError::BindResolution`] until a downstream test
+/// exercises it and pins a canonical round-trip format.
 fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterError> {
     match v {
         Value::Missing => Err(RegisterError::BindResolution(
@@ -317,6 +317,10 @@ fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterErro
         Value::Int(i) => Ok(SqlValue::Number(format!("{i:?}"), false)),
         Value::Float(f) => Ok(SqlValue::Number(format!("{f:?}"), false)),
         Value::String(s) => Ok(SqlValue::SingleQuotedString(s.as_ref().to_string())),
+        // Uppercase hex matches sqlparser's `X'...'` rendering. The decode
+        // leg (`parse_literal` -> `parse_hex_bytes`) accepts either case,
+        // so `parse_literal(value_to_sql_value(Bytes(v))) == Bytes(v)`.
+        Value::Bytes(b) => Ok(SqlValue::HexStringLiteral(hex_upper(b.as_ref()))),
         // Boolean binds are backend-specific (`Postgres::Bool = bool`,
         // `SQLite::Bool = i64`) and don't have a uniform sqlparser
         // spelling under a generic `B`. Reject at placeholder-injection
@@ -324,7 +328,6 @@ fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterErro
         // `false` inline (which the compiler routes through
         // `SqlLiteralParse::parse_literal` with the right coercion).
         Value::Bool(_)
-        | Value::Bytes(_)
         | Value::Uuid(_)
         | Value::Timestamp(_)
         | Value::TimestampTz(_)
@@ -1039,4 +1042,76 @@ where
     Ok(())
 }
 
-// Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    //! Bind-placeholder resolution tests. The broad parser suite is not
+    //! here yet. These pin the `Value::Bytes` placeholder path added
+    //! alongside the existing `SqlLiteralParse::parse_literal` decode leg.
+    use super::*;
+    use crate::backend::{MySql, Postgres, SQLite};
+
+    /// The pinned contract: `parse_literal(value_to_sql_value(Bytes(v)))`
+    /// returns `Bytes(v)` for every byte vector, empty included. Encode
+    /// and decode share the `X'...'` hex spelling, so a bytes bind behaves
+    /// exactly as an inline hex literal.
+    fn assert_bytes_round_trip<B: Backend + SqlLiteralParse>(bytes: alloc::vec::Vec<u8>)
+    where
+        B::Bytes: From<alloc::vec::Vec<u8>>,
+    {
+        let value = Value::<B>::Bytes(B::Bytes::from(bytes.clone()));
+        let sql = value_to_sql_value(&value).unwrap();
+        assert!(matches!(sql, SqlValue::HexStringLiteral(_)));
+        let decoded = B::parse_literal(&sql, ScalarKind::Bytes).unwrap();
+        assert_eq!(decoded, Value::<B>::Bytes(B::Bytes::from(bytes)));
+    }
+
+    #[test]
+    fn bytes_round_trip_postgres() {
+        assert_bytes_round_trip::<Postgres>(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_bytes_round_trip::<Postgres>(vec![]);
+    }
+
+    /// Exhaustive per-byte guard: every value 0..=255 encodes to two hex
+    /// digits and decodes back, so no nibble combination is lost.
+    #[test]
+    fn bytes_round_trip_all_byte_values() {
+        assert_bytes_round_trip::<Postgres>((0u8..=255).collect());
+    }
+
+    #[test]
+    fn bytes_round_trip_sqlite() {
+        assert_bytes_round_trip::<SQLite>(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_bytes_round_trip::<SQLite>(vec![]);
+    }
+
+    #[test]
+    fn bytes_round_trip_mysql() {
+        assert_bytes_round_trip::<MySql>(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_bytes_round_trip::<MySql>(vec![]);
+    }
+
+    /// `X'...'` renders uppercase to match sqlparser's own spelling.
+    #[test]
+    fn bytes_encode_is_uppercase_hex() {
+        let value = Value::<Postgres>::Bytes(vec![0x0a, 0xff, 0x00]);
+        match value_to_sql_value(&value).unwrap() {
+            SqlValue::HexStringLiteral(s) => assert_eq!(s, "0AFF00"),
+            other => panic!("expected HexStringLiteral, got {other:?}"),
+        }
+    }
+
+    /// The untouched arms still reject: a `Missing` bind and a `Bool` bind
+    /// both surface `RegisterError::BindResolution`.
+    #[test]
+    fn missing_and_bool_binds_stay_rejected() {
+        assert!(matches!(
+            value_to_sql_value(&Value::<Postgres>::Missing),
+            Err(RegisterError::BindResolution(_))
+        ));
+        assert!(matches!(
+            value_to_sql_value(&Value::<Postgres>::Bool(true)),
+            Err(RegisterError::BindResolution(_))
+        ));
+    }
+}
