@@ -12,7 +12,7 @@
 //! `DiffSetBuilder::digest(event, schema, adapter)` folds one CDC event
 //! into a builder, resolving the event's table through a
 //! [`WireSchema`] and decoding each column payload through a
-//! [`WireAdapter`](sqlite_diff_rs::WireAdapter). The schema declares one
+//! [`WireAdapter`]. The schema declares one
 //! [`WireType`] per column, a source-independent semantic type that
 //! selects the decoder. subql's catalog is [`ScalarKind`]-based, and
 //! [`scalar_kind_to_wire_type`] maps one to the other, so a single
@@ -46,9 +46,10 @@ use sqlite_diff_rs::pg_walstream::{
 };
 use sqlite_diff_rs::wal2json::{ConversionError, Wal2Json};
 use sqlite_diff_rs::{
-    ChangeSet, ChangesetFormat, ColumnNames, Digestable, DynTable, IndexableValues, NamedColumns,
-    PatchSet, PatchsetFormat, SchemaWithPK, SimpleTable, TypeMap, UuidBlob16Decoder,
-    Value as WireValue, WireColumnTypes, WireSchema, WireType,
+    ChangeSet, ChangesetFormat, ColumnNames, DiffOps, Digestable, DynTable, IndexableValues,
+    Insert, NamedColumns, PatchSet, PatchsetFormat, PgBinary, PgBinaryColumn, SchemaWithPK,
+    SimpleTable, TypeMap, UuidBlob16Decoder, Value as WireValue, WireAdapter, WireColumnTypes,
+    WireSchema, WireType,
 };
 
 use crate::backend::ScalarKind;
@@ -534,6 +535,123 @@ pub fn maxwell_changeset<DB: DatabaseLike>(
     Ok(maxwell_changeset_builder(database, events)?.build())
 }
 
+/// The `PgBinary` decoder registry for snapshot reads.
+///
+/// The snapshot counterpart to [`pgoutput_adapter`]. Unlike that one it
+/// needs no override: the `PgBinary` `defaults()` already map
+/// [`WireType::Uuid`] to [`UuidBlob16Decoder`], so a `UUID` column lowers
+/// to a compact 16-byte blob, byte-identical to the pgoutput CDC path. The
+/// named seam still earns its place as the single point the two policies
+/// could ever diverge.
+#[must_use]
+pub fn pgbinary_adapter() -> TypeMap<PgBinary, String, Vec<u8>> {
+    TypeMap::defaults()
+}
+
+/// Encode Postgres binary result rows for `table` into an insert-patchset
+/// builder, the snapshot counterpart to [`pgoutput_patchset_builder`].
+///
+/// `column_names` names the result columns in order. Each row in `rows`
+/// carries one `Option<&[u8]>` per result column, the raw Postgres binary
+/// bytes (or `None` for SQL NULL), aligned to `column_names`. Column order
+/// and primary key come from the catalog, and each column's [`WireType`] is
+/// the catalog's (via [`scalar_kind_to_wire_type`]), the same source the
+/// pgoutput CDC path folds through, so the patchset is byte-identical to
+/// that path for the same rows (a `uuid` lands as a 16-byte blob). A
+/// catalog column absent from `column_names` is stored as NULL.
+///
+/// A snapshot is a set of rows to insert with no old images, so this
+/// assembles [`Insert`]s directly rather than using the `Digestable` fold
+/// the CDC vehicles need for old-image-carrying ops.
+///
+/// # Errors
+///
+/// [`ConversionError::TableNotFound`] when `table` is not in the catalog,
+/// [`ConversionError::UnsupportedType`] when a catalog column's declared
+/// type has no [`ScalarKind`], [`ConversionError::MissingColumns`] when a
+/// row's width does not match `column_names`, and
+/// [`ConversionError::Decode`] when a column's bytes do not decode for its
+/// type.
+pub fn pgbinary_patchset_builder<DB: DatabaseLike>(
+    database: &DB,
+    table: &str,
+    column_names: &[&str],
+    rows: &[Vec<Option<&[u8]>>],
+) -> Result<PatchSet<SimpleTable, String, Vec<u8>>, ConversionError> {
+    let table_id = catalog_helpers::table_id(database, table)
+        .ok_or_else(|| ConversionError::TableNotFound(table.to_string()))?;
+    let simple = catalog_helpers::simple_table(database, table_id)
+        .ok_or_else(|| ConversionError::TableNotFound(table.to_string()))?;
+
+    // Catalog column list once: name plus wire type per ordinal, both read
+    // from the already-resolved `simple` (as `build_wire_table` does)
+    // rather than re-resolving the table per column. Same source the CDC
+    // path folds through, so the two encoders agree.
+    let arity = simple.number_of_columns();
+    let mut columns: Vec<(String, WireType)> = Vec::with_capacity(arity);
+    for ordinal in 0..arity {
+        let column_id = ColumnId::try_from(ordinal)
+            .map_err(|_| ConversionError::TableNotFound(table.to_string()))?;
+        let name = simple
+            .column_name(ordinal)
+            .ok_or_else(|| ConversionError::TableNotFound(table.to_string()))?
+            .to_string();
+        let wire_type = catalog_helpers::column_scalar_kind(database, table_id, column_id)
+            .map(scalar_kind_to_wire_type)
+            .ok_or_else(|| ConversionError::UnsupportedType(name.clone()))?;
+        columns.push((name, wire_type));
+    }
+
+    // Map each catalog column name to its position in the result row.
+    let mut positions: HashMap<&str, usize> = HashMap::with_capacity(column_names.len());
+    for (idx, name) in column_names.iter().enumerate() {
+        positions.insert(*name, idx);
+    }
+
+    let adapter = pgbinary_adapter();
+    let mut builder = PatchSet::<SimpleTable, String, Vec<u8>>::new();
+    for row in rows {
+        if row.len() != column_names.len() {
+            return Err(ConversionError::MissingColumns);
+        }
+        let mut insert = Insert::<SimpleTable, String, Vec<u8>>::from(simple.clone());
+        for (ordinal, (name, wire_type)) in columns.iter().enumerate() {
+            let raw = positions.get(name.as_str()).and_then(|&idx| row[idx]);
+            let value = adapter.decode(PgBinaryColumn {
+                column_name: name,
+                wire_type: *wire_type,
+                raw,
+            })?;
+            // `ordinal` is bounded by the catalog arity that sized the
+            // insert, so `set` cannot report an out-of-bounds column.
+            insert = insert
+                .set(ordinal, value)
+                .map_err(|_| ConversionError::MissingColumns)?;
+        }
+        builder = builder.insert(insert);
+    }
+    Ok(builder)
+}
+
+/// Encode Postgres binary result rows for `table` into an insert-patchset,
+/// the snapshot counterpart to [`pgoutput_patchset`].
+///
+/// A thin wrapper over [`pgbinary_patchset_builder`] that serializes with
+/// `build()`. An empty `rows` yields an empty patchset (zero bytes),
+/// matching the CDC vehicles.
+///
+/// # Errors
+///
+/// Propagates [`ConversionError`], as [`pgbinary_patchset_builder`] does.
+pub fn pgbinary_patchset<DB: DatabaseLike>(
+    database: &DB,
+    table: &str,
+    column_names: &[&str],
+    rows: &[Vec<Option<&[u8]>>],
+) -> Result<Vec<u8>, ConversionError> {
+    Ok(pgbinary_patchset_builder(database, table, column_names, rows)?.build())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -827,5 +945,141 @@ mod tests {
             values[0],
             (Some(WireValue::Integer(1)), Some(WireValue::Integer(2)))
         );
+    }
+
+    fn orders_uuid_db() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE orders (id UUID PRIMARY KEY, quantity BIGINT);",
+        )
+        .unwrap()
+    }
+
+    fn only_insert_values(bytes: &[u8]) -> Vec<WireValue<String, Vec<u8>>> {
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(bytes) else {
+            unreachable!("marker checked above");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        assert_eq!(ops.len(), 1);
+        let PatchsetOp::Insert { values, .. } = &ops[0] else {
+            panic!("expected an insert op, got {:?}", ops[0]);
+        };
+        values.to_vec()
+    }
+
+    #[test]
+    fn pgbinary_adapter_decodes_uuid_to_16_byte_blob() {
+        // The whole motivation, pinned at the subql seam: the PgBinary
+        // defaults route WireType::Uuid to the 16-byte-blob decoder.
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let adapter = pgbinary_adapter();
+        let value = adapter
+            .decode(PgBinaryColumn {
+                column_name: "id",
+                wire_type: WireType::Uuid,
+                raw: Some(&uuid_bytes),
+            })
+            .unwrap();
+        assert_eq!(value, WireValue::Blob(uuid_bytes.to_vec()));
+    }
+
+    #[test]
+    fn pgbinary_patchset_round_trips_uuid_and_bigint_row() {
+        let db = orders_uuid_db();
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let qty = 42i64.to_be_bytes();
+        let rows = vec![vec![Some(uuid_bytes.as_slice()), Some(qty.as_slice())]];
+        let bytes = pgbinary_patchset(&db, "orders", &["id", "quantity"], &rows).unwrap();
+        assert_eq!(
+            only_insert_values(&bytes),
+            vec![WireValue::Blob(uuid_bytes.to_vec()), WireValue::Integer(42),]
+        );
+    }
+
+    /// The subql-level guard against the snapshot and CDC encoders drifting:
+    /// the same logical uuid lands as the same 16-byte blob whether it
+    /// arrives as raw binary (snapshot) or as pgoutput text (CDC).
+    #[cfg(feature = "pgoutput-emit")]
+    #[test]
+    fn pgbinary_and_pgoutput_agree_on_uuid_blob() {
+        use sqlite_diff_rs::pg_walstream::{ColumnValue, EventType, Lsn, RowData};
+
+        let db = orders_uuid_db();
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let uuid_str = "00010203-0405-0607-0809-0a0b0c0d0e0f";
+
+        // Snapshot path: raw 16 binary bytes.
+        let qty = 7i64.to_be_bytes();
+        let rows = vec![vec![Some(uuid_bytes.as_slice()), Some(qty.as_slice())]];
+        let binary_bytes = pgbinary_patchset(&db, "orders", &["id", "quantity"], &rows).unwrap();
+
+        // CDC path: the same uuid as pgoutput text.
+        let ev = PgChangeEvent {
+            event_type: EventType::Insert {
+                schema: "public".into(),
+                table: "orders".into(),
+                relation_oid: 1,
+                data: RowData::from_pairs(vec![
+                    ("id", ColumnValue::text(uuid_str)),
+                    ("quantity", ColumnValue::text("7")),
+                ]),
+            },
+            lsn: Lsn::new(1),
+            metadata: None,
+        };
+        let cdc_bytes = pgoutput_patchset(&db, core::slice::from_ref(&ev)).unwrap();
+
+        assert_eq!(
+            only_insert_values(&binary_bytes),
+            only_insert_values(&cdc_bytes),
+        );
+        assert_eq!(
+            only_insert_values(&binary_bytes)[0],
+            WireValue::Blob(uuid_bytes.to_vec())
+        );
+    }
+
+    #[test]
+    fn pgbinary_null_cell_emits_null() {
+        let db = orders_uuid_db();
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let rows = vec![vec![Some(uuid_bytes.as_slice()), None]];
+        let bytes = pgbinary_patchset(&db, "orders", &["id", "quantity"], &rows).unwrap();
+        assert_eq!(
+            only_insert_values(&bytes),
+            vec![WireValue::Blob(uuid_bytes.to_vec()), WireValue::Null]
+        );
+    }
+
+    #[test]
+    fn pgbinary_absent_column_stored_as_null() {
+        let db = orders_uuid_db();
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        // The result projects only `id`; `quantity` is absent, so the
+        // catalog stores it as NULL.
+        let rows = vec![vec![Some(uuid_bytes.as_slice())]];
+        let bytes = pgbinary_patchset(&db, "orders", &["id"], &rows).unwrap();
+        assert_eq!(
+            only_insert_values(&bytes),
+            vec![WireValue::Blob(uuid_bytes.to_vec()), WireValue::Null]
+        );
+    }
+
+    #[test]
+    fn pgbinary_row_width_mismatch_is_missing_columns() {
+        let db = orders_uuid_db();
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        // Two column names but a one-cell row.
+        let rows = vec![vec![Some(uuid_bytes.as_slice())]];
+        let err = pgbinary_patchset(&db, "orders", &["id", "quantity"], &rows).unwrap_err();
+        assert!(matches!(err, ConversionError::MissingColumns));
+    }
+
+    #[test]
+    fn pgbinary_unknown_table_is_an_error() {
+        let db = orders_uuid_db();
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let rows = vec![vec![Some(uuid_bytes.as_slice())]];
+        let err = pgbinary_patchset(&db, "absent", &["id"], &rows).unwrap_err();
+        assert!(matches!(err, ConversionError::TableNotFound(name) if name == "absent"));
     }
 }

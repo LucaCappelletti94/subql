@@ -17,7 +17,7 @@ use sql_traits::prelude::DatabaseLike;
 use sqlite_diff_rs::wal2json::{Action, ChangeV1, Column, MessageV2};
 
 use super::pg_type::json_value_to_pg_value_by_kind;
-use super::{resolve_table, WalParseError};
+use super::{changed_columns_by_name, resolve_table, WalParseError};
 use crate::backend::{CdcEvent, Postgres, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
@@ -185,8 +185,8 @@ impl CdcEvent for MessageV2 {
         if new_cols.len() != arity || old_cols.len() != arity {
             return Vec::new();
         }
-        changed_by_name(db, table_id, arity, |name| {
-            (column_value(new_cols, name), column_value(old_cols, name))
+        changed_columns_by_name(db, table_id, arity, |name| {
+            (column_value(old_cols, name), column_value(new_cols, name))
         })
     }
 
@@ -290,10 +290,10 @@ impl CdcEvent for ChangeV1 {
         if self.columnnames.len() != arity || oldkeys.keynames.len() != arity {
             return Vec::new();
         }
-        changed_by_name(db, table_id, arity, |name| {
+        changed_columns_by_name(db, table_id, arity, |name| {
             (
-                v1_value(&self.columnnames, &self.columnvalues, name),
                 v1_value(&oldkeys.keynames, &oldkeys.keyvalues, name),
+                v1_value(&self.columnnames, &self.columnvalues, name),
             )
         })
     }
@@ -318,31 +318,6 @@ impl CdcEvent for ChangeV1 {
         };
         decode_cell(v1_value(names, values, &name), db, table_id, col)
     }
-}
-
-/// Derive changed columns by comparing the new and old JSON value for each
-/// catalog column, listing those that differ. `lookup` returns the
-/// `(new, old)` value pair for a column name.
-fn changed_by_name<'a, DB, F>(db: &DB, table_id: TableId, arity: usize, lookup: F) -> Vec<ColumnId>
-where
-    DB: DatabaseLike,
-    F: Fn(&str) -> (Option<&'a serde_json::Value>, Option<&'a serde_json::Value>),
-{
-    let mut changed = Vec::new();
-    for idx in 0..arity {
-        let Ok(col) = ColumnId::try_from(idx) else {
-            break;
-        };
-        let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
-            continue;
-        };
-        if let (Some(new_v), Some(old_v)) = lookup(&name) {
-            if new_v != old_v {
-                changed.push(col);
-            }
-        }
-    }
-    changed
 }
 
 #[cfg(test)]

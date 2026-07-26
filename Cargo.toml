@@ -357,7 +357,7 @@ diesel-async = { version = "0.7", optional = true, default-features = false }
 # alloc` posture, no C deps (the `wal2json` and `maxwell` features pull only
 # serde). `default-features = false` drops the `diesel` and `pg-walstream`
 # reverse adapters, which the feature gates below opt into when needed.
-sqlite-diff-rs = { version = "0.8.0", default-features = false, features = ["wal2json", "maxwell"] }
+sqlite-diff-rs = { version = "0.9.0", default-features = false, features = ["wal2json", "maxwell"] }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables

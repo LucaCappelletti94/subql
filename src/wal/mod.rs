@@ -29,7 +29,7 @@ pub use streaming::CdcSource;
 pub use wal2json::{parse_wal2json_v1, parse_wal2json_v2};
 
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
-use crate::{Checkpoint, TableId};
+use crate::{catalog_helpers, Checkpoint, ColumnId, TableId};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
@@ -177,6 +177,43 @@ pub(crate) fn resolve_table<DB: DatabaseLike>(
             table: table.to_string(),
         },
     })
+}
+
+/// Derive the changed columns of an UPDATE by comparing the old and new
+/// image value of each catalog column, in ordinal order.
+///
+/// `lookup(name)` returns the `(old, new)` value pair for a column name.
+/// A column present in both images whose values differ is reported; a
+/// column absent from either image is skipped. The comparison is by value,
+/// so it serves any `PartialEq` cell type (wal2json's `serde_json::Value`,
+/// pgoutput's `ColumnValue`). Callers gate the REPLICA IDENTITY FULL
+/// precondition (both images cover every column) before calling.
+pub(crate) fn changed_columns_by_name<DB, V, F>(
+    db: &DB,
+    table_id: TableId,
+    arity: usize,
+    lookup: F,
+) -> Vec<ColumnId>
+where
+    DB: DatabaseLike,
+    V: PartialEq,
+    F: Fn(&str) -> (Option<V>, Option<V>),
+{
+    let mut changed = Vec::new();
+    for idx in 0..arity {
+        let Ok(col) = ColumnId::try_from(idx) else {
+            break;
+        };
+        let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
+            continue;
+        };
+        if let (Some(old), Some(new)) = lookup(&name) {
+            if old != new {
+                changed.push(col);
+            }
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
