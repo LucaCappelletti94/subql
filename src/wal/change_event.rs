@@ -152,21 +152,9 @@ impl CdcEvent for ChangeEvent {
         if old.len() != arity || new_data.len() != arity {
             return Vec::new();
         }
-        let mut changed = Vec::new();
-        for idx in 0..arity {
-            let Ok(col) = ColumnId::try_from(idx) else {
-                break;
-            };
-            let Some(name) = catalog_helpers::column_name(db, table_id, col) else {
-                continue;
-            };
-            if let (Some(old_val), Some(new_val)) = (old.get(&name), new_data.get(&name)) {
-                if old_val != new_val {
-                    changed.push(col);
-                }
-            }
-        }
-        changed
+        super::changed_columns_by_name(db, table_id, arity, |name| {
+            (old.get(name), new_data.get(name))
+        })
     }
 
     fn value_at<DB: DatabaseLike>(

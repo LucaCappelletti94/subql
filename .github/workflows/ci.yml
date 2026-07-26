@@ -211,7 +211,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      - run: cargo llvm-cov --workspace --exclude subql-demo --all-features --locked --codecov --output-path codecov.json
+      - run: cargo llvm-cov --workspace --exclude subql-demo --all-features --release --locked --codecov --output-path codecov.json
       - uses: codecov/codecov-action@v5
         with:
           files: codecov.json
