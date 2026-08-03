@@ -63,8 +63,14 @@ const PROTOCOL_VERSION: u8 = 1;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct PgSqliteEmuSource {
-    connection: SqliteConnection,
+    // `session` MUST stay declared above `connection`. A `Session` holds a
+    // raw pointer into the connection's `sqlite3` handle, and its drop calls
+    // `sqlite3session_delete`, which locks that handle. Fields drop in
+    // declaration order, so a `connection` declared first would close and
+    // free the handle before the session reads it, which is a use after free
+    // that intermittently deadlocks on the freed mutex.
     session: Session,
+    connection: SqliteConnection,
     pg_catalog: ParserDB,
     decoder: PgOutputDecoder,
     pending: VecDeque<ChangeEvent>,
