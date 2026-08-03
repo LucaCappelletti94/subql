@@ -45,8 +45,11 @@ pub enum SqliteCdcError {
 /// Live SQLite CDC source. See the [module docs](super) for the lifecycle
 /// contract.
 pub struct SqliteCdcSource<DB: DatabaseLike> {
-    connection: SqliteConnection,
+    // `session` MUST stay declared above `connection`, for the reason spelled
+    // out on `PgSqliteEmuSource`: fields drop in declaration order, and the
+    // session's drop reads the connection's `sqlite3` handle.
     session: Session,
+    connection: SqliteConnection,
     catalog: DB,
     /// Events buffered from the last changeset drain. Consumed FIFO by
     /// [`Self::poll_next_event`]. When empty and the session has
