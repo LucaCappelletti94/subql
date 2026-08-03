@@ -77,6 +77,7 @@ pub mod reexec;
 pub mod row_set;
 pub mod runtime;
 pub mod sqlite_cdc;
+pub mod visibility;
 pub mod wal;
 
 // Diesel-typed subscription and follow API. Only compiles when the
