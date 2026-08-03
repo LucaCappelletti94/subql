@@ -32,6 +32,11 @@ fuzz/hfuzz_target/
 # locally so proptest can replay between runs but ignored by git.
 **/*.proptest-regressions
 
+# Raw LLVM counter dumps written by `cargo llvm-cov`. A single local
+# coverage run drops a couple of thousand of these in the working tree,
+# and none of them is worth tracking.
+**/*.profraw
+
 # Added by cargo
 
 /target
