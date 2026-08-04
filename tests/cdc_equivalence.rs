@@ -264,8 +264,6 @@ fn push_and_poll_observe_identical_event_streams() {
     });
 
     for slot in [push_slot, poll_slot] {
-        sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-            .execute(&mut setup)
-            .expect("drop slot");
+        common::drop_slot(&mut setup, slot);
     }
 }

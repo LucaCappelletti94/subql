@@ -174,7 +174,9 @@ fn apply_patchset_uuid_roundtrip_blob_and_text_clients() {
         DieselError::QueryBuilderError(inner) => {
             let msg = inner.to_string();
             assert!(
-                msg.contains("id") && msg.contains("UUID") && msg.contains("INTEGER"),
+                msg.contains("id")
+                    && msg.contains("16-byte BLOB or hyphenated TEXT")
+                    && msg.contains("INTEGER"),
                 "error message must name the column, expected shape, and observed shape; got: {msg}",
             );
         }

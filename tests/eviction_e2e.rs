@@ -130,9 +130,7 @@ fn evict_oldest_drops_subscription_from_dispatch_path() {
     );
 
     let _ = s_keep;
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// `EvictLeastActive` end-to-end: real WAL events stamp activity through
@@ -232,9 +230,7 @@ fn evict_least_active_uses_real_wal_dispatch_timestamps() {
     );
 
     let _ = s_b;
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// `register_batch` with `EvictOldest` end-to-end: a batch that exceeds the
@@ -334,9 +330,7 @@ fn register_batch_cap_eviction_round_trips_through_wal() {
         "consumer 4 survived and should match id=4, got hits {hits:?}"
     );
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// `EvictionPolicy::Reject` end-to-end: the over-cap registration fails
@@ -393,7 +387,5 @@ fn reject_keeps_existing_subscriptions_intact() {
         "the first subscriber must still receive matches"
     );
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }

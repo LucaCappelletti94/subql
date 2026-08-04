@@ -408,8 +408,6 @@ fn polling_vs_push_latency_comparison() {
         "bench_poll_100",
         "bench_poll_1000",
     ] {
-        sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-            .execute(&mut setup)
-            .expect("drop slot");
+        common::drop_slot(&mut setup, slot);
     }
 }
