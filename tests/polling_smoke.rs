@@ -90,7 +90,5 @@ fn polling_source_drains_insert_and_updates_counters() {
         );
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }

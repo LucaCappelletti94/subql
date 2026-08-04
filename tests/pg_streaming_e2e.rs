@@ -66,9 +66,7 @@ fn connect_against_real_pg() {
             .expect("connect succeeds against live PG with valid slot");
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// Query the slot's `confirmed_flush_lsn` via a side connection and
@@ -155,9 +153,7 @@ fn next_event_delivers_insert_within_latency_budget() {
         );
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// Explicit `ack(upto)` advances the slot's
@@ -251,9 +247,7 @@ fn ack_advances_confirmed_flush_lsn() {
         );
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// The periodic status-update pump bumps the observability
@@ -305,9 +299,7 @@ fn pump_increments_status_update_counter_during_idle() {
         println!("status_updates_sent after 500ms idle: {observed}");
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// Idle through an impatient server's `wal_sender_timeout`
@@ -375,9 +367,7 @@ fn connection_survives_wal_sender_timeout() {
         );
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// Bounded back-pressure. With `buffer_capacity = 4` and 100
@@ -464,9 +454,7 @@ fn back_pressure_under_slow_consumer_preserves_order_and_count() {
         println!("back-pressure: drained {N} events through a 4-slot buffer in commit order");
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// Dropping the source cleanly shuts down the inner task.
@@ -535,9 +523,7 @@ fn drop_source_shuts_down_inner_task() {
         println!("inner task exited cleanly after source drop");
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }
 
 /// `events_received` counter is incremented as the inner task
@@ -601,7 +587,5 @@ fn events_received_counter_tracks_pushed_events() {
         println!("events_received after {N} inserts: {observed}");
     });
 
-    sql_query(format!("SELECT pg_drop_replication_slot('{slot}')"))
-        .execute(&mut setup)
-        .expect("drop slot");
+    common::drop_slot(&mut setup, slot);
 }

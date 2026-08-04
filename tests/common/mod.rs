@@ -178,6 +178,33 @@ pub fn create_slot(conn: &mut PgConnection, name: &str) {
     .expect("create logical replication slot");
 }
 
+/// Drop a replication slot, waiting out a walsender that still holds it.
+///
+/// A streaming source releases its slot when its replication connection
+/// closes, and the server notices that shortly after the client task ends, so
+/// an immediate drop races the release and fails with `is active for PID`.
+/// Raw SQL because `pg_drop_replication_slot` is a Postgres administrative
+/// function with no typed diesel representation.
+pub fn drop_slot(conn: &mut PgConnection, name: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match diesel::sql_query("SELECT pg_drop_replication_slot($1)")
+            .bind::<diesel::sql_types::Text, _>(name)
+            .execute(conn)
+        {
+            Ok(_) => return,
+            Err(err) => {
+                let racing_walsender = err.to_string().contains("is active");
+                assert!(
+                    racing_walsender && std::time::Instant::now() < deadline,
+                    "drop replication slot {name}: {err}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 /// Drain every queued WAL change from the named slot as wal2json v2 JSON
 /// strings. Returns `Vec<String>` in commit order. Empty if there is nothing
 /// pending. The format options match what subql's `parse_wal2json_v2` expects:
