@@ -526,15 +526,17 @@ fn cross_db_cdc_parity() {
 
     // Expected matched consumer IDs per event.
     //
-    // UPDATE optimization: only predicates depending on changed columns are
-    // re-evaluated, so the UPDATE below (only temperature changed) only
-    // matches consumer 1 (temperature > 30), not consumer 2 (location) or consumer 4
-    // (sensor_id) even though the row still matches their predicates.
+    // Every subscription here is `SELECT *`, so an UPDATE that leaves a
+    // subscription's predicate satisfied still changes the row image it holds.
+    // The UPDATE below raises `temperature` on the row consumers 1, 2 and 4
+    // match, so all three hear about it, exactly as they did for the INSERT of
+    // that row. Consumer 3 wants `humidity < 40` and the row carries 45, so it
+    // matches neither image and hears nothing.
     let expected: Vec<BTreeSet<u64>> = vec![
         BTreeSet::from([1, 2, 4]), // INSERT (1, 35, 45, 'warehouse-A'): temp>30, loc match, sensor match
         BTreeSet::from([3]),       // INSERT (2, 28, 35, 'warehouse-B'): hum<40 AND temp>25
-        BTreeSet::from([1]), // UPDATE sensor_id=1 temp=40: only temp changed -> only temp>30 re-evaluated
-        BTreeSet::from([3]), // DELETE sensor_id=2: old row matches hum<40 AND temp>25
+        BTreeSet::from([1, 2, 4]), // UPDATE sensor_id=1 temp=40: still in all three views
+        BTreeSet::from([3]),       // DELETE sensor_id=2: old row matches hum<40 AND temp>25
     ];
 
     // Assert parity between PG and Maxwell results
