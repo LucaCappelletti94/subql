@@ -40,15 +40,11 @@ const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, statu
 const STATUSES: &[&str] = &["paid", "open", "closed", "pending"];
 
 /// A registered query plus a Rust closure that evaluates the same
-/// predicate. `deps` lists the column ordinals the predicate reads;
-/// the engine's UPDATE dispatch skips re-evaluation of predicates
-/// whose dependency columns did not change, so the oracle mirrors
-/// the same rule to stay consistent.
+/// predicate.
 #[derive(Clone, Copy)]
 struct Subscription {
     consumer_id: u64,
     sql: &'static str,
-    deps: &'static [u16],
     matches: fn(&Row) -> bool,
 }
 
@@ -57,42 +53,24 @@ fn subscriptions() -> Vec<Subscription> {
         Subscription {
             consumer_id: 1,
             sql: "SELECT * FROM orders WHERE amount > 100",
-            deps: &[1],
             matches: |row| row.amount > 100,
         },
         Subscription {
             consumer_id: 2,
             sql: "SELECT * FROM orders WHERE status = 'paid'",
-            deps: &[2],
             matches: |row| row.status == "paid",
         },
         Subscription {
             consumer_id: 3,
             sql: "SELECT * FROM orders WHERE amount < 50",
-            deps: &[1],
             matches: |row| row.amount < 50,
         },
         Subscription {
             consumer_id: 4,
             sql: "SELECT * FROM orders WHERE id = 5",
-            deps: &[0],
             matches: |row| row.id == 5,
         },
     ]
-}
-
-fn diff_columns(old: &Row, new: &Row) -> Vec<u16> {
-    let mut changed = Vec::new();
-    if old.id != new.id {
-        changed.push(0);
-    }
-    if old.amount != new.amount {
-        changed.push(1);
-    }
-    if old.status != new.status {
-        changed.push(2);
-    }
-    changed
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,16 +110,12 @@ struct Expected {
 ///
 /// * matched-new-only -> `inserted`
 /// * matched-old-only -> `deleted`
-/// * matched-both AND at least one dep column changed -> `updated`
+/// * matched-both -> `updated`
 ///
-/// For a no-op UPDATE (no columns actually differ), every matching
-/// subscription still lands in `updated`, matching subql's fallback
-/// to the index-driven candidate set when `changed_columns` is empty.
+/// Which columns the UPDATE touched does not enter into it. Every
+/// subscription here delivers whole rows, so its consumer holds a stale
+/// copy after any change at all.
 fn oracle(subs: &[Subscription], old_row: Option<&Row>, new_row: Option<&Row>) -> Expected {
-    let changed = match (old_row, new_row) {
-        (Some(old), Some(new)) => diff_columns(old, new),
-        _ => Vec::new(),
-    };
     let mut inserted = Vec::new();
     let mut deleted = Vec::new();
     let mut updated = Vec::new();
@@ -151,12 +125,7 @@ fn oracle(subs: &[Subscription], old_row: Option<&Row>, new_row: Option<&Row>) -
         match (matched_old, matched_new) {
             (false, true) => inserted.push(sub.consumer_id),
             (true, false) => deleted.push(sub.consumer_id),
-            (true, true) => {
-                let dep_changed = sub.deps.iter().any(|d| changed.contains(d));
-                if changed.is_empty() || dep_changed {
-                    updated.push(sub.consumer_id);
-                }
-            }
+            (true, true) => updated.push(sub.consumer_id),
             (false, false) => {}
         }
     }

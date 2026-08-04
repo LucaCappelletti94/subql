@@ -264,12 +264,13 @@ proptest! {
         }
     }
 
-    /// Update events with changed_columns behave correctly:
-    /// - Consumers whose predicates depend ONLY on unchanged columns are NOT notified.
-    /// - Consumers whose predicates depend on at least one changed column are evaluated
-    ///   against the new row (matching if the new row satisfies the predicate).
+    /// UPDATE dispatch splits consumers by the verdict on both row images:
+    /// matching only afterwards is a view entry, only beforehand an exit, and
+    /// matching both an update. A `SELECT *` subscription holds every column,
+    /// so it hears about the change whichever column moved, including one its
+    /// WHERE clause never reads.
     #[test]
-    fn update_with_changed_columns_matches_ground_truth(
+    fn update_matches_both_row_images(
         predicates in proptest::collection::vec(predicate_strategy(), 1..15),
         rows in proptest::collection::vec(row_strategy(), 1..8),
     ) {
@@ -290,34 +291,53 @@ proptest! {
         }
 
         // Update events where only `amount` (col 1) changed.
+        let old_amount = Value::Int(0);
         for (id_cell, amount_cell, status_cell) in &rows {
             let event = update_event(
                 tid,
                 id_cell,
-                Value::Int(0),
+                old_amount.clone(),
                 amount_cell,
                 status_cell,
                 [1u16],
             );
 
             let notifs = engine.consumers(&event).unwrap();
-            let all_notified: HashSet<u64> = notifs
-                .inserted()
-                .iter()
-                .chain(notifs.updated().iter())
-                .chain(notifs.deleted().iter())
-                .copied()
-                .collect();
 
+            let mut expected_inserted: HashSet<u64> = HashSet::new();
+            let mut expected_deleted: HashSet<u64> = HashSet::new();
+            let mut expected_updated: HashSet<u64> = HashSet::new();
             for (&consumer_id, pred) in &consumer_predicates {
-                if let TestPredicate::StatusEq(_) = pred {
-                    prop_assert!(
-                        !all_notified.contains(&consumer_id),
-                        "StatusEq predicate should not fire when only amount changed: consumer {}",
-                        consumer_id
-                    );
-                }
+                let before = pred.eval(id_cell, &old_amount, status_cell) == Some(true);
+                let after = pred.eval(id_cell, amount_cell, status_cell) == Some(true);
+                let target = match (before, after) {
+                    (false, true) => &mut expected_inserted,
+                    (true, false) => &mut expected_deleted,
+                    (true, true) => &mut expected_updated,
+                    (false, false) => continue,
+                };
+                target.insert(consumer_id);
             }
+
+            let notified = |ids: &[u64]| -> HashSet<u64> { ids.iter().copied().collect() };
+            prop_assert_eq!(
+                notified(notifs.inserted()),
+                expected_inserted,
+                "view entry mismatch for {:?}",
+                event
+            );
+            prop_assert_eq!(
+                notified(notifs.deleted()),
+                expected_deleted,
+                "view exit mismatch for {:?}",
+                event
+            );
+            prop_assert_eq!(
+                notified(notifs.updated()),
+                expected_updated,
+                "in-view update mismatch for {:?}",
+                event
+            );
         }
     }
 

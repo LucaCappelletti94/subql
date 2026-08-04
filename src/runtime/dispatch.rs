@@ -215,7 +215,8 @@ fn resolve_ordinals<I: IdTypes>(
 /// * `Truncate` -> all row subscribers to `deleted`.
 ///
 /// `arity` is the target table's column count, used to bound index
-/// candidate selection.
+/// candidate selection on INSERT and DELETE. An UPDATE selects without
+/// probing, see [`TablePartition::select_update_candidates`].
 pub fn dispatch_consumers<I, E, DB>(
     event: &E,
     partition: &TablePartition<I, E::Backend>,
@@ -292,15 +293,9 @@ where
                 Vec::new(),
             )
         }
-        EventKind::Update => dispatch_update_with_stamps(
-            event,
-            partition,
-            consumer_dict,
-            vm,
-            arity,
-            db,
-            &mut stamps,
-        )?,
+        EventKind::Update => {
+            dispatch_update_with_stamps(event, partition, consumer_dict, vm, db, &mut stamps)?
+        }
     };
     Ok((notifs.with_checkpoint(checkpoint), stamps))
 }
@@ -335,7 +330,6 @@ fn dispatch_update_with_stamps<I, E, DB>(
     partition: &TablePartition<I, E::Backend>,
     consumer_dict: &ConsumerDictionary<I>,
     vm: &mut Vm<E::Backend>,
-    arity: usize,
     db: &DB,
     stamps: &mut Vec<SubscriptionId>,
 ) -> Result<ConsumerNotifications<I, E::Checkpoint>, DispatchError>
@@ -344,12 +338,7 @@ where
     E: CdcEvent,
     DB: DatabaseLike,
 {
-    let candidates = partition.select_candidates(
-        arity,
-        |col| probe_column_for_index(event, RowKind::New, col, arity, db),
-        EventKind::Update,
-        &event.changed_columns(db),
-    );
+    let candidates = partition.select_update_candidates();
     let snapshot = partition.load_snapshot();
 
     let mut inserted_ordinals = RoaringBitmap::new();
@@ -423,12 +412,9 @@ where
     E: CdcEvent,
     DB: DatabaseLike,
 {
-    let candidates = partition.select_candidates(
-        arity,
-        |col| probe_column_for_index(event, row, col, arity, db),
-        event.kind(),
-        &event.changed_columns(db),
-    );
+    let candidates = partition.select_candidates(arity, |col| {
+        probe_column_for_index(event, row, col, arity, db)
+    });
     let snapshot = partition.load_snapshot();
     let mut matching_ordinals = RoaringBitmap::new();
 

@@ -153,13 +153,13 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         atoms: Vec<IndexableAtom>,
     ) -> PredicateId {
         let deps = predicate.dependency_columns.to_vec();
-        let is_agg = matches!(predicate.projection, QueryProjection::Aggregate(_));
+        let projection = predicate.projection.clone();
 
         // COW: clone-on-write if snapshot still shares this Arc
         let pred_id = Arc::make_mut(&mut self.mutable_predicates).add_predicate(predicate);
 
         // Incrementally update indexes
-        self.rebuild_indexes(&atoms, pred_id, &deps, is_agg);
+        self.rebuild_indexes(&atoms, pred_id, &deps, &projection);
 
         pred_id
     }
@@ -246,11 +246,11 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         atoms: &[IndexableAtom],
         pred_id: PredicateId,
         deps: &[ColumnId],
-        is_agg: bool,
+        projection: &QueryProjection,
     ) {
         let current = self.load_snapshot();
         let mut new_indexes = current.indexes.clone();
-        new_indexes.add_predicate(pred_id, atoms, deps, is_agg);
+        new_indexes.add_predicate(pred_id, atoms, deps, projection);
         self.store_snapshot_with_indexes(new_indexes);
     }
 
@@ -259,19 +259,19 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         let mut new_indexes = HybridIndexes::new();
 
         for (idx, pred) in &self.mutable_predicates.predicates {
-            let is_agg = matches!(pred.projection, QueryProjection::Aggregate(_));
             new_indexes.add_predicate(
                 PredicateId::from_slab_index(idx),
                 &pred.index_atoms,
                 &pred.dependency_columns,
-                is_agg,
+                &pred.projection,
             );
         }
 
         self.store_snapshot_with_indexes(new_indexes);
     }
 
-    /// Select candidate predicates for a row.
+    /// Select candidate predicates for one row image, as INSERT and DELETE
+    /// dispatch do.
     ///
     /// The `read_col` closure yields the current column value as an
     /// [`IndexableCell`] (or `None` for `Null` / `Missing`), together
@@ -283,30 +283,18 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
     ///
     /// Guaranteed no false negatives: every predicate that could match
     /// the row is in the returned bitmap.
+    ///
+    /// An UPDATE is dispatched against two row images, so probing one of them
+    /// cannot select its candidates: a predicate the new image fails may be one
+    /// the old image matched. Use
+    /// [`select_update_candidates`](Self::select_update_candidates).
     #[must_use]
     pub fn select_candidates(
         &self,
         arity: usize,
         mut read_col: impl FnMut(ColumnId) -> ColumnProbe,
-        kind: EventKind,
-        changed_cols: &[ColumnId],
     ) -> RoaringBitmap {
         let snapshot = self.load_snapshot();
-
-        // For Update events with a non-empty changed_cols list, return
-        // exactly the set of predicates that depend on at least one
-        // changed column. The index reflects the *new* row values only:
-        // a predicate may have matched the *old* value (e.g. IS NULL
-        // when a column transitions NULL -> non-NULL) and still needs
-        // re-evaluation. Returning the full dependency set is always
-        // safe because the VM re-evaluates every candidate.
-        if kind == EventKind::Update && !changed_cols.is_empty() {
-            return HybridIndexes::select_update_deps(
-                &snapshot.indexes.dependency_free,
-                &snapshot.indexes.dependency,
-                changed_cols,
-            );
-        }
 
         let mut candidates = RoaringBitmap::new();
 
@@ -382,9 +370,13 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         let store = Arc::make_mut(&mut self.mutable_predicates);
 
         for (predicate, atoms, bindings) in entries {
-            let is_agg = matches!(predicate.projection, QueryProjection::Aggregate(_));
             let pred_id = store.add_predicate(Predicate::clone(predicate));
-            new_indexes.add_predicate(pred_id, atoms, &predicate.dependency_columns, is_agg);
+            new_indexes.add_predicate(
+                pred_id,
+                atoms,
+                &predicate.dependency_columns,
+                &predicate.projection,
+            );
 
             for binding in bindings {
                 let mut b = *binding;
@@ -396,6 +388,15 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
 
         // Single atomic snapshot swap
         self.store_snapshot_with_indexes(new_indexes);
+    }
+
+    /// Select candidate row predicates for an UPDATE.
+    ///
+    /// Delegates to [`HybridIndexes::select_update_candidates`], which explains
+    /// why no row image and no changed-column list enter into it.
+    #[must_use]
+    pub fn select_update_candidates(&self) -> RoaringBitmap {
+        self.load_snapshot().indexes.select_update_candidates()
     }
 
     /// Select candidate agg predicates for an event.
@@ -449,6 +450,17 @@ mod tests {
         }
     }
 
+    /// `SUM(col)` over a WHERE clause reading `col`. Aggregates are the
+    /// projection whose candidate set the changed-column prune narrows: their
+    /// value moves only when a column they read moves.
+    fn make_agg_predicate_on_col(id: usize, hash: u128, col: ColumnId) -> Predicate<Postgres> {
+        use crate::compiler::sql_shape::{AggSpec, QueryProjection};
+        Predicate {
+            projection: QueryProjection::Aggregate(AggSpec::Sum { column: col }),
+            ..make_predicate_on_col(id, hash, col)
+        }
+    }
+
     fn make_row(cells: Vec<Value<Postgres>>) -> Vec<Value<Postgres>> {
         cells
     }
@@ -495,34 +507,9 @@ mod tests {
         partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
 
         let row = make_row(vec![Value::<Postgres>::Int(100)]);
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Insert, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
 
         // Should include fallback predicate
-        assert!(!candidates.is_empty());
-    }
-
-    #[test]
-    fn test_select_candidates_update_optimization() {
-        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
-
-        // Predicate depends on column 1
-        let pred = make_predicate(0, 0x1234);
-        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
-
-        let row = make_row(vec![
-            Value::<Postgres>::Int(100),
-            Value::<Postgres>::Int(200),
-        ]);
-
-        // UPDATE with no changed columns: should return empty (except fallback)
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Update, &[]);
-        assert!(!candidates.is_empty()); // Fallback is always included
-
-        // UPDATE with changed column 1: should include predicate
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Update, &[1]);
         assert!(!candidates.is_empty());
     }
 
@@ -602,8 +589,7 @@ mod tests {
 
         // Row with matching value
         let row = make_row(vec![Value::<Postgres>::Int(42)]);
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Insert, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
 
         // Should find predicate via equality index
         assert!(!candidates.is_empty());
@@ -635,8 +621,7 @@ mod tests {
 
         // Row with NULL and non-NULL values
         let row = make_row(vec![Value::<Postgres>::Null, Value::<Postgres>::Int(100)]);
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Insert, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
 
         // Should find both predicates via NULL check indexes
         assert!(!candidates.is_empty());
@@ -661,40 +646,8 @@ mod tests {
 
         // Indexes should still work after rebuild
         let row = make_row(vec![Value::<Postgres>::Int(42)]);
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Insert, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
         assert!(!candidates.is_empty());
-    }
-
-    #[test]
-    fn test_select_candidates_update_no_overlap() {
-        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
-
-        // Add predicate that depends on column 1
-        // (make_predicate already sets dependency_columns to [1u16])
-        let pred = make_predicate(0, 0x1234);
-        partition.add_predicate(
-            pred,
-            vec![IndexableAtom::Equality {
-                column_id: 1,
-                value: IndexableCell::Int(100),
-            }],
-        );
-
-        let row = make_row(vec![
-            Value::<Postgres>::Int(1),
-            Value::<Postgres>::Int(100),
-            Value::<Postgres>::Int(2),
-        ]);
-
-        // UPDATE with changed column 0 (predicate depends on column 1)
-        // No overlap, should skip early (except fallback)
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Update, &[0]);
-
-        // Might be empty or just fallback, depending on implementation
-        // The key is this hits the "no overlap" path (line 218)
-        let _ = candidates;
     }
 
     #[test]
@@ -721,20 +674,19 @@ mod tests {
             Value::<Postgres>::Int(2),
         ]);
 
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Insert, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
 
         // Should include the predicate because column 1 is NULL
         assert!(candidates.contains(pred_id.as_u32()));
     }
 
     #[test]
-    fn test_update_no_dependency_overlap_returns_empty_without_fallback() {
+    fn test_update_no_dependency_overlap_prunes_aggregate() {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
-        // Predicate depends on column 1 and is indexable (no fallback).
-        let pred = make_predicate(0, 0xAAAA);
-        partition.add_predicate(
+        // Aggregate reading column 1 only.
+        let pred = make_agg_predicate_on_col(0, 0xAAAA, 1);
+        let pred_id = partition.add_predicate(
             pred,
             vec![IndexableAtom::Equality {
                 column_id: 1,
@@ -742,71 +694,59 @@ mod tests {
             }],
         );
 
-        let row = make_row(vec![Value::<Postgres>::Int(1), Value::<Postgres>::Int(100)]);
-
-        // UPDATE changed column 0 only; no dependency overlap.
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Update, &[0]);
-        assert!(candidates.is_empty());
+        // UPDATE changed column 0 only, which the aggregate does not read, so
+        // its value cannot have moved.
+        let candidates = partition.select_agg_candidates(EventKind::Update, &[0]);
+        assert!(
+            !candidates.contains(pred_id.as_u32()),
+            "aggregate reading no changed column must be pruned on UPDATE"
+        );
     }
 
     #[test]
-    fn test_update_keeps_dependency_free_predicates() {
+    fn test_update_selects_predicate_reading_no_column() {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
-        // Dependency-free predicate should always survive UPDATE changed-column
-        // pruning.
+        // A predicate reading no column at all is still an UPDATE candidate.
         let mut pred = make_predicate(0, 0xD00D);
         pred.dependency_columns = Arc::from([]);
         pred.index_atoms = Arc::from([IndexableAtom::Fallback]);
         let pred_id = partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
 
-        let row = make_row(vec![Value::<Postgres>::Int(1), Value::<Postgres>::Int(100)]);
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Update, &[1]);
+        let candidates = partition.select_update_candidates();
         assert!(candidates.contains(pred_id.as_u32()));
     }
 
     #[test]
-    fn test_update_dependency_overlap_keeps_candidates() {
+    fn test_update_dependency_overlap_keeps_aggregate_candidates() {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
-        // Predicate that depends on changed column 0.
-        let mut pred_changed = make_predicate(0, 0xBBBB);
-        pred_changed.dependency_columns = Arc::from([0u16]);
-        let pred_changed_id = partition.add_predicate(
-            pred_changed,
+        let changed = make_agg_predicate_on_col(0, 0xBBBB, 0);
+        let changed_id = partition.add_predicate(
+            changed,
             vec![IndexableAtom::Equality {
                 column_id: 0,
                 value: IndexableCell::Int(1),
             }],
         );
 
-        // Predicate that depends on unchanged column 1.
-        let pred_unchanged = make_predicate(1, 0xCCCC);
-        let pred_unchanged_id = partition.add_predicate(
-            pred_unchanged,
+        let unchanged = make_agg_predicate_on_col(1, 0xCCCC, 1);
+        let unchanged_id = partition.add_predicate(
+            unchanged,
             vec![IndexableAtom::Equality {
                 column_id: 1,
                 value: IndexableCell::Int(100),
             }],
         );
 
-        let row = make_row(vec![Value::<Postgres>::Int(1), Value::<Postgres>::Int(100)]);
-
-        // UPDATE changed column 0 only; only pred_changed should be a candidate.
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Update, &[0]);
-        assert!(candidates.contains(pred_changed_id.as_u32()));
+        // UPDATE changed column 0 only.
+        let candidates = partition.select_agg_candidates(EventKind::Update, &[0]);
+        assert!(candidates.contains(changed_id.as_u32()));
         assert!(
-            !candidates.contains(pred_unchanged_id.as_u32()),
-            "predicates with no changed-column overlap must be excluded on UPDATE"
+            !candidates.contains(unchanged_id.as_u32()),
+            "aggregates with no changed-column overlap must be excluded on UPDATE"
         );
     }
-
-    // =========================================================================
-    // C2: Index x event kind matrix
-    // =========================================================================
 
     #[test]
     fn test_equality_index_on_insert_and_delete() {
@@ -824,8 +764,7 @@ mod tests {
 
         // INSERT row with matching value
         let row = make_row(vec![Value::<Postgres>::Int(42)]);
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Insert, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
         assert!(
             candidates.contains(pred_id.as_u32()),
             "equality index must include predicate on INSERT with matching value"
@@ -833,20 +772,15 @@ mod tests {
 
         // INSERT row with non-matching value
         let row_nomatch = make_row(vec![Value::<Postgres>::Int(99)]);
-        let candidates = partition.select_candidates(
-            row_nomatch.len(),
-            probe_from_row(&row_nomatch),
-            EventKind::Insert,
-            &[],
-        );
+        let candidates =
+            partition.select_candidates(row_nomatch.len(), probe_from_row(&row_nomatch));
         assert!(
             !candidates.contains(pred_id.as_u32()),
             "equality index must exclude predicate on INSERT with non-matching value"
         );
 
         // DELETE row with matching value
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Delete, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
         assert!(
             candidates.contains(pred_id.as_u32()),
             "equality index must include predicate on DELETE with matching value"
@@ -854,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_index_on_insert_update_delete() {
+    fn test_range_index_on_insert_and_delete() {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
         // Range predicate: col 0 > 10  (lower bound is inclusive 11)
@@ -870,8 +804,7 @@ mod tests {
 
         // INSERT row satisfying range
         let row = make_row(vec![Value::<Postgres>::Int(20)]);
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Insert, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
         assert!(
             candidates.contains(pred_id.as_u32()),
             "range index must include predicate on INSERT with value in range"
@@ -879,28 +812,14 @@ mod tests {
 
         // INSERT row outside range
         let row_out = make_row(vec![Value::<Postgres>::Int(5)]);
-        let candidates = partition.select_candidates(
-            row_out.len(),
-            probe_from_row(&row_out),
-            EventKind::Insert,
-            &[],
-        );
+        let candidates = partition.select_candidates(row_out.len(), probe_from_row(&row_out));
         assert!(
             !candidates.contains(pred_id.as_u32()),
             "range index must exclude predicate on INSERT with value outside range"
         );
 
-        // UPDATE with changed_columns containing col 0
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Update, &[0]);
-        assert!(
-            candidates.contains(pred_id.as_u32()),
-            "range index must include predicate on UPDATE when indexed column changed"
-        );
-
         // DELETE row in range
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Delete, &[]);
+        let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
         assert!(
             candidates.contains(pred_id.as_u32()),
             "range index must include predicate on DELETE with matching row"
@@ -908,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn test_null_index_on_insert_update_delete() {
+    fn test_null_index_on_insert_and_delete() {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
         // IS NULL predicate on col 0
@@ -923,12 +842,7 @@ mod tests {
 
         // INSERT with NULL value: should be candidate
         let row_null = make_row(vec![Value::<Postgres>::Null]);
-        let candidates = partition.select_candidates(
-            row_null.len(),
-            probe_from_row(&row_null),
-            EventKind::Insert,
-            &[],
-        );
+        let candidates = partition.select_candidates(row_null.len(), probe_from_row(&row_null));
         assert!(
             candidates.contains(pred_id.as_u32()),
             "null index must include predicate on INSERT with NULL value"
@@ -936,36 +850,15 @@ mod tests {
 
         // INSERT with non-NULL value: should not be candidate
         let row_non_null = make_row(vec![Value::<Postgres>::Int(5)]);
-        let candidates = partition.select_candidates(
-            row_non_null.len(),
-            probe_from_row(&row_non_null),
-            EventKind::Insert,
-            &[],
-        );
+        let candidates =
+            partition.select_candidates(row_non_null.len(), probe_from_row(&row_non_null));
         assert!(
             !candidates.contains(pred_id.as_u32()),
             "null index must exclude IS NULL predicate on INSERT with non-NULL value"
         );
 
-        // UPDATE with changed_columns containing col 0
-        let candidates = partition.select_candidates(
-            row_null.len(),
-            probe_from_row(&row_null),
-            EventKind::Update,
-            &[0],
-        );
-        assert!(
-            candidates.contains(pred_id.as_u32()),
-            "null index must include predicate on UPDATE when indexed column changed"
-        );
-
         // DELETE with NULL value
-        let candidates = partition.select_candidates(
-            row_null.len(),
-            probe_from_row(&row_null),
-            EventKind::Delete,
-            &[],
-        );
+        let candidates = partition.select_candidates(row_null.len(), probe_from_row(&row_null));
         assert!(
             candidates.contains(pred_id.as_u32()),
             "null index must include predicate on DELETE with NULL value"
@@ -973,89 +866,43 @@ mod tests {
     }
 
     // =========================================================================
-    // C3: NULL transition updates under changed_columns
+    // C3: UPDATE candidate set
     // =========================================================================
 
+    /// An UPDATE selects every row predicate, whatever its index atom. No row
+    /// image enters the selection: dispatch evaluates both of them, so a
+    /// predicate the new image fails may be the one the row left the view with,
+    /// and a full-row subscription observes every column anyway.
     #[test]
-    fn test_null_transition_null_to_value_with_changed_column() {
-        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
+    fn test_update_selects_every_row_predicate() {
+        let atoms = [
+            ("unindexable", IndexableAtom::Fallback),
+            (
+                "equality",
+                IndexableAtom::Equality {
+                    column_id: 1,
+                    value: IndexableCell::Int(100),
+                },
+            ),
+            (
+                "IS NULL",
+                IndexableAtom::Null {
+                    column_id: 1,
+                    kind: NullKind::IsNull,
+                },
+            ),
+        ];
 
-        // IS NULL predicate on col 0
-        let pred = make_predicate_on_col(0, 0xDDDD, 0);
-        let pred_id = partition.add_predicate(
-            pred,
-            vec![IndexableAtom::Null {
-                column_id: 0,
-                kind: NullKind::IsNull,
-            }],
-        );
+        for (label, atom) in atoms {
+            let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
+            let pred_id = partition.add_predicate(make_predicate(0, 0x0A11), vec![atom]);
 
-        // UPDATE: NULL to value, changed_columns = [0]
-        // New row has non-NULL value but changed_columns contains col 0,
-        // so predicate must still be a candidate (old row may have been NULL).
-        let new_row = make_row(vec![Value::<Postgres>::Int(10)]);
-        let candidates = partition.select_candidates(
-            new_row.len(),
-            probe_from_row(&new_row),
-            EventKind::Update,
-            &[0],
-        );
-        assert!(
-            candidates.contains(pred_id.as_u32()),
-            "IS NULL predicate must be a candidate on NULL-to-value update when col 0 in changed_columns"
-        );
-    }
-
-    #[test]
-    fn test_null_transition_value_to_null_with_changed_column() {
-        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
-
-        // IS NULL predicate on col 0
-        let pred = make_predicate_on_col(0, 0xEEEE, 0);
-        let pred_id = partition.add_predicate(
-            pred,
-            vec![IndexableAtom::Null {
-                column_id: 0,
-                kind: NullKind::IsNull,
-            }],
-        );
-
-        // UPDATE: value to NULL, changed_columns = [0]
-        // New row has NULL, so predicate must be a candidate.
-        let new_row = make_row(vec![Value::<Postgres>::Null]);
-        let candidates = partition.select_candidates(
-            new_row.len(),
-            probe_from_row(&new_row),
-            EventKind::Update,
-            &[0],
-        );
-        assert!(
-            candidates.contains(pred_id.as_u32()),
-            "IS NULL predicate must be a candidate on value-to-NULL update when col 0 in changed_columns"
-        );
-    }
-
-    #[test]
-    fn test_null_transition_not_in_changed_columns_prunes_candidate() {
-        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
-
-        // IS NULL predicate on col 1
-        let pred = make_predicate(0, 0xFFFF);
-        let pred_id = partition.add_predicate(
-            pred,
-            vec![IndexableAtom::Null {
-                column_id: 1,
-                kind: NullKind::IsNull,
-            }],
-        );
-
-        // UPDATE: changed_columns does NOT include col 1
-        let row = make_row(vec![Value::<Postgres>::Int(5), Value::<Postgres>::Null]);
-        let candidates =
-            partition.select_candidates(row.len(), probe_from_row(&row), EventKind::Update, &[0]); // changed col 0, not col 1
-        assert!(
-            !candidates.contains(pred_id.as_u32()),
-            "null-indexed predicate must be pruned when its column is not in changed_columns"
-        );
+            assert!(
+                partition
+                    .select_update_candidates()
+                    .contains(pred_id.as_u32()),
+                "row predicate must be an UPDATE candidate ({label})"
+            );
+        }
     }
 }
