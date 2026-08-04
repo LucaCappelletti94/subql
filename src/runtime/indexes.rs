@@ -5,10 +5,17 @@
 //! 2. Range: col -> predicates with col IN range
 //! 3. NULL: (col, kind) -> predicates checking IS NULL / IS NOT NULL
 //! 4. Fallback: unindexable predicates (LIKE, complex expressions)
-//! 5. Dependency: col -> predicates referencing col (for UPDATE optimization)
+//! 5. Dependency: col -> predicates referencing col
+//!
+//! Dependency answers whether a predicate's verdict can change, which prunes
+//! aggregate UPDATE candidates and rescues predicates reading a cell that
+//! failed to decode. A full-row subscription asks a second question the WHERE
+//! clause cannot answer, whether the row image it delivers changed, so its
+//! UPDATE candidates come from [`HybridIndexes::full_row`] instead.
 
 use super::ids::PredicateId;
 use crate::backend::{Backend, Value};
+use crate::compiler::sql_shape::QueryProjection;
 use crate::compiler::{BytecodeProgram, Instruction, PlannerAtom, PlannerValue};
 use crate::ColumnId;
 use alloc::sync::Arc;
@@ -167,11 +174,17 @@ pub struct HybridIndexes {
     /// Fallback: unindexable predicates
     pub fallback: RoaringBitmap,
 
-    /// Dependency: col -> `RoaringBitmap<PredicateId>` (for UPDATE optimization)
+    /// Dependency: col -> `RoaringBitmap<PredicateId>`. Consulted for a cell
+    /// that failed to decode, and for aggregate UPDATE pruning through the
+    /// parallel [`agg_dependency`](Self::agg_dependency).
     pub dependency: HashMap<ColumnId, RoaringBitmap>,
 
-    /// Predicates with no dependency columns (must always be considered for UPDATEs)
-    pub dependency_free: RoaringBitmap,
+    /// Row-projection predicates. Their subscriptions receive the whole row
+    /// image, so a change to any column is observable even when the WHERE
+    /// clause reads none of the changed columns. This is the whole UPDATE
+    /// candidate set, see
+    /// [`select_update_candidates`](Self::select_update_candidates).
+    pub full_row: RoaringBitmap,
 
     // -----------------------------------------------------------------------
     // Aggregate (COUNT/SUM/...) predicate indexes, parallel to row indexes.
@@ -198,41 +211,20 @@ impl HybridIndexes {
             null_checks: HashMap::new(),
             fallback: RoaringBitmap::new(),
             dependency: HashMap::new(),
-            dependency_free: RoaringBitmap::new(),
+            full_row: RoaringBitmap::new(),
             agg_fallback: RoaringBitmap::new(),
             agg_dependency: HashMap::new(),
             agg_dependency_free: RoaringBitmap::new(),
         }
     }
 
-    /// Add predicate to indexes based on indexable atoms.
-    ///
-    /// When `is_agg` is `true`, the predicate is routed into the parallel agg
-    /// bitmaps and does **not** appear in row-dispatch bitmaps.
-    /// Populate a dependency-free bitmap and per-column dependency map for a
-    /// single predicate. Shared by both the agg and non-agg paths of
-    /// [`add_predicate`](Self::add_predicate).
-    fn populate_dependency(
-        free: &mut RoaringBitmap,
-        dep_map: &mut HashMap<ColumnId, RoaringBitmap>,
-        pred_id_u32: u32,
-        deps: &[ColumnId],
-    ) {
-        if deps.is_empty() {
-            free.insert(pred_id_u32);
-        } else {
-            for &col_id in deps {
-                dep_map.entry(col_id).or_default().insert(pred_id_u32);
-            }
-        }
-    }
-
     /// Return the set of predicate IDs that depend on at least one of the
-    /// `changed_cols`, plus those that are dependency-free (unconditional).
+    /// `changed_cols`, plus those that read no column at all.
     ///
-    /// Used by both the non-agg UPDATE path in
-    /// [`TablePartition::select_candidates`](super::partition::TablePartition::select_candidates)
-    /// and [`select_agg_candidates`](Self::select_agg_candidates).
+    /// Prunes the UPDATE candidates of
+    /// [`select_agg_candidates`](Self::select_agg_candidates). Row predicates
+    /// are not pruned this way, see
+    /// [`select_update_candidates`](Self::select_update_candidates).
     #[must_use]
     pub fn select_update_deps(
         free: &RoaringBitmap,
@@ -248,37 +240,63 @@ impl HybridIndexes {
         candidates
     }
 
+    /// Candidate row predicates for an UPDATE.
+    ///
+    /// Every full-row predicate qualifies and no row image enters the choice.
+    /// Narrowing by changed columns strands a subscription filtering on none of
+    /// them with a stale row image, and probing the new image alone hides a row
+    /// that left the view. Neither narrowing is sound while `SELECT *` is the
+    /// only row projection subql delivers, since such a subscription observes
+    /// every column. A narrower row projection would earn a
+    /// [`select_update_deps`](Self::select_update_deps) term here.
+    #[must_use]
+    pub fn select_update_candidates(&self) -> RoaringBitmap {
+        self.full_row.clone()
+    }
+
+    /// Add a predicate to the indexes.
+    ///
+    /// `projection` decides the routing: an aggregate lands in the parallel
+    /// agg bitmaps and never appears in a row-dispatch bitmap, while any other
+    /// projection delivers full row images and joins
+    /// [`full_row`](Self::full_row).
     pub fn add_predicate(
         &mut self,
         pred_id: PredicateId,
         atoms: &[IndexableAtom],
         deps: &[ColumnId],
-        is_agg: bool,
+        projection: &QueryProjection,
     ) {
         let pred_id_u32 = pred_id.as_u32();
 
-        if is_agg {
-            // Aggregate predicates live in the parallel agg bitmaps.
-            Self::populate_dependency(
-                &mut self.agg_dependency_free,
-                &mut self.agg_dependency,
-                pred_id_u32,
-                deps,
-            );
+        if matches!(projection, QueryProjection::Aggregate(_)) {
+            // An aggregate's value moves only when a column it reads moves, so
+            // per-column dependencies prune its UPDATE candidates.
+            if deps.is_empty() {
+                self.agg_dependency_free.insert(pred_id_u32);
+            } else {
+                for &col_id in deps {
+                    self.agg_dependency
+                        .entry(col_id)
+                        .or_default()
+                        .insert(pred_id_u32);
+                }
+            }
             // All agg predicates go in agg_fallback so INSERT/DELETE picks them up.
             self.agg_fallback.insert(pred_id_u32);
             return;
         }
 
-        // Track dependencies (dependency-free predicates must always be
-        // evaluated for UPDATE events because they do not depend on changed
-        // column sets).
-        Self::populate_dependency(
-            &mut self.dependency_free,
-            &mut self.dependency,
-            pred_id_u32,
-            deps,
-        );
+        // Per-column entries serve the undecodable-cell path in
+        // `select_candidates`. Row UPDATE candidates come from `full_row`,
+        // since a full row image exposes every column.
+        for &col_id in deps {
+            self.dependency
+                .entry(col_id)
+                .or_default()
+                .insert(pred_id_u32);
+        }
+        self.full_row.insert(pred_id_u32);
 
         // If no atoms were provided by the planner, this predicate has no
         // trigger path and no unconditional scan requirement.
@@ -652,6 +670,10 @@ mod tests {
     use super::*;
     use crate::backend::{Postgres, Value};
 
+    /// Every predicate under test here is a row subscription. Aggregate
+    /// routing is covered in `partition`, where the candidate sets differ.
+    const ROWS: &QueryProjection = &QueryProjection::Rows;
+
     #[test]
     fn test_indexable_cell_from_value() {
         assert_eq!(
@@ -684,7 +706,7 @@ mod tests {
             value: IndexableCell::Int(42),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[5], false);
+        indexes.add_predicate(pred_id, &atoms, &[5], ROWS);
 
         let result = indexes.query_equality(5, &IndexableCell::Int(42));
         assert!(result.is_some());
@@ -706,7 +728,7 @@ mod tests {
                 value: IndexableCell::Int(42),
             }],
             &[5],
-            false,
+            ROWS,
         );
 
         let pred_b = PredicateId::from_slab_index(1);
@@ -717,7 +739,7 @@ mod tests {
                 value: IndexableCell::Int(42),
             }],
             &[6],
-            false,
+            ROWS,
         );
 
         let hit_col_5 = indexes.query_equality(5, &IndexableCell::Int(42)).unwrap();
@@ -745,7 +767,7 @@ mod tests {
             upper: Some(20),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3], false);
+        indexes.add_predicate(pred_id, &atoms, &[3], ROWS);
 
         // Value in range
         let result = indexes.query_range(3, &IndexableCell::Int(15));
@@ -766,7 +788,7 @@ mod tests {
             kind: NullKind::IsNull,
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[7], false);
+        indexes.add_predicate(pred_id, &atoms, &[7], ROWS);
 
         let bitmap = indexes.null_checks.get(&(7, NullKind::IsNull));
         assert!(bitmap.is_some());
@@ -780,7 +802,7 @@ mod tests {
         let pred_id = PredicateId::from_slab_index(0);
         let atoms = vec![IndexableAtom::Fallback];
 
-        indexes.add_predicate(pred_id, &atoms, &[], false);
+        indexes.add_predicate(pred_id, &atoms, &[], ROWS);
 
         assert!(indexes.fallback.contains(pred_id.as_u32()));
     }
@@ -792,7 +814,7 @@ mod tests {
         let pred_id = PredicateId::from_slab_index(0);
         let atoms = vec![IndexableAtom::Fallback];
 
-        indexes.add_predicate(pred_id, &atoms, &[1, 2, 5], false);
+        indexes.add_predicate(pred_id, &atoms, &[1, 2, 5], ROWS);
 
         assert!(indexes
             .dependency
@@ -812,13 +834,16 @@ mod tests {
     }
 
     #[test]
-    fn test_dependency_free_tracking() {
+    fn test_predicate_reading_no_column_gets_no_dependency_entry() {
         let mut indexes = HybridIndexes::new();
         let pred_id = PredicateId::from_slab_index(0);
-        indexes.add_predicate(pred_id, &[IndexableAtom::Fallback], &[], false);
+        indexes.add_predicate(pred_id, &[IndexableAtom::Fallback], &[], ROWS);
 
-        assert!(indexes.dependency_free.contains(pred_id.as_u32()));
         assert!(indexes.dependency.is_empty());
+        assert!(
+            indexes.full_row.contains(pred_id.as_u32()),
+            "a row predicate is an UPDATE candidate whether or not it reads a column"
+        );
     }
 
     #[test]
@@ -827,7 +852,7 @@ mod tests {
 
         let pred_id = PredicateId::from_slab_index(0);
 
-        indexes.add_predicate(pred_id, &[], &[], false);
+        indexes.add_predicate(pred_id, &[], &[], ROWS);
 
         assert!(!indexes.fallback.contains(pred_id.as_u32()));
     }
@@ -993,7 +1018,7 @@ mod tests {
             upper: Some(20),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3], false);
+        indexes.add_predicate(pred_id, &atoms, &[3], ROWS);
 
         // Query with float value (gets converted to int for range)
         let result = indexes.query_range(3, &IndexableCell::Float(15.5f64.to_bits()));
@@ -1011,7 +1036,7 @@ mod tests {
             upper: Some(20),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3], false);
+        indexes.add_predicate(pred_id, &atoms, &[3], ROWS);
 
         // Query with string value (doesn't match range, returns empty)
         let result = indexes.query_range(3, &IndexableCell::String("test".into()));
@@ -1029,7 +1054,7 @@ mod tests {
             upper: Some(20),
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3], false);
+        indexes.add_predicate(pred_id, &atoms, &[3], ROWS);
 
         // Value below upper bound
         let result = indexes.query_range(3, &IndexableCell::Int(10));
@@ -1051,7 +1076,7 @@ mod tests {
             upper: None, // Unbounded upper
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3], false);
+        indexes.add_predicate(pred_id, &atoms, &[3], ROWS);
 
         // Value above lower bound
         let result = indexes.query_range(3, &IndexableCell::Int(15));
@@ -1073,7 +1098,7 @@ mod tests {
             upper: None, // Fully unbounded
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[3], false);
+        indexes.add_predicate(pred_id, &atoms, &[3], ROWS);
 
         // Any value should match
         let result = indexes.query_range(3, &IndexableCell::Int(100));
@@ -1097,7 +1122,7 @@ mod tests {
                 value: IndexableCell::Bool(true),
             }],
             &[1],
-            false,
+            ROWS,
         );
 
         // Add equality for String
@@ -1109,7 +1134,7 @@ mod tests {
                 value: IndexableCell::String("test".into()),
             }],
             &[2],
-            false,
+            ROWS,
         );
 
         // Query bool
@@ -1131,7 +1156,7 @@ mod tests {
             kind: NullKind::IsNotNull,
         }];
 
-        indexes.add_predicate(pred_id, &atoms, &[5], false);
+        indexes.add_predicate(pred_id, &atoms, &[5], ROWS);
 
         let bitmap = indexes.null_checks.get(&(5, NullKind::IsNotNull));
         assert!(bitmap.is_some());
@@ -1324,7 +1349,7 @@ mod tests {
                 upper: Some(100),
             }],
             &[1],
-            false,
+            ROWS,
         );
 
         // Bounded lower (should come last)
@@ -1336,7 +1361,7 @@ mod tests {
                 upper: Some(200),
             }],
             &[1],
-            false,
+            ROWS,
         );
 
         // Another unbounded lower (None,None case)
@@ -1348,7 +1373,7 @@ mod tests {
                 upper: None,
             }],
             &[1],
-            false,
+            ROWS,
         );
 
         indexes.finalize_ranges();

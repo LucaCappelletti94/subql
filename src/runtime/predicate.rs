@@ -27,7 +27,9 @@ pub struct Predicate<B: Backend> {
     pub normalized_sql: Arc<str>,
     /// Compiled bytecode for VM evaluation.
     pub bytecode: Arc<BytecodeProgram<B>>,
-    /// Columns referenced by this predicate (for UPDATE optimization).
+    /// Columns the predicate reads, plus the aggregated column for a column
+    /// aggregate. Prunes aggregate UPDATE candidates, and selects row
+    /// predicates reading a cell that failed to decode.
     pub dependency_columns: Arc<[ColumnId]>,
     /// Precomputed indexable atoms for this predicate.
     pub index_atoms: Arc<[IndexableAtom]>,
