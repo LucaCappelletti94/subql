@@ -221,7 +221,7 @@ where
 ///
 /// Stops at the first non-key cell the row does carry, so a correctly
 /// configured table pays one read.
-fn is_key_only<R, E, DB>(row: &R, event: &E, db: &DB) -> bool
+pub(crate) fn is_key_only<R, E, DB>(row: &R, event: &E, db: &DB) -> bool
 where
     R: RowView,
     E: CdcEvent,
