@@ -29,6 +29,7 @@
 //! per relation instead of per row. What it cannot settle in advance is a
 //! cell that fails to decode, so that falls back to the delegate too.
 
+use alloc::borrow::Cow;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -49,31 +50,38 @@ use crate::TableId;
 // ---------------------------------------------------------------------------
 // Subject
 // ---------------------------------------------------------------------------
-
 /// The principal a watcher authenticates as.
 ///
 /// A record's subject side is a `type:key` string, so answering from the row
 /// is a set-membership test and needs the watcher spelled the same way.
 /// [`VisibilityPolicy::Watcher`] stays opaque to subql everywhere else.
+///
+/// # Why [`Cow`] and not `&str`
+///
+/// A consumer whose identity is a typed id rather than text has no rendered
+/// subject to lend. `&str` would force it to keep one on its own type, which
+/// is a design decision subql has no business making for it. Returning
+/// [`Cow`] leaves the choice where it belongs: a watcher that already holds
+/// the text lends it and pays nothing, and one that renders per call says so.
 pub trait Subject {
     /// `type:key`, exactly as a record spells it (`user:alice`).
-    fn subject(&self) -> &str;
+    fn subject(&self) -> Cow<'_, str>;
 }
 
 impl Subject for str {
-    fn subject(&self) -> &str {
-        self
+    fn subject(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self)
     }
 }
 
 impl Subject for String {
-    fn subject(&self) -> &str {
-        self
+    fn subject(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self)
     }
 }
 
 impl<T: Subject + ?Sized> Subject for &T {
-    fn subject(&self) -> &str {
+    fn subject(&self) -> Cow<'_, str> {
         (*self).subject()
     }
 }
@@ -84,7 +92,7 @@ impl<T: Subject + ?Sized> Subject for &T {
 /// lives here so that consumer implements [`Subject`] on its own type and
 /// needs no newtype.
 impl<T: Subject + ?Sized> Subject for Arc<T> {
-    fn subject(&self) -> &str {
+    fn subject(&self) -> Cow<'_, str> {
         (**self).subject()
     }
 }
@@ -392,7 +400,7 @@ where
         // locally answered event never suspends.
         let answered = self.granted(Action::Select, row).inspect(|granted| {
             for (watcher, verdict) in watchers.iter().zip(verdicts.iter_mut()) {
-                if granted.contains(watcher.subject()) {
+                if granted.contains(watcher.subject().as_ref()) {
                     *verdict = Verdict::Allow;
                 }
             }
@@ -415,7 +423,7 @@ where
         R: RowView<Backend = Self::Backend> + Sync + ?Sized,
     {
         let answered = self.granted(Action::of(op), row).map(|granted| {
-            if granted.contains(watcher.subject()) {
+            if granted.contains(watcher.subject().as_ref()) {
                 Verdict::Allow
             } else {
                 Verdict::Deny
@@ -433,6 +441,7 @@ where
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use alloc::borrow::Cow;
     use alloc::string::{String, ToString};
     use alloc::sync::Arc;
     use alloc::vec;
@@ -450,7 +459,7 @@ mod tests {
     use rls2fga::translator::TranslatorBuilder;
     use sqlparser::dialect::PostgreSqlDialect;
 
-    use super::{Action, RowPolicy};
+    use super::{Action, RowPolicy, Subject};
     use crate::backend::{Postgres, Value};
     use crate::testing::TestEvent;
     use crate::visibility::{EventRow, RowView, Verdict, VisibilityPolicy, WriteOp};
@@ -1144,6 +1153,70 @@ CREATE POLICY pd ON docs FOR DELETE USING (editor_id = current_user);
         let mut verdicts = vec![Verdict::Deny; 2];
 
         block_on(policy.may_see(&view, &["user:alice", "user:bob"], &mut verdicts)).unwrap();
+
+        assert_eq!(verdicts, [Verdict::Allow, Verdict::Deny]);
+        assert_eq!(policy.inner().0.load(Ordering::Relaxed), 0);
+    }
+
+    /// A watcher that holds no text at all is still answerable.
+    ///
+    /// This is the shape a real consumer has: an identity is a typed id, and
+    /// text belongs at the edges, so the subject is rendered rather than
+    /// stored. Returning `&str` would force every such consumer to keep a
+    /// rendered copy on its own type whether it wanted one or not.
+    #[test]
+    fn a_watcher_that_renders_its_subject_on_demand_is_answered() {
+        struct Typed(u64);
+
+        impl Subject for Typed {
+            fn subject(&self) -> Cow<'_, str> {
+                Cow::Owned(alloc::format!("user:{}", self.0))
+            }
+        }
+
+        #[derive(Default)]
+        struct Backend(AtomicUsize);
+
+        impl VisibilityPolicy for Backend {
+            type Watcher = Typed;
+            type Error = Unreachable;
+            type Backend = Postgres;
+
+            fn may_see<R>(
+                &self,
+                _row: &R,
+                _watchers: &[Typed],
+                _verdicts: &mut [Verdict],
+            ) -> impl Future<Output = Result<(), Unreachable>> + Send
+            where
+                R: RowView<Backend = Postgres> + Sync + ?Sized,
+            {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                async { Ok(()) }
+            }
+
+            fn may_write<R>(
+                &self,
+                _row: &R,
+                _watcher: &Typed,
+                _op: WriteOp,
+            ) -> impl Future<Output = Result<Verdict, Unreachable>> + Send
+            where
+                R: RowView<Backend = Postgres> + Sync + ?Sized,
+            {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                async { Ok(Verdict::Deny) }
+            }
+        }
+
+        let (db, relations) = translated(OWNERSHIP);
+        // The row grants the user whose rendered subject is `user:7`.
+        let event = insert(docs_id(&db), docs_row(text("7"), Value::Null));
+        let policy = RowPolicy::new(db, &relations, Backend::default());
+        let view = EventRow::current(&event, policy.catalog()).unwrap();
+        let mut verdicts = vec![Verdict::Deny; 2];
+
+        block_on(policy.may_see(&view, &[Typed(7), Typed(8)], &mut verdicts)).unwrap();
 
         assert_eq!(verdicts, [Verdict::Allow, Verdict::Deny]);
         assert_eq!(policy.inner().0.load(Ordering::Relaxed), 0);

@@ -4143,7 +4143,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#8dbe7b3403310b0011b2510d915bc5395421093e"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#273cf81c2eaea1fe454db050270732fbabba197e"
 dependencies = [
  "serde",
  "serde_json",
@@ -4719,7 +4719,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#b6ec3290f82a5c4e13f13d25fe3e0b442facba44"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#981b57f0724086ef1606fbce110758bcaa1ef0cd"
 dependencies = [
  "geometric-traits",
  "sha2 0.10.9",
