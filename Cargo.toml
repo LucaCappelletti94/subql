@@ -106,6 +106,15 @@ required-features = ["executor-diesel"]
 name = "reexec_postgres"
 required-features = ["executor-diesel-postgres"]
 
+# Docker-backed check that `REPLICA_IDENTITY_AUDIT_SQL` names exactly the
+# tables whose change stream omits the previous row. Needs only a plain
+# Postgres connection, no replication slot. Run with:
+#   cargo test --test replica_identity_audit \
+#       --features executor-diesel-postgres -- --ignored --nocapture
+[[test]]
+name = "replica_identity_audit"
+required-features = ["executor-diesel-postgres"]
+
 [[test]]
 name = "follow_insert_postgres"
 required-features = ["diesel-typed"]
@@ -372,6 +381,14 @@ diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sql
 # deps so the emulator stays a pure-Rust addition.
 pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
 
+# Per-row authorization records: given one changed row's column values,
+# which `(object, relation, subject)` facts it implies, and whether a
+# relation's records follow from that row alone. Backs the
+# `visibility-records` feature. `default-features = false` keeps the
+# `no_std + alloc` posture (its `std`, `agent` and `db` features pull
+# reqwest, tokio and diesel, none of which subql wants here).
+rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
+
 # Future-combinator helpers (FuturesUnordered + StreamExt) used by the
 # async auto-resolving engine to dispatch deduplicated triggers
 # concurrently. `alloc` feature only. We do not depend on std-only
@@ -454,6 +471,7 @@ std = [
     "pg_walstream/std",
     "dep:lz4",
     "dep:toml",
+    "rls2fga?/std",
 ]
 testing = ["dep:arbitrary"]
 observability = ["dep:tracing", "tracing/std"]
@@ -657,6 +675,14 @@ pg-sqlite-emu = [
 # Maxwell emission paths need no feature (their digest surface is
 # unconditional in `sqlite-diff-rs`), only the pg path does.
 pgoutput-emit = ["sqlite-diff-rs/pg-walstream"]
+
+# Opt-in: answer which authorization records a changed row implies, and
+# which relations a single row decides, by feeding the row's own column
+# values to `rls2fga`. This is the half of row visibility that needs no
+# network: whatever it cannot decide locally becomes a question the
+# caller answers, in the `Connector` idiom. subql names no authorization
+# protocol, so the vendor client stays downstream.
+visibility-records = ["dep:rls2fga"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]
