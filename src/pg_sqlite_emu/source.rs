@@ -575,7 +575,11 @@ fn build_table_meta(pg_catalog: &ParserDB) -> Result<HashMap<String, TableMeta>,
 
         let mut columns: Vec<ColumnMeta> = Vec::with_capacity(arity);
         let mut pk_column_indices: Vec<usize> = Vec::new();
-        let mut column_iter = table.columns(pg_catalog);
+        let mut column_iter = table.columns(pg_catalog).map_err(|error| {
+            PgSqliteEmuError::UnknownTable(format!(
+                "table {name} columns unavailable from catalog: {error}"
+            ))
+        })?;
         for col_idx in 0..arity {
             let column_id = u16::try_from(col_idx).map_err(|_| {
                 PgSqliteEmuError::UnknownTable(format!(

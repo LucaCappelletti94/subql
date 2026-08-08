@@ -36,7 +36,7 @@ impl<'db, DB: DatabaseLike> MysqlAdapter<'db, DB> {
             .catalog
             .tables()
             .find(|t| t.table_name() == table_name)?;
-        table.columns(self.catalog).nth(index)
+        table.columns(self.catalog).ok()?.nth(index)
     }
 }
 
