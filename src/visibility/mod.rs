@@ -47,6 +47,10 @@
 #[cfg(feature = "visibility-records")]
 pub mod records;
 
+// `policy` carries its own `//!` docs, for the same reason.
+#[cfg(feature = "visibility-records")]
+pub mod policy;
+
 // `transition` carries its own `//!` docs, for the same reason.
 pub mod transition;
 
