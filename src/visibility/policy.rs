@@ -31,6 +31,7 @@
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
+use alloc::sync::Arc;
 
 use hashbrown::HashMap;
 use rls2fga::generator::records::RecordDerivation;
@@ -74,6 +75,17 @@ impl Subject for String {
 impl<T: Subject + ?Sized> Subject for &T {
     fn subject(&self) -> &str {
         (*self).subject()
+    }
+}
+
+/// A consumer whose watcher is a shared handle over its own type cannot
+/// write this itself: [`Arc`] is not `#[fundamental]`, so `Arc<Local>` is
+/// not a local type and the orphan rule refuses a foreign trait on it. It
+/// lives here so that consumer implements [`Subject`] on its own type and
+/// needs no newtype.
+impl<T: Subject + ?Sized> Subject for Arc<T> {
+    fn subject(&self) -> &str {
+        (**self).subject()
     }
 }
 
@@ -422,6 +434,7 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use alloc::string::{String, ToString};
+    use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
     use core::future::Future;
@@ -1131,6 +1144,66 @@ CREATE POLICY pd ON docs FOR DELETE USING (editor_id = current_user);
         let mut verdicts = vec![Verdict::Deny; 2];
 
         block_on(policy.may_see(&view, &["user:alice", "user:bob"], &mut verdicts)).unwrap();
+
+        assert_eq!(verdicts, [Verdict::Allow, Verdict::Deny]);
+        assert_eq!(policy.inner().0.load(Ordering::Relaxed), 0);
+    }
+
+    /// A watcher held behind a shared handle is named the same way too.
+    ///
+    /// This is not symmetry for its own sake. A consumer whose watcher is
+    /// `Arc<ItsOwnType>` cannot write the impl itself: `Arc` is not
+    /// `#[fundamental]`, so `Arc<Local>` is not a local type and the orphan
+    /// rule refuses a foreign trait on it. Without this the consumer needs
+    /// a newtype at every site that names the watcher.
+    #[test]
+    fn a_watcher_behind_a_shared_handle_is_named_the_same_way() {
+        #[derive(Default)]
+        struct Shared(AtomicUsize);
+
+        impl VisibilityPolicy for Shared {
+            type Watcher = Arc<String>;
+            type Error = Unreachable;
+            type Backend = Postgres;
+
+            fn may_see<R>(
+                &self,
+                _row: &R,
+                _watchers: &[Arc<String>],
+                _verdicts: &mut [Verdict],
+            ) -> impl Future<Output = Result<(), Unreachable>> + Send
+            where
+                R: RowView<Backend = Postgres> + Sync + ?Sized,
+            {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                async { Ok(()) }
+            }
+
+            fn may_write<R>(
+                &self,
+                _row: &R,
+                _watcher: &Arc<String>,
+                _op: WriteOp,
+            ) -> impl Future<Output = Result<Verdict, Unreachable>> + Send
+            where
+                R: RowView<Backend = Postgres> + Sync + ?Sized,
+            {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                async { Ok(Verdict::Deny) }
+            }
+        }
+
+        let (db, relations) = translated(OWNERSHIP);
+        let event = insert(docs_id(&db), docs_row(text("alice"), Value::Null));
+        let policy = RowPolicy::new(db, &relations, Shared::default());
+        let view = EventRow::current(&event, policy.catalog()).unwrap();
+        let audience = [
+            Arc::new("user:alice".to_string()),
+            Arc::new("user:bob".to_string()),
+        ];
+        let mut verdicts = vec![Verdict::Deny; 2];
+
+        block_on(policy.may_see(&view, &audience, &mut verdicts)).unwrap();
 
         assert_eq!(verdicts, [Verdict::Allow, Verdict::Deny]);
         assert_eq!(policy.inner().0.load(Ordering::Relaxed), 0);
