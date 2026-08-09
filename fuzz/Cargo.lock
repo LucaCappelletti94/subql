@@ -77,6 +77,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "barnes-hut-tree"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e722517096156bfb9854089d365d0066892b613ee79579b570e4585687bb52"
+dependencies = [
+ "num-traits",
+ "rayon",
+]
+
+[[package]]
 name = "bigdecimal"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,6 +256,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-deque"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -314,8 +343,8 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.3.10"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
+version = "2.3.11"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
 dependencies = [
  "bitflags",
  "diesel_derives",
@@ -338,10 +367,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "diesel_attribute_parser"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
 dependencies = [
+ "diesel_attribute_parser",
  "diesel_table_macro_syntax",
  "dsl_auto_type",
  "proc-macro2",
@@ -352,7 +392,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
 dependencies = [
  "syn",
 ]
@@ -376,7 +416,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#1bbcab768964badd7139d2d906757d8d15e413c9"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#4c5f06ee0175e34b990f795c2fc1b9fb517629aa"
 dependencies = [
  "darling",
  "either",
@@ -491,8 +531,9 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#ccc7cba3c0301626406cf495c0f280d8e9c52fe3"
+source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#59f580bcf10f357e81f606db693dfc49f20ee863"
 dependencies = [
+ "barnes-hut-tree",
  "bitvec",
  "hashbrown 0.17.1",
  "lender",
@@ -798,9 +839,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#1a32e144d653d261ea4a84d8e1e48aaef8e7d99a"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#a6f46dc63f8520d10737ab1b031ffe5b05dd32c9"
 dependencies = [
- "sql-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/sql-traits?rev=858e17e4561c2b80d779674192d242bcb12f8afa)",
+ "sql-traits",
  "sqlparser",
  "thiserror",
 ]
@@ -905,6 +946,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "recursive"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -952,6 +1013,17 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rls2fga"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#45843b11d26b4d055d6c3b7f3192e99e6231cf24"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sql-traits",
+ "sqlparser",
+]
 
 [[package]]
 name = "roaring"
@@ -1090,20 +1162,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#fe18e678abd23ce8dbc5fc348fa5478146cabe39"
-dependencies = [
- "geometric-traits",
- "sha2",
- "sql_docs",
- "sqlparser",
- "thiserror",
- "unicode-normalization",
-]
-
-[[package]]
-name = "sql-traits"
-version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?rev=858e17e4561c2b80d779674192d242bcb12f8afa#858e17e4561c2b80d779674192d242bcb12f8afa"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#981b57f0724086ef1606fbce110758bcaa1ef0cd"
 dependencies = [
  "geometric-traits",
  "sha2",
@@ -1150,17 +1209,18 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-rs?rev=306abb569fcb64b84c79ab2284c71d69a4854307#306abb569fcb64b84c79ab2284c71d69a4854307"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
 dependencies = [
  "log",
  "recursive",
+ "serde",
  "sqlparser_derive",
 ]
 
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-rs?rev=306abb569fcb64b84c79ab2284c71d69a4854307#306abb569fcb64b84c79ab2284c71d69a4854307"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#30d0836b673d2198262f0662596ac8dbb7379987"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1210,12 +1270,13 @@ dependencies = [
  "pg2sqlite",
  "pg_walstream",
  "postcard",
+ "rls2fga",
  "roaring",
  "seahash",
  "serde",
  "serde_json",
  "slab",
- "sql-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main)",
+ "sql-traits",
  "sqlite-diff-rs",
  "sqlparser",
  "thiserror",
