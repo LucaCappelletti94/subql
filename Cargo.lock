@@ -4143,7 +4143,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#273cf81c2eaea1fe454db050270732fbabba197e"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#45843b11d26b4d055d6c3b7f3192e99e6231cf24"
 dependencies = [
  "serde",
  "serde_json",

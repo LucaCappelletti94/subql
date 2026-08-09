@@ -210,6 +210,7 @@ fn records_from_sql(conn: &mut PgConnection, sql: &str) -> BTreeSet<Record> {
             object: row.object,
             relation: row.relation,
             subject: row.subject,
+            context: None,
         })
         .collect()
 }

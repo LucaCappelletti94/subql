@@ -46,10 +46,14 @@ use crate::ValueError;
 /// withdrawal of access.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RowRecordError {
-    /// The description reads more than the changed row, so it has to be
-    /// queried. Carries the reason rls2fga recorded.
-    #[error("records do not follow from one row: {0}")]
-    NotDerivableFromOneRow(String),
+    /// [`rls2fga`] refused to produce records for this row.
+    ///
+    /// Wrapped whole rather than mapped arm by arm, because
+    /// [`RecordError`] is `#[non_exhaustive]` and every arm of it is a
+    /// refusal. A mapping would have to grow with each new reason, and
+    /// the reason is the producer's to word.
+    #[error(transparent)]
+    Refused(#[from] RecordError),
     /// The description reads a column shape a [`RowView`] cannot answer.
     ///
     /// Today that is only a list column: [`Value`] has no array variant,
@@ -66,14 +70,6 @@ pub enum RowRecordError {
     Undecodable(#[from] ValueError),
 }
 
-impl From<RecordError> for RowRecordError {
-    fn from(error: RecordError) -> Self {
-        match error {
-            RecordError::NotDerivableFromOneRow(reason) => Self::NotDerivableFromOneRow(reason),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -82,7 +78,7 @@ impl From<RecordError> for RowRecordError {
 ///
 /// # Errors
 ///
-/// [`RowRecordError::NotDerivableFromOneRow`] for a joining description,
+/// [`RowRecordError::Refused`] for a description rls2fga will not evaluate,
 /// [`RowRecordError::UnsupportedValueSource`] for a shape whose columns a
 /// row view cannot read, and [`RowRecordError::Undecodable`] for a cell
 /// the row carried but could not decode. None is an empty record set, on
@@ -132,8 +128,14 @@ fn unsupported_description(description: &RecordDescription) -> Option<RowRecordE
         // here.
         return None;
     };
-    unsupported(&template.object_key)
-        .or_else(|| unsupported(&template.subject_key))
+    // An object name is built from every part in order, so one part the
+    // view cannot read loses the whole name rather than a piece of it.
+    template
+        .object_key
+        .parts()
+        .iter()
+        .find_map(unsupported)
+        .or_else(|| unsupported(template.subject_key.part()))
         .or_else(|| guards.iter().find_map(unsupported_guard))
 }
 
@@ -290,7 +292,7 @@ fn json_at(json: &serde_json::Value, path: &[String]) -> Option<String> {
 mod tests {
     use alloc::vec;
 
-    use rls2fga::generator::records::{RecordTemplate, RowValues};
+    use rls2fga::generator::records::{ObjectKey, RecordTemplate, RowValues, SubjectKey};
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::*;
@@ -312,13 +314,14 @@ mod tests {
             tables: vec!["docs".into()],
             derivation: RecordDerivation::FromRow {
                 table: "docs".into(),
-                template: RecordTemplate {
+                template: Box::new(RecordTemplate {
                     object_type: "docs".into(),
-                    object_key: ValueSource::Column("id".into()),
+                    object_key: ObjectKey::column("id"),
                     relation: "owner".into(),
                     subject_type: "user".into(),
-                    subject_key: subject,
-                },
+                    subject_key: SubjectKey::new(subject),
+                    context: None,
+                }),
                 guards,
             },
         }
@@ -368,6 +371,7 @@ mod tests {
                 object: "docs:4".into(),
                 relation: "owner".into(),
                 subject: "user:alice".into(),
+                context: None,
             }]
         );
     }
@@ -471,8 +475,8 @@ mod tests {
         };
         assert_eq!(
             records(&d, row_of(Value::String("alice".into()))),
-            Err(RowRecordError::NotDerivableFromOneRow(
-                "reads the grants table".into()
+            Err(RowRecordError::Refused(
+                RecordError::NotDerivableFromOneRow("reads the grants table".into())
             ))
         );
     }
@@ -632,9 +636,9 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                RowRecordError::NotDerivableFromOneRow("reads grants".into())
+                RowRecordError::Refused(RecordError::NotDerivableFromOneRow("reads grants".into()))
             ),
-            "records do not follow from one row: reads grants"
+            "records do not follow from one row and must be queried: reads grants"
         );
         assert_eq!(
             format!("{}", RowRecordError::UnsupportedValueSource("list")),

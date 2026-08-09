@@ -50,9 +50,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use hashbrown::HashMap;
-use rls2fga::generator::records::{
-    BoundQuery, Record, RecordDerivation, RecordDescription, RecordTemplate,
-};
+use rls2fga::generator::records::{BoundQuery, Record, RecordDerivation, RecordDescription};
 use rls2fga::generator::relations::RelationShapes;
 use sql_traits::prelude::DatabaseLike;
 
@@ -432,15 +430,9 @@ fn name_gap(
     // reader needs when one relation is filled from several shapes. A
     // joining one carries no template, so the entry answers instead.
     let (type_name, relation) = match &shape.derivation {
-        RecordDerivation::FromRow {
-            template:
-                RecordTemplate {
-                    object_type,
-                    relation,
-                    ..
-                },
-            ..
-        } => (object_type.as_str(), relation.as_str()),
+        RecordDerivation::FromRow { template, .. } => {
+            (template.object_type.as_str(), template.relation.as_str())
+        }
         _ => (entry.type_name.as_str(), entry.relation.as_str()),
     };
     Uncovered {
@@ -556,6 +548,7 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
             object: object.into(),
             relation: relation.into(),
             subject: subject.into(),
+            context: None,
         }
     }
 

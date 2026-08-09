@@ -299,12 +299,17 @@ impl<DB: DatabaseLike, P> RowPolicy<DB, P> {
 }
 
 /// The one table every leaf of `decision` reads, or [`None`] when the recipe
-/// cannot be evaluated from a row image at all.
+/// cannot be answered from a row image at all.
 ///
 /// Refuses a composition over no children, because folding an intersection
 /// of nothing yields every subject, which is the one error direction that
 /// matters. It names no table either, so both fall out of the same walk
 /// rather than needing a guard that says so twice.
+///
+/// A recipe shape this does not recognise, `RequestGated` among them, falls
+/// to the wildcard and delegates. That is the whole protection against a
+/// composition a later rls2fga adds: a grant the request completes is not
+/// settled by the row, and answering it here would grant on the row alone.
 fn usable_table(decision: &RowDecision) -> Option<&str> {
     let mut table: Option<&str> = None;
     match decision {
@@ -453,7 +458,7 @@ mod tests {
 
     use rls2fga::classifier::patterns::ConfidenceLevel;
     use rls2fga::generator::records::{
-        RecordDerivation, RecordDescription, RecordTemplate, ValueSource,
+        ObjectKey, RecordDerivation, RecordDescription, RecordTemplate, SubjectKey, ValueSource,
     };
     use rls2fga::generator::relations::{RelationShapes, RowDecision};
     use rls2fga::translator::TranslatorBuilder;
@@ -464,6 +469,7 @@ mod tests {
     use crate::testing::TestEvent;
     use crate::visibility::{EventRow, RowView, Verdict, VisibilityPolicy, WriteOp};
     use crate::{catalog_helpers, ColumnId, ParserDB, TableId, ValueError};
+    use rls2fga::generator::relations::RequestComparison;
 
     // -----------------------------------------------------------------
     // Harness
@@ -915,13 +921,16 @@ CREATE POLICY p ON docs FOR SELECT USING (
                     tables: vec!["docs".to_string()],
                     derivation: RecordDerivation::FromRow {
                         table: "docs".to_string(),
-                        template: RecordTemplate {
+                        template: Box::new(RecordTemplate {
                             object_type: "docs".to_string(),
-                            object_key: ValueSource::Column("id".to_string()),
+                            object_key: ObjectKey::column("id"),
                             relation: "members".to_string(),
                             subject_type: "user".to_string(),
-                            subject_key: ValueSource::ListElements("owner_id".to_string()),
-                        },
+                            subject_key: SubjectKey::new(ValueSource::ListElements(
+                                "owner_id".to_string(),
+                            )),
+                            context: None,
+                        }),
                         guards: Vec::new(),
                     },
                 }],
@@ -1283,6 +1292,44 @@ CREATE POLICY pd ON docs FOR DELETE USING (editor_id = current_user);
     }
 
     // -----------------------------------------------------------------
+    // Recipes this does not recognise
+    // -----------------------------------------------------------------
+
+    /// A grant the caller's own request completes is not settled by the row,
+    /// so it must reach the backend even though it arrives as a recipe.
+    ///
+    /// `RowDecision` is `#[non_exhaustive]` and gained this variant after
+    /// `RowPolicy` was written. The wildcard is what kept that safe, and
+    /// this is the test that says so, because the next variant will arrive
+    /// the same way.
+    #[test]
+    fn a_recipe_the_request_completes_is_delegated() {
+        let (db, _) = translated(OWNERSHIP);
+        let docs = docs_id(&db);
+        let relations = vec![RelationShapes {
+            type_name: "docs".to_string(),
+            relation: "can_select".to_string(),
+            from_one_row: true,
+            shapes: Vec::new(),
+            decision: Some(RowDecision::RequestGated {
+                relation: "gated".to_string(),
+                shapes: vec![shape_on("docs", "owner_id")],
+                context_key: "row_department".to_string(),
+                request_parameter: "department".to_string(),
+                comparison: RequestComparison::CallerValueEquals,
+            }),
+        }];
+        let event = insert(docs, docs_row(text("alice"), Value::Null));
+        let policy = RowPolicy::new(db, &relations, Delegate::granting("user:alice"));
+
+        assert!(!policy.answers_locally(docs, Action::Select));
+        let got = see(&policy, &event, &watchers(&["user:alice"])).unwrap();
+
+        assert_eq!(got, [Verdict::Allow], "the backend answered");
+        assert_eq!(policy.inner().see_calls(), 1);
+    }
+
+    // -----------------------------------------------------------------
     // Recipes no single table keys
     // -----------------------------------------------------------------
 
@@ -1293,13 +1340,14 @@ CREATE POLICY pd ON docs FOR DELETE USING (editor_id = current_user);
             tables: vec![table.to_string()],
             derivation: RecordDerivation::FromRow {
                 table: table.to_string(),
-                template: RecordTemplate {
+                template: Box::new(RecordTemplate {
                     object_type: table.to_string(),
-                    object_key: ValueSource::Column("id".to_string()),
+                    object_key: ObjectKey::column("id"),
                     relation: "owner".to_string(),
                     subject_type: "user".to_string(),
-                    subject_key: ValueSource::Column(subject.to_string()),
-                },
+                    subject_key: SubjectKey::column(subject),
+                    context: None,
+                }),
                 guards: Vec::new(),
             },
         }
