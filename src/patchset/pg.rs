@@ -47,6 +47,7 @@
 //! [`CustomTypePgAdapter`] and register a [`PgCustomBinder`] per such
 //! type to bind those columns natively, still with no SQL cast.
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -93,7 +94,7 @@ impl<'db, DB: DatabaseLike> PgAdapter<'db, DB> {
             .catalog
             .tables()
             .find(|t| t.table_name() == table_name)?;
-        table.columns(self.catalog).nth(index)
+        table.columns(self.catalog).ok()?.nth(index)
     }
 
     /// Classify the target column through the catalog's [`ScalarKind`],
@@ -113,7 +114,7 @@ impl<'db, DB: DatabaseLike> PgAdapter<'db, DB> {
     /// caller-registered native bind. Returns `None` for an unknown table
     /// or column.
     #[must_use]
-    pub fn column_type_name(&self, table_name: &str, column_index: usize) -> Option<&str> {
+    pub fn column_type_name(&self, table_name: &str, column_index: usize) -> Option<Cow<'_, str>> {
         self.column_at(table_name, column_index)
             .map(|col| col.data_type(self.catalog))
     }
@@ -578,7 +579,7 @@ where
             .and_then(|type_name| {
                 self.binders
                     .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(type_name))
+                    .find(|(name, _)| name.eq_ignore_ascii_case(type_name.as_ref()))
             });
         match custom {
             Some((_, binder)) => match value {

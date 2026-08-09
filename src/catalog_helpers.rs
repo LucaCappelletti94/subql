@@ -79,14 +79,14 @@ pub fn column_id<DB: DatabaseLike>(
     column_name: &str,
 ) -> Option<ColumnId> {
     let table = database.table_by_id(table_id as usize)?;
-    let column = table.columns(database).find(|col| {
+    let column = table.columns(database).ok()?.find(|col| {
         stored_identifier_matches_lookup(
             col.column_name(),
             col.column_name_is_quoted(),
             column_name,
         )
     })?;
-    let ordinal = column.column_id(database)?;
+    let ordinal = column.column_id(database).ok().flatten()?;
     u16::try_from(ordinal).ok()
 }
 
@@ -94,7 +94,7 @@ pub fn column_id<DB: DatabaseLike>(
 #[must_use]
 pub fn table_arity<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<usize> {
     let table = database.table_by_id(table_id as usize)?;
-    Some(table.number_of_columns(database))
+    table.number_of_columns(database).ok()
 }
 
 /// Compute the spec-compliant [`SchemaFingerprint`] for the table.
@@ -135,7 +135,8 @@ pub fn primary_key_columns<DB: DatabaseLike>(
     Some(
         table
             .primary_key_columns(database)
-            .filter_map(|col| col.column_id(database))
+            .ok()?
+            .filter_map(|col| col.column_id(database).ok().flatten())
             .filter_map(|id| u16::try_from(id).ok())
             .collect(),
     )
@@ -155,7 +156,8 @@ pub fn column_name<DB: DatabaseLike>(
     let table = database.table_by_id(table_id as usize)?;
     table
         .columns(database)
-        .find(|col| col.column_id(database) == Some(column_id as usize))
+        .ok()?
+        .find(|col| col.column_id(database).ok().flatten() == Some(column_id as usize))
         .map(|col| col.column_name().to_string())
 }
 
@@ -256,8 +258,8 @@ pub fn column_scalar_kind<DB: DatabaseLike>(
     column_id: ColumnId,
 ) -> Option<ScalarKind> {
     let table = database.table_by_id(table_id as usize)?;
-    let column = table.column_by_id(column_id as usize, database)?;
-    scalar_kind_from_raw(column.data_type(database))
+    let column = table.column_by_id(column_id as usize, database).ok()??;
+    scalar_kind_from_raw(&column.data_type(database))
 }
 
 /// Map a raw SQL declared type string to its [`ScalarKind`] via
@@ -292,7 +294,7 @@ fn scalar_kind_from_raw(raw: &str) -> Option<ScalarKind> {
 #[must_use]
 pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<bool> {
     let table = database.table_by_id(table_id as usize)?;
-    Some(table.has_row_level_security(database))
+    table.has_row_level_security(database).ok()
 }
 
 #[cfg(test)]
@@ -461,9 +463,7 @@ mod tests {
         assert_eq!(column_scalar_kind(&pg, tid, 3), Some(ScalarKind::Date));
         assert_eq!(column_scalar_kind(&pg, tid, 4), Some(ScalarKind::Time));
 
-        // MySQL spellings, including `DATETIME` and `BIGINT UNSIGNED`,
-        // both unblocked by the sql-traits normalization fix (see
-        // `docs/uphill-sql-traits-phase3-scalar-normalization.md`).
+        // MySQL spellings, including `DATETIME` and `BIGINT UNSIGNED`.
         // `DATETIME` classifies as a wall-clock `Timestamp`, and `BIGINT
         // UNSIGNED` folds into the integer family.
         let my = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(

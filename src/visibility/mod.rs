@@ -41,6 +41,23 @@
 //! a network therefore does not discard correct local answers when the
 //! network call fails.
 
+// `records` carries its own `//!` docs, so no outer doc here: a module
+// with both resolves its intra-doc links in this file's scope instead of
+// its own, and the types it links to live there.
+#[cfg(feature = "visibility-records")]
+pub mod records;
+
+// `policy` carries its own `//!` docs, for the same reason.
+#[cfg(feature = "visibility-records")]
+pub mod policy;
+
+// `store` carries its own `//!` docs, for the same reason.
+#[cfg(feature = "visibility-records")]
+pub mod store;
+
+// `transition` carries its own `//!` docs, for the same reason.
+pub mod transition;
+
 use alloc::vec::Vec;
 
 use crate::backend::{Backend, CdcEvent, RowKind, Value};
@@ -151,7 +168,7 @@ pub enum WriteOp {
 /// Postgres update whose old image is absent because the table runs
 /// `REPLICA IDENTITY DEFAULT`, so a caller that asks about previous
 /// versions has to require `FULL`
-/// (see [`REPLICA_IDENTITY_CHECK_SQL`](crate::REPLICA_IDENTITY_CHECK_SQL)).
+/// (see [`REPLICA_IDENTITY_AUDIT_SQL`](crate::REPLICA_IDENTITY_AUDIT_SQL)).
 ///
 /// A cell that was carried but cannot be decoded is an `Err`, not a
 /// [`Value::Missing`], so a corrupt row is distinguishable from an
@@ -228,7 +245,7 @@ const fn image_exists(kind: EventKind, row: RowKind) -> bool {
 /// `REPLICA IDENTITY DEFAULT`, since that is indistinguishable from a
 /// populated one without decoding. A caller that asks about previous
 /// versions still has to require `FULL`
-/// (see [`REPLICA_IDENTITY_CHECK_SQL`](crate::REPLICA_IDENTITY_CHECK_SQL)).
+/// (see [`REPLICA_IDENTITY_AUDIT_SQL`](crate::REPLICA_IDENTITY_AUDIT_SQL)).
 pub struct EventRow<'a, E, DB> {
     event: &'a E,
     db: &'a DB,

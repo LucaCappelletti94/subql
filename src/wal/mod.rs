@@ -231,7 +231,8 @@ mod tests {
         // resolves to one id, the bare `users` is also present (it has its
         // own ambient/no-schema entry via a second schema)..
         let catalog = ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE other.users (id INT PRIMARY KEY, name TEXT);\n\
+            "CREATE SCHEMA other;\n\
+             CREATE TABLE other.users (id INT PRIMARY KEY, name TEXT);\n\
              CREATE TABLE public.users (id INT PRIMARY KEY, name TEXT);",
         )
         .expect("ambiguous DDL parses");

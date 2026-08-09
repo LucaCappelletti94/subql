@@ -21,18 +21,15 @@ subql = { path = "..", features = ["testing", "pg-sqlite-emu"] }
 [workspace]
 members = ["."]
 
-# Mirror the root Cargo.toml [patch.crates-io] sqlparser pin. cargo-fuzz's
-# standalone workspace does not inherit the parent workspace's patch
-# table. Pinned to LucaCappelletti94/sqlparser-rs `pathological-combined`,
-# which bundles every unmerged exponential-parse fix surfaced by this
-# very fuzz harness. Keep this rev in lockstep with the root manifest;
-# delete both blocks together once the bundled PRs land and a patched
-# sqlparser release is on crates.io.
 [patch.crates-io]
-# Mirror root Cargo.toml [patch.crates-io] pins. cargo-fuzz's standalone
-# workspace does not inherit the parent's patch table.
-sqlparser = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
-sqlparser_derive = { git = "https://github.com/LucaCappelletti94/sqlparser-rs", rev = "306abb569fcb64b84c79ab2284c71d69a4854307" }
+# Mirror the root Cargo.toml [patch.crates-io] pins. cargo-fuzz's standalone
+# workspace does not inherit the parent's patch table, so every root pin has
+# to be repeated here and moved when the root moves. sqlparser tracks the
+# canonical apache upstream, whose main now carries the exponential-parse
+# fixes this very harness surfaced, so the fork rev that once bundled them
+# is gone from both manifests.
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 # Route diesel through the LucaCappelletti94/future fork so the
 # `SqliteConnection` here is the same type diesel-sqlite-session sees.
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }

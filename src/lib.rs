@@ -95,13 +95,27 @@ pub mod test_harnesses;
 // Version and metadata
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// SQL to check REPLICA IDENTITY setting for a table.
+/// SQL listing every table whose change stream omits the previous row.
 ///
-/// Returns `'f'` for FULL. Callers should run this at setup and reject
-/// tables where the result is not `'f'`, since view-relative UPDATE dispatch
-/// requires a complete old row image.
-pub const REPLICA_IDENTITY_CHECK_SQL: &str =
-    "SELECT relreplident FROM pg_class WHERE oid = $1::regclass";
+/// Run this once at startup and refuse to serve while it returns rows.
+/// Postgres emits an update's or a delete's old image in full only under
+/// `REPLICA IDENTITY FULL`. Under the default it sends the key alone, and
+/// then a row that leaves a subscriber's reach cannot be distinguished
+/// from one that was never reachable, so the subscriber silently keeps a
+/// row it may no longer see.
+///
+/// One round trip for the whole database, and each row names a table to
+/// fix. Ordinary and partitioned tables in user schemas only, since
+/// nothing replicates the catalogs.
+///
+/// [`TransitionError::IncompletePreviousImage`](crate::visibility::transition::TransitionError::IncompletePreviousImage)
+/// is the per-event counterpart, for a table altered after this ran.
+pub const REPLICA_IDENTITY_AUDIT_SQL: &str = "SELECT n.nspname, c.relname, c.relreplident \
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE c.relkind IN ('r', 'p') \
+     AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+     AND c.relreplident <> 'f' \
+     ORDER BY n.nspname, c.relname";
 
 #[cfg(test)]
 mod tests {

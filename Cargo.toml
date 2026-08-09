@@ -106,6 +106,25 @@ required-features = ["executor-diesel"]
 name = "reexec_postgres"
 required-features = ["executor-diesel-postgres"]
 
+# Docker-backed check that `REPLICA_IDENTITY_AUDIT_SQL` names exactly the
+# tables whose change stream omits the previous row. Needs only a plain
+# Postgres connection, no replication slot. Run with:
+#   cargo test --test replica_identity_audit \
+#       --features executor-diesel-postgres -- --ignored --nocapture
+[[test]]
+name = "replica_identity_audit"
+required-features = ["executor-diesel-postgres"]
+
+# Docker-backed differential test: every record subql derives from a real
+# CDC row image must equal what the tuple SQL rls2fga emits for the same
+# rows returns from the same Postgres. This is what stops subql's own
+# value rendering drifting from the loader's. Run with:
+#   cargo test --test visibility_records_parity \
+#       --features "visibility-records executor-diesel-postgres" -- --ignored --nocapture
+[[test]]
+name = "visibility_records_parity"
+required-features = ["visibility-records", "executor-diesel-postgres"]
+
 [[test]]
 name = "follow_insert_postgres"
 required-features = ["diesel-typed"]
@@ -372,6 +391,14 @@ diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sql
 # deps so the emulator stays a pure-Rust addition.
 pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
 
+# Per-row authorization records: given one changed row's column values,
+# which `(object, relation, subject)` facts it implies, and whether a
+# relation's records follow from that row alone. Backs the
+# `visibility-records` feature. `default-features = false` keeps the
+# `no_std + alloc` posture (its `std`, `agent` and `db` features pull
+# reqwest, tokio and diesel, none of which subql wants here).
+rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
+
 # Future-combinator helpers (FuturesUnordered + StreamExt) used by the
 # async auto-resolving engine to dispatch deduplicated triggers
 # concurrently. `alloc` feature only. We do not depend on std-only
@@ -412,9 +439,16 @@ arbitrary = { version = "1", features = ["derive"] }
 # `bigdecimal::BigDecimal`, the temporal columns back as `chrono` types,
 # and the `JSON` / `JSONB` columns back as `serde_json::Value` for the
 # parity assertions, regardless of which apply feature a given test
-# enables.
-diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "numeric", "chrono", "serde_json"] }
+# enables. `uuid` is here for the same reason: the records parity test
+# seeds a `UUID` primary key through the typed DSL and must not depend on
+# an apply feature to get the column type.
+diesel = { version = "2", features = ["postgres", "mysql", "sqlite", "numeric", "chrono", "serde_json", "uuid"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
+
+# Constructing the `UUID` keys that parity test seeds. Already in the
+# graph as a library dependency, but an integration test sees only the
+# dev-dependencies.
+uuid = { version = "1", features = ["v4"] }
 
 # Async diesel execution for the async apply and async re-exec e2e tests
 # (`apply_patchset_pg_async_e2e`, `reexec_postgres_async`, and the MySQL
@@ -426,6 +460,13 @@ diesel-async = { version = "0.7", default-features = false, features = ["postgre
 
 # Property-based testing
 proptest = "1"
+
+# The differential test in `tests/visibility_records_parity.rs` needs the
+# translator, not just the record types, so it plans a schema and runs the
+# tuple SQL rls2fga emits for it. An integration test sees only subql's
+# dev-dependencies, so the library's optional `rls2fga` is not enough.
+# Default features on, since the translator is `std`-only.
+rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main" }
 
 # Multi-task async runtime for tests that need real concurrency (e.g.
 # `tests/reexec_throttle.rs`, which observes peak in-flight connector
@@ -454,6 +495,7 @@ std = [
     "pg_walstream/std",
     "dep:lz4",
     "dep:toml",
+    "rls2fga?/std",
 ]
 testing = ["dep:arbitrary"]
 observability = ["dep:tracing", "tracing/std"]
@@ -657,6 +699,14 @@ pg-sqlite-emu = [
 # Maxwell emission paths need no feature (their digest surface is
 # unconditional in `sqlite-diff-rs`), only the pg path does.
 pgoutput-emit = ["sqlite-diff-rs/pg-walstream"]
+
+# Opt-in: answer which authorization records a changed row implies, and
+# which relations a single row decides, by feeding the row's own column
+# values to `rls2fga`. This is the half of row visibility that needs no
+# network: whatever it cannot decide locally becomes a question the
+# caller answers, in the `Connector` idiom. subql names no authorization
+# protocol, so the vendor client stays downstream.
+visibility-records = ["dep:rls2fga"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]
