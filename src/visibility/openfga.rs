@@ -20,6 +20,38 @@
 //! so a truncated answer is indistinguishable from a complete one and reads as
 //! a wrong refusal.
 //!
+//! So calls per changed row are the watcher count over the batch size, which is
+//! linear in the audience. Whether a shape bounded by the row instead exists was
+//! asked and answered against OpenFGA rather than assumed, and it does, with a
+//! constraint that rules it out here for now. `Expand` on the row names the
+//! usersets granting the relation without enumerating their members, and it is
+//! the one enumerating call that cannot be silently truncated. One paginated
+//! `Read` per named userset then lists that userset's members with a real
+//! continuation token, so a caller always knows it saw all of them, and the
+//! watcher list is intersected locally. Calls are then bounded by how many
+//! usersets the row grants to, which is a property of the row.
+//!
+//! The constraint is that `Read` returns only directly stored tuples and does
+//! not evaluate the model, while the models this reads are generated from
+//! row-level security policies and put conditions on membership. On such a model
+//! `Read` omits members it cannot see it is omitting, which is the silent
+//! wrongness the flat call was rejected for, arriving by another door.
+//! Substituting `ListUsers` per userset evaluates the model correctly and brings
+//! back the truncation. So the linear shape is what is correct today, and this
+//! paragraph is here so the next reader inherits the finding rather than the
+//! search.
+//!
+//! # Nothing here caches, and that is deliberate
+//!
+//! There is no cache and no seam for one. The server has its own check-result
+//! cache, and which of the two paths a question takes is chosen per statement
+//! rather than configured: a read may be served from that cache, and a write
+//! asks authoritatively so it cannot be. A cache in front of this would be a
+//! second staleness window, invalidated by nothing, sitting in front of a
+//! deliberate decision about the first one. Tune the server's cache, and raise
+//! [`read_consistency`](OpenFgaPolicy::read_consistency) when a deployment wants
+//! reads authoritative too.
+//!
 //! # The caller's own values travel with the question
 //!
 //! A grant the caller's request completes is a condition the server evaluates
@@ -42,9 +74,9 @@ use std::collections::HashMap as StructFields;
 
 use openfga_client::client::batch_check_single_result::CheckResult;
 use openfga_client::client::{
-    BatchCheckItem, BatchCheckRequest, CheckRequestTupleKey, ContextualTupleKeys,
-    OpenFgaServiceClient, RelationshipCondition, TupleKey, TupleKeyWithoutCondition, WriteRequest,
-    WriteRequestDeletes, WriteRequestWrites,
+    BatchCheckItem, BatchCheckRequest, CheckRequestTupleKey, ConsistencyPreference,
+    ContextualTupleKeys, OpenFgaServiceClient, RelationshipCondition, TupleKey,
+    TupleKeyWithoutCondition, WriteRequest, WriteRequestDeletes, WriteRequestWrites,
 };
 use openfga_client::prost_wkt_types::{value::Kind, ListValue, Struct, Value as ProstValue};
 use openfga_client::tonic::body::Body;
@@ -179,6 +211,7 @@ pub struct OpenFgaPolicy<DB, T, W, B> {
     authorization_model_id: String,
     max_checks_per_batch: usize,
     connect_retries: u32,
+    read_consistency: ConsistencyPreference,
     watcher: PhantomData<fn(W)>,
     backend: PhantomData<fn(B)>,
 }
@@ -217,6 +250,7 @@ where
             authorization_model_id: String::new(),
             max_checks_per_batch: DEFAULT_MAX_CHECKS_PER_BATCH,
             connect_retries: DEFAULT_CONNECT_RETRIES,
+            read_consistency: ConsistencyPreference::MinimizeLatency,
             watcher: PhantomData,
             backend: PhantomData,
         })
@@ -238,6 +272,18 @@ where
     #[must_use]
     pub const fn max_checks_per_batch(mut self, checks: usize) -> Self {
         self.max_checks_per_batch = if checks == 0 { 1 } else { checks };
+        self
+    }
+
+    /// Ask read questions on `preference` rather than the cheap path.
+    ///
+    /// Only the read path is settable. A write always asks authoritatively,
+    /// because a write accepted against a permission already withdrawn is not
+    /// undone afterwards, so offering to lower it would offer to reintroduce
+    /// exactly that.
+    #[must_use]
+    pub const fn read_consistency(mut self, preference: ConsistencyPreference) -> Self {
+        self.read_consistency = preference;
         self
     }
 
@@ -352,6 +398,48 @@ struct Question {
     item: BatchCheckItem,
 }
 
+/// Which consistency preference a question about `statement` needs, where `read`
+/// is what the caller chose for reads.
+///
+/// The server may answer a check from its own cache unless the question says
+/// otherwise, and `ConsistencyPreference::Unspecified` is documented as
+/// behaving like the cheap path, so leaving it unset asks for the cached answer
+/// rather than for no preference.
+///
+/// A write therefore asks authoritatively: it is authorised once, and a write
+/// accepted against a permission the cache has not caught up to is not undone
+/// later. A read may take the cheap path, because the change path asks again on
+/// the next event, so a stale answer costs freshness rather than disclosure.
+///
+/// The wildcard is the safe direction rather than laziness: [`ActionStatement`]
+/// is `#[non_exhaustive]`, and a statement added upstream is answered
+/// authoritatively until someone decides it is a read.
+const fn consistency_for(
+    statement: ActionStatement,
+    read: ConsistencyPreference,
+) -> ConsistencyPreference {
+    match statement {
+        ActionStatement::Select => read,
+        _ => ConsistencyPreference::HigherConsistency,
+    }
+}
+
+/// One call's worth of questions, asked at `consistency`.
+fn batch_request(
+    store_id: &str,
+    authorization_model_id: &str,
+    chunk: &[Question],
+    consistency: ConsistencyPreference,
+) -> BatchCheckRequest {
+    BatchCheckRequest {
+        store_id: store_id.to_string(),
+        checks: chunk.iter().map(|question| question.item.clone()).collect(),
+        authorization_model_id: authorization_model_id.to_string(),
+        // Discriminant extraction: the generated field is a bare `i32`.
+        consistency: consistency as i32,
+    }
+}
+
 impl<DB, T, W, B> OpenFgaPolicy<DB, T, W, B>
 where
     DB: DatabaseLike + Send + Sync,
@@ -363,20 +451,21 @@ where
     W: Subject + Send + Sync,
     B: Backend,
 {
-    /// Ask `questions`, in calls of at most the configured cap, writing each
-    /// answer where its question says.
+    /// Ask `questions` at `consistency`, in calls of at most the configured cap,
+    /// writing each answer where its question says.
     async fn ask(
         &self,
         questions: Vec<Question>,
         verdicts: &mut [Verdict],
+        consistency: ConsistencyPreference,
     ) -> Result<(), OpenFgaError> {
         for chunk in questions.chunks(self.max_checks_per_batch) {
-            let request = BatchCheckRequest {
-                store_id: self.store_id.clone(),
-                checks: chunk.iter().map(|question| question.item.clone()).collect(),
-                authorization_model_id: self.authorization_model_id.clone(),
-                consistency: 0,
-            };
+            let request = batch_request(
+                &self.store_id,
+                &self.authorization_model_id,
+                chunk,
+                consistency,
+            );
             let answers = self.batch_check(request).await?;
 
             let mut unanswered = 0;
@@ -853,7 +942,8 @@ where
         let questions = self
             .read_relation(row.table_id())
             .and_then(|relation| self.questions(row, relation.as_str(), watchers, &[]));
-        async move { self.ask(questions?, verdicts).await }
+        let consistency = consistency_for(ActionStatement::Select, self.read_consistency);
+        async move { self.ask(questions?, verdicts, consistency).await }
     }
 
     fn may_write<R>(
@@ -864,13 +954,15 @@ where
     where
         R: RowView<Backend = Self::Backend> + Sync + ?Sized,
     {
+        let statement = statement_of(&write);
+        let consistency = consistency_for(statement, self.read_consistency);
         let plan = self.write_plan(write, watcher);
         async move {
             // Every half must grant, so the first refusal is the answer and the
             // rest are never asked.
             for questions in plan? {
                 let mut verdict = [Verdict::Deny];
-                self.ask(questions, &mut verdict).await?;
+                self.ask(questions, &mut verdict, consistency).await?;
                 if verdict[0] == Verdict::Deny {
                     return Ok(Verdict::Deny);
                 }
@@ -892,11 +984,99 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{
-        context_for, usable_index, Code, Kind, OpenFgaError, RequestValues, RequiredParameter,
-        Subject,
+        batch_request, consistency_for, context_for, usable_index, ActionStatement, BatchCheckItem,
+        CheckRequestTupleKey, Code, ConsistencyPreference, Kind, OpenFgaError, Question,
+        RequestValues, RequiredParameter, Subject,
     };
     use crate::visibility::shapes::Shapes;
     use crate::ParserDB;
+
+    /// The four statements a write can be, which is what `statement_of` reports
+    /// for the four [`RowWrite`](crate::visibility::RowWrite) shapes.
+    const WRITE_STATEMENTS: [ActionStatement; 4] = [
+        ActionStatement::Insert,
+        ActionStatement::Update,
+        ActionStatement::SelectForUpdate,
+        ActionStatement::Delete,
+    ];
+
+    /// One question, enough to read the request built around it.
+    fn a_question() -> Question {
+        Question {
+            place: 0,
+            item: BatchCheckItem {
+                tuple_key: Some(CheckRequestTupleKey {
+                    user: "user:one".to_string(),
+                    relation: "can_select".to_string(),
+                    object: "docs:1".to_string(),
+                }),
+                contextual_tuples: None,
+                context: None,
+                correlation_id: "w0n0".to_string(),
+            },
+        }
+    }
+
+    /// A write is authorised once and never revisited, so it asks the
+    /// authoritative path even where the caller chose the cheap one for reads.
+    /// Answering a write from the server's cache accepts it against a permission
+    /// that may already be gone.
+    #[test]
+    fn a_write_asks_authoritatively() {
+        for statement in WRITE_STATEMENTS {
+            assert_eq!(
+                consistency_for(statement, ConsistencyPreference::MinimizeLatency),
+                ConsistencyPreference::HigherConsistency,
+                "{statement:?} is a write and must not be answered from cache"
+            );
+        }
+    }
+
+    /// A read takes the cheap path by default, which is what makes asking per
+    /// watcher affordable. A stale answer there is re-asked on the next event.
+    #[test]
+    fn a_read_asks_cheaply_by_default() {
+        assert_eq!(
+            consistency_for(
+                ActionStatement::Select,
+                ConsistencyPreference::MinimizeLatency
+            ),
+            ConsistencyPreference::MinimizeLatency
+        );
+    }
+
+    /// A deployment wanting every answer authoritative raises the read path, and
+    /// the choice reaches the question rather than being overridden.
+    #[test]
+    fn a_raised_read_preference_reaches_the_question() {
+        assert_eq!(
+            consistency_for(
+                ActionStatement::Select,
+                ConsistencyPreference::HigherConsistency
+            ),
+            ConsistencyPreference::HigherConsistency
+        );
+    }
+
+    /// The preference travels as itself. `Unspecified` is documented as behaving
+    /// like the cheap path, so sending it asks for a cached answer while looking
+    /// like no request at all, which is the one value a reader misreads.
+    #[test]
+    fn the_request_names_the_preference_it_was_given() {
+        let questions = [a_question()];
+        for preference in [
+            ConsistencyPreference::MinimizeLatency,
+            ConsistencyPreference::HigherConsistency,
+        ] {
+            let request = batch_request("store", "", &questions, preference);
+            assert_eq!(request.consistency, preference as i32);
+            assert_ne!(
+                request.consistency,
+                ConsistencyPreference::Unspecified as i32,
+                "an unset preference is the cached path wearing a neutral name"
+            );
+        }
+    }
 
     /// A watcher answering one parameter with whatever it was given.
     struct Holder {
