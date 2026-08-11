@@ -28,6 +28,31 @@
 //! believes its store is complete when it is not is the failure this whole
 //! path exists to remove.
 //!
+//! # When a replayed query has to have finished
+//!
+//! Applying the difference is not the caller's job, and replaying the
+//! queries is. The records this reports reach the store through the terminal
+//! policy's own `apply`, which orders the write against the questions that
+//! read it. A replayed
+//! query is the one part that cannot work that way, because its rows come
+//! from a database only the caller can reach, and it carries an obligation
+//! worth stating rather than leaving to be discovered.
+//!
+//! **Replay the query and write back what it returned before the event is
+//! delivered.** Until then the store still holds the facts from before the
+//! change, so a question about any row those facts reach is answered from a
+//! world that has moved. In the deny direction that costs a row delivered
+//! late. In the allow direction it is a row handed to somebody whose access
+//! has already gone, which is the one failure this path exists to remove,
+//! and no later correction takes the row back.
+//!
+//! The cost is real and it is the reason this sentence exists rather than a
+//! default: the change path then waits on one database read per affected
+//! shape. A caller that would rather not wait can defer the replay, and is
+//! thereby choosing a window whose width is its own replay lag, during which
+//! a withdrawn permission still reads. That is a decision to take
+//! deliberately, so it is written here rather than inferred from silence.
+//!
 //! # Refusing rather than emitting part of it
 //!
 //! A difference that is right about some shapes and silently wrong about
@@ -96,6 +121,11 @@ pub struct Uncovered {
 /// A query to replay for one changed row, because its records span more
 /// than that row.
 ///
+/// Replaying it and writing back what it returned is the caller's, and it is
+/// due before the event is delivered. See the module's own section on when a
+/// replayed query has to have finished, which says what a caller accepts by
+/// deferring it.
+///
 /// The key is a typed [`Value`] rather than text, so the caller binds it
 /// through its own type system and no cast is needed anywhere.
 #[derive(Clone, Debug, PartialEq)]
@@ -121,7 +151,9 @@ pub struct StoreDiff<'a, B: Backend> {
     pub added: Vec<Record>,
     /// Facts the row stated before and no longer does.
     pub removed: Vec<Record>,
-    /// Queries the caller replays for the facts no single row settles.
+    /// Queries the caller replays, then hands the rows back through the
+    /// terminal policy's `write_records`. Due before the event is delivered:
+    /// see the module doc.
     pub requeries: Vec<Requery<'a, B>>,
 }
 
