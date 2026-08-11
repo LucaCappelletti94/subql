@@ -1017,7 +1017,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#45843b11d26b4d055d6c3b7f3192e99e6231cf24"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#814c0c158a82e848a43d626cf0cc5c72010de3d0"
 dependencies = [
  "serde",
  "serde_json",

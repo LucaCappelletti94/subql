@@ -39,7 +39,7 @@ use rls2fga::translator::TranslatorBuilder;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, RowKind};
 use subql::visibility::records::{is_evaluable, records_from_row_view};
-use subql::visibility::store::StoreShapes;
+use subql::visibility::shapes::Shapes;
 use subql::visibility::EventRow;
 use subql::{catalog_helpers, parse_wal2json_v2, MessageV2, ParserDB};
 
@@ -201,17 +201,12 @@ fn seed(conn: &mut PgConnection) {
 }
 
 /// What the loader would write, straight from the database.
-fn records_from_sql(conn: &mut PgConnection, sql: &str) -> BTreeSet<Record> {
+fn records_from_sql(conn: &mut PgConnection, sql: &str) -> BTreeSet<Fact> {
     sql_query(sql)
         .load::<TupleRow>(conn)
         .unwrap_or_else(|error| panic!("tuple query failed: {error}\n{sql}"))
         .into_iter()
-        .map(|row| Record {
-            object: row.object,
-            relation: row.relation,
-            subject: row.subject,
-            context: None,
-        })
+        .map(|row| (row.object, row.relation, row.subject))
         .collect()
 }
 
@@ -222,6 +217,23 @@ fn drain(conn: &mut PgConnection) -> Vec<MessageV2> {
         .collect()
 }
 
+/// One fact, as both sides can spell it.
+///
+/// A relation name that came out of Postgres cannot be a `RelationName`: rls2fga
+/// keeps that constructor crate-private so the type is proof its clamp and its
+/// collision check both ran, and a string from a query is proof of neither. So
+/// the comparison is over text, which is what the loader's SQL and subql's
+/// rendering actually share.
+type Fact = (String, String, String);
+
+fn fact(record: &Record) -> Fact {
+    (
+        record.object.clone(),
+        record.relation.as_str().to_owned(),
+        record.subject.clone(),
+    )
+}
+
 /// Every record `description` implies over the `row` image of each event on
 /// its table.
 fn records_from_events(
@@ -229,7 +241,7 @@ fn records_from_events(
     description: &RecordDescription,
     catalog: &ParserDB,
     row: RowKind,
-) -> BTreeSet<Record> {
+) -> BTreeSet<Fact> {
     let RecordDerivation::FromRow { table, .. } = &description.derivation else {
         panic!("only a row-derived description reaches here");
     };
@@ -244,9 +256,12 @@ fn records_from_events(
             continue;
         };
         out.extend(
-            records_from_row_view(description, &view, catalog).unwrap_or_else(|error| {
-                panic!("subql refused a row it should read: {error}\n{description:#?}")
-            }),
+            records_from_row_view(description, &view, catalog)
+                .unwrap_or_else(|error| {
+                    panic!("subql refused a row it should read: {error}\n{description:#?}")
+                })
+                .iter()
+                .map(fact),
         );
     }
     out
@@ -317,7 +332,7 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
 
     let catalog = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap();
     let shapes = shapes(&catalog);
-    let before: BTreeSet<Record> = shapes
+    let before: BTreeSet<Fact> = shapes
         .iter()
         .flat_map(|(sql, _)| records_from_sql(&mut pg, sql))
         .collect();
@@ -343,7 +358,7 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
     let events = drain(&mut pg);
     assert_eq!(events.len(), 4, "one event per statement");
 
-    let after: BTreeSet<Record> = shapes
+    let after: BTreeSet<Fact> = shapes
         .iter()
         .flat_map(|(sql, _)| records_from_sql(&mut pg, sql))
         .collect();
@@ -353,7 +368,7 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
         .build()
         .translate(&catalog)
         .relations();
-    let store = StoreShapes::new(
+    let store = Shapes::new(
         ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap(),
         &relations,
     );
@@ -365,8 +380,8 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
         let diff = store
             .diff(event)
             .unwrap_or_else(|error| panic!("the difference was refused: {error}"));
-        added.extend(diff.added);
-        removed.extend(diff.removed);
+        added.extend(diff.added.iter().map(fact));
+        removed.extend(diff.removed.iter().map(fact));
         assert!(diff.requeries.is_empty(), "no shape here needs a query");
     }
 

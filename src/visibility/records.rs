@@ -168,6 +168,24 @@ const fn unsupported_guard(guard: &Guard) -> Option<RowRecordError> {
 /// read, which is a linear scan of the table's columns. Descriptions name
 /// one or two columns, so the scan is bounded by the table's arity and
 /// happens twice per changed row.
+/// See `row` as one row's column values, for rls2fga's own readers.
+///
+/// [`ObjectKey::render`](rls2fga::generator::records::ObjectKey::render) wants
+/// this, and naming a row is the one thing a caller needs it for that computing
+/// records does not already cover. Sharing the reader is the point: an object
+/// name spelled by a second reader would drift from the one the records carry.
+pub fn row_values<'a, R, DB>(row: &'a R, db: &'a DB) -> impl RowValues + 'a
+where
+    R: RowView + ?Sized,
+    DB: DatabaseLike,
+{
+    RowValuesView {
+        row,
+        db,
+        undecodable: Cell::new(None),
+    }
+}
+
 struct RowValuesView<'a, R: ?Sized, DB> {
     row: &'a R,
     db: &'a DB,
@@ -292,7 +310,10 @@ fn json_at(json: &serde_json::Value, path: &[String]) -> Option<String> {
 mod tests {
     use alloc::vec;
 
-    use rls2fga::generator::records::{ObjectKey, RecordTemplate, RowValues, SubjectKey};
+    use rls2fga::classifier::patterns::ConfidenceLevel;
+    use rls2fga::generator::records::{RowValues, SubjectKey};
+    use rls2fga::parser::identifiers::{ColumnName, RelationName};
+    use rls2fga::translator::TranslatorBuilder;
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::*;
@@ -304,31 +325,72 @@ mod tests {
     const DDL: &str = "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, public BOOL, \
                        meta JSONB, key UUID, note JSON, score DOUBLE PRECISION);";
 
+    /// The same table with the ownership policy that makes rls2fga describe it, so the
+    /// names in the description below are ones a translation decided.
+    const POLICIED: &str = "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, public BOOL, \
+                            meta JSONB, key UUID, note JSON, score DOUBLE PRECISION);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY docs_owner ON docs USING (owner = current_user);";
+
     fn catalog() -> ParserDB {
         ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap()
     }
 
-    /// `docs.<key_column>` grants `owner` to the user named by `subject`.
-    fn description(subject: ValueSource, guards: Vec<Guard>) -> RecordDescription {
-        RecordDescription {
-            tables: vec!["docs".into()],
-            derivation: RecordDerivation::FromRow {
-                table: "docs".into(),
-                template: Box::new(RecordTemplate {
-                    object_type: "docs".into(),
-                    object_key: ObjectKey::column("id"),
-                    relation: "owner".into(),
-                    subject_type: "user".into(),
-                    subject_key: SubjectKey::new(subject),
-                    context: None,
-                }),
-                guards,
-            },
+    /// Name a column the one way a caller outside rls2fga can, so a guard and a JSON path
+    /// name one too rather than spelling it as text.
+    fn column(name: &str) -> ColumnName {
+        match ValueSource::column(name) {
+            ValueSource::Column(column) => column,
+            other => unreachable!("`ValueSource::column` names a column, got {other:?}"),
         }
     }
 
+    /// The description rls2fga emits for `owner = current_user` on `docs`.
+    ///
+    /// Read off a real translation rather than assembled here, since the object type and
+    /// the relation are names the translation decides and nothing outside it may mint.
+    fn translated_ownership() -> RecordDescription {
+        let db = ParserDB::parse::<PostgreSqlDialect>(POLICIED).unwrap();
+        TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .build()
+            .translate(&db)
+            .relations()
+            .into_iter()
+            .flat_map(|entry| entry.shapes)
+            .find(|shape| {
+                matches!(&shape.derivation, RecordDerivation::FromRow { template, .. }
+                    if template.subject_type == "user")
+            })
+            .expect("the ownership policy describes records read from the row")
+    }
+
+    /// The relation a description names, for an assertion that must agree with it.
+    fn relation_of(description: &RecordDescription) -> RelationName {
+        match &description.derivation {
+            RecordDerivation::FromRow { template, .. } => template.relation.clone(),
+            other => unreachable!("the ownership description reads the row, got {other:?}"),
+        }
+    }
+
+    /// That description with the subject and the guards this test wants.
+    fn description(subject: ValueSource, guards: Vec<Guard>) -> RecordDescription {
+        let mut described = translated_ownership();
+        let RecordDerivation::FromRow {
+            template,
+            guards: existing,
+            ..
+        } = &mut described.derivation
+        else {
+            unreachable!("the ownership description reads the row");
+        };
+        template.subject_key = SubjectKey::new(subject);
+        *existing = guards;
+        described
+    }
+
     fn owner_description() -> RecordDescription {
-        description(ValueSource::Column("owner".into()), vec![])
+        description(ValueSource::column("owner"), vec![])
     }
 
     /// An insert carrying `[id, owner, public, meta, key, note, score]`.
@@ -364,12 +426,13 @@ mod tests {
     /// with no database.
     #[test]
     fn a_text_owner_column_becomes_one_record() {
-        let got = records(&owner_description(), row_of(Value::String("alice".into()))).unwrap();
+        let described = owner_description();
+        let got = records(&described, row_of(Value::String("alice".into()))).unwrap();
         assert_eq!(
             got,
             vec![Record {
                 object: "docs:4".into(),
-                relation: "owner".into(),
+                relation: relation_of(&described),
                 subject: "user:alice".into(),
                 context: None,
             }]
@@ -392,7 +455,7 @@ mod tests {
         let id = uuid::Uuid::parse_str("550E8400-E29B-41D4-A716-446655440000").unwrap();
         let mut row = row_of(Value::Null);
         row[4] = Value::Uuid(id);
-        let got = records(&description(ValueSource::Column("key".into()), vec![]), row).unwrap();
+        let got = records(&description(ValueSource::column("key"), vec![]), row).unwrap();
         assert_eq!(got[0].subject, "user:550e8400-e29b-41d4-a716-446655440000");
     }
 
@@ -409,7 +472,7 @@ mod tests {
     /// A column the catalog does not know is not a silent grant.
     #[test]
     fn an_unknown_column_produces_no_record() {
-        let d = description(ValueSource::Column("nonexistent".into()), vec![]);
+        let d = description(ValueSource::column("nonexistent"), vec![]);
         assert_eq!(
             records(&d, row_of(Value::String("alice".into()))).unwrap(),
             vec![]
@@ -420,8 +483,8 @@ mod tests {
     #[test]
     fn a_failing_guard_drops_the_record() {
         let d = description(
-            ValueSource::Column("owner".into()),
-            vec![Guard::IsTrue("public".into())],
+            ValueSource::column("owner"),
+            vec![Guard::IsTrue(column("public"))],
         );
         assert_eq!(
             records(&d, row_of(Value::String("alice".into()))).unwrap(),
@@ -441,7 +504,7 @@ mod tests {
         row[3] = Value::Jsonb(serde_json::json!({"acl": {"owner": "carol"}}));
         let d = description(
             ValueSource::JsonPath {
-                column: "meta".into(),
+                column: column("meta"),
                 path: vec!["acl".into(), "owner".into()],
             },
             vec![],
@@ -455,7 +518,7 @@ mod tests {
     /// access, so it must be an error the caller has to handle.
     #[test]
     fn a_list_shape_is_refused_rather_than_answered_empty() {
-        let d = description(ValueSource::ListElements("owner".into()), vec![]);
+        let d = description(ValueSource::ListElements(column("owner")), vec![]);
         assert_eq!(
             records(&d, row_of(Value::String("alice".into()))),
             Err(RowRecordError::UnsupportedValueSource("list"))
@@ -543,7 +606,7 @@ mod tests {
         row[5] = Value::Json(serde_json::json!({"acl": {"owner": "dan"}}));
         let d = description(
             ValueSource::JsonPath {
-                column: "note".into(),
+                column: column("note"),
                 path: vec!["acl".into(), "owner".into()],
             },
             vec![],
@@ -557,7 +620,7 @@ mod tests {
     fn a_json_path_on_a_non_json_column_produces_no_record() {
         let d = description(
             ValueSource::JsonPath {
-                column: "owner".into(),
+                column: column("owner"),
                 path: vec!["acl".into()],
             },
             vec![],
@@ -581,7 +644,7 @@ mod tests {
             row[3] = Value::Jsonb(document);
             let d = description(
                 ValueSource::JsonPath {
-                    column: "meta".into(),
+                    column: column("meta"),
                     path: vec!["acl".into(), "owner".into()],
                 },
                 vec![],
@@ -598,7 +661,7 @@ mod tests {
         row[3] = Value::Jsonb(serde_json::json!({"acl": {"owner": 12}}));
         let d = description(
             ValueSource::JsonPath {
-                column: "meta".into(),
+                column: column("meta"),
                 path: vec!["acl".into(), "owner".into()],
             },
             vec![],
@@ -612,7 +675,7 @@ mod tests {
         for (flag, expected) in [(true, "user:true"), (false, "user:false")] {
             let mut row = row_of(Value::Null);
             row[2] = Value::Bool(flag);
-            let d = description(ValueSource::Column("public".into()), vec![]);
+            let d = description(ValueSource::column("public"), vec![]);
             assert_eq!(records(&d, row).unwrap()[0].subject, expected);
         }
     }
@@ -624,7 +687,7 @@ mod tests {
     fn an_unpinned_type_produces_no_record() {
         let mut row = row_of(Value::Null);
         row[6] = Value::Float(1.5);
-        let d = description(ValueSource::Column("score".into()), vec![]);
+        let d = description(ValueSource::column("score"), vec![]);
         assert_eq!(records(&d, row).unwrap(), vec![]);
     }
 

@@ -51,12 +51,25 @@ pub mod records;
 #[cfg(feature = "visibility-records")]
 pub mod policy;
 
+// `shapes` carries its own `//!` docs, for the same reason.
+#[cfg(feature = "visibility-records")]
+pub mod shapes;
+
+// `openfga` carries its own `//!` docs, for the same reason.
+#[cfg(feature = "visibility-openfga")]
+pub mod openfga;
+
 // `store` carries its own `//!` docs, for the same reason.
 #[cfg(feature = "visibility-records")]
 pub mod store;
 
 // `transition` carries its own `//!` docs, for the same reason.
 pub mod transition;
+
+// Names a test needs, taken from a translation rather than spelled. Test-only, since
+// nothing outside rls2fga may mint one.
+#[cfg(all(test, feature = "visibility-records"))]
+pub(crate) mod test_names;
 
 use alloc::vec::Vec;
 
@@ -137,6 +150,87 @@ pub enum WriteOp {
     Update,
     /// Remove the row.
     Delete,
+}
+
+// ---------------------------------------------------------------------------
+// RowWrite
+// ---------------------------------------------------------------------------
+
+/// The write a question is about, carrying the row versions its verb needs.
+///
+/// A replacement is judged on two versions rather than one. The rule choosing
+/// which rows a caller may touch reads the row as it is, and the rule admitting
+/// the result reads the row as it will be, so one version cannot answer both:
+/// judging the new one asks whether the **new** owner is the caller, which
+/// grants a caller who holds nothing and writes themselves in as owner.
+///
+/// The verb and its versions therefore travel together, and the pairings that
+/// cannot be answered are not constructible.
+///
+/// # Judging a replacement on one version, deliberately
+///
+/// [`UpdateUsing`](Self::UpdateUsing) is what a caller asks when it holds only
+/// the row as it stands and wants to know whether a watcher may replace it at
+/// all, which is the question handing on a delegated permission over a row
+/// needs. It is the first rule alone, so it is a **weaker** question than
+/// [`Update`](Self::Update) rather than a cheaper spelling of it.
+///
+/// `#[non_exhaustive]`: a verb this learns adds a variant, and an
+/// implementation keeps a wildcard arm, which has to refuse rather than guess.
+#[non_exhaustive]
+pub enum RowWrite<'a, R: ?Sized> {
+    /// Creating the row, judged on the row being created.
+    Insert {
+        /// The row as it will be.
+        new: &'a R,
+    },
+    /// Replacing the row, judged on both versions.
+    Update {
+        /// The row as it is.
+        old: &'a R,
+        /// The row as it will be.
+        new: &'a R,
+    },
+    /// Whether the row as it stands may be replaced at all, for a caller
+    /// holding no other version.
+    UpdateUsing {
+        /// The row as it is.
+        old: &'a R,
+    },
+    /// Removing the row, judged on the row being removed.
+    Delete {
+        /// The row as it is.
+        old: &'a R,
+    },
+}
+
+// `Clone` and `Copy` by hand rather than derived: this holds references, which
+// are `Copy` whatever they point at, and the derive would demand `R: Copy` and
+// so refuse every real row view.
+impl<R: ?Sized> Clone for RowWrite<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R: ?Sized> Copy for RowWrite<'_, R> {}
+
+impl<R: ?Sized> RowWrite<'_, R> {
+    /// The verb, for an implementation wanting it without matching every
+    /// version the question carries.
+    ///
+    /// [`UpdateUsing`](Self::UpdateUsing) reports [`WriteOp::Update`] because
+    /// it is an update question. It is not the same question, so an
+    /// implementation deciding what to consult matches the variant instead of
+    /// reading this.
+    #[must_use]
+    pub const fn op(&self) -> WriteOp {
+        match self {
+            Self::Insert { .. } => WriteOp::Insert,
+            Self::Update { .. } | Self::UpdateUsing { .. } => WriteOp::Update,
+            Self::Delete { .. } => WriteOp::Delete,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +448,7 @@ impl<E: CdcEvent, DB: DatabaseLike> RowView for EventRow<'_, E, DB> {
 /// use sqlparser::dialect::PostgreSqlDialect;
 /// use subql::backend::{Postgres, Value};
 /// use subql::testing::TestEvent;
-/// use subql::visibility::{EventRow, RowView, Verdict, VisibilityPolicy, WriteOp};
+/// use subql::visibility::{EventRow, RowView, RowWrite, Verdict, VisibilityPolicy};
 /// use subql::{catalog_helpers, ParserDB};
 ///
 /// struct OwnerPolicy;
@@ -394,14 +488,25 @@ impl<E: CdcEvent, DB: DatabaseLike> RowView for EventRow<'_, E, DB> {
 ///
 ///     fn may_write<R>(
 ///         &self,
-///         row: &R,
+///         write: RowWrite<'_, R>,
 ///         watcher: &i64,
-///         _op: WriteOp,
 ///     ) -> impl Future<Output = Result<Verdict, Infallible>> + Send
 ///     where
 ///         R: RowView<Backend = Postgres> + Sync + ?Sized,
 ///     {
-///         let allowed = owner_of(row) == Some(*watcher);
+///         // A replacement is granted only if this watcher owns the row both
+///         // before and after, so it cannot write itself in as the new owner.
+///         let allowed = match write {
+///             RowWrite::Insert { new } => owner_of(new) == Some(*watcher),
+///             RowWrite::Update { old, new } => {
+///                 owner_of(old) == Some(*watcher) && owner_of(new) == Some(*watcher)
+///             }
+///             RowWrite::UpdateUsing { old } | RowWrite::Delete { old } => {
+///                 owner_of(old) == Some(*watcher)
+///             }
+///             // A verb this does not know refuses rather than guessing.
+///             _ => false,
+///         };
 ///         async move { Ok(if allowed { Verdict::Allow } else { Verdict::Deny }) }
 ///     }
 /// }
@@ -426,8 +531,17 @@ impl<E: CdcEvent, DB: DatabaseLike> RowView for EventRow<'_, E, DB> {
 /// runtime.block_on(OwnerPolicy.may_see(&row, &watchers, &mut verdicts))?;
 /// assert_eq!(verdicts, [Verdict::Allow, Verdict::Deny, Verdict::Allow]);
 ///
-/// let write = runtime.block_on(OwnerPolicy.may_write(&row, &9, WriteOp::Delete))?;
+/// let write = runtime.block_on(OwnerPolicy.may_write(RowWrite::Delete { old: &row }, &9))?;
 /// assert_eq!(write, Verdict::Deny);
+///
+/// // Watcher 7 owns row 4 and may delete it, and may not hand it to 9.
+/// let handover =
+///     TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Int(9)]).with_pk_columns([0u16]);
+/// let next = EventRow::current(&handover, &db).expect("an insert carries a post-image");
+/// let rewrite = runtime.block_on(
+///     OwnerPolicy.may_write(RowWrite::Update { old: &row, new: &next }, &7),
+/// )?;
+/// assert_eq!(rewrite, Verdict::Deny, "7 owns it now and would not after");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub trait VisibilityPolicy: Send + Sync {
@@ -465,21 +579,19 @@ pub trait VisibilityPolicy: Send + Sync {
     where
         R: RowView<Backend = Self::Backend> + Sync + ?Sized;
 
-    /// Decide whether `watcher` may perform `op` on `row`.
+    /// Decide whether `watcher` may perform `write`.
     ///
-    /// One watcher, one verb, one verdict. `Err` here is unambiguous:
+    /// One watcher, one write, one verdict. `Err` here is unambiguous:
     /// the policy could not determine an answer, which is a different
     /// thing to tell a client than "you are not allowed".
     ///
-    /// For [`WriteOp::Insert`] the row is the one being created, for
-    /// [`WriteOp::Delete`] the one being removed, and for
-    /// [`WriteOp::Update`] the caller chooses which version it wants
-    /// judged by which [`RowView`] it hands over.
+    /// [`RowWrite`] carries the row versions the verb is judged on, so a
+    /// replacement arrives with both and an implementation cannot be handed
+    /// half of what that question needs.
     fn may_write<R>(
         &self,
-        row: &R,
+        write: RowWrite<'_, R>,
         watcher: &Self::Watcher,
-        op: WriteOp,
     ) -> impl core::future::Future<Output = Result<Verdict, Self::Error>> + Send
     where
         R: RowView<Backend = Self::Backend> + Sync + ?Sized;
@@ -487,7 +599,7 @@ pub trait VisibilityPolicy: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventRow, RowView, Verdict, VisibilityPolicy, WriteOp};
+    use super::{EventRow, RowView, RowWrite, Verdict, VisibilityPolicy, WriteOp};
     use crate::backend::{CdcEvent, Postgres, RowKind, Value};
     use crate::testing::TestEvent;
     use crate::{catalog_helpers, TableId};
@@ -599,17 +711,26 @@ mod tests {
         }
 
         /// Deletes are refused outright, so the verb is the only thing
-        /// that differs between two otherwise identical questions.
+        /// that differs between two otherwise identical questions. A
+        /// replacement has to own the row both before and after.
         fn may_write<R>(
             &self,
-            row: &R,
+            write: RowWrite<'_, R>,
             watcher: &i64,
-            op: WriteOp,
         ) -> impl Future<Output = Result<Verdict, Unreachable>> + Send
         where
             R: RowView<Backend = Postgres> + Sync + ?Sized,
         {
-            let allowed = owner_of(row) == Some(*watcher) && !matches!(op, WriteOp::Delete);
+            let owns = match write {
+                RowWrite::Insert { new } => owner_of(new) == Some(*watcher),
+                RowWrite::Update { old, new } => {
+                    owner_of(old) == Some(*watcher) && owner_of(new) == Some(*watcher)
+                }
+                RowWrite::UpdateUsing { old } | RowWrite::Delete { old } => {
+                    owner_of(old) == Some(*watcher)
+                }
+            };
+            let allowed = owns && !matches!(write.op(), WriteOp::Delete);
             let fails = self.fail_from == Some(0);
             async move {
                 YieldOnce(false).await;
@@ -733,16 +854,22 @@ mod tests {
         let row = EventRow::current(&event, &db).expect("insert carries a post-image");
 
         let allowed =
-            block_on(OwnerPolicy { fail_from: None }.may_write(&row, &7, WriteOp::Insert))
+            block_on(OwnerPolicy { fail_from: None }.may_write(RowWrite::Insert { new: &row }, &7))
                 .expect("policy answers");
         assert_eq!(allowed, Verdict::Allow);
 
-        let denied = block_on(OwnerPolicy { fail_from: None }.may_write(&row, &9, WriteOp::Delete))
-            .expect("policy answers");
+        let denied =
+            block_on(OwnerPolicy { fail_from: None }.may_write(RowWrite::Delete { old: &row }, &9))
+                .expect("policy answers");
         assert_eq!(denied, Verdict::Deny);
 
-        let undetermined =
-            block_on(OwnerPolicy { fail_from: Some(0) }.may_write(&row, &7, WriteOp::Update));
+        let undetermined = block_on(OwnerPolicy { fail_from: Some(0) }.may_write(
+            RowWrite::Update {
+                old: &row,
+                new: &row,
+            },
+            &7,
+        ));
         assert_eq!(undetermined, Err(Unreachable));
     }
 
@@ -889,25 +1016,74 @@ mod tests {
         );
     }
 
-    /// The verb is the parameter that justifies a second method, so it
-    /// has to reach the implementation. Same watcher, same row, and the
-    /// verb is the only thing that differs.
+    /// The verb is what justifies a second method, so it has to reach the
+    /// implementation. Same watcher, same row, and the verb is the only thing
+    /// that differs.
     #[test]
     fn the_write_verb_reaches_the_policy() {
         let (db, docs) = catalog();
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Int(7)]);
         let row = EventRow::current(&event, &db).expect("insert carries a post-image");
 
-        let answer = |op| {
-            block_on(OwnerPolicy { fail_from: None }.may_write(&row, &7, op))
-                .expect("policy answers")
+        let answer = |write| {
+            block_on(OwnerPolicy { fail_from: None }.may_write(write, &7)).expect("policy answers")
         };
-        assert_eq!(answer(WriteOp::Insert), Verdict::Allow);
-        assert_eq!(answer(WriteOp::Update), Verdict::Allow);
+        assert_eq!(answer(RowWrite::Insert { new: &row }), Verdict::Allow);
         assert_eq!(
-            answer(WriteOp::Delete),
+            answer(RowWrite::Update {
+                old: &row,
+                new: &row
+            }),
+            Verdict::Allow
+        );
+        assert_eq!(answer(RowWrite::UpdateUsing { old: &row }), Verdict::Allow);
+        assert_eq!(
+            answer(RowWrite::Delete { old: &row }),
             Verdict::Deny,
             "the policy refuses deletes, so the verb must have arrived"
+        );
+    }
+
+    /// A replacement carries both versions, and a policy reading only the new
+    /// one grants a caller who writes themselves in as the owner.
+    #[test]
+    fn a_replacement_is_judged_on_both_versions() {
+        let (db, docs) = catalog();
+        let held = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Int(7)]);
+        let taken = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Int(9)]);
+        let old = EventRow::current(&held, &db).expect("insert carries a post-image");
+        let new = EventRow::current(&taken, &db).expect("insert carries a post-image");
+
+        let policy = OwnerPolicy { fail_from: None };
+
+        // 9 does not hold the row and writes itself in as the new owner.
+        assert_eq!(
+            block_on(policy.may_write(
+                RowWrite::Update {
+                    old: &old,
+                    new: &new
+                },
+                &9
+            )),
+            Ok(Verdict::Deny),
+            "the row as it is refuses 9, so the replacement refuses"
+        );
+        // 7 holds it and would hand it to 9, which the new version refuses.
+        assert_eq!(
+            block_on(policy.may_write(
+                RowWrite::Update {
+                    old: &old,
+                    new: &new
+                },
+                &7
+            )),
+            Ok(Verdict::Deny),
+            "the row as it will be refuses 7"
+        );
+        // Asked only about the row as it stands, 7 holds it.
+        assert_eq!(
+            block_on(policy.may_write(RowWrite::UpdateUsing { old: &old }, &7)),
+            Ok(Verdict::Allow)
         );
     }
 
