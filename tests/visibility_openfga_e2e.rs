@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openfga_client::client::{
-    CreateStoreRequest, OpenFgaServiceClient, TupleKey, WriteAuthorizationModelRequest,
-    WriteRequest, WriteRequestWrites,
+    CreateStoreRequest, OpenFgaServiceClient, TupleKey, WriteRequest, WriteRequestWrites,
 };
+use openfga_client::tonic::transport::Channel;
 use rls2fga::classifier::patterns::ConfidenceLevel;
 use rls2fga::generator::action_relations::ActionStatement;
 use rls2fga::translator::TranslatorBuilder;
@@ -87,27 +87,24 @@ impl Wiring {
             Shapes::new(self.db, &self.relations)
                 .with_row_naming(&self.naming)
                 .with_action_relations(&self.answers)
-                .with_required_parameters(&self.notes)
-                .with_condition_names(&self.model),
+                .with_required_parameters(&self.notes),
         )
     }
 }
 
-/// rls2fga's model as the client's protobuf types.
+/// Write the model rls2fga emitted and return the id the server stored it under.
 ///
-/// The two are different Rust types over one wire format, and JSON is the shape
-/// both agree on, so this converts rather than re-deriving anything: a model
-/// spelled twice would let the tuples subql writes and the rules the server
-/// applies drift apart.
-fn model_request(
+/// rls2fga's own writer, rather than a conversion spelled here: the model and the
+/// request are different Rust types over one wire format, and the crate that
+/// emits the model is where knowing that belongs.
+async fn write_model(
+    client: &mut OpenFgaServiceClient<Channel>,
     store_id: &str,
     model: &rls2fga::generator::json_model::AuthorizationModel,
-) -> WriteAuthorizationModelRequest {
-    let json = serde_json::to_value(model).expect("the model serializes");
-    let mut request: WriteAuthorizationModelRequest =
-        serde_json::from_value(json).expect("the client reads the same json");
-    store_id.clone_into(&mut request.store_id);
-    request
+) -> String {
+    rls2fga::client::write_authorization_model(client, store_id, model)
+        .await
+        .expect("write the model")
 }
 
 /// `can_select: member from teams`, which one row never decides: whether a
@@ -170,12 +167,7 @@ async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
         .into_inner()
         .id;
 
-    let model_id = client
-        .write_authorization_model(model_request(&store, &model))
-        .await
-        .expect("write the model")
-        .into_inner()
-        .authorization_model_id;
+    let model_id = write_model(&mut client, &store, &model).await;
 
     // The facts the loader would have written: doc 4 belongs to team 1, and
     // alice is a member of it. bob is a member of nothing.
@@ -275,12 +267,7 @@ async fn a_batch_over_the_cap_is_split_and_stays_positional() {
         .expect("create store")
         .into_inner()
         .id;
-    let model_id = client
-        .write_authorization_model(model_request(&store, &model))
-        .await
-        .expect("write the model")
-        .into_inner()
-        .authorization_model_id;
+    let model_id = write_model(&mut client, &store, &model).await;
 
     // Doc 4 belongs to team 1, and every third watcher is a member of it.
     let audience: Vec<String> = (0..120).map(|i| format!("user:u{i}")).collect();
@@ -389,12 +376,7 @@ CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
         .expect("create store")
         .into_inner()
         .id;
-    let model_id = client
-        .write_authorization_model(model_request(&store, &model))
-        .await
-        .expect("write the model")
-        .into_inner()
-        .authorization_model_id;
+    let model_id = write_model(&mut client, &store, &model).await;
 
     let shapes = wired.shapes();
     let backend = OpenFgaPolicy::<_, _, String, Postgres>::new(

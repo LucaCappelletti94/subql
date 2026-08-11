@@ -83,7 +83,7 @@ use openfga_client::tonic::body::Body;
 use openfga_client::tonic::client::GrpcService;
 use openfga_client::tonic::codegen::{Bytes, StdError};
 use openfga_client::tonic::Code;
-use rls2fga::generator::records::Record;
+use rls2fga::generator::records::{Record, RecordContextValue};
 use rls2fga::parser::identifiers::RelationName;
 use sql_traits::prelude::DatabaseLike;
 
@@ -147,17 +147,6 @@ pub enum OpenFgaError {
     /// or for a table the model gives no type.
     #[error("the model names no object for rows of the changed table")]
     RowCannotBeNamed,
-    /// A record carries a condition context and the model names no condition
-    /// for the relation it is written on, so the tuple cannot be sent.
-    ///
-    /// Reached when the index was built without
-    /// [`Shapes::with_condition_names`](crate::visibility::shapes::Shapes::with_condition_names),
-    /// or for a relation the model declares more than one condition on.
-    #[error("the model names no single condition for the relation {relation}")]
-    ConditionNotNamed {
-        /// The relation the tuple is written on.
-        relation: String,
-    },
     /// The model says nothing this can ask about the statement, so no question
     /// can be put.
     ///
@@ -607,7 +596,7 @@ where
             // A row the store has never seen carries the facts it implies, so the
             // rule admitting it has something to read. The stored row needs none.
             let contextual = match judge.version {
-                RowVersion::Resulting => self.contextual_of(row)?,
+                RowVersion::Resulting => self.contextual_of(row),
                 _ => Vec::new(),
             };
             plan.push(self.questions(row, judge.relation.as_str(), only, &contextual)?);
@@ -648,19 +637,12 @@ where
     /// A row that does not exist yet has nothing stored about it, so the rule
     /// admitting it can only be evaluated against facts supplied with the
     /// question.
-    ///
-    /// # Errors
-    ///
-    /// [`OpenFgaError::ConditionNotNamed`] for a record carrying a condition
-    /// context whose condition the model does not name. Sending it unnamed
-    /// would have the server evaluate the tuple by no condition at all, which
-    /// grants whatever the condition was there to restrict.
-    fn contextual_of<R>(&self, row: &R) -> Result<Vec<TupleKey>, OpenFgaError>
+    fn contextual_of<R>(&self, row: &R) -> Vec<TupleKey>
     where
         R: RowView + ?Sized,
     {
         let Some(shapes) = self.shapes.table_records(row.table_id()) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         let mut out = Vec::new();
         for shape in shapes {
@@ -672,32 +654,7 @@ where
                 continue;
             };
             for record in records {
-                let condition = match record.context {
-                    None => None,
-                    Some(context) => {
-                        let object_type = record
-                            .object
-                            .split_once(':')
-                            .map_or(record.object.as_str(), |(kind, _)| kind);
-                        let name = self
-                            .shapes
-                            .condition_name(object_type, record.relation.as_str())
-                            .ok_or_else(|| OpenFgaError::ConditionNotNamed {
-                                relation: record.relation.clone().to_string(),
-                            })?;
-                        Some(RelationshipCondition {
-                            name: name.to_string(),
-                            context: Some(Struct {
-                                fields: StructFields::from_iter([(
-                                    context.key,
-                                    ProstValue {
-                                        kind: Some(Kind::StringValue(context.value)),
-                                    },
-                                )]),
-                            }),
-                        })
-                    }
-                };
+                let condition = record.context.as_ref().map(condition_of);
                 out.push(TupleKey {
                     user: record.subject,
                     relation: record.relation.to_string(),
@@ -706,7 +663,7 @@ where
                 });
             }
         }
-        Ok(out)
+        out
     }
 }
 
@@ -745,14 +702,12 @@ where
     ///
     /// # Errors
     ///
-    /// [`OpenFgaError::Transport`] when the server could not be reached,
-    /// [`OpenFgaError::Rejected`] when it refused the write, and
-    /// [`OpenFgaError::ConditionNotNamed`] for an added record whose condition
-    /// the model does not name.
+    /// [`OpenFgaError::Transport`] when the server could not be reached, and
+    /// [`OpenFgaError::Rejected`] when it refused the write.
     pub async fn apply(&self, diff: &StoreDiff<'_, B>) -> Result<(), OpenFgaError> {
         let mut writes = Vec::with_capacity(diff.added.len());
         for record in &diff.added {
-            writes.push(self.tuple_of(record)?);
+            writes.push(tuple_of(record));
         }
         let deletes: Vec<TupleKeyWithoutCondition> = diff
             .removed
@@ -822,7 +777,7 @@ where
         for chunk in records.chunks(MAX_TUPLES_PER_WRITE) {
             let mut tuple_keys = Vec::with_capacity(chunk.len());
             for record in chunk {
-                tuple_keys.push(self.tuple_of(record)?);
+                tuple_keys.push(tuple_of(record));
             }
             self.write(
                 Some(WriteRequestWrites {
@@ -836,45 +791,6 @@ where
         Ok(())
     }
 
-    /// One record as a tuple, carrying its condition when it has one.
-    fn tuple_of(&self, record: &Record) -> Result<TupleKey, OpenFgaError> {
-        let condition = match record.context.as_ref() {
-            None => None,
-            Some(context) => Some(RelationshipCondition {
-                name: self.condition_for(record)?,
-                context: Some(Struct {
-                    fields: StructFields::from_iter([(
-                        context.key.clone(),
-                        ProstValue {
-                            kind: Some(Kind::StringValue(context.value.clone())),
-                        },
-                    )]),
-                }),
-            }),
-        };
-        Ok(TupleKey {
-            user: record.subject.clone(),
-            relation: record.relation.clone().to_string(),
-            object: record.object.clone(),
-            condition,
-        })
-    }
-
-    /// The condition the model names for `record`'s relation.
-    fn condition_for(&self, record: &Record) -> Result<String, OpenFgaError> {
-        let object_type = record
-            .object
-            .split_once(':')
-            .map_or(record.object.as_str(), |(kind, _)| kind);
-        self.shapes
-            .condition_name(object_type, record.relation.as_str())
-            .map(ToString::to_string)
-            .ok_or_else(|| OpenFgaError::ConditionNotNamed {
-                relation: record.relation.clone().to_string(),
-            })
-    }
-
-    /// One write, retried while the failure is the transport's.
     async fn write(
         &self,
         writes: Option<WriteRequestWrites>,
@@ -912,6 +828,35 @@ where
                 }
             }
         }
+    }
+}
+
+/// One record as a tuple, carrying its condition when it has one.
+///
+/// Free rather than a method, and infallible, because the condition name travels
+/// on the record. Looking it up by relation, which is what this did before, was a
+/// second copy of something rls2fga already states.
+fn tuple_of(record: &Record) -> TupleKey {
+    TupleKey {
+        user: record.subject.clone(),
+        relation: record.relation.clone().to_string(),
+        object: record.object.clone(),
+        condition: record.context.as_ref().map(condition_of),
+    }
+}
+
+/// The condition a record's context asks the server to complete.
+fn condition_of(context: &RecordContextValue) -> RelationshipCondition {
+    RelationshipCondition {
+        name: context.condition.clone(),
+        context: Some(Struct {
+            fields: StructFields::from_iter([(
+                context.key.clone(),
+                ProstValue {
+                    kind: Some(Kind::StringValue(context.value.clone())),
+                },
+            )]),
+        }),
     }
 }
 
@@ -984,11 +929,12 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{
-        batch_request, consistency_for, context_for, usable_index, ActionStatement, BatchCheckItem,
-        CheckRequestTupleKey, Code, ConsistencyPreference, Kind, OpenFgaError, Question,
-        RequestValues, RequiredParameter, Subject,
+        batch_request, consistency_for, context_for, tuple_of, usable_index, ActionStatement,
+        BatchCheckItem, CheckRequestTupleKey, Code, ConsistencyPreference, Kind, OpenFgaError,
+        Question, Record, RecordContextValue, RequestValues, RequiredParameter, Subject,
     };
     use crate::visibility::shapes::Shapes;
+    use crate::visibility::test_names;
     use crate::ParserDB;
 
     /// The four statements a write can be, which is what `statement_of` reports
@@ -1030,6 +976,55 @@ mod tests {
                 "{statement:?} is a write and must not be answered from cache"
             );
         }
+    }
+
+    /// The condition a tuple names comes off the record, which is the only thing
+    /// that knows it. Looking it up by relation, as this used to, is a second
+    /// copy of something rls2fga already states, and two copies can disagree.
+    #[test]
+    fn a_tuple_names_the_condition_its_record_carries() {
+        let record = Record {
+            object: "docs:1".to_string(),
+            relation: test_names::relation("owner"),
+            subject: "user:*".to_string(),
+            context: Some(RecordContextValue {
+                condition: "when_row_owner".to_string(),
+                key: "row_owner".to_string(),
+                value: "alice".to_string(),
+            }),
+        };
+
+        let condition = tuple_of(&record)
+            .condition
+            .expect("a record carrying a context yields a conditional tuple");
+        assert_eq!(condition.name, "when_row_owner");
+        let fields = condition
+            .context
+            .expect("the condition carries its context");
+        assert_eq!(
+            fields
+                .fields
+                .get("row_owner")
+                .and_then(|value| match &value.kind {
+                    Some(Kind::StringValue(text)) => Some(text.as_str()),
+                    _ => None,
+                }),
+            Some("alice")
+        );
+    }
+
+    /// An unconditional record yields an unconditional tuple. A condition
+    /// invented for it would be refused by the server for naming nothing the
+    /// model declares.
+    #[test]
+    fn a_record_without_a_context_yields_an_unconditional_tuple() {
+        let record = Record {
+            object: "docs:1".to_string(),
+            relation: test_names::relation("owner"),
+            subject: "user:alice".to_string(),
+            context: None,
+        };
+        assert!(tuple_of(&record).condition.is_none());
     }
 
     /// A read takes the cheap path by default, which is what makes asking per

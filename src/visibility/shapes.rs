@@ -34,7 +34,6 @@ use alloc::vec::Vec;
 use core::ops::Not;
 use hashbrown::HashMap;
 use rls2fga::generator::action_relations::{ActionAnswer, ActionRelations, ActionStatement};
-use rls2fga::generator::json_model::AuthorizationModel;
 use rls2fga::generator::notes::TranslationNote;
 use rls2fga::generator::records::{BoundQuery, RecordDerivation, RecordDescription};
 use rls2fga::generator::relations::{RelationShapes, RowDecision};
@@ -164,12 +163,6 @@ pub struct Shapes<DB> {
     naming: HashMap<TableId, RowNaming>,
     /// Parameters every question's context has to carry.
     parameters: Vec<RequiredParameter>,
-    /// The condition a conditional tuple has to name, by the object type and
-    /// then the relation it is written on.
-    ///
-    /// Nested rather than keyed on a pair, so a lookup borrows both halves and
-    /// allocates nothing.
-    conditions: HashMap<String, HashMap<String, String>>,
 }
 
 impl<DB: DatabaseLike> Shapes<DB> {
@@ -212,7 +205,6 @@ impl<DB: DatabaseLike> Shapes<DB> {
             answers: HashMap::new(),
             naming: HashMap::new(),
             parameters: Vec::new(),
-            conditions: HashMap::new(),
         }
     }
 
@@ -252,54 +244,6 @@ impl<DB: DatabaseLike> Shapes<DB> {
             })
             .collect();
         self
-    }
-
-    /// Take the condition names from the emitted model, through
-    /// [`Outputs::json_model`](rls2fga::translator::Outputs::json_model).
-    ///
-    /// A record carrying a condition context is a conditional tuple, and
-    /// writing one names the condition the model declares. The record itself
-    /// carries the context and not the name, and the name is not derivable from
-    /// the relation: it is minted from the type and the policy and then clamped.
-    /// The model is where it is stated, so the model is where this reads it.
-    ///
-    /// A relation declaring more than one condition is left out rather than
-    /// guessed at, because picking one would write a tuple the model evaluates
-    /// by a rule nobody chose.
-    #[must_use]
-    pub fn with_condition_names(mut self, model: &AuthorizationModel) -> Self {
-        for definition in &model.type_definitions {
-            let Some(metadata) = definition.metadata.as_ref() else {
-                continue;
-            };
-            for (relation, entry) in &metadata.relations {
-                let mut named = entry
-                    .directly_related_user_types
-                    .iter()
-                    .filter_map(|reference| reference.condition.as_ref());
-                let Some(condition) = named.next() else {
-                    continue;
-                };
-                if named.next().is_some() {
-                    continue;
-                }
-                self.conditions
-                    .entry_ref(definition.type_name.as_str())
-                    .or_default()
-                    .insert(String::from(relation.as_str()), condition.clone());
-            }
-        }
-        self
-    }
-
-    /// The condition a tuple on `type_name`'s `relation` has to name, or
-    /// [`None`] when the model declares none.
-    #[must_use]
-    pub fn condition_name(&self, type_name: &str, relation: &str) -> Option<&str> {
-        self.conditions
-            .get(type_name)
-            .and_then(|relations| relations.get(relation))
-            .map(String::as_str)
     }
 
     /// The catalog every reader resolves tables against.
