@@ -823,8 +823,9 @@ where
                     literals.push(B::parse_literal(&val.value, list_target)?);
                 } else {
                     return Err(RegisterError::UnsupportedSql(
-                        "IN with subqueries not supported - SubQL only supports IN with literal lists like IN ('a', 'b', 'c'). \
-                         For IN with subqueries, run this as a regular SQL query in your database."
+                        "IN requires a literal list - SubQL only supports IN with literals like IN ('a', 'b', 'c'), \
+                         not column references or computed expressions. \
+                         For anything else, run this as a regular SQL query in your database."
                             .to_string(),
                     ));
                 }
@@ -835,6 +836,21 @@ where
             if *negated {
                 out.push(Instruction::Not);
             }
+        }
+
+        // ====================================================================
+        // IN Subqueries
+        // ====================================================================
+        // Its own arm rather than the catch-all below, which would print the
+        // whole parsed expression with `Debug`. The arm above cannot say this:
+        // `IN (SELECT ...)` parses to `InSubquery` and never reaches it.
+        Expr::InSubquery { .. } => {
+            return Err(RegisterError::UnsupportedSql(
+                "IN with a subquery is not supported - SubQL filters one table's change events and \
+                 cannot run a nested SELECT. Use IN with a literal list, or run this as a regular \
+                 SQL query in your database."
+                    .to_string(),
+            ));
         }
 
         // ====================================================================

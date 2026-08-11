@@ -2897,6 +2897,60 @@ mod tests {
         SubscriptionRequest::new(consumer, format!("SELECT * FROM orders WHERE id = {id}"))
     }
 
+    fn refusal(where_clause: &str) -> String {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+        let sql = format!("SELECT * FROM orders WHERE {where_clause}");
+        match engine.register(SubscriptionRequest::new(1, sql)) {
+            Err(RegisterError::UnsupportedSql(message)) => message,
+            other => panic!("{where_clause} should be refused as unsupported SQL, got {other:?}"),
+        }
+    }
+
+    /// A subquery inside `IN` is refused by the message that describes it. The
+    /// wording lives on the arm that handles a literal list, which never
+    /// receives a subquery, so before this the one user who wrote exactly what
+    /// the message describes got a debug dump of their own expression instead.
+    #[test]
+    fn an_in_subquery_is_refused_by_the_message_that_names_it() {
+        let message = refusal("id IN (SELECT id FROM orders)");
+        assert!(
+            message.contains("IN with a subquery is not supported"),
+            "the refusal should name the subquery, got {message:?}"
+        );
+        assert!(
+            !message.contains("InSubquery"),
+            "the refusal should not print the parsed expression, got {message:?}"
+        );
+    }
+
+    /// `EXISTS` is a subquery too, and it reaches the same catch-all. It is
+    /// refused, and not by the wording that promises something about `IN`.
+    #[test]
+    fn an_exists_subquery_is_refused_without_claiming_to_be_about_in() {
+        let message = refusal("EXISTS (SELECT 1 FROM orders)");
+        assert!(
+            !message.contains("IN with"),
+            "an EXISTS refusal should not describe IN, got {message:?}"
+        );
+    }
+
+    /// The literal-list arm still refuses a list item that is not a literal, and
+    /// now says so instead of blaming subqueries. Comparing a column against
+    /// other columns is a different mistake and deserves a different sentence.
+    #[test]
+    fn a_non_literal_in_list_item_is_refused_for_what_it_is() {
+        let message = refusal("id IN (amount, status)");
+        assert!(
+            !message.contains("subquer"),
+            "a non-literal list item is not a subquery, got {message:?}"
+        );
+        assert!(
+            message.contains("literal"),
+            "the refusal should say the list must be literals, got {message:?}"
+        );
+    }
+
     /// `register_batch` under `EvictOldest` matches a sequential `register`
     /// loop: each over-cap entry evicts the subscription committed just before
     /// it and succeeds, so a batch never shields its own members. Guards
