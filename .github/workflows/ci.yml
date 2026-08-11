@@ -234,7 +234,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-udeps --locked
-      - run: cargo +nightly udeps --all-targets --workspace
+      # `--all-features`, because the optional dependencies are exactly the ones
+      # worth checking: every consumer of `rls2fga` sits behind `visibility-records`
+      # or `visibility-openfga`, and the two test targets that use it declare
+      # `required-features`. Under default features none of that compiles, so the
+      # dependency and the dev-dependency both read as unused.
+      - run: cargo +nightly udeps --all-targets --workspace --all-features
 
   audit:
     name: security audit
