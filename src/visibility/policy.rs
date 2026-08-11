@@ -2702,6 +2702,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                     subject_type: "user".to_string(),
                     subject_key: SubjectKey::wildcard(),
                     context: Some(RecordContext {
+                        condition: format!("when_{key}"),
                         key: key.to_string(),
                         value: ValueSource::column(column),
                     }),

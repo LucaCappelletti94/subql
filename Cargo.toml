@@ -403,8 +403,9 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "
 # which `(object, relation, subject)` facts it implies, and whether a
 # relation's records follow from that row alone. Backs the
 # `visibility-records` feature. `default-features = false` keeps the
-# `no_std + alloc` posture (its `std`, `agent` and `db` features pull
-# reqwest, tokio and diesel, none of which subql wants here).
+# `no_std + alloc` posture: its `std` feature forwards `std` to the parser
+# and serde, and its `client` feature pulls a gRPC stack subql does not want
+# in the library, only in the end-to-end test.
 rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
 
 # OpenFGA gRPC client, behind `visibility-openfga`. The only maintained Rust
@@ -483,8 +484,10 @@ proptest = "1"
 # translator, not just the record types, so it plans a schema and runs the
 # tuple SQL rls2fga emits for it. An integration test sees only subql's
 # dev-dependencies, so the library's optional `rls2fga` is not enough.
-# Default features on, since the translator is `std`-only.
-rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main" }
+# Default features on, since the translator is `std`-only, plus `client` so
+# `tests/visibility_openfga_e2e.rs` writes the emitted model to the server
+# through rls2fga rather than converting it here.
+rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", features = ["client"] }
 
 # Multi-task async runtime for tests that need real concurrency (e.g.
 # `tests/reexec_throttle.rs`, which observes peak in-flight connector
