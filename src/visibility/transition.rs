@@ -263,7 +263,7 @@ mod tests {
     use super::{transitions, Transition, TransitionError, Transitions};
     use crate::backend::{Postgres, Value};
     use crate::testing::TestEvent;
-    use crate::visibility::{RowView, Verdict, VisibilityPolicy, WriteOp};
+    use crate::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB, TableId};
 
     // -----------------------------------------------------------------
@@ -353,9 +353,8 @@ mod tests {
 
         fn may_write<R>(
             &self,
-            _row: &R,
+            _write: RowWrite<'_, R>,
             _watcher: &i64,
-            _op: WriteOp,
         ) -> impl Future<Output = Result<Verdict, Unreachable>> + Send
         where
             R: RowView<Backend = Postgres> + Sync + ?Sized,

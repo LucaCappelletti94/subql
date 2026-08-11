@@ -24,7 +24,7 @@
 //! [`rls2fga`] already bound to one row is handed over with the key read
 //! off the row, and the caller runs it. A shape in a list column can be
 //! neither differenced nor queried, so it is named in
-//! [`StoreShapes::uncovered`] and nothing else, because a caller that
+//! [`Shapes::uncovered`](crate::visibility::shapes::Shapes::uncovered) and nothing else, because a caller that
 //! believes its store is complete when it is not is the failure this whole
 //! path exists to remove.
 //!
@@ -49,17 +49,16 @@ use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use hashbrown::HashMap;
 use rls2fga::generator::records::{BoundQuery, Record, RecordDerivation, RecordDescription};
 use rls2fga::generator::relations::RelationShapes;
 use sql_traits::prelude::DatabaseLike;
 
 use crate::backend::{Backend, CdcEvent, Value};
-use crate::catalog_helpers;
-use crate::visibility::records::{is_evaluable, records_from_row_view, RowRecordError};
+use crate::visibility::records::{records_from_row_view, RowRecordError};
+use crate::visibility::shapes::{Shapes, TableShapes};
 use crate::visibility::transition::is_key_only;
 use crate::visibility::{EventRow, RowView};
-use crate::{ColumnId, EventKind, TableId};
+use crate::{ColumnId, EventKind};
 
 // ---------------------------------------------------------------------------
 // Uncovered
@@ -175,154 +174,14 @@ pub enum StoreDiffError {
 }
 
 // ---------------------------------------------------------------------------
-// StoreShapes
+// The difference one changed row makes
 // ---------------------------------------------------------------------------
 
-/// Shapes reaching one table's rows, resolved to subql ids once.
-#[derive(Debug, Default)]
-struct TableShapes {
-    /// Shapes whose records a row of this table settles on its own.
-    settled: Vec<RecordDescription>,
-    /// Queries to replay when a row of this table changes, with the column
-    /// each one binds.
-    requeries: Vec<(ColumnId, BoundQuery)>,
-}
+// ---------------------------------------------------------------------------
+// The difference one changed row makes
+// ---------------------------------------------------------------------------
 
-/// Every shape of a schema, indexed by the table whose changes move it.
-///
-/// Build it from [`rls2fga::translator::Translation::relations`] and the
-/// catalog those relations were planned against, then ask it what each
-/// changed row moved.
-///
-/// # Examples
-///
-/// ```
-/// use rls2fga::classifier::patterns::ConfidenceLevel;
-/// use rls2fga::translator::TranslatorBuilder;
-/// use sqlparser::dialect::PostgreSqlDialect;
-/// use subql::backend::{Postgres, Value};
-/// use subql::testing::TestEvent;
-/// use subql::visibility::store::StoreShapes;
-/// use subql::{catalog_helpers, ParserDB};
-///
-/// let db = ParserDB::parse::<PostgreSqlDialect>(
-///     "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);
-///      ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
-///      CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);",
-/// )?;
-/// let docs = catalog_helpers::table_id(&db, "docs").expect("docs is in the catalog");
-///
-/// let relations = TranslatorBuilder::new()
-///     .with_min_confidence(ConfidenceLevel::B)
-///     .build()
-///     .translate(&db)
-///     .relations();
-/// let store = StoreShapes::new(db, &relations);
-/// assert!(store.uncovered().is_empty(), "every shape here reads from the row");
-///
-/// // The row changes hands, so one fact is withdrawn and one is stated.
-/// let event = TestEvent::<Postgres>::update(
-///     docs,
-///     vec![Value::Int(4), Value::String("alice".into())],
-///     vec![Value::Int(4), Value::String("bob".into())],
-/// )
-/// .with_pk_columns([0u16]);
-///
-/// let diff = store.diff(&event)?;
-/// assert_eq!(diff.added.len(), 1);
-/// assert_eq!(diff.added[0].subject, "user:bob");
-/// assert_eq!(diff.removed[0].subject, "user:alice");
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Debug)]
-pub struct StoreShapes<DB> {
-    db: DB,
-    by_table: HashMap<TableId, TableShapes>,
-    uncovered: Vec<Uncovered>,
-}
-
-impl<DB: DatabaseLike> StoreShapes<DB> {
-    /// Index every shape in `relations` by the table whose changes move it.
-    ///
-    /// A shape reading a table the catalog does not know is skipped rather
-    /// than reported: that table produces no events here, so skipping it
-    /// introduces no staleness and there would be no remedy to name.
-    #[must_use]
-    pub fn new(db: DB, relations: &[RelationShapes]) -> Self {
-        let mut by_table: HashMap<TableId, TableShapes> = HashMap::new();
-        let mut uncovered = Vec::new();
-        for entry in relations {
-            for shape in &entry.shapes {
-                match &shape.derivation {
-                    RecordDerivation::FromRow { table, .. } => {
-                        if !is_evaluable(shape) {
-                            uncovered.push(name_gap(
-                                entry,
-                                shape,
-                                table,
-                                UncoveredReason::UnreadableColumn,
-                            ));
-                            continue;
-                        }
-                        if let Some(id) = catalog_helpers::table_id(&db, table) {
-                            by_table.entry(id).or_default().settled.push(shape.clone());
-                        }
-                    }
-                    RecordDerivation::Joined { queries, .. } => {
-                        for query in queries {
-                            let Some(id) = catalog_helpers::table_id(&db, &query.table) else {
-                                continue;
-                            };
-                            let Some(key) = catalog_helpers::column_id(&db, id, &query.key_column)
-                            else {
-                                continue;
-                            };
-                            by_table
-                                .entry(id)
-                                .or_default()
-                                .requeries
-                                .push((key, query.clone()));
-                        }
-                        // A table the shape reads with no query bound to it
-                        // has nothing to replay when a change arrives there.
-                        for table in &shape.tables {
-                            if !queries.iter().any(|query| query.table == *table) {
-                                uncovered.push(name_gap(
-                                    entry,
-                                    shape,
-                                    table,
-                                    UncoveredReason::NoBoundQuery,
-                                ));
-                            }
-                        }
-                    }
-                    // `RecordDerivation` is `#[non_exhaustive]`: a shape this
-                    // does not understand is named rather than assumed covered.
-                    _ => uncovered.extend(shape.tables.iter().map(|table| {
-                        name_gap(entry, shape, table, UncoveredReason::UnreadableColumn)
-                    })),
-                }
-            }
-        }
-        Self {
-            db,
-            by_table,
-            uncovered,
-        }
-    }
-
-    /// The catalog, so the caller resolves tables against the same one.
-    pub const fn catalog(&self) -> &DB {
-        &self.db
-    }
-
-    /// Shapes whose records this cannot keep current, settled once at
-    /// construction because it depends on the schema rather than on any row.
-    #[must_use]
-    pub fn uncovered(&self) -> &[Uncovered] {
-        &self.uncovered
-    }
-
+impl<DB: DatabaseLike> Shapes<DB> {
     /// What `event` moved.
     ///
     /// # Errors
@@ -340,8 +199,9 @@ impl<DB: DatabaseLike> StoreShapes<DB> {
         if event.kind() == EventKind::Truncate {
             return Err(StoreDiffError::NotARowEvent);
         }
-        let current = EventRow::current(event, &self.db);
-        let previous = EventRow::previous(event, &self.db);
+        let db = self.catalog();
+        let current = EventRow::current(event, db);
+        let previous = EventRow::previous(event, db);
         let Some(table) = current
             .as_ref()
             .map(RowView::table_id)
@@ -349,21 +209,21 @@ impl<DB: DatabaseLike> StoreShapes<DB> {
         else {
             return Err(StoreDiffError::UnknownTable);
         };
-        let Some(shapes) = self.by_table.get(&table) else {
+        let Some(shapes) = self.table_shapes(table) else {
             return Ok(StoreDiff::empty());
         };
 
         // Only a settled shape has to read the row, so a key-only previous
         // image is harmless for a table reached only by a bound query.
         let before = match previous.as_ref().filter(|_| !shapes.settled.is_empty()) {
-            Some(row) if is_key_only(row, event, &self.db) => {
+            Some(row) if is_key_only(row, event, db) => {
                 return Err(StoreDiffError::IncompletePreviousImage)
             }
-            Some(row) => records_of(&shapes.settled, row, &self.db)?,
+            Some(row) => records_of(&shapes.settled, row, db)?,
             None => BTreeSet::new(),
         };
         let after = match current.as_ref() {
-            Some(row) => records_of(&shapes.settled, row, &self.db)?,
+            Some(row) => records_of(&shapes.settled, row, db)?,
             None => BTreeSet::new(),
         };
 
@@ -419,8 +279,8 @@ where
     Ok(out)
 }
 
-/// Name the shape a gap belongs to, for [`StoreShapes::uncovered`].
-fn name_gap(
+/// Name the shape a gap belongs to, for [`Shapes::uncovered`](crate::visibility::shapes::Shapes::uncovered).
+pub(crate) fn name_gap(
     entry: &RelationShapes,
     shape: &RecordDescription,
     table: &str,
@@ -469,13 +329,19 @@ mod tests {
     use rls2fga::classifier::patterns::ConfidenceLevel;
     use rls2fga::generator::records::{BoundQuery, Record, RecordDerivation, RecordDescription};
     use rls2fga::generator::relations::RelationShapes;
+    use rls2fga::generator::well_known::{
+        can_delete_relation, can_select_relation, member_relation,
+    };
+    use rls2fga::parser::identifiers::RelationName;
     use rls2fga::translator::TranslatorBuilder;
     use sqlparser::dialect::PostgreSqlDialect;
 
-    use super::{StoreDiffError, StoreShapes, UncoveredReason};
+    use super::{StoreDiffError, UncoveredReason};
     use crate::backend::{CdcEvent, Postgres, RowKind, Value};
     use crate::testing::TestEvent;
     use crate::visibility::records::RowRecordError;
+    use crate::visibility::shapes::Shapes;
+    use crate::visibility::test_names;
     use crate::{
         catalog_helpers, ColumnId, EventKind, NoCheckpoint, ParserDB, TableId, ValueError,
     };
@@ -525,17 +391,17 @@ ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 ";
 
-    fn shapes(sql: &str) -> StoreShapes<ParserDB> {
+    fn shapes(sql: &str) -> Shapes<ParserDB> {
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
         let relations = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .build()
             .translate(&db)
             .relations();
-        StoreShapes::new(db, &relations)
+        Shapes::new(db, &relations)
     }
 
-    fn table(shapes: &StoreShapes<ParserDB>, name: &str) -> TableId {
+    fn table(shapes: &Shapes<ParserDB>, name: &str) -> TableId {
         catalog_helpers::table_id(shapes.catalog(), name).unwrap()
     }
 
@@ -543,10 +409,10 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         Value::String(value.into())
     }
 
-    fn record(object: &str, relation: &str, subject: &str) -> Record {
+    fn record(object: &str, relation: RelationName, subject: &str) -> Record {
         Record {
             object: object.into(),
-            relation: relation.into(),
+            relation,
             subject: subject.into(),
             context: None,
         }
@@ -571,8 +437,18 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 
         let diff = store.diff(&event).unwrap();
 
-        assert_eq!(diff.added, [record("docs:4", "owner", "user:bob")]);
-        assert_eq!(diff.removed, [record("docs:4", "owner", "user:alice")]);
+        assert_eq!(
+            diff.added,
+            [record("docs:4", test_names::relation("owner"), "user:bob")]
+        );
+        assert_eq!(
+            diff.removed,
+            [record(
+                "docs:4",
+                test_names::relation("owner"),
+                "user:alice"
+            )]
+        );
     }
 
     /// An update that leaves the granting column alone moves nothing, so the
@@ -605,7 +481,14 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 
         let diff = store.diff(&event).unwrap();
 
-        assert_eq!(diff.added, [record("docs:4", "owner", "user:alice")]);
+        assert_eq!(
+            diff.added,
+            [record(
+                "docs:4",
+                test_names::relation("owner"),
+                "user:alice"
+            )]
+        );
         assert!(diff.removed.is_empty());
     }
 
@@ -621,7 +504,14 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         let diff = store.diff(&event).unwrap();
 
         assert!(diff.added.is_empty());
-        assert_eq!(diff.removed, [record("docs:4", "owner", "user:alice")]);
+        assert_eq!(
+            diff.removed,
+            [record(
+                "docs:4",
+                test_names::relation("owner"),
+                "user:alice"
+            )]
+        );
     }
 
     /// A row whose granting column is NULL grants nobody, and a row that
@@ -639,7 +529,14 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 
         let diff = store.diff(&event).unwrap();
 
-        assert_eq!(diff.added, [record("docs:4", "owner", "user:alice")]);
+        assert_eq!(
+            diff.added,
+            [record(
+                "docs:4",
+                test_names::relation("owner"),
+                "user:alice"
+            )]
+        );
         assert!(diff.removed.is_empty());
     }
 
@@ -718,8 +615,14 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 
         let diff = store.diff(&event).unwrap();
 
-        assert_eq!(diff.added, [record("teams:3", "member", "user:bob")]);
-        assert_eq!(diff.removed, [record("teams:3", "member", "user:alice")]);
+        assert_eq!(
+            diff.added,
+            [record("teams:3", member_relation(), "user:bob")]
+        );
+        assert_eq!(
+            diff.removed,
+            [record("teams:3", member_relation(), "user:alice")]
+        );
     }
 
     // -----------------------------------------------------------------
@@ -996,12 +899,12 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         .unwrap();
         let bound = |table: &str, key_column: &str| BoundQuery {
             table: table.to_string(),
-            key_column: key_column.to_string(),
+            key_column: test_names::column(key_column),
             sql: "SELECT 1 WHERE x = $1;".to_string(),
         };
         let relations = vec![RelationShapes {
-            type_name: "docs".to_string(),
-            relation: "can_select".to_string(),
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
             from_one_row: false,
             shapes: vec![RecordDescription {
                 tables: vec!["docs".to_string(), "grants".to_string()],
@@ -1016,7 +919,7 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
             }],
             decision: None,
         }];
-        let store = StoreShapes::new(db, &relations);
+        let store = Shapes::new(db, &relations);
 
         let uncovered = store.uncovered();
         assert_eq!(uncovered.len(), 1, "{uncovered:?}");
@@ -1044,10 +947,10 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         )
         .unwrap();
         let relations = vec![
-            joining("can_select", "SELECT 'read' WHERE id = $1;"),
-            joining("can_delete", "SELECT 'delete' WHERE id = $1;"),
+            joining(can_select_relation(), "SELECT 'read' WHERE id = $1;"),
+            joining(can_delete_relation(), "SELECT 'delete' WHERE id = $1;"),
         ];
-        let store = StoreShapes::new(db, &relations);
+        let store = Shapes::new(db, &relations);
         let docs = table(&store, "docs");
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
@@ -1079,8 +982,11 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         )
         .unwrap();
         let same = "SELECT 'read' WHERE id = $1;";
-        let relations = vec![joining("can_select", same), joining("can_delete", same)];
-        let store = StoreShapes::new(db, &relations);
+        let relations = vec![
+            joining(can_select_relation(), same),
+            joining(can_delete_relation(), same),
+        ];
+        let store = Shapes::new(db, &relations);
         let docs = table(&store, "docs");
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
@@ -1091,17 +997,17 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
     }
 
     /// One relation filled by a joining shape whose query binds `docs.id`.
-    fn joining(relation: &str, sql: &str) -> RelationShapes {
+    fn joining(relation: RelationName, sql: &str) -> RelationShapes {
         RelationShapes {
-            type_name: "docs".to_string(),
-            relation: relation.to_string(),
+            type_name: test_names::docs_type(),
+            relation,
             from_one_row: false,
             shapes: vec![RecordDescription {
                 tables: vec!["docs".to_string()],
                 derivation: RecordDerivation::Joined {
                     queries: vec![BoundQuery {
                         table: "docs".to_string(),
-                        key_column: "id".to_string(),
+                        key_column: test_names::column("id"),
                         sql: sql.to_string(),
                     }],
                     reason: "two rows".to_string(),

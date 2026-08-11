@@ -125,6 +125,14 @@ required-features = ["executor-diesel-postgres"]
 name = "visibility_records_parity"
 required-features = ["visibility-records", "executor-diesel-postgres"]
 
+# The delegated half against a real OpenFGA server, which is the one criterion
+# every other visibility test proves only against a counting stand-in. Run with:
+#   cargo test --test visibility_openfga_e2e \
+#       --features "visibility-openfga testing" -- --ignored --nocapture
+[[test]]
+name = "visibility_openfga_e2e"
+required-features = ["visibility-openfga", "testing"]
+
 [[test]]
 name = "follow_insert_postgres"
 required-features = ["diesel-typed"]
@@ -398,6 +406,16 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "
 # `no_std + alloc` posture (its `std`, `agent` and `db` features pull
 # reqwest, tokio and diesel, none of which subql wants here).
 rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
+
+# OpenFGA gRPC client, behind `visibility-openfga`. The only maintained Rust
+# client for it: OpenFGA publishes no official Rust SDK and never has. No
+# default features, so TLS and bearer auth stay the caller's choice on its
+# own dependency, which is where a transport belongs.
+#
+# It re-exports `tonic` and `prost_wkt_types`, and subql reads both through
+# it rather than depending on them directly, so the protobuf types it hands
+# back and the ones subql builds cannot come from two versions.
+openfga-client = { version = "0.6.1", default-features = false, optional = true }
 
 # Future-combinator helpers (FuturesUnordered + StreamExt) used by the
 # async auto-resolving engine to dispatch deduplicated triggers
@@ -707,6 +725,19 @@ pgoutput-emit = ["sqlite-diff-rs/pg-walstream"]
 # caller answers, in the `Connector` idiom. subql names no authorization
 # protocol, so the vendor client stays downstream.
 visibility-records = ["dep:rls2fga"]
+
+# Opt-in and off by default: answer the questions the row does not settle by
+# asking an OpenFGA server, which completes the composition
+# `visibility-records` ships the local half of. Implies `std`, because the
+# gRPC client and its runtime are std-only, so `--no-default-features`
+# stays severable and the embedded build is untouched.
+#
+# The weight was measured rather than asserted: 63 added packages against a
+# 241-package graph that already carries `tokio` directly and `rustls`
+# through `pg_walstream`, and a third of the addition compiles rather than
+# ships. `openfga-client` needs no `protoc` on the host: it vendors
+# pre-generated code and takes `prost-wkt-types` with `vendored-protox`.
+visibility-openfga = ["std", "visibility-records", "dep:openfga-client"]
 
 # Memory profiling with dhat (std-only).
 dhat-heap = ["std", "dep:dhat"]
