@@ -1,11 +1,12 @@
 //! Table partition with lock-free snapshot reads
 
 use super::{
-    ids::PredicateId,
+    ids::{ConsumerOrdinal, PredicateId},
     indexes::{HybridIndexes, IndexableAtom, IndexableCell},
     predicate::{Predicate, PredicateStore, SubscriptionBinding},
 };
 use crate::backend::Backend;
+use crate::term::TermKey;
 use crate::{
     compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, SubscriptionId, TableId,
 };
@@ -174,6 +175,75 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
 
         // Update snapshot with new predicates
         self.update_snapshot();
+    }
+
+    /// Record which subscribers each of a predicate's terms admits, for one
+    /// newly bound subscription.
+    ///
+    /// `seeds` is indexed by term slot: `seeds[i]` is what this subscriber
+    /// states it matches through slot `i` today. One snapshot swap for every
+    /// slot, since a subscription is bound once.
+    pub fn seed_terms(
+        &mut self,
+        pred_id: PredicateId,
+        ordinal: ConsumerOrdinal,
+        subscriber: &TermKey<B>,
+        seeds: &[Vec<TermKey<B>>],
+    ) {
+        let store = Arc::make_mut(&mut self.mutable_predicates);
+        for (slot, values) in seeds.iter().enumerate() {
+            let Ok(slot) = u16::try_from(slot) else {
+                continue;
+            };
+            store.seed_term(pred_id, slot, ordinal, subscriber.clone(), values.clone());
+        }
+        self.update_snapshot();
+    }
+
+    /// Move who one term admits, as a changed membership row does.
+    ///
+    /// `admitted` is the value the row keys, and `ordinals` are the subscribers
+    /// it names. Returns the subscribers actually moved, which is what the
+    /// notification reports, and is empty when the row names none of this
+    /// predicate's subscribers.
+    pub fn move_term_members(
+        &mut self,
+        pred_id: PredicateId,
+        slot: u16,
+        value: TermKey<B>,
+        ordinals: &RoaringBitmap,
+        widen: bool,
+    ) {
+        let store = Arc::make_mut(&mut self.mutable_predicates);
+        let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
+            return;
+        };
+        if widen {
+            members.widen(value, ordinals);
+        } else {
+            members.narrow(&value, ordinals);
+        }
+        self.update_snapshot();
+    }
+
+    /// Withdraw every value one term admits, and report what was withdrawn.
+    ///
+    /// Used when the table carrying the memberships is truncated: the values are
+    /// only knowable from the sets themselves, and the caller reports them.
+    pub fn clear_term_admissions(
+        &mut self,
+        pred_id: PredicateId,
+        slot: u16,
+    ) -> Vec<(TermKey<B>, RoaringBitmap)> {
+        let store = Arc::make_mut(&mut self.mutable_predicates);
+        let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
+            return Vec::new();
+        };
+        let withdrawn = members.clear_admissions();
+        if !withdrawn.is_empty() {
+            self.update_snapshot();
+        }
+        withdrawn
     }
 
     /// Remove binding and decrement refcount

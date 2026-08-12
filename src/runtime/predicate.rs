@@ -3,6 +3,7 @@
 use super::ids::{ConsumerOrdinal, PredicateHash, PredicateId};
 use super::indexes::IndexableAtom;
 use crate::backend::Backend;
+use crate::term::TermKey;
 use crate::{
     compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
     ColumnId, IdTypes, SubscriptionId, SubscriptionScope,
@@ -108,6 +109,119 @@ impl<I: IdTypes> Clone for SubscriptionBinding<I> {
 
 impl<I: IdTypes> Copy for SubscriptionBinding<I> {}
 
+/// Which subscribers one membership term admits, for one predicate's slot.
+///
+/// Two indexes over the same bindings, because the set moves from both ends. A
+/// changed row of the subscribed table carries the compared value and asks which
+/// subscribers it admits. A changed row of the membership table carries a
+/// subscriber and a value, and asks which of this predicate's subscribers claim
+/// that identity, so it can move them under that value.
+pub struct TermMembers<B: Backend> {
+    /// Which consumer ordinals a compared value admits.
+    by_value: HashMap<TermKey<B>, RoaringBitmap>,
+    /// Which consumer ordinals claim each subscriber identity.
+    by_subscriber: HashMap<TermKey<B>, RoaringBitmap>,
+}
+
+// `Clone` and `Debug` are hand-implemented so their bounds fall on the scalar
+// types `TermKey<B>` names rather than on the backend marker `B`, for the same
+// reason `Value<B>`'s are.
+impl<B: Backend> Clone for TermMembers<B> {
+    fn clone(&self) -> Self {
+        Self {
+            by_value: self.by_value.clone(),
+            by_subscriber: self.by_subscriber.clone(),
+        }
+    }
+}
+
+impl<B: Backend> core::fmt::Debug for TermMembers<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TermMembers")
+            .field("by_value", &self.by_value)
+            .field("by_subscriber", &self.by_subscriber)
+            .finish()
+    }
+}
+
+impl<B: Backend> Default for TermMembers<B> {
+    fn default() -> Self {
+        Self {
+            by_value: HashMap::new(),
+            by_subscriber: HashMap::new(),
+        }
+    }
+}
+
+impl<B: Backend> TermMembers<B> {
+    /// The consumer ordinals `value` admits, empty when it admits none.
+    #[must_use]
+    pub fn admits(&self, value: &TermKey<B>) -> Option<&RoaringBitmap> {
+        self.by_value.get(value)
+    }
+
+    /// Record that `ordinal` matches `value` through this term.
+    fn admit(&mut self, value: TermKey<B>, ordinal: ConsumerOrdinal) {
+        self.by_value
+            .entry(value)
+            .or_default()
+            .insert(ordinal.get());
+    }
+
+    /// Record that `ordinal` filters for `subscriber`.
+    fn claim(&mut self, subscriber: TermKey<B>, ordinal: ConsumerOrdinal) {
+        self.by_subscriber
+            .entry(subscriber)
+            .or_default()
+            .insert(ordinal.get());
+    }
+
+    /// The consumer ordinals filtering for `subscriber`.
+    #[must_use]
+    pub fn claimed_by(&self, subscriber: &TermKey<B>) -> Option<&RoaringBitmap> {
+        self.by_subscriber.get(subscriber)
+    }
+
+    /// Add `ordinals` to the set `value` admits, as a membership row appearing
+    /// does.
+    pub fn widen(&mut self, value: TermKey<B>, ordinals: &RoaringBitmap) {
+        *self.by_value.entry(value).or_default() |= ordinals;
+    }
+
+    /// Take `ordinals` out of the set `value` admits, as a membership row
+    /// disappearing does.
+    pub fn narrow(&mut self, value: &TermKey<B>, ordinals: &RoaringBitmap) {
+        if let Some(admitted) = self.by_value.get_mut(value) {
+            *admitted -= ordinals;
+            if admitted.is_empty() {
+                self.by_value.remove(value);
+            }
+        }
+    }
+
+    /// Take every value this term admits, leaving it admitting none.
+    ///
+    /// The subscriber claims stay: the subscriptions are still registered and
+    /// still filter for the same identities, so a membership row appearing again
+    /// moves them back.
+    pub fn clear_admissions(&mut self) -> Vec<(TermKey<B>, RoaringBitmap)> {
+        self.by_value.drain().collect()
+    }
+
+    /// Drop `ordinal` from every set, as unbinding its subscription does.
+    fn forget(&mut self, ordinal: ConsumerOrdinal) {
+        for set in self
+            .by_value
+            .values_mut()
+            .chain(self.by_subscriber.values_mut())
+        {
+            set.remove(ordinal.get());
+        }
+        self.by_value.retain(|_, set| !set.is_empty());
+        self.by_subscriber.retain(|_, set| !set.is_empty());
+    }
+}
+
 /// Predicate storage with deduplication.
 ///
 /// Manages predicates with slab allocation and hash-based deduplication.
@@ -133,6 +247,12 @@ pub struct PredicateStore<I: IdTypes, B: Backend> {
     /// dispatch in O(1) per matched pair instead of an O(B) scan over
     /// `bindings`.
     pub binding_lookup: HashMap<(PredicateId, ConsumerOrdinal), Vec<SubscriptionId>>,
+    /// (PredicateId, term slot) -> which subscribers that term admits.
+    ///
+    /// Empty for every predicate carrying no membership term, which is every
+    /// predicate until one is registered, so a term-free engine pays one absent
+    /// hash lookup per event and nothing else.
+    pub term_members: HashMap<(PredicateId, u16), TermMembers<B>>,
 }
 
 impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
@@ -144,6 +264,7 @@ impl<I: IdTypes, B: Backend> Clone for PredicateStore<I, B> {
             scope_index: self.scope_index.clone(),
             predicate_consumers: self.predicate_consumers.clone(),
             binding_lookup: self.binding_lookup.clone(),
+            term_members: self.term_members.clone(),
         }
     }
 }
@@ -159,6 +280,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
             scope_index: HashMap::new(),
             predicate_consumers: HashMap::new(),
             binding_lookup: HashMap::new(),
+            term_members: HashMap::new(),
         }
     }
 
@@ -252,6 +374,7 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
                 }
             }
             self.predicate_consumers.remove(&id);
+            self.term_members.retain(|(pred, _), _| *pred != id);
         }
     }
 
@@ -337,6 +460,14 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
                     self.predicate_consumers.remove(&binding.predicate_id);
                 }
             }
+            // Under the same guard as the bitmap: the ordinal is what a term
+            // admits, so it stays while any binding still holds it, and a
+            // stale ordinal would admit rows to a subscription that is gone.
+            for ((pred, _), members) in &mut self.term_members {
+                if *pred == binding.predicate_id {
+                    members.forget(binding.consumer_ordinal);
+                }
+            }
         }
 
         let lookup_key = (binding.predicate_id, binding.consumer_ordinal);
@@ -355,6 +486,35 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
                 }
             }
         }
+    }
+
+    /// Record that `ordinal` filters for `subscriber` through the term in
+    /// `slot` of `pred`, and matches `values` today.
+    ///
+    /// The values are what the subscription stated at registration, and the
+    /// identity is what a changed membership row is matched against. An empty
+    /// `values` admits nobody until such a row arrives, which is the partial
+    /// list a client is allowed to send.
+    pub fn seed_term(
+        &mut self,
+        pred: PredicateId,
+        slot: u16,
+        ordinal: ConsumerOrdinal,
+        subscriber: TermKey<B>,
+        values: Vec<TermKey<B>>,
+    ) {
+        let members = self.term_members.entry((pred, slot)).or_default();
+        members.claim(subscriber, ordinal);
+        for value in values {
+            members.admit(value, ordinal);
+        }
+    }
+
+    /// The subscribers one term admits, or [`None`] when the predicate carries
+    /// no term in that slot.
+    #[must_use]
+    pub fn term_members(&self, pred: PredicateId, slot: u16) -> Option<&TermMembers<B>> {
+        self.term_members.get(&(pred, slot))
     }
 }
 

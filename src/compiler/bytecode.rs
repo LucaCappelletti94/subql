@@ -214,6 +214,27 @@ pub enum Instruction<B: Backend> {
     ///
     /// Symmetric to [`JumpIfFalse`](Self::JumpIfFalse).
     JumpIfTrue(usize),
+
+    // ========================================================================
+    // Membership terms
+    // ========================================================================
+    /// Push the truth supplied for membership term slot `slot`.
+    ///
+    /// A membership term is not a row test: it answers which subscribers the
+    /// changed row admits, and the same row admits different subscribers. So the
+    /// caller supplies one truth per term slot and evaluates the program once
+    /// per assignment, which is what [`Vm::eval_with_terms`] takes.
+    ///
+    /// A slot the caller supplied no truth for is
+    /// [`VmError::MissingTermTruth`], never a silent `Tri::Unknown`: the
+    /// silent answer would deliver the row to every subscriber sharing the
+    /// predicate.
+    ///
+    /// Stack: `[...] -> [..., Tri]`.
+    ///
+    /// [`Vm::eval_with_terms`]: crate::compiler::Vm::eval_with_terms
+    /// [`VmError::MissingTermTruth`]: crate::compiler::VmError::MissingTermTruth
+    TermTruth(u16),
 }
 
 /// A compiled bytecode program.
@@ -234,23 +255,50 @@ pub struct BytecodeProgram<B: Backend> {
     /// an UPDATE event's `changed_columns` is disjoint from this set — a
     /// program whose dependencies did not change cannot change verdict.
     pub dependency_columns: Vec<ColumnId>,
+
+    /// The column each membership term slot compares, indexed by slot.
+    ///
+    /// Empty for a filter carrying no term, which is every filter the
+    /// `membership-term` feature does not compile. Dispatch reads the column at
+    /// `term_columns[slot]` off the changed row to learn which subscribers the
+    /// row admits through that term, so it travels with the program rather than
+    /// beside it: the program is what persistence stores and reloads, and a
+    /// reloaded term with no column would narrow nothing and deliver the row to
+    /// every subscriber sharing the predicate.
+    pub term_columns: Vec<ColumnId>,
 }
 
 impl<B: Backend> BytecodeProgram<B> {
-    /// Build a program from an instruction sequence, extracting the
+    /// Build a term-free program from an instruction sequence, extracting the
     /// dependency-column set once at construction.
     #[must_use]
     pub fn new(instructions: Vec<Instruction<B>>) -> Self {
-        let dependency_columns = Self::extract_dependencies(&instructions);
+        Self::with_terms(instructions, Vec::new())
+    }
+
+    /// Build a program whose slot `i` carries a membership term comparing
+    /// `term_columns[i]`.
+    ///
+    /// A term column is a dependency like any other: an UPDATE touching only
+    /// the column a term compares moves which subscribers the row admits, so a
+    /// program pruned on the load set alone would miss it.
+    #[must_use]
+    pub fn with_terms(instructions: Vec<Instruction<B>>, term_columns: Vec<ColumnId>) -> Self {
+        let dependency_columns = Self::extract_dependencies(&instructions, &term_columns);
         Self {
             instructions,
             dependency_columns,
+            term_columns,
         }
     }
 
     /// Column ids referenced by any [`Instruction::LoadColumn`] in
-    /// `instructions`. Sorted and deduplicated.
-    fn extract_dependencies(instructions: &[Instruction<B>]) -> Vec<ColumnId> {
+    /// `instructions`, plus every column a term compares. Sorted and
+    /// deduplicated.
+    fn extract_dependencies(
+        instructions: &[Instruction<B>],
+        term_columns: &[ColumnId],
+    ) -> Vec<ColumnId> {
         let mut cols: Vec<ColumnId> = instructions
             .iter()
             .filter_map(|inst| {
@@ -260,6 +308,7 @@ impl<B: Backend> BytecodeProgram<B> {
                     None
                 }
             })
+            .chain(term_columns.iter().copied())
             .collect();
         cols.sort_unstable();
         cols.dedup();
@@ -309,6 +358,7 @@ impl<B: Backend> Clone for Instruction<B> {
             },
             Self::JumpIfFalse(offset) => Self::JumpIfFalse(*offset),
             Self::JumpIfTrue(offset) => Self::JumpIfTrue(*offset),
+            Self::TermTruth(slot) => Self::TermTruth(*slot),
         }
     }
 }
@@ -343,6 +393,7 @@ impl<B: Backend> core::fmt::Debug for Instruction<B> {
                 .finish(),
             Self::JumpIfFalse(offset) => f.debug_tuple("JumpIfFalse").field(offset).finish(),
             Self::JumpIfTrue(offset) => f.debug_tuple("JumpIfTrue").field(offset).finish(),
+            Self::TermTruth(slot) => f.debug_tuple("TermTruth").field(slot).finish(),
         }
     }
 }
@@ -374,6 +425,7 @@ impl<B: Backend> PartialEq for Instruction<B> {
             (Self::Like { case_sensitive: a }, Self::Like { case_sensitive: b }) => a == b,
             (Self::JumpIfFalse(a), Self::JumpIfFalse(b))
             | (Self::JumpIfTrue(a), Self::JumpIfTrue(b)) => a == b,
+            (Self::TermTruth(a), Self::TermTruth(b)) => a == b,
             _ => false,
         }
     }
@@ -384,6 +436,7 @@ impl<B: Backend> Clone for BytecodeProgram<B> {
         Self {
             instructions: self.instructions.clone(),
             dependency_columns: self.dependency_columns.clone(),
+            term_columns: self.term_columns.clone(),
         }
     }
 }
@@ -393,6 +446,7 @@ impl<B: Backend> core::fmt::Debug for BytecodeProgram<B> {
         f.debug_struct("BytecodeProgram")
             .field("instructions", &self.instructions)
             .field("dependency_columns", &self.dependency_columns)
+            .field("term_columns", &self.term_columns)
             .finish()
     }
 }
@@ -401,6 +455,7 @@ impl<B: Backend> PartialEq for BytecodeProgram<B> {
     fn eq(&self, other: &Self) -> bool {
         self.instructions == other.instructions
             && self.dependency_columns == other.dependency_columns
+            && self.term_columns == other.term_columns
     }
 }
 #[cfg(test)]
@@ -452,5 +507,36 @@ mod tests {
 
         let program = BytecodeProgram::new(instructions);
         assert_eq!(program.dependency_columns, vec![5]); // Deduplicated
+    }
+
+    /// The column a term compares is a dependency even though no
+    /// [`Instruction::LoadColumn`] reads it, because an UPDATE touching only
+    /// that column moves which subscribers the row admits. A program pruned on
+    /// the load set alone would skip the event that matters most.
+    #[test]
+    fn a_term_column_is_a_dependency_without_a_load() {
+        let instructions: Vec<Instruction<Postgres>> = vec![
+            Instruction::LoadColumn(5),
+            Instruction::PushLiteral(Value::Int(18)),
+            Instruction::GreaterThan,
+            Instruction::JumpIfFalse(3),
+            Instruction::TermTruth(0),
+            Instruction::And,
+        ];
+
+        let program = BytecodeProgram::with_terms(instructions, vec![9]);
+        assert_eq!(program.dependency_columns, vec![5, 9]);
+        assert_eq!(program.term_columns, vec![9]);
+        assert!(!program.is_constant());
+    }
+
+    /// A filter whose only test is a term still depends on the column the term
+    /// compares, so it is not a constant program that registration could fold.
+    #[test]
+    fn a_filter_of_one_term_alone_is_not_constant() {
+        let program: BytecodeProgram<Postgres> =
+            BytecodeProgram::with_terms(vec![Instruction::TermTruth(0)], vec![3]);
+        assert_eq!(program.dependency_columns, vec![3]);
+        assert!(!program.is_constant());
     }
 }

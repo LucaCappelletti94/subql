@@ -188,6 +188,32 @@ fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterErr
             )
         }
 
+        // A membership subquery needs an arm of its own rather than the Debug
+        // fallback below, because a `Debug` rendering carries the byte offset of
+        // every identifier (`Ident` derives `Debug` over its `span` while its
+        // `PartialEq` ignores it). Predicate identity would then depend on where
+        // in the statement text the filter was written, so the same filter under
+        // two spellings would compile twice and never share a predicate.
+        //
+        // The inner query is rendered by sqlparser rather than normalized
+        // clause by clause. The cost is that two spellings of the inner WHERE
+        // (`a = 1 AND b = 2` against `b = 2 AND a = 1`) do not share, which is a
+        // missed sharing rather than a wrong one. Normalizing it would mean
+        // listing every clause that changes which rows are members (`LIMIT`,
+        // `ORDER BY`, `GROUP BY`, `DISTINCT`, a `WITH`), and a clause left off
+        // that list silently maps two different filters onto one predicate.
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let not_str = if *negated { "NOT " } else { "" };
+            format!(
+                "{} {not_str}IN ({subquery})",
+                normalize_expr_inner(expr, depth + 1)?,
+            )
+        }
+
         Expr::Between {
             expr,
             low,
@@ -376,6 +402,65 @@ mod tests {
 
         // IN lists should be sorted
         assert_eq!(norm1, norm2);
+    }
+
+    /// The same membership term written with different whitespace and keyword
+    /// case is one predicate. Without an arm of its own the term falls to the
+    /// `Debug` fallback, which prints the byte offset of every identifier, so
+    /// two spellings of one filter would compile and store twice and the
+    /// architecture's predicate sharing would quietly stop applying to terms.
+    #[test]
+    fn a_membership_term_normalizes_the_same_under_two_spellings() {
+        let dialect = PostgreSqlDialect {};
+
+        let one = normalize_sql(
+            "SELECT * FROM t WHERE x IN (SELECT id FROM m WHERE owner = 'a')",
+            &dialect,
+        )
+        .unwrap();
+        let two = normalize_sql(
+            "SELECT   *  FROM t\n  where   x   in   ( select id from m where owner = 'a' )",
+            &dialect,
+        )
+        .unwrap();
+
+        assert_eq!(one, two, "one filter, two spellings, one predicate");
+        assert!(
+            !one.contains("Span") && !one.contains("Ident"),
+            "the term must not normalize through the Debug fallback, got {one:?}"
+        );
+    }
+
+    /// Two different relationships are two predicates, which is the half a
+    /// canonical rendering can get wrong in the direction that matters: two
+    /// filters collapsed onto one predicate answer each other's subscribers.
+    #[test]
+    fn two_different_membership_terms_are_two_predicates() {
+        let dialect = PostgreSqlDialect {};
+        let norm = |sql: &str| normalize_sql(sql, &dialect).unwrap();
+
+        let base = norm("SELECT * FROM t WHERE x IN (SELECT id FROM m WHERE owner = 'a')");
+
+        for other in [
+            // A different inner table.
+            "SELECT * FROM t WHERE x IN (SELECT id FROM n WHERE owner = 'a')",
+            // A different projected column.
+            "SELECT * FROM t WHERE x IN (SELECT ref FROM m WHERE owner = 'a')",
+            // A different inner filter.
+            "SELECT * FROM t WHERE x IN (SELECT id FROM m WHERE owner = 'b')",
+            // A different tested column.
+            "SELECT * FROM t WHERE y IN (SELECT id FROM m WHERE owner = 'a')",
+            // A clause that changes which rows are members.
+            "SELECT * FROM t WHERE x IN (SELECT id FROM m WHERE owner = 'a' LIMIT 1)",
+            // The negation, which is refused later but must not share either.
+            "SELECT * FROM t WHERE x NOT IN (SELECT id FROM m WHERE owner = 'a')",
+        ] {
+            assert_ne!(
+                base,
+                norm(other),
+                "{other} names a different relationship and must not share the predicate"
+            );
+        }
     }
 
     #[test]

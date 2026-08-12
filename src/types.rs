@@ -161,6 +161,25 @@ pub struct SubscriptionRequest<I: IdTypes, B: crate::backend::Backend = crate::b
     /// binds are empty the `B` parameter is inferred from context; the
     /// default `B = Postgres` covers the common Postgres-backed use.
     pub(crate) binds: alloc::vec::Vec<crate::backend::Value<B>>,
+    /// Which subscriber this subscription filters for.
+    ///
+    /// Required only by a filter naming a membership subquery, which is written
+    /// as `current_setting('app.user_id')` in SQL and resolved per connection by
+    /// Postgres. SubQL has neither a connection nor a session, so the
+    /// subscription states it. Trusting it is safe because visibility gates every
+    /// delivery afterwards: a subscription claiming another identity receives
+    /// nothing it is not permitted to see, it only fails to receive its own rows.
+    pub(crate) subscriber: Option<crate::backend::Value<B>>,
+    /// The values this subscriber currently matches, grouped by the column each
+    /// membership subquery compares.
+    ///
+    /// The client has these already, because it just ran the snapshot query that
+    /// returned exactly those rows under row-level security. Grouped by column
+    /// name because a filter may name several subqueries and the compared column
+    /// is the one name both sides share. A stale or partial list narrows or
+    /// widens only this subscriber's own results, and an absent one admits nobody
+    /// until a membership row changes.
+    pub(crate) term_values: alloc::vec::Vec<(String, alloc::vec::Vec<crate::backend::Value<B>>)>,
 }
 
 impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
@@ -173,6 +192,8 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
             sql: sql.into(),
             updated_at_unix_ms: 0,
             binds: alloc::vec::Vec::new(),
+            subscriber: None,
+            term_values: alloc::vec::Vec::new(),
         }
     }
 
@@ -197,6 +218,32 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
     #[must_use]
     pub fn binds(mut self, binds: alloc::vec::Vec<crate::backend::Value<B>>) -> Self {
         self.binds = binds;
+        self
+    }
+
+    /// State which subscriber this subscription filters for (default: none).
+    ///
+    /// A filter naming a membership subquery is refused without it, because the
+    /// identity is what a changed membership row is matched against.
+    #[must_use]
+    pub fn subscriber(mut self, subscriber: crate::backend::Value<B>) -> Self {
+        self.subscriber = Some(subscriber);
+        self
+    }
+
+    /// State the values this subscriber currently matches for `column`, the
+    /// column one of the filter's membership subqueries compares (default: none
+    /// for every column).
+    ///
+    /// Called once per compared column. Calling it twice for one column adds to
+    /// what that column already carries rather than replacing it.
+    #[must_use]
+    pub fn term_values(
+        mut self,
+        column: impl Into<String>,
+        values: alloc::vec::Vec<crate::backend::Value<B>>,
+    ) -> Self {
+        self.term_values.push((column.into(), values));
         self
     }
 }
@@ -1064,6 +1111,67 @@ impl core::fmt::Display for AggAccumulator {
     }
 }
 
+/// A subscription whose answer changed because a relationship moved, rather than
+/// because a row it reads changed.
+///
+/// Carries no row. The rows leaving are ones the consumer already holds, and it
+/// can match this against its own copy. The rows entering were never in the
+/// change event, so the consumer reads them through the snapshot path it already
+/// has, under row-level security, if the application wants them at all.
+///
+/// Emitted rather than left silent because a subscription is a standing query: if
+/// the engine knows the answer changed and says nothing, a row that never changes
+/// again never arrives.
+// `Clone`, `Debug` and `PartialEq` are hand-implemented for the same reason
+// `Value<B>`'s are: a derive would put the bound on the backend marker `B`
+// rather than on the scalar types the value names.
+pub struct TermNarrowing<B: crate::backend::Backend> {
+    /// The subscription whose answer changed.
+    pub subscription: SubscriptionId,
+    /// The table that subscription reads.
+    pub table: TableId,
+    /// The column its membership subquery compares.
+    pub column: ColumnId,
+    /// The value that column now matches, or stopped matching.
+    pub value: crate::backend::Value<B>,
+    /// Whether the value entered the subscription's set or left it.
+    pub entered: bool,
+}
+
+impl<B: crate::backend::Backend> Clone for TermNarrowing<B> {
+    fn clone(&self) -> Self {
+        Self {
+            subscription: self.subscription,
+            table: self.table,
+            column: self.column,
+            value: self.value.clone(),
+            entered: self.entered,
+        }
+    }
+}
+
+impl<B: crate::backend::Backend> core::fmt::Debug for TermNarrowing<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TermNarrowing")
+            .field("subscription", &self.subscription)
+            .field("table", &self.table)
+            .field("column", &self.column)
+            .field("value", &self.value)
+            .field("entered", &self.entered)
+            .finish()
+    }
+}
+
+impl<B: crate::backend::Backend> PartialEq for TermNarrowing<B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.subscription == other.subscription
+            && self.table == other.table
+            && self.column == other.column
+            && self.value == other.value
+            && self.entered == other.entered
+    }
+}
+
 /// Per-consumer notification classification from `consumers()`.
 ///
 /// Each consumer sees events **relative to their own result set** (view-relative
@@ -1075,7 +1183,16 @@ impl core::fmt::Display for AggAccumulator {
 /// oplog code can correlate notifications with positions in the source
 /// stream. Default `C = NoCheckpoint` preserves the original API for
 /// callers that do not care about positions.
-pub struct ConsumerNotifications<I: IdTypes, C: Checkpoint = NoCheckpoint> {
+///
+/// `B` defaults to `Postgres` for the same reason
+/// [`SubscriptionRequest`]'s does: it appears only in
+/// [`narrowings`](Self::narrowings), which is empty unless a membership subquery
+/// is registered.
+pub struct ConsumerNotifications<
+    I: IdTypes,
+    C: Checkpoint = NoCheckpoint,
+    B: crate::backend::Backend = crate::backend::Postgres,
+> {
     /// Consumers for whom a row appeared in their result set.
     /// (Base INSERT, or base UPDATE where new row matches but old didn't.)
     pub(crate) inserted: Vec<I::ConsumerId>,
@@ -1087,9 +1204,13 @@ pub struct ConsumerNotifications<I: IdTypes, C: Checkpoint = NoCheckpoint> {
     pub(crate) updated: Vec<I::ConsumerId>,
     /// Position of the originating event, when known.
     pub(crate) checkpoint: Option<C>,
+    /// Subscriptions whose answer changed because a relationship moved rather
+    /// than because a row they read changed. Empty for every event on a table no
+    /// membership subquery reads through.
+    pub(crate) narrowings: Vec<TermNarrowing<B>>,
 }
 
-impl<I: IdTypes, C: Checkpoint> ConsumerNotifications<I, C> {
+impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> ConsumerNotifications<I, C, B> {
     /// Create empty notifications with no checkpoint.
     #[must_use]
     pub const fn empty() -> Self {
@@ -1098,6 +1219,7 @@ impl<I: IdTypes, C: Checkpoint> ConsumerNotifications<I, C> {
             deleted: Vec::new(),
             updated: Vec::new(),
             checkpoint: None,
+            narrowings: Vec::new(),
         }
     }
 
@@ -1113,6 +1235,7 @@ impl<I: IdTypes, C: Checkpoint> ConsumerNotifications<I, C> {
             deleted,
             updated,
             checkpoint: None,
+            narrowings: Vec::new(),
         }
     }
 
@@ -1147,6 +1270,23 @@ impl<I: IdTypes, C: Checkpoint> ConsumerNotifications<I, C> {
         self.checkpoint.as_ref()
     }
 
+    /// Subscriptions whose answer changed because a relationship moved.
+    ///
+    /// Empty for every event on a table no membership subquery reads through,
+    /// which is every event until one is registered. Carries no rows: see
+    /// [`TermNarrowing`].
+    #[must_use]
+    pub fn narrowings(&self) -> &[TermNarrowing<B>] {
+        &self.narrowings
+    }
+
+    /// Attach the narrowings a membership change produced.
+    #[must_use]
+    pub(crate) fn with_narrowings(mut self, narrowings: Vec<TermNarrowing<B>>) -> Self {
+        self.narrowings = narrowings;
+        self
+    }
+
     /// Decompose into `(inserted, deleted, updated)`. The checkpoint is
     /// dropped. Use [`checkpoint`](Self::checkpoint) first if needed.
     #[must_use]
@@ -1156,27 +1296,34 @@ impl<I: IdTypes, C: Checkpoint> ConsumerNotifications<I, C> {
     }
 }
 
-impl<I: IdTypes, C: Checkpoint> core::fmt::Debug for ConsumerNotifications<I, C> {
+impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> core::fmt::Debug
+    for ConsumerNotifications<I, C, B>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ConsumerNotifications")
             .field("inserted", &self.inserted)
             .field("deleted", &self.deleted)
             .field("updated", &self.updated)
             .field("checkpoint", &self.checkpoint)
+            .field("narrowings", &self.narrowings)
             .finish()
     }
 }
 
 /// Combined output of [`dispatch`](crate::SubscriptionEngine::dispatch): row-set
 /// notifications plus aggregate deltas for one event.
-pub struct DispatchOutput<I: IdTypes, C: Checkpoint = NoCheckpoint> {
-    notifications: ConsumerNotifications<I, C>,
+pub struct DispatchOutput<
+    I: IdTypes,
+    C: Checkpoint = NoCheckpoint,
+    B: crate::backend::Backend = crate::backend::Postgres,
+> {
+    notifications: ConsumerNotifications<I, C, B>,
     aggregate_deltas: Vec<(I::ConsumerId, AggDelta)>,
 }
 
-impl<I: IdTypes, C: Checkpoint> DispatchOutput<I, C> {
+impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> DispatchOutput<I, C, B> {
     pub(crate) const fn from_parts(
-        notifications: ConsumerNotifications<I, C>,
+        notifications: ConsumerNotifications<I, C, B>,
         aggregate_deltas: Vec<(I::ConsumerId, AggDelta)>,
     ) -> Self {
         Self {
@@ -1187,7 +1334,7 @@ impl<I: IdTypes, C: Checkpoint> DispatchOutput<I, C> {
 
     /// Per-consumer, view-relative row notifications (insert/delete/update).
     #[must_use]
-    pub const fn notifications(&self) -> &ConsumerNotifications<I, C> {
+    pub const fn notifications(&self) -> &ConsumerNotifications<I, C, B> {
         &self.notifications
     }
 
@@ -1245,7 +1392,9 @@ impl<I: IdTypes> Iterator for ConsumerNotificationsIter<I> {
     }
 }
 
-impl<I: IdTypes, C: Checkpoint> IntoIterator for ConsumerNotifications<I, C> {
+impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> IntoIterator
+    for ConsumerNotifications<I, C, B>
+{
     type Item = I::ConsumerId;
     type IntoIter = ConsumerNotificationsIter<I>;
 

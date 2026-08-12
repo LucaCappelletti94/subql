@@ -1,4 +1,5 @@
-//! Keying a membership term's subscriber lookup.
+//! The membership term's vocabulary: what the compiler lifted out of a filter,
+//! and how the subscriber lookup it needs is keyed.
 //!
 //! A membership subquery answers "which subscribers does this changed row
 //! reach" by reading one column off the row and looking the value up. That
@@ -12,10 +13,74 @@
 //!
 //! [`ScalarCore`]: crate::backend::ScalarCore
 
+use alloc::vec::Vec;
 use core::hash::{Hash, Hasher};
 use core::mem::discriminant;
+use sqlparser::ast::Expr;
 
 use crate::backend::{Backend, ScalarKind, Value};
+use crate::{ColumnId, TableId};
+
+/// One membership term the compiler lifted out of a filter.
+///
+/// The compiled program carries only the slot, because that is all the VM
+/// needs. Registration needs the expression, to ask whether the relationship
+/// can be served at all, and the column, to group the subscriber's own starting
+/// values and to read the changed row later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledTerm {
+    /// The slot [`Instruction::TermTruth`] names, and the index into the
+    /// program's `term_columns`.
+    ///
+    /// [`Instruction::TermTruth`]: crate::compiler::Instruction::TermTruth
+    pub slot: u16,
+    /// The column of the subscribed table the term compares.
+    pub column: ColumnId,
+    /// The whole `<column> IN (SELECT ...)` expression, which is what decides
+    /// whether the relationship it names can be served.
+    pub expr: Expr,
+}
+
+/// What registration settled about one term, beyond what the compiler saw.
+///
+/// The compiler knows which column the filter compares. Whether the
+/// relationship can be served, and which table's rows move it, is what
+/// `rls2fga` answers, and this is that answer resolved to subql's own ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermPlan {
+    /// The slot this plan belongs to.
+    pub slot: u16,
+    /// The column of the subscribed table the term compares.
+    pub column: ColumnId,
+    /// The table whose changed rows move which subscribers the term admits.
+    ///
+    /// The subscribed table itself when the filter names the caller directly,
+    /// and the membership table when it names the caller through a related row.
+    /// One walk covers both, because in each case it is the table the shape that
+    /// names a caller reads.
+    pub member_table: TableId,
+    /// The column of `member_table` carrying the value [`column`](Self::column)
+    /// is compared against.
+    pub member_key: ColumnId,
+    /// The column of `member_table` naming the subscriber a row admits.
+    pub member_subject: ColumnId,
+}
+
+/// The columns `terms` compare, indexed by slot.
+///
+/// The compiler assigns slots densely from zero in first-occurrence order, so
+/// this is a reindexing rather than a search, and it is the table dispatch
+/// reads a changed row through.
+#[must_use]
+pub fn term_columns(terms: &[CompiledTerm]) -> Vec<ColumnId> {
+    let mut columns = alloc::vec![0; terms.len()];
+    for term in terms {
+        if let Some(slot) = columns.get_mut(usize::from(term.slot)) {
+            *slot = term.column;
+        }
+    }
+    columns
+}
 
 /// A changed row's link value, in the form the subscriber lookup is keyed by.
 ///
@@ -79,6 +144,29 @@ impl<B: Backend> core::fmt::Debug for TermKey<B> {
             Self::Date(v) => f.debug_tuple("Date").field(v).finish(),
             Self::Time(v) => f.debug_tuple("Time").field(v).finish(),
             Self::Decimal(v) => f.debug_tuple("Decimal").field(v).finish(),
+        }
+    }
+}
+
+impl<B: Backend> TermKey<B> {
+    /// The value this key was read from.
+    ///
+    /// Lossless, since every variant here is a variant of [`Value`]. Used to
+    /// report a value back to the caller, which speaks [`Value`] everywhere
+    /// else and would otherwise have to match a second enum to bind one.
+    #[must_use]
+    pub fn into_value(self) -> Value<B> {
+        match self {
+            Self::Bool(v) => Value::Bool(v),
+            Self::Int(v) => Value::Int(v),
+            Self::String(v) => Value::String(v),
+            Self::Bytes(v) => Value::Bytes(v),
+            Self::Uuid(v) => Value::Uuid(v),
+            Self::Timestamp(v) => Value::Timestamp(v),
+            Self::TimestampTz(v) => Value::TimestampTz(v),
+            Self::Date(v) => Value::Date(v),
+            Self::Time(v) => Value::Time(v),
+            Self::Decimal(v) => Value::Decimal(v),
         }
     }
 }

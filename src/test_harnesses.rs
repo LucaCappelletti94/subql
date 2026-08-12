@@ -1646,6 +1646,7 @@ mod tests {
             Instruction::Like { .. } => 21,
             Instruction::JumpIfFalse(_) => 22,
             Instruction::JumpIfTrue(_) => 23,
+            Instruction::TermTruth(_) => 24,
         }
     }
 

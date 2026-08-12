@@ -8,10 +8,11 @@
 //! the `usize` <-> `u32`/`u16` boundary conversion and centralize the
 //! identifier-resolution rules so call sites never reinvent them.
 //!
-//! Functions: [`table_id`], [`column_id`], [`resolve_table`], [`table_arity`],
-//! [`schema_fingerprint`], [`primary_key_columns`], [`column_scalar_kind`],
-//! [`table_has_rls`].
+//! Functions: [`table_id`], [`table_name`], [`column_id`], [`resolve_table`],
+//! [`table_arity`], [`schema_fingerprint`], [`primary_key_columns`],
+//! [`column_scalar_kind`], [`table_has_rls`].
 
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
@@ -60,6 +61,17 @@ pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<Tab
     let table = database.table(schema, bare)?;
     let id = database.table_id(table)?;
     u32::try_from(id).ok()
+}
+
+/// The name the catalog stores for `table_id`, or [`None`] when it knows no such
+/// table.
+///
+/// The inverse of [`table_id`] for the one caller that has to hand a table's
+/// name to something outside subql. Unqualified, as the catalog stores it.
+#[must_use]
+pub fn table_name<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<String> {
+    let index = usize::try_from(table_id).ok()?;
+    Some(database.table_by_id(index)?.table_name().to_string())
 }
 
 /// Resolve a column name within a table to subql's compact [`ColumnId`].
