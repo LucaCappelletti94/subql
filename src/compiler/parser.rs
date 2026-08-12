@@ -17,6 +17,7 @@ use super::{
 use crate::backend::{Backend, ScalarKind, Value};
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
+use crate::term::{term_columns, CompiledTerm};
 use crate::{ColumnId, RegisterError, TableId};
 use alloc::borrow::ToOwned;
 use alloc::string::{String, ToString};
@@ -24,6 +25,94 @@ use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{Expr, ObjectName, Statement, Value as SqlValue};
 use sqlparser::dialect::Dialect;
+
+/// Where a filter's instructions accumulate, with the membership terms lifted
+/// out of it as they are met.
+///
+/// Derefs to the instruction vector so every `out.push(..)` and every recursive
+/// call in the compiler reads as it did before terms existed. The alternative
+/// was a nineteenth parameter threaded through nineteen recursive calls, which
+/// is the same information carried less legibly.
+struct Compiling<B: Backend> {
+    out: Vec<Instruction<B>>,
+    terms: Vec<CompiledTerm>,
+}
+
+impl<B: Backend> Compiling<B> {
+    const fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            terms: Vec::new(),
+        }
+    }
+
+    /// The slot for `expr`, assigning the next one if this term is new.
+    ///
+    /// Two structurally equal terms share a slot, because the assignment the VM
+    /// evaluates is per term rather than per occurrence: the same relationship
+    /// admits the same subscribers wherever the filter mentions it.
+    ///
+    /// The cap is what keeps the `2^k` enumeration small. Four terms is sixteen
+    /// evaluations per row version, and one term, the ordinary case, is two.
+    fn term_slot(&mut self, expr: &Expr, column: ColumnId) -> Result<u16, RegisterError> {
+        if let Some(existing) = self.terms.iter().find(|term| &term.expr == expr) {
+            return Ok(existing.slot);
+        }
+        let slot = u16::try_from(self.terms.len()).unwrap_or(u16::MAX);
+        if usize::from(slot) >= MAX_TERMS_PER_FILTER {
+            return Err(RegisterError::MembershipTermRefused(format!(
+                "a filter may name at most {MAX_TERMS_PER_FILTER} membership subqueries, because \
+                 SubQL answers each changed row for every combination of them and that is \
+                 2^{MAX_TERMS_PER_FILTER} evaluations at the cap"
+            )));
+        }
+        self.terms.push(CompiledTerm {
+            slot,
+            column,
+            expr: expr.clone(),
+        });
+        Ok(slot)
+    }
+}
+
+impl<B: Backend> core::ops::Deref for Compiling<B> {
+    type Target = Vec<Instruction<B>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.out
+    }
+}
+
+impl<B: Backend> core::ops::DerefMut for Compiling<B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.out
+    }
+}
+
+/// How many membership subqueries one filter may name.
+///
+/// Dispatch evaluates the filter once per assignment over the terms, so the
+/// cost is `2^k` per row version and the cap is what keeps it small.
+pub const MAX_TERMS_PER_FILTER: usize = 4;
+
+/// Everything one subscription statement compiles to.
+///
+/// A struct rather than a tuple because the membership terms are its sixth
+/// member and a six-tuple says nothing about which field is which.
+pub struct CompiledQuery<B: Backend> {
+    /// The table the statement reads.
+    pub table_id: TableId,
+    /// The WHERE clause as bytecode.
+    pub program: BytecodeProgram<B>,
+    /// Canonical WHERE-clause text, which is what predicate sharing keys on.
+    pub normalized: String,
+    /// Planner metadata for candidate pruning.
+    pub prefilter_plan: PrefilterPlan,
+    /// Row events or aggregate deltas.
+    pub projection: QueryProjection,
+    /// The membership terms the filter names, one per slot.
+    pub terms: Vec<CompiledTerm>,
+}
 
 struct SqlTableName {
     unqualified: String,
@@ -78,9 +167,8 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let (table_id, program, _normalized, _, _) =
-        parse_compile_normalize_and_prefilter(sql, dialect, database)?;
-    Ok((table_id, program))
+    let compiled = parse_compile_normalize_and_prefilter(sql, dialect, database)?;
+    Ok((compiled.table_id, compiled.program))
 }
 
 /// Parse SQL once and produce compiled bytecode plus canonical normalized form.
@@ -93,9 +181,8 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let (table_id, program, normalized, _, _) =
-        parse_compile_normalize_and_prefilter(sql, dialect, database)?;
-    Ok((table_id, program, normalized))
+    let compiled = parse_compile_normalize_and_prefilter(sql, dialect, database)?;
+    Ok((compiled.table_id, compiled.program, compiled.normalized))
 }
 
 /// Shared front-half of query parsing: parse -> extract table + WHERE -> resolve
@@ -137,16 +224,7 @@ pub fn parse_compile_normalize_and_prefilter<B, DB>(
     sql: &str,
     dialect: &B::Dialect,
     database: &DB,
-) -> Result<
-    (
-        TableId,
-        BytecodeProgram<B>,
-        String,
-        PrefilterPlan,
-        QueryProjection,
-    ),
-    RegisterError,
->
+) -> Result<CompiledQuery<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
@@ -165,16 +243,7 @@ pub fn parse_compile_normalize_and_prefilter_with_binds<B, DB>(
     dialect: &B::Dialect,
     database: &DB,
     binds: &[Value<B>],
-) -> Result<
-    (
-        TableId,
-        BytecodeProgram<B>,
-        String,
-        PrefilterPlan,
-        QueryProjection,
-    ),
-    RegisterError,
->
+) -> Result<CompiledQuery<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
@@ -182,29 +251,31 @@ where
     let pq = parse_query_front_half::<B, DB>(sql, dialect, database, binds)?;
 
     // Compile WHERE clause to bytecode.
-    let program: BytecodeProgram<B> = if let Some(expr) = pq.where_clause.as_ref() {
-        compile_expression::<B, DB>(expr, pq.table_id, database)?
-    } else {
-        // No WHERE clause matches every row. Feed the bare `true` literal
-        // through the same wrapper that trailing bare-value predicates use
-        // so the VM sees a Tri-typed result at TOS.
-        let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
-            &SqlValue::Boolean(true),
-            ScalarKind::Bool,
-        )?)];
-        wrap_bare_value_as_tri::<B>(&mut instructions)?;
-        BytecodeProgram::new(instructions)
-    };
+    let (program, terms): (BytecodeProgram<B>, Vec<CompiledTerm>) =
+        if let Some(expr) = pq.where_clause.as_ref() {
+            compile_expression::<B, DB>(expr, pq.table_id, database)?
+        } else {
+            // No WHERE clause matches every row. Feed the bare `true` literal
+            // through the same wrapper that trailing bare-value predicates use
+            // so the VM sees a Tri-typed result at TOS.
+            let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
+                &SqlValue::Boolean(true),
+                ScalarKind::Bool,
+            )?)];
+            wrap_bare_value_as_tri::<B>(&mut instructions)?;
+            (BytecodeProgram::new(instructions), Vec::new())
+        };
 
     let prefilter_plan = build_prefilter_plan(pq.where_clause.as_ref(), pq.table_id, database);
 
-    Ok((
-        pq.table_id,
+    Ok(CompiledQuery {
+        table_id: pq.table_id,
         program,
-        pq.normalized,
+        normalized: pq.normalized,
         prefilter_plan,
-        pq.projection,
-    ))
+        projection: pq.projection,
+        terms,
+    })
 }
 
 /// Table identity and WHERE-clause column dependencies for a single-table
@@ -245,7 +316,21 @@ where
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
     let table_id = resolve_table_id(&table_name, database)?;
     let where_program: BytecodeProgram<B> = if let Some(expr) = where_clause.as_ref() {
-        compile_expression::<B, DB>(expr, table_id, database)?
+        let (program, terms) = compile_expression::<B, DB>(expr, table_id, database)?;
+        // This path serves the queries the engine itself rejects, which are the
+        // scalar aggregates. One in-process accumulator is shared by every
+        // consumer of the aggregate, and a term makes their row sets differ, so
+        // the count one subscriber reads would be another's. That is the same
+        // reason an aggregate on a table with row-level security is refused.
+        if !terms.is_empty() {
+            return Err(RegisterError::MembershipTermRefused(
+                "an aggregate cannot carry a membership subquery. SubQL keeps one accumulator \
+                 per aggregate and shares it between consumers, and a membership subquery gives \
+                 each consumer a different set of rows to aggregate."
+                    .to_string(),
+            ));
+        }
+        program
     } else {
         // No WHERE clause matches every row. Feed the bare `true` literal
         // through the same wrapper that trailing bare-value predicates use
@@ -566,6 +651,7 @@ const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
             | Instruction::Like { .. }
             | Instruction::JumpIfFalse(_)
             | Instruction::JumpIfTrue(_)
+            | Instruction::TermTruth(_)
     )
 }
 
@@ -594,32 +680,40 @@ where
     }
 }
 
-/// Compile a SQL expression into bytecode.
+/// Compile a SQL expression into bytecode, plus the membership terms it names.
 ///
 /// Recursively compiles an SQL expression into a sequence of VM
 /// instructions. Handles all supported expression types with proper NULL
 /// propagation. Appends the bare-value rescue at the end so the VM's
 /// final-result contract holds even for `WHERE bool_col` and similar.
+///
+/// A membership term compiles to one [`Instruction::TermTruth`] and travels out
+/// beside the program: the VM is handed its truth rather than computing it,
+/// because the same row admits different subscribers through it.
 fn compile_expression<B, DB>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
-) -> Result<BytecodeProgram<B>, RegisterError>
+) -> Result<(BytecodeProgram<B>, Vec<CompiledTerm>), RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let mut instructions: Vec<Instruction<B>> = Vec::new();
+    let mut compiling: Compiling<B> = Compiling::new();
     compile_expr_recursive::<B, DB>(
         expr,
         table_id,
         database,
-        &mut instructions,
+        &mut compiling,
         0,
         ScalarKind::String,
     )?;
-    wrap_bare_value_as_tri::<B>(&mut instructions)?;
-    Ok(BytecodeProgram::new(instructions))
+    wrap_bare_value_as_tri::<B>(&mut compiling)?;
+    let columns = term_columns(&compiling.terms);
+    Ok((
+        BytecodeProgram::with_terms(compiling.out, columns),
+        compiling.terms,
+    ))
 }
 
 /// Recursive helper for expression compilation.
@@ -634,7 +728,7 @@ fn compile_expr_recursive<B, DB>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
-    out: &mut Vec<Instruction<B>>,
+    out: &mut Compiling<B>,
     depth: usize,
     target_kind: ScalarKind,
 ) -> Result<(), RegisterError>
@@ -844,8 +938,13 @@ where
         // `IN (SELECT ...)` parses to `InSubquery`, which the literal-list arm
         // above never sees. Requirement 1 of the membership term: recognise the
         // bounded form here, in every build, and let the bound itself say what
-        // is wrong with anything outside it. Compiling a bounded term needs
-        // `rls2fga`, so that half is switched and this arm only reaches it.
+        // is wrong with anything outside it.
+        //
+        // A term is not a row test, so it compiles to a slot rather than to a
+        // comparison: dispatch reads the compared column off the changed row,
+        // looks up which subscribers that value admits, and hands the VM one
+        // truth per assignment. Whether the relationship can be served at all is
+        // registration's question, since answering it needs `rls2fga`.
         Expr::InSubquery {
             expr: tested,
             subquery,
@@ -855,18 +954,19 @@ where
                 return Err(negated_term_refusal());
             }
 
-            if resolve_column_ref(tested, table_id, database).is_none() {
+            let Some(column) = resolve_column_ref(tested, table_id, database) else {
                 return Err(RegisterError::UnsupportedSql(
                     "A membership subquery must test a column of the subscribed table. SubQL \
                      reads that column off each changed row to decide which subscribers the row \
                      reaches, so an expression or an unknown name leaves it nothing to read."
                         .to_string(),
                 ));
-            }
+            };
 
             sql_shape::check_membership_subquery_bound(subquery)?;
 
-            return Err(term_refusal_for_bounded_form());
+            let slot = out.term_slot(expr, column)?;
+            out.push(Instruction::TermTruth(slot));
         }
 
         // ====================================================================
@@ -1092,32 +1192,6 @@ fn negated_term_refusal() -> RegisterError {
          Use NOT IN with a literal list, or run this as a regular SQL query in your database."
             .to_string(),
     )
-}
-
-/// Why a membership subquery inside the bounded form is refused here.
-///
-/// Permanent rather than provisional: this site compiles a row test into
-/// bytecode, and a membership term never becomes bytecode. It names which
-/// subscribers a changed row admits, and the engine intersects that set with the
-/// subscribers the compiled predicate already matched, so there is no boolean
-/// for the row test to hold.
-///
-/// The `membership-term` feature is what adds the path that compiles one, so a
-/// build without it says so, since otherwise the reader cannot tell a filter
-/// SubQL will not serve from one this build was not built to serve.
-fn term_refusal_for_bounded_form() -> RegisterError {
-    let mut reason = String::from(
-        "A membership subquery cannot be compiled into a row test. SubQL serves one by \
-         narrowing which subscribers a changed row admits, which the predicate the row is \
-         tested against cannot express.",
-    );
-    if !cfg!(feature = "membership-term") {
-        reason.push_str(
-            " This build was compiled without the membership-term feature, which is what \
-             compiles one at all.",
-        );
-    }
-    RegisterError::MembershipTermRefused(reason)
 }
 
 #[cfg(test)]

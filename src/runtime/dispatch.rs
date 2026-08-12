@@ -9,6 +9,7 @@ use super::{
 };
 use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use crate::runtime::indexes::IndexableCell;
+use crate::term::TermLookup;
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm, VmError},
     AggDelta, ConsumerNotifications, DispatchError, EventKind, IdTypes, SubscriptionId,
@@ -25,6 +26,203 @@ fn dispatch_vm_error(error: VmError) -> DispatchError {
         VmError::Value(inner) => DispatchError::Value(inner),
         other => DispatchError::VmError(format!("{other:?}")),
     }
+}
+
+/// Which of a predicate's subscribers one row version reached.
+///
+/// A predicate is evaluated once for every subscriber sharing its text, so the
+/// verdict is a *set* rather than a boolean as soon as a membership term is in
+/// play: the term names which subscribers the changed row admits, and the
+/// predicate's own subscribers are narrowed to that.
+///
+/// [`Matched::Every`] and [`Matched::Nobody`] borrow the predicate's bitmap
+/// instead of copying it, so a predicate carrying no term costs exactly what it
+/// did before terms existed. Only [`Matched::Narrowed`] owns a bitmap, and only
+/// a term produces one.
+enum Matched<'a> {
+    /// The row test held and nothing narrowed it.
+    Every(&'a RoaringBitmap),
+    /// The row test did not hold, so no subscriber of this predicate matched.
+    Nobody,
+    /// A membership term narrowed the predicate's subscribers to these.
+    Narrowed(RoaringBitmap),
+}
+
+impl Matched<'_> {
+    /// The subscribers matched, or [`None`] when none did.
+    const fn bitmap(&self) -> Option<&RoaringBitmap> {
+        match self {
+            Self::Every(all) => Some(all),
+            Self::Nobody => None,
+            Self::Narrowed(some) => Some(some),
+        }
+    }
+}
+
+/// Which view-relative set a split result belongs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    Inserted,
+    Deleted,
+    Updated,
+}
+
+/// Split one predicate's two row versions into the view-relative sets.
+///
+/// `inserted = new - old`, `deleted = old - new`, `updated = new & old`. With no
+/// membership term the two sides are the whole subscriber bitmap or nothing,
+/// which collapses to the four cases dispatch had before terms existed. Those
+/// four are written out as their own arms so they borrow rather than compute,
+/// leaving a term-free predicate exactly as cheap as it was.
+///
+/// Emits nothing for an empty set, so a predicate no subscriber matched neither
+/// stamps nor touches an accumulator.
+fn split_transition(
+    new: &Matched<'_>,
+    old: &Matched<'_>,
+    mut emit: impl FnMut(Slot, &RoaringBitmap),
+) {
+    let mut emit_non_empty = |slot, set: &RoaringBitmap| {
+        if !set.is_empty() {
+            emit(slot, set);
+        }
+    };
+
+    match (new, old) {
+        (Matched::Nobody, Matched::Nobody) => {}
+        (Matched::Every(all), Matched::Nobody) => emit_non_empty(Slot::Inserted, all),
+        (Matched::Nobody, Matched::Every(all)) => emit_non_empty(Slot::Deleted, all),
+        (Matched::Every(all), Matched::Every(_)) => emit_non_empty(Slot::Updated, all),
+        _ => match (new.bitmap(), old.bitmap()) {
+            (Some(n), None) => emit_non_empty(Slot::Inserted, n),
+            (None, Some(o)) => emit_non_empty(Slot::Deleted, o),
+            (Some(n), Some(o)) => {
+                emit_non_empty(Slot::Inserted, &(n - o));
+                emit_non_empty(Slot::Deleted, &(o - n));
+                emit_non_empty(Slot::Updated, &(n & o));
+            }
+            (None, None) => {}
+        },
+    }
+}
+
+/// What one membership term says about one row version.
+enum TermFacts<'a> {
+    /// The term admits exactly these subscribers, and none when [`None`]: the
+    /// row's compared value is one nobody stated, or it is SQL `NULL`, which
+    /// `IN (SELECT ...)` never admits.
+    Admits(Option<&'a RoaringBitmap>),
+    /// The row does not carry the compared column, so the term cannot say. It
+    /// answers `Tri::Unknown` for every subscriber alike, which composes through
+    /// the filter's own three-valued logic rather than reading as "nobody".
+    CannotSay,
+}
+
+/// Which of a predicate's subscribers `row` reached.
+///
+/// A term-free predicate is one evaluation and no allocation, exactly as before
+/// terms existed. A filter naming `k` terms is `2^k` evaluations, because the
+/// filter is a boolean formula whose only subscriber-dependent inputs are the
+/// terms: partition the subscribers by their assignment over the `k` terms, and
+/// the matched set is the union, over every assignment the formula accepts, of
+/// the intersection of the term sets and their complements that assignment
+/// describes. Exact for `AND`, `OR` and any nesting, and it does not grow with
+/// subscriber count.
+fn matched_for_row<'a, I, E, DB>(
+    pred: &Predicate<E::Backend>,
+    bitmap: &'a RoaringBitmap,
+    store: &'a PredicateStore<I, E::Backend>,
+    event: &E,
+    row: RowKind,
+    vm: &mut Vm<E::Backend>,
+    db: &DB,
+) -> Result<Matched<'a>, DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    if pred.bytecode.term_columns.is_empty() {
+        let held = vm
+            .eval(&pred.bytecode, event, row, db)
+            .map_err(dispatch_vm_error)?
+            == Tri::True;
+        return Ok(if held {
+            Matched::Every(bitmap)
+        } else {
+            Matched::Nobody
+        });
+    }
+
+    let mut facts: Vec<TermFacts<'a>> = Vec::with_capacity(pred.bytecode.term_columns.len());
+    for (slot, column) in pred.bytecode.term_columns.iter().enumerate() {
+        let value = event
+            .value_at(db, row, *column)
+            .map_err(DispatchError::Value)?;
+        let slot = u16::try_from(slot).unwrap_or(u16::MAX);
+        facts.push(match TermLookup::of(value) {
+            TermLookup::Key(key) => TermFacts::Admits(
+                store
+                    .term_members(pred.id, slot)
+                    .and_then(|members| members.admits(&key)),
+            ),
+            TermLookup::Nobody => TermFacts::Admits(None),
+            TermLookup::Unknown => TermFacts::CannotSay,
+        });
+    }
+
+    // Only a term the row can answer partitions the subscribers. One it cannot
+    // answers alike for all of them, so it is a fixed `Unknown` rather than an
+    // axis of the enumeration.
+    let varying: Vec<usize> = facts
+        .iter()
+        .enumerate()
+        .filter(|(_, fact)| matches!(fact, TermFacts::Admits(_)))
+        .map(|(slot, _)| slot)
+        .collect();
+
+    let mut truths = alloc::vec![Tri::Unknown; facts.len()];
+    let mut matched = RoaringBitmap::new();
+    for assignment in 0..(1u32 << varying.len()) {
+        for (bit, &slot) in varying.iter().enumerate() {
+            truths[slot] = if assignment & (1 << bit) == 0 {
+                Tri::False
+            } else {
+                Tri::True
+            };
+        }
+
+        if vm
+            .eval_with_terms(&pred.bytecode, event, row, db, &truths)
+            .map_err(dispatch_vm_error)?
+            != Tri::True
+        {
+            continue;
+        }
+
+        // The subscribers this assignment describes: in every term it says the
+        // subscriber is in, out of every term it says they are not. Complemented
+        // against the predicate's own subscribers, since a term set never reaches
+        // outside them.
+        let mut described = bitmap.clone();
+        for (bit, &slot) in varying.iter().enumerate() {
+            let TermFacts::Admits(admits) = facts[slot] else {
+                continue;
+            };
+            let admits = admits.map_or_else(RoaringBitmap::new, Clone::clone);
+            if assignment & (1 << bit) == 0 {
+                described -= admits;
+            } else {
+                described &= admits;
+            }
+            if described.is_empty() {
+                break;
+            }
+        }
+        matched |= described;
+    }
+
+    Ok(Matched::Narrowed(matched))
 }
 
 /// Consumer dictionary translating between ordinals and ConsumerIds.
@@ -166,7 +364,7 @@ fn notifications_for_truncate_with_stamps<I: IdTypes, B: Backend, C>(
     partition: &TablePartition<I, B>,
     consumer_dict: &ConsumerDictionary<I>,
     stamps: &mut Vec<SubscriptionId>,
-) -> ConsumerNotifications<I, C>
+) -> ConsumerNotifications<I, C, B>
 where
     C: crate::Checkpoint,
 {
@@ -224,7 +422,7 @@ pub fn dispatch_consumers<I, E, DB>(
     vm: &mut Vm<E::Backend>,
     arity: usize,
     db: &DB,
-) -> Result<ConsumerNotifications<I, E::Checkpoint>, DispatchError>
+) -> Result<ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
@@ -248,7 +446,13 @@ pub fn dispatch_consumers_with_stamps<I, E, DB>(
     vm: &mut Vm<E::Backend>,
     arity: usize,
     db: &DB,
-) -> Result<(ConsumerNotifications<I, E::Checkpoint>, Vec<SubscriptionId>), DispatchError>
+) -> Result<
+    (
+        ConsumerNotifications<I, E::Checkpoint, E::Backend>,
+        Vec<SubscriptionId>,
+    ),
+    DispatchError,
+>
 where
     I: IdTypes,
     E: CdcEvent,
@@ -256,7 +460,7 @@ where
 {
     let checkpoint = event.checkpoint();
     let mut stamps: Vec<SubscriptionId> = Vec::new();
-    let notifs: ConsumerNotifications<I, E::Checkpoint> = match event.kind() {
+    let notifs: ConsumerNotifications<I, E::Checkpoint, E::Backend> = match event.kind() {
         EventKind::Truncate => {
             let _ = vm;
             notifications_for_truncate_with_stamps(partition, consumer_dict, &mut stamps)
@@ -332,7 +536,7 @@ fn dispatch_update_with_stamps<I, E, DB>(
     vm: &mut Vm<E::Backend>,
     db: &DB,
     stamps: &mut Vec<SubscriptionId>,
-) -> Result<ConsumerNotifications<I, E::Checkpoint>, DispatchError>
+) -> Result<ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
@@ -359,33 +563,38 @@ where
             continue;
         }
 
-        let new_match = vm
-            .eval(&pred.bytecode, event, RowKind::New, db)
-            .map_err(dispatch_vm_error)?
-            == Tri::True;
+        let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) else {
+            continue;
+        };
 
-        let old_match = vm
-            .eval(&pred.bytecode, event, RowKind::Old, db)
-            .map_err(dispatch_vm_error)?
-            == Tri::True;
+        let new_matched = matched_for_row(
+            pred,
+            bitmap,
+            &snapshot.predicates,
+            event,
+            RowKind::New,
+            vm,
+            db,
+        )?;
+        let old_matched = matched_for_row(
+            pred,
+            bitmap,
+            &snapshot.predicates,
+            event,
+            RowKind::Old,
+            vm,
+            db,
+        )?;
 
-        if let Some(bitmap) = snapshot.predicates.predicate_consumers.get(&pred_id) {
-            match (new_match, old_match) {
-                (true, false) => {
-                    inserted_ordinals |= bitmap;
-                    collect_stamps_for_predicate(&snapshot.predicates, pred_id, bitmap, stamps);
-                }
-                (false, true) => {
-                    deleted_ordinals |= bitmap;
-                    collect_stamps_for_predicate(&snapshot.predicates, pred_id, bitmap, stamps);
-                }
-                (true, true) => {
-                    updated_ordinals |= bitmap;
-                    collect_stamps_for_predicate(&snapshot.predicates, pred_id, bitmap, stamps);
-                }
-                (false, false) => {}
-            }
-        }
+        split_transition(&new_matched, &old_matched, |slot, set| {
+            collect_stamps_for_predicate(&snapshot.predicates, pred_id, set, stamps);
+            let target = match slot {
+                Slot::Inserted => &mut inserted_ordinals,
+                Slot::Deleted => &mut deleted_ordinals,
+                Slot::Updated => &mut updated_ordinals,
+            };
+            *target |= set;
+        });
     }
 
     Ok(ConsumerNotifications::from_parts(
@@ -461,14 +670,18 @@ where
             continue;
         };
 
-        let result = vm
-            .eval(&pred.bytecode, event, row, db)
-            .map_err(dispatch_vm_error)?;
+        let Some(bitmap) = store.predicate_consumers.get(&pred_id) else {
+            continue;
+        };
 
-        if result == Tri::True {
-            if let Some(bitmap) = store.predicate_consumers.get(&pred_id) {
-                on_match(pred, bitmap)?;
-            }
+        // A term narrows which of the predicate's subscribers this one row
+        // reaches, so the callback gets the narrowed set rather than the whole
+        // bitmap. Without the narrowing an insert would reach every subscriber
+        // sharing the filter, which is the failure the staged refusal existed to
+        // prevent.
+        let matched = matched_for_row(pred, bitmap, store, event, row, vm, db)?;
+        if let Some(reached) = matched.bitmap().filter(|set| !set.is_empty()) {
+            on_match(pred, reached)?;
         }
     }
     Ok(())
@@ -723,3 +936,103 @@ fn probe_column_for_agg<E: CdcEvent, DB: DatabaseLike>(
 }
 
 // Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
+
+#[cfg(test)]
+mod transition_tests {
+    use super::{split_transition, Matched, Slot};
+    use alloc::vec::Vec;
+    use roaring::RoaringBitmap;
+
+    fn bits(ordinals: &[u32]) -> RoaringBitmap {
+        ordinals.iter().copied().collect()
+    }
+
+    /// Every non-empty set the split emits, as `(slot, ordinals)`.
+    fn split(new: &Matched<'_>, old: &Matched<'_>) -> Vec<(Slot, Vec<u32>)> {
+        let mut out = Vec::new();
+        split_transition(new, old, |slot, set| out.push((slot, set.iter().collect())));
+        out
+    }
+
+    /// The four cases dispatch had before terms existed, unchanged. A predicate
+    /// with no term reaches exactly these, so this is what says the set algebra
+    /// did not move the old behaviour.
+    #[test]
+    fn a_predicate_with_no_term_splits_as_it_always_did() {
+        let all = bits(&[1, 4, 9]);
+        let every = Matched::Every(&all);
+
+        assert_eq!(
+            split(&every, &Matched::Nobody),
+            vec![(Slot::Inserted, vec![1, 4, 9])],
+            "matching now and not before is an insert for every subscriber"
+        );
+        assert_eq!(
+            split(&Matched::Nobody, &every),
+            vec![(Slot::Deleted, vec![1, 4, 9])],
+            "matching before and not now is a delete for every subscriber"
+        );
+        assert_eq!(
+            split(&every, &every),
+            vec![(Slot::Updated, vec![1, 4, 9])],
+            "matching both times is an update for every subscriber"
+        );
+        assert!(
+            split(&Matched::Nobody, &Matched::Nobody).is_empty(),
+            "matching neither time emits nothing at all"
+        );
+    }
+
+    /// The case a term introduces: the same row is an insert for one subscriber,
+    /// a delete for another and an update for a third, out of one evaluation.
+    #[test]
+    fn a_narrowed_split_separates_subscribers_of_one_predicate() {
+        let new = Matched::Narrowed(bits(&[1, 2]));
+        let old = Matched::Narrowed(bits(&[2, 3]));
+
+        let mut got = split(&new, &old);
+        got.sort_by_key(|(slot, _)| format!("{slot:?}"));
+
+        assert_eq!(
+            got,
+            vec![
+                (Slot::Deleted, vec![3]),
+                (Slot::Inserted, vec![1]),
+                (Slot::Updated, vec![2]),
+            ],
+            "one predicate, three different verdicts, split by subscriber"
+        );
+    }
+
+    /// A narrowed side against a whole side still subtracts, which is what makes
+    /// a term able to remove a subscriber the row test alone would have kept.
+    #[test]
+    fn narrowing_one_side_against_every_still_subtracts() {
+        let all = bits(&[1, 2, 3]);
+        let narrowed = Matched::Narrowed(bits(&[2]));
+
+        assert_eq!(
+            split(&narrowed, &Matched::Every(&all)),
+            vec![(Slot::Deleted, vec![1, 3]), (Slot::Updated, vec![2])],
+            "the subscribers the term dropped leave the view"
+        );
+    }
+
+    /// An empty narrowing is not the same as nobody matching, and must not
+    /// emit an empty set into an accumulator.
+    #[test]
+    fn an_empty_narrowing_emits_nothing() {
+        let empty = Matched::Narrowed(RoaringBitmap::new());
+        let all = bits(&[7]);
+
+        assert_eq!(
+            split(&empty, &Matched::Every(&all)),
+            vec![(Slot::Deleted, vec![7])],
+            "the row left the view for everyone, and no empty set is emitted"
+        );
+        assert!(
+            split(&empty, &empty).is_empty(),
+            "two empty narrowings emit nothing"
+        );
+    }
+}

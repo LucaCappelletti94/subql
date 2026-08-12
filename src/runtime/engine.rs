@@ -14,9 +14,11 @@ use crate::{
     catalog_helpers,
     compiler::{
         canonicalize, parse_and_resolve_hash, parse_compile_normalize_and_prefilter_with_binds,
+        parser::CompiledQuery,
         sql_shape::{AggSpec, QueryProjection},
         BytecodeProgram, PrefilterPlan, Vm,
     },
+    term::{kind_can_key, CompiledTerm, TermKey, TermLookup, TermPlan},
     DispatchError, EventKind, IdTypes, RegisterError, RegisterResult, SubscriptionDispatch,
     SubscriptionId, SubscriptionRegistration, SubscriptionRequest, SubscriptionScope,
     SubscriptionUnregistration, TableId, UnregisterReport,
@@ -128,6 +130,14 @@ struct CompiledSpec<I: IdTypes, B: Backend> {
     /// for an aggregate registration, `None` for row subscriptions.
     /// Rendered once at compile time.
     bootstrap: Option<crate::AggregateBootstrap>,
+    /// What registration settled about each membership term the filter names,
+    /// one per slot, empty for a filter naming none.
+    term_plans: Vec<TermPlan>,
+    /// The subscriber this subscription filters for, in the form the term lookup
+    /// is keyed by. `Some` exactly when the filter names a term.
+    term_subscriber: Option<TermKey<B>>,
+    /// Per term slot, the values the subscription states it matches today.
+    term_seeds: Vec<Vec<TermKey<B>>>,
 }
 
 #[cfg(feature = "std")]
@@ -243,6 +253,88 @@ where
     /// an ordinary inert subscription. Stored as `Vec<Value<E::Backend>>`
     /// so the values round-trip through the parser's bind resolver.
     pk_follows: HashMap<SubscriptionId, (TableId, Vec<crate::backend::Value<E::Backend>>)>,
+    /// The caller's own translation settings, which registration needs to ask
+    /// whether a membership subquery can be served at all.
+    ///
+    /// The whole [`Translator`](rls2fga::translator::Translator) rather than the
+    /// two values read off it, so the filter and the caller's real read rules are
+    /// judged by the same table and the same bar, and so the registry enriched
+    /// from the schema is reachable. `None` refuses every term naming the
+    /// missing configuration: the session setting that identifies the caller is
+    /// deployment-specific, and defaulting it fails silently when wrong.
+    #[cfg(feature = "membership-term")]
+    translator: Option<rls2fga::translator::Translator>,
+    /// Which term slots a change to each table moves, keyed by the table whose
+    /// rows carry the membership.
+    ///
+    /// Cross-table on purpose: the predicate carrying the term lives in the
+    /// subscribed table's partition, and the row that moves its subscriber set
+    /// arrives on another table entirely.
+    ///
+    /// In-memory only (not persisted), like
+    /// [`pk_follows`](Self::pk_follows): across a restart a durable term
+    /// subscription comes back with an empty subscriber set and admits nobody
+    /// until the client registers again. That is the freshness-losing direction,
+    /// never a row delivered to somebody the filter excludes.
+    term_watch: HashMap<TableId, Vec<TermWatch>>,
+}
+
+/// One term whose subscriber set a change to some table moves.
+///
+/// Keyed from the membership table's side, so it carries where to put the answer
+/// back: the subscribed table names the partition holding the predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TermWatch {
+    /// The subscribed table, whose partition holds the predicate.
+    subscribed: TableId,
+    /// The table whose changed rows move this term, which is the key this watch
+    /// is indexed under.
+    member_table: TableId,
+    /// The predicate carrying the term.
+    predicate: PredicateId,
+    /// The term's slot in that predicate.
+    slot: u16,
+    /// The column of the subscribed table the term compares, which is what the
+    /// narrowing message names.
+    column: crate::ColumnId,
+    /// The column of the changed row carrying the value the term compares
+    /// against.
+    member_key: crate::ColumnId,
+    /// The column of the changed row naming the subscriber it admits.
+    member_subject: crate::ColumnId,
+}
+
+/// One subscription's term seeding, held until its predicate id is final.
+struct PendingSeed<B: Backend> {
+    table: TableId,
+    subscription: SubscriptionId,
+    subscriber: TermKey<B>,
+    plans: Vec<TermPlan>,
+    seeds: Vec<Vec<TermKey<B>>>,
+}
+
+/// The subscriptions bound to `predicate` for each ordinal in `ordinals`.
+///
+/// Sorted and deduplicated so a narrowing names each subscription once, however
+/// many bindings a consumer holds on the predicate.
+fn subscriptions_for<I: IdTypes, B: Backend>(
+    store: &super::predicate::PredicateStore<I, B>,
+    predicate: PredicateId,
+    ordinals: &roaring::RoaringBitmap,
+) -> Vec<SubscriptionId> {
+    let mut ids: Vec<SubscriptionId> = ordinals
+        .iter()
+        .filter_map(|ordinal| {
+            store
+                .binding_lookup
+                .get(&(predicate, ConsumerOrdinal::new(ordinal)))
+        })
+        .flatten()
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Look up the partition and consumer dictionary for a table, or return
@@ -298,13 +390,20 @@ where
         &self,
         spec: SubscriptionRequest<I, E::Backend>,
     ) -> Result<CompiledSpec<I, E::Backend>, RegisterError> {
-        let (table_id, bytecode, normalized, prefilter_plan, projection) =
-            parse_compile_normalize_and_prefilter_with_binds::<E::Backend, DB>(
-                &spec.sql,
-                &self.dialect,
-                &self.database,
-                &spec.binds,
-            )?;
+        let compiled = parse_compile_normalize_and_prefilter_with_binds::<E::Backend, DB>(
+            &spec.sql,
+            &self.dialect,
+            &self.database,
+            &spec.binds,
+        )?;
+        let CompiledQuery {
+            table_id,
+            program: bytecode,
+            normalized,
+            prefilter_plan,
+            projection,
+            terms,
+        } = compiled;
 
         // Registration policy: under RLS, viewers observe different rows,
         // so a single in-process aggregate state cannot be shared across
@@ -320,6 +419,9 @@ where
         {
             return Err(RegisterError::AggregatorOnRlsTable { table_id });
         }
+
+        let term_plans = self.check_membership_terms(&terms, table_id, &projection)?;
+        let (term_subscriber, term_seeds) = self.settle_term_seeds(&terms, table_id, &spec)?;
 
         // Disambiguate hash: same WHERE clause with different projection
         // kind must map to distinct predicates.
@@ -349,7 +451,242 @@ where
             projection,
             hash,
             bootstrap,
+            term_plans,
+            term_subscriber,
+            term_seeds,
         })
+    }
+
+    /// Settle every membership term the filter names, or refuse the
+    /// registration.
+    ///
+    /// Refusing here rather than serving is the whole point of the term having
+    /// two executors: the subquery text serves the snapshot and the compiled
+    /// relationship serves the change path, and a filter they answer differently
+    /// is silent divergence.
+    fn check_membership_terms(
+        &self,
+        terms: &[CompiledTerm],
+        table_id: TableId,
+        projection: &QueryProjection,
+    ) -> Result<Vec<TermPlan>, RegisterError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // One accumulator per aggregate is shared between consumers, and a term
+        // gives each consumer a different set of rows to aggregate, so the
+        // number one subscriber reads would be another's. Same reason an
+        // aggregate on a table with row-level security is refused above.
+        if matches!(projection, QueryProjection::Aggregate(_)) {
+            return Err(RegisterError::MembershipTermRefused(
+                "an aggregate cannot carry a membership subquery. SubQL keeps one accumulator \
+                 per aggregate and shares it between consumers, and a membership subquery gives \
+                 each consumer a different set of rows to aggregate."
+                    .to_string(),
+            ));
+        }
+
+        for term in terms {
+            // The lookup is keyed by the compared column's value, so the column
+            // has to hold a kind whose equality is reflexive. A float, a JSON or
+            // a JSONB cell could not find what it stored.
+            let kind = catalog_helpers::column_scalar_kind(&self.database, table_id, term.column)
+                .ok_or_else(|| {
+                RegisterError::MembershipTermRefused(format!(
+                    "column {column} of table {table_id} has a SQL type SubQL cannot read, so \
+                         a membership subquery comparing it has nothing to look up",
+                    column = term.column,
+                ))
+            })?;
+            if !kind_can_key(kind) {
+                return Err(RegisterError::MembershipTermRefused(format!(
+                    "a membership subquery cannot compare a {kind:?} column. SubQL looks the \
+                     column's value up to decide which subscribers a changed row admits, and a \
+                     {kind:?} value is not equal to itself, so the lookup could not find what it \
+                     stored."
+                )));
+            }
+
+            // Two terms comparing one column would make that column's name
+            // ambiguous in the values a subscription states for it, and the name
+            // is the only thing both sides share.
+            if terms
+                .iter()
+                .any(|other| other.slot != term.slot && other.column == term.column)
+            {
+                return Err(RegisterError::MembershipTermRefused(format!(
+                    "two membership subqueries in one filter compare column {column} of table \
+                     {table_id}. A subscription states the values it matches per compared column, \
+                     so two subqueries on one column leave SubQL unable to tell which values \
+                     belong to which.",
+                    column = term.column,
+                )));
+            }
+        }
+
+        self.plan_membership_terms(terms, table_id)
+    }
+
+    /// Turn what the subscription stated into the keys the term lookup stores,
+    /// or refuse the registration.
+    ///
+    /// Returns the subscriber's key and, per term slot, the values it states it
+    /// matches today. Both are empty for a filter naming no term. This runs
+    /// before anything is bound, so seeding afterwards cannot fail halfway and
+    /// leave a subscription registered against a term it was never added to.
+    fn settle_term_seeds(
+        &self,
+        terms: &[CompiledTerm],
+        table_id: TableId,
+        spec: &SubscriptionRequest<I, E::Backend>,
+    ) -> Result<(Option<TermKey<E::Backend>>, Vec<Vec<TermKey<E::Backend>>>), RegisterError> {
+        if terms.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+
+        let subscriber = spec.subscriber.clone().ok_or_else(|| {
+            RegisterError::MembershipTermRefused(
+                "a filter naming a membership subquery has to say which subscriber it filters \
+                 for. SubQL matches a changed membership row against that identity to move who \
+                 the filter admits, so without one the subscription could never be moved."
+                    .to_string(),
+            )
+        })?;
+        let TermLookup::Key(subscriber) = TermLookup::of(subscriber) else {
+            return Err(RegisterError::MembershipTermRefused(
+                "the subscriber this subscription filters for is null, or of a kind SubQL cannot \
+                 look up. An identity has to be a value equal to itself for a membership row to \
+                 be matched against it."
+                    .to_string(),
+            ));
+        };
+
+        let mut seeds: Vec<Vec<TermKey<E::Backend>>> = alloc::vec![Vec::new(); terms.len()];
+        for (column_name, values) in &spec.term_values {
+            let column = catalog_helpers::column_id(&self.database, table_id, column_name);
+            let slot = column
+                .and_then(|column| terms.iter().find(|term| term.column == column))
+                .map(|term| usize::from(term.slot))
+                .ok_or_else(|| {
+                    RegisterError::MembershipTermRefused(format!(
+                        "this subscription states the values it matches for column \
+                         {column_name:?}, which no membership subquery in its filter compares. \
+                         The values would be stored where nothing reads them."
+                    ))
+                })?;
+            for value in values {
+                let TermLookup::Key(key) = TermLookup::of(value.clone()) else {
+                    return Err(RegisterError::MembershipTermRefused(format!(
+                        "one of the values stated for column {column_name:?} is null, or of a \
+                         kind SubQL cannot look up. A value the subscriber matches has to be \
+                         equal to itself, and SQL never admits a row through a null."
+                    )));
+                };
+                seeds[slot].push(key);
+            }
+        }
+
+        Ok((Some(subscriber), seeds))
+    }
+
+    /// Seed one newly bound subscription into its predicate's term lookups, and
+    /// report which tables now move them.
+    ///
+    /// Nothing to do for a filter naming no term, which is the case for every
+    /// filter until one is registered.
+    fn seed_terms(
+        partition: &mut TablePartition<I, E::Backend>,
+        compiled: &CompiledSpec<I, E::Backend>,
+        pred_id: PredicateId,
+        ordinal: ConsumerOrdinal,
+    ) -> Vec<TermWatch> {
+        let Some(subscriber) = compiled.term_subscriber.as_ref() else {
+            return Vec::new();
+        };
+        partition.seed_terms(pred_id, ordinal, subscriber, &compiled.term_seeds);
+
+        compiled
+            .term_plans
+            .iter()
+            .map(|plan| TermWatch {
+                subscribed: compiled.table_id,
+                predicate: pred_id,
+                slot: plan.slot,
+                column: plan.column,
+                member_table: plan.member_table,
+                member_key: plan.member_key,
+                member_subject: plan.member_subject,
+            })
+            .collect()
+    }
+
+    /// Index the tables whose changes move a term, skipping a watch already
+    /// registered because another subscription shares the predicate.
+    fn watch_terms(&mut self, watches: Vec<TermWatch>) {
+        for watch in watches {
+            let indexed = self.term_watch.entry(watch.member_table).or_default();
+            if !indexed.contains(&watch) {
+                indexed.push(watch);
+            }
+        }
+    }
+
+    /// Ask `rls2fga` whether each term's relationship can be served, and resolve
+    /// the answer to subql's ids.
+    #[cfg(feature = "membership-term")]
+    fn plan_membership_terms(
+        &self,
+        terms: &[CompiledTerm],
+        table_id: TableId,
+    ) -> Result<Vec<TermPlan>, RegisterError> {
+        let translator = self.translator.as_ref().ok_or_else(|| {
+            RegisterError::MembershipTermRefused(
+                "this engine was built without translation settings, so SubQL cannot tell \
+                 whether the relationship a membership subquery names can be served. Pass the \
+                 caller's own translator through with_translator."
+                    .to_string(),
+            )
+        })?;
+        let table_name =
+            catalog_helpers::table_name(&self.database, table_id).ok_or_else(|| {
+                RegisterError::MembershipTermRefused(format!(
+                    "table {table_id} is not in the catalog under a name, so the relationship a \
+                 membership subquery names cannot be classified"
+                ))
+            })?;
+
+        terms
+            .iter()
+            .map(|term| {
+                crate::term_compile::plan_term(
+                    term,
+                    table_id,
+                    &table_name,
+                    &self.database,
+                    translator,
+                )
+            })
+            .collect()
+    }
+
+    /// Refuse every term, naming the feature that compiles one.
+    ///
+    /// The bounded form is recognised in every build so that one build does not
+    /// accept a filter another refuses, and this says which of the two the reader
+    /// is holding rather than claiming SubQL cannot run a nested `SELECT`.
+    #[cfg(not(feature = "membership-term"))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn plan_membership_terms(
+        &self,
+        _terms: &[CompiledTerm],
+        _table_id: TableId,
+    ) -> Result<Vec<TermPlan>, RegisterError> {
+        Err(RegisterError::MembershipTermRefused(
+            "this build was compiled without the membership-term feature, which is what serves \
+             a membership subquery at all. The filter itself is one SubQL recognises."
+                .to_string(),
+        ))
     }
 
     fn make_predicate_from_compiled(
@@ -537,7 +874,26 @@ where
             durability_mode: DurabilityMode::Required,
             resume_cursors: HashMap::new(),
             pk_follows: HashMap::new(),
+            #[cfg(feature = "membership-term")]
+            translator: None,
+            term_watch: HashMap::new(),
         }
+    }
+
+    /// Supply the translation settings a membership subquery is judged by.
+    ///
+    /// Without this, a filter naming a membership subquery is refused: deciding
+    /// whether one can be served needs to know which session setting identifies
+    /// the caller and how confident a classification has to be, and both are the
+    /// caller's to state. Passing the whole
+    /// [`Translator`](rls2fga::translator::Translator) rather than those two
+    /// values is what keeps the filter and the caller's real read rules judged by
+    /// the same table and the same bar.
+    #[cfg(feature = "membership-term")]
+    #[must_use]
+    pub fn with_translator(mut self, translator: rls2fga::translator::Translator) -> Self {
+        self.translator = Some(translator);
+        self
     }
 
     /// Configure a maximum number of live subscriptions and the built-in
@@ -797,6 +1153,8 @@ where
 
         // Add binding to partition
         partition.add_binding(binding, pred_id);
+        let watches = Self::seed_terms(partition, &compiled, pred_id, consumer_ord);
+        self.watch_terms(watches);
 
         // 8. Index subscription for O(1) unregister/upsert lookups.
         self.subscription_to_table.insert(subscription_id, table_id);
@@ -1167,9 +1525,20 @@ where
         // Evictions attributed to the spec that triggered them. Filled
         // when the cap-branch picks a victim.
         let mut evicted_per_spec: HashMap<usize, Vec<SubscriptionId>> = HashMap::new();
+        // Term seedings, applied after phase 3: the new-predicate path only
+        // assigns its predicate id there, so both paths defer rather than one of
+        // them seeding early. Empty unless a filter names a membership subquery.
+        let mut pending_seeds: Vec<PendingSeed<E::Backend>> = Vec::new();
 
         for (i, entry) in compiled.into_iter().enumerate() {
-            let Some(c) = entry else { continue };
+            let Some(mut c) = entry else { continue };
+            let pending_terms = c.term_subscriber.take().map(|subscriber| {
+                (
+                    subscriber,
+                    core::mem::take(&mut c.term_plans),
+                    core::mem::take(&mut c.term_seeds),
+                )
+            });
 
             // Enforce the registry cap before allocating a sub id. The
             // projected post-batch size is `subscription_to_table.len()
@@ -1220,6 +1589,15 @@ where
                 .entry(c.table_id)
                 .or_default()
                 .push(subscription_id);
+            if let Some((subscriber, plans, seeds)) = pending_terms {
+                pending_seeds.push(PendingSeed {
+                    table: c.table_id,
+                    subscription: subscription_id,
+                    subscriber,
+                    plans,
+                    seeds,
+                });
+            }
 
             // Check if predicate already exists in current snapshot
             let snapshot = partition.load_snapshot();
@@ -1321,6 +1699,41 @@ where
                 }
             }
         }
+
+        // Phase 3.5: seed the membership terms, now that every predicate id is
+        // final. Each seeding reads its own binding back, so a subscription whose
+        // table failed phase 3 simply has none and is skipped.
+        let mut watches = Vec::new();
+        for pending in pending_seeds {
+            let Some(partition) = self.partitions.get_mut(&pending.table) else {
+                continue;
+            };
+            let Some(binding) = partition
+                .load_snapshot()
+                .predicates
+                .bindings
+                .get(&pending.subscription)
+                .copied()
+            else {
+                continue;
+            };
+            partition.seed_terms(
+                binding.predicate_id,
+                binding.consumer_ordinal,
+                &pending.subscriber,
+                &pending.seeds,
+            );
+            watches.extend(pending.plans.iter().map(|plan| TermWatch {
+                subscribed: pending.table,
+                member_table: plan.member_table,
+                predicate: binding.predicate_id,
+                slot: plan.slot,
+                column: plan.column,
+                member_key: plan.member_key,
+                member_subject: plan.member_subject,
+            }));
+        }
+        self.watch_terms(watches);
 
         #[cfg(feature = "std")]
         {
@@ -1747,13 +2160,29 @@ where
     pub fn consumers(
         &mut self,
         event: &E,
-    ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint>, DispatchError> {
-        // A table owns a partition only once a subscription targets it.
+    ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError> {
+        let table_id = event.table_id(&self.database);
+        let notifs = self.row_consumers(event, table_id)?;
+        // After the row dispatch rather than before it. A table can be both the
+        // one a subscription reads and the one carrying its memberships, and then
+        // both row versions are judged against the set as it stood when the event
+        // arrived, which is one consistent world rather than the old row judged
+        // against a set that did not exist yet. The narrowing beside it is what
+        // says the set has since moved.
+        let narrowings = self.move_watched_terms(event, table_id);
+        Ok(notifs.with_narrowings(narrowings))
+    }
+
+    /// The view-relative notifications for subscriptions reading `table_id`.
+    fn row_consumers(
+        &mut self,
+        event: &E,
+        table_id: TableId,
+    ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError> {
         // An event for a table that is in the catalog but has no
         // subscription affects nobody: report empty rather than
         // erroring. Reserve `UnknownTableId` for ids not in the schema
         // at all (genuine drift or a caller bug).
-        let table_id = event.table_id(&self.database);
         if !self.partitions.contains_key(&table_id) {
             return if self.table_in_catalog(table_id) {
                 Ok(crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint()))
@@ -1793,6 +2222,165 @@ where
                 arity,
                 &self.database,
             )
+        }
+    }
+
+    /// Move who each term admits, for a change on a table carrying memberships,
+    /// and report every subscription whose answer that changed.
+    ///
+    /// Reads the two columns `rls2fga` named on the shape that states who a row
+    /// admits: one carries the value the term compares, the other names the
+    /// subscriber. Neither is guessed from the filter text.
+    fn move_watched_terms(
+        &mut self,
+        event: &E,
+        table_id: TableId,
+    ) -> Vec<crate::TermNarrowing<E::Backend>> {
+        let Some(watches) = self.term_watch.get(&table_id) else {
+            return Vec::new();
+        };
+        // Cloned so the loop can take the partition mutably. One small copy per
+        // event on a table some subscription reads memberships from, and none at
+        // all on any other table.
+        let watches = watches.clone();
+        let mut out = Vec::new();
+
+        for watch in watches {
+            match event.kind() {
+                EventKind::Insert => {
+                    if let Some((value, subject)) = self.read_term_pair(event, &watch, RowKind::New)
+                    {
+                        self.move_term(&watch, value, &subject, true, &mut out);
+                    }
+                }
+                EventKind::Delete => {
+                    if let Some((value, subject)) = self.read_term_pair(event, &watch, RowKind::Old)
+                    {
+                        self.move_term(&watch, value, &subject, false, &mut out);
+                    }
+                }
+                EventKind::Update => {
+                    let before = self.read_term_pair(event, &watch, RowKind::Old);
+                    let after = self.read_term_pair(event, &watch, RowKind::New);
+                    if before == after {
+                        continue;
+                    }
+                    if let Some((value, subject)) = before {
+                        self.move_term(&watch, value, &subject, false, &mut out);
+                    }
+                    if let Some((value, subject)) = after {
+                        self.move_term(&watch, value, &subject, true, &mut out);
+                    }
+                }
+                // Every membership is gone, so every value the term admitted is
+                // withdrawn. Doing nothing here would leave the sets admitting
+                // rows through memberships that no longer exist, which is the one
+                // error direction the whole design refuses.
+                EventKind::Truncate => self.clear_term(&watch, &mut out),
+            }
+        }
+        out
+    }
+
+    /// The value and the subscriber one membership row names, or [`None`] when
+    /// either half is absent, null, or of a kind that cannot be looked up.
+    fn read_term_pair(
+        &self,
+        event: &E,
+        watch: &TermWatch,
+        row: RowKind,
+    ) -> Option<(TermKey<E::Backend>, TermKey<E::Backend>)> {
+        let value = event.value_at(&self.database, row, watch.member_key).ok()?;
+        let subject = event
+            .value_at(&self.database, row, watch.member_subject)
+            .ok()?;
+        match (TermLookup::of(value), TermLookup::of(subject)) {
+            (TermLookup::Key(value), TermLookup::Key(subject)) => Some((value, subject)),
+            _ => None,
+        }
+    }
+
+    /// Add or remove the subscribers claiming `subscriber` from what `value`
+    /// admits, and report the subscriptions moved.
+    fn move_term(
+        &mut self,
+        watch: &TermWatch,
+        value: TermKey<E::Backend>,
+        subscriber: &TermKey<E::Backend>,
+        entered: bool,
+        out: &mut Vec<crate::TermNarrowing<E::Backend>>,
+    ) {
+        let Some(partition) = self.partitions.get_mut(&watch.subscribed) else {
+            return;
+        };
+        let snapshot = partition.load_snapshot();
+        let Some(members) = snapshot
+            .predicates
+            .term_members(watch.predicate, watch.slot)
+        else {
+            return;
+        };
+        let Some(claiming) = members.claimed_by(subscriber) else {
+            return;
+        };
+        // Only this predicate's own subscribers: an ordinal is dense per table
+        // and several predicates share the numbering.
+        let moved = match snapshot
+            .predicates
+            .predicate_consumers
+            .get(&watch.predicate)
+        {
+            Some(bitmap) => claiming & bitmap,
+            None => return,
+        };
+        if moved.is_empty() {
+            return;
+        }
+
+        let subscriptions = subscriptions_for(&snapshot.predicates, watch.predicate, &moved);
+        drop(snapshot);
+        partition.move_term_members(watch.predicate, watch.slot, value.clone(), &moved, entered);
+
+        let value = value.into_value();
+        out.extend(
+            subscriptions
+                .into_iter()
+                .map(|subscription| crate::TermNarrowing {
+                    subscription,
+                    table: watch.subscribed,
+                    column: watch.column,
+                    value: value.clone(),
+                    entered,
+                }),
+        );
+    }
+
+    /// Withdraw every value one term admitted, as a truncate of the table
+    /// carrying its memberships does.
+    fn clear_term(&mut self, watch: &TermWatch, out: &mut Vec<crate::TermNarrowing<E::Backend>>) {
+        let Some(partition) = self.partitions.get_mut(&watch.subscribed) else {
+            return;
+        };
+        let withdrawn = partition.clear_term_admissions(watch.predicate, watch.slot);
+        if withdrawn.is_empty() {
+            return;
+        }
+
+        let snapshot = partition.load_snapshot();
+        for (value, ordinals) in withdrawn {
+            let subscriptions = subscriptions_for(&snapshot.predicates, watch.predicate, &ordinals);
+            let value = value.into_value();
+            out.extend(
+                subscriptions
+                    .into_iter()
+                    .map(|subscription| crate::TermNarrowing {
+                        subscription,
+                        table: watch.subscribed,
+                        column: watch.column,
+                        value: value.clone(),
+                        entered: false,
+                    }),
+            );
         }
     }
 
@@ -1936,7 +2524,7 @@ where
     pub fn dispatch(
         &mut self,
         event: &E,
-    ) -> Result<crate::DispatchOutput<I, E::Checkpoint>, DispatchError> {
+    ) -> Result<crate::DispatchOutput<I, E::Checkpoint, E::Backend>, DispatchError> {
         let notifications = self.consumers(event)?;
         let aggregate_deltas = self.aggregate_deltas(event)?;
         let output = crate::DispatchOutput::from_parts(notifications, aggregate_deltas);
@@ -2773,7 +3361,7 @@ where
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {
-    type Notifications = crate::ConsumerNotifications<I, E::Checkpoint>;
+    type Notifications = crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>;
     type Error = DispatchError;
 
     fn consumers(&mut self, event: &E) -> Result<Self::Notifications, Self::Error> {

@@ -104,7 +104,7 @@ pub struct ReExecutionTrigger<I: IdTypes, C: crate::Checkpoint = crate::NoCheckp
 /// materializer to service.
 pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// View-relative notifications from the core engine.
-    pub engine: ConsumerNotifications<I, C>,
+    pub engine: ConsumerNotifications<I, C, B>,
     /// Scalar values that changed in-process (no DB round-trip).
     pub scalar_updates: Vec<ScalarUpdate<I, B, C>>,
     /// Queries whose maintenance could not resolve in-process. The
@@ -121,7 +121,7 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
 pub struct BatchOutcome<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// View-relative engine notifications, one entry per input event in
     /// the order they were supplied.
-    pub per_event: Vec<ConsumerNotifications<I, C>>,
+    pub per_event: Vec<ConsumerNotifications<I, C, B>>,
     /// Scalar updates produced in-process during the batch.
     pub scalar_updates: Vec<ScalarUpdate<I, B, C>>,
     /// Re-execution triggers, deduplicated by `query_id` across the

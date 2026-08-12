@@ -16,7 +16,7 @@ pub use literals::SqlLiteralParse;
 pub use parser::{
     derive_update_follow_select, derive_update_follow_select_with_set_binds, parse_and_compile,
     parse_and_resolve_hash, parse_compile_and_normalize, parse_compile_normalize_and_prefilter,
-    parse_compile_normalize_and_prefilter_with_binds,
+    parse_compile_normalize_and_prefilter_with_binds, CompiledQuery, MAX_TERMS_PER_FILTER,
 };
 pub use prefilter::{PlannerAtom, PlannerValue, PrefilterPlan};
 pub use sql_shape::{AggSpec, QueryProjection};

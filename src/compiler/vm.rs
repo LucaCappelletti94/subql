@@ -64,6 +64,12 @@ pub enum VmError {
     /// `Tri`. Compiler bug.
     MalformedProgram,
 
+    /// A [`Instruction::TermTruth`] named a slot the caller supplied no truth
+    /// for. The caller evaluates once per assignment over the program's term
+    /// slots, so a slot outside that vector means the assignment and the
+    /// program disagree about how many terms the filter has.
+    MissingTermTruth(u16),
+
     /// A carried cell could not be decoded to its declared type, surfaced
     /// from [`crate::backend::CdcEvent::value_at`].
     Value(crate::ValueError),
@@ -158,6 +164,33 @@ impl<B: Backend> Vm<B> {
         E: CdcEvent<Backend = B>,
         DB: DatabaseLike,
     {
+        self.eval_with_terms(program, event, row, db, &[])
+    }
+
+    /// Evaluate `program` with one truth per membership term slot.
+    ///
+    /// A membership term answers differently for different subscribers, so its
+    /// truth cannot be computed from the row. The caller enumerates the
+    /// assignments over the program's `term_columns` and evaluates once per
+    /// assignment, taking the union of the subscriber sets the accepting
+    /// assignments describe.
+    ///
+    /// # Errors
+    ///
+    /// As [`Vm::eval`], plus [`VmError::MissingTermTruth`] when the program
+    /// names a slot outside `truths`.
+    pub fn eval_with_terms<E, DB>(
+        &mut self,
+        program: &BytecodeProgram<B>,
+        event: &E,
+        row: RowKind,
+        db: &DB,
+        truths: &[Tri],
+    ) -> Result<Tri, VmError>
+    where
+        E: CdcEvent<Backend = B>,
+        DB: DatabaseLike,
+    {
         self.stack.clear();
 
         let instructions = &program.instructions;
@@ -196,7 +229,7 @@ impl<B: Backend> Vm<B> {
                     }
                 }
                 other => {
-                    self.execute(other, event, row, db)?;
+                    self.execute(other, event, row, db, truths)?;
                 }
             }
             ip += 1;
@@ -233,6 +266,7 @@ impl<B: Backend> Vm<B> {
         event: &E,
         row: RowKind,
         db: &DB,
+        truths: &[Tri],
     ) -> Result<(), VmError>
     where
         E: CdcEvent<Backend = B>,
@@ -418,6 +452,14 @@ impl<B: Backend> Vm<B> {
 
             // Jumps are handled in eval() before execute() is called.
             Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_) => {}
+
+            Instruction::TermTruth(slot) => {
+                let truth = truths
+                    .get(usize::from(*slot))
+                    .copied()
+                    .ok_or(VmError::MissingTermTruth(*slot))?;
+                self.stack.push(StackValue::Tri(truth));
+            }
         }
 
         Ok(())
@@ -947,5 +989,155 @@ mod tests {
         assert!(is_zero_scalar(&0.0f64));
         assert!(!is_zero_scalar(&1i64));
         assert!(!is_zero_scalar(&-3.14f64));
+    }
+
+    // ------------------------------------------------------------------
+    // Membership term slots
+    // ------------------------------------------------------------------
+
+    /// The program carrying only a term leaves the supplied truth as the whole
+    /// verdict, all three of them, so a term is not quietly read as a boolean.
+    #[test]
+    fn a_term_slot_evaluates_to_the_supplied_truth() {
+        let mut vm: Vm<Postgres> = Vm::new();
+        let program: BytecodeProgram<Postgres> =
+            BytecodeProgram::with_terms(vec![Instruction::TermTruth(0)], vec![0]);
+        let e = insert_pg(vec![Value::Int(1)]);
+
+        for truth in [Tri::True, Tri::False, Tri::Unknown] {
+            assert_eq!(
+                vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), &[truth])
+                    .unwrap(),
+                truth,
+                "slot 0 answers with exactly the truth it was handed"
+            );
+        }
+    }
+
+    /// Two slots read their own truth rather than the first one, which is what
+    /// makes an assignment vector an assignment rather than one flag.
+    #[test]
+    fn each_term_slot_reads_its_own_truth() {
+        let mut vm: Vm<Postgres> = Vm::new();
+        // `term0 OR term1`, spelled the way the compiler spells an OR.
+        let program: BytecodeProgram<Postgres> = BytecodeProgram::with_terms(
+            vec![
+                Instruction::TermTruth(0),
+                Instruction::JumpIfTrue(3),
+                Instruction::TermTruth(1),
+                Instruction::Or,
+            ],
+            vec![0, 1],
+        );
+        let e = insert_pg(vec![Value::Int(1)]);
+
+        let eval = |vm: &mut Vm<Postgres>, truths: &[Tri]| {
+            vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), truths)
+                .unwrap()
+        };
+
+        assert_eq!(eval(&mut vm, &[Tri::False, Tri::True]), Tri::True);
+        assert_eq!(eval(&mut vm, &[Tri::True, Tri::False]), Tri::True);
+        assert_eq!(eval(&mut vm, &[Tri::False, Tri::False]), Tri::False);
+    }
+
+    /// A term composes with a row test through the tri-state logic that already
+    /// exists, which is the whole reason the term is an instruction rather than
+    /// a set intersected afterwards.
+    #[test]
+    fn a_term_slot_composes_with_a_row_test() {
+        let mut vm: Vm<Postgres> = Vm::new();
+        // `a > 18 AND term0`, spelled the way the compiler spells an AND.
+        let program: BytecodeProgram<Postgres> = BytecodeProgram::with_terms(
+            vec![
+                Instruction::LoadColumn(0),
+                Instruction::PushLiteral(Value::Int(18)),
+                Instruction::GreaterThan,
+                Instruction::JumpIfFalse(3),
+                Instruction::TermTruth(0),
+                Instruction::And,
+            ],
+            vec![1],
+        );
+
+        let matching = insert_pg(vec![Value::Int(25)]);
+        let failing = insert_pg(vec![Value::Int(5)]);
+
+        assert_eq!(
+            vm.eval_with_terms(
+                &program,
+                &matching,
+                RowKind::New,
+                &pg_catalog(),
+                &[Tri::True]
+            )
+            .unwrap(),
+            Tri::True,
+            "row test holds and the term admits: the filter holds"
+        );
+        assert_eq!(
+            vm.eval_with_terms(
+                &program,
+                &matching,
+                RowKind::New,
+                &pg_catalog(),
+                &[Tri::False]
+            )
+            .unwrap(),
+            Tri::False,
+            "row test holds and the term does not admit: the filter does not hold"
+        );
+        assert_eq!(
+            vm.eval_with_terms(
+                &program,
+                &failing,
+                RowKind::New,
+                &pg_catalog(),
+                &[Tri::True]
+            )
+            .unwrap(),
+            Tri::False,
+            "the row test alone can still refuse the row"
+        );
+    }
+
+    /// A slot with no truth supplied is an error rather than an `Unknown`.
+    /// Answering `Unknown` would read as "did not match" for this evaluation
+    /// and hide that the caller never narrowed anything.
+    #[test]
+    fn a_term_slot_with_no_truth_supplied_is_an_error() {
+        let mut vm: Vm<Postgres> = Vm::new();
+        let program: BytecodeProgram<Postgres> =
+            BytecodeProgram::with_terms(vec![Instruction::TermTruth(1)], vec![0, 1]);
+        let e = insert_pg(vec![Value::Int(1)]);
+
+        assert_eq!(
+            vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), &[Tri::True]),
+            Err(VmError::MissingTermTruth(1)),
+            "one truth supplied, slot 1 asked for: the caller is told, not answered"
+        );
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()),
+            Err(VmError::MissingTermTruth(1)),
+            "plain eval supplies no truths at all, so any slot is missing"
+        );
+    }
+
+    /// `eval` is `eval_with_terms` with no truths, so the 23 existing call
+    /// sites keep their behaviour on every term-free program.
+    #[test]
+    fn eval_agrees_with_eval_with_terms_on_a_term_free_program() {
+        let mut vm: Vm<Postgres> = Vm::new();
+        let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
+            Instruction::LoadColumn(0),
+            Instruction::PushLiteral(Value::Int(18)),
+            Instruction::GreaterThan,
+        ]);
+        let e = insert_pg(vec![Value::Int(25)]);
+
+        assert_eq!(
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()),
+            vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), &[]),
+        );
     }
 }
