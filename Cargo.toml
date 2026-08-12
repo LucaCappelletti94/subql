@@ -729,6 +729,15 @@ pgoutput-emit = ["sqlite-diff-rs/pg-walstream"]
 # protocol, so the vendor client stays downstream.
 visibility-records = ["dep:rls2fga"]
 
+# Opt-in: compile a membership subquery in a subscription's WHERE clause into
+# the relationships that answer it per changed row, through `rls2fga`. Only the
+# compiling half is switched. The bounded form itself is recognised in every
+# build, including both wasm targets under `--no-default-features`, because the
+# bound is enforced by subql's own statement-shape rule and names no `rls2fga`
+# type. With this off, a bounded term is refused at registration naming this
+# feature rather than claiming subql cannot run a nested SELECT.
+membership-term = ["visibility-records"]
+
 # Opt-in and off by default: answer the questions the row does not settle by
 # asking an OpenFGA server, which completes the composition
 # `visibility-records` ships the local half of. Implies `std`, because the

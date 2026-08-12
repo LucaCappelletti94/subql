@@ -302,6 +302,20 @@ impl<T> ScalarCore for T where
 {
 }
 
+/// Extra bounds a scalar must satisfy to key a membership term's lookup table.
+///
+/// A term groups subscribers by the value a row carries, so the value has to be
+/// usable as a map key, which [`ScalarCore`] alone does not give: it bounds
+/// equality at `PartialEq`, because `Float` may be `f64` and `NaN` is not equal
+/// to itself.
+///
+/// `Float`, `Json` and `Jsonb` deliberately do not carry this. A membership term
+/// comparing such a column is refused at registration, which is what makes the
+/// bound honest here rather than asserted.
+pub trait ScalarKey: ScalarCore + Eq + core::hash::Hash {}
+
+impl<T> ScalarKey for T where T: ScalarCore + Eq + core::hash::Hash {}
+
 /// One SQL database subql observes.
 ///
 /// An implementation names a database (via its sqlparser dialect) and
@@ -332,10 +346,10 @@ pub trait Backend: 'static {
 
     /// SQL `BOOL` representation. Only equality-shaped operations are
     /// applied to booleans; no ordering or arithmetic bound is required.
-    type Bool: ScalarCore;
+    type Bool: ScalarKey;
     /// SQL integer representation (all integer widths roll up to this type).
     /// Supports arithmetic and ordering.
-    type Int: ScalarCore
+    type Int: ScalarKey
         + PartialOrd
         + core::ops::Add<Output = Self::Int>
         + core::ops::Sub<Output = Self::Int>
@@ -346,6 +360,9 @@ pub trait Backend: 'static {
     /// SQL floating-point representation. Supports arithmetic and
     /// ordering. No `Rem` bound because SQL modulo is defined only on
     /// integers; the VM's `Modulo` instruction coerces to `Int` first.
+    ///
+    /// Not a [`ScalarKey`]: `NaN` is not equal to itself, so a float cannot key
+    /// a membership term's lookup table.
     type Float: ScalarCore
         + PartialOrd
         + core::ops::Add<Output = Self::Float>
@@ -355,23 +372,23 @@ pub trait Backend: 'static {
         + core::ops::Neg<Output = Self::Float>;
     /// SQL text representation (`TEXT`, `VARCHAR`, `CHAR`, ...).
     /// `AsRef<str>` supports `LIKE` / `ILIKE` pattern matching.
-    type String: ScalarCore + PartialOrd + AsRef<str>;
+    type String: ScalarKey + PartialOrd + AsRef<str>;
     /// SQL binary representation (`BYTEA`, `BLOB`, `VARBINARY`, ...).
     /// `AsRef<[u8]>` supports byte-level comparisons.
-    type Bytes: ScalarCore + PartialOrd + AsRef<[u8]>;
+    type Bytes: ScalarKey + PartialOrd + AsRef<[u8]>;
     /// SQL UUID representation. Ordered by underlying bytes for `<` / `>`.
-    type Uuid: ScalarCore + PartialOrd;
+    type Uuid: ScalarKey + PartialOrd;
     /// SQL `TIMESTAMP` (no time zone). Ordered chronologically.
-    type Timestamp: ScalarCore + PartialOrd;
+    type Timestamp: ScalarKey + PartialOrd;
     /// SQL `TIMESTAMP WITH TIME ZONE`. Ordered chronologically.
-    type TimestampTz: ScalarCore + PartialOrd;
+    type TimestampTz: ScalarKey + PartialOrd;
     /// SQL `DATE`. Ordered chronologically.
-    type Date: ScalarCore + PartialOrd;
+    type Date: ScalarKey + PartialOrd;
     /// SQL `TIME` (no time zone). Ordered chronologically.
-    type Time: ScalarCore + PartialOrd;
+    type Time: ScalarKey + PartialOrd;
     /// SQL arbitrary-precision `NUMERIC` / `DECIMAL`. Supports arithmetic
     /// and ordering; no `Rem` bound (see `Float`).
-    type Decimal: ScalarCore
+    type Decimal: ScalarKey
         + PartialOrd
         + core::ops::Add<Output = Self::Decimal>
         + core::ops::Sub<Output = Self::Decimal>

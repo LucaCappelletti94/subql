@@ -122,6 +122,14 @@ pub enum RegisterError {
         /// The table lacking a primary key.
         table_id: TableId,
     },
+
+    /// A membership subquery inside the bounded form was recognised as a term
+    /// and still cannot be served, so it is refused at registration rather than
+    /// served by the snapshot alone. The message says why: either this build was
+    /// compiled without the `membership-term` feature, or `rls2fga` declined to
+    /// compile the filter and this carries its wording for that refusal.
+    #[error("Membership term refused: {0}")]
+    MembershipTermRefused(String),
 }
 
 /// Error decoding a carried CDC cell into its typed [`crate::backend::Value`].

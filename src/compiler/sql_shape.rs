@@ -3,8 +3,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{
-    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
-    SelectItem, SetExpr, Statement, TableFactor,
+    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor,
 };
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
@@ -670,6 +670,46 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
     Ok(())
 }
 
+/// The one `SELECT` a query reduces to, with the table it reads.
+///
+/// This is SubQL's statement-shape rule: single table, no joins, no set
+/// operations, no derived tables. It is stated once and applied both to the
+/// subscription statement and to the inner query of a membership subquery, so
+/// the two cannot drift apart.
+fn single_table_select(query: &Query) -> Result<(&Select, &ObjectName), RegisterError> {
+    match query.body.as_ref() {
+        SetExpr::Select(select) => {
+            if select.from.len() != 1 {
+                return Err(RegisterError::UnsupportedSql(
+                    "Exactly one table required (no joins)".to_string(),
+                ));
+            }
+
+            if !select.from[0].joins.is_empty() {
+                return Err(RegisterError::UnsupportedSql(
+                    "JOINs not supported - SubQL is for single-table CDC event filtering. \
+                     For multi-table queries, run this as a regular SQL query in your database."
+                        .to_string(),
+                ));
+            }
+
+            match &select.from[0].relation {
+                TableFactor::Table { name, .. } => Ok((select, name)),
+                _ => Err(RegisterError::UnsupportedSql(
+                    "Subqueries and derived tables not supported - SubQL is for single-table WHERE clauses. \
+                     Run this as a regular SQL query in your database instead."
+                        .to_string(),
+                )),
+            }
+        }
+        _ => Err(RegisterError::UnsupportedSql(
+            "Set operations (UNION, INTERSECT, EXCEPT) not supported - SubQL is for single-table CDC event filtering. \
+             For queries combining multiple result sets, run this as a regular SQL query in your database."
+                .to_string(),
+        )),
+    }
+}
+
 /// Extract the single table name and WHERE clause from a supported SELECT.
 ///
 /// This enforces SubQL's statement-shape constraints (single table, no joins,
@@ -678,43 +718,116 @@ pub(super) fn extract_single_table_and_where(
     stmt: &Statement,
 ) -> Result<(ObjectName, Option<Expr>), RegisterError> {
     match stmt {
-        Statement::Query(query) => match query.body.as_ref() {
-            SetExpr::Select(select) => {
-                if select.from.len() != 1 {
-                    return Err(RegisterError::UnsupportedSql(
-                        "Exactly one table required (no joins)".to_string(),
-                    ));
-                }
-
-                if !select.from[0].joins.is_empty() {
-                    return Err(RegisterError::UnsupportedSql(
-                        "JOINs not supported - SubQL is for single-table CDC event filtering. \
-                         For multi-table queries, run this as a regular SQL query in your database."
-                            .to_string(),
-                    ));
-                }
-
-                match &select.from[0].relation {
-                    TableFactor::Table { name, .. } => Ok((name.clone(), select.selection.clone())),
-                    _ => Err(RegisterError::UnsupportedSql(
-                        "Subqueries and derived tables not supported - SubQL is for single-table WHERE clauses. \
-                         Run this as a regular SQL query in your database instead."
-                            .to_string(),
-                    )),
-                }
-            }
-            _ => Err(RegisterError::UnsupportedSql(
-                "Set operations (UNION, INTERSECT, EXCEPT) not supported - SubQL is for single-table CDC event filtering. \
-                 For queries combining multiple result sets, run this as a regular SQL query in your database."
-                    .to_string(),
-            )),
-        },
+        Statement::Query(query) => {
+            let (select, name) = single_table_select(query)?;
+            Ok((name.clone(), select.selection.clone()))
+        }
         _ => Err(RegisterError::UnsupportedSql(
             "Only SELECT statements supported - SubQL is for querying CDC events, not modifying data. \
              For INSERT, UPDATE, DELETE, or DDL operations, use your database directly."
                 .to_string(),
         )),
     }
+}
+
+/// Does any expression under `expr` satisfy `matches`?
+///
+/// Recurses through exactly the composite variants the predicate compiler
+/// handles, so the two agree on what SubQL's predicate language contains. A
+/// variant outside that set is a leaf here, and the compiler refuses it anyway.
+fn contains_matching(expr: &Expr, matches: fn(&Expr) -> bool) -> bool {
+    if matches(expr) {
+        return true;
+    }
+    match expr {
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner) => contains_matching(inner, matches),
+        Expr::BinaryOp { left, right, .. } => {
+            contains_matching(left, matches) || contains_matching(right, matches)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            contains_matching(expr, matches)
+                || contains_matching(low, matches)
+                || contains_matching(high, matches)
+        }
+        Expr::InList { expr, list, .. } => {
+            contains_matching(expr, matches)
+                || list.iter().any(|item| contains_matching(item, matches))
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            contains_matching(expr, matches) || contains_matching(pattern, matches)
+        }
+        _ => false,
+    }
+}
+
+/// Is there a subquery of any kind anywhere in `expr`?
+fn contains_subquery(expr: &Expr) -> bool {
+    contains_matching(expr, |inner| {
+        matches!(
+            inner,
+            Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_)
+        )
+    })
+}
+
+/// Is there a membership subquery anywhere in `expr`?
+///
+/// Narrower than [`contains_subquery`] on purpose: a `NOT` over one of these is
+/// refused as subtraction, and saying that about an `EXISTS` would describe the
+/// wrong thing.
+pub(super) fn contains_membership_subquery(expr: &Expr) -> bool {
+    contains_matching(expr, |inner| matches!(inner, Expr::InSubquery { .. }))
+}
+
+/// Enforce the bounded form a membership subquery has to take.
+///
+/// The inner query is bounded exactly as the outer statement is, by the same
+/// [`single_table_select`] rule, plus two things only a subquery can get wrong:
+/// it projects exactly one value, since the tested value is matched against
+/// that one value, and it nests nothing, since one subscription tracks one
+/// relationship.
+///
+/// Whether the projected value is a column, and whether the relationship is one
+/// SubQL can serve, are not decided here.
+pub(super) fn check_membership_subquery_bound(query: &Query) -> Result<(), RegisterError> {
+    if query.with.is_some() {
+        return Err(RegisterError::UnsupportedSql(
+            "A membership subquery cannot contain another subquery. SubQL tracks one \
+             relationship for the subscription, and a WITH clause names another query it \
+             cannot follow."
+                .to_string(),
+        ));
+    }
+
+    let (select, _) = single_table_select(query)?;
+
+    match select.projection.as_slice() {
+        [SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }] => {}
+        _ => {
+            return Err(RegisterError::UnsupportedSql(
+                "A membership subquery must select exactly one column. SubQL matches the \
+                 tested value against that one column, so a wildcard or a second column has \
+                 nothing to match."
+                    .to_string(),
+            ))
+        }
+    }
+
+    if select.selection.as_ref().is_some_and(contains_subquery) {
+        return Err(RegisterError::UnsupportedSql(
+            "A membership subquery cannot contain another subquery. SubQL tracks one \
+             relationship for the subscription, and a nested subquery names a second one it \
+             cannot follow."
+                .to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Derive the follow-subscription SELECT from an UPDATE statement:
