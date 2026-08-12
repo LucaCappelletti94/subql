@@ -673,6 +673,29 @@ where
 /// default matches the server's and a difference larger than one write is split.
 const MAX_TUPLES_PER_WRITE: usize = 100;
 
+/// Whether a difference's two halves can travel in one call.
+///
+/// Two conditions, and the second is not a size. The server's tuple key is the
+/// subject, the relation and the object, and a conditional tuple's context is
+/// not part of it, so a change that moves only a context states one key on both
+/// sides. A call carrying a key twice is refused outright, whatever the sizes,
+/// and the held-key arm rls2fga models as a condition over the wildcard reaches
+/// this on the most ordinary event there is: an owner change, where every owner
+/// shares the subject `user:*`.
+///
+/// Scanning is quadratic and guarded by the size test, so it runs only over
+/// lists already known to be small, and it allocates nothing.
+fn fits_one_call(writes: &[TupleKey], deletes: &[TupleKeyWithoutCondition]) -> bool {
+    writes.len() + deletes.len() <= MAX_TUPLES_PER_WRITE
+        && !deletes.iter().any(|delete| {
+            writes.iter().any(|write| {
+                write.user == delete.user
+                    && write.relation == delete.relation
+                    && write.object == delete.object
+            })
+        })
+}
+
 impl<DB, T, W, B> OpenFgaPolicy<DB, T, W, B>
 where
     DB: DatabaseLike + Send + Sync,
@@ -692,8 +715,9 @@ where
     /// question landing in the gap answers from facts that have already moved.
     ///
     /// A difference that fits one call is applied atomically, so a row changing
-    /// hands never has a moment where both subjects hold it. A larger one cannot
-    /// be, and then removals go first, which is the fail-closed order.
+    /// hands never has a moment where both subjects hold it. One too large for a
+    /// single call, or one stating a key on both sides, cannot be, and then
+    /// removals go first, which is the fail-closed order.
     ///
     /// [`StoreDiff::requeries`] is **not** covered here. Those are the facts no
     /// single row settles, and running their SQL belongs to the caller, which
@@ -719,10 +743,10 @@ where
             })
             .collect();
 
-        // One call while both halves fit, because the server applies a write
+        // One call whenever the server accepts one, because it applies a write
         // atomically: a row changing hands then has no moment where both the old
         // and the new subject hold it, and none where neither does.
-        if writes.len() + deletes.len() <= MAX_TUPLES_PER_WRITE {
+        if fits_one_call(&writes, &deletes) {
             return self
                 .write(
                     (!writes.is_empty()).then(|| WriteRequestWrites {
@@ -737,10 +761,13 @@ where
                 .await;
         }
 
-        // Too large for one call, so the atomicity is gone and the order is
+        // Not sendable as one call, so the atomicity is gone and the order is
         // what is left to choose. Removals go first: between the calls the row
         // then reaches nobody rather than everybody, and a client told too late
-        // that it may see a row loses nothing it was entitled to.
+        // that it may see a row loses nothing it was entitled to. Splitting only
+        // the colliding key and keeping the rest atomic was rejected for that
+        // reason: it leaves the subject losing the row holding it through its
+        // other, uncollided facts for the length of the gap.
         for chunk in deletes.chunks(MAX_TUPLES_PER_WRITE) {
             self.write(
                 None,
@@ -929,9 +956,10 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{
-        batch_request, consistency_for, context_for, tuple_of, usable_index, ActionStatement,
-        BatchCheckItem, CheckRequestTupleKey, Code, ConsistencyPreference, Kind, OpenFgaError,
-        Question, Record, RecordContextValue, RequestValues, RequiredParameter, Subject,
+        batch_request, consistency_for, context_for, fits_one_call, tuple_of, usable_index,
+        ActionStatement, BatchCheckItem, CheckRequestTupleKey, Code, ConsistencyPreference, Kind,
+        OpenFgaError, Question, Record, RecordContextValue, RequestValues, RequiredParameter,
+        Subject, TupleKeyWithoutCondition, MAX_TUPLES_PER_WRITE,
     };
     use crate::visibility::shapes::Shapes;
     use crate::visibility::test_names;
@@ -1025,6 +1053,77 @@ mod tests {
             context: None,
         };
         assert!(tuple_of(&record).condition.is_none());
+    }
+
+    /// The record shapes an owner change produces under the held-key arm: a
+    /// conditional fact whose subject is the wildcard, and an unconditional one
+    /// whose subject is the owner.
+    fn owner_records(owner: &str) -> [Record; 2] {
+        let (gate, condition) = test_names::gated_relation();
+        [
+            Record {
+                object: "notes:1".to_string(),
+                relation: gate,
+                subject: "user:*".to_string(),
+                context: Some(RecordContextValue {
+                    condition,
+                    key: "owner".to_string(),
+                    value: owner.to_string(),
+                }),
+            },
+            Record {
+                object: "notes:1".to_string(),
+                relation: test_names::relation("owner"),
+                subject: format!("user:{owner}"),
+                context: None,
+            },
+        ]
+    }
+
+    fn without_condition(record: &Record) -> TupleKeyWithoutCondition {
+        TupleKeyWithoutCondition {
+            user: record.subject.clone(),
+            relation: record.relation.clone().to_string(),
+            object: record.object.clone(),
+        }
+    }
+
+    /// A context is not part of the server's tuple key, so a change that moves
+    /// only a context states one key on both sides, and the call carrying both
+    /// is refused however small it is. The pair differing in subject alongside
+    /// it is what says the test is about the key rather than about the sizes.
+    #[test]
+    fn a_change_of_only_a_context_cannot_travel_in_one_call() {
+        let after = owner_records("carol");
+        let before = owner_records("alice");
+        let writes: Vec<_> = after.iter().map(tuple_of).collect();
+        let deletes: Vec<_> = before.iter().map(without_condition).collect();
+
+        assert!(
+            !fits_one_call(&writes, &deletes),
+            "the wildcard gate is one key on both sides"
+        );
+        assert!(
+            fits_one_call(&writes[1..], &deletes[1..]),
+            "and the owner records, which differ in their subject, are two keys"
+        );
+    }
+
+    /// The size test still holds, and it is checked first so the scan for a
+    /// shared key never runs over a list that is already too long.
+    #[test]
+    fn a_difference_larger_than_one_call_is_split() {
+        let writes: Vec<_> = (0..=MAX_TUPLES_PER_WRITE)
+            .map(|nth| Record {
+                object: format!("notes:{nth}"),
+                relation: test_names::relation("owner"),
+                subject: "user:alice".to_string(),
+                context: None,
+            })
+            .map(|record| tuple_of(&record))
+            .collect();
+        assert!(!fits_one_call(&writes, &[]));
+        assert!(fits_one_call(&writes[1..], &[]));
     }
 
     /// A read takes the cheap path by default, which is what makes asking per
