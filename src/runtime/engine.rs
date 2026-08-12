@@ -2907,20 +2907,189 @@ mod tests {
         }
     }
 
-    /// A subquery inside `IN` is refused by the message that describes it. The
-    /// wording lives on the arm that handles a literal list, which never
-    /// receives a subquery, so before this the one user who wrote exactly what
-    /// the message describes got a debug dump of their own expression instead.
+    /// A membership subquery the engine cannot serve is refused as a term
+    /// rather than as bad SQL, so the message carries why.
+    fn term_refusal(where_clause: &str) -> String {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+        let sql = format!("SELECT * FROM orders WHERE {where_clause}");
+        match engine.register(SubscriptionRequest::new(1, sql)) {
+            Err(RegisterError::MembershipTermRefused(message)) => message,
+            other => panic!("{where_clause} should be refused as a term, got {other:?}"),
+        }
+    }
+
+    /// `NOT IN` stays refused. A membership subquery is served by tracking the
+    /// relationship it names, and subtraction names no relationship to track.
     #[test]
-    fn an_in_subquery_is_refused_by_the_message_that_names_it() {
-        let message = refusal("id IN (SELECT id FROM orders)");
+    fn a_negated_membership_subquery_is_refused_as_subtraction() {
+        let message = refusal("id NOT IN (SELECT id FROM orders WHERE amount = 1)");
         assert!(
-            message.contains("IN with a subquery is not supported"),
-            "the refusal should name the subquery, got {message:?}"
+            message.contains("NOT IN"),
+            "the refusal should name the negation, got {message:?}"
         );
         assert!(
             !message.contains("InSubquery"),
             "the refusal should not print the parsed expression, got {message:?}"
+        );
+    }
+
+    /// `x NOT IN (SELECT ...)` and `NOT (x IN (SELECT ...))` are the same
+    /// filter written two ways, so they are refused the same way. They reach
+    /// different arms, which is why it is easy to leave one of them behind.
+    #[test]
+    fn the_two_spellings_of_a_negated_term_are_refused_alike() {
+        let inline = refusal("id NOT IN (SELECT id FROM orders WHERE amount = 1)");
+        let outer = refusal("NOT (id IN (SELECT id FROM orders WHERE amount = 1))");
+        assert_eq!(
+            inline, outer,
+            "both spellings negate the same term, so the refusal must not depend on which \
+             one was written"
+        );
+    }
+
+    /// A term names the relationship a column of the subscribed table stands
+    /// in, so the tested side has to be a column of that table. An expression
+    /// has no column to read off the changed row and no name to group the
+    /// subscriber's own starting values under.
+    #[test]
+    fn a_term_comparing_something_other_than_a_column_is_refused() {
+        let message = refusal("1 IN (SELECT id FROM orders WHERE amount = 1)");
+        assert!(
+            message.contains("column of"),
+            "the refusal should say the tested side must be a column, got {message:?}"
+        );
+    }
+
+    /// Same rule, for a name that is not a column of the subscribed table.
+    #[test]
+    fn a_term_comparing_an_unknown_column_is_refused() {
+        let message = refusal("nope IN (SELECT id FROM orders WHERE amount = 1)");
+        assert!(
+            message.contains("column of"),
+            "the refusal should name the missing column, got {message:?}"
+        );
+    }
+
+    /// The inner query is bounded by the same rule as the outer statement, so a
+    /// join inside it is refused by the join wording rather than by a second
+    /// rule that could drift from the first.
+    #[test]
+    fn a_join_inside_the_membership_subquery_is_refused_by_the_one_shape_rule() {
+        let message = refusal("id IN (SELECT o.id FROM orders o JOIN orders p ON o.id = p.id)");
+        assert!(
+            message.contains("JOINs not supported"),
+            "the inner join should be refused by the shared shape rule, got {message:?}"
+        );
+    }
+
+    /// Same rule, the derived-table clause of it.
+    #[test]
+    fn a_derived_table_inside_the_membership_subquery_is_refused() {
+        let message = refusal("id IN (SELECT id FROM (SELECT id FROM orders) inner_q)");
+        assert!(
+            message.contains("Subqueries and derived tables not supported"),
+            "the inner derived table should be refused by the shared shape rule, got {message:?}"
+        );
+    }
+
+    /// Same rule, the set-operation clause of it.
+    #[test]
+    fn a_set_operation_inside_the_membership_subquery_is_refused() {
+        let message =
+            refusal("id IN (SELECT id FROM orders UNION SELECT id FROM orders WHERE amount = 1)");
+        assert!(
+            message.contains("Set operations"),
+            "the inner set operation should be refused by the shared shape rule, got {message:?}"
+        );
+    }
+
+    /// One projected column, because the tested value is matched against that
+    /// one column and a second has nothing to match.
+    #[test]
+    fn a_membership_subquery_selecting_two_columns_is_refused() {
+        let message = refusal("id IN (SELECT id, amount FROM orders WHERE amount = 1)");
+        assert!(
+            message.contains("exactly one column"),
+            "the refusal should say one column, got {message:?}"
+        );
+    }
+
+    /// A wildcard projects whatever the table happens to carry, which is not one
+    /// named column even when the table has exactly one.
+    #[test]
+    fn a_membership_subquery_selecting_a_wildcard_is_refused() {
+        let message = refusal("id IN (SELECT * FROM orders WHERE amount = 1)");
+        assert!(
+            message.contains("exactly one column"),
+            "the refusal should say one column, got {message:?}"
+        );
+    }
+
+    /// No nesting: one subscription tracks one relationship, and a subquery
+    /// inside the subquery names a second one.
+    #[test]
+    fn a_subquery_nested_inside_the_membership_subquery_is_refused() {
+        let message =
+            refusal("id IN (SELECT id FROM orders WHERE amount IN (SELECT amount FROM orders))");
+        assert!(
+            message.contains("cannot contain another subquery"),
+            "the refusal should name the nesting, got {message:?}"
+        );
+    }
+
+    /// The nesting search reaches inside a list item, not just at it. A
+    /// parenthesised subquery in an `IN` list is `Nested(Subquery)`, so a search
+    /// that only inspected each item without descending would walk straight
+    /// past it and admit a filter carrying two relationships.
+    #[test]
+    fn a_subquery_wrapped_inside_an_in_list_item_is_still_found() {
+        let message = refusal(
+            "id IN (SELECT id FROM orders WHERE amount IN (1, ((SELECT amount FROM orders))))",
+        );
+        assert!(
+            message.contains("cannot contain another subquery"),
+            "the refusal should name the nesting, got {message:?}"
+        );
+    }
+
+    /// `EXISTS` is a subquery too, and it nests just as much as `IN` does. It
+    /// reaches the nesting search through its own AST variant, so covering only
+    /// the `IN` spelling leaves that arm undefended.
+    #[test]
+    fn an_exists_nested_inside_the_membership_subquery_is_refused() {
+        let message = refusal("id IN (SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM orders))");
+        assert!(
+            message.contains("cannot contain another subquery"),
+            "the refusal should name the nesting, got {message:?}"
+        );
+    }
+
+    /// The bounded form is inside the language. Whatever declines to serve it,
+    /// the refusal never claims SubQL cannot run a nested `SELECT`, and never
+    /// prints the parsed expression.
+    #[test]
+    fn a_bounded_membership_subquery_is_not_refused_for_being_a_subquery() {
+        let message = term_refusal("status IN (SELECT status FROM orders WHERE amount = 1)");
+        assert!(
+            !message.contains("cannot run a nested SELECT"),
+            "a bounded term is within the language, got {message:?}"
+        );
+        assert!(
+            !message.contains("InSubquery"),
+            "the refusal should not print the parsed expression, got {message:?}"
+        );
+    }
+
+    /// With the term feature off the build simply cannot compile a term, and the
+    /// refusal says that rather than blaming the filter.
+    #[cfg(not(feature = "membership-term"))]
+    #[test]
+    fn a_build_without_the_term_feature_names_the_feature_it_lacks() {
+        let message = term_refusal("status IN (SELECT status FROM orders WHERE amount = 1)");
+        assert!(
+            message.contains("membership-term"),
+            "the refusal should name the missing feature, got {message:?}"
         );
     }
 

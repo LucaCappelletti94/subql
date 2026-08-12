@@ -77,6 +77,7 @@ pub mod reexec;
 pub mod row_set;
 pub mod runtime;
 pub mod sqlite_cdc;
+pub mod term;
 pub mod visibility;
 pub mod wal;
 

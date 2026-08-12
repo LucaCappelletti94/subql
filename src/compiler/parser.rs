@@ -839,18 +839,34 @@ where
         }
 
         // ====================================================================
-        // IN Subqueries
+        // Membership subqueries
         // ====================================================================
-        // Its own arm rather than the catch-all below, which would print the
-        // whole parsed expression with `Debug`. The arm above cannot say this:
-        // `IN (SELECT ...)` parses to `InSubquery` and never reaches it.
-        Expr::InSubquery { .. } => {
-            return Err(RegisterError::UnsupportedSql(
-                "IN with a subquery is not supported - SubQL filters one table's change events and \
-                 cannot run a nested SELECT. Use IN with a literal list, or run this as a regular \
-                 SQL query in your database."
-                    .to_string(),
-            ));
+        // `IN (SELECT ...)` parses to `InSubquery`, which the literal-list arm
+        // above never sees. Requirement 1 of the membership term: recognise the
+        // bounded form here, in every build, and let the bound itself say what
+        // is wrong with anything outside it. Compiling a bounded term needs
+        // `rls2fga`, so that half is switched and this arm only reaches it.
+        Expr::InSubquery {
+            expr: tested,
+            subquery,
+            negated,
+        } => {
+            if *negated {
+                return Err(negated_term_refusal());
+            }
+
+            if resolve_column_ref(tested, table_id, database).is_none() {
+                return Err(RegisterError::UnsupportedSql(
+                    "A membership subquery must test a column of the subscribed table. SubQL \
+                     reads that column off each changed row to decide which subscribers the row \
+                     reaches, so an expression or an unknown name leaves it nothing to read."
+                        .to_string(),
+                ));
+            }
+
+            sql_shape::check_membership_subquery_bound(subquery)?;
+
+            return Err(term_refusal_for_bounded_form());
         }
 
         // ====================================================================
@@ -922,6 +938,14 @@ where
         // Unary Operations
         // ====================================================================
         Expr::UnaryOp { op, expr: inner } => {
+            // A term under `NOT` is subtraction however it is spelled, so it is
+            // refused here in the same words the inline `NOT IN` gets. Checked
+            // before recursing, since the arm below would otherwise report the
+            // inner term as though nothing had negated it.
+            if matches!(op, UnaryOperator::Not) && sql_shape::contains_membership_subquery(inner) {
+                return Err(negated_term_refusal());
+            }
+
             compile_expr_recursive::<B, DB>(
                 inner,
                 table_id,
@@ -1056,6 +1080,44 @@ where
     }
 
     Ok(())
+}
+
+/// Why a negated membership subquery is refused, in one place so that
+/// `x NOT IN (SELECT ...)` and `NOT (x IN (SELECT ...))`, which reach different
+/// arms, cannot drift into two different sentences for one filter.
+fn negated_term_refusal() -> RegisterError {
+    RegisterError::UnsupportedSql(
+        "NOT IN with a subquery is not supported. SubQL serves a membership subquery by \
+         tracking the relationship it names, and subtraction names no relationship to track. \
+         Use NOT IN with a literal list, or run this as a regular SQL query in your database."
+            .to_string(),
+    )
+}
+
+/// Why a membership subquery inside the bounded form is refused here.
+///
+/// Permanent rather than provisional: this site compiles a row test into
+/// bytecode, and a membership term never becomes bytecode. It names which
+/// subscribers a changed row admits, and the engine intersects that set with the
+/// subscribers the compiled predicate already matched, so there is no boolean
+/// for the row test to hold.
+///
+/// The `membership-term` feature is what adds the path that compiles one, so a
+/// build without it says so, since otherwise the reader cannot tell a filter
+/// SubQL will not serve from one this build was not built to serve.
+fn term_refusal_for_bounded_form() -> RegisterError {
+    let mut reason = String::from(
+        "A membership subquery cannot be compiled into a row test. SubQL serves one by \
+         narrowing which subscribers a changed row admits, which the predicate the row is \
+         tested against cannot express.",
+    );
+    if !cfg!(feature = "membership-term") {
+        reason.push_str(
+            " This build was compiled without the membership-term feature, which is what \
+             compiles one at all.",
+        );
+    }
+    RegisterError::MembershipTermRefused(reason)
 }
 
 #[cfg(test)]
