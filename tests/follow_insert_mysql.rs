@@ -51,10 +51,14 @@ fn follow_inserted_row_via_execute_returning_id() {
 
     // MySQL has no RETURNING; `execute_returning_id` runs the insert and reads the
     // minted AUTO_INCREMENT key straight from the client library, no extra query.
+    // It reports the key as an optional non-zero, since a statement that inserted
+    // no row mints none, and this one always does.
     let minted: u64 = diesel::insert_into(users::table)
         .values(users::name.eq("ann"))
         .execute_returning_id(&mut conn)
-        .expect("execute_returning_id");
+        .expect("execute_returning_id")
+        .expect("an insert into an AUTO_INCREMENT table mints a key")
+        .get();
     assert_eq!(minted, 1);
 
     // Follow the row the DB just minted; it dedups with an explicit follow on the
