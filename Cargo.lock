@@ -3688,7 +3688,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#a6f46dc63f8520d10737ab1b031ffe5b05dd32c9"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#5bf6dd97e3a964a848ef98a0691a754e24434e9e"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -5299,7 +5299,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.59.0",

@@ -839,7 +839,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#a6f46dc63f8520d10737ab1b031ffe5b05dd32c9"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#5bf6dd97e3a964a848ef98a0691a754e24434e9e"
 dependencies = [
  "sql-traits",
  "sqlparser",
