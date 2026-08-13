@@ -16,6 +16,7 @@
 #![cfg(all(feature = "visibility-openfga", feature = "testing"))]
 #![allow(clippy::unwrap_used)]
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use openfga_client::client::{
     CreateStoreRequest, OpenFgaServiceClient, TupleKey, WriteRequest, WriteRequestWrites,
 };
 use openfga_client::tonic::transport::Channel;
+use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::classifier::patterns::ConfidenceLevel;
 use rls2fga::generator::action_relations::ActionStatement;
 use rls2fga::translator::TranslatorBuilder;
@@ -30,7 +32,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::visibility::openfga::OpenFgaPolicy;
-use subql::visibility::policy::RowPolicy;
+use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
 use subql::visibility::{EventRow, Verdict, VisibilityPolicy};
 use subql::{catalog_helpers, ParserDB};
@@ -52,10 +54,17 @@ struct Wiring {
     model: rls2fga::generator::json_model::AuthorizationModel,
 }
 
+/// The request-scoped values are declared for every schema here, because
+/// without them rls2fga refuses a held-keys arm rather than modelling it, and a
+/// schema that has no such arm is unaffected by the declaration.
 fn wiring(sql: &str) -> Wiring {
     let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
     let translator = TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
+        .with_session_attributes([
+            SessionAttribute::setting("app.user_id", SessionAttributeKind::CallerId),
+            SessionAttribute::setting("app.subjects", SessionAttributeKind::SetAttribute),
+        ])
         .build();
     let (relations, naming, notes, answers) = {
         let translation = translator.translate(&db);
@@ -434,5 +443,150 @@ CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
         verdicts,
         [Verdict::Deny, Verdict::Allow],
         "and now the store says bob does, so alice lost it rather than both holding it"
+    );
+}
+
+/// A watcher that names itself and says which keys its request carried.
+///
+/// The held-keys arm is a condition the server completes from the question, so
+/// a watcher that cannot state its keys is refused rather than answered.
+struct Principal {
+    name: String,
+    keys: Vec<String>,
+}
+
+impl Principal {
+    fn new(name: &str, keys: &[&str]) -> Self {
+        Self {
+            name: name.to_owned(),
+            keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+        }
+    }
+}
+
+impl Subject for Principal {
+    fn subjects(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        core::iter::once(Cow::Borrowed(self.name.as_str()))
+    }
+
+    fn request_value(&self, parameter: &str, out: &mut RequestValues) -> bool {
+        if parameter != "app_subjects" {
+            return false;
+        }
+        for key in &self.keys {
+            out.push(key);
+        }
+        true
+    }
+}
+
+/// A change that moves only a conditional tuple's context is still applied.
+///
+/// This is the shape connetto writes on every table: an identity arm and a
+/// held-keys arm in one policy. rls2fga models the held-keys arm as a condition
+/// over the wildcard rather than as a subject, so every owner shares the subject
+/// `user:*` and the owner lives in the condition's context. An owner change then
+/// produces an addition and a removal carrying one tuple key, differing in a
+/// field the server does not treat as part of the key, and it refuses a single
+/// call holding both.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_change_of_only_a_conditional_context_is_applied() {
+    const HELD_KEYS: &str = "
+CREATE TABLE notes(id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY notes_p ON notes FOR ALL USING (
+  owner = current_setting('app.user_id', true)
+  OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')));
+";
+
+    let container = openfga().await;
+    let port = container
+        .get_host_port_ipv4(8081.tcp())
+        .await
+        .expect("grpc port");
+    let mut client = OpenFgaServiceClient::connect(format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("connect to openfga");
+
+    let wired = wiring(HELD_KEYS);
+    let notes = catalog_helpers::table_id(&wired.db, "notes").expect("notes is in the catalog");
+    let model = wired.model.clone();
+
+    let store = client
+        .create_store(CreateStoreRequest {
+            name: "subql-visibility-store".to_owned(),
+        })
+        .await
+        .expect("create store")
+        .into_inner()
+        .id;
+    let model_id = write_model(&mut client, &store, &model).await;
+
+    let shapes = wired.shapes();
+    let backend = OpenFgaPolicy::<_, _, Principal, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model_id);
+
+    let created =
+        TestEvent::<Postgres>::insert(notes, vec![Value::Int(1), Value::String("alice".into())])
+            .with_pk_columns([0u16]);
+    backend
+        .apply(&shapes.diff(&created).expect("an insert is all additions"))
+        .await
+        .expect("write the additions");
+
+    // Each watcher holds its own name as a key, which is how the held-keys arm
+    // grants at all, and what puts the owner into the condition's context.
+    let watchers = [
+        Principal::new("user:alice", &["alice"]),
+        Principal::new("user:carol", &["carol"]),
+    ];
+    let row = EventRow::current(&created, shapes.catalog()).expect("post-image");
+    let mut verdicts = Vec::new();
+    Verdict::reset(&mut verdicts, watchers.len());
+    backend
+        .may_see(&row, &watchers, &mut verdicts)
+        .await
+        .expect("the service answered");
+    assert_eq!(
+        verdicts,
+        [Verdict::Allow, Verdict::Deny],
+        "the store says alice owns it"
+    );
+
+    let moved = TestEvent::<Postgres>::update(
+        notes,
+        vec![Value::Int(1), Value::String("alice".into())],
+        vec![Value::Int(1), Value::String("carol".into())],
+    )
+    .with_pk_columns([0u16]);
+    let diff = shapes.diff(&moved).expect("both images are complete");
+    let conditional = |record: &rls2fga::generator::records::Record| record.context.is_some();
+    assert!(
+        diff.added.iter().any(conditional) && diff.removed.iter().any(conditional),
+        "the held-keys arm states a conditional fact on both sides, \
+         which is what collides: {diff:?}"
+    );
+    backend
+        .apply(&diff)
+        .await
+        .expect("the difference is written even though one key is on both sides");
+
+    let row = EventRow::current(&moved, shapes.catalog()).expect("post-image");
+    let mut verdicts = Vec::new();
+    Verdict::reset(&mut verdicts, watchers.len());
+    backend
+        .may_see(&row, &watchers, &mut verdicts)
+        .await
+        .expect("the service answered");
+    assert_eq!(
+        verdicts,
+        [Verdict::Deny, Verdict::Allow],
+        "and the condition now carries carol rather than alice"
     );
 }

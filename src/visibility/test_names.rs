@@ -7,8 +7,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::classifier::patterns::ConfidenceLevel;
-use rls2fga::generator::records::ValueSource;
+use rls2fga::generator::records::{RecordDerivation, ValueSource};
 use rls2fga::generator::relations::RelationShapes;
 use rls2fga::parser::identifiers::{ColumnName, RelationName, TypeName};
 use rls2fga::translator::TranslatorBuilder;
@@ -51,6 +52,47 @@ pub fn relation(name: &str) -> RelationName {
         .map(|entry| entry.relation)
         .find(|relation| relation == name)
         .unwrap_or_else(|| panic!("the model declares no relation named '{name}'"))
+}
+
+/// The shape connetto writes on every table: the caller's identity, or a key
+/// the caller's request holds, in one policy.
+const HELD_KEYS: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT);
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY notes_p ON notes USING (
+  owner = current_setting('app.user_id', true)
+  OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')));";
+
+/// The relation whose records carry a condition, and the condition they name.
+///
+/// The held-keys arm is the one rls2fga gates on a condition over the wildcard
+/// rather than on a subject, and it classifies only when the request-scoped
+/// values are declared. Both names carry a hash of the policy they came from,
+/// so neither can be spelled here.
+#[must_use]
+pub fn gated_relation() -> (RelationName, String) {
+    let db = ParserDB::parse::<PostgreSqlDialect>(HELD_KEYS).expect("the fixture parses");
+    TranslatorBuilder::new()
+        .with_min_confidence(ConfidenceLevel::B)
+        .with_session_attributes([
+            SessionAttribute::setting("app.user_id", SessionAttributeKind::CallerId),
+            SessionAttribute::setting("app.subjects", SessionAttributeKind::SetAttribute),
+        ])
+        .build()
+        .translate(&db)
+        .relations()
+        .into_iter()
+        .flat_map(|entry| entry.shapes)
+        .find_map(|shape| match shape.derivation {
+            RecordDerivation::FromRow { template, .. } => {
+                let template = *template;
+                let context = template.context?;
+                Some((template.relation, context.condition))
+            }
+            // A joining shape carries no template, and a variant added later
+            // reads as carrying no condition rather than being guessed at.
+            _ => None,
+        })
+        .expect("the held-keys arm is gated on a condition")
 }
 
 /// Name a column the one way a caller outside rls2fga can.
