@@ -129,19 +129,40 @@ jobs:
       - run: cargo test --workspace --exclude subql-demo --lib --tests --release --locked ${{ matrix.profile.args }}
 
   integration:
-    name: integration (Docker e2e)
+    name: integration (${{ matrix.group.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The three filters partition the ignored set rather than enumerating it:
+        # the last one is the complement of the other two, so a Docker-backed
+        # target added tomorrow lands in a group by construction and cannot go
+        # unrun. Splitting them at all is what keeps the wall clock near the
+        # slowest group instead of the sum, which had grown past an hour.
+        group:
+          - name: mysql
+            filter: binary(~mysql)
+          - name: openfga
+            filter: binary(~openfga)
+          - name: postgres and the rest
+            filter: not (binary(~mysql) or binary(~openfga))
     steps:
       - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Every Docker-backed test is `#[ignore]`d and nothing else is, so one
-      # `--ignored` run covers the whole set and a newly added target cannot be
-      # left out of this job. `--all-features` compiles once for all of them,
-      # and `--no-fail-fast` reports every failure rather than the first.
-      - run: cargo test --workspace --exclude subql-demo --tests --all-features --release --locked --no-fail-fast -- --ignored --nocapture
+      - uses: taiki-e/install-action@nextest
+      # Every Docker-backed test is `#[ignore]`d and nothing else is, so
+      # `--run-ignored ignored-only` covers exactly this set. nextest schedules
+      # across test binaries rather than finishing one before starting the next,
+      # which is where the time went: each of two dozen binaries paid its own
+      # container startup end to end. Every test builds its own container and
+      # shares no state, so a process per test is what these already assume.
+      # Eight at a time rather than one per core, because the work is waiting on
+      # containers rather than computing, and eight MySQL servers is the most
+      # this runner's memory should be asked to hold.
+      - run: cargo nextest run --workspace --exclude subql-demo --all-features --release --locked --run-ignored ignored-only --no-fail-fast --test-threads 8 -E '${{ matrix.group.filter }}'
 
   docs:
     name: docs + doctests
