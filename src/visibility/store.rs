@@ -521,7 +521,10 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
                 "user:alice"
             )]
         );
-        assert!(diff.removed.is_empty());
+        assert!(
+            diff.removed.is_empty(),
+            "a new row has no previous grants to remove"
+        );
     }
 
     /// A delete takes every record the row held with it.
@@ -535,7 +538,10 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 
         let diff = store.diff(&event).unwrap();
 
-        assert!(diff.added.is_empty());
+        assert!(
+            diff.added.is_empty(),
+            "a deleted row grants nobody going forward"
+        );
         assert_eq!(
             diff.removed,
             [record(
@@ -569,7 +575,10 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
                 "user:alice"
             )]
         );
-        assert!(diff.removed.is_empty());
+        assert!(
+            diff.removed.is_empty(),
+            "the old image granted nobody so nothing was held"
+        );
     }
 
     /// A truncate names no row. Reporting an empty difference for it would
@@ -622,9 +631,18 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 
         let diff = store.diff(&event).unwrap();
 
-        assert!(diff.added.is_empty());
-        assert!(diff.removed.is_empty());
-        assert!(diff.requeries.is_empty());
+        assert!(
+            diff.added.is_empty(),
+            "no shape reads the notes table so nothing is added"
+        );
+        assert!(
+            diff.removed.is_empty(),
+            "no shape reads the notes table so nothing is removed"
+        );
+        assert!(
+            diff.requeries.is_empty(),
+            "no shape reads the notes table so nothing is requeried"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -676,7 +694,10 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         let diff = store.diff(&event).unwrap();
 
         assert!(diff.added.is_empty(), "no shape settles this table");
-        assert!(diff.removed.is_empty());
+        assert!(
+            diff.removed.is_empty(),
+            "an insert into a two-table shape removes nothing"
+        );
         assert_eq!(diff.requeries.len(), 1);
         let requery = &diff.requeries[0];
         assert_eq!(requery.query.table, "team_members");
@@ -762,16 +783,28 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Missing])
             .with_pk_columns([0u16]);
         let diff = store.diff(&event).unwrap();
-        assert!(diff.added.is_empty());
-        assert!(diff.removed.is_empty());
+        assert!(
+            diff.added.is_empty(),
+            "the unreadable column produces no grants to add"
+        );
+        assert!(
+            diff.removed.is_empty(),
+            "the row is new so nothing was held before"
+        );
     }
 
     /// A schema whose every shape is readable reports nothing uncovered, so
     /// the list above is a real signal rather than always populated.
     #[test]
     fn a_fully_readable_schema_reports_nothing_uncovered() {
-        assert!(shapes(OWNERSHIP).uncovered().is_empty());
-        assert!(shapes(MEMBERSHIP).uncovered().is_empty());
+        assert!(
+            shapes(OWNERSHIP).uncovered().is_empty(),
+            "every column in the ownership schema is readable"
+        );
+        assert!(
+            shapes(MEMBERSHIP).uncovered().is_empty(),
+            "every column in the membership schema is readable"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -950,6 +983,7 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
                 },
             }],
             decision: None,
+            grants_nobody: false,
         }];
         let store = Shapes::new(db, &relations);
 
@@ -1046,6 +1080,7 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
                 },
             }],
             decision: None,
+            grants_nobody: false,
         }
     }
 }

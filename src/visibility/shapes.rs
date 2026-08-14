@@ -372,11 +372,17 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// Reports the recipes, not the row: a row whose cell fails to decode is
     /// still delegated, and so is a watcher that cannot supply a value a recipe
     /// compares against.
+    ///
+    /// A refusal counts, because it is knowledge rather than the absence of it,
+    /// and it is the cheapest answer there is: nobody is granted, so no watcher
+    /// needs a question.
     #[must_use]
     pub fn answers_locally(&self, table: TableId, statement: ActionStatement) -> bool {
         match self.answer(table, statement) {
-            // The database restricts nothing here, so there is nothing to ask.
-            Some(ActionAnswer::Unrestricted) => true,
+            // Everybody or nobody. Which of the two is the verdict's business,
+            // and either way the report answered and no watcher needs a
+            // question.
+            Some(ActionAnswer::Unrestricted | ActionAnswer::Denied) => true,
             Some(ActionAnswer::Judged(judges)) => {
                 // Nothing to require is not a grant, so an empty list is not an
                 // answer.
@@ -698,22 +704,59 @@ mod tests {
     }
 
     /// Row-level security on with no policy grants nobody, which must not
-    /// collapse into the state where it is off and grants everybody.
+    /// collapse into the state where it is off and grants everybody, and which
+    /// is an answer rather than the absence of one.
     #[test]
-    fn row_level_security_with_no_policy_is_not_open() {
+    fn row_level_security_with_no_policy_is_not_open_and_is_still_answered() {
         let shapes = shapes(
             "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);
              ALTER TABLE orders ENABLE ROW LEVEL SECURITY;",
         );
         let orders = table(&shapes, "orders");
-        assert_eq!(
-            shapes.answer(orders, ActionStatement::Select),
-            Some(&ActionAnswer::Denied),
-            "the database shows nobody anything here"
+        for statement in EVERY_STATEMENT {
+            assert_eq!(
+                shapes.answer(orders, statement),
+                Some(&ActionAnswer::Denied),
+                "the database shows nobody anything here"
+            );
+            assert!(
+                shapes.answers_locally(orders, statement),
+                "nobody is granted {statement:?}, which is knowledge and needs no round trip"
+            );
+        }
+    }
+
+    /// A refusal is reported per statement, so a table that refuses writes and
+    /// still grants reads is answered locally on both, by two different routes.
+    #[test]
+    fn a_table_that_refuses_writes_and_grants_reads_answers_both_locally() {
+        let shapes = shapes(
+            "CREATE TABLE docs (id INT PRIMARY KEY, owner_id TEXT);
+             ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);",
         );
-        assert!(shapes
-            .answers_locally(orders, ActionStatement::Select)
-            .not());
+        let docs = table(&shapes, "docs");
+        assert!(
+            matches!(
+                shapes.answer(docs, ActionStatement::Select),
+                Some(ActionAnswer::Judged(_))
+            ),
+            "the policy names who reads, so the read is a rule to satisfy"
+        );
+        assert!(shapes.answers_locally(docs, ActionStatement::Select));
+        for statement in [
+            ActionStatement::Insert,
+            ActionStatement::Update,
+            ActionStatement::Delete,
+            ActionStatement::SelectForUpdate,
+        ] {
+            assert_eq!(
+                shapes.answer(docs, statement),
+                Some(&ActionAnswer::Denied),
+                "no policy admits {statement:?} here"
+            );
+            assert!(shapes.answers_locally(docs, statement));
+        }
     }
 
     /// Two tables a guarded policy reaches, which the database itself filters

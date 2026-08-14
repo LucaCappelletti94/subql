@@ -423,6 +423,23 @@ enum Local {
     Unresolved,
 }
 
+/// What the model says answering one statement on one table takes.
+///
+/// Three states rather than a list of judgements, because two of them are not
+/// lists: a table the database restricts nothing on has nothing to satisfy and
+/// grants, and one the model refuses grants nobody. An empty list cannot spell
+/// both, and reading it as either is a wrong verdict half the time.
+#[derive(Clone, Copy, Debug)]
+enum Requirement<'a> {
+    /// Nothing has to be satisfied, so every watcher is granted.
+    Granted,
+    /// Nobody is granted, whatever the row says.
+    Refused,
+    /// Every judgement has to grant, read against the version it names. Never
+    /// empty.
+    Judged(&'a [ActionJudgement]),
+}
+
 /// Evaluate `decision` against `row` for one watcher.
 ///
 /// Per watcher rather than per row, which a request-gated arm forces: its
@@ -613,20 +630,22 @@ where
         // answered for every watcher never suspends.
         let mut leftover: Vec<Self::Watcher> = Vec::new();
         let mut places: Vec<usize> = Vec::new();
-        match self.judgements(row.table_id(), ActionStatement::Select) {
+        match self.requirement(row.table_id(), ActionStatement::Select) {
             None => {
                 leftover.extend_from_slice(watchers);
                 places.extend(0..watchers.len());
             }
-            Some(judges) => {
+            Some(required) => {
                 let mut values = RequestValues::new();
                 for (place, (watcher, verdict)) in
                     watchers.iter().zip(verdicts.iter_mut()).enumerate()
                 {
                     // A read judges the row as it is, so every judgement reads
                     // the one image a read has.
-                    match self.judge(judges, |_| Some(row), watcher, &mut values) {
+                    match self.judge(required, |_| Some(row), watcher, &mut values) {
                         Local::Allow => *verdict = Verdict::Allow,
+                        // The caller pre-filled a denial, so a local refusal is
+                        // already written.
                         Local::Deny => {}
                         Local::Unresolved => {
                             leftover.push(watcher.clone());
@@ -694,7 +713,7 @@ where
     where
         R: RowView<Backend = P::Backend> + ?Sized,
     {
-        let required = self.judgements(table_of(&write), statement_of(&write))?;
+        let required = self.requirement(table_of(&write), statement_of(&write))?;
         let mut values = RequestValues::new();
         let local = self.judge(
             required,
@@ -709,33 +728,33 @@ where
         }
     }
 
-    /// The judgements answering `statement` on rows of `table`, or [`None`] when
+    /// What answering `statement` on rows of `table` takes, or [`None`] when
     /// nothing here can answer it.
-    ///
-    /// A table the database restricts nothing on yields an empty slice, which
-    /// grants, since there is no rule to satisfy.
     ///
     /// The wildcard covers a relation that fuses both versions, which no single
     /// image answers, and every answer a later revision adds. Neither is reached
     /// by the four statements a write asks about today, since the fused one is
     /// reported for an update naming no rows and nothing here asks that. It is
     /// the guard for the next variant rather than a live branch.
-    fn judgements(&self, table: TableId, statement: ActionStatement) -> Option<&[ActionJudgement]> {
-        match self.shapes.answer(table, statement)? {
-            ActionAnswer::Unrestricted => Some(&[]),
-            ActionAnswer::Judged(judges) if !judges.is_empty() => Some(judges),
-            _ => None,
-        }
+    fn requirement(&self, table: TableId, statement: ActionStatement) -> Option<Requirement<'_>> {
+        Some(match self.shapes.answer(table, statement)? {
+            ActionAnswer::Unrestricted => Requirement::Granted,
+            ActionAnswer::Denied => Requirement::Refused,
+            ActionAnswer::Judged(judges) if !judges.is_empty() => Requirement::Judged(judges),
+            _ => return None,
+        })
     }
 
-    /// Require every judgement to grant, reading each against the version it
-    /// names.
+    /// Read `required` against the row versions `image` hands out.
     ///
-    /// A refusal on any of them is definite whatever the others say, so it
-    /// answers rather than delegating. An unreadable one is not an answer.
+    /// The two states that are not lists answer without reading anything: one
+    /// grants because there is no rule, the other refuses because no rule can
+    /// ever grant. A refusal on any judgement is definite whatever the others
+    /// say, so it answers rather than delegating, and an unreadable one is not
+    /// an answer.
     fn judge<'a, R, F>(
         &self,
-        judges: &[ActionJudgement],
+        required: Requirement<'_>,
         image: F,
         watcher: &P::Watcher,
         values: &mut RequestValues,
@@ -744,6 +763,11 @@ where
         R: RowView + ?Sized + 'a,
         F: Fn(RowVersion) -> Option<&'a R>,
     {
+        let judges = match required {
+            Requirement::Granted => return Local::Allow,
+            Requirement::Refused => return Local::Deny,
+            Requirement::Judged(judges) => judges,
+        };
         for judge in judges {
             let Some(row) = image(judge.version) else {
                 return Local::Unresolved;
@@ -1051,6 +1075,14 @@ CREATE POLICY p ON docs FOR SELECT USING (
           WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user));
 ";
 
+    /// Row-level security on with no policy at all, which `PostgreSQL` reads as
+    /// showing nobody anything, and the model reports refused for every
+    /// statement.
+    const CLOSED: &str = "
+CREATE TABLE ledger(id INTEGER PRIMARY KEY, amount INTEGER);
+ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
+";
+
     fn translated(sql: &str) -> (ParserDB, Vec<RelationShapes>) {
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
         let relations = TranslatorBuilder::new()
@@ -1194,6 +1226,82 @@ CREATE POLICY p ON docs FOR SELECT USING (
         assert_eq!(policy.inner().see_calls(), 1);
     }
 
+    /// A table the model refuses shows nobody anything, which is an answer and
+    /// the cheapest one there is. Delegating it costs a round trip whose answer
+    /// is always no, and a caller that fails closed on a failure to answer holds
+    /// the event forever.
+    #[test]
+    fn a_table_the_model_refuses_denies_every_watcher_without_asking() {
+        let (db, relations) = translated(CLOSED);
+        let ledger = catalog_helpers::table_id(&db, "ledger").unwrap();
+        let event = insert(ledger, vec![Value::Int(4), Value::Int(7)]);
+        let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
+
+        assert!(policy.answers_locally(ledger, ActionStatement::Select));
+        let got = see(&policy, &event, &watchers(&["user:alice", "user:bob"])).unwrap();
+
+        assert_eq!(
+            got,
+            [Verdict::Deny, Verdict::Deny],
+            "nobody reads this table, and the delegate would have granted alice"
+        );
+        assert_eq!(
+            policy.inner().see_calls(),
+            0,
+            "and the refusal cost no round trip"
+        );
+    }
+
+    /// The same refusal answers a write, which is the question asked before a
+    /// change is delivered at all.
+    #[test]
+    fn a_write_the_model_refuses_is_denied_without_asking() {
+        let (db, relations) = translated(CLOSED);
+        let ledger = catalog_helpers::table_id(&db, "ledger").unwrap();
+        let event = insert(ledger, vec![Value::Int(4), Value::Int(7)]);
+        let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
+        let view = EventRow::current(&event, policy.catalog()).unwrap();
+
+        assert!(policy.answers_locally(ledger, ActionStatement::Insert));
+        let got =
+            block_on(policy.may_write(RowWrite::Insert { new: &view }, &"user:alice".to_string()));
+
+        assert_eq!(got, Ok(Verdict::Deny));
+        assert_eq!(policy.inner().write_calls(), 0);
+    }
+
+    /// A refusal is reported per statement, so one table can be answered locally
+    /// twice over with opposite verdicts: the owner reads her row and still
+    /// deletes nothing.
+    #[test]
+    fn a_table_that_refuses_writes_still_answers_reads_from_the_row() {
+        let (db, relations) = translated(OWNERSHIP);
+        let docs = docs_id(&db);
+        let event = insert(docs, docs_row(text("alice"), Value::Null));
+        let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
+        let view = EventRow::current(&event, policy.catalog()).unwrap();
+
+        let read = see(&policy, &event, &watchers(&["user:alice"])).unwrap();
+        let removal =
+            block_on(policy.may_write(RowWrite::Delete { old: &view }, &"user:alice".to_string()));
+
+        assert_eq!(
+            read,
+            [Verdict::Allow],
+            "the policy names alice as the owner"
+        );
+        assert_eq!(
+            removal,
+            Ok(Verdict::Deny),
+            "and no policy admits a delete, whoever asks"
+        );
+        assert_eq!(
+            (policy.inner().see_calls(), policy.inner().write_calls()),
+            (0, 0),
+            "neither answer needed the service"
+        );
+    }
+
     /// A guard that fails yields no subject, which is a local deny rather
     /// than a question.
     #[test]
@@ -1271,6 +1379,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
             from_one_row: true,
             shapes: Vec::new(),
             decision: Some(RowDecision::All(Vec::new())),
+            grants_nobody: false,
         }];
         let event = insert(docs, docs_row(text("alice"), Value::Null));
         let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
@@ -1328,26 +1437,30 @@ CREATE POLICY p ON docs FOR SELECT USING (
     // Routing
     // -----------------------------------------------------------------
 
-    /// A write question reads the write relation. `can_select` is decidable
-    /// here and `can_delete` is not, so answering a delete from the read
+    /// A write question reads the write relation. `can_select` grants the owner
+    /// here and no policy admits a delete, so answering a delete from the read
     /// recipe would grant a delete the model denies.
     #[test]
     fn a_write_question_reads_the_write_relation_not_the_read_one() {
         let (db, relations) = translated(OWNERSHIP);
         let docs = docs_id(&db);
         let event = insert(docs, docs_row(text("alice"), Value::Null));
-        let policy = RowPolicy::new(shared(db, &relations), Delegate::default());
+        let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
 
         assert!(policy.answers_locally(docs, ActionStatement::Select));
-        assert!(!policy.answers_locally(docs, ActionStatement::Delete));
+        assert!(policy.answers_locally(docs, ActionStatement::Delete));
 
         let view = EventRow::current(&event, policy.catalog()).unwrap();
         let got =
             block_on(policy.may_write(RowWrite::Delete { old: &view }, &"user:alice".to_string()))
                 .unwrap();
 
-        assert_eq!(got, Verdict::Deny);
-        assert_eq!(policy.inner().write_calls(), 1, "the backend was asked");
+        assert_eq!(
+            got,
+            Verdict::Deny,
+            "alice reads the row she owns and still deletes nothing"
+        );
+        assert_eq!(policy.inner().write_calls(), 0);
     }
 
     /// A table no recipe covers is delegated whole.
@@ -1409,6 +1522,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
                     },
                 }],
             }),
+            grants_nobody: false,
         }];
         let event = insert(docs, docs_row(text("alice"), Value::Null));
         let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
@@ -1590,25 +1704,39 @@ CREATE POLICY pu ON docs FOR UPDATE
 ";
 
     /// Only `can_update_using` is decidable. The `SELECT` policy is what makes
-    /// it so, and the unclassifiable `WITH CHECK` is what leaves the other half
-    /// undecidable.
+    /// it so, and the `WITH CHECK` clause reaching team membership is what
+    /// leaves the other half undecidable: it grants whoever shares the team,
+    /// which no single row names.
     const UPDATE_USING_ONLY: &str = "
-CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT, editor_id TEXT);
+CREATE TABLE teams(id INTEGER PRIMARY KEY);
+CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT, editor_id TEXT,
+                  team_id INTEGER REFERENCES teams(id));
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY ps ON docs FOR SELECT USING (owner_id = current_user);
-CREATE POLICY pu ON docs FOR UPDATE
-  USING (owner_id = current_user) WITH CHECK (length(editor_id) > 2);
+CREATE POLICY pu ON docs FOR UPDATE USING (owner_id = current_user)
+  WITH CHECK (EXISTS (SELECT 1 FROM team_members
+    WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user));
 ";
 
-    /// The mirror: only `can_update_check` is decidable, because with no
-    /// `SELECT` policy rls2fga folds an unclassified `can_select` into the
-    /// first half.
+    /// The mirror: only `can_update_check` is decidable, because the clause
+    /// choosing which rows may be touched reaches team membership.
     const UPDATE_CHECK_ONLY: &str = "
-CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT, editor_id TEXT);
+CREATE TABLE teams(id INTEGER PRIMARY KEY);
+CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT, editor_id TEXT,
+                  team_id INTEGER REFERENCES teams(id));
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
-CREATE POLICY pu ON docs FOR UPDATE
-  USING (owner_id = current_user) WITH CHECK (editor_id = current_user);
+CREATE POLICY ps ON docs FOR SELECT USING (owner_id = current_user);
+CREATE POLICY pu ON docs FOR UPDATE USING (EXISTS (SELECT 1 FROM team_members
+    WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user))
+  WITH CHECK (editor_id = current_user);
 ";
+
+    /// A `docs` row of the two fixtures above: id 4, in team 3.
+    fn docs_team_row(owner: Value<Postgres>, editor: Value<Postgres>) -> Vec<Value<Postgres>> {
+        vec![Value::Int(4), owner, editor, Value::Int(3)]
+    }
 
     /// A replacement is answered from both versions, and the caller who
     /// writes themselves in is refused by the version they do not hold.
@@ -1721,25 +1849,23 @@ CREATE POLICY pu ON docs FOR UPDATE
     /// A replacement whose first half refuses is a definite refusal, so the
     /// second half is never consulted and nothing is delegated.
     ///
-    /// The check half here is not decidable, since no `SELECT` policy makes it
-    /// so, and the answer is still local.
+    /// Both halves are readable here, and the half admitting the result would
+    /// have granted bob, who writes himself in as editor. Consulting it after a
+    /// refusal is the wrong allow this defends.
     #[test]
     fn a_refusal_on_the_row_as_it_is_needs_no_second_half() {
-        let (db, relations) = translated(UPDATE_USING_ONLY);
+        let (db, relations) = translated(UPDATE_TWO_SIDED);
         let docs = docs_id(&db);
         let event = TestEvent::update(
             docs,
             docs_row(text("alice"), Value::Null),
-            docs_row(text("bob"), text("bob")),
+            docs_row(text("alice"), text("bob")),
         )
         .with_pk_columns([0u16]);
         let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:bob"));
 
         assert!(policy.answers_locally(docs, ActionStatement::SelectForUpdate));
-        assert!(
-            !policy.answers_locally(docs, ActionStatement::Update),
-            "the check half is not decidable here"
-        );
+        assert!(policy.answers_locally(docs, ActionStatement::Update));
 
         let old = EventRow::previous(&event, policy.catalog()).unwrap();
         let new = EventRow::current(&event, policy.catalog()).unwrap();
@@ -1751,7 +1877,11 @@ CREATE POLICY pu ON docs FOR UPDATE
             &"user:bob".to_string(),
         ));
 
-        assert_eq!(got, Ok(Verdict::Deny));
+        assert_eq!(
+            got,
+            Ok(Verdict::Deny),
+            "bob does not own the row as it stands, whatever he writes into it"
+        );
         assert_eq!(
             policy.inner().write_calls(),
             0,
@@ -1767,11 +1897,20 @@ CREATE POLICY pu ON docs FOR UPDATE
         let docs = docs_id(&db);
         let event = TestEvent::update(
             docs,
-            docs_row(text("alice"), Value::Null),
-            docs_row(text("alice"), text("alice")),
+            docs_team_row(text("alice"), Value::Null),
+            docs_team_row(text("alice"), text("alice")),
         )
         .with_pk_columns([0u16]);
         let policy = RowPolicy::new(shared(db, &relations), Delegate::granting("user:alice"));
+
+        assert!(
+            policy.answers_locally(docs, ActionStatement::SelectForUpdate),
+            "the half judging the row as it stands is readable"
+        );
+        assert!(
+            !policy.answers_locally(docs, ActionStatement::Update),
+            "and the half admitting the result reaches team membership"
+        );
 
         let old = EventRow::previous(&event, policy.catalog()).unwrap();
         let new = EventRow::current(&event, policy.catalog()).unwrap();
@@ -1799,8 +1938,8 @@ CREATE POLICY pu ON docs FOR UPDATE
         let docs = docs_id(&db);
         let event = TestEvent::update(
             docs,
-            docs_row(text("alice"), Value::Null),
-            docs_row(text("alice"), text("bob")),
+            docs_team_row(text("alice"), Value::Null),
+            docs_team_row(text("alice"), text("bob")),
         )
         .with_pk_columns([0u16]);
         let policy = RowPolicy::new(shared(db, &relations), Delegate::default());
@@ -2616,6 +2755,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                 request_parameter: "app_subjects".to_string(),
                 comparison: RequestComparison::CallerValueEquals,
             }),
+            grants_nobody: false,
         }];
         let event = insert(docs, docs_row(text("alice"), Value::Null));
         let policy = RowPolicy::new(
@@ -2650,6 +2790,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                 request_parameter: "app_subjects".to_string(),
                 comparison: RequestComparison::CallerSetHolds,
             }),
+            grants_nobody: false,
         }];
         let event = insert(docs, docs_row(text("alice"), Value::Null));
         let policy = RowPolicy::new(shared(db, &relations), Named::<Principal>::default());
@@ -2688,6 +2829,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                 request_parameter: "app_subjects".to_string(),
                 comparison: RequestComparison::CallerSetHolds,
             }),
+            grants_nobody: false,
         }];
         let event = insert(docs, docs_row(text("alice"), Value::Null));
         let policy = RowPolicy::new(
@@ -2769,6 +2911,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
             from_one_row: true,
             shapes: Vec::new(),
             decision: Some(decision),
+            grants_nobody: false,
         }]
     }
 
