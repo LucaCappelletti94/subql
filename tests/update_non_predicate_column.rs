@@ -79,8 +79,14 @@ fn update_of_a_projected_non_predicate_column_notifies_the_subscription() {
     let notifs = engine.consumers(&event).unwrap();
 
     assert_eq!(notifs.updated(), vec![CONSUMER]);
-    assert!(notifs.inserted().is_empty());
-    assert!(notifs.deleted().is_empty());
+    assert!(
+        notifs.inserted().is_empty(),
+        "the row stayed in the view so no new entry was fired"
+    );
+    assert!(
+        notifs.deleted().is_empty(),
+        "the row stayed in the view so no exit was fired"
+    );
 }
 
 #[test]
@@ -109,12 +115,18 @@ fn update_crossing_the_predicate_boundary_reports_view_exit_and_entry() {
     let leaving = update(orders, row(9.5, 5, "v1"), row(9.5, 0, "v1"), [QUANTITY]);
     let notifs = engine.consumers(&leaving).unwrap();
     assert_eq!(notifs.deleted(), vec![CONSUMER]);
-    assert!(notifs.updated().is_empty());
+    assert!(
+        notifs.updated().is_empty(),
+        "a row that left the view produces no in-view diff"
+    );
 
     let entering = update(orders, row(9.5, 0, "v1"), row(9.5, 5, "v1"), [QUANTITY]);
     let notifs = engine.consumers(&entering).unwrap();
     assert_eq!(notifs.inserted(), vec![CONSUMER]);
-    assert!(notifs.updated().is_empty());
+    assert!(
+        notifs.updated().is_empty(),
+        "a newly entered row has no prior in-view content"
+    );
 }
 
 #[test]
@@ -130,8 +142,14 @@ fn update_with_unreported_changed_columns_reports_view_exit() {
     let notifs = engine.consumers(&event).unwrap();
 
     assert_eq!(notifs.deleted(), vec![CONSUMER]);
-    assert!(notifs.inserted().is_empty());
-    assert!(notifs.updated().is_empty());
+    assert!(
+        notifs.inserted().is_empty(),
+        "a row that exited the view cannot also be a new entry"
+    );
+    assert!(
+        notifs.updated().is_empty(),
+        "a row that exited the view produces no in-view diff"
+    );
 }
 
 #[test]
@@ -214,7 +232,13 @@ mod real_source {
 
         let notifs = engine.consumers(&update).unwrap();
         assert_eq!(notifs.updated(), vec![1u64]);
-        assert!(notifs.inserted().is_empty());
-        assert!(notifs.deleted().is_empty());
+        assert!(
+            notifs.inserted().is_empty(),
+            "the row stayed in the view so no new entry was fired"
+        );
+        assert!(
+            notifs.deleted().is_empty(),
+            "the row stayed in the view so no exit was fired"
+        );
     }
 }

@@ -969,11 +969,14 @@ mod render_tests {
             alloc::vec![Value::Int(2), Value::Null, Value::Bytes(alloc::vec![0x00])],
         )
         .with_pk_columns([0u16]);
-        assert!(engine
-            .consumers(&miss)
-            .expect("dispatch miss")
-            .inserted()
-            .is_empty());
+        assert!(
+            engine
+                .consumers(&miss)
+                .expect("dispatch miss")
+                .inserted()
+                .is_empty(),
+            "wrong payload bytes notified no consumer"
+        );
     }
 
     /// A typed SQLite UPDATE with a blob predicate follows its target rows.
@@ -1034,10 +1037,13 @@ mod render_tests {
             ],
         )
         .with_pk_columns([0u16]);
-        assert!(engine
-            .consumers(&miss)
-            .expect("dispatch miss")
-            .inserted()
-            .is_empty());
+        assert!(
+            engine
+                .consumers(&miss)
+                .expect("dispatch miss")
+                .inserted()
+                .is_empty(),
+            "wrong payload bytes notified no consumer"
+        );
     }
 }

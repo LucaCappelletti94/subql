@@ -195,14 +195,11 @@ pub fn harness_canonicalize(data: &[u8]) {
     let Ok(sql) = core::str::from_utf8(data) else {
         return;
     };
-    let pg = PostgreSqlDialect {};
-
-    for dialect in [&pg as &dyn sqlparser::dialect::Dialect] {
-        if let Ok(normalized) = normalize_sql(sql, dialect) {
-            let h1 = hash_sql(&normalized);
-            let h2 = hash_sql(&normalized);
-            assert_eq!(h1, h2, "hash_sql is not deterministic");
-        }
+    let dialect = &PostgreSqlDialect {} as &dyn sqlparser::dialect::Dialect;
+    if let Ok(normalized) = normalize_sql(sql, dialect) {
+        let h1 = hash_sql(&normalized);
+        let h2 = hash_sql(&normalized);
+        assert_eq!(h1, h2, "hash_sql is not deterministic");
     }
 }
 

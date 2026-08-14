@@ -126,7 +126,10 @@ fn a_deleted_row_leaves_only_the_subscribers_it_reached() {
         .consumers(&TestEvent::delete(docs, doc(1, 7, "spec")))
         .unwrap();
     assert_eq!(notifs.deleted(), &[1]);
-    assert!(notifs.inserted().is_empty());
+    assert!(
+        notifs.inserted().is_empty(),
+        "a delete event fires no insertions"
+    );
 }
 
 /// One base UPDATE, three different verdicts, out of one evaluation of one
@@ -261,7 +264,10 @@ fn a_row_missing_the_compared_column_matches_nobody() {
     // A row image carrying only the key: `project_id` is absent, not null.
     let partial = TestEvent::insert(docs, vec![Value::Int(1)]);
     let notifs = engine.consumers(&partial).unwrap();
-    assert!(notifs.inserted().is_empty());
+    assert!(
+        notifs.inserted().is_empty(),
+        "project_id absent so no subscriber can be admitted"
+    );
 }
 
 /// A null compared value admits nobody, because `NULL IN (SELECT ...)` is never
@@ -280,11 +286,14 @@ fn a_null_compared_value_admits_nobody() {
             Value::Float(1.0),
         ],
     );
-    assert!(engine
-        .consumers(&null_project)
-        .unwrap()
-        .inserted()
-        .is_empty());
+    assert!(
+        engine
+            .consumers(&null_project)
+            .unwrap()
+            .inserted()
+            .is_empty(),
+        "null cannot be IN any set so no subscriber is admitted"
+    );
 }
 
 /// Unregistering takes the subscriber out of the term's set. Asserted by
@@ -453,7 +462,10 @@ fn a_relationship_that_does_not_compile_is_refused_in_rls2fga_wording() {
         !reason.contains("SubQL"),
         "the reason should be the one rls2fga gave, got {reason:?}"
     );
-    assert!(!reason.is_empty());
+    assert!(
+        !reason.is_empty(),
+        "a refused relationship must carry a non-empty reason"
+    );
 }
 /// A term comparing a column of a different kind than the relationship is keyed
 /// on is refused. The classifier reads the inner half of the correlation and can
@@ -499,11 +511,14 @@ fn a_new_membership_row_moves_the_set_and_reports_the_narrowing() {
     let alice = engine.register(subscribe(1, "alice", &[7])).unwrap();
 
     // Before: project 11 admits nobody.
-    assert!(engine
-        .consumers(&TestEvent::insert(docs, doc(1, 11, "spec")))
-        .unwrap()
-        .inserted()
-        .is_empty());
+    assert!(
+        engine
+            .consumers(&TestEvent::insert(docs, doc(1, 11, "spec")))
+            .unwrap()
+            .inserted()
+            .is_empty(),
+        "project 11 is not yet in alice's admitted set"
+    );
 
     let notifs = engine
         .consumers(&TestEvent::insert(members, membership(11, "alice")))
@@ -584,11 +599,14 @@ fn an_updated_membership_row_reports_both_halves() {
         "one row moved, so one value left and one arrived"
     );
 
-    assert!(engine
-        .consumers(&TestEvent::insert(docs, doc(1, 7, "old")))
-        .unwrap()
-        .inserted()
-        .is_empty());
+    assert!(
+        engine
+            .consumers(&TestEvent::insert(docs, doc(1, 7, "old")))
+            .unwrap()
+            .inserted()
+            .is_empty(),
+        "alice left project 7 so that document no longer reaches her"
+    );
     assert_eq!(
         engine
             .consumers(&TestEvent::insert(docs, doc(2, 11, "new")))
@@ -614,11 +632,14 @@ fn a_membership_naming_another_person_moves_nobody() {
         notifs.narrowings().is_empty(),
         "nobody here filters for that identity"
     );
-    assert!(engine
-        .consumers(&TestEvent::insert(docs, doc(1, 11, "spec")))
-        .unwrap()
-        .inserted()
-        .is_empty());
+    assert!(
+        engine
+            .consumers(&TestEvent::insert(docs, doc(1, 11, "spec")))
+            .unwrap()
+            .inserted()
+            .is_empty(),
+        "stranger is not any subscriber so project 11 admits nobody"
+    );
 }
 
 /// Truncating the membership table withdraws every value it admitted. Leaving
@@ -668,12 +689,18 @@ fn a_membership_row_missing_the_subscriber_moves_nobody() {
 
     // Only the project half of the row.
     let partial = TestEvent::insert(members, vec![Value::Int(11)]);
-    assert!(engine.consumers(&partial).unwrap().narrowings().is_empty());
-    assert!(engine
-        .consumers(&TestEvent::insert(docs, doc(1, 11, "spec")))
-        .unwrap()
-        .inserted()
-        .is_empty());
+    assert!(
+        engine.consumers(&partial).unwrap().narrowings().is_empty(),
+        "a membership row without user_id names no subscriber"
+    );
+    assert!(
+        engine
+            .consumers(&TestEvent::insert(docs, doc(1, 11, "spec")))
+            .unwrap()
+            .inserted()
+            .is_empty(),
+        "the partial row never opened project 11 to any subscriber"
+    );
 }
 
 /// An event on a table no membership subquery reads through produces no
@@ -688,7 +715,10 @@ fn an_ordinary_event_reports_no_narrowing() {
         .consumers(&TestEvent::insert(docs, doc(1, 7, "spec")))
         .unwrap();
     assert_eq!(notifs.inserted(), &[1]);
-    assert!(notifs.narrowings().is_empty());
+    assert!(
+        notifs.narrowings().is_empty(),
+        "a docs event never touches the membership set"
+    );
 }
 
 /// A filter naming more membership subqueries than the cap is refused. The cost

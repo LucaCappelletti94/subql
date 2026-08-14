@@ -863,7 +863,10 @@ mod tests {
         assert!(result.is_ok());
         let normalized = result.unwrap();
         // The fallback uses {:?} format, so it produces something
-        assert!(!normalized.is_empty());
+        assert!(
+            !normalized.is_empty(),
+            "the debug fallback always produces at least the expression text"
+        );
     }
 
     #[test]

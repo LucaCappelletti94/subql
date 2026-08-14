@@ -238,7 +238,10 @@ mod tests {
         };
         assert_eq!(ev.kind(), EventKind::Insert);
         assert_eq!(ev.pk_columns(&db), vec![0u16]);
-        assert!(ev.changed_columns(&db).is_empty());
+        assert!(
+            ev.changed_columns(&db).is_empty(),
+            "insert has no old image so no changed columns arise"
+        );
         assert_eq!(ev.checkpoint(), Some(PgLsn(0x10)));
         assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(7));
         assert_eq!(
@@ -309,7 +312,10 @@ mod tests {
             lsn: Lsn::new(0),
             metadata: None,
         };
-        assert!(ev.changed_columns(&db).is_empty());
+        assert!(
+            ev.changed_columns(&db).is_empty(),
+            "old image has only the pk so non-pk changes are indeterminate"
+        );
         // Pre-update PK identifies the row through the old image.
         assert_eq!(ev.value_at(&db, RowKind::Pk, 0).unwrap(), Value::Int(7));
     }

@@ -779,7 +779,10 @@ mod tests {
         // A batch of only transaction boundaries carries no row ops, so
         // the builder is empty and `build()` emits zero bytes.
         let bytes = wal2json_patchset(&db, &[begin, commit]).unwrap();
-        assert!(bytes.is_empty());
+        assert!(
+            bytes.is_empty(),
+            "begin and commit carry no row ops so no bytes are emitted"
+        );
     }
 
     #[test]

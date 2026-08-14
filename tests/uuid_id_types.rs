@@ -66,12 +66,21 @@ fn uuid_consumer_ids_dispatch() {
     // Matching insert (amount 250 > 100): the UUID consumer is notified.
     let notifs = engine.consumers(&insert_event(orders, 1, 250)).unwrap();
     assert_eq!(notifs.inserted(), vec![consumer]);
-    assert!(notifs.updated().is_empty());
-    assert!(notifs.deleted().is_empty());
+    assert!(
+        notifs.updated().is_empty(),
+        "an insert event produces no updates"
+    );
+    assert!(
+        notifs.deleted().is_empty(),
+        "an insert event produces no deletions"
+    );
 
     // Non-matching insert (amount 5): nobody is notified.
     let notifs = engine.consumers(&insert_event(orders, 2, 5)).unwrap();
-    assert!(notifs.inserted().is_empty());
+    assert!(
+        notifs.inserted().is_empty(),
+        "amount 5 does not satisfy amount > 100"
+    );
 }
 
 #[test]
@@ -103,11 +112,14 @@ fn uuid_session_scope_unregister() {
 
     // Tearing down the UUID-keyed session removes its subscription.
     engine.unregister_session(session);
-    assert!(engine
-        .consumers(&insert_event(orders, 2, 250))
-        .unwrap()
-        .inserted()
-        .is_empty());
+    assert!(
+        engine
+            .consumers(&insert_event(orders, 2, 250))
+            .unwrap()
+            .inserted()
+            .is_empty(),
+        "no subscription remains after the session is torn down",
+    );
 }
 
 /// The strongest guard: a `ConsumerId = Uuid` binding must survive being

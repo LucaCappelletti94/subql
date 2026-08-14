@@ -58,7 +58,10 @@ fn bytes_bind_registers_and_matches() {
         matched(&mut engine, &pg_row(table_id, 1, payload)),
         vec![1u64]
     );
-    assert!(matched(&mut engine, &pg_row(table_id, 2, vec![0x00, 0x11])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 2, vec![0x00, 0x11])).is_empty(),
+        "payload 0x0011 does not match the equality bind",
+    );
 }
 
 /// An empty bytes bind (`X''`) matches an empty-payload row and nothing
@@ -78,7 +81,10 @@ fn empty_bytes_bind_matches_empty_payload() {
         matched(&mut engine, &pg_row(table_id, 1, vec![])),
         vec![2u64]
     );
-    assert!(matched(&mut engine, &pg_row(table_id, 2, vec![0x00])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 2, vec![0x00])).is_empty(),
+        "non-empty payload does not equal the empty bind",
+    );
 }
 
 /// Ordered comparison against a bytes bind follows `value_cmp`'s
@@ -100,9 +106,15 @@ fn bytes_bind_ordered_comparison_is_lexicographic() {
         vec![3u64]
     );
     // Equal is not strictly greater.
-    assert!(matched(&mut engine, &pg_row(table_id, 2, vec![0x10, 0x20])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 2, vec![0x10, 0x20])).is_empty(),
+        "payload equal to the bind is not strictly greater",
+    );
     // Lesser by the second byte.
-    assert!(matched(&mut engine, &pg_row(table_id, 3, vec![0x10, 0x1f])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 3, vec![0x10, 0x1f])).is_empty(),
+        "payload lesser than the bind does not satisfy greater-than",
+    );
     // A proper prefix-extension is lexicographically greater.
     assert_eq!(
         matched(&mut engine, &pg_row(table_id, 4, vec![0x10, 0x20, 0x00])),
@@ -131,7 +143,10 @@ fn in_list_bytes_binds_match_any_member() {
         matched(&mut engine, &pg_row(table_id, 2, vec![0xbb, 0xcc])),
         vec![4u64]
     );
-    assert!(matched(&mut engine, &pg_row(table_id, 3, vec![0xdd])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 3, vec![0xdd])).is_empty(),
+        "payload 0xdd matches no member of the bound IN list",
+    );
 }
 
 /// A bytes bind in a non-first position resolves against the right index:
@@ -152,9 +167,15 @@ fn mixed_binds_resolve_bytes_in_second_position() {
         vec![5u64]
     );
     // Right id, wrong payload.
-    assert!(matched(&mut engine, &pg_row(table_id, 5, vec![0x43])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 5, vec![0x43])).is_empty(),
+        "correct id but mismatched payload does not match",
+    );
     // Right payload, wrong id.
-    assert!(matched(&mut engine, &pg_row(table_id, 6, vec![0x42])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 6, vec![0x42])).is_empty(),
+        "correct payload but wrong id does not match",
+    );
 }
 
 /// An UPDATE moves a row into and out of a bytes-predicate view: a new
@@ -182,8 +203,14 @@ fn update_event_moves_row_into_and_out_of_bytes_view() {
     .with_changed_columns([1u16]);
     let entered = engine.consumers(&into).expect("dispatch update-in");
     assert_eq!(entered.inserted(), &[1u64]);
-    assert!(entered.deleted().is_empty());
-    assert!(entered.updated().is_empty());
+    assert!(
+        entered.deleted().is_empty(),
+        "row entering the view produces no deletion"
+    );
+    assert!(
+        entered.updated().is_empty(),
+        "row entering the view produces no update"
+    );
 
     // old payload == bind, new payload != bind -> row leaves the view.
     let out = TestEvent::<Postgres>::update(
@@ -195,8 +222,14 @@ fn update_event_moves_row_into_and_out_of_bytes_view() {
     .with_changed_columns([1u16]);
     let left = engine.consumers(&out).expect("dispatch update-out");
     assert_eq!(left.deleted(), &[1u64]);
-    assert!(left.inserted().is_empty());
-    assert!(left.updated().is_empty());
+    assert!(
+        left.inserted().is_empty(),
+        "row leaving the view produces no insertion"
+    );
+    assert!(
+        left.updated().is_empty(),
+        "row leaving the view produces no update"
+    );
 }
 
 /// An UPDATE where both the old and new payloads satisfy an ordered bytes
@@ -222,8 +255,14 @@ fn update_event_both_match_reports_updated() {
     .with_changed_columns([1u16]);
     let out = engine.consumers(&ev).expect("dispatch update");
     assert_eq!(out.updated(), &[2u64]);
-    assert!(out.inserted().is_empty());
-    assert!(out.deleted().is_empty());
+    assert!(
+        out.inserted().is_empty(),
+        "row staying in the view produces no insertion"
+    );
+    assert!(
+        out.deleted().is_empty(),
+        "row staying in the view produces no deletion"
+    );
 }
 
 /// A DELETE matches on the old row image: the subscriber whose bind equals
@@ -250,11 +289,14 @@ fn delete_event_matches_on_old_row() {
     let miss =
         TestEvent::<Postgres>::delete(table_id, vec![Value::Int(2), Value::Bytes(vec![0x00])])
             .with_pk_columns([0u16]);
-    assert!(engine
-        .consumers(&miss)
-        .expect("dispatch miss")
-        .deleted()
-        .is_empty());
+    assert!(
+        engine
+            .consumers(&miss)
+            .expect("dispatch miss")
+            .deleted()
+            .is_empty(),
+        "payload 0x00 does not match the delete subscription",
+    );
 }
 
 /// A bare `?` placeholder resolves the same bytes bind identically to `$1`.
@@ -323,7 +365,10 @@ fn inline_hex_literal_and_bind_match_identically() {
     hit.sort_unstable();
     assert_eq!(hit, vec![1u64, 2u64]);
 
-    assert!(matched(&mut engine, &pg_row(table_id, 2, vec![0x00])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 2, vec![0x00])).is_empty(),
+        "payload 0x00 matches neither the literal nor the bind",
+    );
 }
 
 /// Inequality against a bytes bind matches the complement: rows whose
@@ -342,5 +387,8 @@ fn not_equal_bytes_bind_matches_complement() {
         matched(&mut engine, &pg_row(table_id, 1, vec![0xbb])),
         vec![1u64]
     );
-    assert!(matched(&mut engine, &pg_row(table_id, 2, vec![0xaa])).is_empty());
+    assert!(
+        matched(&mut engine, &pg_row(table_id, 2, vec![0xaa])).is_empty(),
+        "payload matching the bind does not satisfy inequality",
+    );
 }

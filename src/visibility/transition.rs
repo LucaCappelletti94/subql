@@ -591,7 +591,10 @@ mod tests {
         buffers.reset(1);
         assert_eq!(buffers.get(), [Transition::Withdraw]);
         buffers.reset(0);
-        assert!(buffers.get().is_empty());
+        assert!(
+            buffers.get().is_empty(),
+            "reset to zero produces an empty transition buffer"
+        );
     }
 
     // -----------------------------------------------------------------

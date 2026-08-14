@@ -373,7 +373,10 @@ mod tests {
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Insert);
         assert_eq!(ev.pk_columns(&db), &[0u16]);
-        assert!(ev.changed_columns(&db).is_empty());
+        assert!(
+            ev.changed_columns(&db).is_empty(),
+            "insert has no old image so no changed columns arise"
+        );
         assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(7));
         assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Int(250));
         assert_eq!(
@@ -449,7 +452,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind(), EventKind::Delete);
-        assert!(ev.changed_columns(&db).is_empty());
+        assert!(
+            ev.changed_columns(&db).is_empty(),
+            "delete has no new image so no changed columns arise"
+        );
         assert_eq!(ev.value_at(&db, RowKind::Old, 0).unwrap(), Value::Int(9));
         assert_eq!(ev.value_at(&db, RowKind::Old, 1).unwrap(), Value::Int(500));
         assert_eq!(

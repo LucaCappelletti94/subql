@@ -757,7 +757,10 @@ mod tests {
         assert_eq!(buffer, [Verdict::Deny; 4], "grow clears stale grants");
 
         Verdict::reset(&mut buffer, 0);
-        assert!(buffer.is_empty());
+        assert!(
+            buffer.is_empty(),
+            "reset to zero produces an empty verdict buffer"
+        );
     }
 
     #[test]
