@@ -128,18 +128,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --exclude subql-demo --lib --tests --release --locked ${{ matrix.profile.args }}
 
+  # The Docker suite is split so its wall clock is the slowest group rather than
+  # the sum, which had grown past an hour. The compile is the expensive half, so
+  # it happens once here and the groups run from the archive: splitting without
+  # this simply pays the release build three times.
+  integration-build:
+    name: integration build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest archive --workspace --exclude subql-demo --all-features --release --locked --archive-file nextest.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest.tar.zst
+          retention-days: 1
+
   integration:
     name: integration (${{ matrix.group.name }})
+    needs: integration-build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         # The three filters partition the ignored set rather than enumerating it:
         # the last one is the complement of the other two, so a Docker-backed
         # target added tomorrow lands in a group by construction and cannot go
-        # unrun. Splitting them at all is what keeps the wall clock near the
-        # slowest group instead of the sum, which had grown past an hour.
+        # unrun.
         group:
           - name: mysql
             filter: binary(~mysql)
@@ -149,20 +170,25 @@ jobs:
             filter: not (binary(~mysql) or binary(~openfga))
     steps:
       - uses: actions/checkout@v5
+      # The tests read the fixture Dockerfile from the working tree and link
+      # against these at run time, so the checkout and the libraries are needed
+      # even though nothing is compiled here.
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
       # Every Docker-backed test is `#[ignore]`d and nothing else is, so
       # `--run-ignored ignored-only` covers exactly this set. nextest schedules
       # across test binaries rather than finishing one before starting the next,
-      # which is where the time went: each of two dozen binaries paid its own
-      # container startup end to end. Every test builds its own container and
-      # shares no state, so a process per test is what these already assume.
+      # which is where the rest of the time went: each of two dozen binaries paid
+      # its own container startup end to end. Every test builds its own container
+      # and shares no state, so a process per test is what these already assume.
       # Eight at a time rather than one per core, because the work is waiting on
-      # containers rather than computing, and eight MySQL servers is the most
-      # this runner's memory should be asked to hold.
-      - run: cargo nextest run --workspace --exclude subql-demo --all-features --release --locked --run-ignored ignored-only --no-fail-fast --test-threads 8 -E '${{ matrix.group.filter }}'
+      # containers rather than computing, and eight MySQL servers is the most this
+      # runner's memory should be asked to hold.
+      - run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --run-ignored ignored-only --no-fail-fast --test-threads 8 -E '${{ matrix.group.filter }}'
 
   docs:
     name: docs + doctests
