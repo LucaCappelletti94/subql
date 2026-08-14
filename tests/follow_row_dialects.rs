@@ -42,7 +42,10 @@ fn follow_row_matches_its_row_under_postgres() {
     let other =
         TestEvent::<Postgres>::insert(users, vec![Value::Int(8), Value::String("bob".into())])
             .with_pk_columns([0u16]);
-    assert!(engine.consumers(&other).unwrap().inserted().is_empty());
+    assert!(
+        engine.consumers(&other).unwrap().inserted().is_empty(),
+        "user id 8 was not followed, only id 7"
+    );
 }
 
 #[test]
@@ -66,7 +69,10 @@ fn follow_row_matches_its_row_under_mysql() {
 
     let other = TestEvent::<MySql>::insert(users, vec![Value::Int(8), Value::String("bob".into())])
         .with_pk_columns([0u16]);
-    assert!(engine.consumers(&other).unwrap().inserted().is_empty());
+    assert!(
+        engine.consumers(&other).unwrap().inserted().is_empty(),
+        "user id 8 was not followed, only id 7"
+    );
 }
 
 #[test]
@@ -91,7 +97,10 @@ fn follow_row_matches_its_row_under_sqlite() {
     let other =
         TestEvent::<SQLite>::insert(users, vec![Value::Int(8), Value::String("bob".into())])
             .with_pk_columns([0u16]);
-    assert!(engine.consumers(&other).unwrap().inserted().is_empty());
+    assert!(
+        engine.consumers(&other).unwrap().inserted().is_empty(),
+        "user id 8 was not followed, only id 7"
+    );
 }
 
 /// A composite key produces one equality per column, each with its own bind.
@@ -134,5 +143,8 @@ fn follow_row_matches_a_composite_key_under_mysql() {
         ],
     )
     .with_pk_columns([0u16, 1u16]);
-    assert!(engine.consumers(&other).unwrap().inserted().is_empty());
+    assert!(
+        engine.consumers(&other).unwrap().inserted().is_empty(),
+        "item 200 was not followed, only item 100 in region 1"
+    );
 }

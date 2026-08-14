@@ -164,7 +164,10 @@ mod tests {
         assert!(rows_equal(&delta.inserted[0], &row(3, 11)));
         assert_eq!(delta.deleted.len(), 1);
         assert!(rows_equal(&delta.deleted[0], &row(1, 5)));
-        assert!(delta.updated.is_empty());
+        assert!(
+            delta.updated.is_empty(),
+            "row(2,9) is identical in both sets so it was not updated"
+        );
     }
 
     /// T7.2: same PK, different cells = update.
@@ -173,8 +176,14 @@ mod tests {
         let prev = [row(1, 5)];
         let next = [row(1, 7)];
         let delta = row_set_delta(&prev, &next, &[0]);
-        assert!(delta.inserted.is_empty());
-        assert!(delta.deleted.is_empty());
+        assert!(
+            delta.inserted.is_empty(),
+            "id=1 is present in both sets so no new PK appeared"
+        );
+        assert!(
+            delta.deleted.is_empty(),
+            "id=1 is present in both sets so no PK disappeared"
+        );
         assert_eq!(delta.updated.len(), 1);
         let (old, new) = &delta.updated[0];
         assert!(rows_equal(old, &row(1, 5)));
@@ -185,9 +194,18 @@ mod tests {
     #[test]
     fn t7_3_empty_inputs() {
         let delta = row_set_delta::<Postgres>(&[], &[], &[0]);
-        assert!(delta.inserted.is_empty());
-        assert!(delta.deleted.is_empty());
-        assert!(delta.updated.is_empty());
+        assert!(
+            delta.inserted.is_empty(),
+            "both inputs are empty so no row could have been added"
+        );
+        assert!(
+            delta.deleted.is_empty(),
+            "both inputs are empty so no row could have been removed"
+        );
+        assert!(
+            delta.updated.is_empty(),
+            "both inputs are empty so no row could have changed"
+        );
     }
 
     /// Identical sets produce no delta entries.
@@ -195,9 +213,18 @@ mod tests {
     fn identical_sets_are_empty() {
         let set = [row(1, 5), row(2, 9), row(3, 11)];
         let delta = row_set_delta(&set, &set, &[0]);
-        assert!(delta.inserted.is_empty());
-        assert!(delta.deleted.is_empty());
-        assert!(delta.updated.is_empty());
+        assert!(
+            delta.inserted.is_empty(),
+            "identical inputs have no new rows to insert"
+        );
+        assert!(
+            delta.deleted.is_empty(),
+            "identical inputs have no rows that disappeared"
+        );
+        assert!(
+            delta.updated.is_empty(),
+            "identical inputs have no rows whose payload changed"
+        );
     }
 
     /// Composite PK: two columns must both match for "same PK".
@@ -210,6 +237,9 @@ mod tests {
         let delta = row_set_delta(&prev, &next, &[0, 1]);
         assert_eq!(delta.inserted.len(), 1);
         assert_eq!(delta.deleted.len(), 1);
-        assert!(delta.updated.is_empty());
+        assert!(
+            delta.updated.is_empty(),
+            "different composite PKs force a delete plus insert not an update"
+        );
     }
 }

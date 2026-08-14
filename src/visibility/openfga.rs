@@ -387,6 +387,21 @@ struct Question {
     item: BatchCheckItem,
 }
 
+/// What answering a statement takes, where the model states a refusal instead of
+/// naming anything to ask.
+///
+/// A refusal is an answer, and the cheapest one there is, so it travels as a
+/// state rather than as [`OpenFgaError::StatementNotAnswered`], which means no
+/// answer was reached and tells a caller that fails closed to hold the event and
+/// try again.
+#[derive(Debug, PartialEq, Eq)]
+enum Asked<T> {
+    /// The model grants nobody, so nobody is asked.
+    Refused,
+    /// What has to be asked.
+    Ask(T),
+}
+
 /// Which consistency preference a question about `statement` needs, where `read`
 /// is what the caller chose for reads.
 ///
@@ -557,7 +572,9 @@ where
         Ok(questions)
     }
 
-    /// The questions `write` raises, one group per rule that has to grant.
+    /// The questions `write` raises, one group per rule that has to grant, or
+    /// [`Asked::Refused`] where the model grants nobody and nothing is worth
+    /// asking.
     ///
     /// A replacement is two rules across two versions. The one choosing which
     /// rows may be touched reads the stored row, and the one admitting the
@@ -567,7 +584,7 @@ where
         &self,
         write: RowWrite<'_, R>,
         watcher: &W,
-    ) -> Result<Vec<Vec<Question>>, OpenFgaError>
+    ) -> Result<Asked<Vec<Vec<Question>>>, OpenFgaError>
     where
         R: RowView + ?Sized,
     {
@@ -580,7 +597,9 @@ where
         let judges = match answer {
             // The database restricts nothing here, so there is nothing to ask
             // and no group has to grant.
-            ActionAnswer::Unrestricted => return Ok(Vec::new()),
+            ActionAnswer::Unrestricted => return Ok(Asked::Ask(Vec::new())),
+            // The model grants nobody, so the write is refused without asking.
+            ActionAnswer::Denied => return Ok(Asked::Refused),
             ActionAnswer::Judged(judges) if judges.is_empty().not() => judges,
             // One relation fusing both versions cannot be asked against either
             // image: judging the check clause on the row as it is grants a
@@ -601,10 +620,11 @@ where
             };
             plan.push(self.questions(row, judge.relation.as_str(), only, &contextual)?);
         }
-        Ok(plan)
+        Ok(Asked::Ask(plan))
     }
 
-    /// The relation that answers a read of `table`, as the model reports it.
+    /// The relation that answers a read of `table`, as the model reports it, or
+    /// [`Asked::Refused`] where the model grants nobody.
     ///
     /// A read judges the row as it is, so its answer is one relation against one
     /// version. Anything else, including a table the model names no type for,
@@ -613,21 +633,26 @@ where
     /// # Errors
     ///
     /// [`OpenFgaError::StatementNotAnswered`] when the model says nothing this
-    /// can ask.
-    fn read_relation(&self, table: TableId) -> Result<RelationName, OpenFgaError> {
+    /// can ask. A refusal is not one of those cases: it is an answer, and it
+    /// comes back as [`Asked::Refused`].
+    fn read_relation(&self, table: TableId) -> Result<Asked<RelationName>, OpenFgaError> {
         let statement = ActionStatement::Select;
         let unanswered = || OpenFgaError::StatementNotAnswered { statement };
-        let ActionAnswer::Judged(judges) = self
+        match self
             .shapes
             .answer(table, statement)
             .ok_or_else(unanswered)?
-        else {
+        {
+            // The model grants nobody, so the read is refused without asking.
+            ActionAnswer::Denied => Ok(Asked::Refused),
+            ActionAnswer::Judged(judges) => match judges.as_slice() {
+                [judge] if judge.version == RowVersion::Existing => {
+                    Ok(Asked::Ask(judge.relation.clone()))
+                }
+                _ => Err(unanswered()),
+            },
             // An unrestricted table has nothing to ask, and this path exists to
             // ask, so the caller answers it locally or not at all.
-            return Err(unanswered());
-        };
-        match judges.as_slice() {
-            [judge] if judge.version == RowVersion::Existing => Ok(judge.relation.clone()),
             _ => Err(unanswered()),
         }
     }
@@ -911,9 +936,13 @@ where
     where
         R: RowView<Backend = Self::Backend> + Sync + ?Sized,
     {
-        let questions = self
-            .read_relation(row.table_id())
-            .and_then(|relation| self.questions(row, relation.as_str(), watchers, &[]));
+        let questions = match self.read_relation(row.table_id()) {
+            // Nobody is granted, and the caller pre-filled a denial for every
+            // watcher, so there is nothing to ask and nothing to write.
+            Ok(Asked::Refused) => Ok(Vec::new()),
+            Ok(Asked::Ask(relation)) => self.questions(row, relation.as_str(), watchers, &[]),
+            Err(err) => Err(err),
+        };
         let consistency = consistency_for(ActionStatement::Select, self.read_consistency);
         async move { self.ask(questions?, verdicts, consistency).await }
     }
@@ -930,9 +959,13 @@ where
         let consistency = consistency_for(statement, self.read_consistency);
         let plan = self.write_plan(write, watcher);
         async move {
+            let groups = match plan? {
+                Asked::Refused => return Ok(Verdict::Deny),
+                Asked::Ask(groups) => groups,
+            };
             // Every half must grant, so the first refusal is the answer and the
             // rest are never asked.
-            for questions in plan? {
+            for questions in groups {
                 let mut verdict = [Verdict::Deny];
                 self.ask(questions, &mut verdict, consistency).await?;
                 if verdict[0] == Verdict::Deny {
@@ -957,13 +990,22 @@ mod tests {
 
     use super::{
         batch_request, consistency_for, context_for, fits_one_call, tuple_of, usable_index,
-        ActionStatement, BatchCheckItem, CheckRequestTupleKey, Code, ConsistencyPreference, Kind,
-        OpenFgaError, Question, Record, RecordContextValue, RequestValues, RequiredParameter,
-        Subject, TupleKeyWithoutCondition, MAX_TUPLES_PER_WRITE,
+        ActionStatement, Asked, BatchCheckItem, CheckRequestTupleKey, Code, ConsistencyPreference,
+        Kind, OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, Question, Record,
+        RecordContextValue, RequestValues, RequiredParameter, RowWrite, Subject,
+        TupleKeyWithoutCondition, MAX_TUPLES_PER_WRITE,
     };
+    use crate::backend::{Postgres, Value};
+    use crate::testing::TestEvent;
     use crate::visibility::shapes::Shapes;
-    use crate::visibility::test_names;
-    use crate::ParserDB;
+    use crate::visibility::{test_names, EventRow, Verdict, VisibilityPolicy};
+    use crate::{catalog_helpers, ParserDB};
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use core::task::{Context as CoreContext, Poll};
+    use openfga_client::tonic::client::GrpcService;
+    use openfga_client::tonic::codegen::http::{Request, Response};
+    use openfga_client::tonic::{body::Body, Status};
 
     /// The four statements a write can be, which is what `statement_of` reports
     /// for the four [`RowWrite`](crate::visibility::RowWrite) shapes.
@@ -1332,7 +1374,10 @@ CREATE POLICY notes_p ON notes USING (
             bare.has_request_gated_recipe(),
             "the recipe grants through the caller's own values"
         );
-        assert!(bare.required_parameters().is_empty());
+        assert!(
+            bare.required_parameters().is_empty(),
+            "built without notes the index reports no required parameters"
+        );
 
         assert_eq!(
             usable_index(&bare),
@@ -1351,5 +1396,123 @@ CREATE POLICY notes_p ON notes USING (
             Ok(()),
             "and one told which parameters carry it builds"
         );
+    }
+
+    /// A transport that panics if anything is asked of it.
+    ///
+    /// The tests below are about questions that are never sent, so a real
+    /// channel would prove less: this one turns a regression into a failure
+    /// rather than into a call nobody notices.
+    #[derive(Clone)]
+    struct NeverAsked;
+
+    impl GrpcService<Body> for NeverAsked {
+        type ResponseBody = Body;
+        type Error = Status;
+        type Future = core::future::Ready<Result<Response<Body>, Status>>;
+
+        fn poll_ready(&mut self, _: &mut CoreContext<'_>) -> Poll<Result<(), Status>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: Request<Body>) -> Self::Future {
+            panic!("the model refused this statement, so nothing may be asked")
+        }
+    }
+
+    fn policy_over(sql: &str) -> OpenFgaPolicy<ParserDB, NeverAsked, String, Postgres> {
+        let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
+        let translation = TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .build()
+            .translate(&db);
+        let (relations, naming, answers) = (
+            translation.relations(),
+            translation.row_naming(),
+            translation.action_relations(),
+        );
+        let shapes = Arc::new(
+            Shapes::new(db, &relations)
+                .with_row_naming(&naming)
+                .with_action_relations(&answers),
+        );
+        OpenFgaPolicy::new(shapes, OpenFgaServiceClient::new(NeverAsked), "store").unwrap()
+    }
+
+    /// Row-level security on with no policy: the model refuses every statement.
+    const CLOSED: &str = "
+CREATE TABLE ledger(id INTEGER PRIMARY KEY, amount INTEGER);
+ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
+";
+
+    /// Spin rather than schedule: every future below answers on its first poll,
+    /// because a refused statement asks nothing, and a regression that asks
+    /// panics in [`NeverAsked`] rather than hanging here.
+    fn block_on<F: core::future::Future>(future: F) -> F::Output {
+        let mut context = CoreContext::from_waker(core::task::Waker::noop());
+        let mut pinned = core::pin::pin!(future);
+        loop {
+            if let Poll::Ready(value) = pinned.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+    }
+
+    /// A refusal the model states is an answer, so it comes back as a denial
+    /// rather than as [`OpenFgaError::StatementNotAnswered`]. The difference
+    /// decides what a caller does with it: an unanswered statement is held and
+    /// retried, and the retry fails identically, while a denial is final.
+    #[test]
+    fn a_write_the_model_refuses_is_denied_without_asking() {
+        let policy = policy_over(CLOSED);
+        let ledger = catalog_helpers::table_id(policy.shapes().catalog(), "ledger").unwrap();
+        let event = TestEvent::<Postgres>::insert(ledger, vec![Value::Int(4), Value::Int(7)])
+            .with_pk_columns([0u16]);
+        let view = EventRow::current(&event, policy.shapes().catalog()).unwrap();
+
+        let got =
+            block_on(policy.may_write(RowWrite::Insert { new: &view }, &"user:alice".to_string()));
+
+        assert_eq!(got, Ok(Verdict::Deny), "nobody may write this table");
+    }
+
+    /// The same for a read, which is a different path with the same rule. Every
+    /// watcher is denied, and the buffer the caller pre-filled is what says so.
+    #[test]
+    fn a_read_the_model_refuses_denies_every_watcher_without_asking() {
+        let policy = policy_over(CLOSED);
+        let ledger = catalog_helpers::table_id(policy.shapes().catalog(), "ledger").unwrap();
+        let event = TestEvent::<Postgres>::insert(ledger, vec![Value::Int(4), Value::Int(7)])
+            .with_pk_columns([0u16]);
+        let view = EventRow::current(&event, policy.shapes().catalog()).unwrap();
+        let watchers = ["user:alice".to_string(), "user:bob".to_string()];
+        let mut verdicts = vec![Verdict::Deny; 2];
+
+        block_on(policy.may_see(&view, &watchers, &mut verdicts)).unwrap();
+
+        assert_eq!(
+            verdicts,
+            [Verdict::Deny, Verdict::Deny],
+            "nobody reads this table"
+        );
+    }
+
+    /// And a table the model does grant reads on still names the relation to
+    /// ask, so the refusal above is read off the report rather than standing in
+    /// for every table.
+    #[test]
+    fn a_read_the_model_grants_still_names_its_relation() {
+        let policy = policy_over(
+            "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);
+             ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);",
+        );
+        let docs = catalog_helpers::table_id(policy.shapes().catalog(), "docs").unwrap();
+
+        let asked = policy.read_relation(docs).unwrap();
+        let Asked::Ask(relation) = asked else {
+            panic!("a granted read names the relation that answers it");
+        };
+        assert_eq!(relation.as_str(), "can_select");
     }
 }

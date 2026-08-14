@@ -200,7 +200,10 @@ mod tests {
                  "data":{"id":7,"amount":250,"status":"paid"}}"#);
         assert_eq!(ev.kind(), EventKind::Insert);
         assert_eq!(ev.pk_columns(&db), alloc::vec![0u16]);
-        assert!(ev.changed_columns(&db).is_empty());
+        assert!(
+            ev.changed_columns(&db).is_empty(),
+            "insert has no old image so no changed columns arise"
+        );
         assert_eq!(ev.checkpoint(), None);
         assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Int(250));
         assert_eq!(
