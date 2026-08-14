@@ -1061,6 +1061,14 @@ CREATE POLICY p ON docs FOR SELECT USING (
         (db, relations)
     }
 
+    /// The two session attributes almost every fixture here declares.
+    fn common_attributes() -> [SessionAttribute; 2] {
+        [
+            SessionAttribute::setting("app.user_id", SessionAttributeKind::CallerId),
+            SessionAttribute::setting("app.subjects", SessionAttributeKind::SetAttribute),
+        ]
+    }
+
     /// The index both readers share, built the way a real caller builds it.
     ///
     /// The naming and the statement answers come from translating the catalog,
@@ -1068,12 +1076,25 @@ CREATE POLICY p ON docs FOR SELECT USING (
     /// shape a real schema does not produce. Which relation answers a statement
     /// is the model's either way.
     fn shared(db: ParserDB, relations: &[RelationShapes]) -> SharedShapes<ParserDB> {
+        shared_declaring(db, relations, common_attributes())
+    }
+
+    /// The same, for a fixture whose policies read a session attribute
+    /// [`common_attributes`] does not carry.
+    ///
+    /// **The answers have to come from a translator that reads the policy the
+    /// same way the recipes did.** One that cannot read it drops the policy, and
+    /// a table with row-level security on and no policy left grants nobody, so
+    /// the report says the statement is refused rather than describing the rule
+    /// the fixture actually wrote.
+    fn shared_declaring(
+        db: ParserDB,
+        relations: &[RelationShapes],
+        attributes: impl IntoIterator<Item = SessionAttribute>,
+    ) -> SharedShapes<ParserDB> {
         let translator = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
-            .with_session_attributes([
-                SessionAttribute::setting("app.user_id", SessionAttributeKind::CallerId),
-                SessionAttribute::setting("app.subjects", SessionAttributeKind::SetAttribute),
-            ])
+            .with_session_attributes(attributes)
             .build();
         let (naming, answers, notes) = {
             let translation = translator.translate(&db);
@@ -2333,19 +2354,21 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
     #[test]
     fn a_single_value_comparison_refuses_a_watcher_that_sent_several() {
         let db = ParserDB::parse::<PostgreSqlDialect>(SCALAR_GATE).unwrap();
+        let department =
+            SessionAttribute::setting("app.department", SessionAttributeKind::ScalarAttribute)
+                .with_parameter("app_subjects");
         let relations = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
-            .with_session_attributes([SessionAttribute::setting(
-                "app.department",
-                SessionAttributeKind::ScalarAttribute,
-            )
-            .with_parameter("app_subjects")])
+            .with_session_attributes([department.clone()])
             .build()
             .translate(&db)
             .relations();
         let notes = notes_id(&db);
         let event = insert(notes, notes_row("physics"));
-        let policy = RowPolicy::new(shared(db, &relations), Named::<Principal>::default());
+        let policy = RowPolicy::new(
+            shared_declaring(db, &relations, [department]),
+            Named::<Principal>::default(),
+        );
         let view = EventRow::current(&event, policy.catalog()).unwrap();
 
         assert!(policy.answers_locally(notes, ActionStatement::Select));

@@ -32,12 +32,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use core::ops::Not;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use rls2fga::generator::action_relations::{ActionAnswer, ActionRelations, ActionStatement};
 use rls2fga::generator::notes::TranslationNote;
 use rls2fga::generator::records::{BoundQuery, RecordDerivation, RecordDescription};
 use rls2fga::generator::relations::{RelationShapes, RowDecision};
 use rls2fga::generator::row_naming::RowNaming;
+use rls2fga::generator::unrestricted::UnrestrictedTable;
 
 use rls2fga::parser::identifiers::RelationName;
 use sql_traits::prelude::DatabaseLike;
@@ -45,6 +46,13 @@ use sql_traits::prelude::DatabaseLike;
 use crate::visibility::records::is_evaluable;
 use crate::visibility::store::{name_gap, Uncovered, UncoveredReason};
 use crate::{catalog_helpers, ColumnId, TableId};
+
+/// The answer every statement on an unrestricted table gets.
+///
+/// Held once so [`Shapes::answer`] can hand out a reference to it: the table is
+/// in a set rather than in the answer map, so there is no stored value to
+/// borrow.
+static UNRESTRICTED: ActionAnswer = ActionAnswer::Unrestricted;
 
 // ---------------------------------------------------------------------------
 // RequiredParameter
@@ -161,6 +169,10 @@ pub struct Shapes<DB> {
     uncovered: Vec<Uncovered>,
     /// How the model names a row of each table it names rows of.
     naming: HashMap<TableId, RowNaming>,
+    /// Tables the database filters nothing on, which the action report cannot
+    /// carry because it is keyed by the type the model gives a table and these
+    /// have none.
+    unrestricted: HashSet<TableId>,
     /// Parameters every question's context has to carry.
     parameters: Vec<RequiredParameter>,
 }
@@ -204,6 +216,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
             uncovered,
             answers: HashMap::new(),
             naming: HashMap::new(),
+            unrestricted: HashSet::new(),
             parameters: Vec::new(),
         }
     }
@@ -274,17 +287,83 @@ impl<DB: DatabaseLike> Shapes<DB> {
         self
     }
 
+    /// Take the tables the database filters nothing on, from
+    /// [`Translation::unrestricted_tables`](rls2fga::translator::Translation::unrestricted_tables).
+    ///
+    /// Read positively and beside
+    /// [`with_action_relations`](Self::with_action_relations): a table here
+    /// shows every row to everybody, so a question about one of its rows is
+    /// granted with nothing asked. **A table in neither report stays
+    /// unanswered**, because absent means uncovered and uncovered still
+    /// delegates.
+    ///
+    /// The action report cannot carry these on its own. It is keyed by the type
+    /// the model gives a table, and the database leaves open plenty of tables
+    /// the model types nothing for: one nothing can name a row of, and one no
+    /// policy anywhere reaches. Those answer nowhere else, so without this a
+    /// reader delegates a question the model defines no type to ask.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rls2fga::classifier::patterns::ConfidenceLevel;
+    /// use rls2fga::generator::action_relations::ActionStatement;
+    /// use rls2fga::translator::TranslatorBuilder;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::visibility::shapes::Shapes;
+    /// use subql::{catalog_helpers, ParserDB};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
+    /// )
+    /// .expect("the schema parses");
+    /// let orders = catalog_helpers::table_id(&db, "orders").expect("orders is in the catalog");
+    ///
+    /// let translator = TranslatorBuilder::new()
+    ///     .with_min_confidence(ConfidenceLevel::B)
+    ///     .build();
+    /// let translation = translator.translate(&db);
+    /// let relations = translation.relations();
+    /// let naming = translation.row_naming();
+    /// let answers = translation.action_relations();
+    /// let open = translation.unrestricted_tables();
+    ///
+    /// let shapes = Shapes::new(db, &relations)
+    ///     .with_row_naming(&naming)
+    ///     .with_action_relations(&answers)
+    ///     .with_unrestricted_tables(&open);
+    ///
+    /// // Row-level security is off, so there is nothing to ask anybody.
+    /// assert!(shapes.answers_locally(orders, ActionStatement::Select));
+    /// ```
+    #[must_use]
+    pub fn with_unrestricted_tables(mut self, tables: &[UnrestrictedTable]) -> Self {
+        self.unrestricted = tables
+            .iter()
+            .filter_map(|entry| catalog_helpers::table_id(&self.db, &entry.table))
+            .collect();
+        self
+    }
+
     /// What answers `statement` on rows of `table`, or [`None`] when nothing
     /// said.
     ///
-    /// [`None`] means the index was built without the report, or the model names
-    /// no type for the table, and either way a reader has to delegate rather
-    /// than pick a relation itself.
+    /// [`None`] means the index was built without either report, or neither
+    /// covered the table, and either way a reader has to delegate rather than
+    /// pick a relation itself.
+    ///
+    /// **The action report wins where both speak.** `rls2fga` reports a table it
+    /// types and leaves open through both surfaces, and the two agree there, so
+    /// the order costs nothing in that case. It matters only if they ever
+    /// disagree, and then the typed answer is the one that restricts, which is
+    /// the direction a wrong answer must fall.
     #[must_use]
     pub fn answer(&self, table: TableId, statement: ActionStatement) -> Option<&ActionAnswer> {
-        self.answers
-            .get(self.naming.get(&table)?.type_name.as_str())?
-            .get(&statement)
+        self.naming
+            .get(&table)
+            .and_then(|named| self.answers.get(named.type_name.as_str()))
+            .and_then(|answers| answers.get(&statement))
+            .or_else(|| self.unrestricted.contains(&table).then_some(&UNRESTRICTED))
     }
 
     /// Whether a question about `statement` on a row of `table` can be answered
@@ -503,3 +582,164 @@ fn usable_table(decision: &RowDecision) -> Option<&str> {
 
 /// A handle several readers share.
 pub type SharedShapes<DB> = Arc<Shapes<DB>>;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use core::ops::Not;
+
+    use rls2fga::classifier::patterns::ConfidenceLevel;
+    use rls2fga::generator::action_relations::{ActionAnswer, ActionStatement};
+    use rls2fga::translator::TranslatorBuilder;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    use super::Shapes;
+    use crate::{catalog_helpers, ParserDB, TableId};
+
+    /// Every statement a table can be asked about, so a test says "every" rather
+    /// than "the one I remembered".
+    const EVERY_STATEMENT: [ActionStatement; 8] = [
+        ActionStatement::Select,
+        ActionStatement::Insert,
+        ActionStatement::Update,
+        ActionStatement::Delete,
+        ActionStatement::SelectForUpdate,
+        ActionStatement::InsertOnConflictUpdate,
+        ActionStatement::InsertReturning,
+        ActionStatement::UpdateWithoutWhere,
+    ];
+
+    /// Build the index the way a real caller does, from all three reports.
+    fn shapes(sql: &str) -> Shapes<ParserDB> {
+        let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
+        let translation = TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .build()
+            .translate(&db);
+        let (relations, naming, answers, unrestricted) = (
+            translation.relations(),
+            translation.row_naming(),
+            translation.action_relations(),
+            translation.unrestricted_tables(),
+        );
+        Shapes::new(db, &relations)
+            .with_row_naming(&naming)
+            .with_action_relations(&answers)
+            .with_unrestricted_tables(&unrestricted)
+    }
+
+    fn table(shapes: &Shapes<ParserDB>, name: &str) -> TableId {
+        catalog_helpers::table_id(shapes.catalog(), name).unwrap()
+    }
+
+    /// The reported case, and the one the action report cannot carry: `orders`
+    /// gets no type, because no policy anywhere reaches it, so it is answered
+    /// nowhere else.
+    #[test]
+    fn an_open_table_the_model_types_nothing_for_is_granted_without_asking() {
+        let shapes = shapes("CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);");
+        let orders = table(&shapes, "orders");
+        assert!(
+            shapes.naming(orders).is_none(),
+            "nothing types this table, which is why the action report is empty for it"
+        );
+        for statement in EVERY_STATEMENT {
+            assert_eq!(
+                shapes.answer(orders, statement),
+                Some(&ActionAnswer::Unrestricted),
+                "row-level security is off, so the database restricts nothing on {statement:?}"
+            );
+            assert!(shapes.answers_locally(orders, statement));
+        }
+    }
+
+    /// The report grants the open table and nothing beside it. A reader that
+    /// swept the whole schema in would grant every row of the guarded one.
+    #[test]
+    fn a_guarded_table_beside_an_open_one_is_not_swept_up() {
+        let shapes = shapes(
+            "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);
+             CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT);
+             ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY d ON docs USING (owner = current_user);",
+        );
+        let docs = table(&shapes, "docs");
+        assert_ne!(
+            shapes.answer(docs, ActionStatement::Delete),
+            Some(&ActionAnswer::Unrestricted),
+            "a policy filters this table's rows, so nothing may call it open"
+        );
+        assert_eq!(
+            shapes.answer(table(&shapes, "orders"), ActionStatement::Select),
+            Some(&ActionAnswer::Unrestricted)
+        );
+    }
+
+    /// Absent from both reports means uncovered, and uncovered still delegates.
+    /// Row-level security is on here, so the table is not open, and nothing can
+    /// name a row of it, so the model gives it no type either.
+    #[test]
+    fn a_table_in_neither_report_stays_unanswered() {
+        let shapes = shapes(
+            "CREATE TABLE audit (message TEXT);
+             ALTER TABLE audit ENABLE ROW LEVEL SECURITY;",
+        );
+        let audit = table(&shapes, "audit");
+        for statement in EVERY_STATEMENT {
+            assert_eq!(
+                shapes.answer(audit, statement),
+                None,
+                "not being covered says nothing about what the database allows"
+            );
+            assert!(shapes.answers_locally(audit, statement).not());
+        }
+    }
+
+    /// Row-level security on with no policy grants nobody, which must not
+    /// collapse into the state where it is off and grants everybody.
+    #[test]
+    fn row_level_security_with_no_policy_is_not_open() {
+        let shapes = shapes(
+            "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);
+             ALTER TABLE orders ENABLE ROW LEVEL SECURITY;",
+        );
+        let orders = table(&shapes, "orders");
+        assert_eq!(
+            shapes.answer(orders, ActionStatement::Select),
+            Some(&ActionAnswer::Denied),
+            "the database shows nobody anything here"
+        );
+        assert!(shapes
+            .answers_locally(orders, ActionStatement::Select)
+            .not());
+    }
+
+    /// Two tables a guarded policy reaches, which the database itself filters
+    /// nothing on. A reader gets the same answer for both without having to
+    /// know which of the two reports carried them.
+    #[test]
+    fn a_table_a_policy_reaches_is_still_open_if_the_database_leaves_it_open() {
+        let shapes = shapes(
+            "CREATE TABLE projects(id INTEGER PRIMARY KEY);
+             CREATE TABLE docs(id INTEGER PRIMARY KEY, project_id INTEGER REFERENCES projects(id));
+             CREATE TABLE project_members(project_id INTEGER REFERENCES projects(id), user_id TEXT);
+             ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY d ON docs USING (project_id IN (
+               SELECT project_id FROM project_members
+               WHERE user_id = current_setting('app.user_id', true)));",
+        );
+        let listed: Vec<TableId> = ["projects", "project_members"]
+            .into_iter()
+            .map(|name| table(&shapes, name))
+            .collect();
+        for open in listed {
+            assert_eq!(
+                shapes.answer(open, ActionStatement::Select),
+                Some(&ActionAnswer::Unrestricted),
+                "the database filters none of these rows, by either report"
+            );
+        }
+    }
+}
