@@ -126,6 +126,10 @@ fn start_postgres() -> testcontainers::Container<GenericImage> {
             "max_wal_senders=4",
             "-c",
             "max_replication_slots=4",
+            "-c",
+            // PostgreSQL 16.15 made this an allow-list, and setting it replaces
+            // rather than extends, so the two it ships with are repeated here.
+            "output_plugin_libraries=pgoutput,test_decoding,wal2json",
         ])
         .with_startup_timeout(Duration::from_secs(60))
         .start()

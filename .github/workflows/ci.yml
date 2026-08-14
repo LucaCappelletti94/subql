@@ -109,39 +109,101 @@ jobs:
       # `std`-only.
       - run: cargo check --lib --no-default-features --target ${{ matrix.target }} --locked
 
-  unit-tests:
-    name: tests (${{ matrix.profile.name }})
+  # Compiling the workspace with every feature in release mode is the expensive
+  # part of this pipeline by a wide margin: the same tests under default features
+  # finish in a quarter of the time. So it happens once, here, and everything that
+  # needs those binaries runs from the archive rather than building its own copy.
+  # The cap is generous because a cold cache pays the whole compile.
+  test-build:
+    name: test build (all features)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest archive --workspace --exclude subql-demo --all-features --release --locked --archive-file nextest.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest.tar.zst
+          retention-days: 1
+
+  # Default features get their own compile rather than riding the archive, because
+  # the point of this leg is that the crate still builds and passes without any
+  # optional feature switched on. It is also the cheap one.
+  unit-tests-default:
+    name: tests (default)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --exclude subql-demo --lib --tests --release --locked
+
+  unit-tests-all-features:
+    name: tests (all-features)
+    needs: test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+      # Ignored tests are exactly the Docker-backed ones, which the integration
+      # jobs run, so leaving them skipped here is the same division as before.
+      - run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --no-fail-fast --test-threads 8
+
+  # The Docker suite is split so its wall clock is the slowest group rather than
+  # the sum, which had grown past an hour.
+  integration:
+    name: integration (${{ matrix.group.name }})
+    needs: test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        profile:
-          - name: default
-            args: ""
-          - name: all-features
-            args: "--all-features"
+        # The three filters partition the ignored set rather than enumerating it:
+        # the last one is the complement of the other two, so a Docker-backed
+        # target added tomorrow lands in a group by construction and cannot go
+        # unrun.
+        group:
+          - name: mysql
+            filter: binary(~mysql)
+          - name: openfga
+            filter: binary(~openfga)
+          - name: postgres and the rest
+            filter: not (binary(~mysql) or binary(~openfga))
     steps:
       - uses: actions/checkout@v5
+      # The tests read the fixture Dockerfile from the working tree and link
+      # against these at run time, so the checkout and the libraries are needed
+      # even though nothing is compiled here.
       - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --exclude subql-demo --lib --tests --release --locked ${{ matrix.profile.args }}
-
-  integration:
-    name: integration (Docker e2e)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-      - run: sudo apt-get update && sudo apt-get install -y libpq-dev default-libmysqlclient-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Every Docker-backed test is `#[ignore]`d and nothing else is, so one
-      # `--ignored` run covers the whole set and a newly added target cannot be
-      # left out of this job. `--all-features` compiles once for all of them,
-      # and `--no-fail-fast` reports every failure rather than the first.
-      - run: cargo test --workspace --exclude subql-demo --tests --all-features --release --locked --no-fail-fast -- --ignored --nocapture
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+      # Every Docker-backed test is `#[ignore]`d and nothing else is, so
+      # `--run-ignored ignored-only` covers exactly this set. nextest schedules
+      # across test binaries rather than finishing one before starting the next,
+      # which is where the rest of the time went: each of two dozen binaries paid
+      # its own container startup end to end. Every test builds its own container
+      # and shares no state, so a process per test is what these already assume.
+      # Eight at a time rather than one per core, because the work is waiting on
+      # containers rather than computing, and eight MySQL servers is the most this
+      # runner's memory should be asked to hold.
+      - run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --run-ignored ignored-only --no-fail-fast --test-threads 8 -E '${{ matrix.group.filter }}'
 
   docs:
     name: docs + doctests
@@ -200,7 +262,7 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-    needs: [unit-tests]
+    needs: [unit-tests-default, unit-tests-all-features]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5

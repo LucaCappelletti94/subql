@@ -91,6 +91,12 @@ pub fn multi_thread_rt() -> tokio::runtime::Runtime {
 
 /// Spin up a Postgres 16 container with the wal2json output plugin and
 /// `wal_level=logical`, waiting until the server is accepting connections.
+///
+/// `output_plugin_libraries` is what admits an output plugin at all. PostgreSQL
+/// 16.15 made it an allow-list, so without it a wal2json slot is refused with
+/// "library wal2json may not be used as an output plugin" however correctly the
+/// plugin is installed. The list is set rather than added to, so the two entries
+/// it ships with have to be repeated or the built-in `pgoutput` stops loading too.
 pub fn pg_with_wal2json() -> Container<GenericImage> {
     ensure_image();
     GenericImage::new(PG_IMAGE, PG_TAG)
@@ -107,6 +113,8 @@ pub fn pg_with_wal2json() -> Container<GenericImage> {
             "max_wal_senders=4",
             "-c",
             "max_replication_slots=4",
+            "-c",
+            "output_plugin_libraries=pgoutput,test_decoding,wal2json",
         ])
         .with_startup_timeout(Duration::from_secs(60))
         .start()
@@ -135,6 +143,8 @@ pub fn pg_with_wal2json_impatient(wal_sender_timeout: Duration) -> Container<Gen
             "max_wal_senders=4",
             "-c",
             "max_replication_slots=4",
+            "-c",
+            "output_plugin_libraries=pgoutput,test_decoding,wal2json",
             "-c",
             &timeout_arg,
         ])
