@@ -131,10 +131,13 @@ pub struct Uncovered {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Requery<'a, B: Backend> {
     /// The query [`rls2fga`] bound to one row of this table. Its SQL takes
-    /// the key as `$1`.
+    /// the key as `$1` through `$n`.
     pub query: &'a BoundQuery,
-    /// The value to bind.
-    pub key: Value<B>,
+    /// The values to bind, one per column of
+    /// [`BoundQuery::key_columns`](rls2fga::generator::records::BoundQuery::key_columns)
+    /// and in that order. Several of them where the key spans several columns,
+    /// which is one key rather than several.
+    pub key: Vec<Value<B>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -281,21 +284,13 @@ where
     R: RowView,
 {
     let mut out = Vec::new();
-    for (key_column, query) in &shapes.requeries {
+    for (key_columns, query) in &shapes.requeries {
         for row in [current, previous].into_iter().flatten() {
-            let key = row.value_at(*key_column).map_err(RowRecordError::from)?;
-            match key {
-                // A NULL key names no row, and the query's own `IS NOT NULL`
-                // guard already selects nothing for it.
-                Value::Null => continue,
-                // The source did not carry the key, so the rows this query
-                // reaches cannot be named. Skipping would leave them stale
-                // with nothing saying so.
-                Value::Missing => return Err(StoreDiffError::MissingBoundKey(*key_column)),
-                _ => {}
-            }
+            let Some(key) = read_key(row, key_columns)? else {
+                continue;
+            };
             // Per query, not per key. Two shapes can bind the same table on
-            // the same column, and dropping the second because its key was
+            // the same columns, and dropping the second because its key was
             // already seen would leave the records it reaches stale. An
             // identical query indexed twice, which happens when one source
             // feeds several relations, still collapses here.
@@ -309,6 +304,38 @@ where
         }
     }
     Ok(out)
+}
+
+/// Every column of one query's key read off one image, in the order its
+/// placeholders take them, or [`None`] where the key names no row.
+///
+/// # Errors
+///
+/// [`StoreDiffError::MissingBoundKey`], naming the column, when the image does
+/// not carry one the query needs.
+fn read_key<R>(
+    row: &R,
+    key_columns: &[ColumnId],
+) -> Result<Option<Vec<Value<R::Backend>>>, StoreDiffError>
+where
+    R: RowView,
+{
+    let mut key = Vec::with_capacity(key_columns.len());
+    for column in key_columns {
+        let value = row.value_at(*column).map_err(RowRecordError::from)?;
+        match value {
+            // A NULL column names no row whatever the rest of the key holds,
+            // since the equality the query binds is never true for it. One is
+            // enough, so the remaining columns go unread.
+            Value::Null => return Ok(None),
+            // The source did not carry this column, so the rows this query
+            // reaches cannot be named. Skipping would leave them stale with
+            // nothing saying so.
+            Value::Missing => return Err(StoreDiffError::MissingBoundKey(*column)),
+            _ => key.push(value),
+        }
+    }
+    Ok(Some(key))
 }
 
 /// Name the shape a gap belongs to, for [`Shapes::uncovered`](crate::visibility::shapes::Shapes::uncovered).
@@ -421,6 +448,15 @@ CREATE POLICY p ON docs FOR SELECT USING (
 CREATE TABLE docs(id INTEGER PRIMARY KEY, members TEXT[]);
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
+";
+
+    /// A key spanning two columns, guarded by a comparison the request settles
+    /// rather than the row, so the shape joins and hands over a bound query.
+    const COMPOUND_KEY: &str = "
+CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, reading_id));
+ALTER TABLE readings ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
 ";
 
     fn shapes(sql: &str) -> Shapes<ParserDB> {
@@ -701,9 +737,9 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         assert_eq!(diff.requeries.len(), 1);
         let requery = &diff.requeries[0];
         assert_eq!(requery.query.table, "team_members");
-        assert_eq!(requery.query.key_column, "team_id");
+        assert_eq!(requery.query.key_columns, ["team_id"]);
         assert!(requery.query.sql.contains("$1"));
-        assert_eq!(requery.key, Value::Int(3));
+        assert_eq!(requery.key, [Value::Int(3)]);
     }
 
     /// Moving the key moves records under both the old value and the new
@@ -720,8 +756,9 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 
         let diff = store.diff(&event).unwrap();
 
-        let keys: Vec<&Value<Postgres>> = diff.requeries.iter().map(|r| &r.key).collect();
-        assert_eq!(keys, [&Value::Int(4), &Value::Int(3)]);
+        let keys: Vec<Vec<Value<Postgres>>> =
+            diff.requeries.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(keys, [vec![Value::Int(4)], vec![Value::Int(3)]]);
     }
 
     /// The same key on both sides is replayed once.
@@ -738,7 +775,7 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         let diff = store.diff(&event).unwrap();
 
         assert_eq!(diff.requeries.len(), 1);
-        assert_eq!(diff.requeries[0].key, Value::Int(3));
+        assert_eq!(diff.requeries[0].key, [Value::Int(3)]);
     }
 
     /// A key-only previous image is only a problem for a shape that had to
@@ -758,7 +795,41 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         let diff = store.diff(&event).unwrap();
 
         assert_eq!(diff.requeries.len(), 1);
-        assert_eq!(diff.requeries[0].key, Value::Int(3));
+        assert_eq!(diff.requeries[0].key, [Value::Int(3)]);
+    }
+
+    /// A table whose key spans two columns is replayed by the whole of it.
+    ///
+    /// Binding the first column alone returns every row sharing it. Each row
+    /// it returns is a real grant, so nothing looks wrong, but as a set to
+    /// reconcile against it is wrong in both directions: it rewrites records
+    /// it need not, and a caller that removes whatever the query stopped
+    /// returning removes another row's records.
+    #[test]
+    fn a_compound_key_hands_over_every_column_in_placeholder_order() {
+        let store = shapes(COMPOUND_KEY);
+        let readings = table(&store, "readings");
+        let event = TestEvent::<Postgres>::insert(
+            readings,
+            vec![Value::Int(7), Value::Int(9), text("2026-01-01T00:00:00Z")],
+        );
+
+        let diff = store.diff(&event).unwrap();
+
+        assert_eq!(diff.requeries.len(), 1, "{:?}", diff.requeries);
+        let requery = &diff.requeries[0];
+        assert_eq!(requery.query.key_columns, ["tenant_id", "reading_id"]);
+        assert_eq!(requery.key, [Value::Int(7), Value::Int(9)]);
+        // What makes the pair above one row's key rather than two values in
+        // some order: the query takes them in exactly this order.
+        assert!(
+            requery
+                .query
+                .sql
+                .contains("\"tenant_id\" = $1 AND \"reading_id\" = $2"),
+            "{}",
+            requery.query.sql
+        );
     }
 
     // -----------------------------------------------------------------
@@ -936,6 +1007,21 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         assert!(diff.requeries.is_empty(), "{:?}", diff.requeries);
     }
 
+    /// A NULL in any column of the key names no row, not only in the first.
+    #[test]
+    fn a_null_later_in_a_compound_key_names_no_row_to_replay() {
+        let store = shapes(COMPOUND_KEY);
+        let readings = table(&store, "readings");
+        let event = TestEvent::<Postgres>::insert(
+            readings,
+            vec![Value::Int(7), Value::Null, text("2026-01-01T00:00:00Z")],
+        );
+
+        let diff = store.diff(&event).unwrap();
+
+        assert!(diff.requeries.is_empty(), "{:?}", diff.requeries);
+    }
+
     /// A key the source did not carry is a different answer from a NULL one.
     /// Skipping it would leave every record that query reaches stale, with
     /// nothing saying so.
@@ -951,6 +1037,21 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         assert_eq!(store.diff(&event), Err(StoreDiffError::MissingBoundKey(0)));
     }
 
+    /// Half a key names no row either, and which half was missing is what a
+    /// caller needs to know, so the error names that column rather than the
+    /// first of the key.
+    #[test]
+    fn a_compound_key_the_source_carried_in_part_is_refused() {
+        let store = shapes(COMPOUND_KEY);
+        let readings = table(&store, "readings");
+        let event = TestEvent::<Postgres>::insert(
+            readings,
+            vec![Value::Int(7), Value::Missing, text("2026-01-01T00:00:00Z")],
+        );
+
+        assert_eq!(store.diff(&event), Err(StoreDiffError::MissingBoundKey(1)));
+    }
+
     /// A joining shape is indexed by the tables its queries bind. A query
     /// naming a table or a column the catalog does not have is skipped,
     /// since that table produces no events here. A table the shape reads
@@ -962,30 +1063,17 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
             "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);",
         )
         .unwrap();
-        let bound = |table: &str, key_column: &str| BoundQuery {
-            table: table.to_string(),
-            key_column: test_names::column(key_column),
-            sql: "SELECT 1 WHERE x = $1;".to_string(),
-        };
-        let relations = vec![RelationShapes {
-            type_name: test_names::docs_type(),
-            relation: can_select_relation(),
-            from_one_row: false,
-            shapes: vec![RecordDescription {
-                tables: vec!["docs".to_string(), "grants".to_string()],
-                derivation: RecordDerivation::Joined {
-                    queries: vec![
-                        bound("docs", "id"),
-                        bound("absent_table", "id"),
-                        bound("docs", "absent_column"),
-                    ],
-                    reason: "a grant row and the resource row it names are separate".to_string(),
-                },
-            }],
-            decision: None,
-            grants_nobody: false,
-        }];
-        let store = Shapes::new(db, &relations);
+        let store = Shapes::new(
+            db,
+            &[joined(
+                &["docs", "grants"],
+                vec![
+                    bound("docs", &["id"]),
+                    bound("absent_table", &["id"]),
+                    bound("docs", &["absent_column"]),
+                ],
+            )],
+        );
 
         let uncovered = store.uncovered();
         assert_eq!(uncovered.len(), 1, "{uncovered:?}");
@@ -1000,7 +1088,44 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
         let diff = store.diff(&event).unwrap();
 
         assert_eq!(diff.requeries.len(), 1, "only the resolvable query");
-        assert_eq!(diff.requeries[0].query.key_column, "id");
+        assert_eq!(diff.requeries[0].query.key_columns, ["id"]);
+    }
+
+    /// A key this catalog cannot bind whole is dropped whole, in either of the
+    /// two ways that happens: a column it does not have, and no columns at all.
+    /// Keeping the columns that did resolve would answer for every row sharing
+    /// them, and the SQL takes one placeholder per column so it could not be
+    /// run anyway. The table is named instead of being left silently unserved,
+    /// which is the difference between a gap a caller can see and one it
+    /// cannot.
+    #[test]
+    fn a_key_this_catalog_cannot_bind_drops_the_query_and_names_the_table() {
+        for key_columns in [vec!["id", "absent_column"], Vec::new()] {
+            let db = ParserDB::parse::<PostgreSqlDialect>(
+                "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);",
+            )
+            .unwrap();
+            let store = Shapes::new(db, &[joined(&["docs"], vec![bound("docs", &key_columns)])]);
+
+            let uncovered = store.uncovered();
+            assert_eq!(uncovered.len(), 1, "{key_columns:?}: {uncovered:?}");
+            assert_eq!(uncovered[0].table, "docs", "{key_columns:?}");
+            assert_eq!(
+                uncovered[0].reason,
+                UncoveredReason::NoBoundQuery,
+                "{key_columns:?}"
+            );
+
+            let docs = table(&store, "docs");
+            let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
+                .with_pk_columns([0u16]);
+            let diff = store.diff(&event).unwrap();
+            assert!(
+                diff.requeries.is_empty(),
+                "{key_columns:?}: {:?}",
+                diff.requeries
+            );
+        }
     }
 
     /// One shape per relation, both binding the same table on the same
@@ -1036,7 +1161,7 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
                 "SELECT 'read' WHERE id = $1;"
             ]
         );
-        assert!(diff.requeries.iter().all(|r| r.key == Value::Int(4)));
+        assert!(diff.requeries.iter().all(|r| r.key == [Value::Int(4)]));
     }
 
     /// The same query reached through two relations, which is what one tuple
@@ -1073,10 +1198,49 @@ CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
                 derivation: RecordDerivation::Joined {
                     queries: vec![BoundQuery {
                         table: "docs".to_string(),
-                        key_column: test_names::column("id"),
+                        key_columns: vec![test_names::column("id")],
                         sql: sql.to_string(),
                     }],
                     reason: "two rows".to_string(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        }
+    }
+
+    /// A query bound to `key_columns` of `table`, spelled the way rls2fga
+    /// spells one: an equality per column, numbered in that order.
+    fn bound(table: &str, key_columns: &[&str]) -> BoundQuery {
+        let predicate = key_columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| alloc::format!("\"{column}\" = ${}", index + 1))
+            .collect::<Vec<String>>()
+            .join(" AND ");
+        BoundQuery {
+            table: table.to_string(),
+            key_columns: key_columns
+                .iter()
+                .copied()
+                .map(test_names::column)
+                .collect(),
+            sql: alloc::format!("SELECT 1 FROM \"{table}\" WHERE {predicate};"),
+        }
+    }
+
+    /// One `can_select` relation filled by a joining shape that reads `tables`
+    /// and binds `queries` to them.
+    fn joined(tables: &[&str], queries: Vec<BoundQuery>) -> RelationShapes {
+        RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: tables.iter().copied().map(String::from).collect(),
+                derivation: RecordDerivation::Joined {
+                    queries,
+                    reason: "a grant row and the resource row it names are separate".to_string(),
                 },
             }],
             decision: None,

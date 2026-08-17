@@ -40,7 +40,7 @@ use rls2fga::generator::relations::{RelationShapes, RowDecision};
 use rls2fga::generator::row_naming::RowNaming;
 use rls2fga::generator::unrestricted::UnrestrictedTable;
 
-use rls2fga::parser::identifiers::RelationName;
+use rls2fga::parser::identifiers::{ColumnName, RelationName};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::visibility::records::is_evaluable;
@@ -96,9 +96,9 @@ impl RequiredParameter {
 pub(crate) struct TableShapes {
     /// Shapes whose records a row of this table settles on its own.
     pub(crate) settled: Vec<RecordDescription>,
-    /// Queries to replay when a row of this table changes, with the column
-    /// each one binds.
-    pub(crate) requeries: Vec<(ColumnId, BoundQuery)>,
+    /// Queries to replay when a row of this table changes, with the columns
+    /// each one binds, in the order its placeholders take them.
+    pub(crate) requeries: Vec<(Vec<ColumnId>, BoundQuery)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -512,24 +512,28 @@ fn index_shape<DB: DatabaseLike>(
             }
         }
         RecordDerivation::Joined { queries, .. } => {
+            let mut bound: Vec<&str> = Vec::with_capacity(queries.len());
             for query in queries {
                 let Some(id) = catalog_helpers::table_id(db, &query.table) else {
                     continue;
                 };
-                let Some(key) = catalog_helpers::column_id(db, id, query.key_column.as_str())
-                else {
+                let Some(key) = resolve_key(db, id, &query.key_columns) else {
                     continue;
                 };
+                bound.push(query.table.as_str());
                 by_table
                     .entry(id)
                     .or_default()
                     .requeries
                     .push((key, query.clone()));
             }
-            // A table the shape reads with no query bound to it has nothing to
-            // replay when a change arrives there.
+            // A table the shape reads with no query this catalog can bind has
+            // nothing to replay when a change arrives there. Asked of the
+            // queries that were indexed rather than of the ones present, so a
+            // query dropped for a column this catalog does not have is a named
+            // gap instead of a silent one.
             for table in &shape.tables {
-                if !queries.iter().any(|query| query.table == *table) {
+                if !bound.contains(&table.as_str()) {
                     uncovered.push(name_gap(entry, shape, table, UncoveredReason::NoBoundQuery));
                 }
             }
@@ -543,6 +547,26 @@ fn index_shape<DB: DatabaseLike>(
                 .map(|table| name_gap(entry, shape, table, UncoveredReason::UnreadableColumn)),
         ),
     }
+}
+
+/// Every column of `columns` resolved against `table`, in that order.
+///
+/// All of them or none, since the query binds one placeholder per column: a
+/// key short of a column cannot be run at all, and were it run it would name
+/// every row sharing the columns that remain. An empty list is refused for the
+/// same reason, a query bound to nothing naming the whole table.
+fn resolve_key<DB: DatabaseLike>(
+    db: &DB,
+    table: TableId,
+    columns: &[ColumnName],
+) -> Option<Vec<ColumnId>> {
+    if columns.is_empty() {
+        return None;
+    }
+    columns
+        .iter()
+        .map(|column| catalog_helpers::column_id(db, table, column.as_str()))
+        .collect()
 }
 
 /// The one table every leaf of `decision` reads, or [`None`] when the recipe

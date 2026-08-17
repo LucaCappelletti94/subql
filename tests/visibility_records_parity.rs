@@ -31,13 +31,13 @@ mod common;
 use std::collections::BTreeSet;
 
 use diesel::prelude::*;
-use diesel::sql_types::Text;
+use diesel::sql_types::{Integer, Text};
 use diesel::{sql_query, PgConnection, QueryableByName};
 use rls2fga::classifier::patterns::ConfidenceLevel;
 use rls2fga::generator::records::{Record, RecordDerivation, RecordDescription};
 use rls2fga::translator::TranslatorBuilder;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{CdcEvent, RowKind};
+use subql::backend::{CdcEvent, Postgres, RowKind, Value};
 use subql::visibility::records::{is_evaluable, records_from_row_view};
 use subql::visibility::shapes::Shapes;
 use subql::visibility::EventRow;
@@ -49,20 +49,29 @@ const SLOT: &str = "records_parity_slot";
 /// both parse, so one string is the single source for the catalog, the
 /// translation and the database.
 ///
-/// Between them the four shapes cover every spelling `render_text` claims:
-/// a `UUID` object key, an `INTEGER` and a `BIGINT` one, a `TEXT` subject,
-/// a JSON path subject, a literal subject, and a boolean guard.
+/// Between them the four row-derived shapes cover every spelling
+/// `render_text` claims: a `UUID` object key, an `INTEGER` and a `BIGINT`
+/// one, a `TEXT` subject, a JSON path subject, a literal subject, and a
+/// boolean guard.
+///
+/// `readings` settles nothing and is reached by a bound query instead. Its
+/// key spans two columns, which is what separates replaying the row that
+/// changed from replaying every row sharing the first column of its key.
 const SCHEMA: &str = "
 CREATE TABLE docs (id UUID PRIMARY KEY, owner_id TEXT, is_public BOOLEAN);
 CREATE TABLE notes (id BIGINT PRIMARY KEY, owner_id TEXT);
 CREATE TABLE cards (id INTEGER PRIMARY KEY, meta JSONB);
+CREATE TABLE readings (tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, reading_id));
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cards ENABLE ROW LEVEL SECURITY;
+ALTER TABLE readings ENABLE ROW LEVEL SECURITY;
 CREATE POLICY docs_owner ON docs FOR SELECT USING (owner_id = current_user);
 CREATE POLICY docs_public ON docs FOR SELECT USING (is_public);
 CREATE POLICY notes_owner ON notes FOR SELECT USING (owner_id = current_user);
 CREATE POLICY cards_owner ON cards FOR SELECT USING (meta->>'owner' = current_user);
+CREATE POLICY readings_started ON readings FOR SELECT USING (starts_at <= now());
 ";
 
 // The typed schema for seeding. One `table!` per table above, so a column
@@ -87,6 +96,14 @@ diesel::table! {
     cards (id) {
         id -> diesel::sql_types::Integer,
         meta -> diesel::sql_types::Nullable<diesel::sql_types::Jsonb>,
+    }
+}
+
+diesel::table! {
+    readings (tenant_id, reading_id) {
+        tenant_id -> diesel::sql_types::Integer,
+        reading_id -> diesel::sql_types::Integer,
+        starts_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
     }
 }
 
@@ -119,6 +136,10 @@ fn create_schema(conn: &mut PgConnection) {
     // The update phase reads the previous image, which Postgres sends in
     // full only under FULL. Without this the difference is refused rather
     // than wrong, which would make that half of the test vacuous.
+    //
+    // `readings` is deliberately left at DEFAULT, which sends the key and
+    // nothing else. Nothing settles from its rows, so the key is all a
+    // replayed query needs, and leaving it here proves that.
     for table in ["docs", "notes", "cards"] {
         ddl(conn, &format!("ALTER TABLE {table} REPLICA IDENTITY FULL"));
     }
@@ -126,6 +147,12 @@ fn create_schema(conn: &mut PgConnection) {
 
 fn uuid(text: &str) -> uuid::Uuid {
     uuid::Uuid::parse_str(text).unwrap()
+}
+
+fn timestamp(text: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
 }
 
 /// Rows chosen so each one answers a question the next cannot.
@@ -195,6 +222,31 @@ fn seed(conn: &mut PgConnection) {
                 cards::meta.eq(Some(serde_json::json!({"other": "frank"}))),
             ),
             (cards::id.eq(6), cards::meta.eq(None::<serde_json::Value>)),
+        ])
+        .execute(conn)
+        .unwrap();
+
+    // Three rows arranged so neither column of the key identifies a row on
+    // its own: two share `tenant_id`, two share `reading_id`. A query bound
+    // to either column alone therefore returns a row that did not change,
+    // which is the failure this fixture exists to expose.
+    diesel::insert_into(readings::table)
+        .values(vec![
+            (
+                readings::tenant_id.eq(1),
+                readings::reading_id.eq(20),
+                readings::starts_at.eq(Some(timestamp("2026-01-01T00:00:00Z"))),
+            ),
+            (
+                readings::tenant_id.eq(1),
+                readings::reading_id.eq(21),
+                readings::starts_at.eq(Some(timestamp("2026-02-01T00:00:00Z"))),
+            ),
+            (
+                readings::tenant_id.eq(2),
+                readings::reading_id.eq(20),
+                readings::starts_at.eq(Some(timestamp("2026-03-01T00:00:00Z"))),
+            ),
         ])
         .execute(conn)
         .unwrap();
@@ -382,7 +434,10 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
             .unwrap_or_else(|error| panic!("the difference was refused: {error}"));
         added.extend(diff.added.iter().map(fact));
         removed.extend(diff.removed.iter().map(fact));
-        assert!(diff.requeries.is_empty(), "no shape here needs a query");
+        assert!(
+            diff.requeries.is_empty(),
+            "these events are on tables no query is bound to"
+        );
     }
 
     assert_eq!(
@@ -398,5 +453,96 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
     assert!(
         !added.is_empty() && !removed.is_empty(),
         "vacuous comparison"
+    );
+}
+
+/// The integer a key column of `readings` carries, in the type the `table!`
+/// above declares for it.
+fn key_int(value: &Value<Postgres>) -> i32 {
+    match value {
+        Value::Int(int) => i32::try_from(*int).expect("an INTEGER key fits an i32"),
+        other => panic!("a key column of readings is an integer, not {other:?}"),
+    }
+}
+
+/// The query handed over for a two-column key selects the row that changed,
+/// and only it.
+///
+/// Nothing else proves the values and the placeholders agree. subql reads the
+/// values off the row image, rls2fga writes the placeholders into the SQL, and
+/// the two meet nowhere until Postgres runs the statement. A key bound in the
+/// wrong order returns the wrong row or none, and a key short of a column is
+/// refused by Postgres outright.
+#[test]
+#[ignore = "requires Docker"]
+fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let mut pg = common::pg_connect(common::pg_port(&container));
+
+    create_schema(&mut pg);
+    common::create_slot(&mut pg, SLOT);
+    seed(&mut pg);
+    drain(&mut pg);
+
+    // Without a sibling sharing the first column of the key, every assertion
+    // below passes for a query bound to that column alone, which is the bug
+    // this test exists to catch.
+    let sharing_the_tenant: i64 = readings::table
+        .filter(readings::tenant_id.eq(1))
+        .count()
+        .get_result(&mut pg)
+        .unwrap();
+    assert!(
+        sharing_the_tenant > 1,
+        "one row per tenant makes this vacuous"
+    );
+
+    diesel::update(readings::table.find((1, 20)))
+        .set(readings::starts_at.eq(Some(timestamp("2026-06-01T00:00:00Z"))))
+        .execute(&mut pg)
+        .unwrap();
+
+    let events = drain(&mut pg);
+    assert_eq!(events.len(), 1, "one event for one statement");
+
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap();
+    let relations = TranslatorBuilder::new()
+        .with_min_confidence(ConfidenceLevel::B)
+        .build()
+        .translate(&catalog)
+        .relations();
+    let store = Shapes::new(
+        ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap(),
+        &relations,
+    );
+
+    let diff = store
+        .diff(&events[0])
+        .unwrap_or_else(|error| panic!("the difference was refused: {error}"));
+    assert!(
+        diff.added.is_empty() && diff.removed.is_empty(),
+        "no row of readings settles a record on its own"
+    );
+    assert_eq!(diff.requeries.len(), 1, "{:?}", diff.requeries);
+    let requery = &diff.requeries[0];
+    assert_eq!(requery.query.key_columns, ["tenant_id", "reading_id"]);
+
+    // The one statement the typed DSL cannot express, since rls2fga generates
+    // its text at run time. Bound with the same SQL type the `table!` above
+    // gives these columns, so the two cannot drift.
+    let rows = sql_query(&requery.query.sql)
+        .bind::<Integer, _>(key_int(&requery.key[0]))
+        .bind::<Integer, _>(key_int(&requery.key[1]))
+        .load::<TupleRow>(&mut pg)
+        .unwrap_or_else(|error| {
+            panic!("the replayed query failed: {error}\n{}", requery.query.sql)
+        });
+
+    let objects: Vec<&str> = rows.iter().map(|row| row.object.as_str()).collect();
+    assert_eq!(
+        objects,
+        ["readings:1|20"],
+        "the whole key names the changed row and no other"
     );
 }
