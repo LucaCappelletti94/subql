@@ -13,13 +13,15 @@
 //!
 //! [`ScalarCore`]: crate::backend::ScalarCore
 
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::hash::{Hash, Hasher};
 use core::mem::discriminant;
+use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::Expr;
 
 use crate::backend::{Backend, ScalarKind, Value};
-use crate::{ColumnId, TableId};
+use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
 
 /// One membership term the compiler lifted out of a filter.
 ///
@@ -64,6 +66,128 @@ pub struct TermPlan {
     pub member_key: ColumnId,
     /// The column of `member_table` naming the subscriber a row admits.
     pub member_subject: ColumnId,
+}
+
+/// What a caller has to read, and at which kinds, to seed one membership term
+/// before registering the filter that names it.
+///
+/// [`TermPlan`] in the catalog's own words, plus the seed read itself.
+/// Registration consumes the seed and an absent one admits nobody, so the caller
+/// needs this before it registers, and deriving it a second time from the SQL
+/// leaves two readers of one text that can disagree.
+///
+/// Answered by
+/// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermDescription {
+    /// The compared column of the subscribed table, by catalog name.
+    ///
+    /// The name
+    /// [`SubscriptionRequest::term_values`](crate::SubscriptionRequest::term_values)
+    /// is keyed by, since the compared column is what both sides share.
+    pub column: String,
+    /// The table whose changed rows move which subscribers the term admits, by
+    /// catalog name.
+    pub member_table: String,
+    /// The column of `member_table` [`seed_sql`](Self::seed_sql) projects.
+    pub member_key: String,
+    /// The column of `member_table` naming the subscriber a row admits.
+    pub member_subject: String,
+    /// The kind the subscriber value has to be built at.
+    ///
+    /// [`TermKey`] keys a string and a UUID under different variants, so an
+    /// identity supplied at another kind matches no membership row and admits
+    /// nobody in silence.
+    pub subject_kind: ScalarKind,
+    /// The kind [`seed_sql`](Self::seed_sql)'s one column decodes as, which is
+    /// also the kind [`column`](Self::column) holds.
+    pub key_kind: ScalarKind,
+    /// The seed read: the membership subquery itself, one column, the values
+    /// this subscriber currently matches.
+    ///
+    /// Run it as the caller, because it names the caller the way the snapshot
+    /// does, then state what came back under [`column`](Self::column). Reading
+    /// the membership table is what makes the seed complete: a snapshot of the
+    /// subscribed table omits every value whose rows do not exist yet, and no
+    /// later membership change repairs that, because the membership did not
+    /// change.
+    pub seed_sql: String,
+}
+
+impl TermDescription {
+    /// Resolve `plan` and the term it was settled from against the catalog.
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterError::MembershipTermRefused`] when the catalog does not name
+    /// one of the plan's ids, or when the term was lifted from a shape whose
+    /// seed read cannot be named.
+    pub(crate) fn resolve<DB: DatabaseLike>(
+        plan: &TermPlan,
+        term: &CompiledTerm,
+        table: TableId,
+        database: &DB,
+    ) -> Result<Self, RegisterError> {
+        // A term compiles from `IN (SELECT ...)` alone, whose inner query the
+        // compiler bounds to one projected column. A shape a later compiler
+        // lifts a term from is refused rather than served with no seed read,
+        // since an unseeded term admits nobody in silence.
+        let Expr::InSubquery { subquery, .. } = &term.expr else {
+            return Err(RegisterError::MembershipTermRefused(
+                "this membership term was not lifted from an IN (SELECT ...), so SubQL cannot say \
+                 which read seeds it"
+                    .into(),
+            ));
+        };
+
+        Ok(Self {
+            column: name(database, table, plan.column)?,
+            member_table: table_name_of(database, plan.member_table)?,
+            member_key: name(database, plan.member_table, plan.member_key)?,
+            member_subject: name(database, plan.member_table, plan.member_subject)?,
+            subject_kind: kind(database, plan.member_table, plan.member_subject)?,
+            key_kind: kind(database, table, plan.column)?,
+            seed_sql: subquery.to_string(),
+        })
+    }
+}
+
+/// The tail every refusal below shares.
+const CANNOT_SAY: &str = "so SubQL cannot say what seeds the membership subquery comparing it";
+
+/// A table's catalog name, or the refusal for a table the catalog forgot.
+fn table_name_of<DB: DatabaseLike>(database: &DB, table: TableId) -> Result<String, RegisterError> {
+    catalog_helpers::table_name(database, table).ok_or_else(|| {
+        RegisterError::MembershipTermRefused(alloc::format!(
+            "table {table} is not in the catalog under a name, {CANNOT_SAY}"
+        ))
+    })
+}
+
+/// A column's catalog name, or the refusal for a column the catalog forgot.
+fn name<DB: DatabaseLike>(
+    database: &DB,
+    table: TableId,
+    column: ColumnId,
+) -> Result<String, RegisterError> {
+    catalog_helpers::column_name(database, table, column).ok_or_else(|| {
+        RegisterError::MembershipTermRefused(alloc::format!(
+            "column {column} of table {table} is not in the catalog under a name, {CANNOT_SAY}"
+        ))
+    })
+}
+
+/// A column's scalar kind, or the refusal for one the catalog cannot type.
+fn kind<DB: DatabaseLike>(
+    database: &DB,
+    table: TableId,
+    column: ColumnId,
+) -> Result<ScalarKind, RegisterError> {
+    catalog_helpers::column_scalar_kind(database, table, column).ok_or_else(|| {
+        RegisterError::MembershipTermRefused(alloc::format!(
+            "column {column} of table {table} holds a SQL type SubQL cannot read, {CANNOT_SAY}"
+        ))
+    })
 }
 
 /// The columns `terms` compare, indexed by slot.

@@ -18,7 +18,7 @@ use crate::{
         sql_shape::{AggSpec, QueryProjection},
         BytecodeProgram, PrefilterPlan, Vm,
     },
-    term::{kind_can_key, CompiledTerm, TermKey, TermLookup, TermPlan},
+    term::{kind_can_key, CompiledTerm, TermDescription, TermKey, TermLookup, TermPlan},
     DispatchError, EventKind, IdTypes, RegisterError, RegisterResult, SubscriptionDispatch,
     SubscriptionId, SubscriptionRegistration, SubscriptionRequest, SubscriptionScope,
     SubscriptionUnregistration, TableId, UnregisterReport,
@@ -386,24 +386,22 @@ where
         atoms
     }
 
-    fn compile_spec(
+    /// Compile `sql` and settle every membership term its filter names, which is
+    /// everything registration decides before it needs the seed.
+    ///
+    /// Shared with [`Self::describe_terms`], so a filter described is a filter
+    /// `register` accepts, and one refused is refused there for the same reason.
+    fn compile_and_plan_terms(
         &self,
-        spec: SubscriptionRequest<I, E::Backend>,
-    ) -> Result<CompiledSpec<I, E::Backend>, RegisterError> {
+        sql: &str,
+        binds: &[Value<E::Backend>],
+    ) -> Result<(CompiledQuery<E::Backend>, Vec<TermPlan>), RegisterError> {
         let compiled = parse_compile_normalize_and_prefilter_with_binds::<E::Backend, DB>(
-            &spec.sql,
+            sql,
             &self.dialect,
             &self.database,
-            &spec.binds,
+            binds,
         )?;
-        let CompiledQuery {
-            table_id,
-            program: bytecode,
-            normalized,
-            prefilter_plan,
-            projection,
-            terms,
-        } = compiled;
 
         // Registration policy: under RLS, viewers observe different rows,
         // so a single in-process aggregate state cannot be shared across
@@ -414,13 +412,67 @@ where
         // stay accepted. MIN/MAX never reach this branch: they fail the
         // compile step above with UnsupportedSql and are captured by the
         // reexec wrapper, which applies its own RLS guard.
-        if matches!(projection, QueryProjection::Aggregate(_))
-            && catalog_helpers::table_has_rls(&self.database, table_id).unwrap_or(false)
+        if matches!(compiled.projection, QueryProjection::Aggregate(_))
+            && catalog_helpers::table_has_rls(&self.database, compiled.table_id).unwrap_or(false)
         {
-            return Err(RegisterError::AggregatorOnRlsTable { table_id });
+            return Err(RegisterError::AggregatorOnRlsTable {
+                table_id: compiled.table_id,
+            });
         }
 
-        let term_plans = self.check_membership_terms(&terms, table_id, &projection)?;
+        let plans =
+            self.check_membership_terms(&compiled.terms, compiled.table_id, &compiled.projection)?;
+        Ok((compiled, plans))
+    }
+
+    /// What each membership subquery in `spec`'s filter needs seeded, without
+    /// registering anything.
+    ///
+    /// [`Self::register`] consumes the seed and an absent one admits nobody, so
+    /// the caller's obligation runs before registration, and this is the only
+    /// thing that runs the classification `register` runs. Describe the request,
+    /// read each [`TermDescription::seed_sql`] as the caller, state what came
+    /// back through [`SubscriptionRequest::subscriber`] and
+    /// [`SubscriptionRequest::term_values`], then register that same request.
+    ///
+    /// Empty for a filter naming no membership subquery, which is every filter
+    /// until one is written.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `register` answers for the same request short of the seed
+    /// itself: [`RegisterError::UnsupportedSql`] for a filter outside SubQL's
+    /// shape, [`RegisterError::AggregatorOnRlsTable`] for an aggregate over
+    /// row-level security, and [`RegisterError::MembershipTermRefused`] for a
+    /// relationship SubQL cannot serve.
+    pub fn describe_terms(
+        &self,
+        spec: &SubscriptionRequest<I, E::Backend>,
+    ) -> Result<Vec<TermDescription>, RegisterError> {
+        let (compiled, plans) = self.compile_and_plan_terms(&spec.sql, &spec.binds)?;
+        plans
+            .iter()
+            .zip(&compiled.terms)
+            .map(|(plan, term)| {
+                TermDescription::resolve(plan, term, compiled.table_id, &self.database)
+            })
+            .collect()
+    }
+
+    fn compile_spec(
+        &self,
+        spec: SubscriptionRequest<I, E::Backend>,
+    ) -> Result<CompiledSpec<I, E::Backend>, RegisterError> {
+        let (compiled, term_plans) = self.compile_and_plan_terms(&spec.sql, &spec.binds)?;
+        let CompiledQuery {
+            table_id,
+            program: bytecode,
+            normalized,
+            prefilter_plan,
+            projection,
+            terms,
+        } = compiled;
+
         let (term_subscriber, term_seeds) = self.settle_term_seeds(&terms, table_id, &spec)?;
 
         // Disambiguate hash: same WHERE clause with different projection

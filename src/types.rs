@@ -173,12 +173,17 @@ pub struct SubscriptionRequest<I: IdTypes, B: crate::backend::Backend = crate::b
     /// The values this subscriber currently matches, grouped by the column each
     /// membership subquery compares.
     ///
-    /// The client has these already, because it just ran the snapshot query that
-    /// returned exactly those rows under row-level security. Grouped by column
-    /// name because a filter may name several subqueries and the compared column
-    /// is the one name both sides share. A stale or partial list narrows or
-    /// widens only this subscriber's own results, and an absent one admits nobody
-    /// until a membership row changes.
+    /// Read them from the membership table, which
+    /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms)
+    /// hands over as a runnable query. Not from the snapshot rows: a value whose
+    /// rows do not exist yet is in no snapshot, and no later membership event
+    /// supplies it, because the membership never changed, so every row inserted
+    /// under that value afterwards is silently never delivered.
+    ///
+    /// Grouped by column name because a filter may name several subqueries and
+    /// the compared column is the one name both sides share. A stale or partial
+    /// list narrows or widens only this subscriber's own results, and an absent
+    /// one admits nobody until a membership row changes.
     pub(crate) term_values: alloc::vec::Vec<(String, alloc::vec::Vec<crate::backend::Value<B>>)>,
 }
 
@@ -224,7 +229,11 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
     /// State which subscriber this subscription filters for (default: none).
     ///
     /// A filter naming a membership subquery is refused without it, because the
-    /// identity is what a changed membership row is matched against.
+    /// identity is what a changed membership row is matched against. Build it at
+    /// [`TermDescription::subject_kind`](crate::term::TermDescription::subject_kind):
+    /// the lookup keys a string and a UUID under different variants, so an
+    /// identity of another kind matches no membership row and admits nobody in
+    /// silence.
     #[must_use]
     pub fn subscriber(mut self, subscriber: crate::backend::Value<B>) -> Self {
         self.subscriber = Some(subscriber);
@@ -234,6 +243,11 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
     /// State the values this subscriber currently matches for `column`, the
     /// column one of the filter's membership subqueries compares (default: none
     /// for every column).
+    ///
+    /// Both the column and the read that yields the values come from
+    /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms),
+    /// which reads the membership table. Deriving them from the snapshot rows
+    /// instead loses every value whose rows do not exist yet, permanently.
     ///
     /// Called once per compared column. Calling it twice for one column adds to
     /// what that column already carries rather than replacing it.
