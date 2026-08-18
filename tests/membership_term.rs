@@ -12,7 +12,7 @@ use rls2fga::classifier::patterns::ConfidenceLevel;
 use rls2fga::translator::{Translator, TranslatorBuilder};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
+use subql::backend::{Postgres, ScalarKind, Value};
 use subql::compiler::MAX_TERMS_PER_FILTER;
 use subql::testing::TestEvent;
 use subql::{
@@ -758,4 +758,176 @@ fn a_filter_past_the_term_cap_is_refused() {
     assert!(engine
         .register(SubscriptionRequest::new(2u64, under).subscriber(Value::String("alice".into())))
         .is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// What a caller has to read before it can register
+// ---------------------------------------------------------------------------
+
+/// Registration consumes the seed, so a caller that cannot ask what to seed can
+/// only guess. This is that question, and the answer names the read in the
+/// catalog's own words.
+#[test]
+fn describe_terms_names_what_a_seed_read_needs() {
+    let (engine, _) = engine();
+    let described = engine
+        .describe_terms(&SubscriptionRequest::new(1u64, TERM))
+        .expect("the canonical term is describable");
+    let [term] = described.as_slice() else {
+        panic!("one membership subquery, got {described:?}");
+    };
+
+    assert_eq!(term.column, "project_id", "the term_values key");
+    assert_eq!(term.member_table, "project_members");
+    assert_eq!(term.member_key, "project_id");
+    assert_eq!(term.member_subject, "user_id");
+    assert_eq!(
+        term.subject_kind,
+        ScalarKind::String,
+        "user_id is TEXT, and a subscriber built at another kind admits nobody"
+    );
+    assert_eq!(
+        term.key_kind,
+        ScalarKind::Int,
+        "project_id is INTEGER, which is what the seed rows decode as"
+    );
+    assert_eq!(
+        term.seed_sql,
+        "SELECT project_id FROM project_members WHERE user_id = \
+         current_setting('app.user_id', true)",
+        "the seed read is the subquery itself, so it cannot disagree with the filter"
+    );
+}
+
+/// The ordering the whole entry point exists for: describing needs no seed,
+/// because the seed is what the answer is for.
+#[test]
+fn describe_terms_answers_before_a_subscriber_is_known() {
+    let (mut engine, _) = engine();
+    let unseeded = SubscriptionRequest::new(1u64, TERM);
+    assert_eq!(
+        engine.describe_terms(&unseeded).map(|d| d.len()).ok(),
+        Some(1),
+        "an unseeded request must still be describable"
+    );
+    assert!(
+        matches!(
+            engine.register(SubscriptionRequest::new(1u64, TERM)),
+            Err(RegisterError::MembershipTermRefused(_))
+        ),
+        "registering the same unseeded request is what is refused"
+    );
+}
+
+/// Describing is not registering. A caller describes a filter it may then
+/// refuse to register, and nothing may be left behind.
+#[test]
+fn describe_terms_registers_nothing() {
+    let (mut engine, docs) = engine();
+    engine
+        .describe_terms(&SubscriptionRequest::new(1u64, TERM))
+        .expect("describable");
+
+    assert_eq!(engine.predicate_count(docs), 0, "no predicate was compiled");
+    assert_eq!(engine.subscription_count(), 0, "nothing was bound");
+
+    // And the same filter still registers afterwards, so describing did not
+    // consume anything either.
+    engine.register(subscribe(1, "alice", &[7])).unwrap();
+    assert_eq!(engine.predicate_count(docs), 1);
+}
+
+/// Every filter names no term until one is written, so the answer for one is
+/// empty rather than an error the caller has to recognise as harmless.
+#[test]
+fn describe_terms_is_empty_for_a_filter_naming_no_term() {
+    let (engine, _) = engine();
+    assert!(engine
+        .describe_terms(&SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM docs WHERE project_id = 7"
+        ))
+        .expect("a plain filter describes")
+        .is_empty());
+}
+
+/// Describing and registering the same request refuse alike, or a panic naming
+/// which of the two broke ranks. Both accepting is a failure too: a parity
+/// assertion over two successes proves nothing.
+fn refuses_alike(sql: &str) {
+    let (mut engine, _) = engine();
+    let request = || SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into()));
+    let described = engine
+        .describe_terms(&request())
+        .err()
+        .map(|error| error.to_string());
+    let registered = engine.register(request()).err().map(|e| e.to_string());
+
+    assert!(described.is_some(), "{sql} must be refused at all");
+    assert_eq!(
+        described, registered,
+        "describing must refuse exactly as registering does, for {sql}"
+    );
+}
+
+/// The point of sharing one classification: a filter the caller was told to seed
+/// is a filter registration accepts, and one it refuses is refused there for the
+/// same stated reason.
+#[test]
+fn describe_terms_refuses_exactly_what_register_refuses() {
+    let member = "(SELECT project_id FROM project_members WHERE user_id = \
+                  current_setting('app.user_id', true))";
+    for sql in [
+        // An aggregate cannot carry a term.
+        format!("SELECT COUNT(*) FROM docs WHERE project_id IN {member}"),
+        // A float column cannot key the lookup.
+        format!("SELECT * FROM docs WHERE score IN {member}"),
+        // Text compared against an integer key.
+        format!("SELECT * FROM docs WHERE title IN {member}"),
+        // Two distinct subqueries comparing one column. Identical text collapses
+        // to one slot instead, so the two have to differ to reach the refusal.
+        format!(
+            "SELECT * FROM docs WHERE project_id IN {member} AND project_id IN (SELECT \
+             project_id FROM project_members WHERE user_id = 'x')"
+        ),
+        // A relationship rls2fga will not compile: the inner filter names nobody.
+        "SELECT * FROM docs WHERE project_id IN (SELECT project_id FROM project_members WHERE \
+         user_id = 'someone-else')"
+            .to_string(),
+        // Outside SubQL's statement shape, refused before any term is seen.
+        format!("SELECT * FROM docs d JOIN projects p ON p.id = d.project_id WHERE d.project_id IN {member}"),
+        // A joined membership subquery, refused by the bounded form before the
+        // relationship is ever classified. Same rule as the outer statement, so
+        // no caller can be told to seed a shape registration will not take.
+        "SELECT * FROM docs WHERE project_id IN (SELECT pm.project_id FROM project_members pm \
+         JOIN projects p ON p.id = pm.project_id WHERE pm.user_id = \
+         current_setting('app.user_id', true))"
+            .to_string(),
+    ] {
+        refuses_alike(&sql);
+    }
+}
+
+/// Two subqueries on different columns are two descriptions, each keyed by the
+/// column it compares, because that key is the only thing the caller and the
+/// engine share. The two subqueries differ in text so that pairing a description
+/// with the wrong one is visible.
+#[test]
+fn describe_terms_answers_once_per_subquery() {
+    let (engine, _) = engine();
+    let sql = "SELECT * FROM docs WHERE project_id IN \
+         (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true)) \
+         AND a IN (SELECT pm.project_id FROM project_members AS pm WHERE pm.user_id = current_setting('app.user_id', true))";
+    let described = engine
+        .describe_terms(&SubscriptionRequest::new(1u64, sql))
+        .expect("two terms on two columns are describable");
+    let pairs: Vec<(&str, bool)> = described
+        .iter()
+        .map(|term| (term.column.as_str(), term.seed_sql.contains("AS pm")))
+        .collect();
+    assert_eq!(
+        pairs,
+        [("project_id", false), ("a", true)],
+        "each description carries the subquery of its own compared column"
+    );
 }
