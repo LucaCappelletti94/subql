@@ -575,6 +575,72 @@ fn a_removed_membership_row_takes_the_value_away() {
     );
 }
 
+/// The direction stated as carefully as the absent one: a value the subscriber
+/// does not match is trusted too, and only a membership row naming that same
+/// pair ever takes it away. A membership that never existed has no row to send,
+/// so the widening lasts as long as the subscription.
+#[test]
+fn a_value_the_subscriber_never_matched_keeps_admitting_it() {
+    let (mut engine, docs) = engine();
+    let members = members_table(&engine);
+    // Alice is a member of project 7. Project 11 is the stale value: she is not
+    // a member, so the membership table holds no row naming the pair.
+    engine.register(subscribe(1, "alice", &[7, 11])).unwrap();
+
+    assert_eq!(
+        engine
+            .consumers(&TestEvent::insert(docs, doc(1, 11, "spec")))
+            .unwrap()
+            .inserted(),
+        &[1],
+        "a stated value admits whether or not a membership row backs it"
+    );
+
+    // Membership traffic naming another project, or another person in this one,
+    // moves nothing: no pass reconciles the set against the table.
+    engine
+        .consumers(&TestEvent::delete(members, membership(7, "alice")))
+        .unwrap();
+    engine
+        .consumers(&TestEvent::delete(members, membership(11, "bob")))
+        .unwrap();
+
+    assert!(
+        engine
+            .consumers(&TestEvent::insert(docs, doc(2, 7, "gone")))
+            .unwrap()
+            .inserted()
+            .is_empty(),
+        "the pair that did change was withdrawn, so what survives is not a dead dispatch path"
+    );
+    assert_eq!(
+        engine
+            .consumers(&TestEvent::insert(docs, doc(3, 11, "plan")))
+            .unwrap()
+            .inserted(),
+        &[1],
+        "neither event named (11, alice), so the value she never matched still admits her"
+    );
+
+    // Only that pair's own row withdraws it, which is the row a membership that
+    // never existed cannot produce.
+    let notifs = engine
+        .consumers(&TestEvent::delete(members, membership(11, "alice")))
+        .unwrap();
+    let narrowings = notifs.narrowings();
+    assert_eq!(narrowings.len(), 1, "one subscription, one withdrawal");
+    assert_eq!(narrowings[0].value, Value::Int(11));
+    assert!(!narrowings[0].entered, "the value left her set");
+    assert!(
+        engine
+            .consumers(&TestEvent::insert(docs, doc(4, 11, "note")))
+            .unwrap()
+            .inserted()
+            .is_empty(),
+        "and once that row arrives the value stops admitting, as any other would"
+    );
+}
+
 /// A membership moving from one project to another is one departure and one
 /// arrival, reported as both.
 #[test]

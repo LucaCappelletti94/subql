@@ -181,9 +181,12 @@ pub struct SubscriptionRequest<I: IdTypes, B: crate::backend::Backend = crate::b
     /// under that value afterwards is silently never delivered.
     ///
     /// Grouped by column name because a filter may name several subqueries and
-    /// the compared column is the one name both sides share. A stale or partial
-    /// list narrows or widens only this subscriber's own results, and an absent
-    /// one admits nobody until a membership row changes.
+    /// the compared column is the one name both sides share. The list is taken on
+    /// trust, and only a membership row naming the same pair ever moves it, so it
+    /// bounds this subscriber's own results and nobody else's. Neither direction
+    /// self-corrects: a missing value admits nobody until a membership row adds
+    /// it, and a value the subscriber does not match keeps admitting rows to it,
+    /// with no row to withdraw a value whose membership never existed.
     pub(crate) term_values: alloc::vec::Vec<(String, alloc::vec::Vec<crate::backend::Value<B>>)>,
 }
 
@@ -248,6 +251,10 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
     /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms),
     /// which reads the membership table. Deriving them from the snapshot rows
     /// instead loses every value whose rows do not exist yet, permanently.
+    ///
+    /// A value the subscriber does not match is trusted just as readily, and
+    /// keeps admitting rows to it until a membership row naming that pair is
+    /// deleted. A membership that never existed has none to delete.
     ///
     /// Called once per compared column. Calling it twice for one column adds to
     /// what that column already carries rather than replacing it.
