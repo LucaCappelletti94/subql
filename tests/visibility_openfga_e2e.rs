@@ -18,10 +18,11 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openfga_client::client::{
-    CreateStoreRequest, OpenFgaServiceClient, TupleKey, WriteRequest, WriteRequestWrites,
+    CreateStoreRequest, ListStoresRequest, OpenFgaServiceClient, TupleKey, WriteRequest,
+    WriteRequestWrites,
 };
 use openfga_client::tonic::transport::Channel;
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
@@ -129,14 +130,19 @@ CREATE POLICY p ON docs FOR SELECT USING (
           WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user));
 ";
 
-/// Pinned rather than `latest`, and ready on the line the server logs once it
-/// is listening.
+/// Pinned rather than `latest`, and handed over only once the gRPC surface has
+/// answered a call.
+///
+/// The line the service logs first is not readiness: it precedes binding the
+/// gRPC listener, and a published port with nothing behind it yet resets the
+/// connection rather than refusing it, so a client built on that line can fail
+/// its first call. A call that succeeded is the only condition worth waiting on.
 ///
 /// Started through the async runner, not the blocking one: the blocking runner
 /// parks the thread it is called on, and this test is already being driven by a
 /// runtime, so parking it deadlocks rather than waits.
-async fn openfga() -> ContainerAsync<GenericImage> {
-    GenericImage::new("openfga/openfga", "v1.8.13")
+async fn openfga() -> (ContainerAsync<GenericImage>, OpenFgaServiceClient<Channel>) {
+    let container = GenericImage::new("openfga/openfga", "v1.8.13")
         .with_wait_for(WaitFor::message_on_stdout("starting openfga service"))
         // The gRPC port, which the image does not declare, so it has to be
         // mapped explicitly before it can be reached.
@@ -145,20 +151,38 @@ async fn openfga() -> ContainerAsync<GenericImage> {
         .with_startup_timeout(Duration::from_secs(60))
         .start()
         .await
-        .expect("start openfga")
+        .expect("start openfga");
+    let port = container
+        .get_host_port_ipv4(8081.tcp())
+        .await
+        .expect("grpc port");
+    let client = serving_client(port).await;
+    (container, client)
+}
+
+/// A client whose first call has already come back, or a panic carrying the
+/// last refusal rather than an unexplained reset inside a test body.
+async fn serving_client(port: u16) -> OpenFgaServiceClient<Channel> {
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = "never attempted".to_owned();
+    while Instant::now() < deadline {
+        match OpenFgaServiceClient::connect(endpoint.clone()).await {
+            Ok(mut client) => match client.list_stores(ListStoresRequest::default()).await {
+                Ok(_) => return client,
+                Err(status) => last = status.to_string(),
+            },
+            Err(error) => last = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("openfga on {endpoint} never answered a call: {last}");
 }
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
-    let container = openfga().await;
-    let port = container
-        .get_host_port_ipv4(8081.tcp())
-        .await
-        .expect("grpc port");
-    let mut client = OpenFgaServiceClient::connect(format!("http://127.0.0.1:{port}"))
-        .await
-        .expect("connect to openfga");
+    let (_container, mut client) = openfga().await;
 
     // What rls2fga makes of the schema: the model, the descriptions subql reads,
     // and which relations answer which statement. All from one translation, so
@@ -255,14 +279,7 @@ async fn a_question_the_row_does_not_settle_is_answered_by_the_service() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn a_batch_over_the_cap_is_split_and_stays_positional() {
-    let container = openfga().await;
-    let port = container
-        .get_host_port_ipv4(8081.tcp())
-        .await
-        .expect("grpc port");
-    let mut client = OpenFgaServiceClient::connect(format!("http://127.0.0.1:{port}"))
-        .await
-        .expect("connect to openfga");
+    let (_container, mut client) = openfga().await;
 
     let wired = wiring(SCHEMA);
     let docs = catalog_helpers::table_id(&wired.db, "docs").expect("docs is in the catalog");
@@ -364,14 +381,7 @@ ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
 ";
 
-    let container = openfga().await;
-    let port = container
-        .get_host_port_ipv4(8081.tcp())
-        .await
-        .expect("grpc port");
-    let mut client = OpenFgaServiceClient::connect(format!("http://127.0.0.1:{port}"))
-        .await
-        .expect("connect to openfga");
+    let (_container, mut client) = openfga().await;
 
     let wired = wiring(OWNED);
     let docs = catalog_helpers::table_id(&wired.db, "docs").expect("docs is in the catalog");
@@ -500,14 +510,7 @@ CREATE POLICY notes_p ON notes FOR ALL USING (
   OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')));
 ";
 
-    let container = openfga().await;
-    let port = container
-        .get_host_port_ipv4(8081.tcp())
-        .await
-        .expect("grpc port");
-    let mut client = OpenFgaServiceClient::connect(format!("http://127.0.0.1:{port}"))
-        .await
-        .expect("connect to openfga");
+    let (_container, mut client) = openfga().await;
 
     let wired = wiring(HELD_KEYS);
     let notes = catalog_helpers::table_id(&wired.db, "notes").expect("notes is in the catalog");

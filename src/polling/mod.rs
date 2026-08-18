@@ -133,6 +133,7 @@ pub struct PollingPgCdcSource {
     events_received: Arc<AtomicU64>,
     empty_polls_observed: Arc<AtomicU64>,
     total_drained_events: Arc<AtomicU64>,
+    non_empty_drains: Arc<AtomicU64>,
     /// Cooperative shutdown signal. Polled at the top of each polling
     /// iteration. The drop guard also calls `abort()` on the handle as a
     /// backstop for the `JoinHandle` slot, although a blocking task's
@@ -188,6 +189,7 @@ impl PollingPgCdcSource {
         let events_received = Arc::new(AtomicU64::new(0));
         let empty_polls_observed = Arc::new(AtomicU64::new(0));
         let total_drained_events = Arc::new(AtomicU64::new(0));
+        let non_empty_drains = Arc::new(AtomicU64::new(0));
         let task_exited = Arc::new(AtomicBool::new(false));
 
         let task_slot = config.slot_name.clone();
@@ -198,6 +200,7 @@ impl PollingPgCdcSource {
         let task_events = Arc::clone(&events_received);
         let task_empty = Arc::clone(&empty_polls_observed);
         let task_total = Arc::clone(&total_drained_events);
+        let task_non_empty = Arc::clone(&non_empty_drains);
         let task_exited_for_task = Arc::clone(&task_exited);
 
         let task = tokio::task::spawn_blocking(move || {
@@ -211,6 +214,7 @@ impl PollingPgCdcSource {
                 task_events,
                 task_empty,
                 task_total,
+                task_non_empty,
                 task_shutdown,
                 task_exited_for_task,
             );
@@ -223,6 +227,7 @@ impl PollingPgCdcSource {
             events_received,
             empty_polls_observed,
             total_drained_events,
+            non_empty_drains,
             shutdown,
             task_exited,
             task,
@@ -257,18 +262,20 @@ impl PollingPgCdcSource {
 
     /// Average number of events returned per non-empty drain. `0.0` if
     /// no non-empty drains have happened yet.
+    ///
+    /// Never below `1.0` once any event has been delivered. Both counters
+    /// move with the event that produces them, so a consumer holding an
+    /// event cannot read an average that has not counted it yet.
     #[must_use]
     pub fn average_drain_batch_size(&self) -> f64 {
         let total = self.total_drained_events.load(Ordering::Relaxed);
-        let polls = self.polls_issued.load(Ordering::Relaxed);
-        let empty = self.empty_polls_observed.load(Ordering::Relaxed);
-        let non_empty = polls.saturating_sub(empty);
-        if non_empty == 0 {
+        let drains = self.non_empty_drains.load(Ordering::Relaxed);
+        if drains == 0 {
             0.0
         } else {
             #[allow(clippy::cast_precision_loss)]
             {
-                total as f64 / non_empty as f64
+                total as f64 / drains as f64
             }
         }
     }
@@ -317,6 +324,7 @@ fn polling_loop(
     events_received: Arc<AtomicU64>,
     empty_polls_observed: Arc<AtomicU64>,
     total_drained_events: Arc<AtomicU64>,
+    non_empty_drains: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     task_exited: Arc<AtomicBool>,
 ) {
@@ -370,7 +378,11 @@ fn polling_loop(
             continue;
         }
 
-        let mut events_in_this_drain: u64 = 0;
+        // Counted before the send, so a consumer that has the event has the
+        // counters that describe it. A drain is counted non-empty by its first
+        // event rather than at the end, which keeps the average at or above one
+        // for as long as any event has been delivered.
+        let mut drain_counted = false;
 
         for row_idx in 0..result.ntuples() {
             let Some(lsn_text) = result.get_value(row_idx, 0) else {
@@ -403,14 +415,16 @@ fn polling_loop(
             };
             for ev in into_engine_events(change) {
                 events_received.fetch_add(1, Ordering::Relaxed);
-                events_in_this_drain += 1;
+                total_drained_events.fetch_add(1, Ordering::Relaxed);
+                if !drain_counted {
+                    drain_counted = true;
+                    non_empty_drains.fetch_add(1, Ordering::Relaxed);
+                }
                 if event_tx.blocking_send(Ok(ev)).is_err() {
                     return;
                 }
             }
         }
-
-        total_drained_events.fetch_add(events_in_this_drain, Ordering::Relaxed);
     }
 }
 
