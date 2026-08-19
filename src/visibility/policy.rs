@@ -581,17 +581,21 @@ where
                 // as a grant would grant everyone.
                 return Local::Unresolved;
             };
-            if context.key != context_key {
+            // A parameter this comparison does not read is a condition half
+            // nothing here evaluates, the clock being the live case, so a
+            // context carrying more than the one compared key delegates.
+            if context.values.len() != 1 {
                 return Local::Unresolved;
             }
+            let Some(value) = context.values.get(context_key) else {
+                return Local::Unresolved;
+            };
             granted |= match comparison {
-                RequestComparison::CallerSetHolds => values.holds(&context.value),
+                RequestComparison::CallerSetHolds => values.holds(value),
                 // One value, not one of several: a watcher that sent a set
                 // where the policy compares a single value has not satisfied
                 // it, and reading any element as a match is a wrong allow.
-                RequestComparison::CallerValueEquals => {
-                    values.len() == 1 && values.holds(&context.value)
-                }
+                RequestComparison::CallerValueEquals => values.len() == 1 && values.holds(value),
                 // `RequestComparison` is `#[non_exhaustive]`: a comparison this
                 // does not know cannot be applied, and its records grant
                 // everyone until one is.
@@ -801,8 +805,8 @@ mod tests {
     use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
     use rls2fga::classifier::patterns::ConfidenceLevel;
     use rls2fga::generator::records::{
-        ObjectKey, RecordContext, RecordDerivation, RecordDescription, RecordTemplate, SubjectKey,
-        ValueSource,
+        ObjectKey, RecordContext, RecordContextEntry, RecordDerivation, RecordDescription,
+        RecordTemplate, SubjectKey, ValueSource,
     };
     use rls2fga::generator::relations::{RelationShapes, RowDecision};
     use rls2fga::generator::well_known::can_select_relation;
@@ -2868,8 +2872,10 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                     subject_key: SubjectKey::wildcard(),
                     context: Some(RecordContext {
                         condition: format!("when_{key}"),
-                        key: key.to_string(),
-                        value: ValueSource::column(column),
+                        entries: vec![RecordContextEntry {
+                            key: key.to_string(),
+                            value: ValueSource::column(column),
+                        }],
                     }),
                 }),
                 guards: Vec::new(),

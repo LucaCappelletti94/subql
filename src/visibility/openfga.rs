@@ -75,15 +75,16 @@ use std::collections::HashMap as StructFields;
 use openfga_client::client::batch_check_single_result::CheckResult;
 use openfga_client::client::{
     BatchCheckItem, BatchCheckRequest, CheckRequestTupleKey, ConsistencyPreference,
-    ContextualTupleKeys, OpenFgaServiceClient, RelationshipCondition, TupleKey,
-    TupleKeyWithoutCondition, WriteRequest, WriteRequestDeletes, WriteRequestWrites,
+    ContextualTupleKeys, OpenFgaServiceClient, ReadRequest, ReadRequestTupleKey,
+    RelationshipCondition, TupleKey, TupleKeyWithoutCondition, WriteRequest, WriteRequestDeletes,
+    WriteRequestWrites,
 };
 use openfga_client::prost_wkt_types::{value::Kind, ListValue, Struct, Value as ProstValue};
 use openfga_client::tonic::body::Body;
 use openfga_client::tonic::client::GrpcService;
 use openfga_client::tonic::codegen::{Bytes, StdError};
 use openfga_client::tonic::Code;
-use rls2fga::generator::records::{Record, RecordContextValue};
+use rls2fga::generator::records::{Record, RecordContextValue, ReplayScope};
 use rls2fga::parser::identifiers::RelationName;
 use sql_traits::prelude::DatabaseLike;
 
@@ -94,8 +95,9 @@ use core::ops::Not;
 
 use rls2fga::generator::action_relations::{ActionAnswer, ActionStatement, RowVersion};
 
+use crate::visibility::records::render_text;
 use crate::visibility::shapes::{RequiredParameter, Shapes, SharedShapes};
-use crate::visibility::store::StoreDiff;
+use crate::visibility::store::{Requery, StoreDiff};
 use crate::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 /// OpenFGA's own default for `MaxChecksPerBatchCheck`.
@@ -158,6 +160,17 @@ pub enum OpenFgaError {
     StatementNotAnswered {
         /// The statement that went unanswered.
         statement: ActionStatement,
+    },
+    /// The replayed key cannot name the slice its result determines, so
+    /// nothing can be reconciled against the store.
+    ///
+    /// Reached when a key value has no text form, when the encoded name is
+    /// longer than the server accepts, and when a replayed record lies outside
+    /// the declared slice, which means the declaration and the query disagree.
+    #[error("the replayed key cannot name its slice: {message}")]
+    SliceCannotBeNamed {
+        /// What could not be named, and why.
+        message: String,
     },
     /// A recipe grants through a comparison the caller's request completes and
     /// nothing said which parameters carry it, so every such question would be
@@ -746,8 +759,9 @@ where
     ///
     /// [`StoreDiff::requeries`] is **not** covered here. Those are the facts no
     /// single row settles, and running their SQL belongs to the caller, which
-    /// then hands the records back through [`write_records`](Self::write_records).
-    /// A caller that ignores them leaves every two-table fact stale.
+    /// then hands the rows back through
+    /// [`reconcile_records`](Self::reconcile_records). A caller that ignores
+    /// them leaves every two-table fact stale.
     ///
     /// # Errors
     ///
@@ -767,7 +781,180 @@ where
                 object: record.object.clone(),
             })
             .collect();
+        self.write_difference(writes, deletes).await
+    }
 
+    /// Replace what the store holds for the slice `requery` determines with
+    /// `records`, which is what replaying it returned.
+    ///
+    /// The replay's result is the whole truth for its slice, so a stored fact
+    /// in the slice the result no longer states is stale and is deleted, which
+    /// is what [`write_records`](Self::write_records) can never do. This is
+    /// where a caller puts what replaying a
+    /// [`Requery`] returned, due before the
+    /// event is delivered, exactly as the store module's contract says.
+    ///
+    /// The read asks authoritatively whatever the configured read preference
+    /// says, because it reads this policy's own writes: a replica missing the
+    /// newest one would resurrect what was just deleted.
+    ///
+    /// # Errors
+    ///
+    /// As [`apply`](Self::apply), and
+    /// [`OpenFgaError::SliceCannotBeNamed`] when the replayed key cannot name
+    /// the slice, or a record lies outside it, which means the query and its
+    /// declaration disagree and nothing here can say which one is right.
+    pub async fn reconcile_records(
+        &self,
+        requery: &Requery<'_, B>,
+        records: &[Record],
+    ) -> Result<(), OpenFgaError> {
+        let scope = &requery.query.scope;
+        let mut rendered = Vec::with_capacity(requery.key.len());
+        for value in &requery.key {
+            let Some(text) = render_text(value) else {
+                return Err(OpenFgaError::SliceCannotBeNamed {
+                    message: "a bound key value has no text form".to_string(),
+                });
+            };
+            rendered.push(text);
+        }
+        let slice = scope
+            .rendered_key(&rendered.iter().map(String::as_str).collect::<Vec<_>>())
+            .map_err(|error| OpenFgaError::SliceCannotBeNamed {
+                message: error.to_string(),
+            })?;
+        for record in records {
+            if !in_slice(scope, &slice, record) {
+                return Err(OpenFgaError::SliceCannotBeNamed {
+                    message: format!(
+                        "the replayed record ({}, {}, {}) lies outside the slice {slice}",
+                        record.subject, record.relation, record.object
+                    ),
+                });
+            }
+        }
+
+        let desired: BTreeMap<Triple, Option<RelationshipCondition>> = records
+            .iter()
+            .map(|record| (triple_of(record), record.context.as_ref().map(condition_of)))
+            .collect();
+        let mut stored: BTreeMap<Triple, Option<RelationshipCondition>> = BTreeMap::new();
+        for tuple in self.read_slice(scope, &slice).await? {
+            // An object slice reads every relation on the object, and the ones
+            // outside the declared set are other shapes' facts.
+            if let ReplayScope::Object { relations, .. } = scope {
+                if !relations.iter().any(|known| *known == tuple.relation) {
+                    continue;
+                }
+            }
+            stored.insert(
+                (
+                    tuple.user.clone(),
+                    tuple.relation.clone(),
+                    tuple.object.clone(),
+                ),
+                tuple.condition,
+            );
+        }
+
+        // A context that moved is a delete and a write of the same key, which
+        // `write_difference` already refuses to send as one call and orders
+        // removals first.
+        let deletes: Vec<TupleKeyWithoutCondition> = stored
+            .iter()
+            .filter(|(key, condition)| desired.get(*key) != Some(condition))
+            .map(|((user, relation, object), _)| TupleKeyWithoutCondition {
+                user: user.clone(),
+                relation: relation.clone(),
+                object: object.clone(),
+            })
+            .collect();
+        let writes: Vec<TupleKey> = desired
+            .into_iter()
+            .filter(|(key, condition)| stored.get(key) != Some(condition))
+            .map(|((user, relation, object), condition)| TupleKey {
+                user,
+                relation,
+                object,
+                condition,
+            })
+            .collect();
+        self.write_difference(writes, deletes).await
+    }
+
+    /// Every tuple the store holds in `slice`, read page by page.
+    async fn read_slice(
+        &self,
+        scope: &ReplayScope,
+        slice: &str,
+    ) -> Result<Vec<TupleKey>, OpenFgaError> {
+        let filter = match scope {
+            ReplayScope::Object { .. } => ReadRequestTupleKey {
+                user: String::new(),
+                relation: String::new(),
+                object: slice.to_string(),
+            },
+            ReplayScope::Subject {
+                relation,
+                object_type,
+                ..
+            } => ReadRequestTupleKey {
+                user: slice.to_string(),
+                relation: relation.as_str().to_string(),
+                object: format!("{object_type}:"),
+            },
+        };
+        let mut out = Vec::new();
+        let mut continuation_token = String::new();
+        loop {
+            let request = ReadRequest {
+                store_id: self.store_id.clone(),
+                tuple_key: Some(filter.clone()),
+                page_size: None,
+                continuation_token: continuation_token.clone(),
+                // Discriminant extraction: the generated field is a bare `i32`.
+                // Authoritative regardless of the configured read preference,
+                // since this read precedes a write built from it.
+                consistency: ConsistencyPreference::HigherConsistency as i32,
+            };
+            let mut attempts = 0;
+            let response = loop {
+                attempts += 1;
+                let mut client = self.client.clone();
+                match client.read(request.clone()).await {
+                    Ok(response) => break response.into_inner(),
+                    Err(status) if OpenFgaError::is_transport(status.code()) => {
+                        if attempts > self.connect_retries {
+                            return Err(OpenFgaError::Transport {
+                                attempts,
+                                message: status.message().to_string(),
+                            });
+                        }
+                    }
+                    Err(status) => {
+                        return Err(OpenFgaError::Rejected {
+                            message: status.message().to_string(),
+                        })
+                    }
+                }
+            };
+            out.extend(response.tuples.into_iter().filter_map(|tuple| tuple.key));
+            if response.continuation_token.is_empty() {
+                return Ok(out);
+            }
+            continuation_token = response.continuation_token;
+        }
+    }
+
+    /// Apply `writes` and `deletes` as [`apply`](Self::apply) documents:
+    /// atomically when the server accepts one call, and removals first
+    /// otherwise, which is the fail-closed order.
+    async fn write_difference(
+        &self,
+        writes: Vec<TupleKey>,
+        deletes: Vec<TupleKeyWithoutCondition>,
+    ) -> Result<(), OpenFgaError> {
         // One call whenever the server accepts one, because it applies a write
         // atomically: a row changing hands then has no moment where both the old
         // and the new subject hold it, and none where neither does.
@@ -818,9 +1005,10 @@ where
 
     /// Write `records` as tuples, splitting them across calls the server accepts.
     ///
-    /// This is also where a caller puts what replaying a
-    /// [`Requery`](crate::visibility::store::Requery) returned, so the facts no
-    /// one row settles reach the store through the same writer as the rest.
+    /// This is where the initial load's rows go: it only ever writes, so what a
+    /// replayed [`Requery`] returned goes
+    /// through [`reconcile_records`](Self::reconcile_records) instead, which
+    /// also takes out what the replay stopped returning.
     ///
     /// # Errors
     ///
@@ -883,6 +1071,41 @@ where
     }
 }
 
+/// One tuple's identity to the server: subject, relation, object. A condition's
+/// context is not part of it, so a context that moved compares as the same key
+/// with a different value.
+type Triple = (String, String, String);
+
+/// The key `record` states, in the server's own terms.
+fn triple_of(record: &Record) -> Triple {
+    (
+        record.subject.clone(),
+        record.relation.clone().to_string(),
+        record.object.clone(),
+    )
+}
+
+/// Whether `record` lies in the slice `scope` names as `slice`.
+fn in_slice(scope: &ReplayScope, slice: &str, record: &Record) -> bool {
+    match scope {
+        ReplayScope::Object { relations, .. } => {
+            record.object == slice && relations.contains(&record.relation)
+        }
+        ReplayScope::Subject {
+            relation,
+            object_type,
+            ..
+        } => {
+            record.subject == slice
+                && record.relation == *relation
+                && record
+                    .object
+                    .strip_prefix(object_type.as_str())
+                    .is_some_and(|rest| rest.starts_with(':'))
+        }
+    }
+}
+
 /// One record as a tuple, carrying its condition when it has one.
 ///
 /// Free rather than a method, and infallible, because the condition name travels
@@ -902,12 +1125,18 @@ fn condition_of(context: &RecordContextValue) -> RelationshipCondition {
     RelationshipCondition {
         name: context.condition.clone(),
         context: Some(Struct {
-            fields: StructFields::from_iter([(
-                context.key.clone(),
-                ProstValue {
-                    kind: Some(Kind::StringValue(context.value.clone())),
-                },
-            )]),
+            fields: context
+                .values
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        ProstValue {
+                            kind: Some(Kind::StringValue(value.clone())),
+                        },
+                    )
+                })
+                .collect(),
         }),
     }
 }
@@ -981,6 +1210,7 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use alloc::borrow::Cow;
+    use alloc::collections::BTreeMap;
     use alloc::vec;
 
     use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
@@ -1059,8 +1289,7 @@ mod tests {
             subject: "user:*".to_string(),
             context: Some(RecordContextValue {
                 condition: "when_row_owner".to_string(),
-                key: "row_owner".to_string(),
-                value: "alice".to_string(),
+                values: BTreeMap::from([("row_owner".to_string(), "alice".to_string())]),
             }),
         };
 
@@ -1109,8 +1338,7 @@ mod tests {
                 subject: "user:*".to_string(),
                 context: Some(RecordContextValue {
                     condition,
-                    key: "owner".to_string(),
-                    value: owner.to_string(),
+                    values: BTreeMap::from([("owner".to_string(), owner.to_string())]),
                 }),
             },
             Record {

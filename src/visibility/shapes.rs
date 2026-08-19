@@ -35,7 +35,7 @@ use core::ops::Not;
 use hashbrown::{HashMap, HashSet};
 use rls2fga::generator::action_relations::{ActionAnswer, ActionRelations, ActionStatement};
 use rls2fga::generator::notes::TranslationNote;
-use rls2fga::generator::records::{BoundQuery, RecordDerivation, RecordDescription};
+use rls2fga::generator::records::{BoundQuery, RecordDerivation, RecordDescription, ReplayScope};
 use rls2fga::generator::relations::{RelationShapes, RowDecision};
 use rls2fga::generator::row_naming::RowNaming;
 use rls2fga::generator::unrestricted::UnrestrictedTable;
@@ -201,11 +201,12 @@ impl<DB: DatabaseLike> Shapes<DB> {
         let mut recipes = HashMap::new();
         let mut by_table: HashMap<TableId, TableShapes> = HashMap::new();
         let mut uncovered = Vec::new();
+        let contested = contested_pairs(relations);
 
         for entry in relations {
             index_recipe(&db, entry, &mut recipes);
             for shape in &entry.shapes {
-                index_shape(&db, entry, shape, &mut by_table, &mut uncovered);
+                index_shape(&db, entry, shape, &contested, &mut by_table, &mut uncovered);
             }
         }
 
@@ -493,6 +494,7 @@ fn index_shape<DB: DatabaseLike>(
     db: &DB,
     entry: &RelationShapes,
     shape: &RecordDescription,
+    contested: &HashSet<(String, RelationName)>,
     by_table: &mut HashMap<TableId, TableShapes>,
     uncovered: &mut Vec<Uncovered>,
 ) {
@@ -510,6 +512,23 @@ fn index_shape<DB: DatabaseLike>(
             if let Some(id) = catalog_helpers::table_id(db, table) {
                 by_table.entry(id).or_default().settled.push(shape.clone());
             }
+        }
+        RecordDerivation::Joined { .. }
+            if stated_pairs(shape)
+                .iter()
+                .any(|pair| contested.contains(pair)) =>
+        {
+            // A slice another shape also states is not this one's to
+            // reconcile: what the replay stopped returning may be the other
+            // shape's living fact. The whole shape is named rather than
+            // partially maintained, since a difference right about some
+            // relations and silently wrong about others is worse than none.
+            uncovered.extend(
+                shape
+                    .tables
+                    .iter()
+                    .map(|table| name_gap(entry, shape, table, UncoveredReason::SharedSlice)),
+            );
         }
         RecordDerivation::Joined { queries, .. } => {
             let mut bound: Vec<&str> = Vec::with_capacity(queries.len());
@@ -546,6 +565,64 @@ fn index_shape<DB: DatabaseLike>(
                 .iter()
                 .map(|table| name_gap(entry, shape, table, UncoveredReason::UnreadableColumn)),
         ),
+    }
+}
+
+/// The (type, relation) pairs stated by more than one distinct description.
+///
+/// A replay's slice inside such a pair belongs to nobody alone, and two
+/// entries carrying the same description state each pair once: the same
+/// source feeding two relations is deduplicated by value, not by entry.
+fn contested_pairs(relations: &[RelationShapes]) -> HashSet<(String, RelationName)> {
+    let mut stated: HashMap<(String, RelationName), Vec<&RecordDescription>> = HashMap::new();
+    for entry in relations {
+        for shape in &entry.shapes {
+            for pair in stated_pairs(shape) {
+                let bucket = stated.entry(pair).or_default();
+                if !bucket.contains(&shape) {
+                    bucket.push(shape);
+                }
+            }
+        }
+    }
+    stated
+        .into_iter()
+        .filter(|(_, shapes)| shapes.len() > 1)
+        .map(|(pair, _)| pair)
+        .collect()
+}
+
+/// Every (type, relation) pair `shape` states records for.
+fn stated_pairs(shape: &RecordDescription) -> Vec<(String, RelationName)> {
+    match &shape.derivation {
+        RecordDerivation::FromRow { template, .. } => {
+            alloc::vec![(template.object_type.clone(), template.relation.clone())]
+        }
+        RecordDerivation::Joined { queries, .. } => {
+            let mut out = Vec::new();
+            for query in queries {
+                match &query.scope {
+                    ReplayScope::Object {
+                        object_type,
+                        relations,
+                    } => {
+                        for relation in relations {
+                            out.push((object_type.clone(), relation.clone()));
+                        }
+                    }
+                    ReplayScope::Subject {
+                        object_type,
+                        relation,
+                        ..
+                    } => out.push((object_type.clone(), relation.clone())),
+                }
+            }
+            out
+        }
+        // `RecordDerivation` is `#[non_exhaustive]`: a shape this does not
+        // understand states nothing here, and `index_shape` already names it
+        // uncovered.
+        _ => Vec::new(),
     }
 }
 

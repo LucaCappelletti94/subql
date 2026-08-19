@@ -49,14 +49,14 @@ const SLOT: &str = "records_parity_slot";
 /// both parse, so one string is the single source for the catalog, the
 /// translation and the database.
 ///
-/// Between them the four row-derived shapes cover every spelling
+/// Between them the five row-derived shapes cover every spelling
 /// `render_text` claims: a `UUID` object key, an `INTEGER` and a `BIGINT`
-/// one, a `TEXT` subject, a JSON path subject, a literal subject, and a
-/// boolean guard.
+/// one, a compound `INTEGER` pair, a `TEXT` subject, a JSON path subject, a
+/// literal subject, and a boolean guard.
 ///
-/// `readings` settles nothing and is reached by a bound query instead. Its
-/// key spans two columns, which is what separates replaying the row that
-/// changed from replaying every row sharing the first column of its key.
+/// `readings` settles too: its clock guard lives in a condition the request
+/// completes, so each row states one conditional record keyed on the whole
+/// compound key.
 const SCHEMA: &str = "
 CREATE TABLE docs (id UUID PRIMARY KEY, owner_id TEXT, is_public BOOLEAN);
 CREATE TABLE notes (id BIGINT PRIMARY KEY, owner_id TEXT);
@@ -124,6 +124,21 @@ struct TupleRow {
     subject: String,
 }
 
+/// One row of a conditional tuple query, which projects five columns.
+#[derive(QueryableByName)]
+struct ConditionalTupleRow {
+    #[diesel(sql_type = Text)]
+    object: String,
+    #[diesel(sql_type = Text)]
+    relation: String,
+    #[diesel(sql_type = Text)]
+    subject: String,
+    #[diesel(sql_type = Text)]
+    condition: String,
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    context: serde_json::Value,
+}
+
 /// DDL, which the typed DSL does not express.
 fn ddl(conn: &mut PgConnection, statement: &str) {
     sql_query(statement).execute(conn).expect(statement);
@@ -135,12 +150,9 @@ fn create_schema(conn: &mut PgConnection) {
     }
     // The update phase reads the previous image, which Postgres sends in
     // full only under FULL. Without this the difference is refused rather
-    // than wrong, which would make that half of the test vacuous.
-    //
-    // `readings` is deliberately left at DEFAULT, which sends the key and
-    // nothing else. Nothing settles from its rows, so the key is all a
-    // replayed query needs, and leaving it here proves that.
-    for table in ["docs", "notes", "cards"] {
+    // than wrong, which would make that half of the test vacuous. `readings`
+    // settles now too, so it needs the full image like the rest.
+    for table in ["docs", "notes", "cards", "readings"] {
         ddl(conn, &format!("ALTER TABLE {table} REPLICA IDENTITY FULL"));
     }
 }
@@ -252,13 +264,43 @@ fn seed(conn: &mut PgConnection) {
         .unwrap();
 }
 
-/// What the loader would write, straight from the database.
-fn records_from_sql(conn: &mut PgConnection, sql: &str) -> BTreeSet<Fact> {
+/// What the loader would write, straight from the database. A conditional
+/// query's context arrives as the jsonb the loader wrote, respelled into the
+/// text map subql renders, so the two spellings meet in one comparison.
+fn records_from_sql(conn: &mut PgConnection, sql: &str, conditional: bool) -> BTreeSet<Fact> {
+    if !conditional {
+        return sql_query(sql)
+            .load::<TupleRow>(conn)
+            .unwrap_or_else(|error| panic!("tuple query failed: {error}\n{sql}"))
+            .into_iter()
+            .map(|row| (row.object, row.relation, row.subject, None))
+            .collect();
+    }
     sql_query(sql)
-        .load::<TupleRow>(conn)
-        .unwrap_or_else(|error| panic!("tuple query failed: {error}\n{sql}"))
+        .load::<ConditionalTupleRow>(conn)
+        .unwrap_or_else(|error| panic!("conditional tuple query failed: {error}\n{sql}"))
         .into_iter()
-        .map(|row| (row.object, row.relation, row.subject))
+        .map(|row| {
+            let serde_json::Value::Object(fields) = row.context else {
+                panic!("the loader writes a context as a JSON object: {sql}");
+            };
+            let values: std::collections::BTreeMap<String, String> = fields
+                .into_iter()
+                .map(|(key, value)| {
+                    let text = match value {
+                        serde_json::Value::String(text) => text,
+                        other => other.to_string(),
+                    };
+                    (key, text)
+                })
+                .collect();
+            (
+                row.object,
+                row.relation,
+                row.subject,
+                Some((row.condition, values)),
+            )
+        })
         .collect()
 }
 
@@ -269,20 +311,32 @@ fn drain(conn: &mut PgConnection) -> Vec<MessageV2> {
         .collect()
 }
 
-/// One fact, as both sides can spell it.
+/// One fact, as both sides can spell it, the condition and its context
+/// values included so the rendering of a carried column is pinned too.
 ///
 /// A relation name that came out of Postgres cannot be a `RelationName`: rls2fga
 /// keeps that constructor crate-private so the type is proof its clamp and its
 /// collision check both ran, and a string from a query is proof of neither. So
 /// the comparison is over text, which is what the loader's SQL and subql's
 /// rendering actually share.
-type Fact = (String, String, String);
+type Fact = (
+    String,
+    String,
+    String,
+    Option<(String, std::collections::BTreeMap<String, String>)>,
+);
 
 fn fact(record: &Record) -> Fact {
     (
         record.object.clone(),
         record.relation.as_str().to_owned(),
         record.subject.clone(),
+        record.context.as_ref().map(|context| {
+            (
+                context.condition.clone(),
+                context.values.clone().into_iter().collect(),
+            )
+        }),
     )
 }
 
@@ -321,7 +375,7 @@ fn records_from_events(
 
 /// The descriptions rls2fga emits for `SCHEMA`, paired with the SQL that
 /// loads each one.
-fn shapes(catalog: &ParserDB) -> Vec<(String, RecordDescription)> {
+fn shapes(catalog: &ParserDB) -> Vec<(String, bool, RecordDescription)> {
     let outputs = TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
         .build()
@@ -334,7 +388,7 @@ fn shapes(catalog: &ParserDB) -> Vec<(String, RecordDescription)> {
             let description = query.description?;
             (is_evaluable(&description)
                 && matches!(description.derivation, RecordDerivation::FromRow { .. }))
-            .then_some((query.sql, description))
+            .then_some((query.sql, query.condition.is_some(), description))
         })
         .collect()
 }
@@ -355,11 +409,11 @@ fn every_record_a_row_implies_matches_the_query_that_loads_it() {
     assert!(!events.is_empty(), "the slot carried no row events");
 
     let shapes = shapes(&catalog);
-    assert_eq!(shapes.len(), 4, "the schema should emit four shapes");
+    assert_eq!(shapes.len(), 5, "the schema should emit five shapes");
 
     let mut compared = 0usize;
-    for (sql, description) in &shapes {
-        let from_sql = records_from_sql(&mut pg, sql);
+    for (sql, conditional, description) in &shapes {
+        let from_sql = records_from_sql(&mut pg, sql, *conditional);
         let from_rows = records_from_events(&events, description, &catalog, RowKind::New);
         assert_eq!(
             from_rows, from_sql,
@@ -386,7 +440,7 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
     let shapes = shapes(&catalog);
     let before: BTreeSet<Fact> = shapes
         .iter()
-        .flat_map(|(sql, _)| records_from_sql(&mut pg, sql))
+        .flat_map(|(sql, conditional, _)| records_from_sql(&mut pg, sql, *conditional))
         .collect();
 
     // One row changes hands, one loses its grant, one gains one, and one is
@@ -412,7 +466,7 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
 
     let after: BTreeSet<Fact> = shapes
         .iter()
-        .flat_map(|(sql, _)| records_from_sql(&mut pg, sql))
+        .flat_map(|(sql, conditional, _)| records_from_sql(&mut pg, sql, *conditional))
         .collect();
 
     let relations = TranslatorBuilder::new()
@@ -456,12 +510,70 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
     );
 }
 
-/// The integer a key column of `readings` carries, in the type the `table!`
+/// The integer a key column of `meters` carries, in the type the `table!`
 /// above declares for it.
 fn key_int(value: &Value<Postgres>) -> i32 {
     match value {
         Value::Int(int) => i32::try_from(*int).expect("an INTEGER key fits an i32"),
-        other => panic!("a key column of readings is an integer, not {other:?}"),
+        other => panic!("a key column of meters is an integer, not {other:?}"),
+    }
+}
+
+/// The grant rule over a table two columns identify together, which is the
+/// shape that still answers by replaying: the deciding rows live on the
+/// grant and principal tables, so no row of `meters` settles it.
+///
+/// `meters` deliberately keeps `REPLICA IDENTITY DEFAULT`, which sends the
+/// key and nothing else. Nothing settles from its rows, so the key is all a
+/// replayed query needs, and leaving it here proves that.
+const GRANTS_SCHEMA: &str = "
+CREATE TABLE users (id TEXT PRIMARY KEY);
+CREATE TABLE meters (tenant_id INTEGER, meter_id INTEGER, owner_id TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, meter_id));
+CREATE TABLE meter_grants (grantee_owner_id TEXT NOT NULL, granted_owner_id TEXT NOT NULL,
+    role_id INTEGER NOT NULL);
+CREATE FUNCTION get_meter_role(user_name TEXT, target_owner_id TEXT) RETURNS INTEGER
+    LANGUAGE sql STABLE AS 'SELECT 1';
+ALTER TABLE meters ENABLE ROW LEVEL SECURITY;
+CREATE POLICY meters_role ON meters FOR SELECT
+    USING (get_meter_role(current_user, owner_id) >= 2);
+";
+
+/// What tells the classifier `get_meter_role` is a role threshold over the
+/// grant table, which is what mints the shapes whose queries bind the whole
+/// compound key of `meters`.
+const GRANTS_REGISTRY: &str = r#"{
+  "get_meter_role": {
+    "kind": "role_threshold",
+    "user_param_index": 0,
+    "resource_param_index": 1,
+    "role_levels": { "viewer": 2, "editor": 3, "admin": 4 },
+    "grant_table": "meter_grants",
+    "grant_grantee_col": "grantee_owner_id",
+    "grant_resource_col": "granted_owner_id",
+    "grant_role_col": "role_id"
+  }
+}"#;
+
+diesel::table! {
+    meters (tenant_id, meter_id) {
+        tenant_id -> diesel::sql_types::Integer,
+        meter_id -> diesel::sql_types::Integer,
+        owner_id -> diesel::sql_types::Text,
+    }
+}
+
+diesel::table! {
+    users (id) {
+        id -> diesel::sql_types::Text,
+    }
+}
+
+diesel::table! {
+    meter_grants (grantee_owner_id, granted_owner_id) {
+        grantee_owner_id -> diesel::sql_types::Text,
+        granted_owner_id -> diesel::sql_types::Text,
+        role_id -> diesel::sql_types::Integer,
     }
 }
 
@@ -480,40 +592,68 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
     let container = common::pg_with_wal2json();
     let mut pg = common::pg_connect(common::pg_port(&container));
 
-    create_schema(&mut pg);
+    for statement in GRANTS_SCHEMA.split(';').filter(|s| !s.trim().is_empty()) {
+        ddl(&mut pg, statement);
+    }
     common::create_slot(&mut pg, SLOT);
-    seed(&mut pg);
-    drain(&mut pg);
-
+    diesel::insert_into(users::table)
+        .values(vec![users::id.eq("alice"), users::id.eq("bob")])
+        .execute(&mut pg)
+        .unwrap();
     // Without a sibling sharing the first column of the key, every assertion
     // below passes for a query bound to that column alone, which is the bug
-    // this test exists to catch.
-    let sharing_the_tenant: i64 = readings::table
-        .filter(readings::tenant_id.eq(1))
-        .count()
-        .get_result(&mut pg)
+    // this test exists to catch. The sibling's owner carries a grant too, so
+    // a widened replay returns rows rather than passing empty.
+    diesel::insert_into(meters::table)
+        .values(vec![
+            (
+                meters::tenant_id.eq(1),
+                meters::meter_id.eq(20),
+                meters::owner_id.eq("bob"),
+            ),
+            (
+                meters::tenant_id.eq(1),
+                meters::meter_id.eq(21),
+                meters::owner_id.eq("alice"),
+            ),
+        ])
+        .execute(&mut pg)
         .unwrap();
-    assert!(
-        sharing_the_tenant > 1,
-        "one row per tenant makes this vacuous"
-    );
+    diesel::insert_into(meter_grants::table)
+        .values(vec![
+            (
+                meter_grants::grantee_owner_id.eq("carol"),
+                meter_grants::granted_owner_id.eq("bob"),
+                meter_grants::role_id.eq(2),
+            ),
+            (
+                meter_grants::grantee_owner_id.eq("dave"),
+                meter_grants::granted_owner_id.eq("alice"),
+                meter_grants::role_id.eq(2),
+            ),
+        ])
+        .execute(&mut pg)
+        .unwrap();
+    drain(&mut pg);
 
-    diesel::update(readings::table.find((1, 20)))
-        .set(readings::starts_at.eq(Some(timestamp("2026-06-01T00:00:00Z"))))
+    diesel::update(meters::table.find((1, 20)))
+        .set(meters::owner_id.eq("bob"))
         .execute(&mut pg)
         .unwrap();
 
     let events = drain(&mut pg);
     assert_eq!(events.len(), 1, "one event for one statement");
 
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap();
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(GRANTS_SCHEMA).unwrap();
     let relations = TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
+        .with_registry_json(GRANTS_REGISTRY)
+        .expect("the registry parses")
         .build()
         .translate(&catalog)
         .relations();
     let store = Shapes::new(
-        ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap(),
+        ParserDB::parse::<PostgreSqlDialect>(GRANTS_SCHEMA).unwrap(),
         &relations,
     );
 
@@ -522,27 +662,37 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
         .unwrap_or_else(|error| panic!("the difference was refused: {error}"));
     assert!(
         diff.added.is_empty() && diff.removed.is_empty(),
-        "no row of readings settles a record on its own"
+        "no row of meters settles a record on its own"
     );
-    assert_eq!(diff.requeries.len(), 1, "{:?}", diff.requeries);
-    let requery = &diff.requeries[0];
-    assert_eq!(requery.query.key_columns, ["tenant_id", "reading_id"]);
+    // The ownership arm and the grant expansion each bind the changed row by
+    // its whole key.
+    assert_eq!(diff.requeries.len(), 2, "{:?}", diff.requeries);
+    for requery in &diff.requeries {
+        assert_eq!(requery.query.table, "meters");
+        assert_eq!(requery.query.key_columns, ["tenant_id", "meter_id"]);
 
-    // The one statement the typed DSL cannot express, since rls2fga generates
-    // its text at run time. Bound with the same SQL type the `table!` above
-    // gives these columns, so the two cannot drift.
-    let rows = sql_query(&requery.query.sql)
-        .bind::<Integer, _>(key_int(&requery.key[0]))
-        .bind::<Integer, _>(key_int(&requery.key[1]))
-        .load::<TupleRow>(&mut pg)
-        .unwrap_or_else(|error| {
-            panic!("the replayed query failed: {error}\n{}", requery.query.sql)
-        });
+        // The one statement the typed DSL cannot express, since rls2fga
+        // generates its text at run time. Bound with the same SQL type the
+        // `table!` above gives these columns, so the two cannot drift.
+        let rows = sql_query(&requery.query.sql)
+            .bind::<Integer, _>(key_int(&requery.key[0]))
+            .bind::<Integer, _>(key_int(&requery.key[1]))
+            .load::<TupleRow>(&mut pg)
+            .unwrap_or_else(|error| {
+                panic!("the replayed query failed: {error}\n{}", requery.query.sql)
+            });
 
-    let objects: Vec<&str> = rows.iter().map(|row| row.object.as_str()).collect();
-    assert_eq!(
-        objects,
-        ["readings:1|20"],
-        "the whole key names the changed row and no other"
-    );
+        assert!(
+            !rows.is_empty(),
+            "the replay returns the changed row's facts:\n{}",
+            requery.query.sql
+        );
+        for row in &rows {
+            assert_eq!(
+                row.object, "meters:1|20",
+                "the whole key names the changed row and no other:\n{}",
+                requery.query.sql
+            );
+        }
+    }
 }

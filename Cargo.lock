@@ -4560,7 +4560,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#fb653cd96992c7093c86c843bc1d231e2a7597bd"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#2003efff5432f3a62b57c811c79fceaa49bfc4dd"
 dependencies = [
  "openfga-client",
  "serde",

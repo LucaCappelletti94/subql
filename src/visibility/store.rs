@@ -22,11 +22,14 @@
 //! between the two images is what moved. A shape whose records span two
 //! tables cannot be differenced from one of them, so the query
 //! [`rls2fga`] already bound to one row is handed over with the key read
-//! off the row, and the caller runs it. A shape in a list column can be
-//! neither differenced nor queried, so it is named in
+//! off the row, and the caller runs it: the result is the whole truth for
+//! the slice the query declares, so reconciling it both writes what is new
+//! and takes out what the result stopped returning. A shape that can be
+//! neither differenced nor replayed is named in
 //! [`Shapes::uncovered`](crate::visibility::shapes::Shapes::uncovered) and nothing else, because a caller that
 //! believes its store is complete when it is not is the failure this whole
-//! path exists to remove.
+//! path exists to remove. That covers a shape in a list column, and one
+//! whose slice another shape also states, which reconciling would clobber.
 //!
 //! # When a replayed query has to have finished
 //!
@@ -38,8 +41,9 @@
 //! from a database only the caller can reach, and it carries an obligation
 //! worth stating rather than leaving to be discovered.
 //!
-//! **Replay the query and write back what it returned before the event is
-//! delivered.** Until then the store still holds the facts from before the
+//! **Replay the query and hand what it returned to the terminal policy's
+//! `reconcile_records` before the event is delivered.** Until then the store
+//! still holds the facts from before the
 //! change, so a question about any row those facts reach is answered from a
 //! world that has moved. In the deny direction that costs a row delivered
 //! late. In the allow direction it is a row handed to somebody whose access
@@ -98,6 +102,9 @@ pub enum UncoveredReason {
     /// The shape reads this table but carries no query bound to it, so a
     /// change arriving here has nothing to replay.
     NoBoundQuery,
+    /// The slice a replay of this shape determines is also stated by another
+    /// shape, so reconciling it would delete that shape's facts.
+    SharedSlice,
 }
 
 /// A shape whose records this cannot keep current, named so a caller does
@@ -121,10 +128,13 @@ pub struct Uncovered {
 /// A query to replay for one changed row, because its records span more
 /// than that row.
 ///
-/// Replaying it and writing back what it returned is the caller's, and it is
+/// Replaying it and handing the rows to the terminal policy's
+/// `reconcile_records` is the caller's, and it is
 /// due before the event is delivered. See the module's own section on when a
 /// replayed query has to have finished, which says what a caller accepts by
-/// deferring it.
+/// deferring it. The result is the whole truth for the slice
+/// [`BoundQuery::scope`](rls2fga::generator::records::BoundQuery::scope)
+/// declares, which is what makes the reconciliation able to remove.
 ///
 /// The key is a typed [`Value`] rather than text, so the caller binds it
 /// through its own type system and no cast is needed anywhere.
@@ -155,8 +165,8 @@ pub struct StoreDiff<'a, B: Backend> {
     /// Facts the row stated before and no longer does.
     pub removed: Vec<Record>,
     /// Queries the caller replays, then hands the rows back through the
-    /// terminal policy's `write_records`. Due before the event is delivered:
-    /// see the module doc.
+    /// terminal policy's `reconcile_records`. Due before the event is
+    /// delivered: see the module doc.
     pub requeries: Vec<Requery<'a, B>>,
 }
 
@@ -386,7 +396,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use rls2fga::classifier::patterns::ConfidenceLevel;
-    use rls2fga::generator::records::{BoundQuery, Record, RecordDerivation, RecordDescription};
+    use rls2fga::generator::records::{
+        BoundQuery, Record, RecordDerivation, RecordDescription, ReplayScope,
+    };
     use rls2fga::generator::relations::RelationShapes;
     use rls2fga::generator::well_known::{
         can_delete_relation, can_select_relation, member_relation,
@@ -430,8 +442,8 @@ CREATE POLICY p ON docs FOR SELECT USING (
           WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user));
 ";
 
-    /// The same membership with a residual condition, so `teams#member` joins
-    /// and reaches `team_members` through a bound query instead.
+    /// The same membership with a residual the row image can evaluate, so the
+    /// shape still settles and the residual travels as a guard.
     const RESIDUAL: &str = "
 CREATE TABLE teams(id INTEGER PRIMARY KEY);
 CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT, active BOOLEAN);
@@ -443,6 +455,39 @@ CREATE POLICY p ON docs FOR SELECT USING (
             AND team_members.active));
 ";
 
+    /// The same membership gated by the clock, which no row image can
+    /// evaluate, so `teams#member` joins and reaches `team_members` through a
+    /// bound query instead.
+    const EXPIRING: &str = "
+CREATE TABLE teams(id INTEGER PRIMARY KEY);
+CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+    expires_at TIMESTAMPTZ);
+CREATE TABLE docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user
+            AND team_members.expires_at > now()));
+";
+
+    /// Two membership sources feeding `teams#member`: one the row settles and
+    /// one only a replay reaches. The replay's slice is also stated by the
+    /// settled shape, so reconciling it would delete that shape's facts.
+    const SHARED_SLICE: &str = "
+CREATE TABLE teams(id INTEGER PRIMARY KEY);
+CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+CREATE TABLE team_guests(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+    expires_at TIMESTAMPTZ);
+CREATE TABLE docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user)
+  OR EXISTS (SELECT 1 FROM team_guests
+          WHERE team_guests.team_id = docs.team_id AND team_guests.user_id = current_user
+            AND team_guests.expires_at > now()));
+";
+
     /// The subjects live in a list column, which no row image can expand.
     const ARRAY: &str = "
 CREATE TABLE docs(id INTEGER PRIMARY KEY, members TEXT[]);
@@ -450,13 +495,12 @@ ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON docs FOR SELECT USING (current_user = ANY(members));
 ";
 
-    /// A key spanning two columns, guarded by a comparison the request settles
-    /// rather than the row, so the shape joins and hands over a bound query.
+    /// A key spanning two columns, so a bound query names a row by the whole
+    /// of it. The shape is hand built below, since every schema-derived shape
+    /// with a residual binds a single joining column.
     const COMPOUND_KEY: &str = "
 CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMPTZ,
     PRIMARY KEY (tenant_id, reading_id));
-ALTER TABLE readings ENABLE ROW LEVEL SECURITY;
-CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
 ";
 
     fn shapes(sql: &str) -> Shapes<ParserDB> {
@@ -720,11 +764,11 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// key read off the row.
     #[test]
     fn a_two_table_shape_hands_over_its_query_with_the_key_bound() {
-        let store = shapes(RESIDUAL);
+        let store = shapes(EXPIRING);
         let members = table(&store, "team_members");
         let event = TestEvent::<Postgres>::insert(
             members,
-            vec![Value::Int(3), text("alice"), Value::Bool(true)],
+            vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
         let diff = store.diff(&event).unwrap();
@@ -746,12 +790,12 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// one, so both have to be replayed.
     #[test]
     fn moving_the_bound_key_hands_over_both_values() {
-        let store = shapes(RESIDUAL);
+        let store = shapes(EXPIRING);
         let members = table(&store, "team_members");
         let event = TestEvent::<Postgres>::update(
             members,
-            vec![Value::Int(3), text("alice"), Value::Bool(true)],
-            vec![Value::Int(4), text("alice"), Value::Bool(true)],
+            vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
+            vec![Value::Int(4), text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
         let diff = store.diff(&event).unwrap();
@@ -764,12 +808,12 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// The same key on both sides is replayed once.
     #[test]
     fn an_unmoved_bound_key_is_handed_over_once() {
-        let store = shapes(RESIDUAL);
+        let store = shapes(EXPIRING);
         let members = table(&store, "team_members");
         let event = TestEvent::<Postgres>::update(
             members,
-            vec![Value::Int(3), text("alice"), Value::Bool(false)],
-            vec![Value::Int(3), text("alice"), Value::Bool(true)],
+            vec![Value::Int(3), text("alice"), text("2026-01-01T00:00:00Z")],
+            vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
         let diff = store.diff(&event).unwrap();
@@ -783,12 +827,12 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// which a key-only image carries.
     #[test]
     fn a_key_only_previous_image_still_hands_over_its_query() {
-        let store = shapes(RESIDUAL);
+        let store = shapes(EXPIRING);
         let members = table(&store, "team_members");
         let event = TestEvent::<Postgres>::update(
             members,
             vec![Value::Int(3), Value::Missing, Value::Missing],
-            vec![Value::Int(3), text("alice"), Value::Bool(true)],
+            vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
         )
         .with_pk_columns([0u16]);
 
@@ -796,6 +840,78 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
 
         assert_eq!(diff.requeries.len(), 1);
         assert_eq!(diff.requeries[0].key, [Value::Int(3)]);
+    }
+
+    /// The finding this module's reconciliation contract closes: a residual
+    /// the row image evaluates settles the shape, so deleting the row that
+    /// carried a permission reports the fact it stated as removed.
+    #[test]
+    fn withdrawing_a_residual_guarded_grant_reports_the_removal() {
+        let store = shapes(RESIDUAL);
+        let members = table(&store, "team_members");
+        let event = TestEvent::<Postgres>::delete(
+            members,
+            vec![Value::Int(3), text("alice"), Value::Bool(true)],
+        );
+
+        let diff = store.diff(&event).unwrap();
+        assert!(diff.added.is_empty());
+        assert_eq!(
+            diff.removed,
+            [record("teams:3", member_relation(), "user:alice")],
+            "alice's membership is gone, so the fact it carried has to be removed"
+        );
+        assert!(
+            diff.requeries.is_empty(),
+            "the row settles the shape, so nothing is left to replay"
+        );
+    }
+
+    /// A row the residual refuses states no record, exactly as the loading
+    /// SQL's `WHERE` leaves it out.
+    #[test]
+    fn a_row_the_residual_refuses_states_no_record() {
+        let store = shapes(RESIDUAL);
+        let members = table(&store, "team_members");
+        let event = TestEvent::<Postgres>::insert(
+            members,
+            vec![Value::Int(3), text("alice"), Value::Bool(false)],
+        );
+
+        let diff = store.diff(&event).unwrap();
+        assert!(diff.added.is_empty(), "{:?}", diff.added);
+    }
+
+    /// The genuinely joined sibling: the clock keeps the shape joined, so a
+    /// delete reports no removal itself and instead hands over the replay
+    /// whose reconciliation takes the stale fact out. The slice it declares
+    /// is what makes that removal possible, so it is pinned here.
+    #[test]
+    fn withdrawing_an_expiring_grant_hands_over_the_replay_and_its_slice() {
+        let store = shapes(EXPIRING);
+        let members = table(&store, "team_members");
+        let event = TestEvent::<Postgres>::delete(
+            members,
+            vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
+        );
+
+        let diff = store.diff(&event).unwrap();
+        assert!(diff.added.is_empty());
+        assert!(
+            diff.removed.is_empty(),
+            "no row image evaluates the clock, so the replay is the remover"
+        );
+        assert_eq!(diff.requeries.len(), 1);
+        let requery = &diff.requeries[0];
+        assert_eq!(requery.key, [Value::Int(3)]);
+        assert_eq!(
+            requery.query.scope,
+            ReplayScope::Object {
+                object_type: "teams".to_string(),
+                relations: alloc::vec![member_relation()],
+            },
+            "the replay determines the one team's member facts"
+        );
     }
 
     /// A table whose key spans two columns is replayed by the whole of it.
@@ -807,7 +923,7 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// returning removes another row's records.
     #[test]
     fn a_compound_key_hands_over_every_column_in_placeholder_order() {
-        let store = shapes(COMPOUND_KEY);
+        let store = compound_key_store();
         let readings = table(&store, "readings");
         let event = TestEvent::<Postgres>::insert(
             readings,
@@ -861,6 +977,45 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
         assert!(
             diff.removed.is_empty(),
             "the row is new so nothing was held before"
+        );
+    }
+
+    /// A replay's slice another shape also states is not its own to
+    /// reconcile: what the replay stopped returning may be the other shape's
+    /// living fact. The joined shape is named uncovered and hands nothing
+    /// over, while the settled sibling keeps differencing.
+    #[test]
+    fn a_replay_whose_slice_another_shape_states_is_named_as_uncovered() {
+        let store = shapes(SHARED_SLICE);
+
+        let uncovered = store.uncovered();
+        assert!(
+            uncovered
+                .iter()
+                .any(|gap| gap.table == "team_guests"
+                    && gap.reason == UncoveredReason::SharedSlice),
+            "the guest shape's slice is also stated by the member shape: {uncovered:?}"
+        );
+
+        let guests = table(&store, "team_guests");
+        let event = TestEvent::<Postgres>::delete(
+            guests,
+            vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
+        );
+        let diff = store.diff(&event).unwrap();
+        assert!(
+            diff.requeries.is_empty(),
+            "a replay nobody may reconcile is not handed over: {:?}",
+            diff.requeries
+        );
+
+        let members = table(&store, "team_members");
+        let event = TestEvent::<Postgres>::delete(members, vec![Value::Int(3), text("alice")]);
+        let diff = store.diff(&event).unwrap();
+        assert_eq!(
+            diff.removed,
+            [record("teams:3", member_relation(), "user:alice")],
+            "the settled sibling still differences its own rows"
         );
     }
 
@@ -995,11 +1150,11 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// nothing for it, so replaying it would be a round trip for no rows.
     #[test]
     fn a_null_bound_key_names_no_row_to_replay() {
-        let store = shapes(RESIDUAL);
+        let store = shapes(EXPIRING);
         let members = table(&store, "team_members");
         let event = TestEvent::<Postgres>::insert(
             members,
-            vec![Value::Null, text("alice"), Value::Bool(true)],
+            vec![Value::Null, text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
         let diff = store.diff(&event).unwrap();
@@ -1010,7 +1165,7 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// A NULL in any column of the key names no row, not only in the first.
     #[test]
     fn a_null_later_in_a_compound_key_names_no_row_to_replay() {
-        let store = shapes(COMPOUND_KEY);
+        let store = compound_key_store();
         let readings = table(&store, "readings");
         let event = TestEvent::<Postgres>::insert(
             readings,
@@ -1027,11 +1182,11 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// nothing saying so.
     #[test]
     fn a_bound_key_the_source_did_not_carry_is_refused() {
-        let store = shapes(RESIDUAL);
+        let store = shapes(EXPIRING);
         let members = table(&store, "team_members");
         let event = TestEvent::<Postgres>::insert(
             members,
-            vec![Value::Missing, text("alice"), Value::Bool(true)],
+            vec![Value::Missing, text("alice"), text("2027-01-01T00:00:00Z")],
         );
 
         assert_eq!(store.diff(&event), Err(StoreDiffError::MissingBoundKey(0)));
@@ -1042,7 +1197,7 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
     /// first of the key.
     #[test]
     fn a_compound_key_the_source_carried_in_part_is_refused() {
-        let store = shapes(COMPOUND_KEY);
+        let store = compound_key_store();
         let readings = table(&store, "readings");
         let event = TestEvent::<Postgres>::insert(
             readings,
@@ -1138,8 +1293,16 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
         )
         .unwrap();
         let relations = vec![
-            joining(can_select_relation(), "SELECT 'read' WHERE id = $1;"),
-            joining(can_delete_relation(), "SELECT 'delete' WHERE id = $1;"),
+            joining(
+                can_select_relation(),
+                &[can_select_relation()],
+                "SELECT 'read' WHERE id = $1;",
+            ),
+            joining(
+                can_delete_relation(),
+                &[can_delete_relation()],
+                "SELECT 'delete' WHERE id = $1;",
+            ),
         ];
         let store = Shapes::new(db, &relations);
         let docs = table(&store, "docs");
@@ -1174,8 +1337,16 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
         .unwrap();
         let same = "SELECT 'read' WHERE id = $1;";
         let relations = vec![
-            joining(can_select_relation(), same),
-            joining(can_delete_relation(), same),
+            joining(
+                can_select_relation(),
+                &[can_select_relation(), can_delete_relation()],
+                same,
+            ),
+            joining(
+                can_delete_relation(),
+                &[can_select_relation(), can_delete_relation()],
+                same,
+            ),
         ];
         let store = Shapes::new(db, &relations);
         let docs = table(&store, "docs");
@@ -1187,8 +1358,16 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
         assert_eq!(diff.requeries.len(), 1);
     }
 
-    /// One relation filled by a joining shape whose query binds `docs.id`.
-    fn joining(relation: RelationName, sql: &str) -> RelationShapes {
+    /// One relation filled by a joining shape whose query binds `docs.id`,
+    /// with `scope_relations` the relations the source declares it fills:
+    /// its own for a source of one relation, and every one it feeds for a
+    /// source shared across entries, exactly as rls2fga derives the scope
+    /// from the source alone.
+    fn joining(
+        relation: RelationName,
+        scope_relations: &[RelationName],
+        sql: &str,
+    ) -> RelationShapes {
         RelationShapes {
             type_name: test_names::docs_type(),
             relation,
@@ -1200,6 +1379,11 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
                         table: "docs".to_string(),
                         key_columns: vec![test_names::column("id")],
                         sql: sql.to_string(),
+                        condition: None,
+                        scope: ReplayScope::Object {
+                            object_type: test_names::docs_type().as_str().to_string(),
+                            relations: scope_relations.to_vec(),
+                        },
                     }],
                     reason: "two rows".to_string(),
                 },
@@ -1226,7 +1410,39 @@ CREATE POLICY p ON readings FOR SELECT USING (starts_at <= now());
                 .map(test_names::column)
                 .collect(),
             sql: alloc::format!("SELECT 1 FROM \"{table}\" WHERE {predicate};"),
+            condition: None,
+            scope: ReplayScope::Object {
+                object_type: table.to_string(),
+                relations: alloc::vec![can_select_relation()],
+            },
         }
+    }
+
+    /// A store over one compound-key table, reached only by a bound query.
+    ///
+    /// Hand built, because every schema-derived joining shape binds a single
+    /// column at the current pin: the compound binds belong to the grant
+    /// shapes, whose recognition needs a function registry the translator
+    /// here does not carry.
+    fn compound_key_store() -> Shapes<ParserDB> {
+        let db = ParserDB::parse::<PostgreSqlDialect>(COMPOUND_KEY).unwrap();
+        let entry = RelationShapes {
+            // The entry's own type name is irrelevant to the mechanics under
+            // test, so the one the helpers already mint serves.
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: vec!["readings".to_string()],
+                derivation: RecordDerivation::Joined {
+                    queries: vec![bound("readings", &["tenant_id", "reading_id"])],
+                    reason: "the guard is settled by the request".to_string(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        };
+        Shapes::new(db, &[entry])
     }
 
     /// One `can_select` relation filled by a joining shape that reads `tables`

@@ -274,12 +274,14 @@ fn as_json<T: serde::Serialize>(payload: &T) -> Option<serde_json::Value> {
 /// record rather than a record keyed on a rendering that may not match
 /// the whole-table query. A caller needing one of those must widen this
 /// deliberately, with a test pinning the rendering against the loader.
-fn render_text<B: crate::backend::Backend>(value: &Value<B>) -> Option<String> {
+pub(crate) fn render_text<B: crate::backend::Backend>(value: &Value<B>) -> Option<String> {
     let scalar = match value {
         Value::String(s) => return Some(s.as_ref().to_string()),
         Value::Int(i) => as_json(i)?,
         Value::Uuid(u) => as_json(u)?,
         Value::Bool(b) => as_json(b)?,
+        Value::Timestamp(t) => return timestamp_text(as_json(t)?),
+        Value::TimestampTz(t) => return timestamp_text(as_json(t)?),
         _ => return None,
     };
     match scalar {
@@ -288,6 +290,35 @@ fn render_text<B: crate::backend::Backend>(value: &Value<B>) -> Option<String> {
         serde_json::Value::Bool(b) => Some(if b { "true" } else { "false" }.to_string()),
         _ => None,
     }
+}
+
+/// A serialized timestamp respelled the way `to_jsonb` prints one, which is
+/// what the loading SQL writes into a record's context: `Z` widens to
+/// `+00:00`, and the fraction drops its trailing zeros, then itself when
+/// nothing is left. The wal adapters normalize a `timestamptz` to UTC, so
+/// `Z` and no suffix are the only spellings that reach this. Anything else
+/// passes through untouched rather than being reshaped on a guess.
+fn timestamp_text(scalar: serde_json::Value) -> Option<String> {
+    let serde_json::Value::String(text) = scalar else {
+        return None;
+    };
+    let (body, zone) = match text.strip_suffix('Z') {
+        Some(body) => (body, "+00:00"),
+        None if text.contains('+') => return Some(text),
+        None => (text.as_str(), ""),
+    };
+    let body = match body.split_once('.') {
+        Some((whole, fraction)) => {
+            let fraction = fraction.trim_end_matches('0');
+            if fraction.is_empty() {
+                alloc::borrow::Cow::Borrowed(whole)
+            } else {
+                alloc::borrow::Cow::Owned(alloc::format!("{whole}.{fraction}"))
+            }
+        }
+        None => alloc::borrow::Cow::Borrowed(body),
+    };
+    Some(alloc::format!("{body}{zone}"))
 }
 
 /// Walk `path` into `json`, outermost field first, and read the leaf as
@@ -457,6 +488,42 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         row[4] = Value::Uuid(id);
         let got = records(&description(ValueSource::column("key"), vec![]), row).unwrap();
         assert_eq!(got[0].subject, "user:550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    /// A `timestamptz` renders exactly as `to_jsonb` prints one, which is
+    /// what the loading SQL writes into a record's context: `T` separator,
+    /// `+00:00` rather than `Z`, and the fraction trimmed of trailing zeros
+    /// down to nothing.
+    #[test]
+    fn a_timestamptz_renders_as_to_jsonb_prints_it() {
+        use super::render_text;
+        use crate::backend::Postgres;
+
+        let whole = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            render_text::<Postgres>(&Value::TimestampTz(whole)).as_deref(),
+            Some("2026-01-01T00:00:00+00:00")
+        );
+
+        let fractional = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.123400Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            render_text::<Postgres>(&Value::TimestampTz(fractional)).as_deref(),
+            Some("2026-01-01T00:00:00.1234+00:00"),
+            "the fraction drops its trailing zeros exactly as PostgreSQL prints it"
+        );
+
+        let naive =
+            chrono::NaiveDateTime::parse_from_str("2026-01-01 00:00:30", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        assert_eq!(
+            render_text::<Postgres>(&Value::Timestamp(naive)).as_deref(),
+            Some("2026-01-01T00:00:30"),
+            "a timestamp without a zone carries none"
+        );
     }
 
     /// A NULL subject grants nobody, and says so by producing no record
