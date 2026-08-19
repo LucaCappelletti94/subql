@@ -428,6 +428,9 @@ where
     /// What each membership subquery in `spec`'s filter needs seeded, without
     /// registering anything.
     ///
+    /// A caller comparison appears in no description: it seeds itself from the
+    /// subscriber the request states, so there is nothing to read for it.
+    ///
     /// [`Self::register`] consumes the seed and an absent one admits nobody, so
     /// the caller's obligation runs before registration, and this is the only
     /// thing that runs the classification `register` runs. Describe the request,
@@ -453,6 +456,7 @@ where
         plans
             .iter()
             .zip(&compiled.terms)
+            .filter(|(plan, _)| plan.moved_by.is_some())
             .map(|(plan, term)| {
                 TermDescription::resolve(plan, term, compiled.table_id, &self.database)
             })
@@ -532,8 +536,8 @@ where
         // aggregate on a table with row-level security is refused above.
         if matches!(projection, QueryProjection::Aggregate(_)) {
             return Err(RegisterError::MembershipTermRefused(
-                "an aggregate cannot carry a membership subquery. SubQL keeps one accumulator \
-                 per aggregate and shares it between consumers, and a membership subquery gives \
+                "an aggregate cannot carry a membership term. SubQL keeps one accumulator \
+                 per aggregate and shares it between consumers, and a membership term gives \
                  each consumer a different set of rows to aggregate."
                     .to_string(),
             ));
@@ -568,9 +572,9 @@ where
                 .any(|other| other.slot != term.slot && other.column == term.column)
             {
                 return Err(RegisterError::MembershipTermRefused(format!(
-                    "two membership subqueries in one filter compare column {column} of table \
+                    "two membership terms in one filter compare column {column} of table \
                      {table_id}. A subscription states the values it matches per compared column, \
-                     so two subqueries on one column leave SubQL unable to tell which values \
+                     so two terms on one column leave SubQL unable to tell which values \
                      belong to which.",
                     column = term.column,
                 )));
@@ -599,9 +603,10 @@ where
 
         let subscriber = spec.subscriber.clone().ok_or_else(|| {
             RegisterError::MembershipTermRefused(
-                "a filter naming a membership subquery has to say which subscriber it filters \
+                "a filter naming a membership term has to say which subscriber it filters \
                  for. SubQL matches a changed membership row against that identity to move who \
-                 the filter admits, so without one the subscription could never be moved."
+                 the filter admits, and a caller comparison admits exactly that identity, so \
+                 without one the subscription could never deliver."
                     .to_string(),
             )
         })?;
@@ -614,12 +619,29 @@ where
             ));
         };
 
+        // A caller comparison seeds itself: the one value it admits is the
+        // subscriber, and it has to be of the compared column's kind, or the
+        // lookup would store a key no row's cell can ever equal and serve the
+        // subscription dead.
         let mut seeds: Vec<Vec<TermKey<E::Backend>>> = alloc::vec![Vec::new(); terms.len()];
+        for term in terms.iter().filter(|term| term.compares_the_caller()) {
+            let compared =
+                catalog_helpers::column_scalar_kind(&self.database, table_id, term.column);
+            let stated = subscriber.scalar_kind();
+            if compared != Some(stated) {
+                return Err(RegisterError::MembershipTermRefused(format!(
+                    "the subscriber this subscription filters for is of kind {stated:?}, and its \
+                     caller comparison reads a column of kind {compared:?}, so no row could ever \
+                     name it. Build the identity at the compared column's kind."
+                )));
+            }
+            seeds[usize::from(term.slot)].push(subscriber.clone());
+        }
+
         for (column_name, values) in &spec.term_values {
             let column = catalog_helpers::column_id(&self.database, table_id, column_name);
-            let slot = column
+            let term = column
                 .and_then(|column| terms.iter().find(|term| term.column == column))
-                .map(|term| usize::from(term.slot))
                 .ok_or_else(|| {
                     RegisterError::MembershipTermRefused(format!(
                         "this subscription states the values it matches for column \
@@ -627,6 +649,17 @@ where
                          The values would be stored where nothing reads them."
                     ))
                 })?;
+            // The one term comparing this column, since two on one column were
+            // refused above.
+            if term.compares_the_caller() {
+                return Err(RegisterError::MembershipTermRefused(format!(
+                    "this subscription states values for column {column_name:?}, which its \
+                     filter compares to the caller directly. A caller comparison seeds itself \
+                     from the subscriber, and stated values would admit rows the filter's text \
+                     never names."
+                )));
+            }
+            let slot = usize::from(term.slot);
             for value in values {
                 let TermLookup::Key(key) = TermLookup::of(value.clone()) else {
                     return Err(RegisterError::MembershipTermRefused(format!(
@@ -661,14 +694,17 @@ where
         compiled
             .term_plans
             .iter()
-            .map(|plan| TermWatch {
-                subscribed: compiled.table_id,
-                predicate: pred_id,
-                slot: plan.slot,
-                column: plan.column,
-                member_table: plan.member_table,
-                member_key: plan.member_key,
-                member_subject: plan.member_subject,
+            .filter_map(|plan| {
+                let movement = plan.moved_by?;
+                Some(TermWatch {
+                    subscribed: compiled.table_id,
+                    predicate: pred_id,
+                    slot: plan.slot,
+                    column: plan.column,
+                    member_table: movement.member_table,
+                    member_key: movement.member_key,
+                    member_subject: movement.member_subject,
+                })
             })
             .collect()
     }
@@ -736,7 +772,7 @@ where
     ) -> Result<Vec<TermPlan>, RegisterError> {
         Err(RegisterError::MembershipTermRefused(
             "this build was compiled without the membership-term feature, which is what serves \
-             a membership subquery at all. The filter itself is one SubQL recognises."
+             a membership term at all. The filter itself is one SubQL recognises."
                 .to_string(),
         ))
     }
@@ -1775,14 +1811,17 @@ where
                 &pending.subscriber,
                 &pending.seeds,
             );
-            watches.extend(pending.plans.iter().map(|plan| TermWatch {
-                subscribed: pending.table,
-                member_table: plan.member_table,
-                predicate: binding.predicate_id,
-                slot: plan.slot,
-                column: plan.column,
-                member_key: plan.member_key,
-                member_subject: plan.member_subject,
+            watches.extend(pending.plans.iter().filter_map(|plan| {
+                let movement = plan.moved_by?;
+                Some(TermWatch {
+                    subscribed: pending.table,
+                    member_table: movement.member_table,
+                    predicate: binding.predicate_id,
+                    slot: plan.slot,
+                    column: plan.column,
+                    member_key: movement.member_key,
+                    member_subject: movement.member_subject,
+                })
             }));
         }
         self.watch_terms(watches);

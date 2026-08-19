@@ -12,13 +12,13 @@
 use alloc::format;
 use alloc::string::ToString;
 
-use rls2fga::generator::records::{RecordDerivation, ValueSource};
+use rls2fga::generator::records::{Guard, RecordDerivation, ValueSource};
 use rls2fga::generator::relations::RelationShapes;
 use rls2fga::term::{describe_membership_term, TermChain, TermShapes};
 use rls2fga::translator::Translator;
 use sql_traits::prelude::DatabaseLike;
 
-use crate::term::{CompiledTerm, TermPlan};
+use crate::term::{CompiledTerm, TermMovement, TermPlan};
 use crate::{catalog_helpers, RegisterError, TableId};
 
 /// Settle whether `term` on `table` can be served, and how its subscriber set
@@ -49,7 +49,11 @@ pub fn plan_term<DB: DatabaseLike>(
     )
     .map_err(|refusal| RegisterError::MembershipTermRefused(refusal.reason))?;
 
-    let (member_table, member_key, member_subject) = member_columns(&shapes, database)?;
+    if term.compares_the_caller() {
+        return caller_plan(term, table, database, &shapes);
+    }
+
+    let movement = member_columns(&shapes, database)?;
 
     // The value the term compares has to be the value the membership row keys
     // its object on, or the lookup stores under one key and reads under another.
@@ -57,7 +61,8 @@ pub fn plan_term<DB: DatabaseLike>(
     // says so rather than trusting it, since a mismatch admits nobody in
     // silence.
     let compared = catalog_helpers::column_scalar_kind(database, table, term.column);
-    let keyed = catalog_helpers::column_scalar_kind(database, member_table, member_key);
+    let keyed =
+        catalog_helpers::column_scalar_kind(database, movement.member_table, movement.member_key);
     if compared != keyed {
         return Err(RegisterError::MembershipTermRefused(format!(
             "the column this filter compares and the column the relationship is keyed on hold \
@@ -69,9 +74,91 @@ pub fn plan_term<DB: DatabaseLike>(
     Ok(TermPlan {
         slot: term.slot,
         column: term.column,
-        member_table,
-        member_key,
-        member_subject,
+        moved_by: Some(movement),
+    })
+}
+
+/// Settle a caller comparison: the compiled rule has to be the one link naming
+/// the caller from the compared column of the subscribed row, with nothing
+/// beside it, or the SQL and the term would answer differently.
+///
+/// Verified against the shapes rather than trusted, in the same spirit as the
+/// kind check above: each divergence admits the wrong rows in silence.
+fn caller_plan<DB: DatabaseLike>(
+    term: &CompiledTerm,
+    table: TableId,
+    database: &DB,
+    shapes: &TermShapes,
+) -> Result<TermPlan, RegisterError> {
+    let TermChain::Direct { relation } = &shapes.chain else {
+        return Err(RegisterError::MembershipTermRefused(
+            "this comparison reaches the subscriber through more than the compared row itself, \
+             so the subscriber the request states is not the one value it admits"
+                .to_string(),
+        ));
+    };
+    let entry = shapes
+        .relations
+        .iter()
+        .find(|entry| &entry.relation == relation)
+        .ok_or_else(|| {
+            RegisterError::MembershipTermRefused(format!(
+                "nothing states the records for '{relation}', so the comparison admits nobody"
+            ))
+        })?;
+
+    let refuse = |what: &str| {
+        RegisterError::MembershipTermRefused(format!(
+            "the records for '{relation}' {what}, so the subscriber the request states is not \
+             the one value this comparison admits",
+            relation = entry.relation,
+        ))
+    };
+    let [shape] = entry.shapes.as_slice() else {
+        return Err(refuse("are stated by more than one query, or by none"));
+    };
+    let RecordDerivation::FromRow {
+        table: row_table,
+        template,
+        guards,
+        ..
+    } = &shape.derivation
+    else {
+        return Err(refuse("need more than one row"));
+    };
+    // A conditional record grants nobody on its own: the service completes the
+    // comparison with what the request supplies, and the term performs no such
+    // completion.
+    if template.context.is_some() {
+        return Err(refuse(
+            "carry a condition the compared row alone does not answer",
+        ));
+    }
+    // The one guard the term itself enforces: a NULL compared cell keys nothing
+    // and admits nobody, which is exactly `NotNull` on the compared column. Any
+    // other guard admits records only for rows the term never re-checks.
+    let enforced_by_the_lookup = |guard: &Guard| {
+        matches!(guard, Guard::NotNull(column)
+            if catalog_helpers::column_id(database, table, column.as_str()) == Some(term.column))
+    };
+    if !guards.iter().all(enforced_by_the_lookup) {
+        return Err(refuse(
+            "are guarded on more than the compared value being present",
+        ));
+    }
+    if catalog_helpers::table_id(database, row_table) != Some(table) {
+        return Err(refuse("read a table other than the subscribed one"));
+    }
+    if column_of(template.subject_key.part(), database, table) != Some(term.column) {
+        return Err(refuse(
+            "name the caller from something other than the compared column",
+        ));
+    }
+
+    Ok(TermPlan {
+        slot: term.slot,
+        column: term.column,
+        moved_by: None,
     })
 }
 
@@ -84,7 +171,7 @@ pub fn plan_term<DB: DatabaseLike>(
 fn member_columns<DB: DatabaseLike>(
     shapes: &TermShapes,
     database: &DB,
-) -> Result<(TableId, u16, u16), RegisterError> {
+) -> Result<TermMovement, RegisterError> {
     let relation =
         match &shapes.chain {
             TermChain::Direct { relation } => relation,
@@ -118,7 +205,7 @@ fn member_columns<DB: DatabaseLike>(
 fn read_from_one_row<DB: DatabaseLike>(
     entry: &RelationShapes,
     database: &DB,
-) -> Result<(TableId, u16, u16), RegisterError> {
+) -> Result<TermMovement, RegisterError> {
     let refuse = |what: &str| {
         RegisterError::MembershipTermRefused(format!(
             "the records for '{relation}' {what}, so SubQL cannot tell from a changed row who \
@@ -147,7 +234,11 @@ fn read_from_one_row<DB: DatabaseLike>(
     let subject = column_of(template.subject_key.part(), database, table_id)
         .ok_or_else(|| refuse("name their subject from something other than a column"))?;
 
-    Ok((table_id, key, subject))
+    Ok(TermMovement {
+        member_table: table_id,
+        member_key: key,
+        member_subject: subject,
+    })
 }
 
 /// The column `source` reads, when it reads exactly one scalar column of

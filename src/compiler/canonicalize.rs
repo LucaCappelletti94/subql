@@ -90,7 +90,7 @@ fn extract_where(stmt: &Statement) -> Result<Option<Expr>, RegisterError> {
 /// - Sort AND/OR operands alphabetically
 /// - Remove redundant parentheses
 /// - Normalize to canonical string representation
-fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
+pub(super) fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
     normalize_expr_inner(expr, 0)
 }
 
@@ -287,6 +287,13 @@ fn normalize_expr_inner(expr: &Expr, depth: usize) -> Result<String, RegisterErr
         Expr::Value(val) => {
             format!("{}", val.value)
         }
+
+        // A call is rendered by sqlparser rather than by the Debug fallback
+        // below, for the same reason the membership subquery above is: `Ident`
+        // derives `Debug` over its byte span while its `PartialEq` ignores it,
+        // so a Debug rendering would make predicate identity depend on where in
+        // the statement the call was written.
+        Expr::Function(function) => format!("{function}"),
 
         _ => {
             // Fallback: use debug representation

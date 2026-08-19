@@ -61,7 +61,7 @@ impl<B: Backend> Compiling<B> {
         let slot = u16::try_from(self.terms.len()).unwrap_or(u16::MAX);
         if usize::from(slot) >= MAX_TERMS_PER_FILTER {
             return Err(RegisterError::MembershipTermRefused(format!(
-                "a filter may name at most {MAX_TERMS_PER_FILTER} membership subqueries, because \
+                "a filter may name at most {MAX_TERMS_PER_FILTER} membership terms, because \
                  SubQL answers each changed row for every combination of them and that is \
                  2^{MAX_TERMS_PER_FILTER} evaluations at the cap"
             )));
@@ -324,8 +324,8 @@ where
         // reason an aggregate on a table with row-level security is refused.
         if !terms.is_empty() {
             return Err(RegisterError::MembershipTermRefused(
-                "an aggregate cannot carry a membership subquery. SubQL keeps one accumulator \
-                 per aggregate and shares it between consumers, and a membership subquery gives \
+                "an aggregate cannot carry a membership term. SubQL keeps one accumulator \
+                 per aggregate and shares it between consumers, and a membership term gives \
                  each consumer a different set of rows to aggregate."
                     .to_string(),
             ));
@@ -709,11 +709,53 @@ where
         ScalarKind::String,
     )?;
     wrap_bare_value_as_tri::<B>(&mut compiling)?;
-    let columns = term_columns(&compiling.terms);
-    Ok((
-        BytecodeProgram::with_terms(compiling.out, columns),
-        compiling.terms,
-    ))
+    let terms = canonicalize_term_slots(&mut compiling)?;
+    let columns = term_columns(&terms);
+    Ok((BytecodeProgram::with_terms(compiling.out, columns), terms))
+}
+
+/// Renumber the term slots into normalized-text order and rewrite the
+/// program's [`Instruction::TermTruth`] operands to match.
+///
+/// Predicate identity is the normalized WHERE text, which sorts `AND`/`OR`
+/// operands, so two spellings of one filter share one predicate. Slots were
+/// assigned in source order, and a subscription binding to a shared predicate
+/// seeds by its own compile's slots, so the numbering has to be a function of
+/// the normalized text too, or a reversed spelling stores one column's values
+/// where dispatch reads another's.
+///
+/// Two terms cannot normalize alike: the text carries the compared column,
+/// and two terms comparing one column are refused at registration, so the
+/// order below never ties on filters SubQL serves.
+fn canonicalize_term_slots<B: Backend>(
+    compiling: &mut Compiling<B>,
+) -> Result<Vec<CompiledTerm>, RegisterError> {
+    let terms = core::mem::take(&mut compiling.terms);
+    if terms.len() < 2 {
+        return Ok(terms);
+    }
+
+    let mut keyed: Vec<(String, CompiledTerm)> = terms
+        .into_iter()
+        .map(|term| Ok((canonicalize::normalize_expr(&term.expr)?, term)))
+        .collect::<Result<_, RegisterError>>()?;
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut remap = [0u16; MAX_TERMS_PER_FILTER];
+    let mut sorted = Vec::with_capacity(keyed.len());
+    for (new_slot, (_, mut term)) in keyed.into_iter().enumerate() {
+        let new_slot = u16::try_from(new_slot).unwrap_or(u16::MAX);
+        remap[usize::from(term.slot)] = new_slot;
+        term.slot = new_slot;
+        sorted.push(term);
+    }
+    for instruction in &mut compiling.out {
+        if let Instruction::TermTruth(slot) = instruction {
+            *slot = remap[usize::from(*slot)];
+        }
+    }
+
+    Ok(sorted)
 }
 
 /// Recursive helper for expression compilation.
@@ -806,6 +848,28 @@ where
                     out[jump_idx] = Instruction::JumpIfTrue(rhs_len + 1);
                 }
                 _ => {
+                    // A comparison of a column to a columnless call is the
+                    // caller comparison, recognised here in every build like
+                    // the membership subquery below: dispatch reads the
+                    // compared column off the changed row, and the subscriber
+                    // the request states is the one value the term admits.
+                    // Whether the call names the caller is registration's
+                    // question, since answering it needs `rls2fga`.
+                    if sql_shape::is_caller_comparison(expr) {
+                        let tested = if resolve_column_ref(left, table_id, database).is_some() {
+                            left
+                        } else {
+                            right
+                        };
+                        if let Some(column) = resolve_column_ref(tested, table_id, database) {
+                            let slot = out.term_slot(expr, column)?;
+                            out.push(Instruction::TermTruth(slot));
+                            return Ok(());
+                        }
+                        // A name that resolves to no column falls through to
+                        // the generic arms, whose refusal names it.
+                    }
+
                     // Non-short-circuit operators: compile both sides,
                     // then emit the op. Target-typed literal inference
                     // picks whichever sibling is a column reference and
@@ -813,7 +877,6 @@ where
                     let child_target = column_scalar_of(left, table_id, database)
                         .or_else(|| column_scalar_of(right, table_id, database))
                         .unwrap_or(ScalarKind::String);
-
                     compile_expr_recursive::<B, DB>(
                         left,
                         table_id,
@@ -1045,6 +1108,12 @@ where
             if matches!(op, UnaryOperator::Not) && sql_shape::contains_membership_subquery(inner) {
                 return Err(negated_term_refusal());
             }
+            // A negated caller comparison is refused for its own reason: the
+            // negation admits every other subscriber, including through a NULL
+            // cell that SQL's three-valued logic admits for nobody.
+            if matches!(op, UnaryOperator::Not) && sql_shape::contains_caller_comparison(inner) {
+                return Err(negated_caller_refusal());
+            }
 
             compile_expr_recursive::<B, DB>(
                 inner,
@@ -1190,6 +1259,18 @@ fn negated_term_refusal() -> RegisterError {
         "NOT IN with a subquery is not supported. SubQL serves a membership subquery by \
          tracking the relationship it names, and subtraction names no relationship to track. \
          Use NOT IN with a literal list, or run this as a regular SQL query in your database."
+            .to_string(),
+    )
+}
+
+/// Why a negated caller comparison is refused, in one place for the same
+/// reason [`negated_term_refusal`] is.
+fn negated_caller_refusal() -> RegisterError {
+    RegisterError::UnsupportedSql(
+        "NOT over a comparison to the caller is not supported. SubQL serves the comparison \
+         by admitting exactly the subscriber the row names, and its negation admits every \
+         other subscriber, including through a NULL cell that SQL's own three-valued logic \
+         admits for nobody. Run this as a regular SQL query in your database."
             .to_string(),
     )
 }

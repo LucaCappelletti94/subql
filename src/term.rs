@@ -43,6 +43,19 @@ pub struct CompiledTerm {
     pub expr: Expr,
 }
 
+impl CompiledTerm {
+    /// Whether this term compares the caller directly rather than through a
+    /// membership subquery.
+    ///
+    /// The distinction decides how the term seeds: a caller comparison admits
+    /// exactly the subscriber the request states, so it seeds itself and takes
+    /// no stated values, and nothing ever moves its set.
+    #[must_use]
+    pub fn compares_the_caller(&self) -> bool {
+        crate::compiler::sql_shape::is_caller_comparison(&self.expr)
+    }
+}
+
 /// What registration settled about one term, beyond what the compiler saw.
 ///
 /// The compiler knows which column the filter compares. Whether the
@@ -54,15 +67,25 @@ pub struct TermPlan {
     pub slot: u16,
     /// The column of the subscribed table the term compares.
     pub column: ColumnId,
+    /// The rows that move which subscribers the term admits.
+    ///
+    /// `None` for a caller comparison: its set is the subscriber itself, and an
+    /// identity does not change, so no table's rows are watched for it.
+    pub moved_by: Option<TermMovement>,
+}
+
+/// The table and columns whose changed rows move a membership term's set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermMovement {
     /// The table whose changed rows move which subscribers the term admits.
     ///
-    /// The subscribed table itself when the filter names the caller directly,
-    /// and the membership table when it names the caller through a related row.
-    /// One walk covers both, because in each case it is the table the shape that
-    /// names a caller reads.
+    /// The subscribed table itself when the filter names the caller from its
+    /// own rows, and the membership table when it names the caller through a
+    /// related row. One walk covers both, because in each case it is the table
+    /// the shape that names a caller reads.
     pub member_table: TableId,
-    /// The column of `member_table` carrying the value [`column`](Self::column)
-    /// is compared against.
+    /// The column of `member_table` carrying the value the term's compared
+    /// column is compared against.
     pub member_key: ColumnId,
     /// The column of `member_table` naming the subscriber a row admits.
     pub member_subject: ColumnId,
@@ -139,13 +162,23 @@ impl TermDescription {
                     .into(),
             ));
         };
+        // A caller comparison seeds itself from the subscriber, so no read
+        // describes it. `describe_terms` skips such plans, and this is what a
+        // later caller of `resolve` gets instead of a fabricated read.
+        let Some(movement) = plan.moved_by else {
+            return Err(RegisterError::MembershipTermRefused(
+                "this membership term seeds itself from the subscriber, so there is no read to \
+                 describe"
+                    .into(),
+            ));
+        };
 
         Ok(Self {
             column: name(database, table, plan.column)?,
-            member_table: table_name_of(database, plan.member_table)?,
-            member_key: name(database, plan.member_table, plan.member_key)?,
-            member_subject: name(database, plan.member_table, plan.member_subject)?,
-            subject_kind: kind(database, plan.member_table, plan.member_subject)?,
+            member_table: table_name_of(database, movement.member_table)?,
+            member_key: name(database, movement.member_table, movement.member_key)?,
+            member_subject: name(database, movement.member_table, movement.member_subject)?,
+            subject_kind: kind(database, movement.member_table, movement.member_subject)?,
             key_kind: kind(database, table, plan.column)?,
             seed_sql: subquery.to_string(),
         })
@@ -291,6 +324,28 @@ impl<B: Backend> TermKey<B> {
             Self::Date(v) => Value::Date(v),
             Self::Time(v) => Value::Time(v),
             Self::Decimal(v) => Value::Decimal(v),
+        }
+    }
+
+    /// The kind this key holds.
+    ///
+    /// A caller comparison refuses a subscriber whose kind is not the compared
+    /// column's: the lookup matches by variant before value, so a mismatched
+    /// kind would never find what it stored and the subscription would be
+    /// served dead.
+    #[must_use]
+    pub const fn scalar_kind(&self) -> ScalarKind {
+        match self {
+            Self::Bool(_) => ScalarKind::Bool,
+            Self::Int(_) => ScalarKind::Int,
+            Self::String(_) => ScalarKind::String,
+            Self::Bytes(_) => ScalarKind::Bytes,
+            Self::Uuid(_) => ScalarKind::Uuid,
+            Self::Timestamp(_) => ScalarKind::Timestamp,
+            Self::TimestampTz(_) => ScalarKind::TimestampTz,
+            Self::Date(_) => ScalarKind::Date,
+            Self::Time(_) => ScalarKind::Time,
+            Self::Decimal(_) => ScalarKind::Decimal,
         }
     }
 }
@@ -513,12 +568,18 @@ mod tests {
         ];
         assert_eq!(cases.len(), 13, "every ScalarKind must appear here");
         for (kind, value) in cases {
-            let keyed = matches!(TermLookup::of(value), TermLookup::Key(_));
+            let lookup = TermLookup::of(value);
+            let keyed = matches!(lookup, TermLookup::Key(_));
             assert_eq!(
                 kind_can_key(kind),
                 keyed,
                 "{kind:?} disagrees between the gate and the conversion"
             );
+            // The key's own kind is the kind the value was built at, which is
+            // what the caller-comparison refusal compares against the column.
+            if let TermLookup::Key(key) = lookup {
+                assert_eq!(key.scalar_kind(), kind, "the key changed kind in transit");
+            }
         }
     }
 
