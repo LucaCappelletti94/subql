@@ -96,8 +96,9 @@ use crate::{ColumnId, EventKind};
 /// Why a shape's records cannot be kept current from the change stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UncoveredReason {
-    /// The shape reads a column a row image cannot answer, today a list
-    /// column, and it carries no query to fall back on.
+    /// The shape reads a column a row image cannot answer, a list column or
+    /// one whose declared kind has no row-side spelling, and it carries no
+    /// query to fall back on.
     UnreadableColumn,
     /// The shape reads this table but carries no query bound to it, so a
     /// change arriving here has nothing to replay.

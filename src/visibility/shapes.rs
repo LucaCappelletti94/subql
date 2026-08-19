@@ -481,7 +481,8 @@ fn index_recipe<DB: DatabaseLike>(
     let Some(decision) = entry.decision.as_ref() else {
         return;
     };
-    let Some(table) = usable_table(decision).and_then(|name| catalog_helpers::table_id(db, name))
+    let Some(table) =
+        usable_table(decision, db).and_then(|name| catalog_helpers::table_id(db, name))
     else {
         return;
     };
@@ -500,7 +501,7 @@ fn index_shape<DB: DatabaseLike>(
 ) {
     match &shape.derivation {
         RecordDerivation::FromRow { table, .. } => {
-            if !is_evaluable(shape) {
+            if !is_evaluable(shape, db) {
                 uncovered.push(name_gap(
                     entry,
                     shape,
@@ -656,12 +657,12 @@ fn resolve_key<DB: DatabaseLike>(
 ///
 /// A recipe shape this does not recognise falls to the wildcard and delegates.
 /// That is the whole protection against a composition a later rls2fga adds.
-fn usable_table(decision: &RowDecision) -> Option<&str> {
+fn usable_table<'a, DB: DatabaseLike>(decision: &'a RowDecision, db: &DB) -> Option<&'a str> {
     let mut table: Option<&str> = None;
     match decision {
         RowDecision::Leaf { shapes, .. } | RowDecision::RequestGated { shapes, .. } => {
             for shape in shapes {
-                if !is_evaluable(shape) {
+                if !is_evaluable(shape, db) {
                     return None;
                 }
                 let RecordDerivation::FromRow { table: name, .. } = &shape.derivation else {
@@ -674,7 +675,7 @@ fn usable_table(decision: &RowDecision) -> Option<&str> {
         }
         RowDecision::Any(children) | RowDecision::All(children) => {
             for child in children {
-                let name = usable_table(child)?;
+                let name = usable_table(child, db)?;
                 if *table.get_or_insert(name) != name {
                     return None;
                 }
@@ -885,5 +886,28 @@ mod tests {
                 "the database filters none of these rows, by either report"
             );
         }
+    }
+
+    /// A shape reading a column whose kind the row side cannot spell is named
+    /// uncovered at setup rather than served and silently stale: the loading
+    /// SQL spells a `DATE` key through `::text`, and a row image does not, so
+    /// serving the shape would load records no changed row could ever move.
+    #[test]
+    fn a_shape_keyed_on_an_unspellable_kind_is_uncovered() {
+        use crate::visibility::store::UncoveredReason;
+
+        let shapes = shapes(
+            "CREATE TABLE snaps (taken DATE PRIMARY KEY, owner TEXT);
+             ALTER TABLE snaps ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY s ON snaps USING (owner = current_user);",
+        );
+        assert!(
+            shapes
+                .uncovered()
+                .iter()
+                .any(|gap| gap.table == "snaps" && gap.reason == UncoveredReason::UnreadableColumn),
+            "the DATE key has no row-side spelling, so the shape must be named: {:?}",
+            shapes.uncovered()
+        );
     }
 }
