@@ -423,7 +423,7 @@ fn two_terms_comparing_the_same_column_are_refused() {
         SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into())),
     );
     assert!(
-        reason.contains("two membership subqueries"),
+        reason.contains("two membership terms"),
         "the refusal should name the ambiguity, got {reason:?}"
     );
 }

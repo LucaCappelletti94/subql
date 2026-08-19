@@ -3,8 +3,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{
-    DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor,
+    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
 };
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
@@ -782,6 +782,71 @@ fn contains_subquery(expr: &Expr) -> bool {
 /// wrong thing.
 pub(super) fn contains_membership_subquery(expr: &Expr) -> bool {
     contains_matching(expr, |inner| matches!(inner, Expr::InSubquery { .. }))
+}
+
+/// Whether `expr` is a call carrying no column reference: a bare keyword
+/// function, or a function of literal arguments only.
+///
+/// The shape a session accessor takes (`current_setting('app.user_id', true)`,
+/// `current_user`), recognised structurally. Which calls actually name the
+/// caller is registration's question, answered by `rls2fga`'s registry.
+fn is_columnless_call(expr: &Expr) -> bool {
+    let Expr::Function(function) = expr else {
+        return false;
+    };
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return false;
+    }
+    match &function.args {
+        FunctionArguments::None => true,
+        FunctionArguments::Subquery(_) => false,
+        FunctionArguments::List(list) => {
+            list.duplicate_treatment.is_none()
+                && list.clauses.is_empty()
+                && list.args.iter().all(|arg| {
+                    matches!(
+                        arg,
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(_)))
+                    )
+                })
+        }
+    }
+}
+
+/// Is `expr` a comparison of a column to the caller, structurally: equality
+/// between an identifier and a columnless call, in either operand order?
+///
+/// Structural on purpose, mirroring the membership subquery: the form is
+/// recognised in every build, and whether the call names the caller is
+/// registration's question.
+pub(crate) fn is_caller_comparison(expr: &Expr) -> bool {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return false;
+    };
+    let column_beside_call = |column: &Expr, call: &Expr| {
+        matches!(column, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+            && is_columnless_call(call)
+    };
+    column_beside_call(left, right) || column_beside_call(right, left)
+}
+
+/// Is there a caller comparison anywhere in `expr`?
+///
+/// Same purpose as [`contains_membership_subquery`]: a `NOT` over one is
+/// refused before the compiler recurses into it.
+pub(super) fn contains_caller_comparison(expr: &Expr) -> bool {
+    contains_matching(expr, is_caller_comparison)
 }
 
 /// Enforce the bounded form a membership subquery has to take.

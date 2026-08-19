@@ -163,12 +163,16 @@ pub struct SubscriptionRequest<I: IdTypes, B: crate::backend::Backend = crate::b
     pub(crate) binds: alloc::vec::Vec<crate::backend::Value<B>>,
     /// Which subscriber this subscription filters for.
     ///
-    /// Required only by a filter naming a membership subquery, which is written
-    /// as `current_setting('app.user_id')` in SQL and resolved per connection by
+    /// Required by a filter naming a membership term: a membership subquery, or
+    /// a comparison of a column to the caller, both written against
+    /// `current_setting('app.user_id')` in SQL and resolved per connection by
     /// Postgres. SubQL has neither a connection nor a session, so the
-    /// subscription states it. Trusting it is safe because visibility gates every
-    /// delivery afterwards: a subscription claiming another identity receives
-    /// nothing it is not permitted to see, it only fails to receive its own rows.
+    /// subscription states it. A membership subquery matches changed membership
+    /// rows against the identity to move who the filter admits, and a caller
+    /// comparison admits exactly the rows naming it. Trusting it is safe because
+    /// visibility gates every delivery afterwards: a subscription claiming
+    /// another identity receives nothing it is not permitted to see, it only
+    /// fails to receive its own rows.
     pub(crate) subscriber: Option<crate::backend::Value<B>>,
     /// The values this subscriber currently matches, grouped by the column each
     /// membership subquery compares.
@@ -231,12 +235,16 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
 
     /// State which subscriber this subscription filters for (default: none).
     ///
-    /// A filter naming a membership subquery is refused without it, because the
-    /// identity is what a changed membership row is matched against. Build it at
+    /// A filter naming a membership term is refused without it: for a
+    /// membership subquery the identity is what a changed membership row is
+    /// matched against, and for a caller comparison it is the one value the
+    /// comparison admits. Build it at
     /// [`TermDescription::subject_kind`](crate::term::TermDescription::subject_kind):
     /// the lookup keys a string and a UUID under different variants, so an
     /// identity of another kind matches no membership row and admits nobody in
-    /// silence.
+    /// silence. A caller comparison checks instead of trusting, since the
+    /// compared column's kind is in the catalog: a mismatched identity is
+    /// refused at registration.
     #[must_use]
     pub fn subscriber(mut self, subscriber: crate::backend::Value<B>) -> Self {
         self.subscriber = Some(subscriber);
