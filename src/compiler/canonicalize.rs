@@ -90,7 +90,7 @@ fn extract_where(stmt: &Statement) -> Result<Option<Expr>, RegisterError> {
 /// - Sort AND/OR operands alphabetically
 /// - Remove redundant parentheses
 /// - Normalize to canonical string representation
-fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
+pub(super) fn normalize_expr(expr: &Expr) -> Result<String, RegisterError> {
     normalize_expr_inner(expr, 0)
 }
 

@@ -709,11 +709,53 @@ where
         ScalarKind::String,
     )?;
     wrap_bare_value_as_tri::<B>(&mut compiling)?;
-    let columns = term_columns(&compiling.terms);
-    Ok((
-        BytecodeProgram::with_terms(compiling.out, columns),
-        compiling.terms,
-    ))
+    let terms = canonicalize_term_slots(&mut compiling)?;
+    let columns = term_columns(&terms);
+    Ok((BytecodeProgram::with_terms(compiling.out, columns), terms))
+}
+
+/// Renumber the term slots into normalized-text order and rewrite the
+/// program's [`Instruction::TermTruth`] operands to match.
+///
+/// Predicate identity is the normalized WHERE text, which sorts `AND`/`OR`
+/// operands, so two spellings of one filter share one predicate. Slots were
+/// assigned in source order, and a subscription binding to a shared predicate
+/// seeds by its own compile's slots, so the numbering has to be a function of
+/// the normalized text too, or a reversed spelling stores one column's values
+/// where dispatch reads another's.
+///
+/// Two terms cannot normalize alike: the text carries the compared column,
+/// and two terms comparing one column are refused at registration, so the
+/// order below never ties on filters SubQL serves.
+fn canonicalize_term_slots<B: Backend>(
+    compiling: &mut Compiling<B>,
+) -> Result<Vec<CompiledTerm>, RegisterError> {
+    let terms = core::mem::take(&mut compiling.terms);
+    if terms.len() < 2 {
+        return Ok(terms);
+    }
+
+    let mut keyed: Vec<(String, CompiledTerm)> = terms
+        .into_iter()
+        .map(|term| Ok((canonicalize::normalize_expr(&term.expr)?, term)))
+        .collect::<Result<_, RegisterError>>()?;
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut remap = [0u16; MAX_TERMS_PER_FILTER];
+    let mut sorted = Vec::with_capacity(keyed.len());
+    for (new_slot, (_, mut term)) in keyed.into_iter().enumerate() {
+        let new_slot = u16::try_from(new_slot).unwrap_or(u16::MAX);
+        remap[usize::from(term.slot)] = new_slot;
+        term.slot = new_slot;
+        sorted.push(term);
+    }
+    for instruction in &mut compiling.out {
+        if let Instruction::TermTruth(slot) = instruction {
+            *slot = remap[usize::from(*slot)];
+        }
+    }
+
+    Ok(sorted)
 }
 
 /// Recursive helper for expression compilation.

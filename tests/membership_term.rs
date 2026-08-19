@@ -346,6 +346,81 @@ fn the_batch_path_seeds_the_terms_as_the_single_path_does() {
     assert_eq!(notifs.inserted(), &[1]);
 }
 
+/// Two spellings of one two-term filter share a predicate, because the
+/// normalized text sorts conjuncts. The slots a subscriber's values land in
+/// must therefore not depend on the order its own source text named the
+/// terms, or one column's values are stored where dispatch reads another's:
+/// rows the subscriber should get never arrive, and rows whose columns hold
+/// each other's values arrive wrongly.
+#[test]
+fn a_reversed_spelling_binds_its_values_to_the_columns_they_name() {
+    let (mut engine, docs) = engine();
+    let subquery = "(SELECT project_id FROM project_members \
+         WHERE user_id = current_setting('app.user_id', true))";
+    let forward = format!("SELECT * FROM docs WHERE project_id IN {subquery} AND a IN {subquery}");
+    let reversed = format!("SELECT * FROM docs WHERE a IN {subquery} AND project_id IN {subquery}");
+    engine
+        .register(
+            SubscriptionRequest::new(1u64, forward)
+                .subscriber(Value::String("alice".into()))
+                .term_values("project_id", vec![Value::Int(7)])
+                .term_values("a", vec![Value::Int(70)]),
+        )
+        .unwrap();
+    engine
+        .register(
+            SubscriptionRequest::new(2u64, reversed)
+                .subscriber(Value::String("bob".into()))
+                .term_values("project_id", vec![Value::Int(9)])
+                .term_values("a", vec![Value::Int(90)]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        engine.predicate_count(docs),
+        1,
+        "the premise: both spellings share one compiled predicate"
+    );
+
+    // A `docs` row: `(id, project_id, title, score, a)`.
+    let row = |id: i64, project: i64, a: i64| {
+        vec![
+            Value::<Postgres>::Int(id),
+            Value::Int(project),
+            Value::String("spec".into()),
+            Value::Float(1.0),
+            Value::Int(a),
+        ]
+    };
+
+    let notifs = engine
+        .consumers(&TestEvent::insert(docs, row(1, 7, 70)))
+        .unwrap();
+    assert_eq!(
+        notifs.inserted(),
+        &[1],
+        "the spelling that created the predicate is bound straight"
+    );
+
+    let notifs = engine
+        .consumers(&TestEvent::insert(docs, row(2, 9, 90)))
+        .unwrap();
+    assert_eq!(
+        notifs.inserted(),
+        &[2],
+        "bob stated project 9 and a 90, and this row is exactly that"
+    );
+
+    let notifs = engine
+        .consumers(&TestEvent::insert(docs, row(3, 90, 9)))
+        .unwrap();
+    assert!(
+        notifs.inserted().is_empty(),
+        "nobody stated project 90, so a row whose columns hold each other's \
+         values reaches nobody"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Refusals
 // ---------------------------------------------------------------------------
@@ -977,7 +1052,10 @@ fn describe_terms_refuses_exactly_what_register_refuses() {
 /// Two subqueries on different columns are two descriptions, each keyed by the
 /// column it compares, because that key is the only thing the caller and the
 /// engine share. The two subqueries differ in text so that pairing a description
-/// with the wrong one is visible.
+/// with the wrong one is visible. The order is slot order, which follows the
+/// normalized text rather than the source text (`a` sorts before `project_id`),
+/// since a shared predicate's slots cannot depend on how one spelling ordered
+/// its conjuncts.
 #[test]
 fn describe_terms_answers_once_per_subquery() {
     let (engine, _) = engine();
@@ -993,7 +1071,7 @@ fn describe_terms_answers_once_per_subquery() {
         .collect();
     assert_eq!(
         pairs,
-        [("project_id", false), ("a", true)],
+        [("a", true), ("project_id", false)],
         "each description carries the subquery of its own compared column"
     );
 }
