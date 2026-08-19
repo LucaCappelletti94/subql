@@ -274,7 +274,7 @@ fn as_json<T: serde::Serialize>(payload: &T) -> Option<serde_json::Value> {
 /// record rather than a record keyed on a rendering that may not match
 /// the whole-table query. A caller needing one of those must widen this
 /// deliberately, with a test pinning the rendering against the loader.
-fn render_text<B: crate::backend::Backend>(value: &Value<B>) -> Option<String> {
+pub(crate) fn render_text<B: crate::backend::Backend>(value: &Value<B>) -> Option<String> {
     let scalar = match value {
         Value::String(s) => return Some(s.as_ref().to_string()),
         Value::Int(i) => as_json(i)?,

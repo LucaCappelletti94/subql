@@ -28,6 +28,8 @@ use openfga_client::tonic::transport::Channel;
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::classifier::patterns::ConfidenceLevel;
 use rls2fga::generator::action_relations::ActionStatement;
+use rls2fga::generator::records::Record;
+use rls2fga::generator::well_known::member_relation;
 use rls2fga::translator::TranslatorBuilder;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
@@ -454,6 +456,152 @@ CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
         [Verdict::Deny, Verdict::Allow],
         "and now the store says bob does, so alice lost it rather than both holding it"
     );
+}
+
+/// The two-table removal, closed against the service: a membership only a
+/// replay reaches is withdrawn, the replay returns the slice's remaining
+/// truth, and reconciling it takes the stale fact out, so live delivery
+/// stops. This is the gap where a caller following the old contract, replay
+/// and write back, was told nothing was stale and kept granting for ever.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_withdrawn_grant_only_a_replay_reaches_is_reconciled_out() {
+    // Nothing keys (team, user) uniquely, so several rows can carry one
+    // grant and the latest deadline wins, which no single row image can say:
+    // the shape hands over a bound query instead of settling, and the
+    // reconciliation is the only remover.
+    const EXPIRING: &str = "
+CREATE TABLE teams(id INTEGER PRIMARY KEY);
+CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+                          expires_at TIMESTAMPTZ);
+CREATE TABLE docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user
+            AND team_members.expires_at > now()));
+";
+
+    let (_container, mut client) = openfga().await;
+
+    let wired = wiring(EXPIRING);
+    let docs = catalog_helpers::table_id(&wired.db, "docs").expect("docs is in the catalog");
+    let members =
+        catalog_helpers::table_id(&wired.db, "team_members").expect("members is in the catalog");
+    let model = wired.model.clone();
+
+    let store = client
+        .create_store(CreateStoreRequest {
+            name: "subql-reconcile-store".to_owned(),
+        })
+        .await
+        .expect("create store")
+        .into_inner()
+        .id;
+    let model_id = write_model(&mut client, &store, &model).await;
+
+    let shapes = wired.shapes();
+    let backend = OpenFgaPolicy::<_, _, String, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model_id);
+
+    // Doc 4 belongs to team 3, and the initial load stated alice's live
+    // membership. The bridge tuple comes from the row the way every settled
+    // fact does, and the membership goes through the writer the load uses.
+    let created = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Int(3)])
+        .with_pk_columns([0u16]);
+    backend
+        .apply(&shapes.diff(&created).expect("an insert is all additions"))
+        .await
+        .expect("write the bridge");
+    backend
+        .write_records(&[membership("user:alice")])
+        .await
+        .expect("seed the membership");
+
+    let watchers = ["user:alice".to_owned(), "user:bob".to_owned()];
+    let row = EventRow::current(&created, shapes.catalog()).expect("post-image");
+    assert_eq!(
+        answered(&backend, &row, &watchers).await,
+        [Verdict::Allow, Verdict::Deny],
+        "the seeded membership grants alice the doc"
+    );
+
+    // Alice's membership row is deleted. No row image evaluates the clock, so
+    // the difference removes nothing itself and hands over the replay.
+    let withdrawn = TestEvent::<Postgres>::delete(
+        members,
+        vec![
+            Value::Int(3),
+            Value::String("alice".into()),
+            Value::String("2027-01-01T00:00:00Z".into()),
+        ],
+    );
+    let diff = shapes
+        .diff(&withdrawn)
+        .expect("the previous image is whole");
+    assert!(
+        diff.removed.is_empty(),
+        "the row alone cannot say what the slice still holds"
+    );
+    let [requery] = diff.requeries.as_slice() else {
+        panic!("one replay, one table the change arrived on: {diff:?}");
+    };
+
+    // The replay of team 3 now returns nothing: the deleted row was the only
+    // live membership. Reconciling the empty truth deletes the stale fact.
+    backend
+        .reconcile_records(requery, &[])
+        .await
+        .expect("reconcile the emptied slice");
+
+    assert_eq!(
+        answered(&backend, &row, &watchers).await,
+        [Verdict::Deny, Verdict::Deny],
+        "the share row is gone, so the key grants nothing and live delivery stops"
+    );
+
+    // The same reconciliation writes what is new: a replay returning bob's
+    // fresh membership adds him without resurrecting alice.
+    backend
+        .reconcile_records(requery, &[membership("user:bob")])
+        .await
+        .expect("reconcile the replayed truth");
+
+    assert_eq!(
+        answered(&backend, &row, &watchers).await,
+        [Verdict::Deny, Verdict::Allow],
+        "the replayed truth is the slice's whole content, in both directions"
+    );
+}
+
+/// A live membership of team 3, as the initial load or a replay states it.
+fn membership(subject: &str) -> Record {
+    Record {
+        object: "teams:3".to_owned(),
+        relation: member_relation(),
+        subject: subject.to_owned(),
+        context: None,
+    }
+}
+
+/// The verdicts `backend` gives `watchers` about `row`.
+async fn answered(
+    backend: &OpenFgaPolicy<ParserDB, Channel, String, Postgres>,
+    row: &(impl subql::visibility::RowView<Backend = Postgres> + Sync),
+    watchers: &[String],
+) -> Vec<Verdict> {
+    let mut verdicts = Vec::new();
+    Verdict::reset(&mut verdicts, watchers.len());
+    backend
+        .may_see(row, watchers, &mut verdicts)
+        .await
+        .expect("the service answered");
+    verdicts
 }
 
 /// A watcher that names itself and says which keys its request carried.
