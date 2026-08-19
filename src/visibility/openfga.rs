@@ -791,7 +791,7 @@ where
     /// in the slice the result no longer states is stale and is deleted, which
     /// is what [`write_records`](Self::write_records) can never do. This is
     /// where a caller puts what replaying a
-    /// [`Requery`](crate::visibility::store::Requery) returned, due before the
+    /// [`Requery`] returned, due before the
     /// event is delivered, exactly as the store module's contract says.
     ///
     /// The read asks authoritatively whatever the configured read preference
@@ -1006,7 +1006,7 @@ where
     /// Write `records` as tuples, splitting them across calls the server accepts.
     ///
     /// This is where the initial load's rows go: it only ever writes, so what a
-    /// replayed [`Requery`](crate::visibility::store::Requery) returned goes
+    /// replayed [`Requery`] returned goes
     /// through [`reconcile_records`](Self::reconcile_records) instead, which
     /// also takes out what the replay stopped returning.
     ///
