@@ -397,6 +397,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use rls2fga::classifier::patterns::ConfidenceLevel;
+    use rls2fga::generator::records::RecordError;
     use rls2fga::generator::records::{
         BoundQuery, Record, RecordDerivation, RecordDescription, ReplayScope,
     };
@@ -510,6 +511,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             .with_min_confidence(ConfidenceLevel::B)
             .build()
             .translate(&db)
+            .unwrap()
             .relations();
         Shapes::new(db, &relations)
     }
@@ -1088,7 +1090,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         assert!(
             matches!(
                 got,
-                Err(StoreDiffError::Row(RowRecordError::Undecodable(_)))
+                Err(StoreDiffError::Row(RowRecordError::Refused(
+                    RecordError::ColumnUndecodable(_)
+                )))
             ),
             "{got:?}"
         );
@@ -1141,7 +1145,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         assert!(
             matches!(
                 got,
-                Err(StoreDiffError::Row(RowRecordError::Undecodable(_)))
+                Err(StoreDiffError::Row(RowRecordError::Refused(
+                    RecordError::ColumnUndecodable(_)
+                )))
             ),
             "{got:?}"
         );

@@ -1593,7 +1593,8 @@ CREATE POLICY notes_p ON notes USING (
                 SessionAttributeKind::SetAttribute,
             )])
             .build()
-            .translate(&db);
+            .translate(&db)
+            .unwrap();
         let relations = translation.relations();
         let notes = translation.notes().to_vec();
 
@@ -1653,7 +1654,8 @@ CREATE POLICY notes_p ON notes USING (
         let translation = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .build()
-            .translate(&db);
+            .translate(&db)
+            .unwrap();
         let (relations, naming, answers) = (
             translation.relations(),
             translation.row_naming(),

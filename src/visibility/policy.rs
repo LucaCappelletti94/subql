@@ -332,7 +332,7 @@ where
 /// let translator = TranslatorBuilder::new()
 ///     .with_min_confidence(ConfidenceLevel::B)
 ///     .build();
-/// let translation = translator.translate(&db);
+/// let translation = translator.translate(&db)?;
 /// let relations = translation.relations();
 /// let naming = translation.row_naming();
 /// let answers = translation.action_relations();
@@ -805,8 +805,8 @@ mod tests {
     use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
     use rls2fga::classifier::patterns::ConfidenceLevel;
     use rls2fga::generator::records::{
-        ObjectKey, RecordContext, RecordContextEntry, RecordDerivation, RecordDescription,
-        RecordTemplate, SubjectKey, ValueSource,
+        ColumnKind, ContextRendering, ObjectKey, RecordContext, RecordContextEntry,
+        RecordDerivation, RecordDescription, RecordTemplate, SubjectKey, ValueSource,
     };
     use rls2fga::generator::relations::{RelationShapes, RowDecision};
     use rls2fga::generator::well_known::can_select_relation;
@@ -1093,6 +1093,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
             .with_min_confidence(ConfidenceLevel::B)
             .build()
             .translate(&db)
+            .unwrap()
             .relations();
         (db, relations)
     }
@@ -1133,7 +1134,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
             .with_session_attributes(attributes)
             .build();
         let (naming, answers, notes) = {
-            let translation = translator.translate(&db);
+            let translation = translator.translate(&db).unwrap();
             (
                 translation.row_naming(),
                 translation.action_relations(),
@@ -1514,11 +1515,11 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
                         table: "docs".to_string(),
                         template: Box::new(RecordTemplate {
                             object_type: "docs".to_string(),
-                            object_key: ObjectKey::column("id"),
+                            object_key: id_key(),
                             relation: test_names::relation("owner"),
                             subject_type: "user".to_string(),
                             subject_key: SubjectKey::new(ValueSource::ListElements(
-                                test_names::column("owner_id"),
+                                test_names::column_read("owner_id"),
                             )),
                             context: None,
                         }),
@@ -2342,6 +2343,7 @@ CREATE POLICY notes_p ON notes USING (
             ])
             .build()
             .translate(&db)
+            .unwrap()
             .relations();
         (db, relations)
     }
@@ -2505,6 +2507,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
             .with_session_attributes([department.clone()])
             .build()
             .translate(&db)
+            .unwrap()
             .relations();
         let notes = notes_id(&db);
         let event = insert(notes, notes_row("physics"));
@@ -2850,6 +2853,13 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
         assert_eq!(policy.inner().calls(), 1);
     }
 
+    fn id_key() -> ObjectKey {
+        ObjectKey::new(vec![ValueSource::typed_column(
+            test_names::column("id"),
+            ColumnKind::Integer,
+        )])
+    }
+
     // -----------------------------------------------------------------
     // Recipes no single table keys
     // -----------------------------------------------------------------
@@ -2866,7 +2876,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                 table: table.to_string(),
                 template: Box::new(RecordTemplate {
                     object_type: table.to_string(),
-                    object_key: ObjectKey::column("id"),
+                    object_key: id_key(),
                     relation: test_names::relation("owner"),
                     subject_type: "user".to_string(),
                     subject_key: SubjectKey::wildcard(),
@@ -2875,6 +2885,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                         entries: vec![RecordContextEntry {
                             key: key.to_string(),
                             value: ValueSource::column(column),
+                            rendering: ContextRendering::SqlText,
                         }],
                     }),
                 }),
@@ -2892,7 +2903,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
                 table: table.to_string(),
                 template: Box::new(RecordTemplate {
                     object_type: table.to_string(),
-                    object_key: ObjectKey::column("id"),
+                    object_key: id_key(),
                     relation: test_names::relation("owner"),
                     subject_type: "user".to_string(),
                     subject_key: SubjectKey::column(subject),

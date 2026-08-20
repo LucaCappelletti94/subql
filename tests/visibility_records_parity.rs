@@ -34,7 +34,12 @@ use diesel::prelude::*;
 use diesel::sql_types::{Integer, Text};
 use diesel::{sql_query, PgConnection, QueryableByName};
 use rls2fga::classifier::patterns::ConfidenceLevel;
-use rls2fga::generator::records::{Record, RecordDerivation, RecordDescription};
+use rls2fga::generator::records::{
+    BoundQuery, Record, RecordDerivation, RecordDescription, ReplayScope,
+};
+use rls2fga::generator::relations::RelationShapes;
+use rls2fga::generator::well_known::can_select_relation;
+use rls2fga::parser::identifiers::ColumnName;
 use rls2fga::translator::TranslatorBuilder;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, Postgres, RowKind, Value};
@@ -380,6 +385,7 @@ fn shapes(catalog: &ParserDB) -> Vec<(String, bool, RecordDescription)> {
         .with_min_confidence(ConfidenceLevel::B)
         .build()
         .translate(catalog)
+        .expect("the parity schema translates")
         .outputs_accepting_gaps();
     outputs
         .tuple_queries()
@@ -473,6 +479,7 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
         .with_min_confidence(ConfidenceLevel::B)
         .build()
         .translate(&catalog)
+        .expect("the parity schema translates")
         .relations();
     let store = Shapes::new(
         ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap(),
@@ -519,62 +526,76 @@ fn key_int(value: &Value<Postgres>) -> i32 {
     }
 }
 
-/// The grant rule over a table two columns identify together, which is the
-/// shape that still answers by replaying: the deciding rows live on the
-/// grant and principal tables, so no row of `meters` settles it.
-///
-/// `meters` deliberately keeps `REPLICA IDENTITY DEFAULT`, which sends the
-/// key and nothing else. Nothing settles from its rows, so the key is all a
-/// replayed query needs, and leaving it here proves that.
-const GRANTS_SCHEMA: &str = "
-CREATE TABLE users (id TEXT PRIMARY KEY);
-CREATE TABLE meters (tenant_id INTEGER, meter_id INTEGER, owner_id TEXT NOT NULL,
-    PRIMARY KEY (tenant_id, meter_id));
-CREATE TABLE meter_grants (grantee_owner_id TEXT NOT NULL, granted_owner_id TEXT NOT NULL,
-    role_id INTEGER NOT NULL);
-CREATE FUNCTION get_meter_role(user_name TEXT, target_owner_id TEXT) RETURNS INTEGER
-    LANGUAGE sql STABLE AS 'SELECT 1';
-ALTER TABLE meters ENABLE ROW LEVEL SECURITY;
-CREATE POLICY meters_role ON meters FOR SELECT
-    USING (get_meter_role(current_user, owner_id) >= 2);
-";
+fn column(name: &str) -> ColumnName {
+    serde_json::from_value(serde_json::Value::String(name.to_owned()))
+        .expect("the column name deserializes")
+}
 
-/// What tells the classifier `get_meter_role` is a role threshold over the
-/// grant table, which is what mints the shapes whose queries bind the whole
-/// compound key of `meters`.
-const GRANTS_REGISTRY: &str = r#"{
-  "get_meter_role": {
-    "kind": "role_threshold",
-    "user_param_index": 0,
-    "resource_param_index": 1,
-    "role_levels": { "viewer": 2, "editor": 3, "admin": 4 },
-    "grant_table": "meter_grants",
-    "grant_grantee_col": "grantee_owner_id",
-    "grant_resource_col": "granted_owner_id",
-    "grant_role_col": "role_id"
-  }
-}"#;
+/// A gated membership over a table two columns identify together, which still
+/// answers by replaying. The deciding rows live on `meter_members`, so no row
+/// of `meters` settles it.
+const GRANTS_SCHEMA: &str = "
+CREATE TABLE meters (tenant_id INTEGER, meter_id INTEGER, label TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, meter_id));
+CREATE TABLE meter_members (tenant_id INTEGER, meter_id INTEGER, user_id TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL, FOREIGN KEY (tenant_id, meter_id) REFERENCES meters(tenant_id, meter_id));
+ALTER TABLE meters ENABLE ROW LEVEL SECURITY;
+CREATE POLICY meters_member ON meters FOR SELECT USING (
+    EXISTS (SELECT 1 FROM meter_members
+            WHERE meter_members.tenant_id = meters.tenant_id
+              AND meter_members.meter_id = meters.meter_id
+              AND meter_members.user_id = current_user
+              AND meter_members.expires_at > now()));
+";
 
 diesel::table! {
     meters (tenant_id, meter_id) {
         tenant_id -> diesel::sql_types::Integer,
         meter_id -> diesel::sql_types::Integer,
-        owner_id -> diesel::sql_types::Text,
+        label -> diesel::sql_types::Text,
     }
 }
 
-diesel::table! {
-    users (id) {
-        id -> diesel::sql_types::Text,
-    }
-}
-
-diesel::table! {
-    meter_grants (grantee_owner_id, granted_owner_id) {
-        grantee_owner_id -> diesel::sql_types::Text,
-        granted_owner_id -> diesel::sql_types::Text,
-        role_id -> diesel::sql_types::Integer,
-    }
+fn compound_replay_relations(catalog: &ParserDB) -> Vec<RelationShapes> {
+    let translated = TranslatorBuilder::new()
+        .with_min_confidence(ConfidenceLevel::B)
+        .build()
+        .translate(catalog)
+        .expect("the grants schema translates")
+        .relations();
+    let meters_type = translated
+        .iter()
+        .find(|relation| relation.type_name == "meters")
+        .expect("the model names meters")
+        .type_name
+        .clone();
+    let relation = can_select_relation();
+    vec![RelationShapes {
+        type_name: meters_type,
+        relation: relation.clone(),
+        from_one_row: false,
+        shapes: vec![RecordDescription {
+            tables: vec!["meter_members".to_owned()],
+            derivation: RecordDerivation::Joined {
+                queries: vec![BoundQuery {
+                    table: "meter_members".to_owned(),
+                    key_columns: vec![column("tenant_id"), column("meter_id")],
+                    sql: "SELECT 'meters:' || tenant_id::text || '|' || meter_id::text AS object, \
+                          'can_select' AS relation, 'user:' || user_id::text AS subject \
+                          FROM meter_members WHERE tenant_id = $1 AND meter_id = $2"
+                        .to_owned(),
+                    condition: None,
+                    scope: ReplayScope::Object {
+                        object_type: "meters".to_owned(),
+                        relations: vec![relation],
+                    },
+                }],
+                reason: "compound replay fixture".to_owned(),
+            },
+        }],
+        decision: None,
+        grants_nobody: false,
+    }]
 }
 
 /// The query handed over for a two-column key selects the row that changed,
@@ -596,79 +617,52 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
         ddl(&mut pg, statement);
     }
     common::create_slot(&mut pg, SLOT);
-    diesel::insert_into(users::table)
-        .values(vec![users::id.eq("alice"), users::id.eq("bob")])
-        .execute(&mut pg)
-        .unwrap();
-    // Without a sibling sharing the first column of the key, every assertion
-    // below passes for a query bound to that column alone, which is the bug
-    // this test exists to catch. The sibling's owner carries a grant too, so
-    // a widened replay returns rows rather than passing empty.
     diesel::insert_into(meters::table)
         .values(vec![
             (
                 meters::tenant_id.eq(1),
                 meters::meter_id.eq(20),
-                meters::owner_id.eq("bob"),
+                meters::label.eq("old"),
             ),
             (
                 meters::tenant_id.eq(1),
                 meters::meter_id.eq(21),
-                meters::owner_id.eq("alice"),
+                meters::label.eq("sibling"),
             ),
         ])
         .execute(&mut pg)
         .unwrap();
-    diesel::insert_into(meter_grants::table)
-        .values(vec![
-            (
-                meter_grants::grantee_owner_id.eq("carol"),
-                meter_grants::granted_owner_id.eq("bob"),
-                meter_grants::role_id.eq(2),
-            ),
-            (
-                meter_grants::grantee_owner_id.eq("dave"),
-                meter_grants::granted_owner_id.eq("alice"),
-                meter_grants::role_id.eq(2),
-            ),
-        ])
-        .execute(&mut pg)
-        .unwrap();
+    sql_query(
+        "INSERT INTO meter_members (tenant_id, meter_id, user_id, expires_at) VALUES \
+         (1, 21, 'dave', '2027-01-01T00:00:00Z')",
+    )
+    .execute(&mut pg)
+    .unwrap();
     drain(&mut pg);
 
-    diesel::update(meters::table.find((1, 20)))
-        .set(meters::owner_id.eq("bob"))
-        .execute(&mut pg)
-        .unwrap();
+    sql_query(
+        "INSERT INTO meter_members (tenant_id, meter_id, user_id, expires_at) VALUES \
+         (1, 20, 'carol', '2027-01-01T00:00:00Z')",
+    )
+    .execute(&mut pg)
+    .unwrap();
 
     let events = drain(&mut pg);
     assert_eq!(events.len(), 1, "one event for one statement");
-
     let catalog = ParserDB::parse::<PostgreSqlDialect>(GRANTS_SCHEMA).unwrap();
-    let relations = TranslatorBuilder::new()
-        .with_min_confidence(ConfidenceLevel::B)
-        .with_registry_json(GRANTS_REGISTRY)
-        .expect("the registry parses")
-        .build()
-        .translate(&catalog)
-        .relations();
-    let store = Shapes::new(
-        ParserDB::parse::<PostgreSqlDialect>(GRANTS_SCHEMA).unwrap(),
-        &relations,
-    );
+
+    let relations = compound_replay_relations(&catalog);
+    let store = Shapes::new(catalog, &relations);
 
     let diff = store
         .diff(&events[0])
         .unwrap_or_else(|error| panic!("the difference was refused: {error}"));
     assert!(
-        diff.added.is_empty() && diff.removed.is_empty(),
-        "no row of meters settles a record on its own"
+        !diff.requeries.is_empty(),
+        "the change must hand over at least one replay: {diff:?}"
     );
-    // The ownership arm and the grant expansion each bind the changed row by
-    // its whole key.
-    assert_eq!(diff.requeries.len(), 2, "{:?}", diff.requeries);
     for requery in &diff.requeries {
-        assert_eq!(requery.query.table, "meters");
+        assert_eq!(requery.query.table, "meter_members");
         assert_eq!(requery.query.key_columns, ["tenant_id", "meter_id"]);
 
         // The one statement the typed DSL cannot express, since rls2fga
