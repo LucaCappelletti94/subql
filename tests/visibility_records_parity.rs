@@ -386,7 +386,7 @@ fn shapes(catalog: &ParserDB) -> Vec<(String, bool, RecordDescription)> {
         .into_iter()
         .filter_map(|query| {
             let description = query.description?;
-            (is_evaluable(&description)
+            (is_evaluable(&description, catalog)
                 && matches!(description.derivation, RecordDerivation::FromRow { .. }))
             .then_some((query.sql, query.condition.is_some(), description))
         })

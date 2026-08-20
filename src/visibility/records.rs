@@ -24,16 +24,17 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::Cell;
 
+use rls2fga::classifier::patterns::{AttributeLiteral, AttributePredicate};
 use rls2fga::generator::records::{
     records_from_row, Guard, Record, RecordDerivation, RecordDescription, RecordError, RowValues,
     ValueSource,
 };
 use sql_traits::prelude::DatabaseLike;
 
-use crate::backend::Value;
+use crate::backend::{ScalarKind, Value};
 use crate::catalog_helpers;
 use crate::visibility::RowView;
-use crate::ValueError;
+use crate::{TableId, ValueError};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -68,6 +69,17 @@ pub enum RowRecordError {
     /// cell as no records would withdraw access the row may still grant.
     #[error(transparent)]
     Undecodable(#[from] ValueError),
+    /// The description reads a column the row side cannot answer the way
+    /// the loading SQL does.
+    ///
+    /// The loading SQL spells every kind through `::text`, while the row
+    /// side spells only the kinds whose text form provably matches it, so
+    /// serving such a shape would load records no changed row could ever
+    /// produce or withdraw. The kind is the catalog's, not any row's, so
+    /// this is refused once at setup through [`is_evaluable`] rather than
+    /// rediscovered per row.
+    #[error("a row view cannot read {0}")]
+    UnreadableColumn(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +104,7 @@ where
     R: RowView + ?Sized,
     DB: DatabaseLike,
 {
-    if let Some(refusal) = unsupported_description(description) {
+    if let Some(refusal) = unsupported_description(description, db) {
         return Err(refusal);
     }
     let view = RowValuesView {
@@ -109,18 +121,25 @@ where
 
 /// Whether [`records_from_row_view`] can evaluate `description` at all.
 ///
-/// Depends only on the description's shape, never on a row, so a caller
-/// holding the descriptions for a whole schema settles this once at setup
-/// rather than rediscovering the refusal on every changed row.
+/// Depends only on the description's shape and the catalog, never on a
+/// row, so a caller holding the descriptions for a whole schema settles
+/// this once at setup rather than rediscovering the refusal on every
+/// changed row.
 #[must_use]
-pub fn is_evaluable(description: &RecordDescription) -> bool {
-    unsupported_description(description).is_none()
+pub fn is_evaluable<DB: DatabaseLike>(description: &RecordDescription, db: &DB) -> bool {
+    unsupported_description(description, db).is_none()
 }
 
 /// Why a row view cannot answer `description`, or [`None`].
-fn unsupported_description(description: &RecordDescription) -> Option<RowRecordError> {
+fn unsupported_description<DB: DatabaseLike>(
+    description: &RecordDescription,
+    db: &DB,
+) -> Option<RowRecordError> {
     let RecordDerivation::FromRow {
-        template, guards, ..
+        table,
+        template,
+        guards,
+        ..
     } = &description.derivation
     else {
         // A joining description is refused by `records_from_row` itself,
@@ -128,21 +147,44 @@ fn unsupported_description(description: &RecordDescription) -> Option<RowRecordE
         // here.
         return None;
     };
+    let Some(table) = catalog_helpers::table_id(db, table) else {
+        return Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "any column of {table:?}, a table the catalog does not know"
+        )));
+    };
     // An object name is built from every part in order, so one part the
     // view cannot read loses the whole name rather than a piece of it.
     template
         .object_key
         .parts()
         .iter()
-        .find_map(unsupported)
-        .or_else(|| unsupported(template.subject_key.part()))
-        .or_else(|| guards.iter().find_map(unsupported_guard))
+        .find_map(|part| unsupported(part, db, table))
+        .or_else(|| unsupported(template.subject_key.part(), db, table))
+        .or_else(|| {
+            guards
+                .iter()
+                .find_map(|guard| unsupported_guard(guard, db, table))
+        })
+        .or_else(|| {
+            template.context.as_ref().and_then(|context| {
+                context
+                    .entries
+                    .iter()
+                    .find_map(|entry| unsupported(&entry.value, db, table))
+            })
+        })
 }
 
-/// The name of the shape a row view cannot answer, or [`None`].
-const fn unsupported(source: &ValueSource) -> Option<RowRecordError> {
+/// The refusal for a value source a row view cannot answer, or [`None`].
+fn unsupported<DB: DatabaseLike>(
+    source: &ValueSource,
+    db: &DB,
+    table: TableId,
+) -> Option<RowRecordError> {
     match source {
-        ValueSource::Column(_) | ValueSource::JsonPath { .. } | ValueSource::Literal(_) => None,
+        ValueSource::Column(column) => text_read(db, table, column.as_str()),
+        ValueSource::JsonPath { column, .. } => document_read(db, table, column.as_str()),
+        ValueSource::Literal(_) => None,
         // `Value` has no array variant, so there is nothing to expand.
         ValueSource::ListElements(_) => Some(RowRecordError::UnsupportedValueSource("list")),
         // `ValueSource` is `#[non_exhaustive]`: an unrecognised shape is
@@ -151,11 +193,113 @@ const fn unsupported(source: &ValueSource) -> Option<RowRecordError> {
     }
 }
 
-const fn unsupported_guard(guard: &Guard) -> Option<RowRecordError> {
+/// The refusal for a guard a row view cannot answer, or [`None`].
+///
+/// Each arm names the read `guard_holds` performs: `NotNull` and the
+/// textual comparisons read the cell as text, `IsTrue` and the boolean
+/// comparison read it as a boolean.
+fn unsupported_guard<DB: DatabaseLike>(
+    guard: &Guard,
+    db: &DB,
+    table: TableId,
+) -> Option<RowRecordError> {
     match guard {
-        Guard::NotNull(_) | Guard::IsTrue(_) | Guard::Compare(_) => None,
+        Guard::NotNull(column) => text_read(db, table, column.as_str()),
+        Guard::IsTrue(column) => boolean_read(db, table, column.as_str()),
+        Guard::Compare(predicate) => unsupported_comparison(predicate, db, table),
+        // `Guard` is `#[non_exhaustive]`: an unrecognised guard is refused
+        // rather than read as absent.
         _ => Some(RowRecordError::UnsupportedValueSource("unrecognised guard")),
     }
+}
+
+/// The refusal for a comparison guard, or [`None`].
+fn unsupported_comparison<DB: DatabaseLike>(
+    predicate: &AttributePredicate,
+    db: &DB,
+    table: TableId,
+) -> Option<RowRecordError> {
+    let column = predicate.column.as_str();
+    match &predicate.value {
+        AttributeLiteral::Boolean(_) => boolean_read(db, table, column),
+        AttributeLiteral::Number(_) | AttributeLiteral::Text(_) => text_read(db, table, column),
+        // `AttributeLiteral` is `#[non_exhaustive]`: a literal this does
+        // not recognise is refused rather than compared as text.
+        _ => Some(RowRecordError::UnsupportedValueSource(
+            "unrecognised comparison",
+        )),
+    }
+}
+
+/// The kinds [`render_text`] spells.
+///
+/// Kept in lockstep with it by the exhaustive kind test below: a kind
+/// spelled there but refused here loses service for no reason, and one
+/// admitted here but unspelled there reopens the silent no-record path
+/// this gate exists to close.
+const fn spells_as_text(kind: ScalarKind) -> bool {
+    matches!(
+        kind,
+        ScalarKind::String
+            | ScalarKind::Int
+            | ScalarKind::Uuid
+            | ScalarKind::Bool
+            | ScalarKind::Timestamp
+            | ScalarKind::TimestampTz
+    )
+}
+
+/// The refusal for a column read as text, or [`None`] when its kind spells.
+fn text_read<DB: DatabaseLike>(db: &DB, table: TableId, column: &str) -> Option<RowRecordError> {
+    match column_kind(db, table, column) {
+        Err(refusal) => Some(refusal),
+        Ok(kind) if spells_as_text(kind) => None,
+        Ok(kind) => Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} as text: it holds a {kind:?}, whose row-side spelling is not known \
+             to match the loading SQL's"
+        ))),
+    }
+}
+
+/// The refusal for a column read as a boolean, or [`None`].
+fn boolean_read<DB: DatabaseLike>(db: &DB, table: TableId, column: &str) -> Option<RowRecordError> {
+    match column_kind(db, table, column) {
+        Err(refusal) => Some(refusal),
+        Ok(ScalarKind::Bool) => None,
+        Ok(kind) => Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} as a boolean: it holds a {kind:?}"
+        ))),
+    }
+}
+
+/// The refusal for a column read as a JSON document, or [`None`].
+fn document_read<DB: DatabaseLike>(
+    db: &DB,
+    table: TableId,
+    column: &str,
+) -> Option<RowRecordError> {
+    match column_kind(db, table, column) {
+        Err(refusal) => Some(refusal),
+        Ok(ScalarKind::Json | ScalarKind::Jsonb) => None,
+        Ok(kind) => Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} as a JSON document: it holds a {kind:?}"
+        ))),
+    }
+}
+
+/// A column's declared kind, or the refusal for one the catalog cannot name.
+fn column_kind<DB: DatabaseLike>(
+    db: &DB,
+    table: TableId,
+    column: &str,
+) -> Result<ScalarKind, RowRecordError> {
+    let refuse = || {
+        RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column}, which the catalog does not know or cannot type"
+        ))
+    };
+    let id = catalog_helpers::column_id(db, table, column).ok_or_else(refuse)?;
+    catalog_helpers::column_scalar_kind(db, table, id).ok_or_else(refuse)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,12 +498,14 @@ mod tests {
     use crate::{catalog_helpers, ParserDB};
 
     const DDL: &str = "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, public BOOL, \
-                       meta JSONB, key UUID, note JSON, score DOUBLE PRECISION);";
+                       meta JSONB, key UUID, note JSON, score DOUBLE PRECISION, \
+                       taken DATE, blob BYTEA, at TIMESTAMPTZ);";
 
     /// The same table with the ownership policy that makes rls2fga describe it, so the
     /// names in the description below are ones a translation decided.
     const POLICIED: &str = "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, public BOOL, \
-                            meta JSONB, key UUID, note JSON, score DOUBLE PRECISION);
+                            meta JSONB, key UUID, note JSON, score DOUBLE PRECISION, \
+                            taken DATE, blob BYTEA, at TIMESTAMPTZ);
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY docs_owner ON docs USING (owner = current_user);";
 
@@ -536,14 +682,144 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         );
     }
 
-    /// A column the catalog does not know is not a silent grant.
+    /// A column the catalog does not know refuses rather than answering as
+    /// an empty set, which would read as "this row grants nobody".
     #[test]
-    fn an_unknown_column_produces_no_record() {
+    fn an_unknown_column_is_refused_rather_than_answered_empty() {
         let d = description(ValueSource::column("nonexistent"), vec![]);
-        assert_eq!(
-            records(&d, row_of(Value::String("alice".into()))).unwrap(),
-            vec![]
+        let Err(RowRecordError::UnreadableColumn(reason)) =
+            records(&d, row_of(Value::String("alice".into())))
+        else {
+            panic!("an uncatalogued column must refuse");
+        };
+        assert!(
+            reason.contains("nonexistent"),
+            "the refusal names the column: {reason}"
         );
+    }
+
+    /// A column whose kind the row side cannot spell refuses at setup, never
+    /// answers as an empty set. The loading SQL spells every kind through
+    /// `::text`, so an empty answer here would silently withhold additions
+    /// and withdrawals the loader states.
+    #[test]
+    fn an_unspellable_kind_is_refused_rather_than_answered_empty() {
+        let db = catalog();
+        for (name, kind) in [
+            ("taken", "Date"),
+            ("blob", "Bytes"),
+            ("score", "Float"),
+            ("meta", "Jsonb"),
+        ] {
+            let d = description(ValueSource::column(name), vec![]);
+            assert!(
+                !is_evaluable(&d, &db),
+                "{name} holds a {kind}, which text cannot spell"
+            );
+            let Err(RowRecordError::UnreadableColumn(reason)) =
+                records(&d, row_of(Value::String("alice".into())))
+            else {
+                panic!("{name} must refuse");
+            };
+            assert!(
+                reason.contains(name) && reason.contains(kind),
+                "the refusal names the column and its kind: {reason}"
+            );
+        }
+        // The contrast that keeps the gate honest: a spellable kind stays
+        // evaluable through the same path.
+        assert!(is_evaluable(
+            &description(ValueSource::column("at"), vec![]),
+            &db
+        ));
+    }
+
+    /// A guard is read at a kind too: `IsTrue` wants a boolean and the
+    /// textual comparisons want a spellable kind, so a guard over the wrong
+    /// kind refuses rather than failing silently for every row.
+    #[test]
+    fn a_guard_over_the_wrong_kind_is_refused() {
+        use rls2fga::classifier::patterns::{AttributeOperator, AttributePredicate};
+
+        let subject = || ValueSource::column("owner");
+        let cases: [(Guard, &str); 3] = [
+            (Guard::IsTrue(column("owner")), "as a boolean"),
+            (Guard::NotNull(column("taken")), "Date"),
+            (
+                Guard::Compare(AttributePredicate {
+                    column: column("score"),
+                    operator: AttributeOperator::Gt,
+                    value: AttributeLiteral::Number("0".into()),
+                }),
+                "Float",
+            ),
+        ];
+        for (guard, expected) in cases {
+            let d = description(subject(), vec![guard]);
+            let Err(RowRecordError::UnreadableColumn(reason)) =
+                records(&d, row_of(Value::String("alice".into())))
+            else {
+                panic!("a guard over the wrong kind must refuse");
+            };
+            assert!(
+                reason.contains(expected),
+                "the refusal names what diverged: {reason}"
+            );
+        }
+    }
+
+    /// A JSON path wants a document, so a path into a scalar column refuses.
+    #[test]
+    fn a_json_path_into_a_scalar_column_is_refused() {
+        let d = description(
+            ValueSource::JsonPath {
+                column: column("owner"),
+                path: vec!["sub".into()],
+            },
+            vec![],
+        );
+        let Err(RowRecordError::UnreadableColumn(reason)) =
+            records(&d, row_of(Value::String("alice".into())))
+        else {
+            panic!("a path into a scalar must refuse");
+        };
+        assert!(
+            reason.contains("JSON document"),
+            "the refusal names the read: {reason}"
+        );
+    }
+
+    /// The gate and the speller cannot drift: for every kind, the setup gate
+    /// admits exactly the kinds `render_text` spells. Exhaustive on purpose,
+    /// mirroring the term lookup's gate test.
+    #[test]
+    fn the_setup_gate_matches_what_render_text_spells() {
+        let epoch = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant");
+        let cases: [(ScalarKind, Value<Postgres>); 13] = [
+            (ScalarKind::Bool, Value::Bool(true)),
+            (ScalarKind::Int, Value::Int(1)),
+            (ScalarKind::Float, Value::Float(1.0)),
+            (ScalarKind::String, Value::String("x".into())),
+            (ScalarKind::Bytes, Value::Bytes(vec![1])),
+            (ScalarKind::Uuid, Value::Uuid(uuid::Uuid::nil())),
+            (ScalarKind::Timestamp, Value::Timestamp(epoch.naive_utc())),
+            (ScalarKind::TimestampTz, Value::TimestampTz(epoch)),
+            (ScalarKind::Date, Value::Date(epoch.date_naive())),
+            (ScalarKind::Time, Value::Time(epoch.time())),
+            (
+                ScalarKind::Decimal,
+                Value::Decimal(bigdecimal::BigDecimal::from(1)),
+            ),
+            (ScalarKind::Json, Value::Json(serde_json::Value::Null)),
+            (ScalarKind::Jsonb, Value::Jsonb(serde_json::Value::Null)),
+        ];
+        for (kind, value) in cases {
+            assert_eq!(
+                spells_as_text(kind),
+                render_text(&value).is_some(),
+                "{kind:?} disagrees between the gate and the speller"
+            );
+        }
     }
 
     /// A guard that fails withdraws the record entirely.
@@ -681,23 +957,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         assert_eq!(records(&d, row).unwrap()[0].subject, "user:dan");
     }
 
-    /// A JSON path aimed at a column that holds no JSON reads as absent,
-    /// not as the column's text.
-    #[test]
-    fn a_json_path_on_a_non_json_column_produces_no_record() {
-        let d = description(
-            ValueSource::JsonPath {
-                column: column("owner"),
-                path: vec!["acl".into()],
-            },
-            vec![],
-        );
-        assert_eq!(
-            records(&d, row_of(Value::String("alice".into()))).unwrap(),
-            vec![]
-        );
-    }
-
     /// A JSON leaf that is null, or a path that runs off the document,
     /// grants nobody rather than granting `user:null`.
     #[test]
@@ -745,17 +1004,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             let d = description(ValueSource::column("public"), vec![]);
             assert_eq!(records(&d, row).unwrap()[0].subject, expected);
         }
-    }
-
-    /// A type whose text form this adapter does not pin grants nobody,
-    /// rather than a record keyed on a rendering the loader may not have
-    /// written. Widening this is a deliberate act with its own test.
-    #[test]
-    fn an_unpinned_type_produces_no_record() {
-        let mut row = row_of(Value::Null);
-        row[6] = Value::Float(1.5);
-        let d = description(ValueSource::column("score"), vec![]);
-        assert_eq!(records(&d, row).unwrap(), vec![]);
     }
 
     /// Both refusals say which one they are, since a caller routes on the
