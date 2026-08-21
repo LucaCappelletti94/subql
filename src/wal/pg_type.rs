@@ -39,14 +39,14 @@ pub(super) fn text_to_pg_value_by_kind(text: &str, kind: ScalarKind) -> Value<Po
         ScalarKind::String => Value::String(text.to_string()),
         ScalarKind::Bytes => decode_pg_bytea_hex(text).map_or(Value::Missing, Value::Bytes),
         ScalarKind::Uuid => Uuid::parse_str(text).map_or(Value::Missing, Value::Uuid),
-        ScalarKind::Timestamp => parse_pg_timestamp(text).map_or(Value::Missing, Value::Timestamp),
+        ScalarKind::Timestamp => {
+            crate::temporal::parse_timestamp(text).map_or(Value::Missing, Value::Timestamp)
+        }
         ScalarKind::TimestampTz => {
-            parse_pg_timestamptz(text).map_or(Value::Missing, Value::TimestampTz)
+            crate::temporal::parse_timestamp_tz(text).map_or(Value::Missing, Value::TimestampTz)
         }
-        ScalarKind::Date => {
-            NaiveDate::parse_from_str(text, "%Y-%m-%d").map_or(Value::Missing, Value::Date)
-        }
-        ScalarKind::Time => parse_pg_time(text).map_or(Value::Missing, Value::Time),
+        ScalarKind::Date => crate::temporal::parse_date(text).map_or(Value::Missing, Value::Date),
+        ScalarKind::Time => crate::temporal::parse_time(text).map_or(Value::Missing, Value::Time),
         ScalarKind::Json => serde_json::from_str(text).map_or(Value::Missing, Value::Json),
         ScalarKind::Jsonb => serde_json::from_str(text).map_or(Value::Missing, Value::Jsonb),
     }
@@ -209,19 +209,19 @@ fn json_bytea(value: &serde_json::Value) -> Option<alloc::vec::Vec<u8>> {
 }
 
 fn json_timestamp(value: &serde_json::Value) -> Option<NaiveDateTime> {
-    value.as_str().and_then(parse_pg_timestamp)
+    value.as_str().and_then(crate::temporal::parse_timestamp)
 }
 
 fn json_timestamptz(value: &serde_json::Value) -> Option<DateTime<Utc>> {
-    value.as_str().and_then(parse_pg_timestamptz)
+    value.as_str().and_then(crate::temporal::parse_timestamp_tz)
 }
 
 fn json_date(value: &serde_json::Value) -> Option<NaiveDate> {
-    value.as_str().and_then(parse_pg_date)
+    value.as_str().and_then(crate::temporal::parse_date)
 }
 
 fn json_time(value: &serde_json::Value) -> Option<NaiveTime> {
-    value.as_str().and_then(parse_pg_time)
+    value.as_str().and_then(crate::temporal::parse_time)
 }
 
 fn json_document(value: &serde_json::Value) -> Option<serde_json::Value> {
@@ -229,41 +229,6 @@ fn json_document(value: &serde_json::Value) -> Option<serde_json::Value> {
         serde_json::Value::String(s) => serde_json::from_str(s).ok(),
         other => Some(other.clone()),
     }
-}
-
-pub fn parse_pg_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
-}
-
-pub fn parse_pg_timestamp(s: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .ok()
-}
-
-pub fn parse_pg_timestamptz(s: &str) -> Option<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S%.f%#z",
-        "%Y-%m-%d %H:%M:%S%.f%z",
-        "%Y-%m-%d %H:%M:%S%#z",
-        "%Y-%m-%d %H:%M:%S%z",
-    ] {
-        if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
-            return Some(dt.with_timezone(&Utc));
-        }
-    }
-    None
-}
-
-pub fn parse_pg_time(s: &str) -> Option<NaiveTime> {
-    NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
-        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
-        .ok()
 }
 
 #[cfg(test)]
@@ -743,5 +708,39 @@ mod tests {
             json_value_to_pg_value_by_kind(&serde_json::json!(123), ScalarKind::Timestamp),
             Value::Missing
         );
+    }
+
+    /// The pgoutput text path and the wal2json JSON path read the shared
+    /// temporal corpus alike, which is the set registration accepts.
+    #[test]
+    fn a_temporal_wire_cell_accepts_the_shared_corpus() {
+        for (text, want) in crate::temporal::corpus::accepted() {
+            assert_eq!(
+                text_to_pg_value_by_kind(text, want.kind()),
+                want.value::<Postgres>(),
+                "pgoutput text {text:?}"
+            );
+            assert_eq!(
+                json_value_to_pg_value_by_kind(&serde_json::json!(text), want.kind()),
+                want.value::<Postgres>(),
+                "wal2json text {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_temporal_wire_cell_refuses_the_shared_corpus() {
+        for (text, kind) in crate::temporal::corpus::refused() {
+            assert_eq!(
+                text_to_pg_value_by_kind(text, kind),
+                Value::Missing,
+                "pgoutput text {text:?} must not decode as {kind:?}"
+            );
+            assert_eq!(
+                json_value_to_pg_value_by_kind(&serde_json::json!(text), kind),
+                Value::Missing,
+                "wal2json text {text:?} must not decode as {kind:?}"
+            );
+        }
     }
 }

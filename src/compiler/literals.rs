@@ -134,32 +134,29 @@ fn parse_uuid_as_string(s: &str, sql: &SqlValue) -> Result<String, RegisterError
 }
 
 fn parse_timestamp(s: &str, sql: &SqlValue) -> Result<chrono::NaiveDateTime, RegisterError> {
-    // Accept the ISO-8601 subset the temporal accessors carry.
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-        .map_err(|e| err_parse(sql, ScalarKind::Timestamp, e))
+    crate::temporal::parse_timestamp(s)
+        .ok_or_else(|| err_parse(sql, ScalarKind::Timestamp, "not a timestamp"))
 }
 
 fn parse_timestamp_tz(
     s: &str,
     sql: &SqlValue,
 ) -> Result<chrono::DateTime<chrono::Utc>, RegisterError> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|e| err_parse(sql, ScalarKind::TimestampTz, e))
+    crate::temporal::parse_timestamp_tz(s).ok_or_else(|| {
+        err_parse(
+            sql,
+            ScalarKind::TimestampTz,
+            "not a timestamp with time zone",
+        )
+    })
 }
 
 fn parse_date(s: &str, sql: &SqlValue) -> Result<chrono::NaiveDate, RegisterError> {
-    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|e| err_parse(sql, ScalarKind::Date, e))
+    crate::temporal::parse_date(s).ok_or_else(|| err_parse(sql, ScalarKind::Date, "not a date"))
 }
 
 fn parse_time(s: &str, sql: &SqlValue) -> Result<chrono::NaiveTime, RegisterError> {
-    chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
-        .map_err(|e| err_parse(sql, ScalarKind::Time, e))
+    crate::temporal::parse_time(s).ok_or_else(|| err_parse(sql, ScalarKind::Time, "not a time"))
 }
 
 fn parse_json(s: &str, sql: &SqlValue) -> Result<serde_json::Value, RegisterError> {
@@ -467,5 +464,46 @@ mod tests {
         let sql = SqlValue::SingleQuotedString("not-a-uuid".to_string());
         let err = Postgres::parse_literal(&sql, ScalarKind::Uuid).unwrap_err();
         assert!(matches!(err, RegisterError::TypeError(_)));
+    }
+
+    /// Every spelling the WAL and changeset decoders read also registers.
+    /// `'2026-01-01 00:00:00+00'` is the one a Postgres client prints, and
+    /// a subscription naming it was refused as a type error while the same
+    /// text off the WAL decoded fine.
+    #[test]
+    fn a_temporal_literal_accepts_the_shared_corpus() {
+        for (text, want) in crate::temporal::corpus::accepted() {
+            let sql = SqlValue::SingleQuotedString(text.to_string());
+            assert_eq!(
+                Postgres::parse_literal(&sql, want.kind()).expect(text),
+                want.value::<Postgres>(),
+                "postgres literal {text:?}"
+            );
+            assert_eq!(
+                SQLite::parse_literal(&sql, want.kind()).expect(text),
+                want.value::<SQLite>(),
+                "sqlite literal {text:?}"
+            );
+            assert_eq!(
+                MySql::parse_literal(&sql, want.kind()).expect(text),
+                want.value::<MySql>(),
+                "mysql literal {text:?}"
+            );
+        }
+    }
+
+    /// The refusals stay refusals, and stay named as type errors.
+    #[test]
+    fn a_temporal_literal_refuses_the_shared_corpus() {
+        for (text, kind) in crate::temporal::corpus::refused() {
+            let sql = SqlValue::SingleQuotedString(text.to_string());
+            assert!(
+                matches!(
+                    Postgres::parse_literal(&sql, kind),
+                    Err(RegisterError::TypeError(_))
+                ),
+                "{text:?} must not parse as {kind:?}"
+            );
+        }
     }
 }

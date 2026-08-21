@@ -277,15 +277,17 @@ fn decode_wire_value(
             Some(ScalarKind::String) | None => Value::String(s),
             Some(ScalarKind::Uuid) => Value::Uuid(s),
             Some(ScalarKind::Timestamp) => {
-                parse_naive_datetime(&s).map_or(Value::Missing, Value::Timestamp)
+                crate::temporal::parse_timestamp(&s).map_or(Value::Missing, Value::Timestamp)
             }
             Some(ScalarKind::TimestampTz) => {
-                parse_datetime_utc(&s).map_or(Value::Missing, Value::TimestampTz)
+                crate::temporal::parse_timestamp_tz(&s).map_or(Value::Missing, Value::TimestampTz)
             }
-            Some(ScalarKind::Date) => chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
-                .ok()
-                .map_or(Value::Missing, Value::Date),
-            Some(ScalarKind::Time) => parse_naive_time(&s).map_or(Value::Missing, Value::Time),
+            Some(ScalarKind::Date) => {
+                crate::temporal::parse_date(&s).map_or(Value::Missing, Value::Date)
+            }
+            Some(ScalarKind::Time) => {
+                crate::temporal::parse_time(&s).map_or(Value::Missing, Value::Time)
+            }
             Some(ScalarKind::Decimal) => {
                 <bigdecimal::BigDecimal as core::str::FromStr>::from_str(&s)
                     .ok()
@@ -304,26 +306,6 @@ fn decode_wire_value(
             _ => Value::Missing,
         },
     }
-}
-
-fn parse_naive_datetime(s: &str) -> Option<chrono::NaiveDateTime> {
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .ok()
-}
-
-fn parse_datetime_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-}
-
-fn parse_naive_time(s: &str) -> Option<chrono::NaiveTime> {
-    chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
-        .ok()
 }
 
 #[cfg(test)]
@@ -514,5 +496,30 @@ mod tests {
         assert_eq!(events.len(), 1);
         let notifs = engine.consumers(&events[0]).expect("dispatch");
         assert_eq!(notifs.inserted(), alloc::vec![99u64]);
+    }
+
+    /// A SQLite text cell reads the shared temporal corpus exactly as the
+    /// Postgres wire paths and registration do. SQLite stores temporals as
+    /// TEXT, so whatever spelling the writer chose has to survive here.
+    #[test]
+    fn a_temporal_text_cell_accepts_the_shared_corpus() {
+        for (text, want) in crate::temporal::corpus::accepted() {
+            assert_eq!(
+                decode_wire_value(WireValue::Text(text.into()), Some(want.kind())),
+                want.value::<SQLite>(),
+                "sqlite text {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_temporal_text_cell_refuses_the_shared_corpus() {
+        for (text, kind) in crate::temporal::corpus::refused() {
+            assert_eq!(
+                decode_wire_value(WireValue::Text(text.into()), Some(kind)),
+                Value::Missing,
+                "sqlite text {text:?} must not decode as {kind:?}"
+            );
+        }
     }
 }
