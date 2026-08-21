@@ -266,7 +266,8 @@ where
             (BytecodeProgram::new(instructions), Vec::new())
         };
 
-    let prefilter_plan = build_prefilter_plan(pq.where_clause.as_ref(), pq.table_id, database);
+    let prefilter_plan =
+        build_prefilter_plan::<B, DB>(pq.where_clause.as_ref(), pq.table_id, database);
 
     Ok(CompiledQuery {
         table_id: pq.table_id,

@@ -36,36 +36,16 @@ pub enum IndexableCell {
 }
 
 impl IndexableCell {
-    /// Convert a `Value<B>` into an `IndexableCell` when its payload
-    /// downcasts to one of the four indexable primitives (`bool`, `i64`,
-    /// `f64`, `String`). Returns `None` for `Missing` / `Null` and for
-    /// scalars whose payload type does not match one of those four.
+    /// Convert a `Value<B>` into an `IndexableCell` when its payload has an
+    /// index key.
     ///
-    /// Uses [`Any::downcast_ref`](core::any::Any), which is safe under
-    /// `Backend`'s `'static` bound on every scalar. For the three
-    /// shipped backends (Postgres, MySql, SQLite) this matches
-    /// `Value::Bool` (Postgres / MySql `bool`, SQLite `i64` also routes
-    /// via `Value::Int`), `Value::Int` (`i64`), `Value::Float` (`f64`),
-    /// and `Value::String` (`alloc::String`); every other scalar
-    /// variant returns `None`, causing the caller to emit
-    /// `IndexableAtom::Fallback`.
+    /// Delegates to [`PlannerValue::from_value`], which is also what the
+    /// planner files an equality atom with, so a row cell probes with the
+    /// key its predicate was indexed under. Deriving the two separately is
+    /// what left an atom unprobeable and its predicate silently missed.
     #[must_use]
     pub fn from_value<B: Backend>(v: &Value<B>) -> Option<Self> {
-        use core::any::Any;
-        match v {
-            Value::Bool(x) => (x as &dyn Any)
-                .downcast_ref::<bool>()
-                .map(|b| Self::Bool(*b))
-                .or_else(|| (x as &dyn Any).downcast_ref::<i64>().map(|i| Self::Int(*i))),
-            Value::Int(x) => (x as &dyn Any).downcast_ref::<i64>().map(|i| Self::Int(*i)),
-            Value::Float(x) => (x as &dyn Any)
-                .downcast_ref::<f64>()
-                .map(|f| Self::Float(f.to_bits())),
-            Value::String(x) => (x as &dyn Any)
-                .downcast_ref::<alloc::string::String>()
-                .map(|s| Self::String(Arc::from(s.as_str()))),
-            _ => None,
-        }
+        PlannerValue::from_value(v).map(|value| Self::from_planner(&value))
     }
 
     /// Convert planner value to runtime indexable cell.

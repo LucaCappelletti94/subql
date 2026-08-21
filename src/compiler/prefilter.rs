@@ -8,13 +8,15 @@
 //! fires (SQL that the analyser could not reduce to a purely indexable
 //! form).
 
-use crate::{ColumnId, TableId};
+use super::literals::SqlLiteralParse;
+use crate::backend::{Backend, Value};
+use crate::{catalog_helpers, ColumnId, TableId};
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
+use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 
 /// A normalized prefilter plan used by runtime dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,6 +43,38 @@ pub enum PlannerValue {
     Int(i64),
     Float(u64), // f64::to_bits()
     String(Arc<str>),
+}
+
+impl PlannerValue {
+    /// The index key for a typed cell, or `None` for a payload the bitmap
+    /// indexes cannot hold.
+    ///
+    /// Runtime dispatch derives a row cell's probe key through this same
+    /// function (see `IndexableCell::from_value`), which is what keeps a
+    /// filed atom reachable. Two derivations of one key is how an atom
+    /// becomes unprobeable and its predicate silently missed.
+    ///
+    /// The payload types are checked rather than the variants, because a
+    /// backend chooses them: SQLite spells `Bool` as `i64`, so its boolean
+    /// cell keys as the integer the row actually carries.
+    #[must_use]
+    pub fn from_value<B: Backend>(v: &Value<B>) -> Option<Self> {
+        use core::any::Any;
+        match v {
+            Value::Bool(x) => (x as &dyn Any)
+                .downcast_ref::<bool>()
+                .map(|b| Self::Bool(*b))
+                .or_else(|| (x as &dyn Any).downcast_ref::<i64>().map(|i| Self::Int(*i))),
+            Value::Int(x) => (x as &dyn Any).downcast_ref::<i64>().map(|i| Self::Int(*i)),
+            Value::Float(x) => (x as &dyn Any)
+                .downcast_ref::<f64>()
+                .map(|f| Self::Float(f.to_bits())),
+            Value::String(x) => (x as &dyn Any)
+                .downcast_ref::<alloc::string::String>()
+                .map(|s| Self::String(Arc::from(s.as_str()))),
+            _ => None,
+        }
+    }
 }
 
 /// Indexable planner atom.
@@ -136,14 +170,14 @@ impl Analysis {
 
 /// Build prefilter plan from WHERE clause expression.
 #[must_use]
-pub fn build_prefilter_plan<DB: DatabaseLike>(
+pub fn build_prefilter_plan<B: SqlLiteralParse, DB: DatabaseLike>(
     where_clause: Option<&Expr>,
     table_id: TableId,
     database: &DB,
 ) -> PrefilterPlan {
     let analysis = where_clause.map_or_else(
         || Analysis::constant(true),
-        |expr| analyze_expr(expr, table_id, database, false),
+        |expr| analyze_expr::<B, DB>(expr, table_id, database, false),
     );
 
     let scan_required = analysis.true_possible && !analysis.hit_guaranteed_if_true;
@@ -155,7 +189,7 @@ pub fn build_prefilter_plan<DB: DatabaseLike>(
     }
 }
 
-fn analyze_expr<DB: DatabaseLike>(
+fn analyze_expr<B: SqlLiteralParse, DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
@@ -169,29 +203,29 @@ fn analyze_expr<DB: DatabaseLike>(
                 let child_negated = negated;
                 let effective_or = matches!(op, BinaryOperator::Or) ^ negated;
 
-                let lhs = analyze_expr(left, table_id, database, child_negated);
-                let rhs = analyze_expr(right, table_id, database, child_negated);
+                let lhs = analyze_expr::<B, DB>(left, table_id, database, child_negated);
+                let rhs = analyze_expr::<B, DB>(right, table_id, database, child_negated);
                 if effective_or {
                     Analysis::or(lhs, rhs)
                 } else {
                     Analysis::and(lhs, rhs)
                 }
             }
-            _ => analyze_comparison(left, op.clone(), right, table_id, database, negated),
+            _ => analyze_comparison::<B, DB>(left, op.clone(), right, table_id, database, negated),
         },
 
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => analyze_expr(expr, table_id, database, !negated),
+        } => analyze_expr::<B, DB>(expr, table_id, database, !negated),
 
-        Expr::Nested(expr) => analyze_expr(expr, table_id, database, negated),
+        Expr::Nested(expr) => analyze_expr::<B, DB>(expr, table_id, database, negated),
 
         Expr::InList {
             expr,
             list,
             negated: list_negated,
-        } => analyze_in_list(expr, list, *list_negated ^ negated, table_id, database),
+        } => analyze_in_list::<B, DB>(expr, list, *list_negated ^ negated, table_id, database),
 
         Expr::Between {
             expr,
@@ -211,7 +245,7 @@ fn analyze_expr<DB: DatabaseLike>(
         Expr::IsNotNull(expr) => analyze_null_check(expr, false ^ negated, table_id, database),
 
         Expr::Value(val) => match &val.value {
-            Value::Boolean(b) => Analysis::constant(*b ^ negated),
+            SqlValue::Boolean(b) => Analysis::constant(*b ^ negated),
             _ => Analysis::unknown(),
         },
 
@@ -230,7 +264,7 @@ fn analyze_null_check<DB: DatabaseLike>(
     })
 }
 
-fn analyze_in_list<DB: DatabaseLike>(
+fn analyze_in_list<B: SqlLiteralParse, DB: DatabaseLike>(
     expr: &Expr,
     list: &[Expr],
     negated: bool,
@@ -257,12 +291,13 @@ fn analyze_in_list<DB: DatabaseLike>(
     for item in list {
         match item {
             Expr::Value(v) => {
-                if let Some(value) = planner_value_from_sql_value(&v.value) {
+                if let Some(value) = literal_index_key::<B, DB>(item, table_id, column_id, database)
+                {
                     disjuncts.push(Analysis::indexed_atom(PlannerAtom::Equality {
                         column_id,
                         value,
                     }));
-                } else if !matches!(v.value, Value::Null) {
+                } else if !matches!(v.value, SqlValue::Null) {
                     // NULL in IN-list cannot make expression TRUE by
                     // itself, but other unsupported literal forms
                     // might.
@@ -334,7 +369,29 @@ fn analyze_between<DB: DatabaseLike>(
     Analysis::or(below, above)
 }
 
-fn analyze_comparison<DB: DatabaseLike>(
+/// Split a comparison into the column it names, the literal it compares
+/// against, and the operator oriented so the column reads on the left.
+fn column_and_literal<'e, DB: DatabaseLike>(
+    left: &'e Expr,
+    op: BinaryOperator,
+    right: &'e Expr,
+    table_id: TableId,
+    database: &DB,
+) -> Option<(ColumnId, &'e Expr, BinaryOperator)> {
+    if is_literal(right) {
+        if let Some(column_id) = resolve_column(left, table_id, database) {
+            return Some((column_id, right, op));
+        }
+    }
+    if is_literal(left) {
+        if let Some(column_id) = resolve_column(right, table_id, database) {
+            return Some((column_id, left, flip_comparison(op)));
+        }
+    }
+    None
+}
+
+fn analyze_comparison<B: SqlLiteralParse, DB: DatabaseLike>(
     left: &Expr,
     op: BinaryOperator,
     right: &Expr,
@@ -342,36 +399,19 @@ fn analyze_comparison<DB: DatabaseLike>(
     database: &DB,
     negated: bool,
 ) -> Analysis {
-    let mut normalized_op = op.clone();
-
-    let comparison = if let (Some(column_id), Some(lit)) = (
-        resolve_column(left, table_id, database),
-        literal_planner_value(right),
-    ) {
-        Some((column_id, lit))
-    } else if let (Some(lit), Some(column_id)) = (
-        literal_planner_value(left),
-        resolve_column(right, table_id, database),
-    ) {
-        normalized_op = flip_comparison(op);
-        Some((column_id, lit))
-    } else {
-        None
-    };
-
-    let Some((column_id, lit)) = comparison else {
+    let Some((column_id, literal, normalized_op)) =
+        column_and_literal(left, op, right, table_id, database)
+    else {
         return Analysis::unknown();
     };
 
-    let effective_op = apply_negation_to_comparison(normalized_op, negated);
+    match apply_negation_to_comparison(normalized_op, negated) {
+        BinaryOperator::Eq => literal_index_key::<B, DB>(literal, table_id, column_id, database)
+            .map_or_else(Analysis::unknown, |value| {
+                Analysis::indexed_atom(PlannerAtom::Equality { column_id, value })
+            }),
 
-    match effective_op {
-        BinaryOperator::Eq => Analysis::indexed_atom(PlannerAtom::Equality {
-            column_id,
-            value: lit,
-        }),
-
-        BinaryOperator::Gt => planner_value_as_int(&lit).map_or_else(Analysis::unknown, |v| {
+        BinaryOperator::Gt => literal_int_from_expr(literal).map_or_else(Analysis::unknown, |v| {
             Analysis::indexed_atom(PlannerAtom::Range {
                 column_id,
                 lower: Some(v.saturating_add(1)),
@@ -379,15 +419,17 @@ fn analyze_comparison<DB: DatabaseLike>(
             })
         }),
 
-        BinaryOperator::GtEq => planner_value_as_int(&lit).map_or_else(Analysis::unknown, |v| {
-            Analysis::indexed_atom(PlannerAtom::Range {
-                column_id,
-                lower: Some(v),
-                upper: None,
+        BinaryOperator::GtEq => {
+            literal_int_from_expr(literal).map_or_else(Analysis::unknown, |v| {
+                Analysis::indexed_atom(PlannerAtom::Range {
+                    column_id,
+                    lower: Some(v),
+                    upper: None,
+                })
             })
-        }),
+        }
 
-        BinaryOperator::Lt => planner_value_as_int(&lit).map_or_else(Analysis::unknown, |v| {
+        BinaryOperator::Lt => literal_int_from_expr(literal).map_or_else(Analysis::unknown, |v| {
             Analysis::indexed_atom(PlannerAtom::Range {
                 column_id,
                 lower: None,
@@ -395,13 +437,15 @@ fn analyze_comparison<DB: DatabaseLike>(
             })
         }),
 
-        BinaryOperator::LtEq => planner_value_as_int(&lit).map_or_else(Analysis::unknown, |v| {
-            Analysis::indexed_atom(PlannerAtom::Range {
-                column_id,
-                lower: None,
-                upper: Some(v),
+        BinaryOperator::LtEq => {
+            literal_int_from_expr(literal).map_or_else(Analysis::unknown, |v| {
+                Analysis::indexed_atom(PlannerAtom::Range {
+                    column_id,
+                    lower: None,
+                    upper: Some(v),
+                })
             })
-        }),
+        }
 
         _ => Analysis::unknown(),
     }
@@ -441,68 +485,92 @@ fn resolve_column<DB: DatabaseLike>(
     super::literals::resolve_column_ref(expr, table_id, database)
 }
 
-fn literal_planner_value(expr: &Expr) -> Option<PlannerValue> {
-    if let Expr::Value(v) = expr {
-        planner_value_from_sql_value(&v.value)
-    } else {
-        None
-    }
+/// The index key for the literal in `expr` as compared against `column_id`,
+/// or `None` when it has none, which sends the comparison to the scan set
+/// for the VM to evaluate on typed values.
+///
+/// The literal is parsed to the column's own kind first, so the key is
+/// derived from the same typed value a row cell would carry. Deriving it
+/// from the SQL text instead is what made an atom unreachable: a UUID
+/// literal read as text filed a String key, while the row's `Value::Uuid`
+/// probed with no key at all.
+fn literal_index_key<B: SqlLiteralParse, DB: DatabaseLike>(
+    expr: &Expr,
+    table_id: TableId,
+    column_id: ColumnId,
+    database: &DB,
+) -> Option<PlannerValue> {
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    let kind = catalog_helpers::column_scalar_kind(database, table_id, column_id)?;
+    PlannerValue::from_value(&B::parse_literal(&value.value, kind).ok()?)
 }
 
+/// An integer bound for a range atom. Range entries hold `i64` bounds and
+/// are probed numerically rather than by key equality, so unlike an
+/// equality key this reads the number the SQL names and needs no column
+/// kind.
 fn literal_int_from_expr(expr: &Expr) -> Option<i64> {
-    match literal_planner_value(expr)? {
-        PlannerValue::Int(v) => Some(v),
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlValue::Number(n, _) => n.parse::<i64>().ok(),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-const fn planner_value_as_int(value: &PlannerValue) -> Option<i64> {
-    match value {
-        PlannerValue::Int(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn planner_value_from_sql_value(val: &Value) -> Option<PlannerValue> {
-    match val {
-        Value::Boolean(b) => Some(PlannerValue::Bool(*b)),
-        Value::Number(n, _) => n.parse::<i64>().map(PlannerValue::Int).ok().or_else(|| {
-            n.parse::<f64>()
-                .map(|f| PlannerValue::Float(f.to_bits()))
-                .ok()
-        }),
-        Value::SingleQuotedString(s)
-        | Value::DoubleQuotedString(s)
-        | Value::NationalStringLiteral(s) => Some(PlannerValue::String(Arc::from(s.as_str()))),
-        // A hex literal (`X'...'`) only ever targets a BYTEA/BLOB column,
-        // whose runtime cells are `Value::Bytes` and have no
-        // `IndexableCell` (see `IndexableCell::from_value`). Indexing it as
-        // a String equality atom builds an index entry no bytes event can
-        // probe, so the predicate would be silently missed. Return None so
-        // the comparison falls to the scan set and the VM performs the
-        // exact bytewise compare.
-        _ => None,
-    }
+const fn is_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Value(_))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::backend::{Postgres, SQLite};
 
-    /// A hex literal must not become an indexable String equality atom: a
-    /// bytes column has no `IndexableCell`, so an indexed hex atom would be
-    /// unprobeable and the predicate silently missed. It stays unindexed
-    /// (scan set), while ordinary quoted strings keep their String atom.
+    /// The four payloads the bitmap indexes can hold keep a key, and every
+    /// other payload has none, so its comparison reaches the VM instead of
+    /// an index entry nothing can probe.
     #[test]
-    fn hex_literal_is_not_indexed_as_string() {
+    fn only_the_indexable_payloads_have_a_key() {
         assert_eq!(
-            planner_value_from_sql_value(&Value::HexStringLiteral("DEADBEEF".to_string())),
-            None,
+            PlannerValue::from_value(&Value::<Postgres>::Int(42)),
+            Some(PlannerValue::Int(42))
+        );
+        assert_eq!(
+            PlannerValue::from_value(&Value::<Postgres>::Bool(true)),
+            Some(PlannerValue::Bool(true))
         );
         assert!(matches!(
-            planner_value_from_sql_value(&Value::SingleQuotedString("x".to_string())),
-            Some(PlannerValue::String(_)),
+            PlannerValue::from_value(&Value::<Postgres>::String("x".to_string())),
+            Some(PlannerValue::String(_))
         ));
+        assert_eq!(
+            PlannerValue::from_value(&Value::<Postgres>::Float(1.5)),
+            Some(PlannerValue::Float(1.5f64.to_bits()))
+        );
+        for value in [
+            Value::<Postgres>::Bytes(alloc::vec![0xde, 0xad]),
+            Value::<Postgres>::Uuid(uuid::Uuid::nil()),
+            Value::<Postgres>::Json(serde_json::Value::Null),
+            Value::<Postgres>::Null,
+            Value::<Postgres>::Missing,
+        ] {
+            assert_eq!(PlannerValue::from_value(&value), None, "{value:?}");
+        }
+    }
+
+    /// SQLite spells a boolean cell as an integer, so its key is that
+    /// integer. Filing a `Bool` key for a `flag = true` filter would leave
+    /// the subscriber unreachable, since the row probes with `Int`.
+    #[test]
+    fn a_sqlite_bool_keys_as_the_integer_it_is_stored_as() {
+        assert_eq!(
+            PlannerValue::from_value(&Value::<SQLite>::Bool(1)),
+            Some(PlannerValue::Int(1))
+        );
     }
 }
