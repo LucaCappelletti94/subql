@@ -24,14 +24,14 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-use rls2fga::classifier::patterns::{AttributeLiteral, AttributePredicate};
+use rls2fga::classifier::patterns::{AttributeLiteral, AttributeOperator, AttributePredicate};
 use rls2fga::generator::records::{
-    records_from_row, Guard, Record, RecordDerivation, RecordDescription, RecordError, RowValues,
-    ValueSource,
+    records_from_row, ColumnKind, ColumnRead, Guard, Record, RecordDerivation, RecordDescription,
+    RecordError, RowCell, RowList, RowValues, ValueSource,
 };
 use sql_traits::prelude::DatabaseLike;
 
-use crate::backend::{ScalarKind, Value};
+use crate::backend::{Backend, JsonDocument, ScalarKind, ScalarText, ScalarTruth, Value};
 use crate::catalog_helpers;
 use crate::visibility::RowView;
 use crate::{TableId, ValueError};
@@ -142,9 +142,6 @@ fn unsupported_description<DB: DatabaseLike>(
         ..
     } = &description.derivation
     else {
-        // A joining description is refused by `records_from_row` itself,
-        // with the reason it recorded, which is better than one invented
-        // here.
         return None;
     };
     let Some(table) = catalog_helpers::table_id(db, table) else {
@@ -152,14 +149,12 @@ fn unsupported_description<DB: DatabaseLike>(
             "any column of {table:?}, a table the catalog does not know"
         )));
     };
-    // An object name is built from every part in order, so one part the
-    // view cannot read loses the whole name rather than a piece of it.
     template
         .object_key
         .parts()
         .iter()
-        .find_map(|part| unsupported(part, db, table))
-        .or_else(|| unsupported(template.subject_key.part(), db, table))
+        .find_map(|part| unsupported_value(part, db, table))
+        .or_else(|| unsupported_value(template.subject_key.part(), db, table))
         .or_else(|| {
             guards
                 .iter()
@@ -170,136 +165,171 @@ fn unsupported_description<DB: DatabaseLike>(
                 context
                     .entries
                     .iter()
-                    .find_map(|entry| unsupported(&entry.value, db, table))
+                    .find_map(|entry| unsupported_value(&entry.value, db, table))
             })
         })
 }
 
-/// The refusal for a value source a row view cannot answer, or [`None`].
-fn unsupported<DB: DatabaseLike>(
+fn unsupported_value<DB: DatabaseLike>(
     source: &ValueSource,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
     match source {
-        ValueSource::Column(column) => text_read(db, table, column.as_str()),
-        ValueSource::JsonPath { column, .. } => document_read(db, table, column.as_str()),
+        ValueSource::Column(column) => direct_column_read(column, db, table),
+        ValueSource::JsonPath { column, .. } => document_read(column, db, table),
         ValueSource::Literal(_) => None,
-        // `Value` has no array variant, so there is nothing to expand.
         ValueSource::ListElements(_) => Some(RowRecordError::UnsupportedValueSource("list")),
-        // `ValueSource` is `#[non_exhaustive]`: an unrecognised shape is
-        // refused rather than read as absent.
         _ => Some(RowRecordError::UnsupportedValueSource("unrecognised")),
     }
 }
 
-/// The refusal for a guard a row view cannot answer, or [`None`].
-///
-/// Each arm names the read `guard_holds` performs: `NotNull` and the
-/// textual comparisons read the cell as text, `IsTrue` and the boolean
-/// comparison read it as a boolean.
 fn unsupported_guard<DB: DatabaseLike>(
     guard: &Guard,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
     match guard {
-        Guard::NotNull(column) => text_read(db, table, column.as_str()),
-        Guard::IsTrue(column) => boolean_read(db, table, column.as_str()),
-        Guard::Compare(predicate) => unsupported_comparison(predicate, db, table),
-        // `Guard` is `#[non_exhaustive]`: an unrecognised guard is refused
-        // rather than read as absent.
+        Guard::NotNull(column) => direct_column_read(column, db, table),
+        Guard::IsTrue(column) => bool_read(column, db, table),
+        Guard::Compare { column, predicate } => comparison_read(column, predicate, db, table),
         _ => Some(RowRecordError::UnsupportedValueSource("unrecognised guard")),
     }
 }
 
-/// The refusal for a comparison guard, or [`None`].
-fn unsupported_comparison<DB: DatabaseLike>(
+fn comparison_read<DB: DatabaseLike>(
+    column: &ColumnRead,
     predicate: &AttributePredicate,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
-    let column = predicate.column.as_str();
-    match &predicate.value {
-        AttributeLiteral::Boolean(_) => boolean_read(db, table, column),
-        AttributeLiteral::Number(_) | AttributeLiteral::Text(_) => text_read(db, table, column),
-        // `AttributeLiteral` is `#[non_exhaustive]`: a literal this does
-        // not recognise is refused rather than compared as text.
+    let kind = match column_read_kind(column, db, table) {
+        Ok(kind) => kind,
+        Err(refusal) => return Some(refusal),
+    };
+    match (&predicate.value, kind) {
+        (AttributeLiteral::Boolean(_), ColumnKind::Bool)
+        | (AttributeLiteral::Number(_), ColumnKind::Integer | ColumnKind::Decimal) => None,
+        (AttributeLiteral::Text(_), ColumnKind::Text)
+            if matches!(
+                predicate.operator,
+                AttributeOperator::Eq | AttributeOperator::NotEq
+            ) =>
+        {
+            None
+        }
+        (AttributeLiteral::Text(_), ColumnKind::Text) => Some(RowRecordError::UnreadableColumn(
+            alloc::format!("comparison over column {column} needs a query"),
+        )),
+        (
+            AttributeLiteral::Boolean(_) | AttributeLiteral::Number(_) | AttributeLiteral::Text(_),
+            _,
+        ) => Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} cannot be compared as {:?}",
+            predicate.value
+        ))),
         _ => Some(RowRecordError::UnsupportedValueSource(
             "unrecognised comparison",
         )),
     }
 }
 
-/// The kinds [`render_text`] spells.
-///
-/// Kept in lockstep with it by the exhaustive kind test below: a kind
-/// spelled there but refused here loses service for no reason, and one
-/// admitted here but unspelled there reopens the silent no-record path
-/// this gate exists to close.
-const fn spells_as_text(kind: ScalarKind) -> bool {
-    matches!(
-        kind,
-        ScalarKind::String
-            | ScalarKind::Int
-            | ScalarKind::Uuid
-            | ScalarKind::Bool
-            | ScalarKind::Timestamp
-            | ScalarKind::TimestampTz
-    )
-}
-
-/// The refusal for a column read as text, or [`None`] when its kind spells.
-fn text_read<DB: DatabaseLike>(db: &DB, table: TableId, column: &str) -> Option<RowRecordError> {
-    match column_kind(db, table, column) {
-        Err(refusal) => Some(refusal),
-        Ok(kind) if spells_as_text(kind) => None,
-        Ok(kind) => Some(RowRecordError::UnreadableColumn(alloc::format!(
-            "column {column} as text: it holds a {kind:?}, whose row-side spelling is not known \
-             to match the loading SQL's"
-        ))),
-    }
-}
-
-/// The refusal for a column read as a boolean, or [`None`].
-fn boolean_read<DB: DatabaseLike>(db: &DB, table: TableId, column: &str) -> Option<RowRecordError> {
-    match column_kind(db, table, column) {
-        Err(refusal) => Some(refusal),
-        Ok(ScalarKind::Bool) => None,
-        Ok(kind) => Some(RowRecordError::UnreadableColumn(alloc::format!(
-            "column {column} as a boolean: it holds a {kind:?}"
-        ))),
-    }
-}
-
-/// The refusal for a column read as a JSON document, or [`None`].
-fn document_read<DB: DatabaseLike>(
+fn direct_column_read<DB: DatabaseLike>(
+    column: &ColumnRead,
     db: &DB,
     table: TableId,
-    column: &str,
 ) -> Option<RowRecordError> {
-    match column_kind(db, table, column) {
-        Err(refusal) => Some(refusal),
-        Ok(ScalarKind::Json | ScalarKind::Jsonb) => None,
-        Ok(kind) => Some(RowRecordError::UnreadableColumn(alloc::format!(
-            "column {column} as a JSON document: it holds a {kind:?}"
-        ))),
+    let kind = match column_read_kind(column, db, table) {
+        Ok(kind) => kind,
+        Err(refusal) => return Some(refusal),
+    };
+    if direct_kind(kind) {
+        None
+    } else {
+        Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} has unsupported kind {kind:?}"
+        )))
     }
 }
 
-/// A column's declared kind, or the refusal for one the catalog cannot name.
-fn column_kind<DB: DatabaseLike>(
+fn bool_read<DB: DatabaseLike>(
+    column: &ColumnRead,
     db: &DB,
     table: TableId,
-    column: &str,
-) -> Result<ScalarKind, RowRecordError> {
+) -> Option<RowRecordError> {
+    let kind = match column_read_kind(column, db, table) {
+        Ok(kind) => kind,
+        Err(refusal) => return Some(refusal),
+    };
+    if kind == ColumnKind::Bool {
+        None
+    } else {
+        Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} is {kind:?}, not Bool"
+        )))
+    }
+}
+
+fn document_read<DB: DatabaseLike>(
+    column: &ColumnRead,
+    db: &DB,
+    table: TableId,
+) -> Option<RowRecordError> {
+    let kind = match column_read_kind(column, db, table) {
+        Ok(kind) => kind,
+        Err(refusal) => return Some(refusal),
+    };
+    if kind == ColumnKind::Json {
+        None
+    } else {
+        Some(RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} is {kind:?}, not Json"
+        )))
+    }
+}
+
+const fn direct_kind(kind: ColumnKind) -> bool {
+    !matches!(kind, ColumnKind::Json | ColumnKind::Unsupported)
+}
+
+fn column_read_kind<DB: DatabaseLike>(
+    column: &ColumnRead,
+    db: &DB,
+    table: TableId,
+) -> Result<ColumnKind, RowRecordError> {
     let refuse = || {
         RowRecordError::UnreadableColumn(alloc::format!(
             "column {column}, which the catalog does not know or cannot type"
         ))
     };
-    let id = catalog_helpers::column_id(db, table, column).ok_or_else(refuse)?;
-    catalog_helpers::column_scalar_kind(db, table, id).ok_or_else(refuse)
+    let id = catalog_helpers::column_id(db, table, column.as_str()).ok_or_else(refuse)?;
+    let scalar = catalog_helpers::column_scalar_kind(db, table, id).ok_or_else(refuse)?;
+    let actual = column_kind_from_scalar(scalar);
+    if actual == column.kind() {
+        Ok(actual)
+    } else {
+        Err(RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} is {actual:?} in the catalog but the shape reads {:?}",
+            column.kind()
+        )))
+    }
+}
+
+const fn column_kind_from_scalar(kind: ScalarKind) -> ColumnKind {
+    match kind {
+        ScalarKind::Bool => ColumnKind::Bool,
+        ScalarKind::Int => ColumnKind::Integer,
+        ScalarKind::Float => ColumnKind::Unsupported,
+        ScalarKind::String => ColumnKind::Text,
+        ScalarKind::Bytes => ColumnKind::Bytea,
+        ScalarKind::Uuid => ColumnKind::Uuid,
+        ScalarKind::Timestamp => ColumnKind::Timestamp,
+        ScalarKind::TimestampTz => ColumnKind::TimestampTz,
+        ScalarKind::Date => ColumnKind::Date,
+        ScalarKind::Time => ColumnKind::Time,
+        ScalarKind::Decimal => ColumnKind::Decimal,
+        ScalarKind::Json | ScalarKind::Jsonb => ColumnKind::Json,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,17 +337,6 @@ fn column_kind<DB: DatabaseLike>(
 // ---------------------------------------------------------------------------
 
 /// A [`RowView`] seen as one row's column values.
-///
-/// Resolves a column name to its ordinal through the catalog on every
-/// read, which is a linear scan of the table's columns. Descriptions name
-/// one or two columns, so the scan is bounded by the table's arity and
-/// happens twice per changed row.
-/// See `row` as one row's column values, for rls2fga's own readers.
-///
-/// [`ObjectKey::render`](rls2fga::generator::records::ObjectKey::render) wants
-/// this, and naming a row is the one thing a caller needs it for that computing
-/// records does not already cover. Sharing the reader is the point: an object
-/// name spelled by a second reader would drift from the one the records carry.
 pub fn row_values<'a, R, DB>(row: &'a R, db: &'a DB) -> impl RowValues + 'a
 where
     R: RowView + ?Sized,
@@ -333,13 +352,12 @@ where
 struct RowValuesView<'a, R: ?Sized, DB> {
     row: &'a R,
     db: &'a DB,
-    /// The first cell that failed to decode, which
-    /// [`records_from_row_view`] turns into a refusal.
-    ///
-    /// [`RowValues`] answers `Option`, so a reader here cannot report a
-    /// failure inline, and reporting none would make a corrupt cell
-    /// indistinguishable from a row that grants nobody.
     undecodable: Cell<Option<ValueError>>,
+}
+
+enum CellRead {
+    Absent,
+    Undecodable,
 }
 
 impl<R, DB> RowValuesView<'_, R, DB>
@@ -347,21 +365,16 @@ where
     R: RowView + ?Sized,
     DB: DatabaseLike,
 {
-    /// The cell `column` names, or [`None`] when the column is unknown to
-    /// the catalog or the cell could not be decoded.
-    ///
-    /// [`Value::Missing`] and [`Value::Null`] are returned as they are.
-    /// Every reader below matches a specific variant, so an absent cell
-    /// already falls through to "the row does not say", and filtering it
-    /// here would be a guard that can never change an answer.
-    fn cell(&self, column: &str) -> Option<Value<R::Backend>> {
-        let id = catalog_helpers::column_id(self.db, self.row.table_id(), column)?;
+    fn value(&self, column: &str) -> Result<Value<R::Backend>, CellRead> {
+        let Some(id) = catalog_helpers::column_id(self.db, self.row.table_id(), column) else {
+            return Err(CellRead::Absent);
+        };
         match self.row.value_at(id) {
-            Ok(value) => Some(value),
+            Ok(value) => Ok(value),
             Err(error) => {
                 let seen = self.undecodable.take();
                 self.undecodable.set(seen.or(Some(error)));
-                None
+                Err(CellRead::Undecodable)
             }
         }
     }
@@ -372,112 +385,135 @@ where
     R: RowView + ?Sized,
     DB: DatabaseLike,
 {
-    fn text(&self, column: &str) -> Option<Cow<'_, str>> {
-        render_text(&self.cell(column)?).map(Cow::Owned)
-    }
-
-    fn boolean(&self, column: &str) -> Option<bool> {
-        match self.cell(column)? {
-            Value::Bool(b) => as_json(&b)?.as_bool(),
-            _ => None,
+    fn cell(&self, column: &str, _kind: ColumnKind) -> RowCell<'_> {
+        match self.value(column) {
+            Ok(value) => row_cell(&value),
+            Err(CellRead::Absent) => RowCell::Absent,
+            Err(CellRead::Undecodable) => RowCell::Undecodable,
         }
     }
 
-    fn json_text(&self, column: &str, path: &[String]) -> Option<Cow<'_, str>> {
-        // `Json` and `Jsonb` are separate associated types, so they need
-        // separate arms even though both serialize the same way.
-        let document = match self.cell(column)? {
-            Value::Json(json) => as_json(&json)?,
-            Value::Jsonb(jsonb) => as_json(&jsonb)?,
-            _ => return None,
-        };
-        json_at(&document, path).map(Cow::Owned)
-    }
-
-    // `list` keeps the trait default of `None`. `records_from_row_view`
-    // refuses a `ListElements` shape before reaching here, so the default
-    // is unreachable rather than a silent wrong answer.
-}
-
-/// A scalar payload as JSON.
-///
-/// [`ScalarCore`](crate::backend::ScalarCore) guarantees `Serialize` and
-/// nothing that renders text, so this is the one route to a payload's
-/// value that every backend already provides. It is also the route that
-/// happens to agree with Postgres: `i64` serializes to a JSON number
-/// whose text is the decimal form, `uuid::Uuid` to its canonical
-/// hyphenated string, and `bool` to `true` or `false`.
-fn as_json<T: serde::Serialize>(payload: &T) -> Option<serde_json::Value> {
-    serde_json::to_value(payload).ok()
-}
-
-/// One cell as the text the loading SQL would have produced for it.
-///
-/// Only the spellings whose text form is unambiguous and matches what
-/// `'type:' || column` writes. Anything else is [`None`], which yields no
-/// record rather than a record keyed on a rendering that may not match
-/// the whole-table query. A caller needing one of those must widen this
-/// deliberately, with a test pinning the rendering against the loader.
-pub(crate) fn render_text<B: crate::backend::Backend>(value: &Value<B>) -> Option<String> {
-    let scalar = match value {
-        Value::String(s) => return Some(s.as_ref().to_string()),
-        Value::Int(i) => as_json(i)?,
-        Value::Uuid(u) => as_json(u)?,
-        Value::Bool(b) => as_json(b)?,
-        Value::Timestamp(t) => return timestamp_text(as_json(t)?),
-        Value::TimestampTz(t) => return timestamp_text(as_json(t)?),
-        _ => return None,
-    };
-    match scalar {
-        serde_json::Value::String(text) => Some(text),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Bool(b) => Some(if b { "true" } else { "false" }.to_string()),
-        _ => None,
-    }
-}
-
-/// A serialized timestamp respelled the way `to_jsonb` prints one, which is
-/// what the loading SQL writes into a record's context: `Z` widens to
-/// `+00:00`, and the fraction drops its trailing zeros, then itself when
-/// nothing is left. The wal adapters normalize a `timestamptz` to UTC, so
-/// `Z` and no suffix are the only spellings that reach this. Anything else
-/// passes through untouched rather than being reshaped on a guess.
-fn timestamp_text(scalar: serde_json::Value) -> Option<String> {
-    let serde_json::Value::String(text) = scalar else {
-        return None;
-    };
-    let (body, zone) = match text.strip_suffix('Z') {
-        Some(body) => (body, "+00:00"),
-        None if text.contains('+') => return Some(text),
-        None => (text.as_str(), ""),
-    };
-    let body = match body.split_once('.') {
-        Some((whole, fraction)) => {
-            let fraction = fraction.trim_end_matches('0');
-            if fraction.is_empty() {
-                alloc::borrow::Cow::Borrowed(whole)
-            } else {
-                alloc::borrow::Cow::Owned(alloc::format!("{whole}.{fraction}"))
-            }
+    fn list(&self, column: &str, _kind: ColumnKind) -> RowList<'_> {
+        match self.value(column) {
+            Ok(Value::Missing) | Err(CellRead::Absent) => RowList::Absent,
+            Ok(Value::Null) => RowList::Null,
+            Ok(_) | Err(CellRead::Undecodable) => RowList::Undecodable,
         }
-        None => alloc::borrow::Cow::Borrowed(body),
-    };
-    Some(alloc::format!("{body}{zone}"))
+    }
+
+    fn json_text(&self, column: &str, path: &[String]) -> RowCell<'_> {
+        match self.value(column) {
+            Ok(Value::Missing) | Err(CellRead::Absent) => RowCell::Absent,
+            Ok(Value::Null) => RowCell::Null,
+            Ok(Value::Json(json)) => json_at(json.json_document(), path),
+            Ok(Value::Jsonb(jsonb)) => json_at(jsonb.json_document(), path),
+            Ok(_) | Err(CellRead::Undecodable) => RowCell::Undecodable,
+        }
+    }
 }
 
-/// Walk `path` into `json`, outermost field first, and read the leaf as
-/// text. A JSON string yields its contents rather than its quoted form,
-/// matching `->>`.
-fn json_at(json: &serde_json::Value, path: &[String]) -> Option<String> {
+fn row_cell<B: Backend>(value: &Value<B>) -> RowCell<'static> {
+    match value {
+        Value::Missing => RowCell::Absent,
+        Value::Null => RowCell::Null,
+        Value::Bool(value) => RowCell::Bool(value.scalar_truth()),
+        Value::Int(value) => RowCell::Integer(Cow::Owned(value.scalar_text().into_owned())),
+        Value::Float(_) | Value::Json(_) | Value::Jsonb(_) => RowCell::Undecodable,
+        Value::String(value) => RowCell::Text(Cow::Owned(value.as_ref().to_string())),
+        Value::Bytes(value) => RowCell::Bytea(Cow::Owned(value.as_ref().to_vec())),
+        Value::Uuid(value) => RowCell::Uuid(Cow::Owned(value.scalar_text().into_owned())),
+        Value::Timestamp(value) => RowCell::Timestamp(Cow::Owned(value.scalar_text().into_owned())),
+        Value::TimestampTz(value) => {
+            RowCell::TimestampTz(Cow::Owned(value.scalar_text().into_owned()))
+        }
+        Value::Date(value) => RowCell::Date(Cow::Owned(value.scalar_text().into_owned())),
+        Value::Time(value) => RowCell::Time(Cow::Owned(value.scalar_text().into_owned())),
+        Value::Decimal(value) => RowCell::Decimal(Cow::Owned(value.scalar_text().into_owned())),
+    }
+}
+
+fn json_at(json: &serde_json::Value, path: &[String]) -> RowCell<'static> {
     let mut node = json;
     for field in path {
-        node = node.get(field.as_str())?;
+        let Some(next) = node.get(field.as_str()) else {
+            return RowCell::Null;
+        };
+        node = next;
     }
     match node {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(s) => Some(s.clone()),
-        other => Some(other.to_string()),
+        serde_json::Value::Null => RowCell::Null,
+        serde_json::Value::String(s) => RowCell::Text(Cow::Owned(s.clone())),
+        other => RowCell::Text(Cow::Owned(other.to_string())),
     }
+}
+
+pub(crate) fn render_text<B: Backend>(value: &Value<B>) -> Option<String> {
+    render_sql_text(&row_cell(value))
+}
+
+fn render_sql_text(cell: &RowCell<'_>) -> Option<String> {
+    match cell {
+        RowCell::Absent | RowCell::Null | RowCell::Undecodable => None,
+        RowCell::Text(value)
+        | RowCell::Uuid(value)
+        | RowCell::Integer(value)
+        | RowCell::Decimal(value)
+        | RowCell::Date(value)
+        | RowCell::Time(value) => Some(value.to_string()),
+        RowCell::Bool(flag) => Some(if *flag { "true" } else { "false" }.to_string()),
+        RowCell::Timestamp(value) => Some(timestamp_sql_text(value.as_ref())),
+        RowCell::TimestampTz(value) => timestamptz_sql_text(value.as_ref()),
+        RowCell::Bytea(bytes) => Some(bytea_sql_text(bytes.as_ref())),
+    }
+}
+
+fn timestamp_sql_text(value: &str) -> String {
+    let mut text = value.replace('T', " ");
+    trim_fraction(&mut text);
+    text
+}
+
+fn trim_fraction(text: &mut String) {
+    let Some(dot) = text.rfind('.') else {
+        return;
+    };
+    let end = text[dot + 1..]
+        .find(|ch: char| !ch.is_ascii_digit())
+        .map_or(text.len(), |offset| dot + 1 + offset);
+    let trimmed = text[dot + 1..end].trim_end_matches('0').len();
+    if trimmed == 0 {
+        text.replace_range(dot..end, "");
+    } else {
+        text.replace_range(dot + 1 + trimmed..end, "");
+    }
+}
+
+fn utc_timestamptz_base(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    for suffix in ["+00:00", "-00:00", "+00", "-00", "Z"] {
+        if let Some(base) = trimmed.strip_suffix(suffix) {
+            return Some(base);
+        }
+    }
+    None
+}
+
+fn timestamptz_sql_text(value: &str) -> Option<String> {
+    let base = utc_timestamptz_base(value)?;
+    let mut text = timestamp_sql_text(base);
+    text.push_str("+00");
+    Some(text)
+}
+
+fn bytea_sql_text(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -486,7 +522,7 @@ mod tests {
     use alloc::vec;
 
     use rls2fga::classifier::patterns::ConfidenceLevel;
-    use rls2fga::generator::records::{RowValues, SubjectKey};
+    use rls2fga::generator::records::{ColumnRead, ContextRendering, RowValues, SubjectKey};
     use rls2fga::parser::identifiers::{ColumnName, RelationName};
     use rls2fga::translator::TranslatorBuilder;
     use sqlparser::dialect::PostgreSqlDialect;
@@ -501,8 +537,6 @@ mod tests {
                        meta JSONB, key UUID, note JSON, score DOUBLE PRECISION, \
                        taken DATE, blob BYTEA, at TIMESTAMPTZ);";
 
-    /// The same table with the ownership policy that makes rls2fga describe it, so the
-    /// names in the description below are ones a translation decided.
     const POLICIED: &str = "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, public BOOL, \
                             meta JSONB, key UUID, note JSON, score DOUBLE PRECISION, \
                             taken DATE, blob BYTEA, at TIMESTAMPTZ);
@@ -513,25 +547,25 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap()
     }
 
-    /// Name a column the one way a caller outside rls2fga can, so a guard and a JSON path
-    /// name one too rather than spelling it as text.
-    fn column(name: &str) -> ColumnName {
-        match ValueSource::column(name) {
-            ValueSource::Column(column) => column,
-            other => unreachable!("`ValueSource::column` names a column, got {other:?}"),
-        }
+    fn name(name: &str) -> ColumnName {
+        serde_json::from_value(serde_json::Value::String(name.to_owned())).unwrap()
     }
 
-    /// The description rls2fga emits for `owner = current_user` on `docs`.
-    ///
-    /// Read off a real translation rather than assembled here, since the object type and
-    /// the relation are names the translation decides and nothing outside it may mint.
+    fn column(name: &str) -> ColumnRead {
+        ColumnRead::text(name)
+    }
+
+    fn typed_column(column: &str, kind: ColumnKind) -> ColumnRead {
+        ColumnRead::new(name(column), kind)
+    }
+
     fn translated_ownership() -> RecordDescription {
         let db = ParserDB::parse::<PostgreSqlDialect>(POLICIED).unwrap();
         TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .build()
             .translate(&db)
+            .unwrap()
             .relations()
             .into_iter()
             .flat_map(|entry| entry.shapes)
@@ -542,7 +576,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             .expect("the ownership policy describes records read from the row")
     }
 
-    /// The relation a description names, for an assertion that must agree with it.
     fn relation_of(description: &RecordDescription) -> RelationName {
         match &description.derivation {
             RecordDerivation::FromRow { template, .. } => template.relation.clone(),
@@ -550,7 +583,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         }
     }
 
-    /// That description with the subject and the guards this test wants.
     fn description(subject: ValueSource, guards: Vec<Guard>) -> RecordDescription {
         let mut described = translated_ownership();
         let RecordDerivation::FromRow {
@@ -570,7 +602,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         description(ValueSource::column("owner"), vec![])
     }
 
-    /// An insert carrying `[id, owner, public, meta, key, note, score]`.
     fn event(row: Vec<Value<Postgres>>) -> TestEvent<Postgres> {
         let db = catalog();
         let docs = catalog_helpers::table_id(&db, "docs").unwrap();
@@ -599,8 +630,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         records_from_row_view(description, &view, &db)
     }
 
-    /// The whole point: an owner column becomes a record naming that user,
-    /// with no database.
     #[test]
     fn a_text_owner_column_becomes_one_record() {
         let described = owner_description();
@@ -616,32 +645,30 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         );
     }
 
-    /// The object key is an `INT` primary key, which is the common case.
-    /// Rendering it as anything but its decimal form keys the record on an
-    /// object the loader never wrote.
     #[test]
     fn an_integer_key_renders_as_its_decimal_form() {
         let got = records(&owner_description(), row_of(Value::String("bob".into()))).unwrap();
         assert_eq!(got[0].object, "docs:4");
     }
 
-    /// A UUID subject must render canonically, lowercase and hyphenated,
-    /// which is what `uuid::text` writes.
     #[test]
     fn a_uuid_renders_canonically() {
         let id = uuid::Uuid::parse_str("550E8400-E29B-41D4-A716-446655440000").unwrap();
         let mut row = row_of(Value::Null);
         row[4] = Value::Uuid(id);
-        let got = records(&description(ValueSource::column("key"), vec![]), row).unwrap();
+        let got = records(
+            &description(
+                ValueSource::typed_column(name("key"), ColumnKind::Uuid),
+                vec![],
+            ),
+            row,
+        )
+        .unwrap();
         assert_eq!(got[0].subject, "user:550e8400-e29b-41d4-a716-446655440000");
     }
 
-    /// A `timestamptz` renders exactly as `to_jsonb` prints one, which is
-    /// what the loading SQL writes into a record's context: `T` separator,
-    /// `+00:00` rather than `Z`, and the fraction trimmed of trailing zeros
-    /// down to nothing.
     #[test]
-    fn a_timestamptz_renders_as_to_jsonb_prints_it() {
+    fn a_timestamptz_renders_as_sql_text() {
         use super::render_text;
         use crate::backend::Postgres;
 
@@ -650,7 +677,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             .with_timezone(&chrono::Utc);
         assert_eq!(
             render_text::<Postgres>(&Value::TimestampTz(whole)).as_deref(),
-            Some("2026-01-01T00:00:00+00:00")
+            Some("2026-01-01 00:00:00+00")
         );
 
         let fractional = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.123400Z")
@@ -658,8 +685,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             .with_timezone(&chrono::Utc);
         assert_eq!(
             render_text::<Postgres>(&Value::TimestampTz(fractional)).as_deref(),
-            Some("2026-01-01T00:00:00.1234+00:00"),
-            "the fraction drops its trailing zeros exactly as PostgreSQL prints it"
+            Some("2026-01-01 00:00:00.1234+00")
         );
 
         let naive =
@@ -667,8 +693,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
                 .unwrap();
         assert_eq!(
             render_text::<Postgres>(&Value::Timestamp(naive)).as_deref(),
-            Some("2026-01-01T00:00:30"),
-            "a timestamp without a zone carries none"
+            Some("2026-01-01 00:00:30")
         );
     }
 
@@ -698,60 +723,138 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         );
     }
 
-    /// A column whose kind the row side cannot spell refuses at setup, never
-    /// answers as an empty set. The loading SQL spells every kind through
-    /// `::text`, so an empty answer here would silently withhold additions
-    /// and withdrawals the loader states.
     #[test]
-    fn an_unspellable_kind_is_refused_rather_than_answered_empty() {
+    fn unsupported_direct_kinds_are_refused_at_setup() {
         let db = catalog();
-        for (name, kind) in [
-            ("taken", "Date"),
-            ("blob", "Bytes"),
-            ("score", "Float"),
-            ("meta", "Jsonb"),
+        for (name, source, expected) in [
+            (
+                "score",
+                ValueSource::typed_column(name("score"), ColumnKind::Unsupported),
+                "Unsupported",
+            ),
+            (
+                "meta",
+                ValueSource::typed_column(name("meta"), ColumnKind::Json),
+                "Json",
+            ),
         ] {
-            let d = description(ValueSource::column(name), vec![]);
-            assert!(
-                !is_evaluable(&d, &db),
-                "{name} holds a {kind}, which text cannot spell"
-            );
+            let d = description(source, vec![]);
+            assert!(!is_evaluable(&d, &db), "{name} must refuse");
             let Err(RowRecordError::UnreadableColumn(reason)) =
                 records(&d, row_of(Value::String("alice".into())))
             else {
                 panic!("{name} must refuse");
             };
             assert!(
-                reason.contains(name) && reason.contains(kind),
-                "the refusal names the column and its kind: {reason}"
+                reason.contains(name) && reason.contains(expected),
+                "the refusal names the column and kind: {reason}"
             );
         }
-        // The contrast that keeps the gate honest: a spellable kind stays
-        // evaluable through the same path.
-        assert!(is_evaluable(
-            &description(ValueSource::column("at"), vec![]),
-            &db
-        ));
+        for source in [
+            ValueSource::typed_column(name("taken"), ColumnKind::Date),
+            ValueSource::typed_column(name("blob"), ColumnKind::Bytea),
+            ValueSource::typed_column(name("at"), ColumnKind::TimestampTz),
+        ] {
+            assert!(is_evaluable(&description(source, vec![]), &db));
+        }
     }
 
-    /// A guard is read at a kind too: `IsTrue` wants a boolean and the
-    /// textual comparisons want a spellable kind, so a guard over the wrong
-    /// kind refuses rather than failing silently for every row.
+    #[test]
+    fn a_timestamp_identity_is_served_with_sql_text() {
+        let db = catalog();
+        let d = description(
+            ValueSource::typed_column(name("at"), ColumnKind::TimestampTz),
+            vec![],
+        );
+        assert!(is_evaluable(&d, &db));
+
+        let moment = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut row = row_of(Value::String("alice".into()));
+        row.extend([Value::Null, Value::Null, Value::TimestampTz(moment)]);
+        let got = records(&d, row).unwrap();
+        assert!(got[0].subject.starts_with("user:~"));
+    }
+
+    #[test]
+    fn a_timestamp_comparison_is_refused_and_presence_is_not() {
+        use rls2fga::classifier::patterns::{AttributeOperator, AttributePredicate};
+
+        let db = catalog();
+        let compared = description(
+            ValueSource::column("owner"),
+            vec![Guard::Compare {
+                column: typed_column("at", ColumnKind::TimestampTz),
+                predicate: AttributePredicate {
+                    column: name("at"),
+                    operator: AttributeOperator::LtEq,
+                    value: AttributeLiteral::Text("2026-01-01".into()),
+                },
+            }],
+        );
+        assert!(!is_evaluable(&compared, &db));
+
+        let present = description(
+            ValueSource::column("owner"),
+            vec![Guard::NotNull(typed_column("at", ColumnKind::TimestampTz))],
+        );
+        assert!(is_evaluable(&present, &db));
+    }
+
+    #[test]
+    fn a_timestamp_context_keeps_serving() {
+        use rls2fga::generator::records::{RecordContext, RecordContextEntry};
+
+        let db = catalog();
+        let mut d = description(ValueSource::column("owner"), vec![]);
+        let RecordDerivation::FromRow { template, .. } = &mut d.derivation else {
+            unreachable!("the ownership description reads the row");
+        };
+        template.context = Some(RecordContext {
+            condition: "when_docs".into(),
+            entries: vec![RecordContextEntry {
+                key: "at".into(),
+                value: ValueSource::typed_column(name("at"), ColumnKind::TimestampTz),
+                rendering: ContextRendering::Json,
+            }],
+        });
+        assert!(is_evaluable(&d, &db));
+
+        let moment = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut row = row_of(Value::String("alice".into()));
+        row.extend([Value::Null, Value::Null, Value::TimestampTz(moment)]);
+        let got = records(&d, row).unwrap();
+        let context = got[0].context.as_ref().expect("the record carries it");
+        assert_eq!(
+            context.values.get("at").map(alloc::string::String::as_str),
+            Some("2026-01-01T00:00:00+00:00")
+        );
+    }
+
     #[test]
     fn a_guard_over_the_wrong_kind_is_refused() {
         use rls2fga::classifier::patterns::{AttributeOperator, AttributePredicate};
 
         let subject = || ValueSource::column("owner");
         let cases: [(Guard, &str); 3] = [
-            (Guard::IsTrue(column("owner")), "as a boolean"),
-            (Guard::NotNull(column("taken")), "Date"),
+            (Guard::IsTrue(column("owner")), "not Bool"),
             (
-                Guard::Compare(AttributePredicate {
-                    column: column("score"),
-                    operator: AttributeOperator::Gt,
-                    value: AttributeLiteral::Number("0".into()),
-                }),
-                "Float",
+                Guard::NotNull(typed_column("meta", ColumnKind::Json)),
+                "Json",
+            ),
+            (
+                Guard::Compare {
+                    column: typed_column("score", ColumnKind::Unsupported),
+                    predicate: AttributePredicate {
+                        column: name("score"),
+                        operator: AttributeOperator::Gt,
+                        value: AttributeLiteral::Number("0".into()),
+                    },
+                },
+                "compared",
             ),
         ];
         for (guard, expected) in cases {
@@ -768,7 +871,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         }
     }
 
-    /// A JSON path wants a document, so a path into a scalar column refuses.
     #[test]
     fn a_json_path_into_a_scalar_column_is_refused() {
         let d = description(
@@ -784,14 +886,11 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             panic!("a path into a scalar must refuse");
         };
         assert!(
-            reason.contains("JSON document"),
+            reason.contains("Json"),
             "the refusal names the read: {reason}"
         );
     }
 
-    /// The gate and the speller cannot drift: for every kind, the setup gate
-    /// admits exactly the kinds `render_text` spells. Exhaustive on purpose,
-    /// mirroring the term lookup's gate test.
     #[test]
     fn the_setup_gate_matches_what_render_text_spells() {
         let epoch = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant");
@@ -815,19 +914,18 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         ];
         for (kind, value) in cases {
             assert_eq!(
-                spells_as_text(kind),
+                direct_kind(column_kind_from_scalar(kind)),
                 render_text(&value).is_some(),
                 "{kind:?} disagrees between the gate and the speller"
             );
         }
     }
 
-    /// A guard that fails withdraws the record entirely.
     #[test]
     fn a_failing_guard_drops_the_record() {
         let d = description(
             ValueSource::column("owner"),
-            vec![Guard::IsTrue(column("public"))],
+            vec![Guard::IsTrue(typed_column("public", ColumnKind::Bool))],
         );
         assert_eq!(
             records(&d, row_of(Value::String("alice".into()))).unwrap(),
@@ -839,15 +937,13 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         assert_eq!(records(&d, row).unwrap().len(), 1);
     }
 
-    /// A JSON path subject reads the leaf as text, not as its quoted JSON
-    /// form, matching `->>`.
     #[test]
     fn a_json_path_subject_reads_the_leaf_as_text() {
         let mut row = row_of(Value::Null);
         row[3] = Value::Jsonb(serde_json::json!({"acl": {"owner": "carol"}}));
         let d = description(
             ValueSource::JsonPath {
-                column: column("meta"),
+                column: typed_column("meta", ColumnKind::Json),
                 path: vec!["acl".into(), "owner".into()],
             },
             vec![],
@@ -855,10 +951,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         assert_eq!(records(&d, row).unwrap()[0].subject, "user:carol");
     }
 
-    /// The one that matters. `Value` has no array variant, so a list shape
-    /// cannot be expanded. Answering it as an empty set would read as
-    /// "this row grants nobody", silently withdrawing every member's
-    /// access, so it must be an error the caller has to handle.
     #[test]
     fn a_list_shape_is_refused_rather_than_answered_empty() {
         let d = description(ValueSource::ListElements(column("owner")), vec![]);
@@ -868,8 +960,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         );
     }
 
-    /// A shape reading a second table is refused with the reason rls2fga
-    /// recorded, never an empty set.
     #[test]
     fn a_joining_shape_is_refused_with_its_reason() {
         let d = RecordDescription {
@@ -887,17 +977,16 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         );
     }
 
-    /// A cell the event does not carry is absent, not empty text.
     #[test]
-    fn a_missing_cell_produces_no_record() {
+    fn a_missing_cell_is_refused() {
         assert_eq!(
-            records(&owner_description(), row_of(Value::Missing)).unwrap(),
-            vec![]
+            records(&owner_description(), row_of(Value::Missing)),
+            Err(RowRecordError::Refused(RecordError::ColumnAbsent(
+                "owner".to_string()
+            )))
         );
     }
 
-    /// The previous image answers about the row as it was, which is what
-    /// a withdrawal has to be computed from.
     #[test]
     fn the_previous_image_answers_about_the_old_owner() {
         let db = catalog();
@@ -922,12 +1011,10 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         );
     }
 
-    /// The adapter reads booleans through the trait's own accessor, which
-    /// is what `Guard::IsTrue` calls.
     #[test]
-    fn the_boolean_accessor_reads_a_bool_column() {
+    fn the_typed_cell_reader_preserves_kind() {
         let db = catalog();
-        let mut row = row_of(Value::Null);
+        let mut row = row_of(Value::String("alice".into()));
         row[2] = Value::Bool(true);
         let event = event(row);
         let view = EventRow::current(&event, &db).unwrap();
@@ -936,20 +1023,21 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             db: &db,
             undecodable: Cell::new(None),
         };
-        assert_eq!(values.boolean("public"), Some(true));
-        assert_eq!(values.boolean("owner"), None, "a text column is not a bool");
-        assert_eq!(values.list("owner"), None, "no array variant to expand");
+        assert_eq!(values.cell("public", ColumnKind::Bool), RowCell::Bool(true));
+        assert!(matches!(
+            values.cell("owner", ColumnKind::Bool),
+            RowCell::Text(_)
+        ));
+        assert_eq!(values.list("owner", ColumnKind::Text), RowList::Undecodable);
     }
 
-    /// `json` and `jsonb` are separate associated types and separate
-    /// match arms, so both need exercising or one can rot.
     #[test]
     fn a_json_column_reads_the_same_as_a_jsonb_one() {
         let mut row = row_of(Value::Null);
         row[5] = Value::Json(serde_json::json!({"acl": {"owner": "dan"}}));
         let d = description(
             ValueSource::JsonPath {
-                column: column("note"),
+                column: typed_column("note", ColumnKind::Json),
                 path: vec!["acl".into(), "owner".into()],
             },
             vec![],
@@ -957,8 +1045,6 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         assert_eq!(records(&d, row).unwrap()[0].subject, "user:dan");
     }
 
-    /// A JSON leaf that is null, or a path that runs off the document,
-    /// grants nobody rather than granting `user:null`.
     #[test]
     fn an_absent_or_null_json_leaf_produces_no_record() {
         for document in [
@@ -970,7 +1056,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             row[3] = Value::Jsonb(document);
             let d = description(
                 ValueSource::JsonPath {
-                    column: column("meta"),
+                    column: typed_column("meta", ColumnKind::Json),
                     path: vec!["acl".into(), "owner".into()],
                 },
                 vec![],
@@ -979,15 +1065,13 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         }
     }
 
-    /// A non-string JSON leaf keeps its own text, which is what `->>`
-    /// yields for a number.
     #[test]
     fn a_numeric_json_leaf_reads_as_its_digits() {
         let mut row = row_of(Value::Null);
         row[3] = Value::Jsonb(serde_json::json!({"acl": {"owner": 12}}));
         let d = description(
             ValueSource::JsonPath {
-                column: column("meta"),
+                column: typed_column("meta", ColumnKind::Json),
                 path: vec!["acl".into(), "owner".into()],
             },
             vec![],
@@ -995,13 +1079,15 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         assert_eq!(records(&d, row).unwrap()[0].subject, "user:12");
     }
 
-    /// A boolean subject renders as Postgres writes it, not as `1`.
     #[test]
     fn a_boolean_renders_as_true_or_false() {
         for (flag, expected) in [(true, "user:true"), (false, "user:false")] {
             let mut row = row_of(Value::Null);
             row[2] = Value::Bool(flag);
-            let d = description(ValueSource::column("public"), vec![]);
+            let d = description(
+                ValueSource::typed_column(name("public"), ColumnKind::Bool),
+                vec![],
+            );
             assert_eq!(records(&d, row).unwrap()[0].subject, expected);
         }
     }

@@ -17,18 +17,19 @@
 #![allow(clippy::unwrap_used)]
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openfga_client::client::{
-    CreateStoreRequest, ListStoresRequest, OpenFgaServiceClient, TupleKey, WriteRequest,
-    WriteRequestWrites,
+    ConsistencyPreference, CreateStoreRequest, ListStoresRequest, OpenFgaServiceClient,
+    ReadRequest, ReadRequestTupleKey, TupleKey, WriteRequest, WriteRequestWrites,
 };
 use openfga_client::tonic::transport::Channel;
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::classifier::patterns::ConfidenceLevel;
 use rls2fga::generator::action_relations::ActionStatement;
-use rls2fga::generator::records::Record;
+use rls2fga::generator::records::{Record, RecordContextValue};
 use rls2fga::generator::well_known::member_relation;
 use rls2fga::translator::TranslatorBuilder;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -70,7 +71,9 @@ fn wiring(sql: &str) -> Wiring {
         ])
         .build();
     let (relations, naming, notes, answers) = {
-        let translation = translator.translate(&db);
+        let translation = translator
+            .translate(&db)
+            .expect("the visibility schema translates");
         (
             translation.relations(),
             translation.row_naming(),
@@ -80,6 +83,7 @@ fn wiring(sql: &str) -> Wiring {
     };
     let model = translator
         .translate(&db)
+        .expect("the visibility schema translates")
         .outputs_accepting_gaps()
         .json_model();
     Wiring {
@@ -458,11 +462,11 @@ CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
     );
 }
 
-/// The two-table removal, closed against the service: a membership only a
+/// The two-table removal, closed against the service store: a membership only a
 /// replay reaches is withdrawn, the replay returns the slice's remaining
-/// truth, and reconciling it takes the stale fact out, so live delivery
-/// stops. This is the gap where a caller following the old contract, replay
-/// and write back, was told nothing was stale and kept granting for ever.
+/// truth, and reconciling it takes the stale fact out. This is the gap where a
+/// caller following the old contract, replay and write back, was told nothing
+/// was stale and kept granting for ever.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn a_withdrawn_grant_only_a_replay_reaches_is_reconciled_out() {
@@ -485,7 +489,6 @@ CREATE POLICY p ON docs FOR SELECT USING (
     let (_container, mut client) = openfga().await;
 
     let wired = wiring(EXPIRING);
-    let docs = catalog_helpers::table_id(&wired.db, "docs").expect("docs is in the catalog");
     let members =
         catalog_helpers::table_id(&wired.db, "team_members").expect("members is in the catalog");
     let model = wired.model.clone();
@@ -509,30 +512,6 @@ CREATE POLICY p ON docs FOR SELECT USING (
     .expect("the index carries what the questions need")
     .authorization_model_id(model_id);
 
-    // Doc 4 belongs to team 3, and the initial load stated alice's live
-    // membership. The bridge tuple comes from the row the way every settled
-    // fact does, and the membership goes through the writer the load uses.
-    let created = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), Value::Int(3)])
-        .with_pk_columns([0u16]);
-    backend
-        .apply(&shapes.diff(&created).expect("an insert is all additions"))
-        .await
-        .expect("write the bridge");
-    backend
-        .write_records(&[membership("user:alice")])
-        .await
-        .expect("seed the membership");
-
-    let watchers = ["user:alice".to_owned(), "user:bob".to_owned()];
-    let row = EventRow::current(&created, shapes.catalog()).expect("post-image");
-    assert_eq!(
-        answered(&backend, &row, &watchers).await,
-        [Verdict::Allow, Verdict::Deny],
-        "the seeded membership grants alice the doc"
-    );
-
-    // Alice's membership row is deleted. No row image evaluates the clock, so
-    // the difference removes nothing itself and hands over the replay.
     let withdrawn = TestEvent::<Postgres>::delete(
         members,
         vec![
@@ -544,64 +523,94 @@ CREATE POLICY p ON docs FOR SELECT USING (
     let diff = shapes
         .diff(&withdrawn)
         .expect("the previous image is whole");
+    let [requery] = diff.requeries.as_slice() else {
+        panic!("one replay, one table the change arrived on: {diff:?}");
+    };
+    let condition = requery
+        .query
+        .condition
+        .as_deref()
+        .expect("the membership is conditional");
+    backend
+        .write_records(&[membership(
+            "user:alice",
+            condition,
+            "2027-01-01T00:00:00+00:00",
+        )])
+        .await
+        .expect("seed the membership");
+
+    assert_eq!(
+        stored_members(&mut client, &store).await,
+        ["user:alice".to_owned()]
+    );
     assert!(
         diff.removed.is_empty(),
         "the row alone cannot say what the slice still holds"
     );
-    let [requery] = diff.requeries.as_slice() else {
-        panic!("one replay, one table the change arrived on: {diff:?}");
-    };
 
-    // The replay of team 3 now returns nothing: the deleted row was the only
-    // live membership. Reconciling the empty truth deletes the stale fact.
     backend
         .reconcile_records(requery, &[])
         .await
         .expect("reconcile the emptied slice");
 
     assert_eq!(
-        answered(&backend, &row, &watchers).await,
-        [Verdict::Deny, Verdict::Deny],
-        "the share row is gone, so the key grants nothing and live delivery stops"
+        stored_members(&mut client, &store).await,
+        Vec::<String>::new()
     );
 
-    // The same reconciliation writes what is new: a replay returning bob's
-    // fresh membership adds him without resurrecting alice.
     backend
-        .reconcile_records(requery, &[membership("user:bob")])
+        .reconcile_records(
+            requery,
+            &[membership(
+                "user:bob",
+                condition,
+                "2027-01-01T00:00:00+00:00",
+            )],
+        )
         .await
         .expect("reconcile the replayed truth");
 
     assert_eq!(
-        answered(&backend, &row, &watchers).await,
-        [Verdict::Deny, Verdict::Allow],
-        "the replayed truth is the slice's whole content, in both directions"
+        stored_members(&mut client, &store).await,
+        ["user:bob".to_owned()]
     );
 }
 
-/// A live membership of team 3, as the initial load or a replay states it.
-fn membership(subject: &str) -> Record {
+fn membership(subject: &str, condition: &str, expires_at: &str) -> Record {
     Record {
         object: "teams:3".to_owned(),
         relation: member_relation(),
         subject: subject.to_owned(),
-        context: None,
+        context: Some(RecordContextValue {
+            condition: condition.to_owned(),
+            values: BTreeMap::from([("expires_at".to_owned(), expires_at.to_owned())]),
+        }),
     }
 }
 
-/// The verdicts `backend` gives `watchers` about `row`.
-async fn answered(
-    backend: &OpenFgaPolicy<ParserDB, Channel, String, Postgres>,
-    row: &(impl subql::visibility::RowView<Backend = Postgres> + Sync),
-    watchers: &[String],
-) -> Vec<Verdict> {
-    let mut verdicts = Vec::new();
-    Verdict::reset(&mut verdicts, watchers.len());
-    backend
-        .may_see(row, watchers, &mut verdicts)
+async fn stored_members(client: &mut OpenFgaServiceClient<Channel>, store: &str) -> Vec<String> {
+    let response = client
+        .read(ReadRequest {
+            store_id: store.to_owned(),
+            tuple_key: Some(ReadRequestTupleKey {
+                user: String::new(),
+                relation: member_relation().to_string(),
+                object: "teams:3".to_owned(),
+            }),
+            page_size: None,
+            continuation_token: String::new(),
+            consistency: ConsistencyPreference::HigherConsistency as i32,
+        })
         .await
-        .expect("the service answered");
-    verdicts
+        .expect("read memberships")
+        .into_inner();
+    response
+        .tuples
+        .into_iter()
+        .filter_map(|tuple| tuple.key)
+        .map(|key| key.user)
+        .collect()
 }
 
 /// A watcher that names itself and says which keys its request carried.

@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::classifier::patterns::ConfidenceLevel;
-use rls2fga::generator::records::{RecordDerivation, ValueSource};
+use rls2fga::generator::records::{ColumnKind, ColumnRead, RecordDerivation};
 use rls2fga::generator::relations::RelationShapes;
 use rls2fga::parser::identifiers::{ColumnName, RelationName, TypeName};
 use rls2fga::translator::TranslatorBuilder;
@@ -28,6 +28,7 @@ fn translated(sql: &str) -> Vec<RelationShapes> {
         .with_min_confidence(ConfidenceLevel::B)
         .build()
         .translate(&db)
+        .expect("the ownership fixture translates")
         .relations()
 }
 
@@ -79,6 +80,7 @@ pub fn gated_relation() -> (RelationName, String) {
         ])
         .build()
         .translate(&db)
+        .expect("the held-keys fixture translates")
         .relations()
         .into_iter()
         .flat_map(|entry| entry.shapes)
@@ -95,11 +97,13 @@ pub fn gated_relation() -> (RelationName, String) {
         .expect("the held-keys arm is gated on a condition")
 }
 
-/// Name a column the one way a caller outside rls2fga can.
 #[must_use]
 pub fn column(name: &str) -> ColumnName {
-    match ValueSource::column(String::from(name)) {
-        ValueSource::Column(column) => column,
-        other => unreachable!("`ValueSource::column` names a column, got {other:?}"),
-    }
+    serde_json::from_value(serde_json::Value::String(String::from(name)))
+        .expect("the column name deserializes")
+}
+
+#[must_use]
+pub fn column_read(name: &str) -> ColumnRead {
+    ColumnRead::new(column(name), ColumnKind::Text)
 }

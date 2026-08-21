@@ -33,7 +33,7 @@
 
 use crate::checkpoint::Checkpoint;
 use crate::types::{ColumnId, EventKind, TableId};
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, string::ToString, vec::Vec};
 use sql_traits::prelude::DatabaseLike;
 
 // ---------------------------------------------------------------------------
@@ -316,6 +316,90 @@ pub trait ScalarKey: ScalarCore + Eq + core::hash::Hash {}
 
 impl<T> ScalarKey for T where T: ScalarCore + Eq + core::hash::Hash {}
 
+/// Text payload a row can hand to typed record rendering.
+pub trait ScalarText: ScalarCore {
+    /// Return the canonical payload text.
+    fn scalar_text(&self) -> Cow<'_, str>;
+}
+
+impl ScalarText for alloc::string::String {
+    fn scalar_text(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.as_str())
+    }
+}
+
+impl ScalarText for i64 {
+    fn scalar_text(&self) -> Cow<'_, str> {
+        Cow::Owned(self.to_string())
+    }
+}
+
+impl ScalarText for uuid::Uuid {
+    fn scalar_text(&self) -> Cow<'_, str> {
+        Cow::Owned(self.to_string())
+    }
+}
+
+impl ScalarText for chrono::NaiveDateTime {
+    fn scalar_text(&self) -> Cow<'_, str> {
+        Cow::Owned(self.to_string())
+    }
+}
+
+impl ScalarText for chrono::DateTime<chrono::Utc> {
+    fn scalar_text(&self) -> Cow<'_, str> {
+        Cow::Owned(self.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+    }
+}
+
+impl ScalarText for chrono::NaiveDate {
+    fn scalar_text(&self) -> Cow<'_, str> {
+        Cow::Owned(self.to_string())
+    }
+}
+
+impl ScalarText for chrono::NaiveTime {
+    fn scalar_text(&self) -> Cow<'_, str> {
+        Cow::Owned(self.to_string())
+    }
+}
+
+impl ScalarText for bigdecimal::BigDecimal {
+    fn scalar_text(&self) -> Cow<'_, str> {
+        Cow::Owned(self.to_string())
+    }
+}
+
+/// Payload that can answer a SQL boolean guard.
+pub trait ScalarTruth: ScalarCore {
+    /// Return the SQL truth value.
+    fn scalar_truth(&self) -> bool;
+}
+
+impl ScalarTruth for bool {
+    fn scalar_truth(&self) -> bool {
+        *self
+    }
+}
+
+impl ScalarTruth for i64 {
+    fn scalar_truth(&self) -> bool {
+        *self != 0
+    }
+}
+
+/// Payload that stores a JSON document.
+pub trait JsonDocument: ScalarCore {
+    /// Borrow the stored document.
+    fn json_document(&self) -> &serde_json::Value;
+}
+
+impl JsonDocument for serde_json::Value {
+    fn json_document(&self) -> &serde_json::Value {
+        self
+    }
+}
+
 /// One SQL database subql observes.
 ///
 /// An implementation names a database (via its sqlparser dialect) and
@@ -345,11 +429,12 @@ pub trait Backend: 'static {
     type Dialect: sqlparser::dialect::Dialect;
 
     /// SQL `BOOL` representation. Only equality-shaped operations are
-    /// applied to booleans; no ordering or arithmetic bound is required.
-    type Bool: ScalarKey;
+    /// applied to booleans, so truth is the extra row-side capability.
+    type Bool: ScalarKey + ScalarTruth;
     /// SQL integer representation (all integer widths roll up to this type).
     /// Supports arithmetic and ordering.
     type Int: ScalarKey
+        + ScalarText
         + PartialOrd
         + core::ops::Add<Output = Self::Int>
         + core::ops::Sub<Output = Self::Int>
@@ -372,23 +457,24 @@ pub trait Backend: 'static {
         + core::ops::Neg<Output = Self::Float>;
     /// SQL text representation (`TEXT`, `VARCHAR`, `CHAR`, ...).
     /// `AsRef<str>` supports `LIKE` / `ILIKE` pattern matching.
-    type String: ScalarKey + PartialOrd + AsRef<str>;
+    type String: ScalarKey + ScalarText + PartialOrd + AsRef<str>;
     /// SQL binary representation (`BYTEA`, `BLOB`, `VARBINARY`, ...).
     /// `AsRef<[u8]>` supports byte-level comparisons.
     type Bytes: ScalarKey + PartialOrd + AsRef<[u8]>;
     /// SQL UUID representation. Ordered by underlying bytes for `<` / `>`.
-    type Uuid: ScalarKey + PartialOrd;
+    type Uuid: ScalarKey + ScalarText + PartialOrd;
     /// SQL `TIMESTAMP` (no time zone). Ordered chronologically.
-    type Timestamp: ScalarKey + PartialOrd;
+    type Timestamp: ScalarKey + ScalarText + PartialOrd;
     /// SQL `TIMESTAMP WITH TIME ZONE`. Ordered chronologically.
-    type TimestampTz: ScalarKey + PartialOrd;
+    type TimestampTz: ScalarKey + ScalarText + PartialOrd;
     /// SQL `DATE`. Ordered chronologically.
-    type Date: ScalarKey + PartialOrd;
+    type Date: ScalarKey + ScalarText + PartialOrd;
     /// SQL `TIME` (no time zone). Ordered chronologically.
-    type Time: ScalarKey + PartialOrd;
+    type Time: ScalarKey + ScalarText + PartialOrd;
     /// SQL arbitrary-precision `NUMERIC` / `DECIMAL`. Supports arithmetic
-    /// and ordering; no `Rem` bound (see `Float`).
+    /// and ordering. No `Rem` bound (see `Float`).
     type Decimal: ScalarKey
+        + ScalarText
         + PartialOrd
         + core::ops::Add<Output = Self::Decimal>
         + core::ops::Sub<Output = Self::Decimal>
@@ -397,9 +483,9 @@ pub trait Backend: 'static {
         + core::ops::Neg<Output = Self::Decimal>;
     /// SQL `JSON` (text-shaped). Comparison beyond equality is undefined,
     /// so no ordering bound.
-    type Json: ScalarCore;
+    type Json: ScalarCore + JsonDocument;
     /// SQL `JSONB` (binary-shaped). No ordering bound (see `Json`).
-    type Jsonb: ScalarCore;
+    type Jsonb: ScalarCore + JsonDocument;
 }
 
 // ---------------------------------------------------------------------------

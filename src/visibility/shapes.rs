@@ -131,7 +131,7 @@ pub(crate) struct TableShapes {
 /// let translator = TranslatorBuilder::new()
 ///     .with_min_confidence(ConfidenceLevel::B)
 ///     .build();
-/// let translation = translator.translate(&db);
+/// let translation = translator.translate(&db)?;
 /// let relations = translation.relations();
 /// let naming = translation.row_naming();
 /// let answers = translation.action_relations();
@@ -323,7 +323,9 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// let translator = TranslatorBuilder::new()
     ///     .with_min_confidence(ConfidenceLevel::B)
     ///     .build();
-    /// let translation = translator.translate(&db);
+    /// let translation = translator
+    ///     .translate(&db)
+    ///     .expect("the schema translates");
     /// let relations = translation.relations();
     /// let naming = translation.row_naming();
     /// let answers = translation.action_relations();
@@ -725,7 +727,8 @@ mod tests {
         let translation = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .build()
-            .translate(&db);
+            .translate(&db)
+            .unwrap();
         let (relations, naming, answers, unrestricted) = (
             translation.relations(),
             translation.row_naming(),
@@ -888,16 +891,12 @@ mod tests {
         }
     }
 
-    /// A shape reading a column whose kind the row side cannot spell is named
-    /// uncovered at setup rather than served and silently stale: the loading
-    /// SQL spells a `DATE` key through `::text`, and a row image does not, so
-    /// serving the shape would load records no changed row could ever move.
     #[test]
-    fn a_shape_keyed_on_an_unspellable_kind_is_uncovered() {
+    fn a_shape_keyed_on_an_unsupported_kind_is_uncovered() {
         use crate::visibility::store::UncoveredReason;
 
         let shapes = shapes(
-            "CREATE TABLE snaps (taken DATE PRIMARY KEY, owner TEXT);
+            "CREATE TABLE snaps (score DOUBLE PRECISION PRIMARY KEY, owner TEXT);
              ALTER TABLE snaps ENABLE ROW LEVEL SECURITY;
              CREATE POLICY s ON snaps USING (owner = current_user);",
         );
@@ -906,7 +905,28 @@ mod tests {
                 .uncovered()
                 .iter()
                 .any(|gap| gap.table == "snaps" && gap.reason == UncoveredReason::UnreadableColumn),
-            "the DATE key has no row-side spelling, so the shape must be named: {:?}",
+            "the unsupported key must be named: {:?}",
+            shapes.uncovered()
+        );
+    }
+
+    #[test]
+    fn a_time_keyed_table_is_served() {
+        use crate::visibility::store::UncoveredReason;
+
+        let shapes = shapes(
+            "CREATE TABLE readings (device_id INT, recorded_at TIMESTAMPTZ, owner TEXT, \
+             PRIMARY KEY (device_id, recorded_at));
+             ALTER TABLE readings ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY r ON readings USING (owner = current_user);",
+        );
+        assert!(
+            !shapes
+                .uncovered()
+                .iter()
+                .any(|gap| gap.table == "readings"
+                    && gap.reason == UncoveredReason::UnreadableColumn),
+            "a time part now has an identity spelling: {:?}",
             shapes.uncovered()
         );
     }
