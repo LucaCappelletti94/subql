@@ -41,15 +41,18 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::num::NonZeroU32;
 
 use diesel::backend::Backend;
 use diesel::connection::{DefaultLoadingMode, LoadConnection};
+use diesel::deserialize::FromSql;
 use diesel::expression::QueryMetadata;
 use diesel::pg::{Pg, PgMetadataLookup, PgTypeMetadata, PgValue};
 use diesel::query_builder::bind_collector::RawBytesBindCollector;
 use diesel::query_builder::returning::ReturningClause;
 use diesel::query_builder::{InsertStatement, Query, QueryBuilder, QueryFragment, QueryId};
 use diesel::row::{Field, Row};
+use diesel::sql_types;
 use diesel::Table;
 
 /// A follow-insert query: the caller's insert with a `RETURNING <primary key>`
@@ -321,24 +324,37 @@ fn mysql_int_ne(b: &[u8], signed: bool) -> Result<i64, RegisterError> {
 
 /// Decode one Postgres binary-format bind value into a `Value<Postgres>`.
 /// `None` bytes are a SQL NULL.
+///
+/// The OID dispatch is subql's, since it decides which `Value` variant a bind
+/// becomes, but each arm's bytes are read by diesel's own `FromSql` for the
+/// Rust type that OID means. Diesel wrote those binary readers for the wire
+/// format it also serializes, so re-implementing them here only added a second
+/// place for the two to disagree.
 fn decode_pg_bind(bytes: Option<&[u8]>, type_oid: u32) -> Result<Value<Postgres>, RegisterError> {
     let Some(b) = bytes else {
         return Ok(Value::Null);
     };
     let value = match type_oid {
-        oid::BOOL => Value::Bool(*b.first().ok_or_else(|| bad_len("bool", b.len()))? != 0),
-        oid::INT2 => Value::Int(i64::from(i16::from_be_bytes(fixed(b, "int2")?))),
-        oid::INT4 => Value::Int(i64::from(i32::from_be_bytes(fixed(b, "int4")?))),
-        oid::INT8 => Value::Int(i64::from_be_bytes(fixed(b, "int8")?)),
-        oid::FLOAT4 => Value::Float(f64::from(f32::from_be_bytes(fixed(b, "float4")?))),
-        oid::FLOAT8 => Value::Float(f64::from_be_bytes(fixed(b, "float8")?)),
+        oid::BOOL => Value::Bool(pg_from_sql::<sql_types::Bool, bool>(b, type_oid, "bool")?),
+        oid::INT2 => Value::Int(i64::from(pg_from_sql::<sql_types::SmallInt, i16>(
+            b, type_oid, "int2",
+        )?)),
+        oid::INT4 => Value::Int(i64::from(pg_from_sql::<sql_types::Integer, i32>(
+            b, type_oid, "int4",
+        )?)),
+        oid::INT8 => Value::Int(pg_from_sql::<sql_types::BigInt, i64>(b, type_oid, "int8")?),
+        oid::FLOAT4 => Value::Float(f64::from(pg_from_sql::<sql_types::Float, f32>(
+            b, type_oid, "float4",
+        )?)),
+        oid::FLOAT8 => Value::Float(pg_from_sql::<sql_types::Double, f64>(
+            b, type_oid, "float8",
+        )?),
         oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME => {
-            let s = core::str::from_utf8(b).map_err(|_| {
-                RegisterError::UnsupportedSql("diesel text bind is not valid UTF-8".to_string())
-            })?;
-            Value::String(s.to_string())
+            Value::String(pg_from_sql::<sql_types::Text, String>(b, type_oid, "text")?)
         }
-        oid::UUID => Value::Uuid(uuid::Uuid::from_bytes(fixed(b, "uuid")?)),
+        oid::UUID => Value::Uuid(pg_from_sql::<sql_types::Uuid, uuid::Uuid>(
+            b, type_oid, "uuid",
+        )?),
         other => {
             return Err(RegisterError::UnsupportedSql(format!(
                 "unsupported diesel bind type (Postgres OID {other}); only bool, integer, float, text and uuid are supported"
@@ -346,6 +362,22 @@ fn decode_pg_bind(bytes: Option<&[u8]>, type_oid: u32) -> Result<Value<Postgres>
         }
     };
     Ok(value)
+}
+
+/// Read one Postgres binary bind through diesel's `FromSql` for `T`.
+///
+/// `ty` names the arm in the error, since diesel's own message describes the
+/// Rust type it was decoding rather than the bind that carried it.
+fn pg_from_sql<ST, T: FromSql<ST, Pg>>(
+    bytes: &[u8],
+    type_oid: u32,
+    ty: &str,
+) -> Result<T, RegisterError> {
+    // Zero is not a Postgres OID, and every arm above matches a real one.
+    let lookup = NonZeroU32::new(type_oid)
+        .ok_or_else(|| RegisterError::UnsupportedSql("diesel bind carries OID 0".to_string()))?;
+    T::from_sql(PgValue::new(bytes, &lookup))
+        .map_err(|e| RegisterError::UnsupportedSql(format!("diesel {ty} bind: {e}")))
 }
 
 /// Recover the bare table name an insert targets straight from its diesel table
@@ -609,6 +641,157 @@ mod tests {
             decode_pg_bind(Some(&[0, 0]), 1700),
             Err(RegisterError::UnsupportedSql(_))
         ));
+    }
+
+    /// Every arm's decode, pinned across the value range and the boundaries
+    /// the wire can carry. These hold both before and after the arms delegate
+    /// to diesel's own `FromSql`, which is what makes them the evidence that
+    /// delegation changed no decoded value.
+    #[test]
+    fn decode_bool_reads_the_first_byte() {
+        assert_eq!(
+            decode_pg_bind(Some(&[0]), oid::BOOL).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            decode_pg_bind(Some(&[1]), oid::BOOL).unwrap(),
+            Value::Bool(true)
+        );
+        // Any nonzero byte is true, and an empty buffer has no answer.
+        assert_eq!(
+            decode_pg_bind(Some(&[2]), oid::BOOL).unwrap(),
+            Value::Bool(true)
+        );
+        assert!(decode_pg_bind(Some(&[]), oid::BOOL).is_err());
+    }
+
+    #[test]
+    fn decode_integers_span_their_range() {
+        for v in [0i16, -1, i16::MIN, i16::MAX] {
+            assert_eq!(
+                decode_pg_bind(Some(&v.to_be_bytes()), oid::INT2).unwrap(),
+                Value::Int(i64::from(v)),
+                "int2 {v}"
+            );
+        }
+        for v in [0i32, -1, i32::MIN, i32::MAX] {
+            assert_eq!(
+                decode_pg_bind(Some(&v.to_be_bytes()), oid::INT4).unwrap(),
+                Value::Int(i64::from(v)),
+                "int4 {v}"
+            );
+        }
+        for v in [0i64, -1, i64::MIN, i64::MAX] {
+            assert_eq!(
+                decode_pg_bind(Some(&v.to_be_bytes()), oid::INT8).unwrap(),
+                Value::Int(v),
+                "int8 {v}"
+            );
+        }
+        // An integer arm reads its own width and refuses any other.
+        assert!(decode_pg_bind(Some(&[0]), oid::INT2).is_err());
+        assert!(decode_pg_bind(Some(&0i64.to_be_bytes()), oid::INT2).is_err());
+        assert!(decode_pg_bind(Some(&0i16.to_be_bytes()), oid::INT4).is_err());
+        assert!(decode_pg_bind(Some(&0i32.to_be_bytes()), oid::INT8).is_err());
+    }
+
+    #[test]
+    fn decode_floats_keep_their_bits() {
+        for v in [0.0f32, -0.0, 1.5, -1.5, f32::MIN, f32::MAX, f32::EPSILON] {
+            let Value::Float(got) = decode_pg_bind(Some(&v.to_be_bytes()), oid::FLOAT4).unwrap()
+            else {
+                panic!("float4 {v} decodes as a float")
+            };
+            assert_eq!(got.to_bits(), f64::from(v).to_bits(), "float4 {v}");
+        }
+        for v in [0.0f64, -0.0, 1.5, -1.5, f64::MIN, f64::MAX, f64::EPSILON] {
+            let Value::Float(got) = decode_pg_bind(Some(&v.to_be_bytes()), oid::FLOAT8).unwrap()
+            else {
+                panic!("float8 {v} decodes as a float")
+            };
+            assert_eq!(got.to_bits(), v.to_bits(), "float8 {v}");
+        }
+        // NaN and the infinities survive as themselves.
+        for (bytes, oid) in [
+            (f32::NAN.to_be_bytes().to_vec(), oid::FLOAT4),
+            (f64::NAN.to_be_bytes().to_vec(), oid::FLOAT8),
+        ] {
+            let Value::Float(got) = decode_pg_bind(Some(&bytes), oid).unwrap() else {
+                panic!("NaN decodes as a float")
+            };
+            assert!(got.is_nan());
+        }
+        for (bytes, oid, sign) in [
+            (f32::INFINITY.to_be_bytes().to_vec(), oid::FLOAT4, 1.0f64),
+            (
+                f32::NEG_INFINITY.to_be_bytes().to_vec(),
+                oid::FLOAT4,
+                -1.0f64,
+            ),
+            (f64::INFINITY.to_be_bytes().to_vec(), oid::FLOAT8, 1.0f64),
+            (
+                f64::NEG_INFINITY.to_be_bytes().to_vec(),
+                oid::FLOAT8,
+                -1.0f64,
+            ),
+        ] {
+            assert_eq!(
+                decode_pg_bind(Some(&bytes), oid).unwrap(),
+                Value::Float(f64::INFINITY * sign)
+            );
+        }
+        assert!(decode_pg_bind(Some(&[0, 0]), oid::FLOAT4).is_err());
+        assert!(decode_pg_bind(Some(&[0, 0, 0, 0]), oid::FLOAT8).is_err());
+    }
+
+    #[test]
+    fn decode_text_covers_every_text_oid() {
+        for oid in [oid::TEXT, oid::VARCHAR, oid::BPCHAR, oid::NAME] {
+            assert_eq!(
+                decode_pg_bind(Some(b""), oid).unwrap(),
+                Value::String(String::new()),
+                "empty text under oid {oid}"
+            );
+            assert_eq!(
+                decode_pg_bind(Some("héllo".as_bytes()), oid).unwrap(),
+                Value::String("héllo".to_string()),
+                "text under oid {oid}"
+            );
+            // A lone continuation byte is not UTF-8.
+            assert!(
+                decode_pg_bind(Some(&[0x80]), oid).is_err(),
+                "invalid utf-8 under oid {oid}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_uuid_spans_the_boundaries() {
+        for bytes in [[0x00u8; 16], [0xff; 16]] {
+            assert_eq!(
+                decode_pg_bind(Some(&bytes), oid::UUID).unwrap(),
+                Value::Uuid(uuid::Uuid::from_bytes(bytes))
+            );
+        }
+        assert!(decode_pg_bind(Some(&[0u8; 15]), oid::UUID).is_err());
+        assert!(decode_pg_bind(Some(&[0u8; 17]), oid::UUID).is_err());
+    }
+
+    /// A NULL bind carries no bytes whatever type it was declared as.
+    #[test]
+    fn decode_null_ignores_the_oid() {
+        for oid in [
+            oid::BOOL,
+            oid::INT2,
+            oid::INT4,
+            oid::INT8,
+            oid::FLOAT4,
+            oid::FLOAT8,
+            oid::TEXT,
+            oid::UUID,
+        ] {
+            assert_eq!(decode_pg_bind(None, oid).unwrap(), Value::Null, "oid {oid}");
+        }
     }
 }
 

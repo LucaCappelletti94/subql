@@ -521,9 +521,15 @@ std = [
 testing = ["dep:arbitrary"]
 observability = ["dep:tracing", "tracing/std"]
 # Opt-in: ship `DieselConnector` plus the auto-resolving engine's diesel
-# bindings. Implies `std` (diesel needs std). The user activates their
+# bindings. Does NOT imply `std`: diesel's core is `no_std` and carries no
+# `std` gate even on its `connection` module, and `DieselConnector` compiles
+# under `--no-default-features`, verified by planting a type error in it and
+# watching that build report it. Any diesel backend feature
+# (`postgres_backend`, `mysql_backend`, `sqlite`) does list diesel's own
+# `std`, so a configuration that actually connects has it, which is why the
+# `std` that used to sit here read as necessary. The user activates their
 # backend on their own diesel dep.
-executor-diesel = ["std", "dep:diesel"]
+executor-diesel = ["dep:diesel"]
 # Opt-in: the diesel-typed subscription/follow API. Renders a typed diesel
 # query to placeholder SQL plus a list of bind `Value<B>`s and registers it
 # via the string+binds core. This base feature covers the Postgres backend
