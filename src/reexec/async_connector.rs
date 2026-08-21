@@ -12,7 +12,7 @@
 //! additively without a trait-shape change.
 
 use super::connector::{ScalarRowError, Snapshot};
-use crate::backend::{Backend, ScalarKind, Value};
+use crate::backend::{Backend, BuiltinKind, Value};
 use crate::Checkpoint;
 
 /// Async [`Connector`](super::Connector). Returned futures are `Send` so
@@ -52,7 +52,7 @@ pub trait AsyncConnector: Send + Sync {
     type Backend: Backend;
 
     /// Run the re-execution SQL and decode a single scalar value with the
-    /// expected [`ScalarKind`], optionally reporting the position at
+    /// expected [`BuiltinKind`](crate::backend::BuiltinKind), optionally reporting the position at
     /// which the read was taken.
     ///
     /// See [`Connector::execute_scalar`](super::Connector::execute_scalar)
@@ -61,7 +61,7 @@ pub trait AsyncConnector: Send + Sync {
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: BuiltinKind,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
         Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>,
@@ -92,7 +92,7 @@ pub trait AsyncConnector: Send + Sync {
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[BuiltinKind],
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
         Output = Result<

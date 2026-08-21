@@ -145,7 +145,7 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
     let display = func.to_uppercase();
     let column = resolve_single_column_arg(&display, f, table_id, database)?;
 
-    if let Some(kind) = catalog_helpers::column_scalar_kind(database, table_id, column) {
+    if let Some(kind) = catalog_helpers::column_builtin_kind(database, table_id, column) {
         match kind {
             // Numeric scalars: SUM/AVG/variance/stddev accept these.
             crate::backend::ScalarKind::Int
@@ -532,7 +532,7 @@ pub(crate) fn render_aggregate_bootstrap(
 /// ([`crate::backend::ScalarKind::Float`]) regardless of the source column
 /// type, matching the `f64` accumulator, since `SUM` promotes to
 /// `bigint`/`numeric`/`DECIMAL` depending on the backend.
-pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::ScalarKind> {
+pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::BuiltinKind> {
     use crate::backend::ScalarKind::{Float, Int};
     match spec {
         AggSpec::CountStar | AggSpec::CountColumn { .. } => alloc::vec![Int],

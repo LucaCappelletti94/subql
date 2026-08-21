@@ -392,7 +392,7 @@ fn shapes(catalog: &ParserDB) -> Vec<(String, bool, RecordDescription)> {
         .into_iter()
         .filter_map(|query| {
             let description = query.description?;
-            (is_evaluable(&description, catalog)
+            (is_evaluable::<Postgres, _>(&description, catalog)
                 && matches!(description.derivation, RecordDerivation::FromRow { .. }))
             .then_some((query.sql, query.condition.is_some(), description))
         })
@@ -481,7 +481,7 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
         .translate(&catalog)
         .expect("the parity schema translates")
         .relations();
-    let store = Shapes::new(
+    let store = Shapes::new::<Postgres>(
         ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap(),
         &relations,
     );
@@ -652,7 +652,7 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(GRANTS_SCHEMA).unwrap();
 
     let relations = compound_replay_relations(&catalog);
-    let store = Shapes::new(catalog, &relations);
+    let store = Shapes::new::<Postgres>(catalog, &relations);
 
     let diff = store
         .diff(&events[0])

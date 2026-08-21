@@ -70,8 +70,17 @@ pub enum RowKind {
 /// typed [`Value`] variant against the catalog at decode time. It is never
 /// carried in the bytecode nor consumed by the runtime VM, which reads
 /// cells through [`CdcEvent::value_at`] directly.
+///
+/// `C` names the embedder's own scalar types, one variant per type they
+/// taught the backend (see [`CustomScalars`]). It carries no default on
+/// purpose: a site that wrote the bare name would silently get the
+/// no-customs universe and skip deciding what a custom column means there,
+/// which is the whole point of threading it. A backend serving no custom
+/// types instantiates it at [`NoCustom`], which is uninhabited, so
+/// [`Self::Custom`] is unreachable and its arms discharge by matching the
+/// payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum ScalarKind {
+pub enum ScalarKind<C> {
     /// [`Backend::Bool`].
     Bool,
     /// [`Backend::Int`].
@@ -98,6 +107,239 @@ pub enum ScalarKind {
     Json,
     /// [`Backend::Jsonb`].
     Jsonb,
+    /// One of the embedder's own types, named by its compile-time variant.
+    Custom(C),
+}
+
+/// The kind of a column a custom type travels as on the wire, and of a
+/// column no embedder extended: [`ScalarKind`] with the custom position
+/// made unreachable.
+///
+/// This is the only place a kind may be spelled without a custom universe,
+/// and it is a distinct type from `ScalarKind<C>` for any real `C`, so it
+/// cannot stand in for a column type by accident.
+pub type BuiltinKind = ScalarKind<NoCustom>;
+
+/// The kind of a column under backend `B`, custom position included.
+///
+/// Spelling this alias is how a site says "a column type of this backend",
+/// as against [`BuiltinKind`], which says "a builtin shape".
+pub type ScalarKindOf<B> = ScalarKind<<<B as Backend>::Custom as CustomScalars>::Kind>;
+
+/// The custom scalar set of a backend that has none. Uninhabited, so
+/// [`ScalarKind::Custom`] cannot be constructed for such a backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum NoCustom {}
+
+impl<C> ScalarKind<C> {
+    /// Re-tag a kind that names no custom type into any custom universe.
+    ///
+    /// The carrier a custom type declares is a [`BuiltinKind`], and the
+    /// decoders it feeds speak `ScalarKind<C>`, so one total mapping sits
+    /// between them rather than an ad-hoc match at each call.
+    #[must_use]
+    pub const fn from_builtin(kind: BuiltinKind) -> Self {
+        match kind {
+            ScalarKind::Bool => Self::Bool,
+            ScalarKind::Int => Self::Int,
+            ScalarKind::Float => Self::Float,
+            ScalarKind::String => Self::String,
+            ScalarKind::Bytes => Self::Bytes,
+            ScalarKind::Uuid => Self::Uuid,
+            ScalarKind::Timestamp => Self::Timestamp,
+            ScalarKind::TimestampTz => Self::TimestampTz,
+            ScalarKind::Date => Self::Date,
+            ScalarKind::Time => Self::Time,
+            ScalarKind::Decimal => Self::Decimal,
+            ScalarKind::Json => Self::Json,
+            ScalarKind::Jsonb => Self::Jsonb,
+            ScalarKind::Custom(none) => match none {},
+        }
+    }
+
+    /// This kind as a builtin, or `None` when it names a custom type.
+    ///
+    /// The inverse of [`Self::from_builtin`], used where a builtin-only
+    /// decoder has to be handed a kind it can actually accept.
+    #[must_use]
+    pub const fn as_builtin(&self) -> Option<BuiltinKind> {
+        Some(match self {
+            Self::Bool => ScalarKind::Bool,
+            Self::Int => ScalarKind::Int,
+            Self::Float => ScalarKind::Float,
+            Self::String => ScalarKind::String,
+            Self::Bytes => ScalarKind::Bytes,
+            Self::Uuid => ScalarKind::Uuid,
+            Self::Timestamp => ScalarKind::Timestamp,
+            Self::TimestampTz => ScalarKind::TimestampTz,
+            Self::Date => ScalarKind::Date,
+            Self::Time => ScalarKind::Time,
+            Self::Decimal => ScalarKind::Decimal,
+            Self::Json => ScalarKind::Json,
+            Self::Jsonb => ScalarKind::Jsonb,
+            Self::Custom(_) => return None,
+        })
+    }
+
+    /// The custom type this kind names, or `None` for a builtin.
+    pub const fn custom(&self) -> Option<&C> {
+        match self {
+            Self::Custom(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+/// What an embedder teaches a [`Backend`] about its own scalar types.
+///
+/// One implementation describes the whole custom set: [`Self::Kind`] names
+/// the types (one variant each, so identity is compile-time and two
+/// same-named types in different schemas stay distinct), and
+/// [`Self::Value`] carries a decoded one.
+///
+/// The four methods are the whole surface, and each answers exactly once
+/// for the read side, the write side, and SQL literals alike:
+///
+/// * [`Self::classify`] turns a declared catalog type name into a kind, and
+///   is the single rule both directions consult, so a column cannot bind as
+///   one type and read back as another.
+/// * [`Self::carrier`] names the builtin shape the type travels as on the
+///   wire, which lets the existing decoders keep producing what they always
+///   did before conversion.
+/// * [`Self::convert`] turns that builtin value into a custom one. A change
+///   event, a diesel bind and a SQL literal all arrive here, so a filter's
+///   value and a row's value cannot disagree about what a spelling means.
+/// * [`Self::can_key`] answers whether a membership term may compare the
+///   type, the same question [`crate::term::kind_can_key`] answers for
+///   builtins.
+pub trait CustomScalars: 'static {
+    /// The embedder's types, one variant per type.
+    type Kind: Copy + Eq + core::hash::Hash + core::fmt::Debug + Send + Sync + 'static;
+
+    /// A decoded custom value. `Eq + Hash` because a membership term keys
+    /// its lookup on this value (see [`Self::can_key`]), and the serde
+    /// bounds because a literal of this type reaches a persisted predicate.
+    type Value: Clone
+        + core::fmt::Debug
+        + Eq
+        + core::hash::Hash
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + Send
+        + Sync
+        + 'static;
+    /// Which custom type, if any, a declared catalog type name means.
+    ///
+    /// Receives the name as the catalog spells it. An embedder that wants
+    /// two same-named types in different schemas told apart resolves that
+    /// here, which a bare name comparison could not.
+    fn classify(declared_type: &str) -> Option<Self::Kind>;
+
+    /// The builtin shape `kind` travels as on the wire.
+    fn carrier(kind: Self::Kind) -> BuiltinKind;
+
+    /// Turn a wire or literal value of `kind`'s carrier shape into a custom
+    /// value, or refuse it.
+    ///
+    /// Refusing is reported against the column that carried it rather than
+    /// silently dropping the cell. The argument is a [`Carried`] rather than
+    /// a [`Value`] because a [`Value`] can itself be a custom, and a custom
+    /// never carries a custom.
+    fn convert(kind: Self::Kind, carried: Carried<'_, Self::Carrier>) -> Option<Self::Value>;
+
+    /// The backend these types extend, named so [`Self::convert`] can read
+    /// its payload types.
+    type Carrier: Backend;
+
+    /// May a membership term compare a column of this type?
+    ///
+    /// The builtin rule is that equality must be reflexive, since a lookup
+    /// keyed on a value has to find what it stored. `true` requires the same
+    /// of [`Self::Value`], which its `Eq` bound already promises, so this
+    /// exists for a type that wants to refuse keying for its own reasons.
+    fn can_key(kind: Self::Kind) -> bool;
+
+    /// Which custom type a decoded value is.
+    ///
+    /// Keeps [`Value::scalar_kind`] total: a custom cell can name its own
+    /// kind instead of reporting no kind at all, which would read as
+    /// "carries no scalar".
+    fn kind_of(value: &Self::Value) -> Self::Kind;
+}
+
+/// The custom set of a backend serving none.
+///
+/// Uninhabited [`Kind`](CustomScalars::Kind) and
+/// [`Value`](CustomScalars::Value), so [`ScalarKind::Custom`] and
+/// [`Value::Custom`] cannot be constructed for such a backend and every
+/// method below discharges by matching an impossible value.
+pub struct NoCustomScalars<B>(core::marker::PhantomData<fn() -> B>);
+
+impl<B: Backend> CustomScalars for NoCustomScalars<B> {
+    type Kind = NoCustom;
+    type Value = NoCustom;
+    type Carrier = B;
+
+    fn classify(_declared_type: &str) -> Option<Self::Kind> {
+        None
+    }
+
+    fn carrier(kind: Self::Kind) -> BuiltinKind {
+        match kind {}
+    }
+
+    fn convert(kind: Self::Kind, _carried: Carried<'_, B>) -> Option<Self::Value> {
+        match kind {}
+    }
+
+    fn can_key(kind: Self::Kind) -> bool {
+        match kind {}
+    }
+
+    fn kind_of(value: &Self::Value) -> Self::Kind {
+        // No `&NoCustom` can exist, since the type is uninhabited, so this is
+        // unreachable. Discharging it by matching through the reference would
+        // be a dereference of an uninhabited place.
+        let _ = value;
+        unreachable!("NoCustom is uninhabited, so no reference to one exists")
+    }
+}
+
+/// A borrowed builtin payload of `B`, handed to
+/// [`CustomScalars::convert`].
+///
+/// One variant per builtin kind and no custom position, so the type states
+/// what the contract needs: whatever carries a custom value is itself never
+/// custom. Borrowed rather than owned, since the decoders already hold the
+/// value they just built.
+#[derive(Debug)]
+pub enum Carried<'a, B: Backend> {
+    /// [`Backend::Bool`] payload.
+    Bool(&'a B::Bool),
+    /// [`Backend::Int`] payload.
+    Int(&'a B::Int),
+    /// [`Backend::Float`] payload.
+    Float(&'a B::Float),
+    /// [`Backend::String`] payload.
+    String(&'a B::String),
+    /// [`Backend::Bytes`] payload.
+    Bytes(&'a B::Bytes),
+    /// [`Backend::Uuid`] payload.
+    Uuid(&'a B::Uuid),
+    /// [`Backend::Timestamp`] payload.
+    Timestamp(&'a B::Timestamp),
+    /// [`Backend::TimestampTz`] payload.
+    TimestampTz(&'a B::TimestampTz),
+    /// [`Backend::Date`] payload.
+    Date(&'a B::Date),
+    /// [`Backend::Time`] payload.
+    Time(&'a B::Time),
+    /// [`Backend::Decimal`] payload.
+    Decimal(&'a B::Decimal),
+    /// [`Backend::Json`] payload.
+    Json(&'a B::Json),
+    /// [`Backend::Jsonb`] payload.
+    Jsonb(&'a B::Jsonb),
 }
 
 /// A scalar value carried in the VM's evaluation stack, or as a literal
@@ -144,13 +386,16 @@ pub enum Value<B: Backend> {
     Json(B::Json),
     /// [`Backend::Jsonb`] payload.
     Jsonb(B::Jsonb),
+    /// One of the embedder's own types, decoded through
+    /// [`CustomScalars::convert`].
+    Custom(<B::Custom as CustomScalars>::Value),
 }
 
 impl<B: Backend> Value<B> {
     /// Discriminant tag for this value, or `None` for [`Value::Missing`] and
     /// [`Value::Null`] (which do not correspond to a specific scalar type).
     #[inline]
-    pub const fn scalar_kind(&self) -> Option<ScalarKind> {
+    pub fn scalar_kind(&self) -> Option<ScalarKindOf<B>> {
         match self {
             Self::Missing | Self::Null => None,
             Self::Bool(_) => Some(ScalarKind::Bool),
@@ -166,7 +411,33 @@ impl<B: Backend> Value<B> {
             Self::Decimal(_) => Some(ScalarKind::Decimal),
             Self::Json(_) => Some(ScalarKind::Json),
             Self::Jsonb(_) => Some(ScalarKind::Jsonb),
+            Self::Custom(x) => Some(ScalarKind::Custom(<B::Custom as CustomScalars>::kind_of(x))),
         }
+    }
+
+    /// This value as a borrowed builtin payload, or `None` when it is
+    /// absent or already custom.
+    ///
+    /// Feeds [`CustomScalars::convert`], which reads what a carrier
+    /// delivered and never reads a custom.
+    #[must_use]
+    pub const fn as_carried(&self) -> Option<Carried<'_, B>> {
+        Some(match self {
+            Self::Missing | Self::Null | Self::Custom(_) => return None,
+            Self::Bool(x) => Carried::Bool(x),
+            Self::Int(x) => Carried::Int(x),
+            Self::Float(x) => Carried::Float(x),
+            Self::String(x) => Carried::String(x),
+            Self::Bytes(x) => Carried::Bytes(x),
+            Self::Uuid(x) => Carried::Uuid(x),
+            Self::Timestamp(x) => Carried::Timestamp(x),
+            Self::TimestampTz(x) => Carried::TimestampTz(x),
+            Self::Date(x) => Carried::Date(x),
+            Self::Time(x) => Carried::Time(x),
+            Self::Decimal(x) => Carried::Decimal(x),
+            Self::Json(x) => Carried::Json(x),
+            Self::Jsonb(x) => Carried::Jsonb(x),
+        })
     }
 
     /// True when this value carries no scalar (`Missing` or `Null`).
@@ -213,6 +484,7 @@ impl<B: Backend> Clone for Value<B> {
             Self::Decimal(x) => Self::Decimal(x.clone()),
             Self::Json(x) => Self::Json(x.clone()),
             Self::Jsonb(x) => Self::Jsonb(x.clone()),
+            Self::Custom(x) => Self::Custom(x.clone()),
         }
     }
 }
@@ -234,6 +506,7 @@ impl<B: Backend> core::fmt::Debug for Value<B> {
             Self::Time(x) => f.debug_tuple("Time").field(x).finish(),
             Self::Decimal(x) => f.debug_tuple("Decimal").field(x).finish(),
             Self::Json(x) => f.debug_tuple("Json").field(x).finish(),
+            Self::Custom(x) => f.debug_tuple("Custom").field(x).finish(),
             Self::Jsonb(x) => f.debug_tuple("Jsonb").field(x).finish(),
         }
     }
@@ -257,6 +530,10 @@ impl<B: Backend> PartialEq for Value<B> {
             (Self::Decimal(a), Self::Decimal(b)) => a == b,
             (Self::Json(a), Self::Json(b)) => a == b,
             (Self::Jsonb(a), Self::Jsonb(b)) => a == b,
+            // Without this arm the wildcard below answers `false` for two
+            // equal custom values, which is the silent wrong answer the
+            // wildcard hides from the compiler.
+            (Self::Custom(a), Self::Custom(b)) => a == b,
             _ => false,
         }
     }
@@ -431,6 +708,11 @@ pub trait Backend: 'static {
     /// SQL `BOOL` representation. Only equality-shaped operations are
     /// applied to booleans, so truth is the extra row-side capability.
     type Bool: ScalarKey + ScalarTruth;
+    /// The embedder's own scalar types, or [`NoCustomScalars`] for a backend
+    /// serving none. One rule classifies a declared type name into this set
+    /// and both the read and the write side consult it, so a column cannot
+    /// bind as one type and read back as another.
+    type Custom: CustomScalars<Carrier = Self>;
     /// SQL integer representation (all integer widths roll up to this type).
     /// Supports arithmetic and ordering.
     type Int: ScalarKey
@@ -497,6 +779,7 @@ pub trait Backend: 'static {
 pub struct Postgres;
 
 impl Backend for Postgres {
+    type Custom = NoCustomScalars<Self>;
     type Dialect = sqlparser::dialect::PostgreSqlDialect;
     type Bool = bool;
     type Int = i64;
@@ -518,6 +801,7 @@ impl Backend for Postgres {
 pub struct MySql;
 
 impl Backend for MySql {
+    type Custom = NoCustomScalars<Self>;
     type Dialect = sqlparser::dialect::MySqlDialect;
     type Bool = bool;
     type Int = i64;
@@ -543,6 +827,7 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    type Custom = NoCustomScalars<Self>;
     type Dialect = sqlparser::dialect::SQLiteDialect;
     // SQLite has no native BOOL; the column-type contract stores 0 / 1
     // as INTEGER. The backend surfaces the wire type honestly rather than
@@ -665,4 +950,57 @@ pub trait CdcEvent {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Self::Backend>, crate::ValueError>;
+}
+
+/// Decode one cell whose column kind may name a custom type, by handing a
+/// builtin kind to `decode` and converting afterwards when it does.
+///
+/// The four wire decoders stay builtin-only and unchanged: this is the one
+/// place that knows a custom column is read by decoding its carrier and then
+/// converting, so the four paths cannot drift apart on it.
+///
+/// # Errors
+///
+/// [`crate::ValueError::Builtin`] when `decode` could not read the bytes as the
+/// kind (or as the carrier, for a custom), and [`crate::ValueError::Custom`] when
+/// the carrier read fine and the type's own conversion declined it. Keeping
+/// those apart is why this returns a `Result` rather than
+/// [`Value::Missing`].
+pub fn decode_cell<B, F>(
+    column: crate::ColumnId,
+    kind: ScalarKindOf<B>,
+    decode: F,
+) -> Result<Value<B>, crate::ValueError>
+where
+    B: Backend,
+    F: FnOnce(BuiltinKind) -> Value<B>,
+{
+    let Some(custom) = kind.custom().copied() else {
+        // Total: `custom()` answered `None`, so `as_builtin` answers `Some`.
+        let builtin = kind.as_builtin().unwrap_or(ScalarKind::String);
+        let decoded = decode(builtin);
+        return if decoded.is_missing() {
+            Err(crate::ValueError::Builtin {
+                column,
+                kind: builtin,
+            })
+        } else {
+            Ok(decoded)
+        };
+    };
+
+    let carrier = <B::Custom as CustomScalars>::carrier(custom);
+    let raw = decode(carrier);
+    let Some(view) = raw.as_carried() else {
+        return Err(crate::ValueError::Builtin {
+            column,
+            kind: carrier,
+        });
+    };
+    <B::Custom as CustomScalars>::convert(custom, view)
+        .map(Value::Custom)
+        .ok_or_else(|| crate::ValueError::Custom {
+            column,
+            custom: alloc::format!("{custom:?}"),
+        })
 }

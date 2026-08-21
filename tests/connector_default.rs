@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use subql::backend::{Postgres, ScalarKind, Value};
+use subql::backend::{BuiltinKind, Postgres, ScalarKind, Value};
 use subql::reexec::{Connector, ScalarRowError, Snapshot};
 use subql::NoCheckpoint;
 
@@ -23,7 +23,7 @@ impl Connector for MinimalConnector {
     fn execute_scalar(
         &self,
         _sql: &str,
-        _kind: ScalarKind,
+        _kind: BuiltinKind,
         _auth: &(),
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), String> {
         Ok((Value::Int(0), None))

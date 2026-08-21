@@ -52,7 +52,7 @@ use sqlite_diff_rs::{
     WireSchema, WireType,
 };
 
-use crate::backend::ScalarKind;
+use crate::backend::{BuiltinKind, ScalarKind};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, TableId};
 
@@ -62,7 +62,7 @@ use crate::types::{ColumnId, TableId};
 /// The mapping is total: every `ScalarKind` has a `WireType`. subql has
 /// no interval scalar, so [`WireType::Interval`] is never produced here.
 #[must_use]
-pub const fn scalar_kind_to_wire_type(kind: ScalarKind) -> WireType {
+pub const fn scalar_kind_to_wire_type(kind: BuiltinKind) -> WireType {
     match kind {
         ScalarKind::Bool => WireType::Bool,
         ScalarKind::Int => WireType::Int,
@@ -210,7 +210,7 @@ fn build_wire_table<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Optio
     let mut wire_types: Vec<WireType> = Vec::with_capacity(arity);
     for ordinal in 0..arity {
         let column_id = ColumnId::try_from(ordinal).ok()?;
-        let wire_type = catalog_helpers::column_scalar_kind(database, table_id, column_id)
+        let wire_type = catalog_helpers::column_builtin_kind(database, table_id, column_id)
             .map_or(WireType::Text, scalar_kind_to_wire_type);
         wire_types.push(wire_type);
     }
@@ -596,7 +596,7 @@ pub fn pgbinary_patchset_builder<DB: DatabaseLike>(
             .column_name(ordinal)
             .ok_or_else(|| ConversionError::TableNotFound(table.to_string()))?
             .to_string();
-        let wire_type = catalog_helpers::column_scalar_kind(database, table_id, column_id)
+        let wire_type = catalog_helpers::column_builtin_kind(database, table_id, column_id)
             .map(scalar_kind_to_wire_type)
             .ok_or_else(|| ConversionError::UnsupportedType(name.clone()))?;
         columns.push((name, wire_type));

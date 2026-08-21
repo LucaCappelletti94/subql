@@ -11,7 +11,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, ScalarKind, Value};
+use subql::backend::{BuiltinKind, Postgres, ScalarKind, Value};
 use subql::testing::TestEvent;
 use subql::{
     AggAccumulator, AggSpec, AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine,
@@ -98,7 +98,7 @@ fn bootstrap_sql_preserves_where() {
 #[test]
 fn bootstrap_kinds_per_aggspec() {
     use ScalarKind::{Float, Int};
-    let cases: [(&str, Vec<ScalarKind>); 8] = [
+    let cases: [(&str, Vec<BuiltinKind>); 8] = [
         ("SELECT COUNT(*) FROM t", vec![Int]),
         ("SELECT COUNT(amount) FROM t", vec![Int]),
         ("SELECT SUM(amount) FROM t", vec![Float]),

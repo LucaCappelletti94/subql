@@ -31,7 +31,9 @@ use rls2fga::generator::records::{
 };
 use sql_traits::prelude::DatabaseLike;
 
-use crate::backend::{Backend, JsonDocument, ScalarKind, ScalarText, ScalarTruth, Value};
+use crate::backend::{
+    Backend, JsonDocument, ScalarKind, ScalarKindOf, ScalarText, ScalarTruth, Value,
+};
 use crate::catalog_helpers;
 use crate::visibility::RowView;
 use crate::{TableId, ValueError};
@@ -104,7 +106,7 @@ where
     R: RowView + ?Sized,
     DB: DatabaseLike,
 {
-    if let Some(refusal) = unsupported_description(description, db) {
+    if let Some(refusal) = unsupported_description::<R::Backend, DB>(description, db) {
         return Err(refusal);
     }
     let view = RowValuesView {
@@ -126,12 +128,15 @@ where
 /// this once at setup rather than rediscovering the refusal on every
 /// changed row.
 #[must_use]
-pub fn is_evaluable<DB: DatabaseLike>(description: &RecordDescription, db: &DB) -> bool {
-    unsupported_description(description, db).is_none()
+pub fn is_evaluable<B: crate::backend::Backend, DB: DatabaseLike>(
+    description: &RecordDescription,
+    db: &DB,
+) -> bool {
+    unsupported_description::<B, DB>(description, db).is_none()
 }
 
 /// Why a row view cannot answer `description`, or [`None`].
-fn unsupported_description<DB: DatabaseLike>(
+fn unsupported_description<B: crate::backend::Backend, DB: DatabaseLike>(
     description: &RecordDescription,
     db: &DB,
 ) -> Option<RowRecordError> {
@@ -153,57 +158,59 @@ fn unsupported_description<DB: DatabaseLike>(
         .object_key
         .parts()
         .iter()
-        .find_map(|part| unsupported_value(part, db, table))
-        .or_else(|| unsupported_value(template.subject_key.part(), db, table))
+        .find_map(|part| unsupported_value::<B, DB>(part, db, table))
+        .or_else(|| unsupported_value::<B, DB>(template.subject_key.part(), db, table))
         .or_else(|| {
             guards
                 .iter()
-                .find_map(|guard| unsupported_guard(guard, db, table))
+                .find_map(|guard| unsupported_guard::<B, DB>(guard, db, table))
         })
         .or_else(|| {
             template.context.as_ref().and_then(|context| {
                 context
                     .entries
                     .iter()
-                    .find_map(|entry| unsupported_value(&entry.value, db, table))
+                    .find_map(|entry| unsupported_value::<B, DB>(&entry.value, db, table))
             })
         })
 }
 
-fn unsupported_value<DB: DatabaseLike>(
+fn unsupported_value<B: crate::backend::Backend, DB: DatabaseLike>(
     source: &ValueSource,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
     match source {
-        ValueSource::Column(column) => direct_column_read(column, db, table),
-        ValueSource::JsonPath { column, .. } => document_read(column, db, table),
+        ValueSource::Column(column) => direct_column_read::<B, DB>(column, db, table),
+        ValueSource::JsonPath { column, .. } => document_read::<B, DB>(column, db, table),
         ValueSource::Literal(_) => None,
         ValueSource::ListElements(_) => Some(RowRecordError::UnsupportedValueSource("list")),
         _ => Some(RowRecordError::UnsupportedValueSource("unrecognised")),
     }
 }
 
-fn unsupported_guard<DB: DatabaseLike>(
+fn unsupported_guard<B: crate::backend::Backend, DB: DatabaseLike>(
     guard: &Guard,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
     match guard {
-        Guard::NotNull(column) => direct_column_read(column, db, table),
-        Guard::IsTrue(column) => bool_read(column, db, table),
-        Guard::Compare { column, predicate } => comparison_read(column, predicate, db, table),
+        Guard::NotNull(column) => direct_column_read::<B, DB>(column, db, table),
+        Guard::IsTrue(column) => bool_read::<B, DB>(column, db, table),
+        Guard::Compare { column, predicate } => {
+            comparison_read::<B, DB>(column, predicate, db, table)
+        }
         _ => Some(RowRecordError::UnsupportedValueSource("unrecognised guard")),
     }
 }
 
-fn comparison_read<DB: DatabaseLike>(
+fn comparison_read<B: crate::backend::Backend, DB: DatabaseLike>(
     column: &ColumnRead,
     predicate: &AttributePredicate,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
-    let kind = match column_read_kind(column, db, table) {
+    let kind = match column_read_kind::<B, DB>(column, db, table) {
         Ok(kind) => kind,
         Err(refusal) => return Some(refusal),
     };
@@ -234,12 +241,12 @@ fn comparison_read<DB: DatabaseLike>(
     }
 }
 
-fn direct_column_read<DB: DatabaseLike>(
+fn direct_column_read<B: crate::backend::Backend, DB: DatabaseLike>(
     column: &ColumnRead,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
-    let kind = match column_read_kind(column, db, table) {
+    let kind = match column_read_kind::<B, DB>(column, db, table) {
         Ok(kind) => kind,
         Err(refusal) => return Some(refusal),
     };
@@ -252,12 +259,12 @@ fn direct_column_read<DB: DatabaseLike>(
     }
 }
 
-fn bool_read<DB: DatabaseLike>(
+fn bool_read<B: crate::backend::Backend, DB: DatabaseLike>(
     column: &ColumnRead,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
-    let kind = match column_read_kind(column, db, table) {
+    let kind = match column_read_kind::<B, DB>(column, db, table) {
         Ok(kind) => kind,
         Err(refusal) => return Some(refusal),
     };
@@ -270,12 +277,12 @@ fn bool_read<DB: DatabaseLike>(
     }
 }
 
-fn document_read<DB: DatabaseLike>(
+fn document_read<B: crate::backend::Backend, DB: DatabaseLike>(
     column: &ColumnRead,
     db: &DB,
     table: TableId,
 ) -> Option<RowRecordError> {
-    let kind = match column_read_kind(column, db, table) {
+    let kind = match column_read_kind::<B, DB>(column, db, table) {
         Ok(kind) => kind,
         Err(refusal) => return Some(refusal),
     };
@@ -292,7 +299,7 @@ const fn direct_kind(kind: ColumnKind) -> bool {
     !matches!(kind, ColumnKind::Json | ColumnKind::Unsupported)
 }
 
-fn column_read_kind<DB: DatabaseLike>(
+fn column_read_kind<B: crate::backend::Backend, DB: DatabaseLike>(
     column: &ColumnRead,
     db: &DB,
     table: TableId,
@@ -303,8 +310,15 @@ fn column_read_kind<DB: DatabaseLike>(
         ))
     };
     let id = catalog_helpers::column_id(db, table, column.as_str()).ok_or_else(refuse)?;
-    let scalar = catalog_helpers::column_scalar_kind(db, table, id).ok_or_else(refuse)?;
-    let actual = column_kind_from_scalar(scalar);
+    let scalar = catalog_helpers::column_scalar_kind::<B, DB>(db, table, id).ok_or_else(refuse)?;
+    // A custom type answers `None`: it has no renderable column kind, so a
+    // shape that reads this column is refused rather than served a spelling
+    // subql cannot prove (R1).
+    let actual = column_kind_from_scalar::<B>(scalar).ok_or_else(|| {
+        RowRecordError::UnreadableColumn(alloc::format!(
+            "column {column} holds a custom type, which has no spelling this side can prove"
+        ))
+    })?;
     if actual == column.kind() {
         Ok(actual)
     } else {
@@ -315,8 +329,13 @@ fn column_read_kind<DB: DatabaseLike>(
     }
 }
 
-const fn column_kind_from_scalar(kind: ScalarKind) -> ColumnKind {
-    match kind {
+fn column_kind_from_scalar<B: crate::backend::Backend>(
+    kind: ScalarKindOf<B>,
+) -> Option<ColumnKind> {
+    // A custom type has no column kind here on purpose: rendering it would
+    // mean asserting a text form subql cannot prove matches the loading SQL
+    // (R1), so a shape that renders such a column is reported uncovered.
+    Some(match kind.as_builtin()? {
         ScalarKind::Bool => ColumnKind::Bool,
         ScalarKind::Int => ColumnKind::Integer,
         ScalarKind::Float => ColumnKind::Unsupported,
@@ -329,7 +348,8 @@ const fn column_kind_from_scalar(kind: ScalarKind) -> ColumnKind {
         ScalarKind::Time => ColumnKind::Time,
         ScalarKind::Decimal => ColumnKind::Decimal,
         ScalarKind::Json | ScalarKind::Jsonb => ColumnKind::Json,
-    }
+        ScalarKind::Custom(none) => match none {},
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -416,9 +436,16 @@ fn row_cell<B: Backend>(value: &Value<B>) -> RowCell<'static> {
     match value {
         Value::Missing => RowCell::Absent,
         Value::Null => RowCell::Null,
+
         Value::Bool(value) => RowCell::Bool(value.scalar_truth()),
         Value::Int(value) => RowCell::Integer(Cow::Owned(value.scalar_text().into_owned())),
-        Value::Float(_) | Value::Json(_) | Value::Jsonb(_) => RowCell::Undecodable,
+        // A float and a JSON document have no column kind on the other side,
+        // and a custom type has no spelling this side can prove matches the
+        // loading SQL (R1), so all of them read as undecodable rather than as
+        // a rendered value.
+        Value::Float(_) | Value::Json(_) | Value::Jsonb(_) | Value::Custom(_) => {
+            RowCell::Undecodable
+        }
         Value::String(value) => RowCell::Text(Cow::Owned(value.as_ref().to_string())),
         Value::Bytes(value) => RowCell::Bytea(Cow::Owned(value.as_ref().to_vec())),
         Value::Uuid(value) => RowCell::Uuid(Cow::Owned(value.scalar_text().into_owned())),
@@ -519,6 +546,7 @@ fn bytea_sql_text(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::backend::BuiltinKind;
     use alloc::vec;
 
     use rls2fga::classifier::patterns::ConfidenceLevel;
@@ -739,7 +767,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             ),
         ] {
             let d = description(source, vec![]);
-            assert!(!is_evaluable(&d, &db), "{name} must refuse");
+            assert!(!is_evaluable::<Postgres, _>(&d, &db), "{name} must refuse");
             let Err(RowRecordError::UnreadableColumn(reason)) =
                 records(&d, row_of(Value::String("alice".into())))
             else {
@@ -755,7 +783,10 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             ValueSource::typed_column(name("blob"), ColumnKind::Bytea),
             ValueSource::typed_column(name("at"), ColumnKind::TimestampTz),
         ] {
-            assert!(is_evaluable(&description(source, vec![]), &db));
+            assert!(is_evaluable::<Postgres, _>(
+                &description(source, vec![]),
+                &db
+            ));
         }
     }
 
@@ -766,7 +797,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             ValueSource::typed_column(name("at"), ColumnKind::TimestampTz),
             vec![],
         );
-        assert!(is_evaluable(&d, &db));
+        assert!(is_evaluable::<Postgres, _>(&d, &db));
 
         let moment = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -793,13 +824,13 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
                 },
             }],
         );
-        assert!(!is_evaluable(&compared, &db));
+        assert!(!is_evaluable::<Postgres, _>(&compared, &db));
 
         let present = description(
             ValueSource::column("owner"),
             vec![Guard::NotNull(typed_column("at", ColumnKind::TimestampTz))],
         );
-        assert!(is_evaluable(&present, &db));
+        assert!(is_evaluable::<Postgres, _>(&present, &db));
     }
 
     #[test]
@@ -819,7 +850,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
                 rendering: ContextRendering::Json,
             }],
         });
-        assert!(is_evaluable(&d, &db));
+        assert!(is_evaluable::<Postgres, _>(&d, &db));
 
         let moment = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -894,7 +925,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
     #[test]
     fn the_setup_gate_matches_what_render_text_spells() {
         let epoch = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant");
-        let cases: [(ScalarKind, Value<Postgres>); 13] = [
+        let cases: [(BuiltinKind, Value<Postgres>); 13] = [
             (ScalarKind::Bool, Value::Bool(true)),
             (ScalarKind::Int, Value::Int(1)),
             (ScalarKind::Float, Value::Float(1.0)),
@@ -914,7 +945,10 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
         ];
         for (kind, value) in cases {
             assert_eq!(
-                direct_kind(column_kind_from_scalar(kind)),
+                direct_kind(
+                    column_kind_from_scalar::<Postgres>(ScalarKind::from_builtin(kind))
+                        .expect("every builtin kind has a column kind"),
+                ),
                 render_text(&value).is_some(),
                 "{kind:?} disagrees between the gate and the speller"
             );

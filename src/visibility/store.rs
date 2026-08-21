@@ -265,7 +265,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
             Some(row) if is_key_only(row, event, db) => {
                 return Err(StoreDiffError::IncompletePreviousImage)
             }
-            Some(row) => records_of(&shapes.settled, row, db)?,
+            Some(row) => records_of::<_, DB>(&shapes.settled, row, db)?,
             None => BTreeSet::new(),
         };
         let after = match current.as_ref() {
@@ -385,7 +385,7 @@ where
 {
     let mut out = BTreeSet::new();
     for shape in shapes {
-        out.extend(records_from_row_view(shape, row, db)?);
+        out.extend(records_from_row_view::<R, DB>(shape, row, db)?);
     }
     Ok(out)
 }
@@ -513,7 +513,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             .translate(&db)
             .unwrap()
             .relations();
-        Shapes::new(db, &relations)
+        Shapes::new::<Postgres>(db, &relations)
     }
 
     fn table(shapes: &Shapes<ParserDB>, name: &str) -> TableId {
@@ -1075,7 +1075,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 if col == 0 {
                     return Ok(Value::Int(4));
                 }
-                Err(ValueError {
+                Err(ValueError::Builtin {
                     column: col,
                     kind: crate::backend::ScalarKind::String,
                 })
@@ -1130,7 +1130,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 _row: RowKind,
                 col: ColumnId,
             ) -> Result<Value<Postgres>, ValueError> {
-                Err(ValueError {
+                Err(ValueError::Builtin {
                     column: col,
                     kind: crate::backend::ScalarKind::Int,
                 })
@@ -1225,7 +1225,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);",
         )
         .unwrap();
-        let store = Shapes::new(
+        let store = Shapes::new::<Postgres>(
             db,
             &[joined(
                 &["docs", "grants"],
@@ -1267,7 +1267,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);",
             )
             .unwrap();
-            let store = Shapes::new(db, &[joined(&["docs"], vec![bound("docs", &key_columns)])]);
+            let store = Shapes::new::<Postgres>(
+                db,
+                &[joined(&["docs"], vec![bound("docs", &key_columns)])],
+            );
 
             let uncovered = store.uncovered();
             assert_eq!(uncovered.len(), 1, "{key_columns:?}: {uncovered:?}");
@@ -1311,7 +1314,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 "SELECT 'delete' WHERE id = $1;",
             ),
         ];
-        let store = Shapes::new(db, &relations);
+        let store = Shapes::new::<Postgres>(db, &relations);
         let docs = table(&store, "docs");
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
@@ -1355,7 +1358,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 same,
             ),
         ];
-        let store = Shapes::new(db, &relations);
+        let store = Shapes::new::<Postgres>(db, &relations);
         let docs = table(&store, "docs");
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
@@ -1449,7 +1452,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             decision: None,
             grants_nobody: false,
         };
-        Shapes::new(db, &[entry])
+        Shapes::new::<Postgres>(db, &[entry])
     }
 
     /// One `can_select` relation filled by a joining shape that reads `tables`

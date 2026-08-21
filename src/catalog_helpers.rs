@@ -24,7 +24,7 @@ use sql_traits::{
 };
 use sqlite_diff_rs::SimpleTable;
 
-use crate::backend::ScalarKind;
+use crate::backend::{ScalarKind, ScalarKindOf};
 use crate::types::{ColumnId, TableId};
 
 /// Resolve a table name (unquoted or quoted form) to subql's compact
@@ -264,11 +264,36 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
 /// declared type doesn't match any supported scalar (compiler surfaces
 /// this as [`crate::RegisterError::UnsupportedSql`]).
 #[must_use]
-pub fn column_scalar_kind<DB: DatabaseLike>(
+pub fn column_scalar_kind<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_id: ColumnId,
-) -> Option<ScalarKind> {
+) -> Option<ScalarKindOf<B>> {
+    let table = database.table_by_id(table_id as usize)?;
+    let column = table.column_by_id(column_id as usize, database).ok()??;
+    let declared = column.data_type(database);
+    // A builtin name wins, so an embedder cannot shadow a type subql
+    // already understands. Only an unrecognised name reaches the backend's
+    // own classifier, which is the single rule the write side consults too.
+    if let Some(builtin) = scalar_kind_from_raw(&declared) {
+        return Some(ScalarKind::from_builtin(builtin));
+    }
+    <B::Custom as crate::backend::CustomScalars>::classify(&declared).map(ScalarKind::Custom)
+}
+
+/// The builtin kind a column declares, or `None` when it declares none.
+///
+/// For callers whose question is genuinely about builtins: whether a column
+/// can be aggregated, which wire type it emits, how a seed row decodes. A
+/// column of a custom type answers `None`, which is the honest answer to
+/// "which builtin is this", and each caller refuses it in its own terms.
+/// Use [`column_scalar_kind`] where a custom column has to be served.
+#[must_use]
+pub fn column_builtin_kind<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Option<crate::backend::BuiltinKind> {
     let table = database.table_by_id(table_id as usize)?;
     let column = table.column_by_id(column_id as usize, database).ok()??;
     scalar_kind_from_raw(&column.data_type(database))
@@ -276,7 +301,7 @@ pub fn column_scalar_kind<DB: DatabaseLike>(
 
 /// Map a raw SQL declared type string to its [`ScalarKind`] via
 /// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token).
-fn scalar_kind_from_raw(raw: &str) -> Option<ScalarKind> {
+fn scalar_kind_from_raw(raw: &str) -> Option<crate::backend::BuiltinKind> {
     match canonical_type_token(raw).as_str() {
         "INT" => Some(ScalarKind::Int),
         "FLOAT" => Some(ScalarKind::Float),
@@ -313,6 +338,7 @@ pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Opti
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::backend::Postgres;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::GenericDialect;
 
@@ -467,13 +493,22 @@ mod tests {
         )
         .unwrap();
         let tid = table_id(&pg, "e").unwrap();
-        assert_eq!(column_scalar_kind(&pg, tid, 1), Some(ScalarKind::Timestamp));
         assert_eq!(
-            column_scalar_kind(&pg, tid, 2),
+            column_scalar_kind::<Postgres, _>(&pg, tid, 1),
+            Some(ScalarKind::Timestamp)
+        );
+        assert_eq!(
+            column_scalar_kind::<Postgres, _>(&pg, tid, 2),
             Some(ScalarKind::TimestampTz)
         );
-        assert_eq!(column_scalar_kind(&pg, tid, 3), Some(ScalarKind::Date));
-        assert_eq!(column_scalar_kind(&pg, tid, 4), Some(ScalarKind::Time));
+        assert_eq!(
+            column_scalar_kind::<Postgres, _>(&pg, tid, 3),
+            Some(ScalarKind::Date)
+        );
+        assert_eq!(
+            column_scalar_kind::<Postgres, _>(&pg, tid, 4),
+            Some(ScalarKind::Time)
+        );
 
         // MySQL spellings, including `DATETIME` and `BIGINT UNSIGNED`.
         // `DATETIME` classifies as a wall-clock `Timestamp`, and `BIGINT
@@ -483,10 +518,25 @@ mod tests {
         )
         .unwrap();
         let tid = table_id(&my, "e").unwrap();
-        assert_eq!(column_scalar_kind(&my, tid, 1), Some(ScalarKind::Timestamp));
-        assert_eq!(column_scalar_kind(&my, tid, 2), Some(ScalarKind::Timestamp));
-        assert_eq!(column_scalar_kind(&my, tid, 3), Some(ScalarKind::Date));
-        assert_eq!(column_scalar_kind(&my, tid, 4), Some(ScalarKind::Time));
-        assert_eq!(column_scalar_kind(&my, tid, 5), Some(ScalarKind::Int));
+        assert_eq!(
+            column_scalar_kind::<Postgres, _>(&my, tid, 1),
+            Some(ScalarKind::Timestamp)
+        );
+        assert_eq!(
+            column_scalar_kind::<Postgres, _>(&my, tid, 2),
+            Some(ScalarKind::Timestamp)
+        );
+        assert_eq!(
+            column_scalar_kind::<Postgres, _>(&my, tid, 3),
+            Some(ScalarKind::Date)
+        );
+        assert_eq!(
+            column_scalar_kind::<Postgres, _>(&my, tid, 4),
+            Some(ScalarKind::Time)
+        );
+        assert_eq!(
+            column_scalar_kind::<Postgres, _>(&my, tid, 5),
+            Some(ScalarKind::Int)
+        );
     }
 }

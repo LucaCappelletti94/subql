@@ -182,18 +182,31 @@ impl CdcEvent for ChangeEvent {
             // than surfacing as a decode error.
             None | Some(ColumnValue::Binary(_)) => Ok(Value::Missing),
             Some(ColumnValue::Null) => Ok(Value::Null),
-            Some(ColumnValue::Text(bytes)) => catalog_helpers::column_scalar_kind(
-                db, table_id, col,
-            )
-            .map_or(Ok(Value::Missing), |kind| {
-                core::str::from_utf8(bytes).map_or_else(
-                    |_| Err(crate::ValueError { column: col, kind }),
-                    |text| match text_to_pg_value_by_kind(text, kind) {
-                        Value::Missing => Err(crate::ValueError { column: col, kind }),
-                        decoded => Ok(decoded),
+            Some(ColumnValue::Text(bytes)) => {
+                catalog_helpers::column_scalar_kind::<Postgres, DB>(db, table_id, col).map_or(
+                    Ok(Value::Missing),
+                    |kind| {
+                        // Non-UTF-8 bytes fail before any kind is consulted,
+                        // so they are reported against the kind the column
+                        // declares, custom or not.
+                        let Ok(text) = core::str::from_utf8(bytes) else {
+                            return Err(kind.as_builtin().map_or_else(
+                                || crate::ValueError::Custom {
+                                    column: col,
+                                    custom: alloc::format!("{kind:?}"),
+                                },
+                                |builtin| crate::ValueError::Builtin {
+                                    column: col,
+                                    kind: builtin,
+                                },
+                            ));
+                        };
+                        crate::backend::decode_cell(col, kind, |builtin| {
+                            text_to_pg_value_by_kind(text, builtin)
+                        })
                     },
                 )
-            }),
+            }
         }
     }
 }

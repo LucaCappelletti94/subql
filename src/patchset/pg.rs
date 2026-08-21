@@ -25,7 +25,7 @@
 //! * `TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, and `TIME` get native temporal
 //!   binds when the wire carries a `Value::Text` holding the verbatim
 //!   Postgres text form, parsed through the shared `chrono` parsers in
-//!   `crate::wal::pg_type`. `TIMESTAMPTZ` normalizes to a UTC instant.
+//!   `crate::temporal`. `TIMESTAMPTZ` normalizes to a UTC instant.
 //!   Each column is classified through the catalog's [`ScalarKind`],
 //!   since Postgres has no implicit assignment cast from text to these
 //!   types. Any other wire shape on such a column is rejected.
@@ -68,10 +68,10 @@ use diesel::sql_types::{
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TableLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
-use crate::backend::ScalarKind;
+use crate::backend::{ScalarKind, ScalarKindOf};
 use crate::catalog_helpers;
+use crate::temporal::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 use crate::types::ColumnId;
-use crate::wal::pg_type::{parse_pg_date, parse_pg_time, parse_pg_timestamp, parse_pg_timestamptz};
 
 /// Adapter that resolves column names and native diesel binders for a
 /// Postgres target from a subql catalog.
@@ -101,10 +101,18 @@ impl<'db, DB: DatabaseLike> PgAdapter<'db, DB> {
     /// the dispatch key for families Postgres will not assignment-cast
     /// from a text bind. Returns `None` for an unknown table or column,
     /// or a declared type that maps to no supported scalar.
-    fn scalar_kind_at(&self, table_name: &str, column_index: usize) -> Option<ScalarKind> {
+    fn scalar_kind_at(
+        &self,
+        table_name: &str,
+        column_index: usize,
+    ) -> Option<ScalarKindOf<crate::backend::Postgres>> {
         let table_id = catalog_helpers::table_id(self.catalog, table_name)?;
         let column_id = ColumnId::try_from(column_index).ok()?;
-        catalog_helpers::column_scalar_kind(self.catalog, table_id, column_id)
+        catalog_helpers::column_scalar_kind::<crate::backend::Postgres, _>(
+            self.catalog,
+            table_id,
+            column_id,
+        )
     }
 
     /// The declared SQL type name of the target column, verbatim from the
@@ -199,21 +207,21 @@ where
             }
             Some(ScalarKind::Timestamp) => {
                 text_scalar_bind(col_name, value, "timestamp TEXT or NULL", |s| {
-                    Some(Box::new(TimestampBinder(parse_pg_timestamp(s)?))
+                    Some(Box::new(TimestampBinder(parse_timestamp(s)?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
             Some(ScalarKind::TimestampTz) => {
                 text_scalar_bind(col_name, value, "timestamptz TEXT or NULL", |s| {
-                    Some(Box::new(TimestampTzBinder(parse_pg_timestamptz(s)?))
+                    Some(Box::new(TimestampTzBinder(parse_timestamp_tz(s)?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
             Some(ScalarKind::Date) => text_scalar_bind(col_name, value, "date TEXT or NULL", |s| {
-                Some(Box::new(DateBinder(parse_pg_date(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
+                Some(Box::new(DateBinder(parse_date(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
             }),
             Some(ScalarKind::Time) => text_scalar_bind(col_name, value, "time TEXT or NULL", |s| {
-                Some(Box::new(TimeBinder(parse_pg_time(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
+                Some(Box::new(TimeBinder(parse_time(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
             }),
             Some(ScalarKind::Json) => text_scalar_bind(col_name, value, "json TEXT or NULL", |s| {
                 Some(Box::new(JsonBinder(serde_json::from_str(s).ok()?))

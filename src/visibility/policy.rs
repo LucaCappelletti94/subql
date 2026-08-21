@@ -337,7 +337,7 @@ where
 /// let naming = translation.row_naming();
 /// let answers = translation.action_relations();
 /// let shapes = Arc::new(
-///     Shapes::new(db, &relations)
+///     Shapes::new::<Postgres>(db, &relations)
 ///         .with_row_naming(&naming)
 ///         .with_action_relations(&answers),
 /// );
@@ -461,7 +461,7 @@ where
         RowDecision::Leaf { shapes, .. } => {
             let mut granted = false;
             for shape in shapes {
-                let Ok(records) = records_from_row_view(shape, row, db) else {
+                let Ok(records) = records_from_row_view::<R, DB>(shape, row, db) else {
                     return Local::Unresolved;
                 };
                 granted |= records.iter().any(|record| {
@@ -482,7 +482,7 @@ where
             request_parameter,
             comparison,
             ..
-        } => request_gated(
+        } => request_gated::<R, DB, S>(
             shapes,
             context_key,
             request_parameter,
@@ -571,7 +571,7 @@ where
 
     let mut granted = false;
     for shape in shapes {
-        let Ok(records) = records_from_row_view(shape, row, db) else {
+        let Ok(records) = records_from_row_view::<R, DB>(shape, row, db) else {
             return Local::Unresolved;
         };
         for record in records {
@@ -779,7 +779,7 @@ where
             let Some(decision) = self.shapes.recipe(row.table_id(), &judge.relation) else {
                 return Local::Unresolved;
             };
-            match evaluate(decision, row, self.shapes.catalog(), watcher, values) {
+            match evaluate::<R, _, _>(decision, row, self.shapes.catalog(), watcher, values) {
                 Local::Deny => return Local::Deny,
                 Local::Unresolved => return Local::Unresolved,
                 Local::Allow => {}
@@ -1142,7 +1142,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
             )
         };
         Arc::new(
-            Shapes::new(db, relations)
+            Shapes::new::<Postgres>(db, relations)
                 .with_row_naming(&naming)
                 .with_action_relations(&answers)
                 .with_required_parameters(&notes),
@@ -1553,7 +1553,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
                 if col == 0 {
                     return Ok(Value::Int(4));
                 }
-                Err(ValueError {
+                Err(ValueError::Builtin {
                     column: col,
                     kind: crate::backend::ScalarKind::String,
                 })

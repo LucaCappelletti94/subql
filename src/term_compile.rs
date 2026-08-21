@@ -29,7 +29,7 @@ use crate::{catalog_helpers, RegisterError, TableId};
 /// [`RegisterError::MembershipTermRefused`] carrying `rls2fga`'s reason when the
 /// relationship cannot be compiled, or subql's own reason when it can be but the
 /// shape describing it reads something a changed row cannot answer.
-pub fn plan_term<DB: DatabaseLike>(
+pub fn plan_term<B: crate::backend::Backend, DB: DatabaseLike>(
     term: &CompiledTerm,
     table: TableId,
     table_name: &str,
@@ -60,9 +60,12 @@ pub fn plan_term<DB: DatabaseLike>(
     // The two coincide by construction for the chain `rls2fga` reports, and this
     // says so rather than trusting it, since a mismatch admits nobody in
     // silence.
-    let compared = catalog_helpers::column_scalar_kind(database, table, term.column);
-    let keyed =
-        catalog_helpers::column_scalar_kind(database, movement.member_table, movement.member_key);
+    let compared = catalog_helpers::column_scalar_kind::<B, DB>(database, table, term.column);
+    let keyed = catalog_helpers::column_scalar_kind::<B, DB>(
+        database,
+        movement.member_table,
+        movement.member_key,
+    );
     if compared != keyed {
         return Err(RegisterError::MembershipTermRefused(format!(
             "the column this filter compares and the column the relationship is keyed on hold \

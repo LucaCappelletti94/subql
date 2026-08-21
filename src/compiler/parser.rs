@@ -14,7 +14,7 @@ use super::{
     prefilter::build_prefilter_plan,
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
-use crate::backend::{Backend, ScalarKind, Value};
+use crate::backend::{Backend, ScalarKind, ScalarKindOf, Value};
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::term::{term_columns, CompiledTerm};
@@ -266,7 +266,8 @@ where
             (BytecodeProgram::new(instructions), Vec::new())
         };
 
-    let prefilter_plan = build_prefilter_plan(pq.where_clause.as_ref(), pq.table_id, database);
+    let prefilter_plan =
+        build_prefilter_plan::<B, DB>(pq.where_clause.as_ref(), pq.table_id, database);
 
     Ok(CompiledQuery {
         table_id: pq.table_id,
@@ -395,6 +396,10 @@ fn extract_table_and_where(
 /// exercises it and pins a canonical round-trip format.
 fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterError> {
     match v {
+        Value::Custom(_) => Err(RegisterError::BindResolution(
+            "a bind of a custom type has no SQL literal spelling, so it cannot be re-rendered"
+                .into(),
+        )),
         Value::Missing => Err(RegisterError::BindResolution(
             "bind value is Missing (not a concrete value)".to_string(),
         )),
@@ -620,13 +625,13 @@ pub fn derive_update_follow_select_with_set_binds<D: Dialect>(
 /// If `expr` is a bare column reference, return the [`ScalarKind`] of that
 /// column via the catalog. Otherwise `None`. Used to derive the target
 /// type for a paired literal in a comparison or an IN list.
-fn column_scalar_of<DB: DatabaseLike>(
+fn column_scalar_of<B: Backend, DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
-) -> Option<ScalarKind> {
+) -> Option<ScalarKindOf<B>> {
     let col = resolve_column_ref(expr, table_id, database)?;
-    crate::catalog_helpers::column_scalar_kind(database, table_id, col)
+    crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col)
 }
 
 /// Return `true` if `instr` produces a [`crate::compiler::Tri`] on the
@@ -772,7 +777,7 @@ fn compile_expr_recursive<B, DB>(
     database: &DB,
     out: &mut Compiling<B>,
     depth: usize,
-    target_kind: ScalarKind,
+    target_kind: ScalarKindOf<B>,
 ) -> Result<(), RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -874,8 +879,8 @@ where
                     // then emit the op. Target-typed literal inference
                     // picks whichever sibling is a column reference and
                     // uses its ScalarKind for the other side's literal.
-                    let child_target = column_scalar_of(left, table_id, database)
-                        .or_else(|| column_scalar_of(right, table_id, database))
+                    let child_target = column_scalar_of::<B, DB>(left, table_id, database)
+                        .or_else(|| column_scalar_of::<B, DB>(right, table_id, database))
                         .unwrap_or(ScalarKind::String);
                     compile_expr_recursive::<B, DB>(
                         left,
@@ -941,7 +946,8 @@ where
             })?;
             // Reject a column whose declared type the runtime decoder cannot
             // resolve against the catalog (an unsupported SQL type).
-            crate::catalog_helpers::column_scalar_kind(database, table_id, col_id).ok_or_else(
+            crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col_id)
+                .ok_or_else(
                 || {
                     RegisterError::UnsupportedSql(format!(
                         "Column {col_id} of table {table_id} has an unsupported SQL type for the compiler"
@@ -970,7 +976,7 @@ where
             // Derive target from the tested expression if it's a column
             // reference; fall back to String otherwise (best-effort).
             let list_target =
-                column_scalar_of(expr, table_id, database).unwrap_or(ScalarKind::String);
+                column_scalar_of::<B, DB>(expr, table_id, database).unwrap_or(ScalarKind::String);
 
             compile_expr_recursive::<B, DB>(expr, table_id, database, out, depth + 1, list_target)?;
 
@@ -1042,7 +1048,7 @@ where
             negated,
         } => {
             let range_target =
-                column_scalar_of(expr, table_id, database).unwrap_or(ScalarKind::String);
+                column_scalar_of::<B, DB>(expr, table_id, database).unwrap_or(ScalarKind::String);
 
             // Stack order: value, lower, upper.
             compile_expr_recursive::<B, DB>(

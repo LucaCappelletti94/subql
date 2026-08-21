@@ -100,7 +100,7 @@ impl Wiring {
     /// The index every reader shares.
     fn shapes(self) -> Arc<Shapes<ParserDB>> {
         Arc::new(
-            Shapes::new(self.db, &self.relations)
+            Shapes::new::<Postgres>(self.db, &self.relations)
                 .with_row_naming(&self.naming)
                 .with_action_relations(&self.answers)
                 .with_required_parameters(&self.notes),
