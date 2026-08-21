@@ -140,12 +140,32 @@ pub enum RegisterError {
 /// declared type. A cell the source did not carry is `Ok(Value::Missing)`,
 /// not an error.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
-#[error("column {column} carried a value that could not be decoded as its {kind:?} type")]
-pub struct ValueError {
-    /// Column ordinal whose carried cell failed to decode.
-    pub column: crate::ColumnId,
-    /// The catalog scalar kind subql tried to decode the cell into.
-    pub kind: crate::backend::ScalarKind,
+pub enum ValueError {
+    /// A cell malformed for the builtin type its column declares.
+    #[error("column {column} carried a value that could not be decoded as its {kind:?} type")]
+    Builtin {
+        /// Column ordinal whose carried cell failed to decode.
+        column: crate::ColumnId,
+        /// The catalog scalar kind subql tried to decode the cell into.
+        kind: crate::backend::BuiltinKind,
+    },
+    /// A custom type's conversion refused the value its carrier delivered.
+    ///
+    /// Distinct from [`Self::Builtin`] because nothing was malformed: the
+    /// carrier decoded, and
+    /// [`CustomScalars::convert`](crate::backend::CustomScalars::convert)
+    /// declined the result. Reporting this as a failure to decode the
+    /// carrier would send a reader looking in the wrong place.
+    ///
+    /// The type is named by its printed form rather than carried as a
+    /// value, which keeps this error free of a backend type parameter.
+    #[error("column {column} carried a value the custom type {custom} refused")]
+    Custom {
+        /// Column ordinal whose carried cell was refused.
+        column: crate::ColumnId,
+        /// The custom type that refused it, as it prints.
+        custom: alloc::string::String,
+    },
 }
 
 /// Errors during event dispatch

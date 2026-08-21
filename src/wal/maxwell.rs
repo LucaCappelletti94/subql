@@ -162,13 +162,12 @@ impl CdcEvent for Message {
         match image.get(name.as_str()) {
             None => Ok(Value::Missing),
             Some(value) if value.is_null() => Ok(Value::Null),
-            Some(value) => catalog_helpers::column_scalar_kind(db, table_id, col).map_or(
-                Ok(Value::Missing),
-                |kind| match json_value_to_mysql_value_by_kind(value, kind) {
-                    Value::Missing => Err(crate::ValueError { column: col, kind }),
-                    decoded => Ok(decoded),
-                },
-            ),
+            Some(value) => catalog_helpers::column_scalar_kind::<MySql, DB>(db, table_id, col)
+                .map_or(Ok(Value::Missing), |kind| {
+                    crate::backend::decode_cell(col, kind, |builtin| {
+                        json_value_to_mysql_value_by_kind(value, builtin)
+                    })
+                }),
         }
     }
 }
@@ -283,7 +282,12 @@ mod tests {
                  "data":{"id":1,"big":18446744073709551615}}"#);
         assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(1));
         let err = ev.value_at(&db, RowKind::New, 1).unwrap_err();
-        assert_eq!(err.column, 1);
-        assert_eq!(err.kind, crate::backend::ScalarKind::Int);
+        assert_eq!(
+            err,
+            crate::ValueError::Builtin {
+                column: 1,
+                kind: crate::backend::ScalarKind::Int
+            }
+        );
     }
 }

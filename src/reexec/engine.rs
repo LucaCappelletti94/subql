@@ -57,7 +57,7 @@ pub enum Registered {
         /// SQL to run for the initial value and for any later trigger.
         sql: String,
         /// Decode hint for the scalar result.
-        column_kind: crate::backend::ScalarKind,
+        column_kind: crate::backend::BuiltinKind,
     },
 }
 

@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, ScalarKind, Value};
+use subql::backend::{BuiltinKind, Postgres, Value};
 use subql::reexec::{AsyncAutoResolvingEngine, AsyncConnector, ReExecEngine, Registered, Snapshot};
 use subql::testing::TestEvent;
 use subql::{
@@ -93,7 +93,7 @@ impl AsyncConnector for ConcurrencyProbingConnector {
     fn execute_scalar(
         &self,
         _sql: &str,
-        _kind: ScalarKind,
+        _kind: BuiltinKind,
         _auth: &(),
     ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
     {

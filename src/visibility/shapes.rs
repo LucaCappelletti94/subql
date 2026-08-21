@@ -114,6 +114,7 @@ pub(crate) struct TableShapes {
 ///
 /// ```
 /// use std::sync::Arc;
+/// use subql::backend::Postgres;
 /// use rls2fga::classifier::patterns::ConfidenceLevel;
 /// use rls2fga::translator::TranslatorBuilder;
 /// use sqlparser::dialect::PostgreSqlDialect;
@@ -137,7 +138,7 @@ pub(crate) struct TableShapes {
 /// let answers = translation.action_relations();
 ///
 /// let shapes = Arc::new(
-///     Shapes::new(db, &relations)
+///     Shapes::new::<Postgres>(db, &relations)
 ///         .with_row_naming(&naming)
 ///         .with_action_relations(&answers),
 /// );
@@ -197,16 +198,16 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// reported: that table produces no events here, so skipping it introduces
     /// no staleness and there would be no remedy to name.
     #[must_use]
-    pub fn new(db: DB, relations: &[RelationShapes]) -> Self {
+    pub fn new<B: crate::backend::Backend>(db: DB, relations: &[RelationShapes]) -> Self {
         let mut recipes = HashMap::new();
         let mut by_table: HashMap<TableId, TableShapes> = HashMap::new();
         let mut uncovered = Vec::new();
         let contested = contested_pairs(relations);
 
         for entry in relations {
-            index_recipe(&db, entry, &mut recipes);
+            index_recipe::<B, DB>(&db, entry, &mut recipes);
             for shape in &entry.shapes {
-                index_shape(&db, entry, shape, &contested, &mut by_table, &mut uncovered);
+                index_shape::<B, DB>(&db, entry, shape, &contested, &mut by_table, &mut uncovered);
             }
         }
 
@@ -311,6 +312,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// use rls2fga::generator::action_relations::ActionStatement;
     /// use rls2fga::translator::TranslatorBuilder;
     /// use sqlparser::dialect::PostgreSqlDialect;
+    /// use subql::backend::Postgres;
     /// use subql::visibility::shapes::Shapes;
     /// use subql::{catalog_helpers, ParserDB};
     ///
@@ -331,7 +333,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// let answers = translation.action_relations();
     /// let open = translation.unrestricted_tables();
     ///
-    /// let shapes = Shapes::new(db, &relations)
+    /// let shapes = Shapes::new::<Postgres>(db, &relations)
     ///     .with_row_naming(&naming)
     ///     .with_action_relations(&answers)
     ///     .with_unrestricted_tables(&open);
@@ -475,7 +477,7 @@ fn is_request_gated(decision: &RowDecision) -> bool {
 /// Every relation is indexed, not a chosen few: which of them answers a
 /// statement is what the model reports, and a reader that filtered here would
 /// be deciding that question in the wrong place.
-fn index_recipe<DB: DatabaseLike>(
+fn index_recipe<B: crate::backend::Backend, DB: DatabaseLike>(
     db: &DB,
     entry: &RelationShapes,
     recipes: &mut HashMap<(TableId, RelationName), RowDecision>,
@@ -484,7 +486,7 @@ fn index_recipe<DB: DatabaseLike>(
         return;
     };
     let Some(table) =
-        usable_table(decision, db).and_then(|name| catalog_helpers::table_id(db, name))
+        usable_table::<B, DB>(decision, db).and_then(|name| catalog_helpers::table_id(db, name))
     else {
         return;
     };
@@ -493,7 +495,7 @@ fn index_recipe<DB: DatabaseLike>(
 
 /// Index one shape by the table whose changes move it, naming it uncovered
 /// when nothing here can keep its records current.
-fn index_shape<DB: DatabaseLike>(
+fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
     db: &DB,
     entry: &RelationShapes,
     shape: &RecordDescription,
@@ -503,7 +505,7 @@ fn index_shape<DB: DatabaseLike>(
 ) {
     match &shape.derivation {
         RecordDerivation::FromRow { table, .. } => {
-            if !is_evaluable(shape, db) {
+            if !is_evaluable::<B, DB>(shape, db) {
                 uncovered.push(name_gap(
                     entry,
                     shape,
@@ -659,12 +661,15 @@ fn resolve_key<DB: DatabaseLike>(
 ///
 /// A recipe shape this does not recognise falls to the wildcard and delegates.
 /// That is the whole protection against a composition a later rls2fga adds.
-fn usable_table<'a, DB: DatabaseLike>(decision: &'a RowDecision, db: &DB) -> Option<&'a str> {
+fn usable_table<'a, B: crate::backend::Backend, DB: DatabaseLike>(
+    decision: &'a RowDecision,
+    db: &DB,
+) -> Option<&'a str> {
     let mut table: Option<&str> = None;
     match decision {
         RowDecision::Leaf { shapes, .. } | RowDecision::RequestGated { shapes, .. } => {
             for shape in shapes {
-                if !is_evaluable(shape, db) {
+                if !is_evaluable::<B, DB>(shape, db) {
                     return None;
                 }
                 let RecordDerivation::FromRow { table: name, .. } = &shape.derivation else {
@@ -677,7 +682,7 @@ fn usable_table<'a, DB: DatabaseLike>(decision: &'a RowDecision, db: &DB) -> Opt
         }
         RowDecision::Any(children) | RowDecision::All(children) => {
             for child in children {
-                let name = usable_table(child, db)?;
+                let name = usable_table::<B, DB>(child, db)?;
                 if *table.get_or_insert(name) != name {
                     return None;
                 }
@@ -696,6 +701,7 @@ pub type SharedShapes<DB> = Arc<Shapes<DB>>;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::backend::Postgres;
     use alloc::vec::Vec;
 
     use core::ops::Not;
@@ -735,7 +741,7 @@ mod tests {
             translation.action_relations(),
             translation.unrestricted_tables(),
         );
-        Shapes::new(db, &relations)
+        Shapes::new::<Postgres>(db, &relations)
             .with_row_naming(&naming)
             .with_action_relations(&answers)
             .with_unrestricted_tables(&unrestricted)

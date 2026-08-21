@@ -458,7 +458,12 @@ where
             .zip(&compiled.terms)
             .filter(|(plan, _)| plan.moved_by.is_some())
             .map(|(plan, term)| {
-                TermDescription::resolve(plan, term, compiled.table_id, &self.database)
+                TermDescription::resolve::<E::Backend, _>(
+                    plan,
+                    term,
+                    compiled.table_id,
+                    &self.database,
+                )
             })
             .collect()
     }
@@ -547,15 +552,19 @@ where
             // The lookup is keyed by the compared column's value, so the column
             // has to hold a kind whose equality is reflexive. A float, a JSON or
             // a JSONB cell could not find what it stored.
-            let kind = catalog_helpers::column_scalar_kind(&self.database, table_id, term.column)
-                .ok_or_else(|| {
+            let kind = catalog_helpers::column_scalar_kind::<E::Backend, _>(
+                &self.database,
+                table_id,
+                term.column,
+            )
+            .ok_or_else(|| {
                 RegisterError::MembershipTermRefused(format!(
                     "column {column} of table {table_id} has a SQL type SubQL cannot read, so \
                          a membership subquery comparing it has nothing to look up",
                     column = term.column,
                 ))
             })?;
-            if !kind_can_key(kind) {
+            if !kind_can_key::<E::Backend>(kind) {
                 return Err(RegisterError::MembershipTermRefused(format!(
                     "a membership subquery cannot compare a {kind:?} column. SubQL looks the \
                      column's value up to decide which subscribers a changed row admits, and a \
@@ -625,8 +634,11 @@ where
         // subscription dead.
         let mut seeds: Vec<Vec<TermKey<E::Backend>>> = alloc::vec![Vec::new(); terms.len()];
         for term in terms.iter().filter(|term| term.compares_the_caller()) {
-            let compared =
-                catalog_helpers::column_scalar_kind(&self.database, table_id, term.column);
+            let compared = catalog_helpers::column_scalar_kind::<E::Backend, _>(
+                &self.database,
+                table_id,
+                term.column,
+            );
             let stated = subscriber.scalar_kind();
             if compared != Some(stated) {
                 return Err(RegisterError::MembershipTermRefused(format!(
@@ -747,7 +759,7 @@ where
         terms
             .iter()
             .map(|term| {
-                crate::term_compile::plan_term(
+                crate::term_compile::plan_term::<E::Backend, _>(
                     term,
                     table_id,
                     &table_name,

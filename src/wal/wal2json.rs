@@ -105,11 +105,12 @@ fn decode_cell<DB: DatabaseLike>(
     match value {
         None => Ok(Value::Missing),
         Some(v) if v.is_null() => Ok(Value::Null),
-        Some(v) => catalog_helpers::column_scalar_kind(db, table_id, col).map_or(
+        Some(v) => catalog_helpers::column_scalar_kind::<Postgres, DB>(db, table_id, col).map_or(
             Ok(Value::Missing),
-            |kind| match json_value_to_pg_value_by_kind(v, kind) {
-                Value::Missing => Err(crate::ValueError { column: col, kind }),
-                decoded => Ok(decoded),
+            |kind| {
+                crate::backend::decode_cell(col, kind, |builtin| {
+                    json_value_to_pg_value_by_kind(v, builtin)
+                })
             },
         ),
     }

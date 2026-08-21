@@ -684,7 +684,7 @@ where
         };
         let mut out = Vec::new();
         for shape in shapes {
-            let Ok(records) = crate::visibility::records::records_from_row_view(
+            let Ok(records) = crate::visibility::records::records_from_row_view::<R, _>(
                 shape,
                 row,
                 self.shapes.catalog(),
@@ -1598,7 +1598,7 @@ CREATE POLICY notes_p ON notes USING (
         let relations = translation.relations();
         let notes = translation.notes().to_vec();
 
-        let bare = Shapes::new(db, &relations);
+        let bare = Shapes::new::<crate::backend::Postgres>(db, &relations);
         assert!(
             bare.has_request_gated_recipe(),
             "the recipe grants through the caller's own values"
@@ -1614,7 +1614,7 @@ CREATE POLICY notes_p ON notes USING (
             "so a policy over it refuses to build"
         );
 
-        let told = Shapes::new(
+        let told = Shapes::new::<crate::backend::Postgres>(
             ParserDB::parse::<PostgreSqlDialect>(sql).unwrap(),
             &relations,
         )
@@ -1662,7 +1662,7 @@ CREATE POLICY notes_p ON notes USING (
             translation.action_relations(),
         );
         let shapes = Arc::new(
-            Shapes::new(db, &relations)
+            Shapes::new::<crate::backend::Postgres>(db, &relations)
                 .with_row_naming(&naming)
                 .with_action_relations(&answers),
         );

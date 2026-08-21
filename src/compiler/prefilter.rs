@@ -503,7 +503,7 @@ fn literal_index_key<B: SqlLiteralParse, DB: DatabaseLike>(
     let Expr::Value(value) = expr else {
         return None;
     };
-    let kind = catalog_helpers::column_scalar_kind(database, table_id, column_id)?;
+    let kind = catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, column_id)?;
     PlannerValue::from_value(&B::parse_literal(&value.value, kind).ok()?)
 }
 

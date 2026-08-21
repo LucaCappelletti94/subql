@@ -27,7 +27,9 @@ use sqlite_diff_rs::{
 };
 
 use super::event::SqliteChangesetEvent;
-use crate::backend::{SQLite, ScalarKind, Value};
+use crate::backend::{
+    Backend, BuiltinKind, CustomScalars, SQLite, ScalarKind, ScalarKindOf, Value,
+};
 use crate::wal::{resolve_table, WalParseError, WalParser};
 use crate::{catalog_helpers, ColumnId, EventKind, TableId};
 
@@ -112,7 +114,7 @@ fn op_to_event<DB: DatabaseLike>(
             }
             let mut row: Vec<Value<SQLite>> = Vec::with_capacity(arity);
             for (col, wire) in values.iter().enumerate() {
-                row.push(decode_wire_value(
+                row.push(decode_wire_cell(
                     wire.clone(),
                     scalar_kind_for(&scalar_kinds, col),
                 ));
@@ -162,7 +164,7 @@ fn op_to_event<DB: DatabaseLike>(
             }
             let mut row: Vec<Value<SQLite>> = Vec::with_capacity(arity);
             for (col, wire) in old_values.iter().enumerate() {
-                row.push(decode_wire_value(
+                row.push(decode_wire_cell(
                     wire.clone(),
                     scalar_kind_for(&scalar_kinds, col),
                 ));
@@ -194,16 +196,16 @@ fn op_to_event<DB: DatabaseLike>(
 /// corresponding side.
 fn decode_update_pair(
     pair: &ChangesetUpdatePair<alloc::string::String, Vec<u8>>,
-    kind: Option<ScalarKind>,
+    kind: Option<BuiltinKind>,
 ) -> (Value<SQLite>, Value<SQLite>) {
     let old = pair
         .0
         .as_ref()
-        .map_or(Value::Missing, |v| decode_wire_value(v.clone(), kind));
+        .map_or(Value::Missing, |v| decode_wire_cell(v.clone(), kind));
     let new = pair
         .1
         .as_ref()
-        .map_or(Value::Missing, |v| decode_wire_value(v.clone(), kind));
+        .map_or(Value::Missing, |v| decode_wire_cell(v.clone(), kind));
     (old, new)
 }
 
@@ -239,18 +241,45 @@ fn column_scalar_kinds<DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     arity: usize,
-) -> Vec<Option<ScalarKind>> {
+) -> Vec<Option<ScalarKindOf<SQLite>>> {
     (0..arity)
         .map(|i| {
             #[allow(clippy::cast_possible_truncation)]
             let col_id = i as ColumnId;
-            catalog_helpers::column_scalar_kind(database, table_id, col_id)
+            catalog_helpers::column_scalar_kind::<SQLite, DB>(database, table_id, col_id)
         })
         .collect()
 }
 
-fn scalar_kind_for(kinds: &[Option<ScalarKind>], col: usize) -> Option<ScalarKind> {
+fn scalar_kind_for(
+    kinds: &[Option<ScalarKindOf<SQLite>>],
+    col: usize,
+) -> Option<ScalarKindOf<SQLite>> {
     kinds.get(col).copied().flatten()
+}
+
+/// Decode a SQLite wire cell whose column may declare a custom type.
+///
+/// Mirrors [`crate::backend::decode_cell`] for a path that reports a failure
+/// as [`Value::Missing`] rather than an error: this stream escalates an
+/// undecodable cell to re-execution, so nothing here has an error to carry.
+fn decode_wire_cell(
+    wire: WireValue<alloc::string::String, Vec<u8>>,
+    kind: Option<ScalarKindOf<SQLite>>,
+) -> Value<SQLite> {
+    match kind {
+        Some(ScalarKind::Custom(custom)) => {
+            let carrier = <<SQLite as Backend>::Custom as CustomScalars>::carrier(custom);
+            let raw = decode_wire_value(wire, Some(carrier));
+            raw.as_carried()
+                .and_then(|view| {
+                    <<SQLite as Backend>::Custom as CustomScalars>::convert(custom, view)
+                })
+                .map_or(Value::Missing, Value::Custom)
+        }
+        Some(builtin) => decode_wire_value(wire, builtin.as_builtin()),
+        None => decode_wire_value(wire, None),
+    }
 }
 
 /// Route a wire value into its typed [`Value<SQLite>`] variant using
@@ -260,7 +289,7 @@ fn scalar_kind_for(kinds: &[Option<ScalarKind>], col: usize) -> Option<ScalarKin
 /// contract from the [`crate::backend::CdcEvent`] trait.
 fn decode_wire_value(
     wire: WireValue<alloc::string::String, Vec<u8>>,
-    kind: Option<ScalarKind>,
+    kind: Option<BuiltinKind>,
 ) -> Value<SQLite> {
     match wire {
         WireValue::Null => Value::Null,

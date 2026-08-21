@@ -17,9 +17,9 @@
 //!    every cell type, so neither the classifier nor the engine has
 //!    grounds to reject them.
 //! 2. **The reported `column_type` matches the column's declared type.**
-//!    `MIN(price)` returns `ScalarKind::Float`. `MIN(quantity)`
-//!    returns `ScalarKind::Int`. `MIN(status)` returns
-//!    `ScalarKind::String`.
+//!    `MIN(price)` returns `BuiltinKind::Float`. `MIN(quantity)`
+//!    returns `BuiltinKind::Int`. `MIN(status)` returns
+//!    `BuiltinKind::String`.
 //! 3. **The returned SQL carries the canonical projection alias `v`.**
 //!    Materializers load the scalar back by that alias.
 //! 4. **Distinct queries get distinct `query_id`s within one engine.**
@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, ScalarKind};
+use subql::backend::{BuiltinKind, Postgres};
 use subql::reexec::{ReExecEngine, Registered};
 use subql::testing::TestEvent;
 use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
@@ -62,11 +62,11 @@ impl AggCol {
         }
     }
 
-    const fn scalar_kind(self) -> ScalarKind {
+    const fn scalar_kind(self) -> BuiltinKind {
         match self {
-            Self::Price => ScalarKind::Float,
-            Self::Quantity => ScalarKind::Int,
-            Self::Status => ScalarKind::String,
+            Self::Price => BuiltinKind::Float,
+            Self::Quantity => BuiltinKind::Int,
+            Self::Status => BuiltinKind::String,
         }
     }
 }

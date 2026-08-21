@@ -13,7 +13,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use uuid::Uuid;
 
-use crate::backend::{MySql, Postgres, ScalarKind, Value};
+use crate::backend::{BuiltinKind, MySql, Postgres, ScalarKind, Value};
 
 // ============================================================================
 // Typed decoders producing `Value<Postgres>` (Phase 7)
@@ -26,7 +26,7 @@ use crate::backend::{MySql, Postgres, ScalarKind, Value};
 /// catalog at decode time rather than the wire OID. Parse failures and
 /// shapes the kind cannot accept collapse to [`Value::Missing`], matching
 /// the `value_at` contract (a corrupt cell escalates to re-execution).
-pub(super) fn text_to_pg_value_by_kind(text: &str, kind: ScalarKind) -> Value<Postgres> {
+pub(super) fn text_to_pg_value_by_kind(text: &str, kind: BuiltinKind) -> Value<Postgres> {
     match kind {
         ScalarKind::Bool => match text {
             "t" => Value::Bool(true),
@@ -74,7 +74,7 @@ fn decode_pg_bytea_hex(text: &str) -> Option<alloc::vec::Vec<u8>> {
 /// contract (a corrupt cell escalates to re-execution).
 pub(super) fn json_value_to_pg_value_by_kind(
     value: &serde_json::Value,
-    kind: ScalarKind,
+    kind: BuiltinKind,
 ) -> Value<Postgres> {
     if value.is_null() {
         return Value::Null;
@@ -110,7 +110,7 @@ pub(super) fn json_value_to_pg_value_by_kind(
 /// [`uuid::Uuid`].
 pub(super) fn json_value_to_mysql_value_by_kind(
     value: &serde_json::Value,
-    kind: ScalarKind,
+    kind: BuiltinKind,
 ) -> Value<MySql> {
     if value.is_null() {
         return Value::Null;

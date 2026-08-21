@@ -20,7 +20,7 @@ use core::mem::discriminant;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::Expr;
 
-use crate::backend::{Backend, ScalarKind, Value};
+use crate::backend::{Backend, BuiltinKind, CustomScalars, ScalarKind, ScalarKindOf, Value};
 use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
 
 /// One membership term the compiler lifted out of a filter.
@@ -121,10 +121,20 @@ pub struct TermDescription {
     /// [`TermKey`] keys a string and a UUID under different variants, so an
     /// identity supplied at another kind matches no membership row and admits
     /// nobody in silence.
-    pub subject_kind: ScalarKind,
+    pub subject_kind: BuiltinKind,
+    /// The custom type [`subject_kind`](Self::subject_kind) carries, when the
+    /// compared column is one, as it prints.
+    ///
+    /// The kind above names the shape the caller reads and supplies, since
+    /// that is what the database hands them and the conversion into the
+    /// custom type is subql's to run. This names what it means.
+    pub subject_custom: Option<String>,
     /// The kind [`seed_sql`](Self::seed_sql)'s one column decodes as, which is
     /// also the kind [`column`](Self::column) holds.
-    pub key_kind: ScalarKind,
+    pub key_kind: BuiltinKind,
+    /// The custom type [`key_kind`](Self::key_kind) carries, when the seed
+    /// column is one, as it prints.
+    pub key_custom: Option<String>,
     /// The seed read: the membership subquery itself, one column, the values
     /// this subscriber currently matches.
     ///
@@ -145,7 +155,7 @@ impl TermDescription {
     /// [`RegisterError::MembershipTermRefused`] when the catalog does not name
     /// one of the plan's ids, or when the term was lifted from a shape whose
     /// seed read cannot be named.
-    pub(crate) fn resolve<DB: DatabaseLike>(
+    pub(crate) fn resolve<B: Backend, DB: DatabaseLike>(
         plan: &TermPlan,
         term: &CompiledTerm,
         table: TableId,
@@ -173,13 +183,17 @@ impl TermDescription {
             ));
         };
 
+        let subject = kind::<B, DB>(database, movement.member_table, movement.member_subject)?;
+        let compared = kind::<B, DB>(database, table, plan.column)?;
         Ok(Self {
             column: name(database, table, plan.column)?,
             member_table: table_name_of(database, movement.member_table)?,
             member_key: name(database, movement.member_table, movement.member_key)?,
             member_subject: name(database, movement.member_table, movement.member_subject)?,
-            subject_kind: kind(database, movement.member_table, movement.member_subject)?,
-            key_kind: kind(database, table, plan.column)?,
+            subject_kind: carrier_of::<B>(subject),
+            subject_custom: custom_name::<B>(subject),
+            key_kind: carrier_of::<B>(compared),
+            key_custom: custom_name::<B>(compared),
             seed_sql: subquery.to_string(),
         })
     }
@@ -210,13 +224,31 @@ fn name<DB: DatabaseLike>(
     })
 }
 
+/// The builtin shape a column's kind is read at: itself for a builtin, its
+/// carrier for a custom.
+///
+/// What a caller reads out of the database and supplies back, since the
+/// conversion into a custom value is subql's to run.
+fn carrier_of<B: Backend>(kind: ScalarKindOf<B>) -> BuiltinKind {
+    kind.as_builtin().unwrap_or_else(|| {
+        kind.custom().map_or(ScalarKind::String, |custom| {
+            <B::Custom as CustomScalars>::carrier(*custom)
+        })
+    })
+}
+
+/// The custom type a kind names, as it prints, or `None` for a builtin.
+fn custom_name<B: Backend>(kind: ScalarKindOf<B>) -> Option<String> {
+    kind.custom().map(|custom| alloc::format!("{custom:?}"))
+}
+
 /// A column's scalar kind, or the refusal for one the catalog cannot type.
-fn kind<DB: DatabaseLike>(
+fn kind<B: Backend, DB: DatabaseLike>(
     database: &DB,
     table: TableId,
     column: ColumnId,
-) -> Result<ScalarKind, RegisterError> {
-    catalog_helpers::column_scalar_kind(database, table, column).ok_or_else(|| {
+) -> Result<ScalarKindOf<B>, RegisterError> {
+    catalog_helpers::column_scalar_kind::<B, DB>(database, table, column).ok_or_else(|| {
         RegisterError::MembershipTermRefused(alloc::format!(
             "column {column} of table {table} holds a SQL type SubQL cannot read, {CANNOT_SAY}"
         ))
@@ -265,6 +297,11 @@ pub enum TermKey<B: Backend> {
     Time(B::Time),
     /// [`Backend::Decimal`] payload.
     Decimal(B::Decimal),
+    /// A custom type's converted value.
+    ///
+    /// Keyed on the value the type's own conversion produced, not on the
+    /// carrier it arrived as, so two spellings meaning the same value match.
+    Custom(<B::Custom as CustomScalars>::Value),
 }
 
 // `Clone`, `Debug`, `PartialEq`, `Eq` and `Hash` are hand-implemented for the
@@ -274,6 +311,7 @@ pub enum TermKey<B: Backend> {
 impl<B: Backend> Clone for TermKey<B> {
     fn clone(&self) -> Self {
         match self {
+            Self::Custom(v) => Self::Custom(v.clone()),
             Self::Bool(v) => Self::Bool(v.clone()),
             Self::Int(v) => Self::Int(v.clone()),
             Self::String(v) => Self::String(v.clone()),
@@ -291,6 +329,7 @@ impl<B: Backend> Clone for TermKey<B> {
 impl<B: Backend> core::fmt::Debug for TermKey<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Custom(v) => f.debug_tuple("Custom").field(v).finish(),
             Self::Bool(v) => f.debug_tuple("Bool").field(v).finish(),
             Self::Int(v) => f.debug_tuple("Int").field(v).finish(),
             Self::String(v) => f.debug_tuple("String").field(v).finish(),
@@ -314,6 +353,7 @@ impl<B: Backend> TermKey<B> {
     #[must_use]
     pub fn into_value(self) -> Value<B> {
         match self {
+            Self::Custom(v) => Value::Custom(v),
             Self::Bool(v) => Value::Bool(v),
             Self::Int(v) => Value::Int(v),
             Self::String(v) => Value::String(v),
@@ -334,8 +374,9 @@ impl<B: Backend> TermKey<B> {
     /// kind would never find what it stored and the subscription would be
     /// served dead.
     #[must_use]
-    pub const fn scalar_kind(&self) -> ScalarKind {
+    pub fn scalar_kind(&self) -> ScalarKindOf<B> {
         match self {
+            Self::Custom(v) => ScalarKind::Custom(<B::Custom as CustomScalars>::kind_of(v)),
             Self::Bool(_) => ScalarKind::Bool,
             Self::Int(_) => ScalarKind::Int,
             Self::String(_) => ScalarKind::String,
@@ -378,6 +419,7 @@ impl<B: Backend> Hash for TermKey<B> {
         // `String`, and the same text under each must not collide.
         discriminant(self).hash(state);
         match self {
+            Self::Custom(v) => v.hash(state),
             Self::Bool(v) => v.hash(state),
             Self::Int(v) => v.hash(state),
             Self::String(v) => v.hash(state),
@@ -418,6 +460,7 @@ impl<B: Backend> TermLookup<B> {
     /// registration bug from taking the dispatch loop down with it.
     pub fn of(value: Value<B>) -> Self {
         match value {
+            Value::Custom(v) => Self::Key(TermKey::Custom(v)),
             Value::Bool(v) => Self::Key(TermKey::Bool(v)),
             Value::Int(v) => Self::Key(TermKey::Int(v)),
             Value::String(v) => Self::Key(TermKey::String(v)),
@@ -440,8 +483,12 @@ impl<B: Backend> TermLookup<B> {
 /// a lookup keyed on one could not find what it stored. Registration refuses a
 /// term on such a column rather than serving one that answers inconsistently.
 #[must_use]
-pub const fn kind_can_key(kind: ScalarKind) -> bool {
+pub fn kind_can_key<B: Backend>(kind: ScalarKindOf<B>) -> bool {
     match kind {
+        // A custom type answers for itself. Its value is `Eq + Hash`, so the
+        // reflexivity the builtin rule demands is already promised, and this
+        // exists for a type that refuses keying for its own reasons.
+        ScalarKind::Custom(custom) => <B::Custom as CustomScalars>::can_key(custom),
         ScalarKind::Bool
         | ScalarKind::Int
         | ScalarKind::String
@@ -571,7 +618,7 @@ mod tests {
             let lookup = TermLookup::of(value);
             let keyed = matches!(lookup, TermLookup::Key(_));
             assert_eq!(
-                kind_can_key(kind),
+                kind_can_key::<Postgres>(kind),
                 keyed,
                 "{kind:?} disagrees between the gate and the conversion"
             );

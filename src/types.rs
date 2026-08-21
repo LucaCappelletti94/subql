@@ -701,7 +701,7 @@ pub struct AggregateBootstrap {
     /// Runnable single-row seed query with positionally-aliased columns.
     pub sql: String,
     /// Per-column decode kinds, in column order.
-    pub kinds: Vec<crate::backend::ScalarKind>,
+    pub kinds: Vec<crate::backend::BuiltinKind>,
 }
 
 /// Result of successful subscription registration

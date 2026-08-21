@@ -62,7 +62,7 @@ pub mod corpus {
     use alloc::vec::Vec;
     use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
-    use crate::backend::{Backend, ScalarKind, Value};
+    use crate::backend::{Backend, BuiltinKind, ScalarKind, Value};
 
     /// The value a corpus entry means. All three shipped backends map the
     /// four temporal kinds to these same `chrono` types, so one shape
@@ -76,7 +76,7 @@ pub mod corpus {
     }
 
     impl Temporal {
-        pub const fn kind(self) -> ScalarKind {
+        pub const fn kind(self) -> BuiltinKind {
             match self {
                 Self::Timestamp(_) => ScalarKind::Timestamp,
                 Self::TimestampTz(_) => ScalarKind::TimestampTz,
@@ -157,7 +157,7 @@ pub mod corpus {
     /// Text no temporal parser accepts for the named kind. A timestamptz
     /// without an offset and a naive timestamp carrying one are the two
     /// that matter: each is the other kind's spelling.
-    pub fn refused() -> Vec<(&'static str, ScalarKind)> {
+    pub fn refused() -> Vec<(&'static str, BuiltinKind)> {
         vec![
             ("2026-01-01 00:00:00", ScalarKind::TimestampTz),
             ("2026-01-01", ScalarKind::TimestampTz),

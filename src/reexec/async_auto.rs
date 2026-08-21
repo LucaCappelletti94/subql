@@ -535,7 +535,7 @@ where
 mod tests {
     use super::super::connector::Snapshot;
     use super::*;
-    use crate::backend::{Postgres, ScalarKind};
+    use crate::backend::{BuiltinKind, Postgres};
     use crate::testing::TestEvent;
     use crate::{DefaultIds, NoCheckpoint, SubscriptionEngine, SubscriptionRequest, TableId};
     use core::future::Future;
@@ -618,7 +618,7 @@ mod tests {
         fn execute_scalar(
             &self,
             _sql: &str,
-            _kind: ScalarKind,
+            _kind: BuiltinKind,
             _auth: &(),
         ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
         {

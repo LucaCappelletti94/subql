@@ -19,7 +19,7 @@ use super::engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
     Registered, ScalarUpdate,
 };
-use crate::backend::{Backend, CdcEvent, ScalarKind, Value};
+use crate::backend::{Backend, BuiltinKind, CdcEvent, Value};
 use crate::clock::{duration_between, ClockHandle};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::{IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport};
@@ -50,7 +50,7 @@ pub(super) struct ResolveContext<I: IdTypes, A> {
     /// Re-execution SQL produced by the plan.
     pub(super) sql: String,
     /// Decode kind for the scalar result.
-    pub(super) column_kind: ScalarKind,
+    pub(super) column_kind: BuiltinKind,
     /// Session owning the query, used to drop contexts on
     /// [`unregister_session`](AutoResolvingEngine::unregister_session).
     pub(super) session: Option<I::SessionId>,
@@ -416,6 +416,7 @@ where
 mod tests {
     use super::*;
     use crate::backend::Postgres;
+    use crate::backend::ScalarKind;
     use crate::testing::TestEvent;
     use crate::TableId;
     use crate::{DefaultIds, SubscriptionEngine};
@@ -434,7 +435,7 @@ mod tests {
     /// modeled by leaving the queue empty when `panic_on_empty` is false.
     struct MockConnector {
         values: RefCell<alloc::vec::Vec<Value<Postgres>>>,
-        calls: RefCell<alloc::vec::Vec<(String, ScalarKind)>>,
+        calls: RefCell<alloc::vec::Vec<(String, BuiltinKind)>>,
     }
 
     impl MockConnector {
@@ -467,7 +468,7 @@ mod tests {
         fn execute_scalar(
             &self,
             sql: &str,
-            column_kind: ScalarKind,
+            column_kind: BuiltinKind,
             _auth: &(),
         ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
             self.calls

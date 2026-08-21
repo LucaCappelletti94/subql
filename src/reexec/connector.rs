@@ -33,7 +33,7 @@
 //! expected to retry the batch. Retry policy lives in the Connector impl
 //! (or above the engine), never inside subql.
 
-use crate::backend::{Backend, ScalarKind, Value};
+use crate::backend::{Backend, BuiltinKind, ScalarKind, Value};
 use crate::{Checkpoint, DispatchError};
 use thiserror::Error;
 
@@ -126,7 +126,7 @@ pub trait Connector {
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: BuiltinKind,
         auth: &Self::AuthContext,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>;
 
@@ -169,7 +169,7 @@ pub trait Connector {
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[BuiltinKind],
         auth: &Self::AuthContext,
     ) -> Result<
         (
@@ -366,7 +366,7 @@ pub struct TextRow {
 /// row. Decimals are carried as text through this path so precision is
 /// not lost through `f64`.
 #[cfg(feature = "executor-diesel")]
-fn load_scalar<C, B>(conn: &mut C, sql: &str, kind: ScalarKind) -> QueryResult<Value<B>>
+fn load_scalar<C, B>(conn: &mut C, sql: &str, kind: BuiltinKind) -> QueryResult<Value<B>>
 where
     B: DieselBackend,
     for<'q> SqlQuery:
@@ -410,7 +410,7 @@ where
 fn load_scalar_row<C, B>(
     conn: &mut C,
     sql: &str,
-    kinds: &[ScalarKind],
+    kinds: &[BuiltinKind],
 ) -> QueryResult<alloc::vec::Vec<Value<B>>>
 where
     B: DieselBackend,
@@ -452,7 +452,7 @@ where
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: BuiltinKind,
         _auth: &(),
     ) -> Result<(Value<B>, Option<Self::Checkpoint>), Self::Error> {
         let value = load_scalar::<_, B>(&mut self.conn.borrow_mut(), sql, kind)?;
@@ -484,7 +484,7 @@ where
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[BuiltinKind],
         _auth: &(),
     ) -> Result<(alloc::vec::Vec<Value<B>>, Option<Self::Checkpoint>), ScalarRowError<Self::Error>>
     {
@@ -570,7 +570,7 @@ impl Connector for PgDieselConnector {
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: BuiltinKind,
         _auth: &(),
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
@@ -606,7 +606,7 @@ impl Connector for PgDieselConnector {
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[BuiltinKind],
         _auth: &(),
     ) -> Result<
         (
@@ -740,7 +740,7 @@ impl Connector for MysqlDieselConnector {
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: BuiltinKind,
         _auth: &(),
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
@@ -773,7 +773,7 @@ impl Connector for MysqlDieselConnector {
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[BuiltinKind],
         _auth: &(),
     ) -> Result<
         (
@@ -872,7 +872,7 @@ impl Connector for PgR2D2DieselConnector {
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: BuiltinKind,
         _auth: &(),
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.pool.get()?;
@@ -907,7 +907,7 @@ impl Connector for PgR2D2DieselConnector {
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[BuiltinKind],
         _auth: &(),
     ) -> Result<
         (

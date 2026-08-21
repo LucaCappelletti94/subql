@@ -45,7 +45,7 @@ pub(super) struct MinMaxPlan<B: Backend> {
     /// column. Not consumed by in-process maintenance (MIN/MAX compares
     /// `Value` variants directly), but returned to the materializer via
     /// [`Registered::ReExec`](super::Registered::ReExec) as a decode hint.
-    pub agg_kind: crate::backend::ScalarKind,
+    pub agg_kind: crate::backend::BuiltinKind,
     /// Columns whose change can alter the result: the aggregated column
     /// plus every column the WHERE clause reads (UPDATE routing
     /// optimization).
@@ -86,7 +86,8 @@ where
         ));
     };
 
-    let agg_kind = crate::catalog_helpers::column_scalar_kind(database, parsed.table_id, agg_column)
+    let agg_kind =
+        crate::catalog_helpers::column_builtin_kind(database, parsed.table_id, agg_column)
         .ok_or_else(|| {
             RegisterError::UnsupportedSql(format!(
                 "aggregated column {agg_column} of table {table_id} has an unsupported SQL type for the maintenance layer",

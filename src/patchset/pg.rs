@@ -68,7 +68,7 @@ use diesel::sql_types::{
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TableLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
-use crate::backend::ScalarKind;
+use crate::backend::{ScalarKind, ScalarKindOf};
 use crate::catalog_helpers;
 use crate::temporal::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 use crate::types::ColumnId;
@@ -101,10 +101,18 @@ impl<'db, DB: DatabaseLike> PgAdapter<'db, DB> {
     /// the dispatch key for families Postgres will not assignment-cast
     /// from a text bind. Returns `None` for an unknown table or column,
     /// or a declared type that maps to no supported scalar.
-    fn scalar_kind_at(&self, table_name: &str, column_index: usize) -> Option<ScalarKind> {
+    fn scalar_kind_at(
+        &self,
+        table_name: &str,
+        column_index: usize,
+    ) -> Option<ScalarKindOf<crate::backend::Postgres>> {
         let table_id = catalog_helpers::table_id(self.catalog, table_name)?;
         let column_id = ColumnId::try_from(column_index).ok()?;
-        catalog_helpers::column_scalar_kind(self.catalog, table_id, column_id)
+        catalog_helpers::column_scalar_kind::<crate::backend::Postgres, _>(
+            self.catalog,
+            table_id,
+            column_id,
+        )
     }
 
     /// The declared SQL type name of the target column, verbatim from the

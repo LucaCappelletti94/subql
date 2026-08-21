@@ -32,7 +32,7 @@ use super::connector::LogStatusRow;
 #[cfg(feature = "executor-diesel-async-postgres")]
 use super::connector::PgLsnRow;
 use super::connector::{DieselBackend, FloatRow, IntRow, ScalarRowError, Snapshot, TextRow};
-use crate::backend::{ScalarKind, Value};
+use crate::backend::{BuiltinKind, ScalarKind, Value};
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -73,7 +73,7 @@ pub enum DieselAsyncError {
 async fn load_scalar_async<C, B>(
     conn: &mut C,
     sql: &str,
-    kind: ScalarKind,
+    kind: BuiltinKind,
 ) -> diesel::QueryResult<Value<B>>
 where
     B: DieselBackend,
@@ -119,7 +119,7 @@ where
 async fn load_scalar_row_async<C, B>(
     conn: &mut C,
     sql: &str,
-    kinds: &[ScalarKind],
+    kinds: &[BuiltinKind],
 ) -> diesel::QueryResult<Vec<Value<B>>>
 where
     B: DieselBackend,
@@ -196,7 +196,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: BuiltinKind,
         _auth: &(),
     ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
     {
@@ -237,7 +237,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[BuiltinKind],
         _auth: &(),
     ) -> impl Future<
         Output = Result<
@@ -354,7 +354,7 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
     fn execute_scalar(
         &self,
         sql: &str,
-        kind: ScalarKind,
+        kind: BuiltinKind,
         _auth: &(),
     ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
     {
@@ -390,7 +390,7 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
     fn execute_scalar_row(
         &self,
         sql: &str,
-        kinds: &[ScalarKind],
+        kinds: &[BuiltinKind],
         _auth: &(),
     ) -> impl Future<
         Output = Result<

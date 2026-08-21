@@ -1114,7 +1114,13 @@ mod tests {
 
         assert_eq!(row.value_at(0), Ok(Value::Int(4)), "the good column reads");
         let err = row.value_at(1).expect_err("an undecodable INT cell errors");
-        assert_eq!(err.column, 1);
+        assert_eq!(
+            err,
+            crate::ValueError::Builtin {
+                column: 1,
+                kind: crate::backend::ScalarKind::Int
+            }
+        );
 
         // An implementation that does not inspect the error still fails
         // closed, because the caller pre-filled the buffer.

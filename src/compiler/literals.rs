@@ -11,7 +11,9 @@
 //! extension of it: CDC-runtime paths that only read events don't touch
 //! SQL and don't need the sqlparser dependency in their bounds.
 
-use crate::backend::{Backend, MySql, Postgres, SQLite, ScalarKind, Value};
+use crate::backend::{
+    Backend, BuiltinKind, CustomScalars, MySql, Postgres, SQLite, ScalarKind, ScalarKindOf, Value,
+};
 use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -49,18 +51,25 @@ pub trait SqlLiteralParse: Backend + Sized {
     /// sqlparser variants outside the supported subset (currently
     /// `Placeholder`, `Interval`, `Time`, `Date`, `Boolean` in a
     /// non-boolean context, etc.).
-    fn parse_literal(sql: &SqlValue, target: ScalarKind) -> Result<Value<Self>, RegisterError>;
+    fn parse_literal(
+        sql: &SqlValue,
+        target: ScalarKindOf<Self>,
+    ) -> Result<Value<Self>, RegisterError>;
 }
 
 // ============================================================================
 // Shared parsing helpers
 // ============================================================================
 
-fn err_shape(sql: &SqlValue, target: ScalarKind) -> RegisterError {
+fn err_shape<C: core::fmt::Debug + Copy>(sql: &SqlValue, target: ScalarKind<C>) -> RegisterError {
     RegisterError::TypeError(format!("cannot use SQL literal {sql:?} as {target:?}"))
 }
 
-fn err_parse(sql: &SqlValue, target: ScalarKind, msg: impl core::fmt::Display) -> RegisterError {
+fn err_parse<C: core::fmt::Debug + Copy>(
+    sql: &SqlValue,
+    target: ScalarKind<C>,
+    msg: impl core::fmt::Display,
+) -> RegisterError {
     RegisterError::TypeError(format!(
         "cannot parse SQL literal {sql:?} as {target:?}: {msg}"
     ))
@@ -68,30 +77,32 @@ fn err_parse(sql: &SqlValue, target: ScalarKind, msg: impl core::fmt::Display) -
 
 fn parse_i64(n: &str, sql: &SqlValue) -> Result<i64, RegisterError> {
     n.parse::<i64>()
-        .map_err(|e| err_parse(sql, ScalarKind::Int, e))
+        .map_err(|e| err_parse(sql, BuiltinKind::Int, e))
 }
 
 fn parse_f64(n: &str, sql: &SqlValue) -> Result<f64, RegisterError> {
     n.parse::<f64>()
-        .map_err(|e| err_parse(sql, ScalarKind::Float, e))
+        .map_err(|e| err_parse(sql, BuiltinKind::Float, e))
 }
 
 fn parse_decimal(n: &str, sql: &SqlValue) -> Result<bigdecimal::BigDecimal, RegisterError> {
-    bigdecimal::BigDecimal::from_str(n).map_err(|e| err_parse(sql, ScalarKind::Decimal, e))
+    bigdecimal::BigDecimal::from_str(n).map_err(|e| err_parse(sql, BuiltinKind::Decimal, e))
 }
 
 fn parse_hex_bytes(s: &str, sql: &SqlValue) -> Result<Vec<u8>, RegisterError> {
     if !s.len().is_multiple_of(2) {
-        return Err(err_parse(sql, ScalarKind::Bytes, "odd-length hex literal"));
+        return Err(err_parse(sql, BuiltinKind::Bytes, "odd-length hex literal"));
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let hi = hex_nibble(bytes[i])
-            .ok_or_else(|| err_parse(sql, ScalarKind::Bytes, "non-hex character in hex literal"))?;
-        let lo = hex_nibble(bytes[i + 1])
-            .ok_or_else(|| err_parse(sql, ScalarKind::Bytes, "non-hex character in hex literal"))?;
+        let hi = hex_nibble(bytes[i]).ok_or_else(|| {
+            err_parse(sql, BuiltinKind::Bytes, "non-hex character in hex literal")
+        })?;
+        let lo = hex_nibble(bytes[i + 1]).ok_or_else(|| {
+            err_parse(sql, BuiltinKind::Bytes, "non-hex character in hex literal")
+        })?;
         out.push((hi << 4) | lo);
         i += 2;
     }
@@ -123,19 +134,19 @@ pub(super) fn hex_upper(bytes: &[u8]) -> String {
 }
 
 fn parse_uuid(s: &str, sql: &SqlValue) -> Result<uuid::Uuid, RegisterError> {
-    uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, ScalarKind::Uuid, e))
+    uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, BuiltinKind::Uuid, e))
 }
 
 fn parse_uuid_as_string(s: &str, sql: &SqlValue) -> Result<String, RegisterError> {
     // Validate the shape before storing as a string so downstream matches
     // do not silently paper over a malformed UUID literal.
-    uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, ScalarKind::Uuid, e))?;
+    uuid::Uuid::parse_str(s).map_err(|e| err_parse(sql, BuiltinKind::Uuid, e))?;
     Ok(s.to_string())
 }
 
 fn parse_timestamp(s: &str, sql: &SqlValue) -> Result<chrono::NaiveDateTime, RegisterError> {
     crate::temporal::parse_timestamp(s)
-        .ok_or_else(|| err_parse(sql, ScalarKind::Timestamp, "not a timestamp"))
+        .ok_or_else(|| err_parse(sql, BuiltinKind::Timestamp, "not a timestamp"))
 }
 
 fn parse_timestamp_tz(
@@ -145,22 +156,22 @@ fn parse_timestamp_tz(
     crate::temporal::parse_timestamp_tz(s).ok_or_else(|| {
         err_parse(
             sql,
-            ScalarKind::TimestampTz,
+            BuiltinKind::TimestampTz,
             "not a timestamp with time zone",
         )
     })
 }
 
 fn parse_date(s: &str, sql: &SqlValue) -> Result<chrono::NaiveDate, RegisterError> {
-    crate::temporal::parse_date(s).ok_or_else(|| err_parse(sql, ScalarKind::Date, "not a date"))
+    crate::temporal::parse_date(s).ok_or_else(|| err_parse(sql, BuiltinKind::Date, "not a date"))
 }
 
 fn parse_time(s: &str, sql: &SqlValue) -> Result<chrono::NaiveTime, RegisterError> {
-    crate::temporal::parse_time(s).ok_or_else(|| err_parse(sql, ScalarKind::Time, "not a time"))
+    crate::temporal::parse_time(s).ok_or_else(|| err_parse(sql, BuiltinKind::Time, "not a time"))
 }
 
 fn parse_json(s: &str, sql: &SqlValue) -> Result<serde_json::Value, RegisterError> {
-    serde_json::from_str(s).map_err(|e| err_parse(sql, ScalarKind::Json, e))
+    serde_json::from_str(s).map_err(|e| err_parse(sql, BuiltinKind::Json, e))
 }
 
 /// Extract a string payload from a sqlparser quoted-string variant.
@@ -178,6 +189,31 @@ fn quoted_string(sql: &SqlValue) -> Option<&str> {
     }
 }
 
+/// Parse a literal targeting a custom type: read it at the type's carrier
+/// shape, then hand that to the type's own conversion.
+///
+/// The same conversion a change event's cell goes through, so a filter's
+/// value and a row's value cannot disagree about what a spelling means. A
+/// spelling the conversion declines is a registration error naming the
+/// literal, never a silently ignored filter.
+pub fn parse_custom_literal<B: SqlLiteralParse>(
+    sql: &SqlValue,
+    custom: <B::Custom as CustomScalars>::Kind,
+) -> Result<Value<B>, RegisterError> {
+    let carrier = <B::Custom as CustomScalars>::carrier(custom);
+    let raw = B::parse_literal(sql, ScalarKind::from_builtin(carrier))?;
+    let view = raw
+        .as_carried()
+        .ok_or_else(|| err_shape(sql, ScalarKind::<()>::from_builtin(carrier)))?;
+    <B::Custom as CustomScalars>::convert(custom, view)
+        .map(Value::Custom)
+        .ok_or_else(|| {
+            RegisterError::TypeError(alloc::format!(
+                "the custom type {custom:?} refused SQL literal {sql:?}"
+            ))
+        })
+}
+
 // ============================================================================
 // Backend impls
 // ============================================================================
@@ -189,7 +225,10 @@ fn quoted_string(sql: &SqlValue) -> Option<&str> {
 // backends.
 
 impl SqlLiteralParse for Postgres {
-    fn parse_literal(sql: &SqlValue, target: ScalarKind) -> Result<Value<Self>, RegisterError> {
+    fn parse_literal(
+        sql: &SqlValue,
+        target: ScalarKindOf<Self>,
+    ) -> Result<Value<Self>, RegisterError> {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
@@ -230,13 +269,17 @@ impl SqlLiteralParse for Postgres {
                     Value::Jsonb(v)
                 })
             }
+            (ScalarKind::Custom(custom), _) => parse_custom_literal::<Self>(sql, custom),
             _ => Err(err_shape(sql, target)),
         }
     }
 }
 
 impl SqlLiteralParse for MySql {
-    fn parse_literal(sql: &SqlValue, target: ScalarKind) -> Result<Value<Self>, RegisterError> {
+    fn parse_literal(
+        sql: &SqlValue,
+        target: ScalarKindOf<Self>,
+    ) -> Result<Value<Self>, RegisterError> {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
@@ -279,13 +322,17 @@ impl SqlLiteralParse for MySql {
                     Value::Jsonb(v)
                 })
             }
+            (ScalarKind::Custom(custom), _) => parse_custom_literal::<Self>(sql, custom),
             _ => Err(err_shape(sql, target)),
         }
     }
 }
 
 impl SqlLiteralParse for SQLite {
-    fn parse_literal(sql: &SqlValue, target: ScalarKind) -> Result<Value<Self>, RegisterError> {
+    fn parse_literal(
+        sql: &SqlValue,
+        target: ScalarKindOf<Self>,
+    ) -> Result<Value<Self>, RegisterError> {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
@@ -330,6 +377,7 @@ impl SqlLiteralParse for SQLite {
                     Value::Jsonb(v)
                 })
             }
+            (ScalarKind::Custom(custom), _) => parse_custom_literal::<Self>(sql, custom),
             _ => Err(err_shape(sql, target)),
         }
     }

@@ -56,6 +56,11 @@ pub fn values_equal<B: Backend>(a: &Value<B>, b: &Value<B>) -> bool {
         (Value::Decimal(x), Value::Decimal(y)) => x == y,
         (Value::Json(x), Value::Json(y)) => x == y,
         (Value::Jsonb(x), Value::Jsonb(y)) => x == y,
+        // A custom pair compares by the value the type's own conversion
+        // produced, so two spellings the conversion maps together are equal.
+        // Without this arm the wildcard answers `false` and a filter on a
+        // custom column registers and then never fires.
+        (Value::Custom(x), Value::Custom(y)) => x == y,
         // Missing/Null and cross-scalar pairs are never equal here.
         _ => false,
     }

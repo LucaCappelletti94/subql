@@ -28,7 +28,7 @@ use sqlite_diff_rs::pg_walstream_reverse::{
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, TableSchema, Value as WireValue};
 
 use super::error::PgSqliteEmuError;
-use crate::backend::ScalarKind;
+use crate::backend::{BuiltinKind, ScalarKind};
 use crate::wal::into_engine_events;
 use crate::{catalog_helpers, ColumnId, TableId};
 
@@ -592,7 +592,7 @@ fn build_table_meta(pg_catalog: &ParserDB) -> Result<HashMap<String, TableMeta>,
                 ))
             })?;
             let column_name = column.column_name().to_string();
-            let scalar_kind = catalog_helpers::column_scalar_kind(pg_catalog, table_id, column_id);
+            let scalar_kind = catalog_helpers::column_builtin_kind(pg_catalog, table_id, column_id);
             let pg_type_oid = pg_type_oid_for_kind(scalar_kind);
             let is_pk = pk_cols.contains(&column_id);
             if is_pk {
@@ -629,7 +629,7 @@ const fn synth_oid(table_id: TableId) -> Oid {
 /// `pgoutput` relation message. The OID labels the column on the wire,
 /// while the engine decodes each cell against the catalog scalar kind.
 /// Unknown or composite columns fall back to `TEXT` (25).
-const fn pg_type_oid_for_kind(kind: Option<ScalarKind>) -> Oid {
+const fn pg_type_oid_for_kind(kind: Option<BuiltinKind>) -> Oid {
     match kind {
         Some(ScalarKind::Bool) => 16,
         Some(ScalarKind::Int) => 20,
