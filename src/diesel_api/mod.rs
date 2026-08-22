@@ -66,19 +66,28 @@ use crate::backend::{CdcEvent, Postgres, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::{IdTypes, RegisterError, RegisterResult, SubscriptionEngine, SubscriptionRequest};
 
-/// Postgres built-in scalar type OIDs (stable constants).
+/// Postgres built-in scalar type OIDs, as `diesel` itself declares them in
+/// `sql_types` (`#[diesel(postgres_type(oid = ...))]`).
 mod oid {
     pub const BOOL: u32 = 16;
+    pub const BYTEA: u32 = 17;
     pub const NAME: u32 = 19;
     pub const INT8: u32 = 20;
     pub const INT2: u32 = 21;
     pub const INT4: u32 = 23;
     pub const TEXT: u32 = 25;
+    pub const JSON: u32 = 114;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
     pub const BPCHAR: u32 = 1042;
     pub const VARCHAR: u32 = 1043;
+    pub const DATE: u32 = 1082;
+    pub const TIME: u32 = 1083;
+    pub const TIMESTAMP: u32 = 1114;
+    pub const TIMESTAMPTZ: u32 = 1184;
+    pub const NUMERIC: u32 = 1700;
     pub const UUID: u32 = 2950;
+    pub const JSONB: u32 = 3802;
 }
 
 /// A metadata lookup that resolves nothing. Built-in scalar Postgres types
@@ -290,13 +299,59 @@ fn decode_mysql_bind(
             })?;
             Value::String(s.to_string())
         }
+        T::Blob => Value::Bytes(mysql_from_sql::<
+            diesel::sql_types::Binary,
+            alloc::vec::Vec<u8>,
+        >(b, ty, "blob")?),
+        T::Numeric => Value::Decimal(mysql_from_sql::<
+            diesel::sql_types::Numeric,
+            bigdecimal::BigDecimal,
+        >(b, ty, "numeric")?),
+        T::Date => Value::Date(
+            mysql_from_sql::<diesel::sql_types::Date, chrono::NaiveDate>(b, ty, "date")?,
+        ),
+        T::Time => Value::Time(
+            mysql_from_sql::<diesel::sql_types::Time, chrono::NaiveTime>(b, ty, "time")?,
+        ),
+        T::DateTime => Value::Timestamp(mysql_from_sql::<
+            diesel::sql_types::Datetime,
+            chrono::NaiveDateTime,
+        >(b, ty, "datetime")?),
+        T::Timestamp => Value::Timestamp(mysql_from_sql::<
+            diesel::sql_types::Timestamp,
+            chrono::NaiveDateTime,
+        >(b, ty, "timestamp")?),
+        // MySQL has no JSON bind tag: a JSON column binds as `String` and the
+        // arm above reads it. `Bit` is the one tag today with no `Value`
+        // payload, and `MysqlType` is `#[non_exhaustive]`, so a tag diesel adds
+        // later lands here too and is refused by name rather than mis-decoded.
         other => {
             return Err(RegisterError::UnsupportedSql(format!(
-                "unsupported diesel MySQL bind type ({other:?}); only integer, float, text and enum/set are supported"
+                "unsupported diesel MySQL bind type ({other:?}); SubQL's `Value` has no payload \
+                 for it to become"
             )))
         }
     };
     Ok(value)
+}
+
+/// Read one MySQL client bind through diesel's `FromSql` for `T`.
+///
+/// The peer of [`pg_from_sql`], and for the same reason: diesel wrote the
+/// readers for the buffer shapes it also serializes, so a second reader here
+/// would only be a second place for the two to disagree. Notably the temporal
+/// tags carry diesel's `MysqlTime` struct rather than text or an integer.
+#[cfg(feature = "diesel-typed-mysql")]
+fn mysql_from_sql<ST, T>(
+    bytes: &[u8],
+    ty: diesel::mysql::MysqlType,
+    what: &str,
+) -> Result<T, RegisterError>
+where
+    T: FromSql<ST, diesel::mysql::Mysql>,
+{
+    T::from_sql(diesel::mysql::MysqlValue::new(bytes, ty))
+        .map_err(|e| RegisterError::UnsupportedSql(format!("diesel MySQL {what} bind: {e}")))
 }
 
 /// Read a native-endian MySQL integer bind of 1/2/4/8 bytes into an `i64`,
@@ -355,9 +410,37 @@ fn decode_pg_bind(bytes: Option<&[u8]>, type_oid: u32) -> Result<Value<Postgres>
         oid::UUID => Value::Uuid(pg_from_sql::<sql_types::Uuid, uuid::Uuid>(
             b, type_oid, "uuid",
         )?),
+        oid::BYTEA => Value::Bytes(pg_from_sql::<sql_types::Binary, alloc::vec::Vec<u8>>(
+            b, type_oid, "bytea",
+        )?),
+        oid::TIMESTAMP => Value::Timestamp(pg_from_sql::<
+            sql_types::Timestamp,
+            chrono::NaiveDateTime,
+        >(b, type_oid, "timestamp")?),
+        oid::TIMESTAMPTZ => Value::TimestampTz(pg_from_sql::<
+            sql_types::Timestamptz,
+            chrono::DateTime<chrono::Utc>,
+        >(b, type_oid, "timestamptz")?),
+        oid::DATE => Value::Date(pg_from_sql::<sql_types::Date, chrono::NaiveDate>(
+            b, type_oid, "date",
+        )?),
+        oid::TIME => Value::Time(pg_from_sql::<sql_types::Time, chrono::NaiveTime>(
+            b, type_oid, "time",
+        )?),
+        oid::NUMERIC => Value::Decimal(pg_from_sql::<sql_types::Numeric, bigdecimal::BigDecimal>(
+            b, type_oid, "numeric",
+        )?),
+        oid::JSON => Value::Json(pg_from_sql::<sql_types::Json, serde_json::Value>(
+            b, type_oid, "json",
+        )?),
+        oid::JSONB => Value::Jsonb(pg_from_sql::<sql_types::Jsonb, serde_json::Value>(
+            b, type_oid, "jsonb",
+        )?),
         other => {
             return Err(RegisterError::UnsupportedSql(format!(
-                "unsupported diesel bind type (Postgres OID {other}); only bool, integer, float, text and uuid are supported"
+                "unsupported diesel bind type (Postgres OID {other}); SubQL reads the scalar \
+                 types its own `Value` carries, so an array, a range, an interval, or a \
+                 user-declared enum, domain or composite has no `Value` variant to become"
             )))
         }
     };
@@ -469,11 +552,7 @@ impl FollowRowDecode for diesel::sqlite::Sqlite {
             }
             Some(SqliteType::Float | SqliteType::Double) => Value::Float(v.read_double()),
             Some(SqliteType::Text) => Value::String(v.read_text().to_string()),
-            Some(SqliteType::Binary) => {
-                return Err(RegisterError::UnsupportedSql(
-                    "unsupported SQLite BLOB in a followed row".to_string(),
-                ))
-            }
+            Some(SqliteType::Binary) => Value::Bytes(v.read_blob().to_vec()),
         })
     }
 }
@@ -634,13 +713,43 @@ mod tests {
         );
     }
 
+    /// A type with no `Value` variant to become is refused by OID, and the
+    /// refusal names the OID so the caller can look it up. Both examples are
+    /// types diesel itself can read: `interval` has a `FromSql` impl and
+    /// `bytea[]` is the array of a type subql does read, so what is missing is
+    /// subql's payload, not diesel's reader.
     #[test]
-    fn decode_unsupported_oid_errors() {
-        // 1700 = numeric
-        assert!(matches!(
-            decode_pg_bind(Some(&[0, 0]), 1700),
-            Err(RegisterError::UnsupportedSql(_))
-        ));
+    fn a_type_with_no_value_variant_is_refused_by_oid() {
+        for (type_oid, what) in [(1186_u32, "interval"), (1001, "bytea[]")] {
+            let refusal = decode_pg_bind(Some(&[0, 0, 0, 0]), type_oid);
+            let Err(RegisterError::UnsupportedSql(message)) = refusal else {
+                panic!("{what} (OID {type_oid}) should be refused, got {refusal:?}");
+            };
+            assert!(
+                message.contains(&alloc::format!("OID {type_oid}")),
+                "the refusal of {what} should name its OID, got {message:?}"
+            );
+        }
+    }
+
+    /// `numeric` used to be this file's example of an unsupported type. It is
+    /// read now, so the case that used to prove the refusal arm would pass for
+    /// the wrong reason: malformed bytes rather than an unknown OID.
+    #[test]
+    fn numeric_is_read_rather_than_refused() {
+        use core::str::FromStr;
+
+        let encoded = render_typed::<Pg, _>(
+            &diesel::dsl::sql::<sql_types::Bool>("")
+                .bind::<sql_types::Numeric, _>(bigdecimal::BigDecimal::from_str("-0.5").unwrap()),
+        )
+        .expect("render");
+        assert_eq!(
+            encoded.1,
+            alloc::vec![Value::<Postgres>::Decimal(
+                bigdecimal::BigDecimal::from_str("-0.5").unwrap()
+            )]
+        );
     }
 
     /// Every arm's decode, pinned across the value range and the boundaries
@@ -822,6 +931,79 @@ mod render_tests {
         }
     }
 
+    // Every payload `Value` carries that the Postgres decoder used to refuse.
+    diesel::table! {
+        readings (id) {
+            id -> Integer,
+            at -> Timestamp,
+            at_tz -> Timestamptz,
+            on_day -> Date,
+            at_time -> Time,
+            amount -> Numeric,
+            doc -> Json,
+            docb -> Jsonb,
+            raw -> Binary,
+        }
+    }
+
+    // `Datetime` is MySQL's own tag, distinct from `Timestamp`, so it needs its
+    // own column or the arm that reads it is never exercised.
+    #[cfg(feature = "diesel-typed-mysql")]
+    diesel::table! {
+        stamps (id) {
+            id -> Integer,
+            at_dt -> Datetime,
+        }
+    }
+
+    /// A bind of every remaining payload kind round trips: diesel's own
+    /// serializer writes the wire bytes, and the decoder reads them back into
+    /// the `Value` variant the catalog would name for that column. Hand-written
+    /// bytes would only pin subql's guess at each binary format.
+    #[test]
+    fn every_payload_kind_round_trips_through_a_bind() {
+        use bigdecimal::BigDecimal;
+        use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+        use core::str::FromStr;
+
+        let at = NaiveDate::from_ymd_opt(2026, 8, 22)
+            .unwrap()
+            .and_hms_micro_opt(13, 45, 6, 123_456)
+            .unwrap();
+        let at_tz: DateTime<Utc> = DateTime::from_naive_utc_and_offset(at, Utc);
+        let on_day = NaiveDate::from_ymd_opt(2026, 8, 22).unwrap();
+        let at_time = NaiveTime::from_hms_micro_opt(13, 45, 6, 123_456).unwrap();
+        let amount = BigDecimal::from_str("1234.5678").unwrap();
+        let doc = serde_json::json!({"a": 1});
+        let docb = serde_json::json!({"b": [true, null]});
+        let raw = alloc::vec![0_u8, 1, 2, 255];
+
+        let query = readings::table
+            .filter(readings::at.eq(at))
+            .filter(readings::at_tz.eq(at_tz))
+            .filter(readings::on_day.eq(on_day))
+            .filter(readings::at_time.eq(at_time))
+            .filter(readings::amount.eq(amount.clone()))
+            .filter(readings::doc.eq(doc.clone()))
+            .filter(readings::docb.eq(docb.clone()))
+            .filter(readings::raw.eq(raw.clone()));
+
+        let (_sql, binds) = render_typed::<Pg, _>(&query).expect("render");
+        assert_eq!(
+            binds,
+            alloc::vec![
+                Value::<Postgres>::Timestamp(at),
+                Value::TimestampTz(at_tz),
+                Value::Date(on_day),
+                Value::Time(at_time),
+                Value::Decimal(amount),
+                Value::Json(doc),
+                Value::Jsonb(docb),
+                Value::Bytes(raw),
+            ]
+        );
+    }
+
     #[test]
     fn render_select_with_binds() {
         let query = users::table
@@ -970,6 +1152,54 @@ mod render_tests {
                 Value::String("ann".into()),
                 Value::Int(1)
             ]
+        );
+    }
+
+    /// The MySQL peer of the Postgres round trip. The temporal tags carry
+    /// diesel's own `MysqlTime` struct rather than text or an integer, so
+    /// letting diesel write and read them is what keeps the two ends agreeing.
+    #[cfg(feature = "diesel-typed-mysql")]
+    #[test]
+    fn every_payload_kind_round_trips_through_a_mysql_bind() {
+        use bigdecimal::BigDecimal;
+        use chrono::{NaiveDate, NaiveTime};
+        use core::str::FromStr;
+        use diesel::mysql::Mysql;
+
+        let at = NaiveDate::from_ymd_opt(2026, 8, 22)
+            .unwrap()
+            .and_hms_opt(13, 45, 6)
+            .unwrap();
+        let on_day = NaiveDate::from_ymd_opt(2026, 8, 22).unwrap();
+        let at_time = NaiveTime::from_hms_opt(13, 45, 6).unwrap();
+        let amount = BigDecimal::from_str("1234.5678").unwrap();
+        let raw = alloc::vec![0_u8, 1, 2, 255];
+
+        let query = readings::table
+            .filter(readings::at.eq(at))
+            .filter(readings::on_day.eq(on_day))
+            .filter(readings::at_time.eq(at_time))
+            .filter(readings::amount.eq(amount.clone()))
+            .filter(readings::raw.eq(raw.clone()));
+
+        let (_sql, binds) = render_typed::<Mysql, _>(&query).expect("render mysql");
+        assert_eq!(
+            binds,
+            alloc::vec![
+                Value::<crate::backend::MySql>::Timestamp(at),
+                Value::Date(on_day),
+                Value::Time(at_time),
+                Value::Decimal(amount),
+                Value::Bytes(raw),
+            ]
+        );
+
+        // MySQL's own `Datetime` tag, which no `Timestamp` column reaches.
+        let (_sql, binds) = render_typed::<Mysql, _>(&stamps::table.filter(stamps::at_dt.eq(at)))
+            .expect("render mysql datetime");
+        assert_eq!(
+            binds,
+            alloc::vec![Value::<crate::backend::MySql>::Timestamp(at)]
         );
     }
 

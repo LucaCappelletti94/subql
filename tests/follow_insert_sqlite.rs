@@ -62,3 +62,46 @@ fn register_follow_insert_sqlite_decodes_minted_pk() {
 
     assert_ne!(ann[0].subscription_id, bob[0].subscription_id);
 }
+
+// A table keyed on a blob, so the returned field decodes through the `Binary`
+// arm of `FollowRowDecode for Sqlite`.
+diesel::table! {
+    docs (id) {
+        id -> Binary,
+        name -> Text,
+    }
+}
+
+/// A returned blob field decodes to `Value::Bytes`. SQLite's four storage
+/// classes are the whole universe a returned field can carry, and this is the
+/// one the row side used to refuse outright while the bind side already read
+/// it, so a blob-keyed table could be inserted into but never followed.
+#[test]
+fn register_follow_insert_sqlite_decodes_a_blob_key() {
+    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    diesel::sql_query("CREATE TABLE docs (id BLOB PRIMARY KEY, name TEXT)")
+        .execute(&mut conn)
+        .expect("CREATE TABLE docs");
+
+    let catalog =
+        ParserDB::parse::<SQLiteDialect>("CREATE TABLE docs (id BLOB PRIMARY KEY, name TEXT);")
+            .expect("catalog");
+    let mut engine =
+        SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, _>::new(catalog, SQLiteDialect {});
+
+    let key = vec![0_u8, 1, 2, 255];
+    let followed = engine
+        .register_follow_insert(
+            1,
+            diesel::insert_into(docs::table)
+                .values((docs::id.eq(key.clone()), docs::name.eq("spec"))),
+            &mut conn,
+        )
+        .expect("follow insert docs");
+    assert_eq!(followed.len(), 1);
+
+    let by_key = engine
+        .follow_row(1, "docs", vec![Value::Bytes(key)])
+        .expect("follow the same row by its blob key");
+    assert_eq!(followed[0].subscription_id, by_key.subscription_id);
+}

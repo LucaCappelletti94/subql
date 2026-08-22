@@ -541,6 +541,13 @@ diesel-typed = [
     "dep:diesel",
     "diesel?/postgres_backend",
     "diesel?/uuid",
+    # `Value` carries temporal, decimal and JSON payloads, so the decoders need
+    # diesel's readers for them. These add no crate to the graph: `Backend for
+    # Postgres` already names `chrono::NaiveDateTime`, `bigdecimal::BigDecimal`
+    # and `serde_json::Value` as its payload types.
+    "diesel?/chrono",
+    "diesel?/numeric",
+    "diesel?/serde_json",
     "diesel?/i-implement-a-third-party-backend-and-opt-into-breaking-changes",
 ]
 # Opt-in: extend the diesel-typed follow API to SQLite. Adds `FollowRowDecode for
