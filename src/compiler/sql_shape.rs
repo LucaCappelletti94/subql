@@ -3,8 +3,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, LimitClause, ObjectName, Query, Select, SelectItem,
+    SelectModifiers, SetExpr, Statement, TableFactor,
 };
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
@@ -672,48 +673,205 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
 
 /// The one `SELECT` a query reduces to, with the table it reads.
 ///
-/// This is SubQL's statement-shape rule: single table, no joins, no set
-/// operations, no derived tables. It is stated once and applied both to the
-/// subscription statement and to the inner query of a membership subquery, so
-/// the two cannot drift apart.
+/// This is SubQL's statement-shape rule: one table, and of the statement only
+/// the projection, that table, and the WHERE clause. A subscription is the
+/// rows of one table that satisfy one filter, delivered as they change, so
+/// every other clause asks a question no single change event can answer, and
+/// answering the reduced query instead is silent wrongness. Refusing is also
+/// what routes a statement upward: the re-execution wrapper triggers on
+/// [`RegisterError::UnsupportedSql`], so a clause accepted here is a clause no
+/// tier above can serve.
+///
+/// Stated once and applied both to the subscription statement and to the inner
+/// query of a membership subquery, so the two cannot drift apart.
 fn single_table_select(query: &Query) -> Result<(&Select, &ObjectName), RegisterError> {
-    match query.body.as_ref() {
-        SetExpr::Select(select) => {
-            if select.from.len() != 1 {
-                return Err(RegisterError::UnsupportedSql(
-                    "Exactly one table required (no joins)".to_string(),
-                ));
-            }
-
-            if !select.from[0].joins.is_empty() {
-                return Err(RegisterError::UnsupportedSql(
-                    "JOINs not supported - SubQL is for single-table CDC event filtering. \
-                     For multi-table queries, run this as a regular SQL query in your database."
-                        .to_string(),
-                ));
-            }
-
-            match &select.from[0].relation {
-                TableFactor::Table { name, .. } => Ok((select, name)),
-                _ => Err(RegisterError::UnsupportedSql(
-                    "Subqueries and derived tables not supported - SubQL is for single-table WHERE clauses. \
-                     Run this as a regular SQL query in your database instead."
-                        .to_string(),
-                )),
-            }
-        }
-        _ => Err(RegisterError::UnsupportedSql(
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(RegisterError::UnsupportedSql(
             "Set operations (UNION, INTERSECT, EXCEPT) not supported - SubQL is for single-table CDC event filtering. \
              For queries combining multiple result sets, run this as a regular SQL query in your database."
                 .to_string(),
-        )),
+        ));
+    };
+
+    if select.from.len() != 1 {
+        return Err(RegisterError::UnsupportedSql(
+            "Exactly one table required (no joins)".to_string(),
+        ));
     }
+
+    if !select.from[0].joins.is_empty() {
+        return Err(RegisterError::UnsupportedSql(
+            "JOINs not supported - SubQL is for single-table CDC event filtering. \
+             For multi-table queries, run this as a regular SQL query in your database."
+                .to_string(),
+        ));
+    }
+
+    let TableFactor::Table { name, .. } = &select.from[0].relation else {
+        return Err(RegisterError::UnsupportedSql(
+            "Subqueries and derived tables not supported - SubQL is for single-table WHERE clauses. \
+             Run this as a regular SQL query in your database."
+                .to_string(),
+        ));
+    };
+
+    check_served_clauses(query, select)?;
+
+    Ok((select, name))
+}
+
+/// Refuse every clause of `query` and `select` outside the projection, the
+/// table, and the WHERE clause.
+fn check_served_clauses(query: &Query, select: &Select) -> Result<(), RegisterError> {
+    // Destructured exhaustively, no `..`, on purpose: sqlparser is tracked by
+    // branch, so a clause it learns to parse arrives here as a compile error
+    // demanding a decision instead of as a silently dropped clause. sqlparser
+    // guards `SelectModifiers::is_any_set` the same way.
+    let Query {
+        with,
+        // Reduced to `select` by the caller.
+        body: _,
+        order_by,
+        limit_clause,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = query;
+
+    let Select {
+        // Span of the `SELECT` keyword, not a clause.
+        select_token: _,
+        optimizer_hints,
+        distinct,
+        select_modifiers,
+        top,
+        // Only meaningful alongside `top`, refused below.
+        top_before_distinct: _,
+        projection: _,
+        exclude,
+        into,
+        // Reduced to the one table by the caller.
+        from: _,
+        lateral_views,
+        prewhere,
+        selection: _,
+        connect_by,
+        group_by,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having,
+        named_window,
+        qualify,
+        // Only meaningful alongside `named_window` and `qualify`, both refused below.
+        window_before_qualify: _,
+        value_table_mode,
+        // `FROM t SELECT *` spells the same query as `SELECT * FROM t`.
+        flavor: _,
+    } = select;
+
+    let grouped = match group_by {
+        GroupByExpr::All(_) => true,
+        GroupByExpr::Expressions(exprs, modifiers) => !exprs.is_empty() || !modifiers.is_empty(),
+    };
+
+    // `SELECT ALL` asks for every row and no deduplication, which is the served
+    // shape spelled out, so only the deduplicating spellings are refused.
+    let deduplicating = match distinct {
+        None | Some(Distinct::All) => false,
+        Some(Distinct::Distinct | Distinct::On(_)) => true,
+    };
+
+    // Ordered most-written first. Later entries name clauses no backend's
+    // dialect here parses (ClickHouse, Hive, Snowflake, MSSQL, BigQuery), so no
+    // test reaches them: they are the decision the exhaustive destructuring
+    // demands, and refusing is the only safe one to make blind.
+    for (present, clause) in [
+        (with.is_some(), "WITH"),
+        (grouped, "GROUP BY"),
+        (having.is_some(), "HAVING"),
+        (deduplicating, "DISTINCT"),
+        (order_by.is_some(), "ORDER BY"),
+        (
+            limit_clause.is_some(),
+            limit_clause_name(limit_clause.as_ref()),
+        ),
+        (fetch.is_some(), "FETCH"),
+        (!locks.is_empty(), "FOR UPDATE / FOR SHARE"),
+        (for_clause.is_some(), "FOR XML / FOR JSON"),
+        (settings.is_some(), "SETTINGS"),
+        (format_clause.is_some(), "FORMAT"),
+        (!pipe_operators.is_empty(), "a pipe operator"),
+        (!optimizer_hints.is_empty(), "an optimizer hint"),
+        (
+            select_modifiers
+                .as_ref()
+                .is_some_and(SelectModifiers::is_any_set),
+            "a SELECT modifier",
+        ),
+        (top.is_some(), "TOP"),
+        (exclude.is_some(), "EXCLUDE"),
+        (into.is_some(), "INTO"),
+        (!lateral_views.is_empty(), "LATERAL VIEW"),
+        (prewhere.is_some(), "PREWHERE"),
+        (!connect_by.is_empty(), "CONNECT BY"),
+        (!cluster_by.is_empty(), "CLUSTER BY"),
+        (!distribute_by.is_empty(), "DISTRIBUTE BY"),
+        (!sort_by.is_empty(), "SORT BY"),
+        (!named_window.is_empty(), "WINDOW"),
+        (qualify.is_some(), "QUALIFY"),
+        (
+            value_table_mode.is_some(),
+            "SELECT AS VALUE / SELECT AS STRUCT",
+        ),
+    ] {
+        if present {
+            return Err(unserved_clause(clause));
+        }
+    }
+
+    Ok(())
+}
+
+/// Which part of a `LIMIT` clause the caller actually wrote, so the refusal
+/// quotes their own keyword.
+const fn limit_clause_name(limit: Option<&LimitClause>) -> &'static str {
+    match limit {
+        Some(LimitClause::LimitOffset {
+            limit: None,
+            offset,
+            limit_by,
+        }) => {
+            if offset.is_some() {
+                "OFFSET"
+            } else if limit_by.is_empty() {
+                "LIMIT"
+            } else {
+                "LIMIT BY"
+            }
+        }
+        None | Some(LimitClause::LimitOffset { .. } | LimitClause::OffsetCommaLimit { .. }) => {
+            "LIMIT"
+        }
+    }
+}
+
+/// Refuse a clause outside the shape SubQL serves.
+fn unserved_clause(clause: &str) -> RegisterError {
+    RegisterError::UnsupportedSql(format!(
+        "{clause} not supported - a SubQL subscription is the rows of one table that satisfy one \
+         WHERE clause, delivered as they change, and nothing else in a SELECT survives that \
+         reduction. Run this as a regular SQL query in your database."
+    ))
 }
 
 /// Extract the single table name and WHERE clause from a supported SELECT.
 ///
-/// This enforces SubQL's statement-shape constraints (single table, no joins,
-/// no set operations, no derived tables) so parser and canonicalizer stay in sync.
+/// This enforces SubQL's statement-shape constraints (see
+/// [`single_table_select`]) so parser and canonicalizer stay in sync.
 pub(super) fn extract_single_table_and_where(
     stmt: &Statement,
 ) -> Result<(ObjectName, Option<Expr>), RegisterError> {
@@ -860,15 +1018,6 @@ pub(super) fn contains_caller_comparison(expr: &Expr) -> bool {
 /// Whether the projected value is a column, and whether the relationship is one
 /// SubQL can serve, are not decided here.
 pub(super) fn check_membership_subquery_bound(query: &Query) -> Result<(), RegisterError> {
-    if query.with.is_some() {
-        return Err(RegisterError::UnsupportedSql(
-            "A membership subquery cannot contain another subquery. SubQL tracks one \
-             relationship for the subscription, and a WITH clause names another query it \
-             cannot follow."
-                .to_string(),
-        ));
-    }
-
     let (select, _) = single_table_select(query)?;
 
     match select.projection.as_slice() {
