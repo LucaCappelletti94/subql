@@ -13,13 +13,14 @@
 //! DSL: a statement whose column list is unknown until runtime is exactly the
 //! case the typed DSL cannot express, and is the case this code path exists to
 //! serve.
-#![cfg(feature = "diesel-typed-sqlite")]
+#![cfg(all(feature = "diesel-typed-sqlite", feature = "executor-diesel"))]
 #![allow(clippy::unwrap_used)]
 
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use subql::backend::{SQLite, Value};
 use subql::diesel_decode::DynamicRow;
+use subql::reexec::DieselConnector;
 
 fn conn() -> SqliteConnection {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
@@ -104,4 +105,108 @@ fn row_counts_follow_the_result() {
         .load(&mut conn)
         .expect("load no rows");
     assert!(none.is_empty());
+}
+
+/// The paged read: a budget stops the page, `more` says the result went on,
+/// and the column names survive. Driven through `DieselConnector`, whose
+/// declared backend deliberately differs from its connection's, which is the
+/// generality the scalar path always had and the row path now keeps.
+#[test]
+fn a_budget_stops_the_page_and_says_the_result_went_on() {
+    use subql::backend::Postgres;
+    use subql::reexec::{Connector, DieselConnector};
+
+    let mut setup = conn();
+    for id in 8..40 {
+        diesel::sql_query(format!(
+            "INSERT INTO readings VALUES ({id}, 'row{id}', 1.0, X'00', NULL)"
+        ))
+        .execute(&mut setup)
+        .expect("insert");
+    }
+    // A SQLite connection serving a Postgres-typed connector.
+    let connector: DieselConnector<SqliteConnection, Postgres> = DieselConnector::new(setup);
+
+    let first = connector
+        .read_page("SELECT id, label FROM readings ORDER BY id", 64, &())
+        .expect("first page");
+    assert!(first.value.more, "a 33-row result does not fit 64 bytes");
+    assert!(
+        !first.value.rows.is_empty() && first.value.rows.len() < 33,
+        "the budget should stop the page short, got {} rows",
+        first.value.rows.len()
+    );
+    assert_eq!(first.value.columns, vec!["id", "label"]);
+
+    // Resuming is the caller's job and it happens in the SQL, which is why the
+    // read needs no cursor: ask again past the last id seen.
+    let last = match first.value.rows.last().expect("a row")[0] {
+        Value::Int(id) => id,
+        ref other => panic!("id should decode as an integer, got {other:?}"),
+    };
+    let second = connector
+        .read_page(
+            &format!("SELECT id, label FROM readings WHERE id > {last} ORDER BY id"),
+            64,
+            &(),
+        )
+        .expect("second page");
+    assert!(
+        matches!(second.value.rows.first().map(|r| &r[0]), Some(Value::Int(id)) if *id > last),
+        "the second page starts after the first"
+    );
+}
+
+/// A budget too small for even one row still returns that row, because a page
+/// that returned nothing would make no progress and the caller would ask
+/// forever.
+#[test]
+fn a_row_larger_than_the_budget_still_makes_progress() {
+    let mut setup = conn();
+    diesel::sql_query("INSERT INTO readings VALUES (9, 'x', 1.0, X'00', NULL)")
+        .execute(&mut setup)
+        .expect("insert");
+    let connector: DieselConnector<SqliteConnection, subql::backend::Postgres> =
+        DieselConnector::new(setup);
+
+    let page = subql::reexec::Connector::read_page(
+        &connector,
+        "SELECT * FROM readings ORDER BY id",
+        1,
+        &(),
+    )
+    .expect("page");
+    assert_eq!(page.value.rows.len(), 1, "one row, never zero");
+    assert!(page.value.more, "and the result went on");
+}
+
+/// A whole result inside the budget reports no more pages, so a caller that
+/// trusted a full page would not make a wasted read.
+#[test]
+fn a_result_inside_the_budget_reports_no_more() {
+    let connector: DieselConnector<SqliteConnection, subql::backend::Postgres> =
+        DieselConnector::new(conn());
+    let page =
+        subql::reexec::Connector::read_page(&connector, "SELECT id FROM readings", 4096, &())
+            .expect("page");
+    assert_eq!(page.value.rows.len(), 1);
+    assert!(!page.value.more);
+}
+
+/// The cursor path is what keyless results need, and a connector that holds no
+/// cursors says so rather than pretending.
+#[test]
+fn a_connector_without_cursors_refuses_them_by_name() {
+    use subql::reexec::{Connector, CursorError, CursorId, DieselConnector};
+
+    let connector: DieselConnector<SqliteConnection, subql::backend::Postgres> =
+        DieselConnector::new(conn());
+    assert!(matches!(
+        connector.open_cursor("SELECT DISTINCT label FROM readings", &()),
+        Err(CursorError::Unsupported)
+    ));
+    assert!(matches!(
+        connector.close_cursor(CursorId(1)),
+        Err(CursorError::Unsupported)
+    ));
 }

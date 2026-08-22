@@ -13,24 +13,52 @@
 //! to disagree. What stays subql's own is the dispatch: which `Value` variant a
 //! tag becomes, and which tags have no variant and are refused.
 
-#[cfg(any(feature = "diesel-typed", feature = "executor-diesel-postgres"))]
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
 use crate::backend::Postgres;
 use crate::backend::Value;
 use crate::RegisterError;
 use alloc::format;
 use alloc::string::{String, ToString};
-#[cfg(any(feature = "diesel-typed", feature = "executor-diesel-postgres"))]
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
 use core::num::NonZeroU32;
 use diesel::backend::Backend;
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "diesel-typed-mysql",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
 use diesel::deserialize::FromSql;
-#[cfg(any(feature = "diesel-typed", feature = "executor-diesel-postgres"))]
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
 use diesel::pg::{Pg, PgValue};
-#[cfg(any(feature = "diesel-typed", feature = "executor-diesel-postgres"))]
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
 use diesel::sql_types;
 
 /// Postgres built-in scalar type OIDs, as `diesel` itself declares them in
 /// `sql_types` (`#[diesel(postgres_type(oid = ...))]`).
-#[cfg(any(feature = "diesel-typed", feature = "executor-diesel-postgres"))]
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
 pub mod oid {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
@@ -60,17 +88,15 @@ pub mod oid {
 /// `OwnedSqliteBindValue`.
 #[cfg(feature = "diesel-typed-sqlite")]
 #[must_use]
-pub fn owned_sqlite_to_value(
-    value: &diesel::sqlite::OwnedSqliteBindValue,
-) -> Value<crate::backend::SQLite> {
+pub fn owned_sqlite_canonical(value: &diesel::sqlite::OwnedSqliteBindValue) -> Canonical {
     use diesel::sqlite::OwnedSqliteBindValue as V;
     match value {
-        V::I32(i) => Value::Int(i64::from(*i)),
-        V::I64(i) => Value::Int(*i),
-        V::F64(f) => Value::Float(*f),
-        V::String(s) => Value::String(s.as_ref().to_string()),
-        V::Binary(b) => Value::Bytes(b.to_vec()),
-        V::Null => Value::Null,
+        V::I32(i) => Canonical::Int(i64::from(*i)),
+        V::I64(i) => Canonical::Int(*i),
+        V::F64(f) => Canonical::Float(*f),
+        V::String(s) => Canonical::Text(s.as_ref().to_string()),
+        V::Binary(b) => Canonical::Bytes(b.to_vec()),
+        V::Null => Canonical::Null,
     }
 }
 
@@ -79,49 +105,53 @@ pub fn owned_sqlite_to_value(
 /// The buffer is a native-endian client buffer, and `None` bytes are a SQL
 /// NULL. Integers read by their actual byte length, which also handles `bool`
 /// (serialized as a 4-byte `i32`).
-#[cfg(any(feature = "diesel-typed-mysql", feature = "executor-diesel-mysql"))]
-pub fn decode_mysql_bind(
+#[cfg(any(
+    feature = "diesel-typed-mysql",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
+pub fn mysql_canonical(
     bytes: Option<&[u8]>,
     ty: diesel::mysql::MysqlType,
-) -> Result<Value<crate::backend::MySql>, RegisterError> {
+) -> Result<Canonical, RegisterError> {
     use diesel::mysql::MysqlType as T;
     let Some(b) = bytes else {
-        return Ok(Value::Null);
+        return Ok(Canonical::Null);
     };
     let value = match ty {
-        T::Tiny | T::Short | T::Long | T::LongLong => Value::Int(mysql_int_ne(b, true)?),
+        T::Tiny | T::Short | T::Long | T::LongLong => Canonical::Int(mysql_int_ne(b, true)?),
         T::UnsignedTiny | T::UnsignedShort | T::UnsignedLong | T::UnsignedLongLong => {
-            Value::Int(mysql_int_ne(b, false)?)
+            Canonical::Int(mysql_int_ne(b, false)?)
         }
-        T::Float => Value::Float(f64::from(f32::from_ne_bytes(fixed(b, "mysql float")?))),
-        T::Double => Value::Float(f64::from_ne_bytes(fixed(b, "mysql double")?)),
+        T::Float => Canonical::Float(f64::from(f32::from_ne_bytes(fixed(b, "mysql float")?))),
+        T::Double => Canonical::Float(f64::from_ne_bytes(fixed(b, "mysql double")?)),
         T::String | T::Enum | T::Set => {
             let s = core::str::from_utf8(b).map_err(|_| {
                 RegisterError::UnsupportedSql(
                     "diesel MySQL text bind is not valid UTF-8".to_string(),
                 )
             })?;
-            Value::String(s.to_string())
+            Canonical::Text(s.to_string())
         }
-        T::Blob => Value::Bytes(mysql_from_sql::<
+        T::Blob => Canonical::Bytes(mysql_from_sql::<
             diesel::sql_types::Binary,
             alloc::vec::Vec<u8>,
         >(b, ty, "blob")?),
-        T::Numeric => Value::Decimal(mysql_from_sql::<
+        T::Numeric => Canonical::Decimal(mysql_from_sql::<
             diesel::sql_types::Numeric,
             bigdecimal::BigDecimal,
         >(b, ty, "numeric")?),
-        T::Date => Value::Date(
+        T::Date => Canonical::Date(
             mysql_from_sql::<diesel::sql_types::Date, chrono::NaiveDate>(b, ty, "date")?,
         ),
-        T::Time => Value::Time(
+        T::Time => Canonical::Time(
             mysql_from_sql::<diesel::sql_types::Time, chrono::NaiveTime>(b, ty, "time")?,
         ),
-        T::DateTime => Value::Timestamp(mysql_from_sql::<
+        T::DateTime => Canonical::Timestamp(mysql_from_sql::<
             diesel::sql_types::Datetime,
             chrono::NaiveDateTime,
         >(b, ty, "datetime")?),
-        T::Timestamp => Value::Timestamp(mysql_from_sql::<
+        T::Timestamp => Canonical::Timestamp(mysql_from_sql::<
             diesel::sql_types::Timestamp,
             chrono::NaiveDateTime,
         >(b, ty, "timestamp")?),
@@ -145,7 +175,11 @@ pub fn decode_mysql_bind(
 /// readers for the buffer shapes it also serializes, so a second reader here
 /// would only be a second place for the two to disagree. Notably the temporal
 /// tags carry diesel's `MysqlTime` struct rather than text or an integer.
-#[cfg(any(feature = "diesel-typed-mysql", feature = "executor-diesel-mysql"))]
+#[cfg(any(
+    feature = "diesel-typed-mysql",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
 fn mysql_from_sql<ST, T>(
     bytes: &[u8],
     ty: diesel::mysql::MysqlType,
@@ -160,7 +194,11 @@ where
 
 /// Read a native-endian MySQL integer bind of 1/2/4/8 bytes into an `i64`,
 /// interpreting the bytes as signed or unsigned per the `MysqlType`.
-#[cfg(any(feature = "diesel-typed-mysql", feature = "executor-diesel-mysql"))]
+#[cfg(any(
+    feature = "diesel-typed-mysql",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
 fn mysql_int_ne(b: &[u8], signed: bool) -> Result<i64, RegisterError> {
     Ok(match (b.len(), signed) {
         (1, true) => i64::from(i8::from_ne_bytes(fixed(b, "mysql tiny")?)),
@@ -189,59 +227,61 @@ fn mysql_int_ne(b: &[u8], signed: bool) -> Result<i64, RegisterError> {
 /// Rust type that OID means. Diesel wrote those binary readers for the wire
 /// format it also serializes, so re-implementing them here only added a second
 /// place for the two to disagree.
-#[cfg(any(feature = "diesel-typed", feature = "executor-diesel-postgres"))]
-pub fn decode_pg_bind(
-    bytes: Option<&[u8]>,
-    type_oid: u32,
-) -> Result<Value<Postgres>, RegisterError> {
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
+pub fn pg_canonical(bytes: Option<&[u8]>, type_oid: u32) -> Result<Canonical, RegisterError> {
     let Some(b) = bytes else {
-        return Ok(Value::Null);
+        return Ok(Canonical::Null);
     };
     let value = match type_oid {
-        oid::BOOL => Value::Bool(pg_from_sql::<sql_types::Bool, bool>(b, type_oid, "bool")?),
-        oid::INT2 => Value::Int(i64::from(pg_from_sql::<sql_types::SmallInt, i16>(
+        oid::BOOL => Canonical::Bool(pg_from_sql::<sql_types::Bool, bool>(b, type_oid, "bool")?),
+        oid::INT2 => Canonical::Int(i64::from(pg_from_sql::<sql_types::SmallInt, i16>(
             b, type_oid, "int2",
         )?)),
-        oid::INT4 => Value::Int(i64::from(pg_from_sql::<sql_types::Integer, i32>(
+        oid::INT4 => Canonical::Int(i64::from(pg_from_sql::<sql_types::Integer, i32>(
             b, type_oid, "int4",
         )?)),
-        oid::INT8 => Value::Int(pg_from_sql::<sql_types::BigInt, i64>(b, type_oid, "int8")?),
-        oid::FLOAT4 => Value::Float(f64::from(pg_from_sql::<sql_types::Float, f32>(
+        oid::INT8 => Canonical::Int(pg_from_sql::<sql_types::BigInt, i64>(b, type_oid, "int8")?),
+        oid::FLOAT4 => Canonical::Float(f64::from(pg_from_sql::<sql_types::Float, f32>(
             b, type_oid, "float4",
         )?)),
-        oid::FLOAT8 => Value::Float(pg_from_sql::<sql_types::Double, f64>(
+        oid::FLOAT8 => Canonical::Float(pg_from_sql::<sql_types::Double, f64>(
             b, type_oid, "float8",
         )?),
         oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME => {
-            Value::String(pg_from_sql::<sql_types::Text, String>(b, type_oid, "text")?)
+            Canonical::Text(pg_from_sql::<sql_types::Text, String>(b, type_oid, "text")?)
         }
-        oid::UUID => Value::Uuid(pg_from_sql::<sql_types::Uuid, uuid::Uuid>(
+        oid::UUID => Canonical::Uuid(pg_from_sql::<sql_types::Uuid, uuid::Uuid>(
             b, type_oid, "uuid",
         )?),
-        oid::BYTEA => Value::Bytes(pg_from_sql::<sql_types::Binary, alloc::vec::Vec<u8>>(
+        oid::BYTEA => Canonical::Bytes(pg_from_sql::<sql_types::Binary, alloc::vec::Vec<u8>>(
             b, type_oid, "bytea",
         )?),
-        oid::TIMESTAMP => Value::Timestamp(pg_from_sql::<
+        oid::TIMESTAMP => Canonical::Timestamp(pg_from_sql::<
             sql_types::Timestamp,
             chrono::NaiveDateTime,
         >(b, type_oid, "timestamp")?),
-        oid::TIMESTAMPTZ => Value::TimestampTz(pg_from_sql::<
+        oid::TIMESTAMPTZ => Canonical::TimestampTz(pg_from_sql::<
             sql_types::Timestamptz,
             chrono::DateTime<chrono::Utc>,
         >(b, type_oid, "timestamptz")?),
-        oid::DATE => Value::Date(pg_from_sql::<sql_types::Date, chrono::NaiveDate>(
+        oid::DATE => Canonical::Date(pg_from_sql::<sql_types::Date, chrono::NaiveDate>(
             b, type_oid, "date",
         )?),
-        oid::TIME => Value::Time(pg_from_sql::<sql_types::Time, chrono::NaiveTime>(
+        oid::TIME => Canonical::Time(pg_from_sql::<sql_types::Time, chrono::NaiveTime>(
             b, type_oid, "time",
         )?),
-        oid::NUMERIC => Value::Decimal(pg_from_sql::<sql_types::Numeric, bigdecimal::BigDecimal>(
-            b, type_oid, "numeric",
-        )?),
-        oid::JSON => Value::Json(pg_from_sql::<sql_types::Json, serde_json::Value>(
+        oid::NUMERIC => Canonical::Decimal(pg_from_sql::<
+            sql_types::Numeric,
+            bigdecimal::BigDecimal,
+        >(b, type_oid, "numeric")?),
+        oid::JSON => Canonical::Json(pg_from_sql::<sql_types::Json, serde_json::Value>(
             b, type_oid, "json",
         )?),
-        oid::JSONB => Value::Jsonb(pg_from_sql::<sql_types::Jsonb, serde_json::Value>(
+        oid::JSONB => Canonical::Jsonb(pg_from_sql::<sql_types::Jsonb, serde_json::Value>(
             b, type_oid, "jsonb",
         )?),
         other => {
@@ -259,7 +299,11 @@ pub fn decode_pg_bind(
 ///
 /// `ty` names the arm in the error, since diesel's own message describes the
 /// Rust type it was decoding rather than the bind that carried it.
-#[cfg(any(feature = "diesel-typed", feature = "executor-diesel-postgres"))]
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
 fn pg_from_sql<ST, T: FromSql<ST, Pg>>(
     bytes: &[u8],
     type_oid: u32,
@@ -281,61 +325,6 @@ pub fn fixed<const N: usize>(b: &[u8], ty: &str) -> Result<[u8; N], RegisterErro
     b.try_into().map_err(|_| bad_len(ty, b.len()))
 }
 
-/// Decode a column value returned by an executed query into a
-/// `Value<B>`, per backend.
-///
-/// Lets an `INSERT ... RETURNING` row be read without a compile-time row
-/// struct.
-pub trait FollowRowDecode: Backend {
-    /// The subql [`crate::backend::Backend`] whose [`Value`] shape this
-    /// diesel backend's returned fields decode to.
-    type SubqlBackend: crate::backend::Backend;
-
-    /// Decode one field's raw value (or SQL NULL) into a
-    /// `Value<Self::SubqlBackend>`.
-    ///
-    /// # Errors
-    /// [`RegisterError::UnsupportedSql`] for a column type outside the
-    /// supported scalar set.
-    fn field_to_value(
-        value: Option<Self::RawValue<'_>>,
-    ) -> Result<Value<Self::SubqlBackend>, RegisterError>;
-}
-
-#[cfg(any(feature = "diesel-typed", feature = "executor-diesel-postgres"))]
-impl FollowRowDecode for Pg {
-    type SubqlBackend = Postgres;
-
-    fn field_to_value(value: Option<PgValue<'_>>) -> Result<Value<Postgres>, RegisterError> {
-        value.map_or(Ok(Value::Null), |v| {
-            decode_pg_bind(Some(v.as_bytes()), v.get_oid().get())
-        })
-    }
-}
-
-#[cfg(feature = "diesel-typed-sqlite")]
-impl FollowRowDecode for diesel::sqlite::Sqlite {
-    type SubqlBackend = crate::backend::SQLite;
-
-    fn field_to_value(
-        value: Option<Self::RawValue<'_>>,
-    ) -> Result<Value<crate::backend::SQLite>, RegisterError> {
-        use diesel::sqlite::SqliteType;
-        let Some(mut v) = value else {
-            return Ok(Value::Null);
-        };
-        Ok(match v.value_type() {
-            None => Value::Null,
-            Some(SqliteType::SmallInt | SqliteType::Integer | SqliteType::Long) => {
-                Value::Int(v.read_long())
-            }
-            Some(SqliteType::Float | SqliteType::Double) => Value::Float(v.read_double()),
-            Some(SqliteType::Text) => Value::String(v.read_text().to_string()),
-            Some(SqliteType::Binary) => Value::Bytes(v.read_blob().to_vec()),
-        })
-    }
-}
-
 /// One row of a result whose shape is not known at compile time, decoded
 /// column by column.
 ///
@@ -351,9 +340,10 @@ pub struct DynamicRow<B: crate::backend::Backend> {
     pub values: alloc::vec::Vec<Value<B>>,
 }
 
-impl<DB> diesel::deserialize::QueryableByName<DB> for DynamicRow<DB::SubqlBackend>
+impl<DB, B> diesel::deserialize::QueryableByName<DB> for DynamicRow<B>
 where
-    DB: FollowRowDecode,
+    DB: RowFieldDecode,
+    B: SpellCanonical,
 {
     fn build<'a>(row: &impl diesel::row::NamedRow<'a, DB>) -> diesel::deserialize::Result<Self> {
         use diesel::row::{Field, Row};
@@ -368,11 +358,14 @@ where
                 ))
             })?;
             columns.push(field.field_name().unwrap_or_default().to_string());
-            values.push(DB::field_to_value(field.value()).map_err(|e| {
+            // Reading is the connection's job, spelling is the declared
+            // backend's, which is what lets the two differ.
+            let canonical = DB::field_to_canonical(field.value()).map_err(|e| {
                 alloc::boxed::Box::<dyn core::error::Error + Send + Sync>::from(alloc::format!(
                     "{e}"
                 ))
-            })?);
+            })?;
+            values.push(B::value_from_canonical(canonical));
         }
         Ok(Self { columns, values })
     }
@@ -385,26 +378,26 @@ mod tests {
 
     #[test]
     fn decode_scalars() {
-        assert_eq!(decode_pg_bind(None, oid::INT4).unwrap(), Value::Null);
+        assert_eq!(pg_canonical(None, oid::INT4).unwrap(), Canonical::Null);
         assert_eq!(
-            decode_pg_bind(Some(&5i32.to_be_bytes()), oid::INT4).unwrap(),
-            Value::Int(5)
+            pg_canonical(Some(&5i32.to_be_bytes()), oid::INT4).unwrap(),
+            Canonical::Int(5)
         );
         assert_eq!(
-            decode_pg_bind(Some(&(-7i64).to_be_bytes()), oid::INT8).unwrap(),
-            Value::Int(-7)
+            pg_canonical(Some(&(-7i64).to_be_bytes()), oid::INT8).unwrap(),
+            Canonical::Int(-7)
         );
         assert_eq!(
-            decode_pg_bind(Some(&3.5f64.to_be_bytes()), oid::FLOAT8).unwrap(),
-            Value::Float(3.5)
+            pg_canonical(Some(&3.5f64.to_be_bytes()), oid::FLOAT8).unwrap(),
+            Canonical::Float(3.5)
         );
         assert_eq!(
-            decode_pg_bind(Some(&[1]), oid::BOOL).unwrap(),
-            Value::Bool(true)
+            pg_canonical(Some(&[1]), oid::BOOL).unwrap(),
+            Canonical::Bool(true)
         );
         assert_eq!(
-            decode_pg_bind(Some(b"hello"), oid::TEXT).unwrap(),
-            Value::String("hello".into())
+            pg_canonical(Some(b"hello"), oid::TEXT).unwrap(),
+            Canonical::Text("hello".into())
         );
     }
 
@@ -415,8 +408,8 @@ mod tests {
             0x00, 0x00,
         ];
         assert_eq!(
-            decode_pg_bind(Some(&bytes), oid::UUID).unwrap(),
-            Value::Uuid(uuid::Uuid::from_bytes(bytes))
+            pg_canonical(Some(&bytes), oid::UUID).unwrap(),
+            Canonical::Uuid(uuid::Uuid::from_bytes(bytes))
         );
     }
 
@@ -428,7 +421,7 @@ mod tests {
     #[test]
     fn a_type_with_no_value_variant_is_refused_by_oid() {
         for (type_oid, what) in [(1186_u32, "interval"), (1001, "bytea[]")] {
-            let refusal = decode_pg_bind(Some(&[0, 0, 0, 0]), type_oid);
+            let refusal = pg_canonical(Some(&[0, 0, 0, 0]), type_oid);
             let Err(RegisterError::UnsupportedSql(message)) = refusal else {
                 panic!("{what} (OID {type_oid}) should be refused, got {refusal:?}");
             };
@@ -446,62 +439,62 @@ mod tests {
     #[test]
     fn decode_bool_reads_the_first_byte() {
         assert_eq!(
-            decode_pg_bind(Some(&[0]), oid::BOOL).unwrap(),
-            Value::Bool(false)
+            pg_canonical(Some(&[0]), oid::BOOL).unwrap(),
+            Canonical::Bool(false)
         );
         assert_eq!(
-            decode_pg_bind(Some(&[1]), oid::BOOL).unwrap(),
-            Value::Bool(true)
+            pg_canonical(Some(&[1]), oid::BOOL).unwrap(),
+            Canonical::Bool(true)
         );
         // Any nonzero byte is true, and an empty buffer has no answer.
         assert_eq!(
-            decode_pg_bind(Some(&[2]), oid::BOOL).unwrap(),
-            Value::Bool(true)
+            pg_canonical(Some(&[2]), oid::BOOL).unwrap(),
+            Canonical::Bool(true)
         );
-        assert!(decode_pg_bind(Some(&[]), oid::BOOL).is_err());
+        assert!(pg_canonical(Some(&[]), oid::BOOL).is_err());
     }
 
     #[test]
     fn decode_integers_span_their_range() {
         for v in [0i16, -1, i16::MIN, i16::MAX] {
             assert_eq!(
-                decode_pg_bind(Some(&v.to_be_bytes()), oid::INT2).unwrap(),
-                Value::Int(i64::from(v)),
+                pg_canonical(Some(&v.to_be_bytes()), oid::INT2).unwrap(),
+                Canonical::Int(i64::from(v)),
                 "int2 {v}"
             );
         }
         for v in [0i32, -1, i32::MIN, i32::MAX] {
             assert_eq!(
-                decode_pg_bind(Some(&v.to_be_bytes()), oid::INT4).unwrap(),
-                Value::Int(i64::from(v)),
+                pg_canonical(Some(&v.to_be_bytes()), oid::INT4).unwrap(),
+                Canonical::Int(i64::from(v)),
                 "int4 {v}"
             );
         }
         for v in [0i64, -1, i64::MIN, i64::MAX] {
             assert_eq!(
-                decode_pg_bind(Some(&v.to_be_bytes()), oid::INT8).unwrap(),
-                Value::Int(v),
+                pg_canonical(Some(&v.to_be_bytes()), oid::INT8).unwrap(),
+                Canonical::Int(v),
                 "int8 {v}"
             );
         }
         // An integer arm reads its own width and refuses any other.
-        assert!(decode_pg_bind(Some(&[0]), oid::INT2).is_err());
-        assert!(decode_pg_bind(Some(&0i64.to_be_bytes()), oid::INT2).is_err());
-        assert!(decode_pg_bind(Some(&0i16.to_be_bytes()), oid::INT4).is_err());
-        assert!(decode_pg_bind(Some(&0i32.to_be_bytes()), oid::INT8).is_err());
+        assert!(pg_canonical(Some(&[0]), oid::INT2).is_err());
+        assert!(pg_canonical(Some(&0i64.to_be_bytes()), oid::INT2).is_err());
+        assert!(pg_canonical(Some(&0i16.to_be_bytes()), oid::INT4).is_err());
+        assert!(pg_canonical(Some(&0i32.to_be_bytes()), oid::INT8).is_err());
     }
 
     #[test]
     fn decode_floats_keep_their_bits() {
         for v in [0.0f32, -0.0, 1.5, -1.5, f32::MIN, f32::MAX, f32::EPSILON] {
-            let Value::Float(got) = decode_pg_bind(Some(&v.to_be_bytes()), oid::FLOAT4).unwrap()
+            let Canonical::Float(got) = pg_canonical(Some(&v.to_be_bytes()), oid::FLOAT4).unwrap()
             else {
                 panic!("float4 {v} decodes as a float")
             };
             assert_eq!(got.to_bits(), f64::from(v).to_bits(), "float4 {v}");
         }
         for v in [0.0f64, -0.0, 1.5, -1.5, f64::MIN, f64::MAX, f64::EPSILON] {
-            let Value::Float(got) = decode_pg_bind(Some(&v.to_be_bytes()), oid::FLOAT8).unwrap()
+            let Canonical::Float(got) = pg_canonical(Some(&v.to_be_bytes()), oid::FLOAT8).unwrap()
             else {
                 panic!("float8 {v} decodes as a float")
             };
@@ -512,7 +505,7 @@ mod tests {
             (f32::NAN.to_be_bytes().to_vec(), oid::FLOAT4),
             (f64::NAN.to_be_bytes().to_vec(), oid::FLOAT8),
         ] {
-            let Value::Float(got) = decode_pg_bind(Some(&bytes), oid).unwrap() else {
+            let Canonical::Float(got) = pg_canonical(Some(&bytes), oid).unwrap() else {
                 panic!("NaN decodes as a float")
             };
             assert!(got.is_nan());
@@ -532,30 +525,30 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                decode_pg_bind(Some(&bytes), oid).unwrap(),
-                Value::Float(f64::INFINITY * sign)
+                pg_canonical(Some(&bytes), oid).unwrap(),
+                Canonical::Float(f64::INFINITY * sign)
             );
         }
-        assert!(decode_pg_bind(Some(&[0, 0]), oid::FLOAT4).is_err());
-        assert!(decode_pg_bind(Some(&[0, 0, 0, 0]), oid::FLOAT8).is_err());
+        assert!(pg_canonical(Some(&[0, 0]), oid::FLOAT4).is_err());
+        assert!(pg_canonical(Some(&[0, 0, 0, 0]), oid::FLOAT8).is_err());
     }
 
     #[test]
     fn decode_text_covers_every_text_oid() {
         for oid in [oid::TEXT, oid::VARCHAR, oid::BPCHAR, oid::NAME] {
             assert_eq!(
-                decode_pg_bind(Some(b""), oid).unwrap(),
-                Value::String(String::new()),
+                pg_canonical(Some(b""), oid).unwrap(),
+                Canonical::Text(String::new()),
                 "empty text under oid {oid}"
             );
             assert_eq!(
-                decode_pg_bind(Some("héllo".as_bytes()), oid).unwrap(),
-                Value::String("héllo".to_string()),
+                pg_canonical(Some("héllo".as_bytes()), oid).unwrap(),
+                Canonical::Text("héllo".to_string()),
                 "text under oid {oid}"
             );
             // A lone continuation byte is not UTF-8.
             assert!(
-                decode_pg_bind(Some(&[0x80]), oid).is_err(),
+                pg_canonical(Some(&[0x80]), oid).is_err(),
                 "invalid utf-8 under oid {oid}"
             );
         }
@@ -565,12 +558,12 @@ mod tests {
     fn decode_uuid_spans_the_boundaries() {
         for bytes in [[0x00u8; 16], [0xff; 16]] {
             assert_eq!(
-                decode_pg_bind(Some(&bytes), oid::UUID).unwrap(),
-                Value::Uuid(uuid::Uuid::from_bytes(bytes))
+                pg_canonical(Some(&bytes), oid::UUID).unwrap(),
+                Canonical::Uuid(uuid::Uuid::from_bytes(bytes))
             );
         }
-        assert!(decode_pg_bind(Some(&[0u8; 15]), oid::UUID).is_err());
-        assert!(decode_pg_bind(Some(&[0u8; 17]), oid::UUID).is_err());
+        assert!(pg_canonical(Some(&[0u8; 15]), oid::UUID).is_err());
+        assert!(pg_canonical(Some(&[0u8; 17]), oid::UUID).is_err());
     }
 
     /// A NULL bind carries no bytes whatever type it was declared as.
@@ -586,7 +579,195 @@ mod tests {
             oid::TEXT,
             oid::UUID,
         ] {
-            assert_eq!(decode_pg_bind(None, oid).unwrap(), Value::Null, "oid {oid}");
+            assert_eq!(
+                pg_canonical(None, oid).unwrap(),
+                Canonical::Null,
+                "oid {oid}"
+            );
         }
+    }
+}
+
+/// A field's value in its canonical Rust spelling, before any backend spells it.
+///
+/// The row path's counterpart to the scalar path's `i64` / `f64` / `String`:
+/// reading a raw field is the connection's job and produces one of these,
+/// turning it into a [`Value<B>`] is `B`'s job. Keeping those apart is what lets
+/// a connector declare a backend that differs from its connection's, which the
+/// scalar path has always allowed.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[non_exhaustive]
+pub enum Canonical {
+    /// SQL NULL.
+    Null,
+    /// A boolean.
+    Bool(bool),
+    /// An integer, widened to the largest the wire carries.
+    Int(i64),
+    /// A floating-point number, widened to double.
+    Float(f64),
+    /// Text.
+    Text(String),
+    /// Raw bytes.
+    Bytes(alloc::vec::Vec<u8>),
+    /// A UUID.
+    Uuid(uuid::Uuid),
+    /// A timestamp with no zone.
+    Timestamp(chrono::NaiveDateTime),
+    /// A timestamp in UTC.
+    TimestampTz(chrono::DateTime<chrono::Utc>),
+    /// A calendar date.
+    Date(chrono::NaiveDate),
+    /// A time of day.
+    Time(chrono::NaiveTime),
+    /// An exact decimal.
+    Decimal(bigdecimal::BigDecimal),
+    /// A JSON document.
+    Json(serde_json::Value),
+    /// A binary JSON document.
+    Jsonb(serde_json::Value),
+}
+
+/// Read one column of a returned row, without choosing who spells it.
+///
+/// Implemented per diesel backend. The result is a [`Canonical`], so the same
+/// read serves any subql backend the caller declares, exactly as the scalar
+/// path's `i64` / `f64` / `String` do.
+pub trait RowFieldDecode: Backend {
+    /// Read one field's raw value, or a SQL NULL, into its canonical spelling.
+    ///
+    /// # Errors
+    /// [`RegisterError::UnsupportedSql`] when the column's type has no
+    /// canonical spelling, which means subql carries no payload for it.
+    fn field_to_canonical(value: Option<Self::RawValue<'_>>) -> Result<Canonical, RegisterError>;
+}
+
+/// Spell a [`Canonical`] as this backend's own [`Value`].
+///
+/// The row path's peer of the scalar path's `value_from_i64` and friends, and
+/// the half of decoding that belongs to the backend a caller declared rather
+/// than to the connection it read through. A backend that spells a payload
+/// differently says so here once: SQLite has no boolean or uuid storage class,
+/// so both arrive as the shape it does carry.
+pub trait SpellCanonical: crate::backend::Backend + Sized {
+    /// Turn a canonical field value into this backend's `Value`.
+    fn value_from_canonical(value: Canonical) -> Value<Self>;
+}
+
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
+impl SpellCanonical for Postgres {
+    fn value_from_canonical(value: Canonical) -> Value<Self> {
+        match value {
+            Canonical::Bool(b) => Value::Bool(b),
+            Canonical::Uuid(u) => Value::Uuid(u),
+            Canonical::Null => Value::Null,
+            Canonical::Int(i) => Value::Int(i),
+            Canonical::Float(f) => Value::Float(f),
+            Canonical::Text(s) => Value::String(s),
+            Canonical::Bytes(b) => Value::Bytes(b),
+            Canonical::Timestamp(t) => Value::Timestamp(t),
+            Canonical::TimestampTz(t) => Value::TimestampTz(t),
+            Canonical::Date(d) => Value::Date(d),
+            Canonical::Time(t) => Value::Time(t),
+            Canonical::Decimal(d) => Value::Decimal(d),
+            Canonical::Json(j) => Value::Json(j),
+            Canonical::Jsonb(j) => Value::Jsonb(j),
+        }
+    }
+}
+
+impl SpellCanonical for crate::backend::MySql {
+    fn value_from_canonical(value: Canonical) -> Value<Self> {
+        match value {
+            Canonical::Bool(b) => Value::Bool(b),
+            Canonical::Null => Value::Null,
+            Canonical::Int(i) => Value::Int(i),
+            Canonical::Float(f) => Value::Float(f),
+            Canonical::Text(s) => Value::String(s),
+            Canonical::Bytes(b) => Value::Bytes(b),
+            Canonical::Timestamp(t) => Value::Timestamp(t),
+            Canonical::TimestampTz(t) => Value::TimestampTz(t),
+            Canonical::Date(d) => Value::Date(d),
+            Canonical::Time(t) => Value::Time(t),
+            Canonical::Decimal(d) => Value::Decimal(d),
+            Canonical::Json(j) => Value::Json(j),
+            Canonical::Jsonb(j) => Value::Jsonb(j),
+            // MySQL stores a UUID as CHAR(36) or BINARY(16), never natively, so
+            // the backend spells it as the text it carries on the wire.
+            Canonical::Uuid(u) => Value::Uuid(u.to_string()),
+        }
+    }
+}
+
+impl SpellCanonical for crate::backend::SQLite {
+    fn value_from_canonical(value: Canonical) -> Value<Self> {
+        match value {
+            // SQLite has no boolean storage class: the column contract is 0/1
+            // in an INTEGER, so the backend surfaces the wire shape honestly.
+            Canonical::Bool(b) => Value::Bool(i64::from(b)),
+            Canonical::Uuid(u) => Value::Uuid(u.to_string()),
+            Canonical::Null => Value::Null,
+            Canonical::Int(i) => Value::Int(i),
+            Canonical::Float(f) => Value::Float(f),
+            Canonical::Text(s) => Value::String(s),
+            Canonical::Bytes(b) => Value::Bytes(b),
+            Canonical::Timestamp(t) => Value::Timestamp(t),
+            Canonical::TimestampTz(t) => Value::TimestampTz(t),
+            Canonical::Date(d) => Value::Date(d),
+            Canonical::Time(t) => Value::Time(t),
+            Canonical::Decimal(d) => Value::Decimal(d),
+            Canonical::Json(j) => Value::Json(j),
+            Canonical::Jsonb(j) => Value::Jsonb(j),
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "diesel-typed",
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
+impl RowFieldDecode for Pg {
+    fn field_to_canonical(value: Option<PgValue<'_>>) -> Result<Canonical, RegisterError> {
+        value.map_or(Ok(Canonical::Null), |v| {
+            pg_canonical(Some(v.as_bytes()), v.get_oid().get())
+        })
+    }
+}
+
+#[cfg(feature = "diesel-typed-sqlite")]
+impl RowFieldDecode for diesel::sqlite::Sqlite {
+    fn field_to_canonical(value: Option<Self::RawValue<'_>>) -> Result<Canonical, RegisterError> {
+        use diesel::sqlite::SqliteType;
+        let Some(mut v) = value else {
+            return Ok(Canonical::Null);
+        };
+        Ok(match v.value_type() {
+            None => Canonical::Null,
+            Some(SqliteType::SmallInt | SqliteType::Integer | SqliteType::Long) => {
+                Canonical::Int(v.read_long())
+            }
+            Some(SqliteType::Float | SqliteType::Double) => Canonical::Float(v.read_double()),
+            Some(SqliteType::Text) => Canonical::Text(v.read_text().to_string()),
+            Some(SqliteType::Binary) => Canonical::Bytes(v.read_blob().to_vec()),
+        })
+    }
+}
+
+#[cfg(any(
+    feature = "diesel-typed-mysql",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
+impl RowFieldDecode for diesel::mysql::Mysql {
+    fn field_to_canonical(value: Option<Self::RawValue<'_>>) -> Result<Canonical, RegisterError> {
+        value.map_or(Ok(Canonical::Null), |v| {
+            mysql_canonical(Some(v.as_bytes()), v.value_type())
+        })
     }
 }

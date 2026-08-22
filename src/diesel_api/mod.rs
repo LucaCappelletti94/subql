@@ -62,11 +62,11 @@ use sql_traits::prelude::DatabaseLike;
 use crate::backend::{CdcEvent, Postgres, Value};
 use crate::compiler::literals::SqlLiteralParse;
 #[cfg(feature = "diesel-typed-mysql")]
-use crate::diesel_decode::decode_mysql_bind;
-use crate::diesel_decode::decode_pg_bind;
+use crate::diesel_decode::mysql_canonical;
 #[cfg(feature = "diesel-typed-sqlite")]
-use crate::diesel_decode::owned_sqlite_to_value;
-use crate::diesel_decode::FollowRowDecode;
+use crate::diesel_decode::owned_sqlite_canonical;
+use crate::diesel_decode::pg_canonical;
+use crate::diesel_decode::{RowFieldDecode, SpellCanonical};
 use crate::{IdTypes, RegisterError, RegisterResult, SubscriptionEngine, SubscriptionRequest};
 
 /// A metadata lookup that resolves nothing. Built-in scalar Postgres types
@@ -128,7 +128,7 @@ where
 /// [`crate::backend::Backend`] to type the values against. The bind
 /// side is backend-specific: Postgres decodes the binary wire format
 /// by OID, SQLite reads its typed bind values. This is the input-side
-/// counterpart to [`FollowRowDecode`], which decodes the values an
+/// counterpart to [`RowFieldDecode`], which reads the values an
 /// executed query hands back.
 pub trait BindDecode: Backend {
     /// The subql [`crate::backend::Backend`] whose [`Value`] shape this
@@ -169,7 +169,10 @@ impl BindDecode for Pg {
             let type_oid = meta.oid().map_err(|_| {
                 RegisterError::UnsupportedSql("diesel bind has an unresolved type OID".to_string())
             })?;
-            values.push(decode_pg_bind(bytes.as_deref(), type_oid)?);
+            values.push(Postgres::value_from_canonical(pg_canonical(
+                bytes.as_deref(),
+                type_oid,
+            )?));
         }
         Ok((sql, values))
     }
@@ -199,7 +202,9 @@ impl BindDecode for diesel::sqlite::Sqlite {
         let data = collector.moveable();
         let mut values = Vec::with_capacity(data.binds().len());
         for (value, _ty) in data.binds() {
-            values.push(owned_sqlite_to_value(value));
+            values.push(crate::backend::SQLite::value_from_canonical(
+                owned_sqlite_canonical(value),
+            ));
         }
         Ok((sql, values))
     }
@@ -225,7 +230,9 @@ impl BindDecode for diesel::mysql::Mysql {
             })?;
         let mut values = Vec::with_capacity(collector.binds.len());
         for (bytes, meta) in collector.binds.iter().zip(collector.metadata.iter()) {
-            values.push(decode_mysql_bind(bytes.as_deref(), *meta)?);
+            values.push(crate::backend::MySql::value_from_canonical(
+                mysql_canonical(bytes.as_deref(), *meta)?,
+            ));
         }
         Ok((sql, values))
     }
@@ -332,7 +339,8 @@ where
     ) -> Result<alloc::vec::Vec<RegisterResult>, FollowInsertError>
     where
         C: LoadConnection<DefaultLoadingMode>,
-        C::Backend: FollowRowDecode<SubqlBackend = E::Backend>
+        E::Backend: SpellCanonical,
+        C::Backend: RowFieldDecode
             + Default
             + QueryMetadata<<PkReturningInsert<T, U, Op> as Query>::SqlType>,
         <C::Backend as Backend>::QueryBuilder: Default,
@@ -353,10 +361,10 @@ where
                 let mut values = alloc::vec::Vec::with_capacity(n);
                 for i in 0..n {
                     let value = match row.get(i) {
-                        Some(field) => {
-                            <C::Backend as FollowRowDecode>::field_to_value(field.value())
-                                .map_err(FollowInsertError::Register)?
-                        }
+                        Some(field) => E::Backend::value_from_canonical(
+                            <C::Backend as RowFieldDecode>::field_to_canonical(field.value())
+                                .map_err(FollowInsertError::Register)?,
+                        ),
                         None => Value::Null,
                     };
                     values.push(value);
@@ -811,24 +819,25 @@ mod render_tests {
     /// (empty included) rather than being rejected.
     #[cfg(feature = "diesel-typed-sqlite")]
     #[test]
-    fn owned_sqlite_to_value_covers_all_variants() {
-        use super::owned_sqlite_to_value;
-        use crate::backend::SQLite;
+    fn owned_sqlite_binds_read_every_variant() {
+        use crate::diesel_decode::{owned_sqlite_canonical, Canonical};
         use diesel::sqlite::OwnedSqliteBindValue as V;
 
-        let dec = owned_sqlite_to_value;
-        assert_eq!(dec(&V::Null), Value::<SQLite>::Null);
-        assert_eq!(dec(&V::I32(5)), Value::Int(5));
-        assert_eq!(dec(&V::I64(9)), Value::Int(9));
-        assert_eq!(dec(&V::F64(1.5)), Value::Float(1.5));
-        assert_eq!(dec(&V::String("hi".into())), Value::String("hi".into()));
+        // Asserts what was read, not how a backend spells it: the spelling is
+        // `SpellCanonical`'s job and is tested with the backend that does it.
+        let dec = owned_sqlite_canonical;
+        assert_eq!(dec(&V::Null), Canonical::Null);
+        assert_eq!(dec(&V::I32(5)), Canonical::Int(5));
+        assert_eq!(dec(&V::I64(9)), Canonical::Int(9));
+        assert_eq!(dec(&V::F64(1.5)), Canonical::Float(1.5));
+        assert_eq!(dec(&V::String("hi".into())), Canonical::Text("hi".into()));
         assert_eq!(
             dec(&V::Binary(alloc::vec![1u8, 2, 3].into())),
-            Value::Bytes(alloc::vec![1, 2, 3])
+            Canonical::Bytes(alloc::vec![1, 2, 3])
         );
         assert_eq!(
             dec(&V::Binary(alloc::vec::Vec::<u8>::new().into())),
-            Value::Bytes(alloc::vec![])
+            Canonical::Bytes(alloc::vec![])
         );
     }
 

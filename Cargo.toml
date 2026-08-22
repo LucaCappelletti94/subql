@@ -87,16 +87,23 @@ required-features = ["testing"]
 # Integration test for the DieselConnector. Uses in-memory SQLite. Gated
 # behind the `executor-diesel` feature so default `cargo test` does not try
 # to compile it.
+# Docker-free proof that a result of unknown shape decodes and that the byte
+# budget bounds a page. Needs the SQLite backend for a real connection plus the
+# connector seam under test.
+[[test]]
+name = "dynamic_row_decode"
+required-features = ["diesel-typed-sqlite", "executor-diesel"]
+
 [[test]]
 name = "reexec_diesel"
-required-features = ["executor-diesel"]
+required-features = ["executor-diesel", "diesel-typed-sqlite"]
 
 # Docker-free connector round-trip for the multi-column aggregate seed
 # (`execute_scalar_row`) over in-memory SQLite. Gated behind
 # `executor-diesel` like `reexec_diesel`.
 [[test]]
 name = "execute_scalar_row_sqlite"
-required-features = ["executor-diesel"]
+required-features = ["executor-diesel", "diesel-typed-sqlite"]
 
 # Docker-backed integration test for AutoResolvingEngine + DieselConnector
 # against a real Postgres with logical replication. Tests are #[ignore]d;
@@ -646,6 +653,8 @@ executor-diesel-async-postgres = [
     "executor-diesel-async",
     "diesel-async/postgres",
     "diesel-async/bb8",
+    # The row decoder reads a `uuid` column through diesel's own reader.
+    "diesel?/uuid",
 ]
 # Opt-in: ship `MysqlAsyncDieselConnector`, the async binlog-position-aware
 # analogue of `MysqlDieselConnector`. Wraps a `bb8` pool over

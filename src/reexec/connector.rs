@@ -40,8 +40,8 @@ use thiserror::Error;
 /// A captured-state snapshot of a query's value, together with the
 /// [`Checkpoint`] at which it was read.
 ///
-/// Returned by [`Connector::execute_rows`] (and the future
-/// [`AutoResolvingEngine::snapshot`](super::AutoResolvingEngine::snapshot))
+/// Returned by the row-returning reads and by
+/// [`AutoResolvingEngine::snapshot`](super::AutoResolvingEngine::snapshot)
 /// so downstream replay layers (oplogs, client cursors) can anchor a
 /// snapshot to a position in the source stream. The `checkpoint` is
 /// `None` when the backend has no native notion of position (e.g.
@@ -49,11 +49,77 @@ use thiserror::Error;
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub struct Snapshot<T, C: Checkpoint> {
-    /// The snapshot value (a scalar [`Value`] or a `Vec<Vec<Value<_>>>`,
-    /// one inner `Vec` per row).
+    /// The snapshot value (a scalar [`Value`], or a [`RowPage`]).
     pub value: T,
     /// The position at which the snapshot was read, when known.
     pub checkpoint: Option<C>,
+}
+
+/// One bounded page of a row-returning read.
+///
+/// A captured query's answer can be far larger than memory, so a read hands
+/// back as much as fits a byte budget and says whether the result went on.
+/// The budget is bytes rather than rows because a row is not a bounded thing:
+/// one row carrying a large text column is unbounded on its own.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct RowPage<B: Backend> {
+    /// Column names as the database reported them, in projection order.
+    ///
+    /// A captured query's projection can be an expression or an alias that no
+    /// catalog describes, so the names travel with the rows rather than being
+    /// looked up.
+    pub columns: alloc::vec::Vec<alloc::string::String>,
+    /// Rows, each in [`Self::columns`] order.
+    pub rows: alloc::vec::Vec<alloc::vec::Vec<Value<B>>>,
+    /// Whether the budget stopped the read before the result ended.
+    ///
+    /// `false` means this page is the last one. It is the connector's answer
+    /// and not a guess: a caller that inferred "more" from a full page would
+    /// make one wasted read on every exactly-fitting result.
+    pub more: bool,
+}
+
+impl<B: Backend> RowPage<B> {
+    /// The encoded size of `row`, which is what a page's budget is spent in.
+    ///
+    /// postcard, because that is already the crate's encoding for a row's
+    /// identity (`crate::row_set`), so one row costs the same number of bytes
+    /// here as it does there.
+    pub(crate) fn row_bytes_of(row: &[Value<B>]) -> usize {
+        postcard::experimental::serialized_size(row).unwrap_or(usize::MAX)
+    }
+}
+
+/// Handle to a cursor a connector holds open, with the transaction behind it.
+///
+/// A result with no key cannot be resumed by asking for "everything after the
+/// last row", so those pages come from one cursor inside one read-only
+/// repeatable-read transaction, which is the only way successive pages describe
+/// a single instant. The id is opaque and connector-minted, matching how this
+/// module already addresses captured queries by
+/// [`ReExecQueryId`](super::ReExecQueryId).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CursorId(pub u64);
+
+/// Error from the cursor reads.
+///
+/// Separates "this connector holds no cursors" from a genuine failure, so a
+/// caller can tell a connector that cannot serve keyless captures from a
+/// database that refused.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum CursorError<E> {
+    /// This connector does not implement cursors, so it cannot serve a
+    /// captured query whose result has no key to resume from.
+    #[error("connector holds no cursors; a keyless captured query needs one")]
+    Unsupported,
+    /// No cursor is open under this id: it was closed, or never opened.
+    #[error("cursor {0:?} is not open")]
+    Unknown(CursorId),
+    /// The connector failed.
+    #[error(transparent)]
+    Connector(E),
 }
 
 #[cfg(feature = "executor-diesel")]
@@ -130,23 +196,72 @@ pub trait Connector {
         auth: &Self::AuthContext,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>;
 
-    /// Run `sql` as a row-returning query and decode every row into a
-    /// column-ordered `Vec<Value<Self::Backend>>`.
+    /// Read one page of `sql`, stopping once the decoded rows reach
+    /// `max_bytes`.
     ///
-    /// Used by the auto-resolving engine's `snapshot` method to bootstrap
-    /// a subscription, and by total single-table row re-execution once
-    /// that lands (see `MILESTONES.md`). Impls should open a read-only
-    /// repeatable-read transaction so the rows and the returned
-    /// [`Snapshot::checkpoint`] agree on a single point in the source
-    /// stream.
-    fn execute_rows(
+    /// Stateless on purpose. A result that can be resumed carries a key, and
+    /// the caller renders the resume predicate into `sql` itself
+    /// (`... AND (k) > (last seen) ORDER BY k`), so this needs no cursor, holds
+    /// no transaction between pages, and each page is its own short read. That
+    /// is what keeps a large result from pinning a connection: the price is
+    /// that successive pages see successive states, which the caller
+    /// reconciles against the change stream using
+    /// [`Snapshot::checkpoint`].
+    ///
+    /// Stop at the first row that would take the page past `max_bytes`, and
+    /// report [`RowPage::more`] as whether the result had further rows. A page
+    /// always carries at least one row when the result is non-empty, even if
+    /// that row alone exceeds the budget, since returning nothing would make
+    /// no progress and the caller would ask again forever.
+    fn read_page(
+        &self,
+        sql: &str,
+        max_bytes: usize,
+        auth: &Self::AuthContext,
+    ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, Self::Error>;
+
+    /// Open a cursor over `sql` inside one read-only repeatable-read
+    /// transaction, for a result with no key to resume from.
+    ///
+    /// A `DISTINCT`, a set operation, or a join with a computed projection has
+    /// nothing to seek on, so its pages can only describe one instant if they
+    /// all come from one snapshot. That costs a transaction and a borrowed
+    /// connection until [`close_cursor`](Self::close_cursor), which is why it
+    /// is not the path a keyed result takes.
+    ///
+    /// The default refuses: a connector over a source with no cursors is
+    /// honest to say so, and the refusal names what the caller loses.
+    fn open_cursor(
         &self,
         sql: &str,
         auth: &Self::AuthContext,
-    ) -> Result<
-        Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
-        Self::Error,
-    >;
+    ) -> Result<CursorId, CursorError<Self::Error>> {
+        let _ = (sql, auth);
+        Err(CursorError::Unsupported)
+    }
+
+    /// Read the next page from an open cursor, under the same budget rule as
+    /// [`read_page`](Self::read_page).
+    ///
+    /// Every page carries the same [`Snapshot::checkpoint`], because every
+    /// page is the same snapshot.
+    fn fetch_cursor(
+        &self,
+        cursor: CursorId,
+        max_bytes: usize,
+    ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, CursorError<Self::Error>> {
+        let _ = (cursor, max_bytes);
+        Err(CursorError::Unsupported)
+    }
+
+    /// Close a cursor and commit its transaction, releasing the connection.
+    ///
+    /// Idempotent: closing an already-closed cursor succeeds, so an abandoned
+    /// read cannot leak a transaction through a double close.
+    fn close_cursor(&self, cursor: CursorId) -> Result<(), CursorError<Self::Error>> {
+        let _ = cursor;
+        Err(CursorError::Unsupported)
+    }
 
     /// Run a single-row, multi-column scalar seed query and decode each
     /// column by the matching [`ScalarKind`].
@@ -433,12 +548,20 @@ where
 }
 
 #[cfg(feature = "executor-diesel")]
+/// Reading a row needs a decoder for the connection's backend, so this impl
+/// asks for one. Every backend subql speaks has it behind that backend's own
+/// feature (`diesel-typed` for Postgres, `diesel-typed-sqlite`,
+/// `diesel-typed-mysql`, `executor-diesel-postgres`, `executor-diesel-mysql`),
+/// and a connector that cannot decode a row cannot honestly claim to read one.
 impl<C, B> Connector for DieselConnector<C, B>
 where
-    C: Connection,
-    B: DieselBackend,
-    for<'q> SqlQuery:
-        LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
+    C: Connection + diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
+    C::Backend: crate::diesel_decode::RowFieldDecode + diesel::backend::DieselReserveSpecialization,
+    B: DieselBackend + crate::diesel_decode::SpellCanonical,
+    for<'q> SqlQuery: LoadQuery<'q, C, IntRow>
+        + LoadQuery<'q, C, FloatRow>
+        + LoadQuery<'q, C, TextRow>
+        + LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>,
 {
     type AuthContext = ();
     type Error = diesel::result::Error;
@@ -459,26 +582,17 @@ where
         Ok((value, None))
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
-        _sql: &str,
+        sql: &str,
+        max_bytes: usize,
         _auth: &(),
-    ) -> Result<Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<B>>>, Self::Checkpoint>, Self::Error>
-    {
-        // Row-set decoding through diesel's `sql_query` requires the
-        // caller to know the schema at compile time (each column wants
-        // its own typed accessor). The generic row-decoding path lands
-        // with the total reexec feature (tracked in `MILESTONES.md`).
-        // For now this method is wired up as a panic so any caller that
-        // opts into it gets a clear signal that it is not yet
-        // implemented for the generic `DieselConnector`.
-        #[allow(clippy::unimplemented)]
-        {
-            unimplemented!(
-                "DieselConnector::execute_rows is reserved for total row reexec; \
-                 use the scalar path or supply a custom Connector impl"
-            )
-        }
+    ) -> Result<Snapshot<RowPage<B>, Self::Checkpoint>, Self::Error> {
+        let value = load_page::<_, B>(&mut self.conn.borrow_mut(), sql, max_bytes)?;
+        Ok(Snapshot {
+            value,
+            checkpoint: None,
+        })
     }
 
     fn execute_scalar_row(
@@ -584,23 +698,25 @@ impl Connector for PgDieselConnector {
         })
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
-        _sql: &str,
+        sql: &str,
+        max_bytes: usize,
         _auth: &(),
-    ) -> Result<
-        Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
-        Self::Error,
-    > {
-        // Same restriction as DieselConnector: generic row decoding is
-        // deferred to the total row reexec feature.
-        #[allow(clippy::unimplemented)]
-        {
-            unimplemented!(
-                "PgDieselConnector::execute_rows is reserved for total row reexec; \
-                 use the scalar path or supply a custom Connector impl"
-            )
-        }
+    ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
+        let mut conn = self.conn.borrow_mut();
+        // The page and the LSN share one snapshot, so a caller reconciling
+        // pages against the change stream knows exactly where this one sits.
+        conn.transaction(|conn| {
+            diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
+                .execute(conn)?;
+            let value = load_page::<_, crate::backend::Postgres>(conn, sql, max_bytes)?;
+            let lsn = read_current_lsn(conn)?;
+            Ok(Snapshot {
+                value,
+                checkpoint: lsn,
+            })
+        })
     }
 
     fn execute_scalar_row(
@@ -751,23 +867,21 @@ impl Connector for MysqlDieselConnector {
         })
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
-        _sql: &str,
+        sql: &str,
+        max_bytes: usize,
         _auth: &(),
-    ) -> Result<
-        Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
-        Self::Error,
-    > {
-        // Same restriction as the other diesel connectors: generic row
-        // decoding is deferred to the total row reexec feature.
-        #[allow(clippy::unimplemented)]
-        {
-            unimplemented!(
-                "MysqlDieselConnector::execute_rows is reserved for total row reexec; \
-                 use the scalar path or supply a custom Connector impl"
-            )
-        }
+    ) -> Result<Snapshot<RowPage<crate::backend::MySql>, Self::Checkpoint>, Self::Error> {
+        let mut conn = self.conn.borrow_mut();
+        conn.transaction(|conn| {
+            let value = load_page::<_, crate::backend::MySql>(conn, sql, max_bytes)?;
+            let pos = read_binlog_pos(conn);
+            Ok(Snapshot {
+                value,
+                checkpoint: pos,
+            })
+        })
     }
 
     fn execute_scalar_row(
@@ -887,21 +1001,24 @@ impl Connector for PgR2D2DieselConnector {
         Ok(result?)
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
-        _sql: &str,
+        sql: &str,
+        max_bytes: usize,
         _auth: &(),
-    ) -> Result<
-        Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
-        Self::Error,
-    > {
-        #[allow(clippy::unimplemented)]
-        {
-            unimplemented!(
-                "PgR2D2DieselConnector::execute_rows is reserved for total row reexec; \
-                 use the scalar path or supply a custom Connector impl"
-            )
-        }
+    ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
+        let mut conn = self.pool.get().map_err(PgR2D2Error::Pool)?;
+        let result = conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
+                .execute(conn)?;
+            let value = load_page::<_, crate::backend::Postgres>(conn, sql, max_bytes)?;
+            let lsn = read_current_lsn(conn)?;
+            Ok(Snapshot {
+                value,
+                checkpoint: lsn,
+            })
+        });
+        Ok(result?)
     }
 
     fn execute_scalar_row(
@@ -931,4 +1048,55 @@ impl Connector for PgR2D2DieselConnector {
         });
         result.map_err(|e| ScalarRowError::Connector(e.into()))
     }
+}
+
+/// Read one page of `sql` off a diesel connection, decoding each row without a
+/// compile-time schema and stopping at `max_bytes`.
+///
+/// The shared body behind every diesel-backed connector's
+/// [`Connector::read_page`]. `conn.load` hands back an iterator, so the budget
+/// stops the decode rather than trimming an already-materialized vector, and
+/// one extra row is pulled to answer [`RowPage::more`] without guessing.
+#[cfg(feature = "executor-diesel")]
+fn load_page<C, B>(conn: &mut C, sql: &str, max_bytes: usize) -> QueryResult<RowPage<B>>
+where
+    C: diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
+    C::Backend: crate::diesel_decode::RowFieldDecode + diesel::backend::DieselReserveSpecialization,
+    B: crate::diesel_decode::SpellCanonical,
+    for<'q> SqlQuery: LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>,
+{
+    let mut columns = alloc::vec::Vec::new();
+    let mut rows: alloc::vec::Vec<alloc::vec::Vec<Value<B>>> = alloc::vec::Vec::new();
+    let mut spent = 0_usize;
+    let mut more = false;
+
+    // Lazy on purpose: the iterator lets the budget stop the decode rather
+    // than trim a vector that was already built in full.
+    let iter =
+        diesel::query_dsl::LoadQuery::<'_, C, crate::diesel_decode::DynamicRow<B>>::internal_load(
+            diesel::sql_query(sql),
+            conn,
+        )?;
+    for row in iter {
+        let row = row?;
+        if columns.is_empty() {
+            columns = row.columns;
+        }
+        // A page always makes progress: the budget stops the row after the
+        // first, never the first itself, or an oversized row would stall the
+        // read forever.
+        let cost = RowPage::<B>::row_bytes_of(&row.values);
+        if !rows.is_empty() && spent + cost > max_bytes {
+            more = true;
+            break;
+        }
+        spent += cost;
+        rows.push(row.values);
+    }
+
+    Ok(RowPage {
+        columns,
+        rows,
+        more,
+    })
 }

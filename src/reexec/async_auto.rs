@@ -629,14 +629,18 @@ mod tests {
             }
         }
 
-        fn execute_rows(
+        fn read_page(
             &self,
             _sql: &str,
+            _max_bytes: usize,
             _auth: &(),
         ) -> impl Future<
-            Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>,
+            Output = Result<
+                Snapshot<crate::reexec::RowPage<Postgres>, Self::Checkpoint>,
+                Self::Error,
+            >,
         > + Send {
-            async move { Err(MockError("execute_rows not exercised in v1 tests")) }
+            async move { Err(MockError("read_page is not exercised by the scalar tests")) }
         }
     }
 

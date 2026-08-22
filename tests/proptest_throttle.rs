@@ -33,7 +33,9 @@ use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{BuiltinKind, Postgres, Value};
-use subql::reexec::{AsyncAutoResolvingEngine, AsyncConnector, ReExecEngine, Registered, Snapshot};
+use subql::reexec::{
+    AsyncAutoResolvingEngine, AsyncConnector, ReExecEngine, Registered, RowPage, Snapshot,
+};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, NoCheckpoint, SubscriptionEngine, SubscriptionRequest, TableId,
@@ -118,14 +120,14 @@ impl AsyncConnector for ConcurrencyProbingConnector {
         }
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
         _sql: &str,
+        _max_bytes: usize,
         _auth: &(),
-    ) -> impl Future<
-        Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>,
-    > + Send {
-        async move { Err(ProbeError("execute_rows not exercised in this test")) }
+    ) -> impl Future<Output = Result<Snapshot<RowPage<Postgres>, Self::Checkpoint>, Self::Error>> + Send
+    {
+        async move { Err(ProbeError("read_page is not exercised by this test")) }
     }
 }
 

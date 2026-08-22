@@ -224,14 +224,40 @@ impl AsyncConnector for PgAsyncDieselConnector {
         }
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
-        _sql: &str,
+        sql: &str,
+        max_bytes: usize,
         _auth: &(),
     ) -> impl Future<
-        Output = Result<Snapshot<Vec<Vec<Value<Self::Backend>>>, Self::Checkpoint>, Self::Error>,
+        Output = Result<
+            Snapshot<crate::reexec::RowPage<Self::Backend>, Self::Checkpoint>,
+            Self::Error,
+        >,
     > + Send {
-        async move { Err(DieselAsyncError::RowsUnsupported) }
+        let sql = sql.to_string();
+        async move {
+            let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
+            let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
+            conn.transaction::<Snapshot<crate::reexec::RowPage<Self::Backend>, crate::PgLsn>, diesel::result::Error, _>(
+                |c| {
+                    async move {
+                        sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
+                            .execute(c)
+                            .await?;
+                        let value = load_page_async::<_, diesel::pg::Pg, crate::backend::Postgres>(c, &sql, max_bytes).await?;
+                        let lsn = read_current_lsn_async(c).await?;
+                        Ok(Snapshot {
+                            value,
+                            checkpoint: lsn,
+                        })
+                    }
+                    .scope_boxed()
+                },
+            )
+            .await
+            .map_err(DieselAsyncError::Diesel)
+        }
     }
 
     fn execute_scalar_row(
@@ -377,14 +403,31 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
         }
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
-        _sql: &str,
+        sql: &str,
+        max_bytes: usize,
         _auth: &(),
     ) -> impl Future<
-        Output = Result<Snapshot<Vec<Vec<Value<Self::Backend>>>, Self::Checkpoint>, Self::Error>,
+        Output = Result<
+            Snapshot<crate::reexec::RowPage<Self::Backend>, Self::Checkpoint>,
+            Self::Error,
+        >,
     > + Send {
-        async move { Err(DieselAsyncError::RowsUnsupported) }
+        let sql = sql.to_string();
+        async move {
+            let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
+            let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
+            let value = load_page_async::<_, diesel::mysql::Mysql, crate::backend::MySql>(
+                conn, &sql, max_bytes,
+            )
+            .await
+            .map_err(DieselAsyncError::Diesel)?;
+            Ok(Snapshot {
+                value,
+                checkpoint: None,
+            })
+        }
     }
 
     fn execute_scalar_row(
@@ -422,4 +465,53 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
             .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))
         }
     }
+}
+
+/// Read one page off an async diesel connection, decoding each row without a
+/// compile-time schema and stopping at `max_bytes`.
+///
+/// The async peer of the sync `load_page`. `diesel_async`'s `load` yields a
+/// stream, so the budget stops the decode rather than trimming a materialized
+/// vector, and the row after the budget answers `more` without guessing.
+async fn load_page_async<C, DB, B>(
+    conn: &mut C,
+    sql: &str,
+    max_bytes: usize,
+) -> diesel::QueryResult<crate::reexec::RowPage<B>>
+where
+    C: diesel_async::AsyncConnection<Backend = DB>,
+    DB: crate::diesel_decode::RowFieldDecode
+        + diesel::backend::DieselReserveSpecialization
+        + 'static,
+    B: crate::diesel_decode::SpellCanonical,
+    crate::diesel_decode::DynamicRow<B>:
+        diesel::deserialize::FromSqlRow<diesel::sql_types::Untyped, DB> + Send + 'static,
+{
+    use diesel_async::RunQueryDsl;
+
+    let decoded: Vec<crate::diesel_decode::DynamicRow<B>> = sql_query(sql).load(conn).await?;
+
+    let mut columns = Vec::new();
+    let mut rows = Vec::new();
+    let mut spent = 0_usize;
+    let mut more = false;
+    for row in decoded {
+        if columns.is_empty() {
+            columns = row.columns;
+        }
+        let cost = crate::reexec::RowPage::<B>::row_bytes_of(&row.values);
+        // A page always makes progress: the budget stops the row after the
+        // first, never the first itself.
+        if !rows.is_empty() && spent + cost > max_bytes {
+            more = true;
+            break;
+        }
+        spent += cost;
+        rows.push(row.values);
+    }
+    Ok(crate::reexec::RowPage {
+        columns,
+        rows,
+        more,
+    })
 }

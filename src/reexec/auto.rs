@@ -482,18 +482,19 @@ mod tests {
             Ok((value, None))
         }
 
-        fn execute_rows(
+        fn read_page(
             &self,
             _sql: &str,
+            _max_bytes: usize,
             _auth: &(),
         ) -> Result<
-            super::super::connector::Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>,
+            super::super::connector::Snapshot<
+                super::super::connector::RowPage<Postgres>,
+                Self::Checkpoint,
+            >,
             Self::Error,
         > {
-            #[allow(clippy::unimplemented)]
-            {
-                unimplemented!("MockConnector::execute_rows is not exercised in v1 tests")
-            }
+            Err(MockError("read_page is not exercised by the scalar tests"))
         }
     }
 

@@ -67,22 +67,56 @@ pub trait AsyncConnector: Send + Sync {
         Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>,
     > + Send;
 
-    /// Run `sql` as a row-returning query and decode every row into a
-    /// column-ordered `Vec<Value<Self::Backend>>`.
-    ///
-    /// See [`Connector::execute_rows`](super::Connector::execute_rows) for
-    /// the contract. Impls should open a read-only repeatable-read
-    /// transaction so rows and checkpoint observe the same snapshot.
-    fn execute_rows(
+    /// Async peer of [`Connector::read_page`](super::Connector::read_page).
+    /// See it for the contract, including the budget rule and why this stays
+    /// stateless.
+    fn read_page(
+        &self,
+        sql: &str,
+        max_bytes: usize,
+        auth: &Self::AuthContext,
+    ) -> impl core::future::Future<
+        Output = Result<Snapshot<super::RowPage<Self::Backend>, Self::Checkpoint>, Self::Error>,
+    > + Send;
+
+    /// Async peer of
+    /// [`Connector::open_cursor`](super::Connector::open_cursor).
+    fn open_cursor(
         &self,
         sql: &str,
         auth: &Self::AuthContext,
+    ) -> impl core::future::Future<Output = Result<super::CursorId, super::CursorError<Self::Error>>>
+           + Send {
+        let _ = (sql, auth);
+        core::future::ready(Err(super::CursorError::Unsupported))
+    }
+
+    /// Async peer of
+    /// [`Connector::fetch_cursor`](super::Connector::fetch_cursor).
+    fn fetch_cursor(
+        &self,
+        cursor: super::CursorId,
+        max_bytes: usize,
     ) -> impl core::future::Future<
         Output = Result<
-            Snapshot<alloc::vec::Vec<alloc::vec::Vec<Value<Self::Backend>>>, Self::Checkpoint>,
-            Self::Error,
+            Snapshot<super::RowPage<Self::Backend>, Self::Checkpoint>,
+            super::CursorError<Self::Error>,
         >,
-    > + Send;
+    > + Send {
+        let _ = (cursor, max_bytes);
+        core::future::ready(Err(super::CursorError::Unsupported))
+    }
+
+    /// Async peer of
+    /// [`Connector::close_cursor`](super::Connector::close_cursor).
+    fn close_cursor(
+        &self,
+        cursor: super::CursorId,
+    ) -> impl core::future::Future<Output = Result<(), super::CursorError<Self::Error>>> + Send
+    {
+        let _ = cursor;
+        core::future::ready(Err(super::CursorError::Unsupported))
+    }
 
     /// Async peer of
     /// [`Connector::execute_scalar_row`](super::Connector::execute_scalar_row).
