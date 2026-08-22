@@ -628,14 +628,18 @@ where
 /// Sync [`Connector`] backed by a diesel `PgConnection` that anchors
 /// every read to a PostgreSQL WAL position.
 ///
-/// On each `execute_scalar` (and future `execute_rows`) call the connector
-/// opens a `READ ONLY REPEATABLE READ` transaction, queries
-/// `pg_current_wal_lsn()` alongside the user's SQL, and returns the
-/// resulting [`Value<crate::backend::Postgres>`] together with the
-/// parsed [`crate::PgLsn`]. The user
-/// query and the LSN observe the same MVCC snapshot, so downstream replay
-/// layers (an oplog, a client cursor) can chain WAL events onto the
-/// snapshot at exactly the position the snapshot was taken.
+/// Each read takes the WAL position first, then opens a `READ ONLY REPEATABLE
+/// READ` transaction for the user's SQL, and returns the resulting
+/// [`Value<crate::backend::Postgres>`] with the parsed [`crate::PgLsn`].
+///
+/// The order is the whole point. `pg_current_wal_lsn()` is not bound to the
+/// transaction snapshot: inside one repeatable-read transaction it advances
+/// when another connection commits, which is measured rather than assumed. So a
+/// position read after the query can sit ahead of the snapshot, and a replay
+/// layer starting there would skip a transaction that committed before the
+/// position yet was invisible to the snapshot. Reading first puts the position
+/// at or behind the snapshot instead, so a replay re-delivers a few changes the
+/// snapshot already holds, which keyed application absorbs.
 ///
 /// Holds the connection in a [`RefCell`] for the interior-mutability the
 /// trait's `&self` requires. Not `Send`/`Sync`. For multi-threaded use,
@@ -694,12 +698,18 @@ impl Connector for PgDieselConnector {
         _auth: &(),
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
+        // The position is read before the snapshot exists. A caller replays the
+        // change stream from it, so it must sit at or behind the snapshot:
+        // behind re-delivers a few changes the snapshot already holds, which
+        // keyed application absorbs, while ahead silently loses a transaction
+        // that committed after the position and is invisible to the snapshot.
+        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
+        // assumed: inside one repeatable-read transaction it advances when
+        // another connection commits.
+        let lsn = read_current_lsn(&mut conn)?;
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
-            // Pin the transaction's MVCC snapshot so the user query and
-            // the LSN agree on a single point in the WAL.
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
             let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
-            let lsn = read_current_lsn(conn)?;
             Ok((value, lsn))
         })
     }
@@ -713,11 +723,19 @@ impl Connector for PgDieselConnector {
         let mut conn = self.conn.borrow_mut();
         // The page and the LSN share one snapshot, so a caller reconciling
         // pages against the change stream knows exactly where this one sits.
+        // The position is read before the snapshot exists. A caller replays the
+        // change stream from it, so it must sit at or behind the snapshot:
+        // behind re-delivers a few changes the snapshot already holds, which
+        // keyed application absorbs, while ahead silently loses a transaction
+        // that committed after the position and is invisible to the snapshot.
+        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
+        // assumed: inside one repeatable-read transaction it advances when
+        // another connection commits.
+        let lsn = read_current_lsn(&mut conn)?;
         conn.transaction(|conn| {
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(conn)?;
             let value = load_page::<_, crate::backend::Postgres>(conn, sql, max_bytes)?;
-            let lsn = read_current_lsn(conn)?;
             Ok(Snapshot {
                 value,
                 checkpoint: lsn,
@@ -738,10 +756,18 @@ impl Connector for PgDieselConnector {
         ScalarRowError<Self::Error>,
     > {
         let mut conn = self.conn.borrow_mut();
+        // The position is read before the snapshot exists. A caller replays the
+        // change stream from it, so it must sit at or behind the snapshot:
+        // behind re-delivers a few changes the snapshot already holds, which
+        // keyed application absorbs, while ahead silently loses a transaction
+        // that committed after the position and is invisible to the snapshot.
+        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
+        // assumed: inside one repeatable-read transaction it advances when
+        // another connection commits.
+        let lsn = read_current_lsn(&mut conn).map_err(ScalarRowError::Connector)?;
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
             let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
-            let lsn = read_current_lsn(conn)?;
             Ok((values, lsn))
         })
         .map_err(ScalarRowError::Connector)
@@ -1026,12 +1052,20 @@ impl Connector for PgR2D2DieselConnector {
         _auth: &(),
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.pool.get()?;
+        // The position is read before the snapshot exists. A caller replays the
+        // change stream from it, so it must sit at or behind the snapshot:
+        // behind re-delivers a few changes the snapshot already holds, which
+        // keyed application absorbs, while ahead silently loses a transaction
+        // that committed after the position and is invisible to the snapshot.
+        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
+        // assumed: inside one repeatable-read transaction it advances when
+        // another connection commits.
+        let lsn = read_current_lsn(&mut conn)?;
         let result: Result<(Value<Self::Backend>, Option<crate::PgLsn>), diesel::result::Error> =
             diesel::connection::Connection::transaction(&mut *conn, |conn| {
                 sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                     .execute(conn)?;
                 let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
-                let lsn = read_current_lsn(conn)?;
                 Ok((value, lsn))
             });
         Ok(result?)
@@ -1044,11 +1078,19 @@ impl Connector for PgR2D2DieselConnector {
         _auth: &(),
     ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.pool.get().map_err(PgR2D2Error::Pool)?;
+        // The position is read before the snapshot exists. A caller replays the
+        // change stream from it, so it must sit at or behind the snapshot:
+        // behind re-delivers a few changes the snapshot already holds, which
+        // keyed application absorbs, while ahead silently loses a transaction
+        // that committed after the position and is invisible to the snapshot.
+        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
+        // assumed: inside one repeatable-read transaction it advances when
+        // another connection commits.
+        let lsn = read_current_lsn(&mut conn)?;
         let result = conn.transaction::<_, diesel::result::Error, _>(|conn| {
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(conn)?;
             let value = load_page::<_, crate::backend::Postgres>(conn, sql, max_bytes)?;
-            let lsn = read_current_lsn(conn)?;
             Ok(Snapshot {
                 value,
                 checkpoint: lsn,
@@ -1073,13 +1115,22 @@ impl Connector for PgR2D2DieselConnector {
             .pool
             .get()
             .map_err(|e| ScalarRowError::Connector(e.into()))?;
+        // The position is read before the snapshot exists. A caller replays the
+        // change stream from it, so it must sit at or behind the snapshot:
+        // behind re-delivers a few changes the snapshot already holds, which
+        // keyed application absorbs, while ahead silently loses a transaction
+        // that committed after the position and is invisible to the snapshot.
+        // `pg_current_wal_lsn()` is not snapshot-bound, measured rather than
+        // assumed: inside one repeatable-read transaction it advances when
+        // another connection commits.
+        let lsn = read_current_lsn(&mut conn)
+            .map_err(|e| ScalarRowError::Connector(PgR2D2Error::Diesel(e)))?;
         let result: Result<
             (alloc::vec::Vec<Value<Self::Backend>>, Option<crate::PgLsn>),
             diesel::result::Error,
         > = diesel::connection::Connection::transaction(&mut *conn, |conn| {
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
             let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
-            let lsn = read_current_lsn(conn)?;
             Ok((values, lsn))
         });
         result.map_err(|e| ScalarRowError::Connector(e.into()))
@@ -1100,12 +1151,23 @@ impl Connector for PgR2D2DieselConnector {
         // and the transaction has to outlive this call, so diesel's scoped
         // `transaction` closure cannot express it either.
         let opened = (|| -> QueryResult<Option<crate::PgLsn>> {
+            // The position is read BEFORE the snapshot exists, on purpose. It
+            // is what a caller replays the change stream from, so it must sit
+            // at or behind the snapshot: behind means a few changes already in
+            // the snapshot arrive again, which keyed application absorbs, while
+            // ahead means a transaction that committed after the position but
+            // is invisible to the snapshot is never delivered at all. Reading
+            // it after `DECLARE` would give exactly that, because `DECLARE` is
+            // what establishes the snapshot and `pg_current_wal_lsn()` is not
+            // snapshot-bound. Debezium orders its initial snapshot the same
+            // way, position first and scan second.
+            let lsn = read_current_lsn(&mut conn)?;
             diesel::sql_query("BEGIN").execute(&mut *conn)?;
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut *conn)?;
             diesel::sql_query(alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {sql}"))
                 .execute(&mut *conn)?;
-            read_current_lsn(&mut conn)
+            Ok(lsn)
         })();
 
         let checkpoint = match opened {

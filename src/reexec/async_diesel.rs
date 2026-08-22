@@ -204,16 +204,21 @@ impl AsyncConnector for PgAsyncDieselConnector {
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
+            // The position is read before the snapshot exists, because
+            // `pg_current_wal_lsn()` is not snapshot-bound: a position taken
+            // after the query can sit ahead of the snapshot, and a replay
+            // starting there skips a transaction that committed before it yet
+            // was invisible to the snapshot. Behind is safe, ahead loses data.
+            let lsn = read_current_lsn_async(conn)
+                .await
+                .map_err(DieselAsyncError::Diesel)?;
             conn.transaction::<(Value<Self::Backend>, Option<crate::PgLsn>), diesel::result::Error, _>(
                 |c| {
                     async move {
-                        // Pin the transaction's MVCC snapshot so the user query
-                        // and the LSN agree on a single point in the WAL.
                         sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                             .execute(c)
                             .await?;
                         let value = load_scalar_async::<_, Self::Backend>(c, &sql, kind).await?;
-                        let lsn = read_current_lsn_async(c).await?;
                         Ok((value, lsn))
                     }
                     .scope_boxed()
@@ -239,6 +244,14 @@ impl AsyncConnector for PgAsyncDieselConnector {
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
+            // The position is read before the snapshot exists, because
+            // `pg_current_wal_lsn()` is not snapshot-bound: a position taken
+            // after the query can sit ahead of the snapshot, and a replay
+            // starting there skips a transaction that committed before it yet
+            // was invisible to the snapshot. Behind is safe, ahead loses data.
+            let lsn = read_current_lsn_async(conn)
+                .await
+                .map_err(DieselAsyncError::Diesel)?;
             conn.transaction::<Snapshot<crate::reexec::RowPage<Self::Backend>, crate::PgLsn>, diesel::result::Error, _>(
                 |c| {
                     async move {
@@ -246,7 +259,6 @@ impl AsyncConnector for PgAsyncDieselConnector {
                             .execute(c)
                             .await?;
                         let value = load_page_async::<_, diesel::pg::Pg, crate::backend::Postgres>(c, &sql, max_bytes).await?;
-                        let lsn = read_current_lsn_async(c).await?;
                         Ok(Snapshot {
                             value,
                             checkpoint: lsn,
@@ -280,6 +292,12 @@ impl AsyncConnector for PgAsyncDieselConnector {
                 .await
                 .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Pool(e)))?;
             let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
+            // Position before snapshot, for the reason spelled out on
+            // `execute_scalar`: a position taken after can sit ahead of the
+            // snapshot and a replay from there loses data.
+            let lsn = read_current_lsn_async(conn)
+                .await
+                .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Diesel(e)))?;
             conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::PgLsn>), diesel::result::Error, _>(
                 |c| {
                     async move {
@@ -288,7 +306,6 @@ impl AsyncConnector for PgAsyncDieselConnector {
                             .await?;
                         let values =
                             load_scalar_row_async::<_, Self::Backend>(c, &sql, &kinds).await?;
-                        let lsn = read_current_lsn_async(c).await?;
                         Ok((values, lsn))
                     }
                     .scope_boxed()

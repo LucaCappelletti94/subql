@@ -467,3 +467,76 @@ fn a_joined_capture_is_triggered_by_either_table() {
         );
     }
 }
+
+/// `pg_current_wal_lsn()` is not bound to the transaction snapshot.
+///
+/// This is the fact every position-carrying read depends on, so it is pinned
+/// rather than asserted in a comment. Inside one `REPEATABLE READ` transaction
+/// the position advances when another connection commits, while that commit
+/// stays invisible to the snapshot. A position taken after the rows can
+/// therefore sit ahead of the snapshot it claims to describe, and a caller
+/// replaying the change stream from it would skip that commit entirely.
+///
+/// The connectors read the position before opening the snapshot for exactly
+/// this reason. That ordering is internal to one call, so no black-box test can
+/// distinguish it; what a test can do is pin the premise, which is this. If a
+/// future PostgreSQL made the function snapshot-bound, this test fails and the
+/// ordering constraint can be revisited.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn the_wal_position_is_not_bound_to_the_transaction_snapshot() {
+    #[derive(diesel::QueryableByName, Debug)]
+    struct Lsn {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        lsn: String,
+    }
+    #[derive(diesel::QueryableByName, Debug)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut reader = common::pg_connect(port);
+    let mut writer = common::pg_connect(port);
+
+    setup_pg(&mut reader, &[(1, 5.0)]);
+
+    sql_query("BEGIN").execute(&mut reader).expect("begin");
+    sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut reader)
+        .expect("isolation");
+    // Establish the snapshot, then read the position it supposedly matches.
+    let rows_before: Vec<Count> = sql_query("SELECT count(*) AS n FROM orders")
+        .load(&mut reader)
+        .expect("snapshot read");
+    let at_snapshot: Vec<Lsn> = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
+        .load(&mut reader)
+        .expect("position at snapshot");
+
+    sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (2, 7.0, 1, 'paid')")
+        .execute(&mut writer)
+        .expect("concurrent commit");
+
+    let rows_after: Vec<Count> = sql_query("SELECT count(*) AS n FROM orders")
+        .load(&mut reader)
+        .expect("second snapshot read");
+    let after_commit: Vec<Lsn> = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
+        .load(&mut reader)
+        .expect("position after commit");
+    sql_query("COMMIT").execute(&mut reader).expect("commit");
+
+    assert_eq!(
+        rows_before[0].n, rows_after[0].n,
+        "the snapshot does not see the concurrent commit, which is the point of \
+         REPEATABLE READ"
+    );
+    assert_ne!(
+        at_snapshot[0].lsn, after_commit[0].lsn,
+        "yet the position advanced, so it is not snapshot-bound: a position read \
+         after the rows would sit ahead of the snapshot and a replay from it \
+         would lose the commit"
+    );
+}
