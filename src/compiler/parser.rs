@@ -114,13 +114,13 @@ pub struct CompiledQuery<B: Backend> {
     pub terms: Vec<CompiledTerm>,
 }
 
-struct SqlTableName {
-    unqualified: String,
-    qualified: Option<String>,
+pub(crate) struct SqlTableName {
+    pub(crate) unqualified: String,
+    pub(crate) qualified: Option<String>,
 }
 
 impl SqlTableName {
-    fn from_object_name(name: &ObjectName) -> Result<Self, RegisterError> {
+    pub(crate) fn from_object_name(name: &ObjectName) -> Result<Self, RegisterError> {
         let mut parts = Vec::with_capacity(name.0.len());
         for part in &name.0 {
             let ident = part

@@ -17,7 +17,7 @@
 use super::connector::{Connector, ReExecError};
 use super::engine::{
     BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
-    Registered, ScalarUpdate,
+    Registered, RowsUpdate, ScalarUpdate,
 };
 use crate::backend::{Backend, BuiltinKind, CdcEvent, Value};
 use crate::clock::{duration_between, ClockHandle};
@@ -27,6 +27,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
 use hashbrown::HashMap;
+
+/// Default byte budget for one page of a re-read captured query.
+///
+/// A quarter of a mebibyte: large enough that a small result arrives in one
+/// page, small enough that a large one cannot exhaust memory before the caller
+/// sees anything.
+pub const DEFAULT_PAGE_BYTES: usize = 256 * 1024;
 use sql_traits::prelude::DatabaseLike;
 
 /// Result of [`AutoResolvingEngine::snapshot`]: the captured query's
@@ -49,8 +56,15 @@ pub enum SnapshotResult<B: Backend, C: crate::Checkpoint> {
 pub(super) struct ResolveContext<I: IdTypes, A> {
     /// Re-execution SQL produced by the plan.
     pub(super) sql: String,
-    /// Decode kind for the scalar result.
+    /// Decode kind for the scalar result. Meaningless for a whole re-read,
+    /// which has no single column.
     pub(super) column_kind: BuiltinKind,
+    /// Whether resolving means reading one scalar or re-reading every row.
+    /// The trigger does not say, and the two are resolved differently.
+    pub(super) whole_result: bool,
+    /// Which re-read the next page belongs to, so a consumer can tell a new
+    /// answer from a continuation of the old one.
+    pub(super) generation: u64,
     /// Session owning the query, used to drop contexts on
     /// [`unregister_session`](AutoResolvingEngine::unregister_session).
     pub(super) session: Option<I::SessionId>,
@@ -83,6 +97,11 @@ where
     inner: ReExecEngine<E, I, DB>,
     connector: X,
     contexts: HashMap<ReExecQueryId, ResolveContext<I, X::AuthContext>>,
+    /// Byte budget for one page of a re-read captured query.
+    ///
+    /// Bytes rather than rows because a row is not a bounded thing: one row
+    /// carrying a large text column is unbounded on its own.
+    max_page_bytes: usize,
     /// Optional [`Clock`](crate::Clock) used for per-query debounce.
     clock: Option<ClockHandle>,
     /// Minimum interval between two re-executions of the same captured
@@ -108,12 +127,25 @@ where
             connector,
             contexts: HashMap::new(),
             clock: None,
+            max_page_bytes: DEFAULT_PAGE_BYTES,
             debounce: None,
             last_reexec_at: HashMap::new(),
         }
     }
 
     /// Attach a [`Clock`](crate::Clock) for time-based decisions
+    /// Set the byte budget for one page of a re-read captured query.
+    ///
+    /// A smaller budget bounds memory and wire size per message at the cost of
+    /// more round trips. Defaults to [`DEFAULT_PAGE_BYTES`].
+    #[must_use]
+    pub const fn with_max_page_bytes(mut self, max_bytes: usize) -> Self {
+        // Zero would make no progress, and the read guarantees at least one row
+        // per page anyway, so clamp rather than accept a budget that lies.
+        self.max_page_bytes = if max_bytes == 0 { 1 } else { max_bytes };
+        self
+    }
+
     /// (per-query debounce). Defaults to no clock. Without one, debounce
     /// is silently disabled even if [`with_debounce_per_query`](Self::with_debounce_per_query)
     /// is set.
@@ -187,21 +219,40 @@ where
             SubscriptionScope::Durable => None,
         };
         let result = self.inner.register(spec)?;
-        if let Registered::ReExec {
-            query_id,
-            sql,
-            column_kind,
-        } = &result
-        {
-            self.contexts.insert(
-                *query_id,
-                ResolveContext {
-                    sql: sql.clone(),
-                    column_kind: *column_kind,
-                    session,
-                    auth,
-                },
-            );
+        match &result {
+            Registered::ReExec {
+                query_id,
+                sql,
+                column_kind,
+            } => {
+                self.contexts.insert(
+                    *query_id,
+                    ResolveContext {
+                        sql: sql.clone(),
+                        column_kind: *column_kind,
+                        whole_result: false,
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
+            }
+            Registered::Captured { query_id, sql, .. } => {
+                self.contexts.insert(
+                    *query_id,
+                    ResolveContext {
+                        sql: sql.clone(),
+                        // No single column to decode: the rows carry their own
+                        // shape, which is why `RowPage` reports column names.
+                        column_kind: BuiltinKind::String,
+                        whole_result: true,
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
+            }
+            Registered::Engine(_) => {}
         }
         Ok(result)
     }
@@ -268,6 +319,7 @@ where
         let ReExecNotifications {
             engine,
             mut scalar_updates,
+            mut rows_updates,
             triggers,
         } = self.inner.consumers(event).map_err(ReExecError::Dispatch)?;
 
@@ -283,6 +335,16 @@ where
                 "every captured query stores its resolve context at register time, \
                  trigger.query_id must exist in `contexts`",
             );
+            if ctx.whole_result {
+                let pages = self.reread(
+                    trigger.query_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                )?;
+                self.stamp_reexec(trigger.query_id);
+                rows_updates.extend(pages);
+                continue;
+            }
             // The connector also reports the position at which it took
             // the read (in `_db_checkpoint`), we ignore it here because
             // the ScalarUpdate is correlated with the *event* that
@@ -305,8 +367,72 @@ where
         Ok(ReExecNotifications {
             engine,
             scalar_updates,
+            rows_updates,
             triggers: Vec::new(),
         })
+    }
+
+    /// Re-read a captured query in full and hand back its pages.
+    ///
+    /// Every page comes from one cursor in one transaction, which is what makes
+    /// the pages add up to a single instant. A keyed result could instead be
+    /// paged statelessly through [`Connector::read_page`], avoiding the
+    /// transaction, and that is an optimisation to add per shape rather than a
+    /// different delivered contract: these same pages, same generation, same
+    /// `more`.
+    fn reread(
+        &mut self,
+        query_id: ReExecQueryId,
+        consumer_id: I::ConsumerId,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> Result<Vec<RowsUpdate<I, E::Backend, E::Checkpoint>>, ReExecError<X::Error>> {
+        let ctx = self.contexts.get_mut(&query_id).expect(
+            "every captured query stores its resolve context at register time, \
+             query_id must exist in `contexts`",
+        );
+        let sql = ctx.sql.clone();
+        // Bump first: a re-read that fails part way through must not let a
+        // later one reuse the generation its partial pages carried.
+        ctx.generation = ctx.generation.saturating_add(1);
+        let generation = ctx.generation;
+
+        let cursor = self
+            .connector
+            .open_cursor(&sql, &self.contexts[&query_id].auth)
+            .map_err(ReExecError::Cursor)?;
+
+        let mut pages = Vec::new();
+        let outcome = (|| -> Result<(), ReExecError<X::Error>> {
+            loop {
+                let page = self
+                    .connector
+                    .fetch_cursor(cursor, self.max_page_bytes)
+                    .map_err(ReExecError::Cursor)?;
+                let more = page.value.more;
+                pages.push(RowsUpdate {
+                    query_id,
+                    consumer_id,
+                    generation,
+                    columns: page.value.columns,
+                    rows: page.value.rows,
+                    more,
+                    checkpoint: checkpoint.cloned(),
+                });
+                if !more {
+                    return Ok(());
+                }
+            }
+        })();
+
+        // Close either way: a cursor left open holds a transaction and a
+        // pooled connection, so an error must not leak both.
+        let closed = self
+            .connector
+            .close_cursor(cursor)
+            .map_err(ReExecError::Cursor);
+        outcome?;
+        closed?;
+        Ok(pages)
     }
 
     /// Batch variant of [`consumers`](Self::consumers).
@@ -558,7 +684,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         // Bootstrap: model = {1=>5.0}. Current MIN = 5.0.
         assert!(e.install(qid, Value::Float(5.0)));
@@ -595,7 +721,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid, Value::Float(10.0)));
 
@@ -617,7 +743,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid, Value::Float(5.0)));
 
@@ -641,7 +767,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
 
         // No bootstrap install: snapshot does it.
@@ -690,7 +816,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         // Bootstrap: extreme is 5.0.
         assert!(e.install(qid, Value::Float(5.0)));
@@ -736,7 +862,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid, Value::Float(5.0)));
 
@@ -767,7 +893,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec for MIN"),
+            other => panic!("expected ReExec for MIN, got {other:?}"),
         };
         let qid2 = match e
             .register(
@@ -777,7 +903,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec for MAX"),
+            other => panic!("expected ReExec for MAX, got {other:?}"),
         };
         // Bootstrap both at 7.0 so deleting price=7.0 displaces both.
         assert!(e.install(qid1, Value::Float(7.0)));
@@ -821,7 +947,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid, Value::Float(5.0)));
 
@@ -873,7 +999,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid, Value::Float(5.0)));
 
@@ -900,7 +1026,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert_eq!(e.contexts.len(), 1);
         assert!(e.unregister_reexec_query(qid));

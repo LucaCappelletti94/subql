@@ -238,6 +238,8 @@ impl<B: Backend> MaintainedQuery<B> for MinMaxQuery<B> {
 /// `install`ed identically by the Subscription Materializer.
 pub(super) enum QueryRuntime<B: Backend> {
     Partial(MinMaxQuery<B>),
+    /// Re-read in full on any relevant change, holding nothing.
+    Total(TotalQuery),
 }
 
 impl<B: Backend> QueryRuntime<B> {
@@ -248,20 +250,71 @@ impl<B: Backend> QueryRuntime<B> {
     {
         match self {
             Self::Partial(q) => q.on_event(event, vm, db),
+            Self::Total(q) => q.on_event(event, vm, db),
         }
     }
 
     pub(super) fn install(&mut self, value: Value<B>) {
         match self {
             Self::Partial(q) => q.install(value),
+            Self::Total(q) => MaintainedQuery::<B>::install(q, value),
         }
     }
 
     pub(super) fn dependency_columns(&self) -> &[ColumnId] {
         match self {
             Self::Partial(q) => q.dependency_columns(),
+            Self::Total(q) => MaintainedQuery::<B>::dependency_columns(q),
         }
     }
 }
 
 // Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
+
+/// A query whose answer subql cannot maintain at all, only re-read.
+///
+/// The catch-all tier: a filter the in-process predicate language cannot
+/// evaluate, a `DISTINCT`, a set operation, a computed projection. Every event
+/// touching a table it reads means the answer may have moved, and since nothing
+/// about the answer is held there is nothing to compare against, so the honest
+/// response to every event is [`Maintenance::NeedsReexecution`].
+///
+/// Holding no state is the point rather than a shortcut: the alternative is a
+/// copy of every captured result set in memory, which is the cost that was
+/// declined when whole-result delivery was chosen over difference delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TotalQuery {
+    /// Every column of every table the query reads.
+    ///
+    /// A computed projection can depend on any column, so narrowing this would
+    /// mean guessing which UPDATEs matter. The UPDATE filter in the engine
+    /// treats an empty list as "nothing depends on anything" and skips the
+    /// event, so this must be the full set rather than empty.
+    dependency_columns: Vec<crate::ColumnId>,
+}
+
+impl TotalQuery {
+    pub(super) const fn new(dependency_columns: Vec<crate::ColumnId>) -> Self {
+        Self { dependency_columns }
+    }
+}
+
+impl<B: Backend> MaintainedQuery<B> for TotalQuery {
+    fn on_event<E: crate::backend::CdcEvent<Backend = B>, DB: DatabaseLike>(
+        &mut self,
+        _event: &E,
+        _vm: &mut crate::compiler::Vm<B>,
+        _database: &DB,
+    ) -> Maintenance<B> {
+        Maintenance::NeedsReexecution
+    }
+
+    fn install(&mut self, _value: Value<B>) {
+        // Nothing to install: the tier holds no answer, so a re-read is
+        // delivered to the consumer rather than stored here.
+    }
+
+    fn dependency_columns(&self) -> &[crate::ColumnId] {
+        &self.dependency_columns
+    }
+}

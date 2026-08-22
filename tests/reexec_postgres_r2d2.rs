@@ -110,7 +110,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
         .expect("captured registration")
     {
         Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        other => panic!("expected ReExec, got {other:?}"),
     };
 
     // Snapshot: must come back with value=5.0 and a non-zero LSN.
@@ -232,4 +232,100 @@ fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
         connector.fetch_cursor(CursorId(9999), 96),
         Err(CursorError::Unknown(_))
     ));
+}
+
+/// End to end for the whole-re-read tier: a query the engine refuses because
+/// its filter is outside the predicate language is captured instead, and a
+/// change to the table it reads delivers the answer again as pages.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
+    use subql::reexec::Registered;
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let mut conn_setup = common::pg_connect(port);
+    let mut conn_dml = common::pg_connect(port);
+    // Enough rows that the answer cannot fit one page, so the test exercises
+    // paging rather than trivially passing on a single page.
+    let seed: Vec<(i64, f64)> = (1..=40_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn_setup, &seed);
+
+    // `lower(status)` is a function call, which the in-process predicate
+    // language cannot evaluate, so the engine refuses and the wrapper captures.
+    let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(64);
+    let registered = engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT id, status FROM orders WHERE lower(status) = 'paid' ORDER BY id",
+            ),
+            (),
+        )
+        .expect("a filter outside the language is captured, not refused");
+    let (query_id, tables) = match registered {
+        Registered::Captured {
+            query_id, tables, ..
+        } => (query_id, tables),
+        other => panic!("expected a whole-re-read capture, got {other:?}"),
+    };
+    assert_eq!(tables.len(), 1, "one table triggers this query");
+
+    // A change to that table means the answer may have moved.
+    sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (41, 1.0, 1, 'paid')")
+        .execute(&mut conn_dml)
+        .expect("insert");
+    let msgs = common::drain_slot(&mut conn_setup, SLOT);
+    let mut events: Vec<MessageV2> = Vec::new();
+    for msg in &msgs {
+        events.extend(parse_message(msg));
+    }
+    assert_eq!(events.len(), 1, "expected one INSERT event");
+
+    let mut delivered: Vec<i64> = Vec::new();
+    let mut generations = Vec::new();
+    let mut finals = 0;
+    let mut pages = 0;
+    for event in &events {
+        let notifications = engine.consumers(event).expect("dispatch");
+        for update in &notifications.rows_updates {
+            assert_eq!(update.query_id, query_id);
+            generations.push(update.generation);
+            pages += 1;
+            if !update.more {
+                finals += 1;
+            }
+            for row in &update.rows {
+                match row[0] {
+                    Value::Int(id) => delivered.push(id),
+                    ref other => panic!("id should decode as an integer, got {other:?}"),
+                }
+            }
+        }
+        assert!(
+            notifications.scalar_updates.is_empty(),
+            "this tier delivers rows, not a scalar"
+        );
+    }
+
+    delivered.sort_unstable();
+    assert_eq!(
+        delivered,
+        (1..=41_i64).collect::<Vec<_>>(),
+        "the answer is delivered again in full, including the new row"
+    );
+    assert!(
+        pages > 1,
+        "a 41-row answer does not fit one 64-byte page, got {pages}"
+    );
+    assert_eq!(finals, 1, "exactly one page closes the re-read");
+    assert!(
+        generations.windows(2).all(|w| w[0] == w[1]),
+        "pages of one re-read share a generation, got {generations:?}"
+    );
+    assert_eq!(generations.first().copied(), Some(1), "the first re-read");
 }

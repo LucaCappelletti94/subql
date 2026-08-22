@@ -187,7 +187,7 @@ fn engine_with_first_n_queries(n: usize, cap: usize, delay: Duration) -> (Engine
             .unwrap();
         let qid = match registered {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec capture for `{sql}`"),
+            other => panic!("expected ReExec capture for `{sql}`, got {other:?}"),
         };
         assert!(engine.install(qid, install_value()));
     }

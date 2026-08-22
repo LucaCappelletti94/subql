@@ -123,7 +123,7 @@ pub use async_diesel::DieselAsyncError;
 pub use async_diesel::MysqlAsyncDieselConnector;
 #[cfg(feature = "executor-diesel-async-postgres")]
 pub use async_diesel::PgAsyncDieselConnector;
-pub use auto::{AutoResolvingEngine, SnapshotResult};
+pub use auto::{AutoResolvingEngine, SnapshotResult, DEFAULT_PAGE_BYTES};
 #[cfg(feature = "executor-diesel-mysql")]
 pub use connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]

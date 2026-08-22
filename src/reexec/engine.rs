@@ -36,7 +36,10 @@ struct ReExecEntry<I: IdTypes, B: Backend> {
     /// Session owning the query, if session-scoped (for cleanup).
     session: Option<I::SessionId>,
     /// Table the query reads from (routing + cleanup).
-    table_id: TableId,
+    /// Every table whose changes route to this query. One for a scalar
+    /// aggregate, one per referenced table for a whole re-read, and removal
+    /// walks all of them so a multi-table capture leaves no stale routing.
+    tables: Vec<TableId>,
     /// In-process maintenance state machine.
     runtime: QueryRuntime<B>,
 }
@@ -59,6 +62,22 @@ pub enum Registered {
         /// Decode hint for the scalar result.
         column_kind: crate::backend::BuiltinKind,
     },
+    /// The query was captured to be re-read whole. Nothing about its answer
+    /// is maintained in process, so every change to a table it reads produces
+    /// a fresh read delivered as pages.
+    ///
+    /// Reported rather than folded into [`Self::ReExec`] because the two cost
+    /// wildly different things per change, and a caller metering its database
+    /// needs to know which it got.
+    Captured {
+        /// Wrapper-assigned id for the captured query.
+        query_id: ReExecQueryId,
+        /// The statement, unchanged: this tier promises exactly the rows the
+        /// caller asked for.
+        sql: String,
+        /// Tables whose changes trigger a re-read.
+        tables: Vec<TableId>,
+    },
 }
 
 /// A re-executed scalar whose value changed, to be delivered to its
@@ -76,6 +95,34 @@ pub struct ScalarUpdate<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::No
     /// The new scalar value (`Value::Null` if the aggregate is now empty).
     pub value: Value<B>,
     /// Position of the event that produced this update, when known.
+    pub checkpoint: Option<C>,
+}
+
+/// One page of a re-read captured query, delivered to its consumer.
+///
+/// A whole-re-read capture holds no answer, so a change does not produce a
+/// delta: it produces the answer again, in pages. `generation` says which
+/// re-read a page belongs to and `more` says whether the re-read is finished,
+/// which together are what let a consumer replace what it had without ever
+/// showing a half-replaced answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowsUpdate<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
+    /// The captured query these rows answer.
+    pub query_id: ReExecQueryId,
+    /// Consumer that registered the query.
+    pub consumer_id: I::ConsumerId,
+    /// Which re-read this page belongs to, increasing by one per re-read.
+    ///
+    /// Pages of one re-read share a generation. A page carrying a higher one
+    /// starts a new answer, which is the signal to discard the previous.
+    pub generation: u64,
+    /// Column names as the database reported them, in projection order.
+    pub columns: Vec<String>,
+    /// This page's rows, in `columns` order.
+    pub rows: Vec<Vec<Value<B>>>,
+    /// Whether further pages of this same re-read follow.
+    pub more: bool,
+    /// Position of the event that triggered the re-read, when known.
     pub checkpoint: Option<C>,
 }
 
@@ -107,6 +154,8 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
     pub engine: ConsumerNotifications<I, C, B>,
     /// Scalar values that changed in-process (no DB round-trip).
     pub scalar_updates: Vec<ScalarUpdate<I, B, C>>,
+    /// Pages of re-read captured queries, in delivery order.
+    pub rows_updates: Vec<RowsUpdate<I, B, C>>,
     /// Queries whose maintenance could not resolve in-process. The
     /// materializer must re-execute and call [`ReExecEngine::install`].
     pub triggers: Vec<ReExecutionTrigger<I, C>>,
@@ -239,6 +288,21 @@ where
                         }
                         Ok(self.capture(plan, consumer_id, session))
                     }
+                    Ok(QueryPlan::Total(plan)) => {
+                        // Row-level security makes a shared answer unsafe for
+                        // the same reason it does for an aggregate: consumers
+                        // see different rows, and this tier holds one answer
+                        // per query rather than one per viewer.
+                        if let Some(table) = plan
+                            .tables
+                            .iter()
+                            .copied()
+                            .find(|t| table_has_rls(self.inner.database(), *t).unwrap_or(false))
+                        {
+                            return Err(RegisterError::AggregatorOnRlsTable { table_id: table });
+                        }
+                        Ok(self.capture_total(plan, consumer_id, session))
+                    }
                     // Not a re-executable query (build_plan rejected it):
                     // surface the engine's original rejection.
                     Err(_) => Err(RegisterError::UnsupportedSql(msg)),
@@ -294,7 +358,7 @@ where
             ReExecEntry {
                 consumer_id,
                 session,
-                table_id,
+                tables: alloc::vec![table_id],
                 runtime,
             },
         );
@@ -303,6 +367,48 @@ where
             query_id,
             sql: reexec_sql,
             column_kind: agg_kind,
+        }
+    }
+
+    /// Register a whole-re-read capture: route every table it reads to it, and
+    /// report the tables so a caller knows what will trigger a read.
+    fn capture_total(
+        &mut self,
+        plan: crate::reexec::plan::TotalPlan,
+        consumer_id: I::ConsumerId,
+        session: Option<I::SessionId>,
+    ) -> Registered {
+        let crate::reexec::plan::TotalPlan {
+            tables,
+            dependency_columns,
+            reexec_sql,
+        } = plan;
+
+        let query_id = self.next_id;
+        self.next_id += 1;
+
+        for table in &tables {
+            self.table_deps.entry(*table).or_default().insert(query_id);
+        }
+        if let Some(s) = session {
+            self.session_index.entry(s).or_default().push(query_id);
+        }
+        self.reexec.insert(
+            query_id,
+            ReExecEntry {
+                consumer_id,
+                session,
+                tables: tables.clone(),
+                runtime: QueryRuntime::Total(crate::reexec::maintain::TotalQuery::new(
+                    dependency_columns,
+                )),
+            },
+        );
+
+        Registered::Captured {
+            query_id,
+            sql: reexec_sql,
+            tables,
         }
     }
 
@@ -433,6 +539,9 @@ where
         Ok(ReExecNotifications {
             engine,
             scalar_updates,
+            // The trigger-emitting engine never reads the database, so a
+            // re-read's pages can only come from a resolving engine above it.
+            rows_updates: Vec::new(),
             triggers,
         })
     }
@@ -512,10 +621,12 @@ where
             return false;
         };
 
-        if let Some(set) = self.table_deps.get_mut(&entry.table_id) {
-            set.remove(&query_id);
-            if set.is_empty() {
-                self.table_deps.remove(&entry.table_id);
+        for table in &entry.tables {
+            if let Some(set) = self.table_deps.get_mut(table) {
+                set.remove(&query_id);
+                if set.is_empty() {
+                    self.table_deps.remove(table);
+                }
             }
         }
 

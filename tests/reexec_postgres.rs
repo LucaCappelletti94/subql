@@ -120,7 +120,7 @@ fn scaffold_registers_both_subscription_kinds() {
         .expect("engine-supported registration");
     match engine_reg {
         Registered::Engine(_) => {}
-        Registered::ReExec { .. } => panic!("expected Engine variant"),
+        other => panic!("expected the Engine variant, got {other:?}"),
     }
 
     let captured_reg = engine
@@ -133,7 +133,7 @@ fn scaffold_registers_both_subscription_kinds() {
         Registered::ReExec { query_id, .. } => {
             assert!(engine.install(query_id, Value::Float(5.0)));
         }
-        Registered::Engine(_) => panic!("expected ReExec variant"),
+        other => panic!("expected ReExec variant, got {other:?}"),
     }
 
     // Sanity: connector still callable (proves the PG connection survived
@@ -195,7 +195,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         .expect("captured registration")
     {
         Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        other => panic!("expected ReExec, got {other:?}"),
     };
     assert!(engine.install(captured_qid, Value::Float(5.0)));
 
@@ -298,7 +298,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
         .expect("captured registration")
     {
         Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        other => panic!("expected ReExec, got {other:?}"),
     };
     assert!(engine.install(captured_qid, Value::Float(5.0)));
 
@@ -350,7 +350,7 @@ fn snapshot_reads_value_and_lsn_from_pg() {
         .expect("captured registration")
     {
         Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        other => panic!("expected ReExec, got {other:?}"),
     };
 
     // Snapshot reads value + LSN inside a single transaction.

@@ -246,21 +246,38 @@ where
             SubscriptionScope::Durable => None,
         };
         let result = self.inner.register(spec)?;
-        if let Registered::ReExec {
-            query_id,
-            sql,
-            column_kind,
-        } = &result
-        {
-            self.contexts.insert(
-                *query_id,
-                ResolveContext {
-                    sql: sql.clone(),
-                    column_kind: *column_kind,
-                    session,
-                    auth,
-                },
-            );
+        match &result {
+            Registered::ReExec {
+                query_id,
+                sql,
+                column_kind,
+            } => {
+                self.contexts.insert(
+                    *query_id,
+                    ResolveContext {
+                        sql: sql.clone(),
+                        column_kind: *column_kind,
+                        whole_result: false,
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
+            }
+            Registered::Captured { query_id, sql, .. } => {
+                self.contexts.insert(
+                    *query_id,
+                    ResolveContext {
+                        sql: sql.clone(),
+                        column_kind: crate::backend::BuiltinKind::String,
+                        whole_result: true,
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
+            }
+            Registered::Engine(_) => {}
         }
         Ok(result)
     }
@@ -312,6 +329,7 @@ where
         let ReExecNotifications {
             engine,
             mut scalar_updates,
+            rows_updates,
             triggers,
         } = self.inner.consumers(event).map_err(ReExecError::Dispatch)?;
 
@@ -325,6 +343,7 @@ where
             return Ok(ReExecNotifications {
                 engine,
                 scalar_updates,
+                rows_updates,
                 triggers: Vec::new(),
             });
         }
@@ -378,6 +397,7 @@ where
         Ok(ReExecNotifications {
             engine,
             scalar_updates,
+            rows_updates,
             triggers: Vec::new(),
         })
     }
@@ -706,7 +726,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
 
         // Snapshot bootstraps. Future is Send-bound and ready immediately.
@@ -746,7 +766,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid, Value::Float(10.0)));
 
@@ -778,7 +798,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid, Value::Float(5.0)));
 
@@ -802,7 +822,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid, Value::Float(5.0)));
 
@@ -842,7 +862,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec for MIN"),
+            other => panic!("expected ReExec for MIN, got {other:?}"),
         };
         let qid2 = match e
             .register(
@@ -852,7 +872,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec for MAX"),
+            other => panic!("expected ReExec for MAX, got {other:?}"),
         };
         assert!(e.install(qid1, Value::Float(7.0)));
         assert!(e.install(qid2, Value::Float(7.0)));
@@ -879,7 +899,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert_eq!(e.contexts.len(), 1);
         assert!(e.unregister_reexec_query(qid));
@@ -940,7 +960,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         let qid2 = match e
             .register(
@@ -950,7 +970,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid1, Value::Float(7.0)));
         assert!(e.install(qid2, Value::Float(7.0)));
@@ -979,7 +999,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         let qid2 = match e
             .register(
@@ -989,7 +1009,7 @@ mod tests {
             .unwrap()
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(e.install(qid1, Value::Float(7.0)));
         assert!(e.install(qid2, Value::Float(7.0)));
@@ -1023,7 +1043,7 @@ mod tests {
                     .unwrap()
                 {
                     Registered::ReExec { query_id, .. } => query_id,
-                    Registered::Engine(_) => panic!("expected ReExec"),
+                    other => panic!("expected ReExec, got {other:?}"),
                 }
             })
             .collect();

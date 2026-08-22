@@ -107,7 +107,7 @@ fn scaffold_registers_both_and_executes_scalar() {
         .expect("engine-supported registration");
     match engine_reg {
         Registered::Engine(_) => {}
-        Registered::ReExec { .. } => panic!("expected Engine variant"),
+        other => panic!("expected the Engine variant, got {other:?}"),
     }
 
     let captured_reg = engine
@@ -120,7 +120,7 @@ fn scaffold_registers_both_and_executes_scalar() {
         Registered::ReExec { query_id, .. } => {
             assert!(engine.install(query_id, Value::Float(5.0)));
         }
-        Registered::Engine(_) => panic!("expected ReExec variant"),
+        other => panic!("expected ReExec variant, got {other:?}"),
     }
 
     let (value, _checkpoint) = engine
@@ -152,7 +152,7 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql() {
         .expect("captured registration")
     {
         Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        other => panic!("expected ReExec, got {other:?}"),
     };
 
     let snap = engine
@@ -198,7 +198,7 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
         .expect("captured registration")
     {
         Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        other => panic!("expected ReExec, got {other:?}"),
     };
     assert!(engine.install(captured_qid, Value::Float(5.0)));
 

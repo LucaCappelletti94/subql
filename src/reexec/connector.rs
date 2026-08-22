@@ -312,6 +312,12 @@ pub enum ReExecError<E> {
     /// batch is aborted. The caller is expected to retry it.
     #[error("connector failed: {0}")]
     Connector(E),
+    /// A cursor read failed, or the connector holds no cursors and so cannot
+    /// serve a captured query that has to be re-read whole. Kept apart from
+    /// [`Self::Connector`] because "this connector cannot do that" is a
+    /// configuration answer and a failed read is a retry answer.
+    #[error("cursor read failed: {0}")]
+    Cursor(CursorError<E>),
 }
 
 /// Error from [`Connector::execute_scalar_row`] and its async peer.

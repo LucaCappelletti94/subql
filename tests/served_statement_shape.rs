@@ -173,28 +173,34 @@ fn an_accepted_aggregate_seeds_from_the_statement_it_maintains() {
     );
 }
 
-/// The re-execution wrapper reaches a statement only through the core engine's
-/// refusal, and it re-renders the captured statement to run it. A dropped
-/// clause riding along would make that re-execution answer a different query
-/// than the one being maintained: `GROUP BY` returns one row per group where
-/// the wrapper reads a scalar.
+/// A dropped clause must never ride a *scalar* re-execution. That would make
+/// the re-run answer a different query than the one being read: `GROUP BY`
+/// returns one row per group where a scalar read takes one value.
+///
+/// These statements are captured rather than refused now, because the
+/// whole-re-read tier re-runs them verbatim and delivers every row they ask
+/// for, which is correct rather than silently wrong. The invariant this pins is
+/// therefore about which tier they land in, not about being rejected: the core
+/// engine still refuses them, and the wrapper never treats them as scalars.
 #[test]
-fn the_reexecution_wrapper_does_not_resurrect_a_dropped_clause() {
-    for (sql, clause) in [
-        ("SELECT MIN(amount) FROM t GROUP BY status", "GROUP BY"),
-        ("SELECT MAX(amount) FROM t HAVING COUNT(*) > 1", "HAVING"),
-        ("SELECT MIN(amount) FROM t ORDER BY amount", "ORDER BY"),
-        ("SELECT MIN(amount) FROM t LIMIT 1", "LIMIT"),
+fn a_dropped_clause_never_rides_a_scalar_reexecution() {
+    for sql in [
+        "SELECT MIN(amount) FROM t GROUP BY status",
+        "SELECT MAX(amount) FROM t HAVING COUNT(*) > 1",
+        "SELECT MIN(amount) FROM t ORDER BY amount",
+        "SELECT MIN(amount) FROM t LIMIT 1",
     ] {
+        // The core engine's refusal is what routes it upward at all.
+        refused_naming(sql, "not supported");
+
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
         let mut wrapper: Wrapper =
             ReExecEngine::new(SubscriptionEngine::new(db, PostgreSqlDialect {}));
         match wrapper.register(SubscriptionRequest::new(1u64, sql)) {
-            Err(RegisterError::UnsupportedSql(message)) => assert!(
-                message.contains(clause),
-                "the refusal of {sql} should name {clause}, got {message:?}"
-            ),
-            other => panic!("{sql} should be refused, got {other:?}"),
+            Ok(Registered::Captured { sql: captured, .. }) => {
+                assert_eq!(captured, sql, "the tier re-reads the statement as written");
+            }
+            other => panic!("{sql} should be captured for a whole re-read, got {other:?}"),
         }
     }
 }

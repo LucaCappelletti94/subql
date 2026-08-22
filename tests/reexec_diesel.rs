@@ -101,7 +101,7 @@ fn register_min(e: &mut Engine, bootstrap: Value<Postgres>) -> u64 {
         .unwrap()
     {
         Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+        other => panic!("expected ReExec, got Engine, got {other:?}"),
     };
     assert!(e.install(qid, bootstrap));
     qid

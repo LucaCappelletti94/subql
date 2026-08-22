@@ -453,7 +453,7 @@ pub(crate) fn extract_scalar_aggregate<DB: DatabaseLike>(
 ///
 /// Encapsulates the common sequence: length / sanity check -> parse ->
 /// single-statement assertion.
-pub(super) fn parse_single_statement(
+pub(crate) fn parse_single_statement(
     sql: &str,
     dialect: &dyn sqlparser::dialect::Dialect,
 ) -> Result<sqlparser::ast::Statement, crate::RegisterError> {

@@ -120,7 +120,7 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql_async() {
             .expect("captured registration")
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
 
         let snap = engine
@@ -173,7 +173,7 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
             .expect("captured registration")
         {
             Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert!(engine.install(captured_qid, Value::Float(5.0)));
 

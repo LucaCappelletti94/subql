@@ -225,9 +225,9 @@ proptest! {
                     "reexec SQL was empty for `{sql}`",
                 );
             }
-            Registered::Engine(_) => {
+            other => {
                 return Err(TestCaseError::Fail(
-                    format!("`{sql}` should not be engine-handled but was").into(),
+                    format!("`{sql}` should classify as a scalar ReExec, got {other:?}").into(),
                 ));
             }
         }

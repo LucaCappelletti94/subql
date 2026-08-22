@@ -709,7 +709,7 @@ impl RlsGuardCell {
             Ok(Registered::Engine(_)) => {
                 let _ = self.plain_engine.unregister_query(consumer, plain_flavor);
             }
-            Ok(Registered::ReExec { query_id, .. }) => {
+            Ok(Registered::ReExec { query_id, .. } | Registered::Captured { query_id, .. }) => {
                 assert!(self.plain_engine.unregister_reexec_query(query_id));
             }
             Err(e) => panic!("`{plain_flavor}` without RLS must be accepted, got Err({e:?})"),
