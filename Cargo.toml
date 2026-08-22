@@ -529,7 +529,17 @@ observability = ["dep:tracing", "tracing/std"]
 # `std`, so a configuration that actually connects has it, which is why the
 # `std` that used to sit here read as necessary. The user activates their
 # backend on their own diesel dep.
-executor-diesel = ["dep:diesel"]
+# Row reading needs diesel's raw-value accessors, which sit behind the
+# third-party-backend flag, so a connector that decodes a returned row carries
+# it just as `diesel-typed` does for binds. The flag gates diesel's own API
+# surface only and pulls in no crate.
+executor-diesel = [
+    "dep:diesel",
+    "diesel?/chrono",
+    "diesel?/numeric",
+    "diesel?/serde_json",
+    "diesel?/i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+]
 # Opt-in: the diesel-typed subscription/follow API. Renders a typed diesel
 # query to placeholder SQL plus a list of bind `Value<B>`s and registers it
 # via the string+binds core. This base feature covers the Postgres backend
@@ -573,7 +583,7 @@ diesel-typed-mysql = [
 # through this connector carry a `PgLsn` checkpoint read from
 # `pg_current_wal_lsn()` inside the same transaction as the user query,
 # so the snapshot value and the LSN agree on a single point in the WAL.
-executor-diesel-postgres = ["executor-diesel", "diesel?/postgres"]
+executor-diesel-postgres = ["executor-diesel", "diesel?/postgres", "diesel?/uuid"]
 # Opt-in: ship `PgR2D2DieselConnector`, the pool-backed analogue of
 # `PgDieselConnector`. Wraps `r2d2::Pool<ConnectionManager<PgConnection>>`,
 # is `Send + Sync`, and reads `pg_current_wal_lsn()` inside the same

@@ -84,6 +84,12 @@ mod term_compile;
 pub mod visibility;
 pub mod wal;
 
+// Value decoding shared by the diesel-typed query API and the diesel-backed
+// re-execution connectors. Both need the same raw-value readers, so the
+// convention lives in one place rather than one per consumer.
+#[cfg(any(feature = "diesel-typed", feature = "executor-diesel"))]
+pub mod diesel_decode;
+
 // Diesel-typed subscription and follow API. Only compiles when the
 // `diesel-typed` family of features pulls in `diesel` with the third-party
 // backend hooks its `BindDecode` impls need.
