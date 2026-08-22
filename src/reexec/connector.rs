@@ -932,6 +932,34 @@ impl Connector for MysqlDieselConnector {
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 pub struct PgR2D2DieselConnector {
     pool: r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
+    /// Cursors this connector holds open, each pinning one pooled connection
+    /// inside its own transaction until closed. A cursor is the only way pages
+    /// of a keyless result describe one instant, and holding a connection is
+    /// its price, which is why only the pooled connector offers it.
+    /// Locked per cursor rather than map-wide: a cursor is a serial resource,
+    /// so two reads of the same one must not interleave their `FETCH`es, but
+    /// reads of different cursors have no reason to wait on each other. A
+    /// single map-wide lock held across a round trip would make them.
+    cursors: parking_lot::Mutex<
+        hashbrown::HashMap<CursorId, alloc::sync::Arc<parking_lot::Mutex<PgCursor>>>,
+    >,
+    next_cursor: core::sync::atomic::AtomicU64,
+}
+
+/// One open cursor: the connection it pins, the position its snapshot sits at,
+/// and rows already fetched but not yet delivered.
+///
+/// The leftover buffer is what keeps the byte budget exact. `FETCH` cannot be
+/// undone, so a batch that overshoots the budget would otherwise have to be
+/// returned whole or thrown away; carrying the remainder into the next page
+/// does neither.
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+struct PgCursor {
+    conn: r2d2::PooledConnection<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
+    name: String,
+    checkpoint: Option<crate::PgLsn>,
+    columns: alloc::vec::Vec<String>,
+    leftover: alloc::collections::VecDeque<alloc::vec::Vec<Value<crate::backend::Postgres>>>,
 }
 
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
@@ -939,10 +967,12 @@ impl PgR2D2DieselConnector {
     /// Wrap an `r2d2::Pool` already configured by the caller (max size,
     /// connection timeout, etc.).
     #[must_use]
-    pub const fn new(
-        pool: r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
-    ) -> Self {
-        Self { pool }
+    pub fn new(pool: r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>) -> Self {
+        Self {
+            pool,
+            cursors: parking_lot::Mutex::new(hashbrown::HashMap::new()),
+            next_cursor: core::sync::atomic::AtomicU64::new(1),
+        }
     }
 }
 
@@ -1047,6 +1077,138 @@ impl Connector for PgR2D2DieselConnector {
             Ok((values, lsn))
         });
         result.map_err(|e| ScalarRowError::Connector(e.into()))
+    }
+
+    fn open_cursor(&self, sql: &str, _auth: &()) -> Result<CursorId, CursorError<Self::Error>> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| CursorError::Connector(PgR2D2Error::Pool(e)))?;
+        let id = CursorId(
+            self.next_cursor
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+        );
+        let name = alloc::format!("subql_cursor_{}", id.0);
+
+        // Transaction control and `DECLARE CURSOR` have no query-DSL spelling,
+        // and the transaction has to outlive this call, so diesel's scoped
+        // `transaction` closure cannot express it either.
+        let opened = (|| -> QueryResult<Option<crate::PgLsn>> {
+            diesel::sql_query("BEGIN").execute(&mut *conn)?;
+            diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *conn)?;
+            diesel::sql_query(alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {sql}"))
+                .execute(&mut *conn)?;
+            read_current_lsn(&mut conn)
+        })();
+
+        let checkpoint = match opened {
+            Ok(lsn) => lsn,
+            Err(e) => {
+                // Leave no transaction behind on a failed open.
+                let _ = diesel::sql_query("ROLLBACK").execute(&mut *conn);
+                return Err(CursorError::Connector(PgR2D2Error::Diesel(e)));
+            }
+        };
+
+        self.cursors.lock().insert(
+            id,
+            alloc::sync::Arc::new(parking_lot::Mutex::new(PgCursor {
+                conn,
+                name,
+                checkpoint,
+                columns: alloc::vec::Vec::new(),
+                leftover: alloc::collections::VecDeque::new(),
+            })),
+        );
+        Ok(id)
+    }
+
+    fn fetch_cursor(
+        &self,
+        cursor: CursorId,
+        max_bytes: usize,
+    ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, CursorError<Self::Error>> {
+        /// Rows per `FETCH`. Overshoot is carried into the next page rather
+        /// than discarded, so this trades round trips against buffered rows
+        /// and never against correctness.
+        const BATCH: usize = 64;
+
+        let entry = self
+            .cursors
+            .lock()
+            .get(&cursor)
+            .map(alloc::sync::Arc::clone)
+            .ok_or(CursorError::Unknown(cursor))?;
+        let held = &mut *entry.lock();
+
+        let mut rows: alloc::vec::Vec<alloc::vec::Vec<Value<crate::backend::Postgres>>> =
+            alloc::vec::Vec::new();
+        let mut spent = 0_usize;
+        loop {
+            while let Some(row) = held.leftover.front() {
+                let cost = RowPage::<crate::backend::Postgres>::row_bytes_of(row);
+                if !rows.is_empty() && spent + cost > max_bytes {
+                    return Ok(Snapshot {
+                        value: RowPage {
+                            columns: held.columns.clone(),
+                            rows,
+                            more: true,
+                        },
+                        checkpoint: held.checkpoint,
+                    });
+                }
+                spent += cost;
+                // Total: `front` just answered `Some`.
+                if let Some(row) = held.leftover.pop_front() {
+                    rows.push(row);
+                }
+            }
+            let page = load_page::<_, crate::backend::Postgres>(
+                &mut held.conn,
+                &alloc::format!("FETCH FORWARD {BATCH} FROM {}", held.name),
+                usize::MAX,
+            )
+            .map_err(|e| CursorError::Connector(PgR2D2Error::Diesel(e)))?;
+            if held.columns.is_empty() {
+                held.columns = page.columns;
+            }
+            // An empty batch is the cursor's own end-of-result signal, so the
+            // loop's exit depends on what the database said rather than on a
+            // short-batch guess. A guess costs one round trip when it is right
+            // and a hang when it is wrong, which is a bad trade for a loop.
+            let fetched = page.rows.len();
+            held.leftover.extend(page.rows);
+            if fetched == 0 {
+                return Ok(Snapshot {
+                    value: RowPage {
+                        columns: held.columns.clone(),
+                        rows,
+                        more: false,
+                    },
+                    checkpoint: held.checkpoint,
+                });
+            }
+        }
+    }
+
+    fn close_cursor(&self, cursor: CursorId) -> Result<(), CursorError<Self::Error>> {
+        // Idempotent: an already-closed cursor is not an error, so an
+        // abandoned read cannot leak a transaction through a double close.
+        let Some(entry) = self.cursors.lock().remove(&cursor) else {
+            return Ok(());
+        };
+        let held = &mut *entry.lock();
+        let closed = diesel::sql_query(alloc::format!("CLOSE {}", held.name))
+            .execute(&mut *held.conn)
+            .and_then(|_| diesel::sql_query("COMMIT").execute(&mut *held.conn));
+        match closed {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = diesel::sql_query("ROLLBACK").execute(&mut *held.conn);
+                Err(CursorError::Connector(PgR2D2Error::Diesel(e)))
+            }
+        }
     }
 }
 

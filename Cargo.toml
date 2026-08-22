@@ -448,6 +448,11 @@ tokio = { version = "1", optional = true, features = ["sync", "rt", "macros", "t
 tokio-util = { version = "0.7", optional = true }
 bytes = { version = "1", default-features = false }
 
+# Non-poisoning lock guarding the cursors the pooled connector holds open.
+# The workspace rs-parking-lot rule bans `std::sync::Mutex` where the guard
+# would be unwrapped, and a cursor map is exactly that shape.
+parking_lot = { version = "0.12", optional = true }
+
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -600,6 +605,7 @@ executor-diesel-postgres = ["executor-diesel", "diesel?/postgres", "diesel?/uuid
 executor-diesel-postgres-r2d2 = [
     "executor-diesel-postgres",
     "dep:r2d2",
+    "dep:parking_lot",
     "diesel?/r2d2",
 ]
 # Opt-in: ship the `patchset::PgAdapter` and the

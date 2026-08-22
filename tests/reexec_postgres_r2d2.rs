@@ -163,3 +163,73 @@ fn r2d2_connector_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<PgR2D2DieselConnector>();
 }
+
+/// Pages of a keyless result come from one cursor in one transaction, which is
+/// the only way successive pages describe a single instant. Asserts the whole
+/// lifecycle against real Postgres: every row arrives exactly once across
+/// pages, the byte budget bounds each page, the last page says so, and a
+/// concurrent write is invisible because the snapshot predates it.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
+    use subql::reexec::{Connector, CursorError, CursorId};
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let mut conn_setup = common::pg_connect(port);
+    let seed: Vec<(i64, f64)> = (1..=40_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn_setup, &seed);
+
+    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    // DISTINCT has no key to resume from, which is what cursors exist for.
+    let cursor = connector
+        .open_cursor("SELECT DISTINCT id, status FROM orders ORDER BY id", &())
+        .expect("open cursor");
+
+    // A write committed after the cursor opened must not appear in its pages.
+    let mut conn_dml = common::pg_connect(port);
+    sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (999, 1.0, 1, 'late')")
+        .execute(&mut conn_dml)
+        .expect("concurrent insert");
+
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = connector.fetch_cursor(cursor, 96).expect("fetch page");
+        pages += 1;
+        assert!(
+            page.checkpoint.is_some(),
+            "a cursor's pages carry the snapshot's position"
+        );
+        for row in &page.value.rows {
+            match row[0] {
+                Value::Int(id) => ids.push(id),
+                ref other => panic!("id should decode as an integer, got {other:?}"),
+            }
+        }
+        if !page.value.more {
+            break;
+        }
+        assert!(pages < 100, "the cursor should finish");
+    }
+
+    assert!(pages > 1, "a 40-row result should not fit one 96-byte page");
+    assert_eq!(ids, (1..=40).collect::<Vec<_>>(), "every row, exactly once");
+
+    connector.close_cursor(cursor).expect("close cursor");
+    // Closing twice is not an error, so an abandoned read cannot leak a
+    // transaction through a double close.
+    connector.close_cursor(cursor).expect("close is idempotent");
+    assert!(matches!(
+        connector.fetch_cursor(cursor, 96),
+        Err(CursorError::Unknown(_))
+    ));
+    assert!(matches!(
+        connector.fetch_cursor(CursorId(9999), 96),
+        Err(CursorError::Unknown(_))
+    ));
+}
