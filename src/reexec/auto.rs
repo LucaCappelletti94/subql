@@ -45,8 +45,21 @@ use sql_traits::prelude::DatabaseLike;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SnapshotResult<B: Backend, C: crate::Checkpoint> {
-    /// Single-table scalar (today's only flavor): a `MIN`/`MAX` value.
+    /// A scalar captured query: a `MIN`/`MAX` value.
     Scalar(Value<B>, Option<C>),
+    /// A whole-re-read captured query: its answer, in pages, all read from one
+    /// snapshot so they describe a single instant.
+    ///
+    /// Every page carries that snapshot's position, so a caller can anchor the
+    /// answer to the change stream and know which events follow it.
+    Rows {
+        /// Column names as the database reported them, in projection order.
+        columns: Vec<String>,
+        /// Every row of the answer, in `columns` order, pages concatenated.
+        rows: Vec<Vec<Value<B>>>,
+        /// Position the snapshot was read at, when the connector reports one.
+        checkpoint: Option<C>,
+    },
 }
 
 /// Per-query state needed to drive an automatic re-execution.
@@ -268,15 +281,17 @@ where
     /// connector and installing the result.
     ///
     /// Returns a [`SnapshotResult`] tagged with the connector's
-    /// [`Checkpoint`](Connector::Checkpoint). Today every captured query
-    /// is a scalar (single-table `MIN`/`MAX`), so the variant is always
-    /// `Scalar`. The enum leaves room for the future single-table row
-    /// re-execution flavor without a breaking-bump.
+    /// [`Checkoint`](Connector::Checkpoint): `Scalar` for a scalar capture,
+    /// `Rows` for one that is re-read whole.
     ///
-    /// The value is also installed via [`ReExecEngine::install`], so the
-    /// engine is fully primed once this returns. Subsequent
-    /// [`consumers`](Self::consumers) calls see the snapshot as the
-    /// starting state.
+    /// Without this a whole-re-read subscription would deliver nothing until
+    /// something happened to change a table it reads, so a caller registering
+    /// against a quiet database would sit empty holding a correct answer it
+    /// had never been told.
+    ///
+    /// A scalar's value is also installed via [`ReExecEngine::install`], so the
+    /// engine is fully primed once this returns. A whole re-read installs
+    /// nothing, because that tier holds no answer: the rows go to the caller.
     ///
     /// # Errors
     ///
@@ -291,12 +306,82 @@ where
         let Some(ctx) = self.contexts.get(&query_id) else {
             return Ok(None);
         };
+        if ctx.whole_result {
+            let sql = ctx.sql.clone();
+            let (columns, rows, checkpoint) = self.read_whole(&sql, query_id)?;
+            return Ok(Some(SnapshotResult::Rows {
+                columns,
+                rows,
+                checkpoint,
+            }));
+        }
         let (value, checkpoint) = self
             .connector
             .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
             .map_err(ReExecError::Connector)?;
         self.inner.install(query_id, value.clone());
         Ok(Some(SnapshotResult::Scalar(value, checkpoint)))
+    }
+
+    /// Read a captured query's whole answer from one cursor, concatenating its
+    /// pages.
+    ///
+    /// One snapshot for the lot, which is what makes the concatenation mean
+    /// something: pages from separate reads would describe no single instant.
+    /// The page budget still bounds each round trip, so a large answer is read
+    /// in bounded steps even though it is returned whole.
+    fn read_whole(
+        &self,
+        sql: &str,
+        query_id: ReExecQueryId,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<Vec<Value<E::Backend>>>,
+            Option<X::Checkpoint>,
+        ),
+        ReExecError<X::Error>,
+    > {
+        let auth = &self
+            .contexts
+            .get(&query_id)
+            .expect("the caller just read this context")
+            .auth;
+        let cursor = self
+            .connector
+            .open_cursor(sql, auth)
+            .map_err(ReExecError::Cursor)?;
+
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        let mut checkpoint = None;
+        let outcome = (|| -> Result<(), ReExecError<X::Error>> {
+            loop {
+                let page = self
+                    .connector
+                    .fetch_cursor(cursor, self.max_page_bytes)
+                    .map_err(ReExecError::Cursor)?;
+                if columns.is_empty() {
+                    columns = page.value.columns;
+                }
+                checkpoint = page.checkpoint;
+                let more = page.value.more;
+                rows.extend(page.value.rows);
+                if !more {
+                    return Ok(());
+                }
+            }
+        })();
+
+        // Close either way: a cursor left open holds a transaction and a
+        // pooled connection, so an error must not leak both.
+        let closed = self
+            .connector
+            .close_cursor(cursor)
+            .map_err(ReExecError::Cursor);
+        outcome?;
+        closed?;
+        Ok((columns, rows, checkpoint))
     }
 
     /// Dispatch a CDC event.
@@ -778,6 +863,7 @@ mod tests {
                 // MockConnector returns checkpoint = None.
                 assert!(checkpoint.is_none());
             }
+            other => panic!("a scalar capture snapshots as a scalar, got {other:?}"),
         }
         assert_eq!(e.connector().call_count(), 1);
 

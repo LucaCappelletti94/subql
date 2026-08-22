@@ -329,3 +329,141 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
     );
     assert_eq!(generations.first().copied(), Some(1), "the first re-read");
 }
+
+/// A captured query has an answer before anything changes. Without a bootstrap
+/// a subscription against a quiet database sits empty holding a correct answer
+/// it was never told, which is a worse failure than a refusal because it looks
+/// like success.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_captured_query_snapshots_its_answer_at_registration() {
+    use subql::reexec::{Registered, SnapshotResult};
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let mut conn_setup = common::pg_connect(port);
+    let seed: Vec<(i64, f64)> = (1..=30_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn_setup, &seed);
+
+    let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(64);
+    let query_id = match engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT id, status FROM orders WHERE lower(status) = 'paid' ORDER BY id",
+            ),
+            (),
+        )
+        .expect("captured registration")
+    {
+        Registered::Captured { query_id, .. } => query_id,
+        other => panic!("expected a whole-re-read capture, got {other:?}"),
+    };
+
+    let snapshot = engine
+        .snapshot(query_id)
+        .expect("snapshot reads")
+        .expect("the query exists");
+    match snapshot {
+        SnapshotResult::Rows {
+            columns,
+            rows,
+            checkpoint,
+        } => {
+            assert_eq!(columns, vec!["id", "status"]);
+            // Every row, though the budget forced several round trips to get
+            // them, and all from one snapshot so concatenating them is sound.
+            let ids: Vec<i64> = rows
+                .iter()
+                .map(|row| match row[0] {
+                    Value::Int(id) => id,
+                    ref other => panic!("id should decode as an integer, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(ids, (1..=30_i64).collect::<Vec<_>>());
+            assert!(
+                checkpoint.is_some(),
+                "the answer is anchored to a position in the change stream"
+            );
+        }
+        other => panic!("a whole-re-read capture snapshots as rows, got {other:?}"),
+    }
+}
+
+/// A join is triggered by a change to either side. Routing keys on a table set
+/// rather than one table, and this is what proves it: nothing else in the suite
+/// registers a capture over more than one table.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_joined_capture_is_triggered_by_either_table() {
+    use subql::reexec::Registered;
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let mut conn_setup = common::pg_connect(port);
+    let mut conn_dml = common::pg_connect(port);
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+    sql_query("CREATE TABLE couriers (status TEXT PRIMARY KEY, name TEXT)")
+        .execute(&mut conn_setup)
+        .expect("create couriers");
+    sql_query("ALTER TABLE couriers REPLICA IDENTITY FULL")
+        .execute(&mut conn_setup)
+        .expect("replica identity");
+    sql_query("INSERT INTO couriers VALUES ('paid', 'ana')")
+        .execute(&mut conn_setup)
+        .expect("seed courier");
+
+    let joined_catalog = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT); \
+         CREATE TABLE couriers (status TEXT PRIMARY KEY, name TEXT);",
+    )
+    .expect("parse joined DDL");
+    let mut engine = build_engine(joined_catalog, build_pool(port));
+
+    let tables = match engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT o.id, c.name FROM orders o JOIN couriers c ON c.status = o.status \
+                 ORDER BY o.id",
+            ),
+            (),
+        )
+        .expect("a join is captured, not refused")
+    {
+        Registered::Captured { tables, .. } => tables,
+        other => panic!("expected a whole-re-read capture, got {other:?}"),
+    };
+    assert_eq!(tables.len(), 2, "both sides of the join trigger it");
+
+    // Drain the slot so only the changes below are read.
+    let _ = common::drain_slot(&mut conn_setup, SLOT);
+
+    for (label, dml) in [
+        (
+            "left side",
+            "INSERT INTO orders (id, price, quantity, status) VALUES (3, 1.0, 1, 'paid')",
+        ),
+        ("right side", "INSERT INTO couriers VALUES ('late', 'bo')"),
+    ] {
+        sql_query(dml).execute(&mut conn_dml).expect(label);
+        let msgs = common::drain_slot(&mut conn_setup, SLOT);
+        let mut delivered = 0;
+        for msg in &msgs {
+            for event in parse_message(msg) {
+                let notifications = engine.consumers(&event).expect("dispatch");
+                delivered += notifications.rows_updates.len();
+            }
+        }
+        assert!(
+            delivered > 0,
+            "a change to the {label} should re-read the join, got no pages"
+        );
+    }
+}
