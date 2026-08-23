@@ -422,3 +422,67 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     // The read is LSN-anchored like execute_scalar.
     assert!(checkpoint.is_some());
 }
+
+/// A key column whose name needs quoting must still be readable.
+///
+/// Postgres folds an unquoted identifier to lower case, so a column created as
+/// `"OrderId"` is not found by `OrderId`. Building the scoped read's identifiers
+/// from catalog names without quoting them registered the subscription cleanly
+/// and then failed on every single change with `column "orderid" does not
+/// exist`. SQLite cannot show this: its identifiers are case-insensitive.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_key_column_needing_quotes_is_still_readable() {
+    use subql::testing::TestEvent;
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut setup = common::pg_connect(port);
+    sql_query(r#"CREATE TABLE quoted ("OrderId" INT PRIMARY KEY, status TEXT)"#)
+        .execute(&mut setup)
+        .expect("create");
+    sql_query("INSERT INTO quoted VALUES (1, 'paid'), (2, 'void')")
+        .execute(&mut setup)
+        .expect("seed");
+
+    let cat = ParserDB::parse::<PostgreSqlDialect>(
+        r#"CREATE TABLE quoted ("OrderId" INT PRIMARY KEY, status TEXT);"#,
+    )
+    .expect("catalog");
+    let table = subql::catalog_helpers::table_id(&cat, "quoted").expect("quoted");
+    let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+        cat,
+        PostgreSqlDialect {},
+    );
+    let mut engine = AutoResolvingEngine::new(
+        ReExecEngine::new(inner),
+        PgDieselConnector::new(common::pg_connect(port)),
+    );
+    engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT * FROM quoted WHERE lower(status) = 'paid'",
+            ),
+            (),
+        )
+        .expect("captured");
+
+    let event = TestEvent::<Postgres>::update(
+        table,
+        vec![Value::Int(1), Value::String("paid".into())],
+        vec![Value::Int(1), Value::String("paid".into())],
+    )
+    .with_pk_columns([0u16]);
+    let notifications = engine
+        .consumers(&event)
+        .expect("a quoted key column must be readable, not fail on every change");
+
+    assert_eq!(notifications.row_deltas.len(), 1);
+    assert_eq!(notifications.row_deltas[0].key, vec![Value::Int(1)]);
+    assert!(
+        notifications.row_deltas[0].row.is_some(),
+        "the row still matches, so it arrives as itself"
+    );
+}

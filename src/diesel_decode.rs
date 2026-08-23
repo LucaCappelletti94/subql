@@ -371,7 +371,15 @@ where
     }
 }
 
-#[cfg(test)]
+// These exercise the Postgres decoder, so they compile exactly where it does.
+#[cfg(all(
+    test,
+    any(
+        feature = "diesel-typed",
+        feature = "executor-diesel-postgres",
+        feature = "executor-diesel-async-postgres"
+    )
+))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

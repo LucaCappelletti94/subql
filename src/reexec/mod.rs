@@ -123,7 +123,9 @@ pub use async_diesel::DieselAsyncError;
 pub use async_diesel::MysqlAsyncDieselConnector;
 #[cfg(feature = "executor-diesel-async-postgres")]
 pub use async_diesel::PgAsyncDieselConnector;
-pub use auto::{AutoResolvingEngine, SnapshotResult, DEFAULT_PAGE_BYTES};
+pub use auto::{
+    AutoResolvingEngine, SnapshotResult, DEFAULT_MAX_KEYS_PER_READ, DEFAULT_PAGE_BYTES,
+};
 #[cfg(feature = "executor-diesel-mysql")]
 pub use connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
@@ -136,6 +138,6 @@ pub use connector::{DieselBackend, DieselConnector};
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
 pub use engine::{
-    BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
-    ReExecutionTrigger, Registered, ScalarUpdate,
+    BatchOutcome, CaptureTier, ReExecEngine, ReExecNotifications, ReExecQueryId,
+    ReExecUnregisterReport, ReExecutionTrigger, Registered, RowDelta, RowsUpdate, ScalarUpdate,
 };

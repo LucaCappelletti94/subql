@@ -75,8 +75,10 @@ pub enum Registered {
         /// The statement, unchanged: this tier promises exactly the rows the
         /// caller asked for.
         sql: String,
-        /// Tables whose changes trigger a re-read.
+        /// Tables whose changes trigger a read.
         tables: Vec<TableId>,
+        /// How a change is served, which decides what a change costs.
+        tier: CaptureTier,
     },
 }
 
@@ -96,6 +98,27 @@ pub struct ScalarUpdate<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::No
     pub value: Value<B>,
     /// Position of the event that produced this update, when known.
     pub checkpoint: Option<C>,
+}
+
+/// How a captured query is served when a table it reads changes.
+///
+/// Reported at registration because the two cost wildly different things: one
+/// asks about the rows that changed, the other reads the whole answer again.
+/// A caller metering its database needs to know which it got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureTier {
+    /// The database is asked only about the rows that changed, and the answer
+    /// is maintained as per-row upserts and removals.
+    ///
+    /// Delivered as [`RowDelta`] in
+    /// [`ReExecNotifications::row_deltas`], never as pages.
+    ChangedRowsOnly,
+    /// The whole answer is read again and delivered as pages replacing what the
+    /// caller had.
+    ///
+    /// Delivered as [`RowsUpdate`] in
+    /// [`ReExecNotifications::rows_updates`], never as per-row deltas.
+    WholeReread,
 }
 
 /// One page of a re-read captured query, delivered to its consumer.
@@ -126,6 +149,29 @@ pub struct RowsUpdate<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCh
     pub checkpoint: Option<C>,
 }
 
+/// One row of a keyed capture's answer entering, changing, or leaving.
+///
+/// The keyed tier's delivery: a change costs one small read and produces one of
+/// these per row asked about, rather than the whole answer again. `row` absent
+/// means the row is no longer in the answer, and applying a removal for a row
+/// the caller never held is harmless, which is what lets this carry no state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowDelta<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
+    /// The captured query this row belongs to.
+    pub query_id: ReExecQueryId,
+    /// Consumer that registered the query.
+    pub consumer_id: I::ConsumerId,
+    /// Primary key values identifying the row, in key-column order.
+    pub key: Vec<Value<B>>,
+    /// Column names for [`Self::row`], in projection order. Empty when the row
+    /// left the answer, since no row came back to describe.
+    pub columns: Vec<String>,
+    /// The row as it now is, or `None` when it is no longer in the answer.
+    pub row: Option<Vec<Value<B>>>,
+    /// Position of the event that produced this, when known.
+    pub checkpoint: Option<C>,
+}
+
 /// Signal that a captured query needs to be re-executed.
 ///
 /// Emitted when the in-process maintenance state machine cannot resolve
@@ -146,9 +192,23 @@ pub struct ReExecutionTrigger<I: IdTypes, C: crate::Checkpoint = crate::NoCheckp
     pub checkpoint: Option<C>,
 }
 
-/// Combined dispatch result: the core engine's per-consumer notifications,
-/// any in-process scalar updates, and any re-execution triggers for the
-/// materializer to service.
+/// Everything one dispatched event produced, across five channels.
+///
+/// **Every channel has to be drained.** They exist because the deliveries have
+/// different shapes, not so a caller can pick among them, and which one a
+/// captured query uses is fixed by its [`CaptureTier`] at registration. A
+/// consumer that reads some and ignores the rest compiles cleanly and then
+/// silently delivers nothing at all for the subscriptions that use the others.
+///
+/// - [`engine`](Self::engine): rows the in-process engine matched directly.
+/// - [`scalar_updates`](Self::scalar_updates): new values of maintained
+///   aggregates.
+/// - [`rows_updates`](Self::rows_updates): pages of a
+///   [`CaptureTier::WholeReread`] capture.
+/// - [`row_deltas`](Self::row_deltas): per-row changes of a
+///   [`CaptureTier::ChangedRowsOnly`] capture.
+/// - [`triggers`](Self::triggers): queries this engine could not resolve
+///   itself, always empty under a resolving engine.
 pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// View-relative notifications from the core engine.
     pub engine: ConsumerNotifications<I, C, B>,
@@ -156,6 +216,8 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
     pub scalar_updates: Vec<ScalarUpdate<I, B, C>>,
     /// Pages of re-read captured queries, in delivery order.
     pub rows_updates: Vec<RowsUpdate<I, B, C>>,
+    /// Per-row changes from keyed captures, in delivery order.
+    pub row_deltas: Vec<RowDelta<I, B, C>>,
     /// Queries whose maintenance could not resolve in-process. The
     /// materializer must re-execute and call [`ReExecEngine::install`].
     pub triggers: Vec<ReExecutionTrigger<I, C>>,
@@ -163,16 +225,24 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
 
 /// Result of [`ReExecEngine::consumers_batch`].
 ///
-/// Carries per-event engine notifications in input order plus coalesced
-/// scalar updates and triggers across the whole batch. Also returned by
-/// the auto-resolving engines' batch methods (with `triggers` always
-/// empty after resolution).
+/// Carries per-event engine notifications in input order plus coalesced work
+/// across the whole batch. Also returned by the auto-resolving engines' batch
+/// methods, with `triggers` always empty after resolution.
+///
+/// **Every channel has to be drained**, for the reason given on
+/// [`ReExecNotifications`]: the deliveries have different shapes rather than
+/// being alternatives, so ignoring one silently drops every subscription that
+/// uses it.
 pub struct BatchOutcome<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
     /// View-relative engine notifications, one entry per input event in
     /// the order they were supplied.
     pub per_event: Vec<ConsumerNotifications<I, C, B>>,
     /// Scalar updates produced in-process during the batch.
     pub scalar_updates: Vec<ScalarUpdate<I, B, C>>,
+    /// Pages of re-read captured queries produced during the batch.
+    pub rows_updates: Vec<RowsUpdate<I, B, C>>,
+    /// Per-row changes from keyed captures produced during the batch.
+    pub row_deltas: Vec<RowDelta<I, B, C>>,
     /// Re-execution triggers, deduplicated by `query_id` across the
     /// batch (last occurrence's checkpoint wins).
     pub triggers: Vec<ReExecutionTrigger<I, C>>,
@@ -203,6 +273,9 @@ where
     reexec: HashMap<ReExecQueryId, ReExecEntry<I, E::Backend>>,
     /// Table -> captured queries reading from it (CDC event routing).
     table_deps: HashMap<TableId, HashSet<ReExecQueryId>>,
+    /// Plans for keyed captures, kept so a resolve can render the scoped read
+    /// from the caller's own statement rather than from a reconstruction.
+    keyed_plans: HashMap<ReExecQueryId, crate::reexec::plan::KeyedPlan>,
     /// Session -> its captured queries (session-scoped cleanup).
     session_index: HashMap<I::SessionId, Vec<ReExecQueryId>>,
     /// VM reused for in-process WHERE-membership evaluation during
@@ -225,6 +298,7 @@ where
             inner,
             reexec: HashMap::new(),
             table_deps: HashMap::new(),
+            keyed_plans: HashMap::new(),
             session_index: HashMap::new(),
             vm: Vm::new(),
             next_id: 1,
@@ -288,6 +362,17 @@ where
                         }
                         Ok(self.capture(plan, consumer_id, session))
                     }
+                    Ok(QueryPlan::Keyed(plan)) => {
+                        // Row-level security means each consumer sees a
+                        // different set of rows, and this tier holds one answer
+                        // per query rather than one per viewer.
+                        if table_has_rls(self.inner.database(), plan.table).unwrap_or(false) {
+                            return Err(RegisterError::RowCaptureOnRlsTable {
+                                table_id: plan.table,
+                            });
+                        }
+                        Ok(self.capture_keyed(*plan, consumer_id, session))
+                    }
                     Ok(QueryPlan::Total(plan)) => {
                         // Row-level security makes a shared answer unsafe for
                         // the same reason it does for an aggregate: consumers
@@ -299,7 +384,7 @@ where
                             .copied()
                             .find(|t| table_has_rls(self.inner.database(), *t).unwrap_or(false))
                         {
-                            return Err(RegisterError::AggregatorOnRlsTable { table_id: table });
+                            return Err(RegisterError::RowCaptureOnRlsTable { table_id: table });
                         }
                         Ok(self.capture_total(plan, consumer_id, session))
                     }
@@ -409,7 +494,100 @@ where
             query_id,
             sql: reexec_sql,
             tables,
+            tier: CaptureTier::WholeReread,
         }
+    }
+
+    /// Register a keyed capture: one table, and a change asks about the changed
+    /// rows rather than the whole answer.
+    fn capture_keyed(
+        &mut self,
+        plan: crate::reexec::plan::KeyedPlan,
+        consumer_id: I::ConsumerId,
+        session: Option<I::SessionId>,
+    ) -> Registered {
+        let query_id = self.next_id;
+        self.next_id += 1;
+
+        self.table_deps
+            .entry(plan.table)
+            .or_default()
+            .insert(query_id);
+        if let Some(s) = session {
+            self.session_index.entry(s).or_default().push(query_id);
+        }
+        let sql = alloc::format!("{}", plan.statement);
+        let table = plan.table;
+        self.keyed_plans.insert(query_id, plan);
+        let dependency_columns = self.keyed_plans[&query_id].dependency_columns.clone();
+        self.reexec.insert(
+            query_id,
+            ReExecEntry {
+                consumer_id,
+                session,
+                tables: alloc::vec![table],
+                runtime: QueryRuntime::Keyed(crate::reexec::maintain::KeyedQuery::new(
+                    dependency_columns,
+                )),
+            },
+        );
+
+        Registered::Captured {
+            query_id,
+            sql,
+            tables: alloc::vec![table],
+            tier: CaptureTier::ChangedRowsOnly,
+        }
+    }
+
+    /// Take the table that sent a change carrying no readable key, if any.
+    ///
+    /// Surfaced rather than swallowed: without a key this tier cannot ask which
+    /// rows moved, and delivering nothing would leave the subscription silently
+    /// stale.
+    pub(super) fn take_keyless_change(&mut self, query_id: ReExecQueryId) -> Option<TableId> {
+        match self.reexec.get_mut(&query_id).map(|e| &mut e.runtime) {
+            Some(QueryRuntime::Keyed(q)) => q.take_keyless_change(),
+            _ => None,
+        }
+    }
+
+    /// Take the keys a keyed capture accumulated since the last resolve.
+    ///
+    /// Draining rather than reading, so a resolve that already asked about a
+    /// key does not ask again on the next event.
+    pub(super) fn take_pending_keys(
+        &mut self,
+        query_id: ReExecQueryId,
+    ) -> Vec<Vec<Value<E::Backend>>> {
+        match self.reexec.get_mut(&query_id).map(|e| &mut e.runtime) {
+            Some(QueryRuntime::Keyed(q)) => q.take_pending(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Put a keyed capture's keys back after a read that never delivered them.
+    ///
+    /// The counterpart to [`take_pending_keys`](Self::take_pending_keys): a
+    /// resolver takes keys before it reads, so a read that fails has to return
+    /// them or the rows they name stay stale until they change again.
+    pub(super) fn restore_pending_keys(
+        &mut self,
+        query_id: ReExecQueryId,
+        keys: Vec<Vec<Value<E::Backend>>>,
+    ) {
+        if let Some(QueryRuntime::Keyed(q)) = self.reexec.get_mut(&query_id).map(|e| &mut e.runtime)
+        {
+            q.restore_pending(keys);
+        }
+    }
+
+    /// The plan a keyed capture reads with, for rendering its scoped query.
+    pub(super) fn keyed_plan(
+        &self,
+        query_id: ReExecQueryId,
+    ) -> Option<&crate::reexec::plan::KeyedPlan> {
+        self.keyed_plans.get(&query_id)
     }
 
     /// Install a value computed by the materializer (initial bootstrap,
@@ -504,6 +682,10 @@ where
         Ok(BatchOutcome {
             per_event,
             scalar_updates,
+            // The trigger-emitting engine reads no database, so rows can only
+            // come from a resolving engine above it.
+            rows_updates: Vec::new(),
+            row_deltas: Vec::new(),
             triggers: triggers.into_values().collect(),
         })
     }
@@ -539,9 +721,10 @@ where
         Ok(ReExecNotifications {
             engine,
             scalar_updates,
-            // The trigger-emitting engine never reads the database, so a
-            // re-read's pages can only come from a resolving engine above it.
+            // The trigger-emitting engine never reads the database, so pages
+            // and per-row deltas can only come from a resolving engine above.
             rows_updates: Vec::new(),
+            row_deltas: Vec::new(),
             triggers,
         })
     }
@@ -620,6 +803,8 @@ where
         let Some(entry) = self.reexec.remove(&query_id) else {
             return false;
         };
+
+        self.keyed_plans.remove(&query_id);
 
         for table in &entry.tables {
             if let Some(set) = self.table_deps.get_mut(table) {

@@ -240,6 +240,8 @@ pub(super) enum QueryRuntime<B: Backend> {
     Partial(MinMaxQuery<B>),
     /// Re-read in full on any relevant change, holding nothing.
     Total(TotalQuery),
+    /// Ask only about the rows that changed.
+    Keyed(KeyedQuery<B>),
 }
 
 impl<B: Backend> QueryRuntime<B> {
@@ -251,6 +253,7 @@ impl<B: Backend> QueryRuntime<B> {
         match self {
             Self::Partial(q) => q.on_event(event, vm, db),
             Self::Total(q) => q.on_event(event, vm, db),
+            Self::Keyed(q) => q.on_event(event, vm, db),
         }
     }
 
@@ -258,6 +261,7 @@ impl<B: Backend> QueryRuntime<B> {
         match self {
             Self::Partial(q) => q.install(value),
             Self::Total(q) => MaintainedQuery::<B>::install(q, value),
+            Self::Keyed(q) => MaintainedQuery::<B>::install(q, value),
         }
     }
 
@@ -265,6 +269,7 @@ impl<B: Backend> QueryRuntime<B> {
         match self {
             Self::Partial(q) => q.dependency_columns(),
             Self::Total(q) => MaintainedQuery::<B>::dependency_columns(q),
+            Self::Keyed(q) => MaintainedQuery::<B>::dependency_columns(q),
         }
     }
 }
@@ -312,6 +317,120 @@ impl<B: Backend> MaintainedQuery<B> for TotalQuery {
     fn install(&mut self, _value: Value<B>) {
         // Nothing to install: the tier holds no answer, so a re-read is
         // delivered to the consumer rather than stored here.
+    }
+
+    fn dependency_columns(&self) -> &[crate::ColumnId] {
+        &self.dependency_columns
+    }
+}
+
+/// A query maintained by asking the database only about the rows that changed.
+///
+/// Holds no answer and no copy of the result: only the keys changed since the
+/// last resolve, which the resolver drains. That is bounded by the change
+/// volume of one batch rather than by the size of the answer, which is what
+/// makes this tier cost proportional to the change.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct KeyedQuery<B: Backend> {
+    /// Every column of the table: the filter is one the engine could not
+    /// compile, so it may read any of them.
+    dependency_columns: Vec<crate::ColumnId>,
+    /// Keys whose membership has to be re-asked, accumulated across a batch so
+    /// several changes to one query cost one read.
+    pending: Vec<Vec<Value<B>>>,
+    /// The same keys encoded, so recording one is a hash lookup rather than a
+    /// scan of every key already held. `Value` carries floats, so it has
+    /// neither `Hash` nor `Ord`, and its serialized form is what can be
+    /// compared cheaply. Without this, a batch of n changes costs n squared
+    /// key comparisons.
+    seen: hashbrown::HashSet<Vec<u8>>,
+    /// A table that sent a change with no readable key, held until the resolve
+    /// can surface it. Swallowing it would leave the subscription silently
+    /// stale, which is the one outcome this tier must not have.
+    keyless_change: Option<crate::TableId>,
+}
+
+impl<B: Backend> KeyedQuery<B> {
+    pub(super) fn new(dependency_columns: Vec<crate::ColumnId>) -> Self {
+        Self {
+            dependency_columns,
+            pending: Vec::new(),
+            seen: hashbrown::HashSet::new(),
+            keyless_change: None,
+        }
+    }
+
+    /// Record a key to ask about, ignoring one already held.
+    ///
+    /// A key that cannot be encoded is recorded without the duplicate check,
+    /// which costs a longer `IN` list and never a missed row.
+    fn record(&mut self, key: Vec<Value<B>>) {
+        match postcard::to_allocvec(&key) {
+            Ok(encoded) => {
+                if self.seen.insert(encoded) {
+                    self.pending.push(key);
+                }
+            }
+            Err(_) => self.pending.push(key),
+        }
+    }
+
+    /// Take the keys accumulated so far, leaving none behind.
+    pub(super) fn take_pending(&mut self) -> Vec<Vec<Value<B>>> {
+        self.seen.clear();
+        core::mem::take(&mut self.pending)
+    }
+
+    /// Put keys back after a read that never delivered them.
+    ///
+    /// Taking a key is a promise to ask the database about it, so a read that
+    /// failed has to give it back. This tier is the only one that cannot heal
+    /// itself: the others re-read everything, so a later change repairs an
+    /// earlier lost answer, while this one asks only about the keys named in
+    /// it, and a dropped key leaves that row wrong until it happens to change
+    /// again.
+    pub(super) fn restore_pending(&mut self, keys: Vec<Vec<Value<B>>>) {
+        for key in keys {
+            self.record(key);
+        }
+    }
+
+    /// Take the table that sent an unkeyed change, if one did.
+    pub(super) const fn take_keyless_change(&mut self) -> Option<crate::TableId> {
+        self.keyless_change.take()
+    }
+}
+
+impl<B: Backend> MaintainedQuery<B> for KeyedQuery<B> {
+    fn on_event<E: crate::backend::CdcEvent<Backend = B>, DB: DatabaseLike>(
+        &mut self,
+        event: &E,
+        _vm: &mut crate::compiler::Vm<B>,
+        database: &DB,
+    ) -> Maintenance<B> {
+        // The primary-key projection is always populated for a row-level event,
+        // which is what lets this tier ask about the changed row by name
+        // whatever the change was, including a delete whose row is gone.
+        let mut key = Vec::new();
+        for column in event.pk_columns(database) {
+            match event.value_at(database, crate::backend::RowKind::Pk, column) {
+                Ok(value) if !value.is_missing() => key.push(value),
+                _ => {
+                    self.keyless_change = Some(event.table_id(database));
+                    return Maintenance::NeedsReexecution;
+                }
+            }
+        }
+        if key.is_empty() {
+            self.keyless_change = Some(event.table_id(database));
+            return Maintenance::NeedsReexecution;
+        }
+        self.record(key);
+        Maintenance::NeedsReexecution
+    }
+
+    fn install(&mut self, _value: Value<B>) {
+        // Nothing to install: this tier holds no answer.
     }
 
     fn dependency_columns(&self) -> &[crate::ColumnId] {

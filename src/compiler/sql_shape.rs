@@ -872,7 +872,7 @@ fn unserved_clause(clause: &str) -> RegisterError {
 ///
 /// This enforces SubQL's statement-shape constraints (see
 /// [`single_table_select`]) so parser and canonicalizer stay in sync.
-pub(super) fn extract_single_table_and_where(
+pub(crate) fn extract_single_table_and_where(
     stmt: &Statement,
 ) -> Result<(ObjectName, Option<Expr>), RegisterError> {
     match stmt {

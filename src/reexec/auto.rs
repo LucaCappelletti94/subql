@@ -16,8 +16,8 @@
 
 use super::connector::{Connector, ReExecError};
 use super::engine::{
-    BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
-    Registered, RowsUpdate, ScalarUpdate,
+    BatchOutcome, CaptureTier, ReExecEngine, ReExecNotifications, ReExecQueryId,
+    ReExecUnregisterReport, Registered, RowDelta, RowsUpdate, ScalarUpdate,
 };
 use crate::backend::{Backend, BuiltinKind, CdcEvent, Value};
 use crate::clock::{duration_between, ClockHandle};
@@ -34,6 +34,24 @@ use hashbrown::HashMap;
 /// page, small enough that a large one cannot exhaust memory before the caller
 /// sees anything.
 pub const DEFAULT_PAGE_BYTES: usize = 256 * 1024;
+
+/// Keys named in one scoped read by default.
+///
+/// A keyed read's duration tracks how many keys it names, and a caller's
+/// statement timeout applies per statement, so an unbounded request disables
+/// the only read ceiling the caller has. Measured against Postgres 16: a 50,000
+/// key request is cancelled outright under a 25 ms ceiling that an ordinary
+/// read clears in under 1 ms, and because a failed read returns its keys, the
+/// next ordinary change carries the whole backlog and fails again.
+///
+/// The value is a measured optimum rather than a round number. Splitting 10,000
+/// keys was fastest near this size, 28 percent quicker than one statement,
+/// while 1,000 was 14 percent slower than not splitting at all and 200 was
+/// three times slower. The curve is shallow above this point and steep below
+/// it, so err upwards. That measurement ran over a local socket where round
+/// trips are nearly free, and real network latency moves the optimum higher,
+/// which is why this is configurable.
+pub const DEFAULT_MAX_KEYS_PER_READ: usize = 4096;
 use sql_traits::prelude::DatabaseLike;
 
 /// Result of [`AutoResolvingEngine::snapshot`]: the captured query's
@@ -75,6 +93,8 @@ pub(super) struct ResolveContext<I: IdTypes, A> {
     /// Whether resolving means reading one scalar or re-reading every row.
     /// The trigger does not say, and the two are resolved differently.
     pub(super) whole_result: bool,
+    /// Whether resolving means asking only about the rows that changed.
+    pub(super) keyed: bool,
     /// Which re-read the next page belongs to, so a consumer can tell a new
     /// answer from a continuation of the old one.
     pub(super) generation: u64,
@@ -115,6 +135,11 @@ where
     /// Bytes rather than rows because a row is not a bounded thing: one row
     /// carrying a large text column is unbounded on its own.
     max_page_bytes: usize,
+    /// Keys named in one scoped read of the keyed tier.
+    ///
+    /// Bounds statement size, and so statement duration, which is what keeps a
+    /// caller's statement timeout meaningful when a burst arrives.
+    max_keys_per_read: usize,
     /// Optional [`Clock`](crate::Clock) used for per-query debounce.
     clock: Option<ClockHandle>,
     /// Minimum interval between two re-executions of the same captured
@@ -123,6 +148,65 @@ where
     /// Last `now_micros` at which each captured query was re-executed.
     /// Populated only when `clock` + `debounce` are set.
     last_reexec_at: HashMap<ReExecQueryId, u64>,
+}
+
+/// Walks a key set in bounded batches.
+///
+/// Bounded because statement duration tracks how many keys a statement names,
+/// and a caller's statement timeout applies per statement, so one unbounded
+/// request puts the duration under the burst's control rather than the
+/// caller's.
+pub(super) struct KeyBatches<'a, B: Backend> {
+    keys: &'a [Vec<Value<B>>],
+    size: usize,
+    at: usize,
+}
+
+impl<'a, B: Backend> KeyBatches<'a, B> {
+    pub(super) const fn new(keys: &'a [Vec<Value<B>>], size: usize) -> Self {
+        Self {
+            keys,
+            // Zero would never advance.
+            size: if size == 0 { 1 } else { size },
+            at: 0,
+        }
+    }
+}
+
+impl<'a, B: Backend> Iterator for KeyBatches<'a, B> {
+    type Item = &'a [Vec<Value<B>>];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at >= self.keys.len() {
+            return None;
+        }
+        let start = self.at;
+        let end = self.keys.len().min(start + self.size);
+        self.at = end;
+        Some(&self.keys[start..end])
+    }
+}
+
+/// Closes a cursor if the read using it is abandoned by an unwinding panic.
+///
+/// The ordinary path closes explicitly and disarms this, which is what lets a
+/// close failure be reported instead of swallowed. Unwinding runs nothing but
+/// destructors, so without this a panic mid-read would strand the connector's
+/// map entry, holding a pooled connection inside an open transaction forever.
+struct CloseOnUnwind<'a, X: Connector> {
+    connector: &'a X,
+    cursor: super::CursorId,
+    armed: bool,
+}
+
+impl<X: Connector> Drop for CloseOnUnwind<'_, X> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: there is no caller left to report to, and nothing
+            // here may panic.
+            let _ = self.connector.close_cursor(self.cursor);
+        }
+    }
 }
 
 impl<E, I, DB, X> AutoResolvingEngine<E, I, DB, X>
@@ -141,16 +225,36 @@ where
             contexts: HashMap::new(),
             clock: None,
             max_page_bytes: DEFAULT_PAGE_BYTES,
+            max_keys_per_read: DEFAULT_MAX_KEYS_PER_READ,
             debounce: None,
             last_reexec_at: HashMap::new(),
         }
     }
 
-    /// Attach a [`Clock`](crate::Clock) for time-based decisions
+    /// Set how many keys one scoped read of the keyed tier may name.
+    ///
+    /// Bounds statement size and therefore statement duration, which is what
+    /// keeps a caller's statement timeout meaningful under a burst: that
+    /// ceiling applies per statement, so one unbounded request puts the
+    /// duration under the burst's control rather than the caller's.
+    ///
+    /// Lower costs round trips, and below roughly a thousand keys that cost
+    /// dominates. Zero is clamped to one rather than meaning "no limit".
+    /// Defaults to [`DEFAULT_MAX_KEYS_PER_READ`].
+    #[must_use]
+    pub const fn with_max_keys_per_read(mut self, max_keys: usize) -> Self {
+        // Zero would make no progress possible, so it means one at a time.
+        self.max_keys_per_read = if max_keys == 0 { 1 } else { max_keys };
+        self
+    }
+
     /// Set the byte budget for one page of a re-read captured query.
     ///
     /// A smaller budget bounds memory and wire size per message at the cost of
-    /// more round trips. Defaults to [`DEFAULT_PAGE_BYTES`].
+    /// more round trips. Zero is clamped to one rather than meaning "no limit",
+    /// and a page always carries at least one row whatever the budget, because
+    /// a budget smaller than a single row would otherwise make no progress.
+    /// Defaults to [`DEFAULT_PAGE_BYTES`].
     #[must_use]
     pub const fn with_max_page_bytes(mut self, max_bytes: usize) -> Self {
         // Zero would make no progress, and the read guarantees at least one row
@@ -159,9 +263,10 @@ where
         self
     }
 
-    /// (per-query debounce). Defaults to no clock. Without one, debounce
-    /// is silently disabled even if [`with_debounce_per_query`](Self::with_debounce_per_query)
-    /// is set.
+    /// Attach a [`Clock`](crate::Clock) for time-based decisions (per-query
+    /// debounce). Defaults to no clock. Without one, debounce is silently
+    /// disabled even if
+    /// [`with_debounce_per_query`](Self::with_debounce_per_query) is set.
     #[must_use]
     pub fn with_clock(mut self, clock: ClockHandle) -> Self {
         self.clock = Some(clock);
@@ -244,13 +349,19 @@ where
                         sql: sql.clone(),
                         column_kind: *column_kind,
                         whole_result: false,
+                        keyed: false,
                         generation: 0,
                         session,
                         auth,
                     },
                 );
             }
-            Registered::Captured { query_id, sql, .. } => {
+            Registered::Captured {
+                query_id,
+                sql,
+                tier,
+                ..
+            } => {
                 self.contexts.insert(
                     *query_id,
                     ResolveContext {
@@ -258,7 +369,8 @@ where
                         // No single column to decode: the rows carry their own
                         // shape, which is why `RowPage` reports column names.
                         column_kind: BuiltinKind::String,
-                        whole_result: true,
+                        whole_result: *tier == CaptureTier::WholeReread,
+                        keyed: *tier == CaptureTier::ChangedRowsOnly,
                         generation: 0,
                         session,
                         auth,
@@ -352,6 +464,17 @@ where
             .open_cursor(sql, auth)
             .map_err(ReExecError::Cursor)?;
 
+        // The cursor is closed on every exit from here, including a panic. An
+        // early return is handled by closing before `outcome?` below, but a
+        // panic unwinds straight past that, and the connector's map would keep
+        // the entry alive forever with a pooled connection inside an open
+        // transaction. `Drop` is the only thing unwinding runs.
+        let mut guard = CloseOnUnwind {
+            connector: &self.connector,
+            cursor,
+            armed: true,
+        };
+
         let mut columns = Vec::new();
         let mut rows = Vec::new();
         let mut checkpoint = None;
@@ -373,8 +496,10 @@ where
             }
         })();
 
-        // Close either way: a cursor left open holds a transaction and a
-        // pooled connection, so an error must not leak both.
+        // Close either way, and report a close failure rather than swallowing
+        // it, which the guard alone could not do. A read error outranks it: it
+        // is the reason the caller asked and the cursor is closed regardless.
+        guard.armed = false;
         let closed = self
             .connector
             .close_cursor(cursor)
@@ -405,6 +530,7 @@ where
             engine,
             mut scalar_updates,
             mut rows_updates,
+            mut row_deltas,
             triggers,
         } = self.inner.consumers(event).map_err(ReExecError::Dispatch)?;
 
@@ -420,6 +546,16 @@ where
                 "every captured query stores its resolve context at register time, \
                  trigger.query_id must exist in `contexts`",
             );
+            if ctx.keyed {
+                let deltas = self.resolve_keyed(
+                    trigger.query_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                )?;
+                self.stamp_reexec(trigger.query_id);
+                row_deltas.extend(deltas);
+                continue;
+            }
             if ctx.whole_result {
                 let pages = self.reread(
                     trigger.query_id,
@@ -453,10 +589,233 @@ where
             engine,
             scalar_updates,
             rows_updates,
+            row_deltas,
             triggers: Vec::new(),
         })
     }
 
+    /// Ask the database which of the changed rows are in the answer, and turn
+    /// that into one delta per row.
+    ///
+    /// A key that comes back is in the answer and is delivered as its current
+    /// row. A key that comes back empty is not, and is delivered as a removal,
+    /// which is harmless for a row the caller never held. That is why this tier
+    /// holds no state: the answer to "is it in" is asked rather than remembered.
+    fn resolve_keyed(
+        &mut self,
+        query_id: ReExecQueryId,
+        consumer_id: I::ConsumerId,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> Result<Vec<RowDelta<I, E::Backend, E::Checkpoint>>, ReExecError<X::Error>> {
+        // Loud before anything else: a change with no readable key means the
+        // stream is not carrying what this tier needs, and continuing would
+        // deliver a subscription that has quietly stopped tracking its table.
+        if let Some(table) = self.inner.take_keyless_change(query_id) {
+            return Err(ReExecError::Dispatch(
+                crate::DispatchError::KeyedChangeWithoutKey(table),
+            ));
+        }
+        let keys = self.inner.take_pending_keys(query_id);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(plan) = self.inner.keyed_plan(query_id) else {
+            return Ok(Vec::new());
+        };
+        let key_positions = plan.key_positions.clone();
+        let plan_ref = plan.clone();
+
+        // Asked in bounded batches. Statement duration tracks how many keys a
+        // statement names, and a caller's statement timeout applies per
+        // statement, so one unbounded request disables the only read ceiling
+        // the caller has. Each key appears in exactly one batch, so no key is
+        // asked about twice however many rows come back.
+        let mut columns = Vec::new();
+        let mut present: Vec<(Vec<Value<E::Backend>>, Vec<Value<E::Backend>>)> = Vec::new();
+        for batch in KeyBatches::new(&keys, self.max_keys_per_read) {
+            if let Err(e) = self.read_one_batch(
+                query_id,
+                &plan_ref,
+                &key_positions,
+                batch,
+                &mut columns,
+                &mut present,
+            ) {
+                // Every key goes back, including those of batches that already
+                // succeeded. A failure fails the whole call, so their rows were
+                // never delivered, and keeping their keys would leave those rows
+                // stale for good. Asking again is the cost of an all-or-nothing
+                // result.
+                self.inner.restore_pending_keys(query_id, keys);
+                return Err(e);
+            }
+        }
+
+        Ok(Self::deltas_from(
+            query_id,
+            consumer_id,
+            checkpoint,
+            &keys,
+            &present,
+            &columns,
+        ))
+    }
+
+    /// Read one bounded batch of keys, resuming inside the batch if its rows do
+    /// not fit one page.
+    ///
+    /// Split out so the batch loop reads as the one thing it is, and so the
+    /// caller owns the decision about which keys go back on a failure.
+    #[allow(clippy::too_many_arguments)]
+    fn read_one_batch(
+        &self,
+        query_id: ReExecQueryId,
+        plan: &crate::reexec::plan::KeyedPlan,
+        key_positions: &[usize],
+        batch: &[Vec<Value<E::Backend>>],
+        columns: &mut Vec<String>,
+        present: &mut Vec<(Vec<Value<E::Backend>>, Vec<Value<E::Backend>>)>,
+    ) -> Result<(), ReExecError<X::Error>> {
+        let auth = &self
+            .contexts
+            .get(&query_id)
+            .expect("a captured query stores its context at register time")
+            .auth;
+        let render = |keys: &[Vec<Value<E::Backend>>]| {
+            crate::reexec::plan::render_scoped_read::<E::Backend>(plan, keys).map_err(|e| {
+                ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!("{e}")))
+            })
+        };
+        let Some(mut page_sql) = render(batch)? else {
+            return Ok(());
+        };
+        // Accumulated across pages, not per page. Resetting it would let a key
+        // answered on an earlier page back into the next statement, which
+        // delivers it twice and, with a stable row order, never terminates:
+        // the remaining sets oscillate between the halves of the batch.
+        let mut seen: Vec<Vec<Value<E::Backend>>> = Vec::new();
+        loop {
+            let page = self
+                .connector
+                .read_page(&page_sql, self.max_page_bytes, auth)
+                .map_err(ReExecError::Connector)?;
+            if columns.is_empty() {
+                columns.clone_from(&page.value.columns);
+            }
+            let before = seen.len();
+            for row in page.value.rows {
+                let key: Vec<Value<E::Backend>> = key_positions
+                    .iter()
+                    .filter_map(|i| row.get(*i).cloned())
+                    .collect();
+                seen.push(key.clone());
+                present.push((key, row));
+            }
+            // A page with no rows ends the read whatever it claims about there
+            // being more. Our own reader cannot report that combination, but
+            // this trait has outside implementors, and without this a connector
+            // that did would loop here forever.
+            if !page.value.more || seen.len() == before {
+                return Ok(());
+            }
+            // Resume within the batch, excluding the keys already returned, so
+            // the statement stays bounded by the batch. `seen` accumulates
+            // across pages, so `remaining` strictly shrinks and the loop ends.
+            let remaining: Vec<Vec<Value<E::Backend>>> = batch
+                .iter()
+                .filter(|k| !seen.contains(k))
+                .cloned()
+                .collect();
+            if remaining.is_empty() {
+                return Ok(());
+            }
+            match render(&remaining)? {
+                Some(next) => page_sql = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Turn "these keys were asked about, these rows came back" into one delta
+    /// per key. Shared with the async engine, which asks the same question.
+    fn deltas_from(
+        query_id: ReExecQueryId,
+        consumer_id: I::ConsumerId,
+        checkpoint: Option<&E::Checkpoint>,
+        keys: &[Vec<Value<E::Backend>>],
+        present: &[(Vec<Value<E::Backend>>, Vec<Value<E::Backend>>)],
+        columns: &[String],
+    ) -> Vec<RowDelta<I, E::Backend, E::Checkpoint>> {
+        deltas_from(query_id, consumer_id, checkpoint, keys, present, columns)
+    }
+}
+
+/// Turn "these keys were asked about, these rows came back" into one delta per
+/// key: present is an upsert, absent is a removal.
+///
+/// A free function because both engines produce it from the same answer, and a
+/// method on the sync engine would drag its [`Connector`] bound into the async
+/// one. `columns` is empty on a removal: there is no row to describe.
+pub(super) fn deltas_from<I, B, C>(
+    query_id: ReExecQueryId,
+    consumer_id: I::ConsumerId,
+    checkpoint: Option<&C>,
+    keys: &[Vec<Value<B>>],
+    present: &[(Vec<Value<B>>, Vec<Value<B>>)],
+    columns: &[String],
+) -> Vec<RowDelta<I, B, C>>
+where
+    I: IdTypes,
+    B: Backend,
+    C: crate::Checkpoint,
+{
+    let mut deltas = Vec::with_capacity(keys.len());
+    // Which keys came back, by encoded form. `Value` carries floats so it has
+    // neither `Hash` nor `Ord`, and scanning the returned rows once per key
+    // asked about is the product of the two counts.
+    let mut returned: hashbrown::HashSet<Vec<u8>> = hashbrown::HashSet::new();
+    for (key, row) in present {
+        if let Ok(encoded) = postcard::to_allocvec(key) {
+            returned.insert(encoded);
+        }
+        deltas.push(RowDelta {
+            query_id,
+            consumer_id,
+            key: key.clone(),
+            columns: columns.to_vec(),
+            row: Some(row.clone()),
+            checkpoint: checkpoint.cloned(),
+        });
+    }
+    for key in keys {
+        // A key that could not be encoded falls back to the scan, which is
+        // correct and merely slower, rather than being reported as removed.
+        let came_back = postcard::to_allocvec(key).map_or_else(
+            |_| present.iter().any(|(k, _)| k == key),
+            |encoded| returned.contains(&encoded),
+        );
+        if !came_back {
+            deltas.push(RowDelta {
+                query_id,
+                consumer_id,
+                key: key.clone(),
+                columns: Vec::new(),
+                row: None,
+                checkpoint: checkpoint.cloned(),
+            });
+        }
+    }
+    deltas
+}
+
+impl<E, I, DB, X> AutoResolvingEngine<E, I, DB, X>
+where
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
+    I: IdTypes,
+    DB: DatabaseLike + 'static,
+    X: Connector<Backend = E::Backend>,
+{
     /// Re-read a captured query in full and hand back its pages.
     ///
     /// Every page comes from one cursor in one transaction, which is what makes
@@ -486,6 +845,16 @@ where
             .open_cursor(&sql, &self.contexts[&query_id].auth)
             .map_err(ReExecError::Cursor)?;
 
+        // Closed on every exit from here, including a panic. The explicit close
+        // below covers an early return, but unwinding skips straight past it,
+        // and the connector's registry would keep the entry alive with a pooled
+        // connection inside an open transaction. `Drop` is all unwinding runs.
+        let mut guard = CloseOnUnwind {
+            connector: &self.connector,
+            cursor,
+            armed: true,
+        };
+
         let mut pages = Vec::new();
         let outcome = (|| -> Result<(), ReExecError<X::Error>> {
             loop {
@@ -509,8 +878,9 @@ where
             }
         })();
 
-        // Close either way: a cursor left open holds a transaction and a
-        // pooled connection, so an error must not leak both.
+        // Close either way, and report a close failure rather than swallowing
+        // it, which the guard alone could not do. A read error outranks it.
+        guard.armed = false;
         let closed = self
             .connector
             .close_cursor(cursor)
@@ -539,6 +909,8 @@ where
         let BatchOutcome {
             per_event,
             mut scalar_updates,
+            mut rows_updates,
+            mut row_deltas,
             triggers,
         } = self
             .inner
@@ -553,6 +925,29 @@ where
                 "every captured query stores its resolve context at register time, \
                  trigger.query_id must exist in `contexts`",
             );
+            // Same tier split as the single-event path. The batch already
+            // coalesced to one trigger per query, so a keyed resolve here sees
+            // every key the batch changed and reads once for all of them.
+            if ctx.keyed {
+                let deltas = self.resolve_keyed(
+                    trigger.query_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                )?;
+                self.stamp_reexec(trigger.query_id);
+                row_deltas.extend(deltas);
+                continue;
+            }
+            if ctx.whole_result {
+                let pages = self.reread(
+                    trigger.query_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                )?;
+                self.stamp_reexec(trigger.query_id);
+                rows_updates.extend(pages);
+                continue;
+            }
             let (value, _db_checkpoint) = self
                 .connector
                 .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
@@ -570,6 +965,8 @@ where
         Ok(BatchOutcome {
             per_event,
             scalar_updates,
+            rows_updates,
+            row_deltas,
             triggers: Vec::new(),
         })
     }

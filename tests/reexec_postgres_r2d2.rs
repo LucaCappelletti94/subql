@@ -27,9 +27,38 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, Postgres, Value};
 use subql::reexec::{
-    AutoResolvingEngine, PgR2D2DieselConnector, ReExecEngine, Registered, SnapshotResult,
+    AutoResolvingEngine, Connector, PgR2D2DieselConnector, ReExecEngine, Registered, SnapshotResult,
 };
 use subql::{parse_wal2json_v2, DefaultIds, MessageV2, SubscriptionEngine, SubscriptionRequest};
+
+/// One `BigInt` column, for the `count(*)` and `pg_backend_pid()` probes the
+/// cursor tests make against `pg_stat_activity`.
+#[derive(diesel::QueryableByName)]
+struct Counted {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+/// Count of whatever `sql` counts, read from an observing connection.
+fn scalar(observer: &mut PgConnection, sql: &str) -> i64 {
+    let rows: Vec<Counted> = sql_query(sql).load(observer).expect("observe");
+    rows[0].n
+}
+
+/// The server-side process id of whichever connection asks. Comparing it before
+/// and after tells connection reuse from discard-and-reopen exactly, where a
+/// connection count only tells it approximately.
+fn backend_pid(conn: &mut PgConnection) -> i64 {
+    let rows: Vec<Counted> = sql_query("SELECT pg_backend_pid()::bigint AS n")
+        .load(conn)
+        .expect("read backend pid");
+    rows[0].n
+}
+
+/// Backends parked inside a transaction, which is what a stranded cursor looks
+/// like from outside.
+const IDLE_IN_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
+     WHERE state = 'idle in transaction' AND xact_start IS NOT NULL";
 
 const SLOT: &str = "subql_test";
 const DDL: &str =
@@ -538,5 +567,281 @@ fn the_wal_position_is_not_bound_to_the_transaction_snapshot() {
         "yet the position advanced, so it is not snapshot-bound: a position read \
          after the rows would sit ahead of the snapshot and a replay from it \
          would lose the commit"
+    );
+}
+
+/// An abandoned cursor must end its transaction and give its connection back.
+///
+/// A cursor pins a pooled connection inside an open transaction, so a read
+/// that never reaches its close would hold both, and a permanently open read
+/// transaction pins Postgres's `xmin` horizon and stops vacuum from reclaiming
+/// dead tuples database-wide. `Drop` on the cursor is the mechanism, and the
+/// pool has to stay alive to observe it: dropping the pool closes every socket,
+/// which ends the transaction no matter what the cursor did.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn an_abandoned_cursor_ends_its_transaction_and_keeps_its_connection() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
+
+    // Observed from a separate connection, never through the pool under test:
+    // that pool's own query reads as `active`, not `idle in transaction`.
+    let mut observer = common::pg_connect(port);
+
+    // One connection, so an abandoned cursor cannot hide behind a spare.
+    let url = common::pg_url(port);
+    let pool = r2d2::Pool::builder()
+        .max_size(1)
+        .connection_timeout(Duration::from_secs(10))
+        .build(ConnectionManager::<PgConnection>::new(url))
+        .expect("build pool");
+
+    // The pool holds exactly one connection, so this is the process the cursor
+    // will run on and the one that must come back.
+    let pooled_pid = {
+        let mut only = pool.get().expect("pool pre-fills one connection");
+        backend_pid(&mut only)
+    };
+    let connector = PgR2D2DieselConnector::new(pool.clone());
+    let cursor = connector
+        .open_cursor("SELECT id, price FROM orders ORDER BY id", &())
+        .expect("open cursor");
+    let page = connector
+        .fetch_cursor(cursor, 1)
+        .expect("fetch one bounded page");
+    assert!(
+        page.value.more,
+        "a one-byte budget must leave the read unfinished, else nothing is abandoned"
+    );
+    assert_eq!(
+        scalar(&mut observer, IDLE_IN_TXN),
+        1,
+        "an open cursor holds exactly one transaction while it is alive"
+    );
+
+    // Abandon the read: never close, drop the connector. The pool outlives it,
+    // so every socket stays open and the cursor's own cleanup is what shows.
+    drop(connector);
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        scalar(&mut observer, IDLE_IN_TXN),
+        0,
+        "an abandoned cursor must not leave a transaction open on a live pool"
+    );
+    // The pool can still serve, which a stranded connection would block
+    // forever on a one-connection pool.
+    let mut reused = pool.get().expect("the pool still has its connection");
+    assert_eq!(
+        backend_pid(&mut reused),
+        pooled_pid,
+        "the same connection must come back reusable, not be discarded and reopened"
+    );
+    assert_eq!(
+        scalar(&mut observer, IDLE_IN_TXN),
+        0,
+        "the reused connection must not carry the abandoned transaction"
+    );
+}
+
+/// A cursor whose read failed must be gone, not merely unavailable.
+///
+/// After a failure its server-side state is unknown, so it is dropped rather
+/// than left registered, and later calls behave as they do for a cursor that
+/// was never opened.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_cursor_whose_read_failed_reports_as_unknown() {
+    use subql::reexec::CursorError;
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
+    let mut observer = common::pg_connect(port);
+
+    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let cursor = connector
+        .open_cursor("SELECT id, price FROM orders ORDER BY id", &())
+        .expect("open cursor");
+
+    // Drain the buffered rows so the next fetch reaches the server, otherwise
+    // breaking the connection proves nothing.
+    loop {
+        let page = connector.fetch_cursor(cursor, 1).expect("drain");
+        if !page.value.more {
+            break;
+        }
+    }
+    sql_query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE state = 'idle in transaction' AND xact_start IS NOT NULL",
+    )
+    .execute(&mut observer)
+    .expect("terminate the cursor's backend");
+
+    assert!(
+        connector.fetch_cursor(cursor, 1).is_err(),
+        "a fetch on a terminated backend must fail rather than answer"
+    );
+    let after = connector.fetch_cursor(cursor, 1);
+    assert!(
+        matches!(after, Err(CursorError::Unknown(_))),
+        "a cursor whose fetch failed must be gone, got {after:?}"
+    );
+    connector
+        .close_cursor(cursor)
+        .expect("closing a gone cursor is idempotent");
+}
+
+/// Delegates everything, and panics part way through a paged read.
+struct PanicMidRead {
+    inner: PgR2D2DieselConnector,
+    fetches: parking_lot::Mutex<usize>,
+}
+
+impl Connector for PanicMidRead {
+    type AuthContext = ();
+    type Error = <PgR2D2DieselConnector as Connector>::Error;
+    type Checkpoint = <PgR2D2DieselConnector as Connector>::Checkpoint;
+    type Backend = Postgres;
+
+    fn execute_scalar(
+        &self,
+        sql: &str,
+        kind: subql::backend::BuiltinKind,
+        auth: &(),
+    ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
+        self.inner.execute_scalar(sql, kind, auth)
+    }
+
+    fn read_page(
+        &self,
+        sql: &str,
+        max_bytes: usize,
+        auth: &(),
+    ) -> Result<
+        subql::reexec::Snapshot<subql::reexec::RowPage<Postgres>, Self::Checkpoint>,
+        Self::Error,
+    > {
+        self.inner.read_page(sql, max_bytes, auth)
+    }
+
+    fn execute_scalar_row(
+        &self,
+        sql: &str,
+        kinds: &[subql::backend::BuiltinKind],
+        auth: &(),
+    ) -> Result<
+        (Vec<Value<Postgres>>, Option<Self::Checkpoint>),
+        subql::reexec::ScalarRowError<Self::Error>,
+    > {
+        self.inner.execute_scalar_row(sql, kinds, auth)
+    }
+
+    fn open_cursor(
+        &self,
+        sql: &str,
+        auth: &(),
+    ) -> Result<subql::reexec::CursorId, subql::reexec::CursorError<Self::Error>> {
+        self.inner.open_cursor(sql, auth)
+    }
+
+    fn fetch_cursor(
+        &self,
+        cursor: subql::reexec::CursorId,
+        max_bytes: usize,
+    ) -> Result<
+        subql::reexec::Snapshot<subql::reexec::RowPage<Postgres>, Self::Checkpoint>,
+        subql::reexec::CursorError<Self::Error>,
+    > {
+        let seen = {
+            let mut fetches = self.fetches.lock();
+            *fetches += 1;
+            *fetches
+        };
+        assert!(seen != 2, "simulated failure part way through a paged read");
+        self.inner.fetch_cursor(cursor, max_bytes)
+    }
+
+    fn close_cursor(
+        &self,
+        cursor: subql::reexec::CursorId,
+    ) -> Result<(), subql::reexec::CursorError<Self::Error>> {
+        self.inner.close_cursor(cursor)
+    }
+}
+
+/// A panic during a read must not strand the cursor's transaction.
+///
+/// Unwinding runs only destructors, and `PgCursor::drop` cannot help: the
+/// connector's registry holds the handle, so the entry outlives the unwind. The
+/// guard in the engine's read loop is the only thing that closes it, so the
+/// panic has to happen inside that loop, which means inside a connector call
+/// the loop makes.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_panic_during_a_read_leaves_no_transaction_behind() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 10.0), (2, 20.0), (3, 30.0)]);
+    let mut observer = common::pg_connect(port);
+
+    let connector = PanicMidRead {
+        inner: PgR2D2DieselConnector::new(build_pool(port)),
+        fetches: parking_lot::Mutex::new(0),
+    };
+    let cat = catalog();
+    let table = subql::catalog_helpers::table_id(&cat, "orders").expect("orders");
+    let inner =
+        SubscriptionEngine::<subql::testing::TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+            cat,
+            PostgreSqlDialect {},
+        );
+    // One row per page, so the read needs a second fetch and reaches the panic.
+    let mut engine =
+        AutoResolvingEngine::new(ReExecEngine::new(inner), connector).with_max_page_bytes(1);
+    engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT DISTINCT id, price FROM orders WHERE lower(status) = 'paid'",
+            ),
+            (),
+        )
+        .expect("captured");
+
+    let event = subql::testing::TestEvent::<Postgres>::update(
+        table,
+        vec![
+            Value::Int(1),
+            Value::Float(10.0),
+            Value::Int(1),
+            Value::String("paid".into()),
+        ],
+        vec![
+            Value::Int(1),
+            Value::Float(11.0),
+            Value::Int(1),
+            Value::String("paid".into()),
+        ],
+    )
+    .with_pk_columns([0u16]);
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = engine.consumers(&event);
+    }));
+    assert!(unwound.is_err(), "the read must have panicked");
+
+    assert_eq!(
+        scalar(&mut observer, IDLE_IN_TXN),
+        0,
+        "the guard must close the cursor as the panic unwinds through the read loop"
     );
 }

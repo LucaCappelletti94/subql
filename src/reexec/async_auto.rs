@@ -83,6 +83,69 @@ async fn acquire_permit(
     })
 }
 
+/// What one triggered query needs from the database, with every borrow of the
+/// engine already resolved.
+///
+/// The async resolve runs in three phases: decide and take (needs `&mut self`),
+/// read concurrently (needs only shared borrows), install and emit (needs
+/// `&mut self` again). This type is what crosses the first boundary, so
+/// anything the read needs from engine state is owned by the time it is built.
+/// Pending keys in particular are *taken* in phase one, which is why they
+/// cannot be re-read later.
+type KeyedRows<B> = Vec<(Vec<Value<B>>, Vec<Value<B>>)>;
+
+/// Keys a resolve took from the engine, per query, so a failure can give them
+/// back.
+type BorrowedKeys<B> = Vec<(ReExecQueryId, Vec<Vec<Value<B>>>)>;
+
+enum ResolveJob<B: Backend> {
+    /// A scalar the connector reads in one call.
+    Scalar {
+        sql: alloc::string::String,
+        column_kind: crate::backend::BuiltinKind,
+    },
+    /// Rows for the keys that changed, read scoped to those keys. Boxed: this
+    /// variant carries a parsed statement, and the others carry a string.
+    Keyed(alloc::boxed::Box<KeyedJob<B>>),
+    /// The whole result, paged. The generation is taken when the job is built,
+    /// so a read that fails part way cannot let a later one reuse it.
+    Whole {
+        sql: alloc::string::String,
+        generation: u64,
+    },
+}
+
+/// The keyed tier's read, as planned.
+struct KeyedJob<B: Backend> {
+    plan: super::plan::KeyedPlan,
+    key_positions: Vec<usize>,
+    keys: Vec<Vec<Value<B>>>,
+    /// Keys one statement may name, carried so the read needs nothing from the
+    /// engine once it is planned.
+    max_keys: usize,
+}
+
+/// What the database answered, still owned, ready to install.
+enum Resolved<B: Backend> {
+    Scalar(Value<B>),
+    Keyed {
+        keys: Vec<Vec<Value<B>>>,
+        columns: Vec<alloc::string::String>,
+        present: KeyedRows<B>,
+    },
+    Whole {
+        generation: u64,
+        pages: Vec<ReadPage<B>>,
+    },
+}
+
+/// One page of a whole re-read, as it will be delivered.
+struct ReadPage<B: Backend> {
+    columns: Vec<alloc::string::String>,
+    rows: Vec<Vec<Value<B>>>,
+    more: bool,
+}
+
 /// Auto-resolving engine driven by an [`AsyncConnector`].
 ///
 /// Mirrors [`AutoResolvingEngine`](super::AutoResolvingEngine) one-for-one.
@@ -104,6 +167,11 @@ where
     inner: ReExecEngine<E, I, DB>,
     connector: X,
     contexts: HashMap<ReExecQueryId, ResolveContext<I, X::AuthContext>>,
+    /// Byte budget per page of a row-returning read. Bytes rather than rows,
+    /// because a row is not a bounded thing.
+    max_page_bytes: usize,
+    /// Keys named in one scoped read of the keyed tier.
+    max_keys_per_read: usize,
     /// Optional [`Clock`](crate::Clock) used for per-query debounce.
     clock: Option<ClockHandle>,
     /// Minimum interval between two re-executions of the same captured
@@ -134,6 +202,8 @@ where
             inner,
             connector,
             contexts: HashMap::new(),
+            max_page_bytes: super::auto::DEFAULT_PAGE_BYTES,
+            max_keys_per_read: super::auto::DEFAULT_MAX_KEYS_PER_READ,
             clock: None,
             debounce: None,
             last_reexec_at: HashMap::new(),
@@ -182,6 +252,36 @@ where
     #[must_use]
     pub fn concurrency_cap(&self) -> Option<usize> {
         self.permits.as_ref().map(|s| s.cap)
+    }
+
+    /// Set how many keys one scoped read of the keyed tier may name.
+    ///
+    /// Bounds statement size and therefore statement duration, which is what
+    /// keeps a caller's statement timeout meaningful under a burst: that
+    /// ceiling applies per statement, so one unbounded request puts the
+    /// duration under the burst's control rather than the caller's.
+    ///
+    /// Lower costs round trips. Zero is clamped to one rather than meaning "no
+    /// limit". Defaults to
+    /// [`DEFAULT_MAX_KEYS_PER_READ`](super::DEFAULT_MAX_KEYS_PER_READ).
+    #[must_use]
+    pub const fn with_max_keys_per_read(mut self, max_keys: usize) -> Self {
+        self.max_keys_per_read = if max_keys == 0 { 1 } else { max_keys };
+        self
+    }
+
+    /// Set the byte budget for one page of a row-returning read.
+    ///
+    /// A smaller budget bounds memory and wire size per message at the cost of
+    /// more round trips. Zero is clamped to one rather than meaning "no limit",
+    /// and a page always carries at least one row whatever the budget.
+    /// Defaults to [`DEFAULT_PAGE_BYTES`](super::DEFAULT_PAGE_BYTES).
+    #[must_use]
+    pub const fn with_max_page_bytes(mut self, max_bytes: usize) -> Self {
+        // Zero would make no progress possible, so it means "one row at a time"
+        // rather than "no rows".
+        self.max_page_bytes = if max_bytes == 0 { 1 } else { max_bytes };
+        self
     }
 
     /// Attach a [`Clock`](crate::Clock) for per-query debounce. See
@@ -258,19 +358,32 @@ where
                         sql: sql.clone(),
                         column_kind: *column_kind,
                         whole_result: false,
+                        keyed: false,
                         generation: 0,
                         session,
                         auth,
                     },
                 );
             }
-            Registered::Captured { query_id, sql, .. } => {
+            Registered::Captured {
+                query_id,
+                sql,
+                tier,
+                ..
+            } => {
                 self.contexts.insert(
                     *query_id,
                     ResolveContext {
                         sql: sql.clone(),
                         column_kind: crate::backend::BuiltinKind::String,
-                        whole_result: true,
+                        // The tier decides which read serves a change, so it
+                        // comes from the registration rather than a default.
+                        // Defaulting here once made every keyed capture resolve
+                        // as a whole re-read, which is correct output produced
+                        // the expensive way, so nothing failed and nothing said
+                        // so.
+                        whole_result: *tier == super::engine::CaptureTier::WholeReread,
+                        keyed: *tier == super::engine::CaptureTier::ChangedRowsOnly,
                         generation: 0,
                         session,
                         auth,
@@ -324,12 +437,13 @@ where
         &mut self,
         event: &E,
     ) -> Result<ReExecNotifications<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
-        use futures_util::stream::{StreamExt, TryStreamExt};
+        use futures_util::stream::StreamExt;
 
         let ReExecNotifications {
             engine,
             mut scalar_updates,
-            rows_updates,
+            mut rows_updates,
+            mut row_deltas,
             triggers,
         } = self.inner.consumers(event).map_err(ReExecError::Dispatch)?;
 
@@ -344,62 +458,447 @@ where
                 engine,
                 scalar_updates,
                 rows_updates,
+                row_deltas,
                 triggers: Vec::new(),
             });
         }
 
-        // Borrow the immutable fields the futures need. `inner` and
-        // `last_reexec_at` stay free for the post-resolution mutation.
+        // Phase one, under `&mut self`: decide each query's tier and take the
+        // engine state its read needs. Pending keys are consumed here, so this
+        // cannot be folded into the concurrent phase below.
+        let (jobs, borrowed) = self.plan_jobs(actionable)?;
+        if jobs.is_empty() {
+            return Ok(ReExecNotifications {
+                engine,
+                scalar_updates,
+                rows_updates,
+                row_deltas,
+                triggers: Vec::new(),
+            });
+        }
+
+        // Phase two: shared borrows only, so the reads can run concurrently.
+        // `inner` and `last_reexec_at` stay free for the mutation afterwards.
         let connector = &self.connector;
         let contexts = &self.contexts;
+        let max_page_bytes = self.max_page_bytes;
         let throttle = self
             .permits
             .as_ref()
             .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
-        let actionable_len = actionable.len();
+        let jobs_len = jobs.len();
 
         #[allow(clippy::type_complexity)]
-        let resolved: Vec<(
-            super::ReExecutionTrigger<I, E::Checkpoint>,
-            (Value<E::Backend>, Option<X::Checkpoint>),
-        )> = futures_util::stream::iter(actionable.into_iter().map(|trigger| {
-            let ctx = contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time, \
-                 trigger.query_id must exist in `contexts`",
-            );
-            let sql = ctx.sql.clone();
-            let column_kind = ctx.column_kind;
-            let auth = &ctx.auth;
+        let resolved: Vec<
+            Result<
+                (
+                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    Resolved<E::Backend>,
+                ),
+                ReExecError<X::Error>,
+            >,
+        > = futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
+            let auth = &contexts
+                .get(&trigger.query_id)
+                .expect(
+                    "every captured query stores its resolve context at register time, \
+                     trigger.query_id must exist in `contexts`",
+                )
+                .auth;
             let throttle = throttle.clone();
             async move {
                 let _guard = acquire_permit(throttle.as_ref(), trigger.query_id).await;
-                let result = connector.execute_scalar(&sql, column_kind, auth).await;
-                result.map(|r| (trigger, r))
+                let answer = Self::run_job(connector, job, max_page_bytes, auth).await?;
+                Ok::<_, ReExecError<X::Error>>((trigger, answer))
             }
         }))
-        .buffer_unordered(actionable_len)
-        .try_collect()
-        .await
-        .map_err(ReExecError::Connector)?;
+        .buffer_unordered(jobs_len)
+        .collect::<Vec<_>>()
+        .await;
 
-        // All borrows released. Apply the resolutions.
-        for (trigger, (value, _db_checkpoint)) in resolved {
-            self.inner.install(trigger.query_id, value.clone());
+        // One failure fails the call, so nothing is delivered and every key
+        // taken goes back. Collected rather than short-circuited for exactly
+        // that reason: `try_collect` drops the other jobs, and their keys with
+        // them.
+        let answers = match Self::first_failure(resolved) {
+            Ok(answers) => answers,
+            Err(e) => {
+                self.restore_borrowed(borrowed);
+                return Err(e);
+            }
+        };
+
+        // Phase three: borrows released, apply what came back.
+        for (trigger, answer) in answers {
             self.stamp_reexec(trigger.query_id);
-            scalar_updates.push(ScalarUpdate {
-                query_id: trigger.query_id,
-                consumer_id: trigger.consumer_id,
-                value,
-                checkpoint: trigger.checkpoint.clone(),
-            });
+            self.apply_resolved(
+                &trigger,
+                answer,
+                &mut scalar_updates,
+                &mut rows_updates,
+                &mut row_deltas,
+            );
         }
 
         Ok(ReExecNotifications {
             engine,
             scalar_updates,
             rows_updates,
+            row_deltas,
             triggers: Vec::new(),
         })
+    }
+
+    /// Decide every triggered query's read, and record what was taken.
+    ///
+    /// Phase one of the resolve, and the only part needing `&mut self`, which
+    /// is what lets the reads themselves run concurrently. A failure here gives
+    /// back whatever earlier queries in the same call already took.
+    #[allow(clippy::type_complexity)]
+    fn plan_jobs(
+        &mut self,
+        actionable: Vec<super::ReExecutionTrigger<I, E::Checkpoint>>,
+    ) -> Result<
+        (
+            Vec<(
+                super::ReExecutionTrigger<I, E::Checkpoint>,
+                ResolveJob<E::Backend>,
+            )>,
+            BorrowedKeys<E::Backend>,
+        ),
+        ReExecError<X::Error>,
+    > {
+        let mut jobs = Vec::with_capacity(actionable.len());
+        // Taking a key is a promise to ask the database about it, and an error
+        // means nothing was delivered, so every key taken has to survive it.
+        let mut borrowed: BorrowedKeys<E::Backend> = Vec::new();
+        for trigger in actionable {
+            match self.plan_job(trigger.query_id) {
+                Ok(Some(job)) => {
+                    if let ResolveJob::Keyed(keyed) = &job {
+                        borrowed.push((trigger.query_id, keyed.keys.clone()));
+                    }
+                    jobs.push((trigger, job));
+                }
+                // Nothing to ask about, but the query was still triggered, so
+                // its debounce stamp moves as if it had been read.
+                Ok(None) => self.stamp_reexec(trigger.query_id),
+                Err(e) => {
+                    self.restore_borrowed(borrowed);
+                    return Err(e);
+                }
+            }
+        }
+        Ok((jobs, borrowed))
+    }
+
+    /// Split collected outcomes into every answer, or the first failure.
+    ///
+    /// Every outcome is inspected rather than short-circuited, because a
+    /// sibling read failing must not silently swallow the keys another job
+    /// already took.
+    #[allow(clippy::type_complexity)]
+    fn first_failure(
+        resolved: Vec<
+            Result<
+                (
+                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    Resolved<E::Backend>,
+                ),
+                ReExecError<X::Error>,
+            >,
+        >,
+    ) -> Result<
+        Vec<(
+            super::ReExecutionTrigger<I, E::Checkpoint>,
+            Resolved<E::Backend>,
+        )>,
+        ReExecError<X::Error>,
+    > {
+        let mut answers = Vec::with_capacity(resolved.len());
+        for outcome in resolved {
+            answers.push(outcome?);
+        }
+        Ok(answers)
+    }
+
+    /// Give back every key a failed call had taken.
+    fn restore_borrowed(&mut self, borrowed: BorrowedKeys<E::Backend>) {
+        for (query_id, keys) in borrowed {
+            self.inner.restore_pending_keys(query_id, keys);
+        }
+    }
+
+    /// Install one answer and record what the caller should be told.
+    ///
+    /// Shared by the single-event and batch paths so the two cannot drift on
+    /// what a tier delivers.
+    fn apply_resolved(
+        &mut self,
+        trigger: &super::ReExecutionTrigger<I, E::Checkpoint>,
+        answer: Resolved<E::Backend>,
+        scalar_updates: &mut Vec<ScalarUpdate<I, E::Backend, E::Checkpoint>>,
+        rows_updates: &mut Vec<super::engine::RowsUpdate<I, E::Backend, E::Checkpoint>>,
+        row_deltas: &mut Vec<super::engine::RowDelta<I, E::Backend, E::Checkpoint>>,
+    ) {
+        match answer {
+            Resolved::Scalar(value) => {
+                self.inner.install(trigger.query_id, value.clone());
+                scalar_updates.push(ScalarUpdate {
+                    query_id: trigger.query_id,
+                    consumer_id: trigger.consumer_id,
+                    value,
+                    checkpoint: trigger.checkpoint.clone(),
+                });
+            }
+            Resolved::Keyed {
+                keys,
+                columns,
+                present,
+            } => row_deltas.extend(super::auto::deltas_from(
+                trigger.query_id,
+                trigger.consumer_id,
+                trigger.checkpoint.as_ref(),
+                &keys,
+                &present,
+                &columns,
+            )),
+            // One update per page, same as the sync engine: a re-read is
+            // delivered in pages sharing a generation, not as one message.
+            Resolved::Whole { generation, pages } => {
+                rows_updates.extend(pages.into_iter().map(|page| super::engine::RowsUpdate {
+                    query_id: trigger.query_id,
+                    consumer_id: trigger.consumer_id,
+                    generation,
+                    columns: page.columns,
+                    rows: page.rows,
+                    more: page.more,
+                    checkpoint: trigger.checkpoint.clone(),
+                }));
+            }
+        }
+    }
+
+    /// Decide what a triggered query has to ask the database, taking whatever
+    /// engine state the read needs.
+    ///
+    /// `None` means there is nothing to ask: a keyed query whose changed keys
+    /// were already drained, or a plan that cannot be scoped. The caller still
+    /// stamps the query, because it was triggered.
+    ///
+    /// This is the only part of the resolve that needs `&mut self`, which is
+    /// what lets the reads themselves run concurrently.
+    fn plan_job(
+        &mut self,
+        query_id: ReExecQueryId,
+    ) -> Result<Option<ResolveJob<E::Backend>>, ReExecError<X::Error>> {
+        let ctx = self.contexts.get(&query_id).expect(
+            "every captured query stores its resolve context at register time, \
+             query_id must exist in `contexts`",
+        );
+        if !ctx.keyed {
+            if !ctx.whole_result {
+                return Ok(Some(ResolveJob::Scalar {
+                    sql: ctx.sql.clone(),
+                    column_kind: ctx.column_kind,
+                }));
+            }
+            let ctx = self.contexts.get_mut(&query_id).expect("just read above");
+            let sql = ctx.sql.clone();
+            // Bump first: a read that fails part way through must not let a
+            // later one reuse the generation its partial pages carried.
+            ctx.generation = ctx.generation.saturating_add(1);
+            return Ok(Some(ResolveJob::Whole {
+                sql,
+                generation: ctx.generation,
+            }));
+        }
+
+        // Loud before anything else: a change with no readable key means the
+        // stream is not carrying what this tier needs, and continuing would
+        // deliver a subscription that has quietly stopped tracking its table.
+        if let Some(table) = self.inner.take_keyless_change(query_id) {
+            return Err(ReExecError::Dispatch(
+                crate::DispatchError::KeyedChangeWithoutKey(table),
+            ));
+        }
+        let keys = self.inner.take_pending_keys(query_id);
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let Some(plan) = self.inner.keyed_plan(query_id) else {
+            return Ok(None);
+        };
+        let plan = plan.clone();
+        let key_positions = plan.key_positions.clone();
+        Ok(Some(ResolveJob::Keyed(alloc::boxed::Box::new(KeyedJob {
+            plan,
+            key_positions,
+            keys,
+            max_keys: self.max_keys_per_read,
+        }))))
+    }
+
+    /// Run one planned read. Holds no borrow of the engine, so callers can run
+    /// these concurrently.
+    async fn run_job(
+        connector: &X,
+        job: ResolveJob<E::Backend>,
+        max_page_bytes: usize,
+        auth: &X::AuthContext,
+    ) -> Result<Resolved<E::Backend>, ReExecError<X::Error>> {
+        match job {
+            ResolveJob::Scalar { sql, column_kind } => {
+                let (value, _db_checkpoint) = connector
+                    .execute_scalar(&sql, column_kind, auth)
+                    .await
+                    .map_err(ReExecError::Connector)?;
+                Ok(Resolved::Scalar(value))
+            }
+            ResolveJob::Keyed(job) => {
+                let KeyedJob {
+                    plan,
+                    key_positions,
+                    keys,
+                    max_keys,
+                } = *job;
+                let mut columns = Vec::new();
+                let mut present: KeyedRows<E::Backend> = Vec::new();
+                // Bounded batches, same reason as the sync engine: statement
+                // duration tracks how many keys a statement names, and a
+                // caller's statement timeout applies per statement, so one
+                // unbounded request disables the only read ceiling it has.
+                for batch in super::auto::KeyBatches::new(&keys, max_keys) {
+                    let Some(sql) = super::plan::render_scoped_read::<E::Backend>(&plan, batch)
+                        .map_err(|e| {
+                            ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!(
+                                "{e}"
+                            )))
+                        })?
+                    else {
+                        continue;
+                    };
+                    let mut page_sql = sql;
+                    // Accumulated across pages, not per page. Resetting it
+                    // would let a key answered on an earlier page back into the
+                    // next statement, which delivers it twice and, with a
+                    // stable row order, never terminates.
+                    let mut seen_in_batch: Vec<Vec<Value<E::Backend>>> = Vec::new();
+                    loop {
+                        let page = connector
+                            .read_page(&page_sql, max_page_bytes, auth)
+                            .await
+                            .map_err(ReExecError::Connector)?;
+                        if columns.is_empty() {
+                            columns.clone_from(&page.value.columns);
+                        }
+                        let before = seen_in_batch.len();
+                        for row in page.value.rows {
+                            let key: Vec<Value<E::Backend>> = key_positions
+                                .iter()
+                                .filter_map(|i| row.get(*i).cloned())
+                                .collect();
+                            seen_in_batch.push(key.clone());
+                            present.push((key, row));
+                        }
+                        // A page with no rows ends the read whatever it claims
+                        // about there being more. Our own reader cannot report
+                        // that combination, but this trait has outside
+                        // implementors, and without this a connector that did
+                        // would loop here forever.
+                        if !page.value.more || seen_in_batch.len() == before {
+                            break;
+                        }
+                        // A batch whose rows do not fit one page resumes inside
+                        // the batch, so the statement stays bounded. No cursor
+                        // is needed, which is what keeps this tier
+                        // cancellation-safe with no server-side state to strand.
+                        let remaining: Vec<Vec<Value<E::Backend>>> = batch
+                            .iter()
+                            .filter(|k| !seen_in_batch.contains(k))
+                            .cloned()
+                            .collect();
+                        if remaining.is_empty() {
+                            break;
+                        }
+                        let Some(next) =
+                            super::plan::render_scoped_read::<E::Backend>(&plan, &remaining)
+                                .map_err(|e| {
+                                    ReExecError::Dispatch(crate::DispatchError::VmError(
+                                        alloc::format!("{e}"),
+                                    ))
+                                })?
+                        else {
+                            break;
+                        };
+                        page_sql = next;
+                    }
+                }
+                Ok(Resolved::Keyed {
+                    keys,
+                    columns,
+                    present,
+                })
+            }
+            ResolveJob::Whole { sql, generation } => {
+                let pages = Self::read_whole_with(connector, &sql, max_page_bytes, auth).await?;
+                Ok(Resolved::Whole { generation, pages })
+            }
+        }
+    }
+
+    /// Page a whole result through a cursor, closing it on every path this
+    /// function can take.
+    ///
+    /// Cancellation is the path it cannot cover: dropping this future runs no
+    /// cleanup, because a destructor cannot await. What makes that safe is the
+    /// connector opening the cursor's transaction through diesel's own
+    /// transaction manager, so the pool sees a released connection is still
+    /// inside a transaction and discards it instead of handing it to the next
+    /// caller. A raw `BEGIN` leaves diesel's depth counter at zero and the pool
+    /// blind, which was measured to hand an unrelated caller a transaction it
+    /// never opened and silently lose its write.
+    async fn read_whole_with(
+        connector: &X,
+        sql: &str,
+        max_page_bytes: usize,
+        auth: &X::AuthContext,
+    ) -> Result<Vec<ReadPage<E::Backend>>, ReExecError<X::Error>> {
+        let cursor = connector
+            .open_cursor(sql, auth)
+            .await
+            .map_err(ReExecError::Cursor)?;
+
+        let mut pages = Vec::new();
+        let outcome = async {
+            loop {
+                let page = connector
+                    .fetch_cursor(cursor, max_page_bytes)
+                    .await
+                    .map_err(ReExecError::Cursor)?;
+                let more = page.value.more;
+                pages.push(ReadPage {
+                    columns: page.value.columns,
+                    rows: page.value.rows,
+                    more,
+                });
+                if !more {
+                    return Ok::<(), ReExecError<X::Error>>(());
+                }
+            }
+        }
+        .await;
+
+        // Close either way: a read error must not leave the cursor holding a
+        // transaction and a connection. A read error outranks a close failure,
+        // being the reason the caller asked.
+        let closed = connector
+            .close_cursor(cursor)
+            .await
+            .map_err(ReExecError::Cursor);
+        outcome?;
+        closed?;
+        Ok(pages)
     }
 
     /// Async batch variant of [`consumers`](Self::consumers).
@@ -419,11 +918,13 @@ where
         &mut self,
         events: &[E],
     ) -> Result<BatchOutcome<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
-        use futures_util::stream::{StreamExt, TryStreamExt};
+        use futures_util::stream::StreamExt;
 
         let BatchOutcome {
             per_event,
             mut scalar_updates,
+            mut rows_updates,
+            mut row_deltas,
             triggers,
         } = self
             .inner
@@ -440,59 +941,93 @@ where
             return Ok(BatchOutcome {
                 per_event,
                 scalar_updates,
+                rows_updates,
+                row_deltas,
                 triggers: Vec::new(),
             });
         }
 
-        // Borrow the immutable fields the futures need. `inner` and
-        // `last_reexec_at` stay free for the mutation pass below.
+        // Phase one, under `&mut self`: same tier split as the single-event
+        // path. The batch already coalesced to one trigger per query, so a
+        // keyed job here carries every key the batch changed and reads once.
+        let (jobs, borrowed) = self.plan_jobs(actionable)?;
+        if jobs.is_empty() {
+            return Ok(BatchOutcome {
+                per_event,
+                scalar_updates,
+                rows_updates,
+                row_deltas,
+                triggers: Vec::new(),
+            });
+        }
+
+        // Phase two: shared borrows only, so the reads run concurrently.
         let connector = &self.connector;
         let contexts = &self.contexts;
+        let max_page_bytes = self.max_page_bytes;
         let throttle = self
             .permits
             .as_ref()
             .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
-        let actionable_len = actionable.len();
+        let jobs_len = jobs.len();
 
         #[allow(clippy::type_complexity)]
-        let resolved: alloc::vec::Vec<(
-            super::ReExecutionTrigger<I, E::Checkpoint>,
-            (Value<E::Backend>, Option<X::Checkpoint>),
-        )> = futures_util::stream::iter(actionable.into_iter().map(|trigger| {
-            let ctx = contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time, \
-                 trigger.query_id must exist in `contexts`",
-            );
-            let sql = ctx.sql.clone();
-            let column_kind = ctx.column_kind;
-            let auth = &ctx.auth;
+        let resolved: alloc::vec::Vec<
+            Result<
+                (
+                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    Resolved<E::Backend>,
+                ),
+                ReExecError<X::Error>,
+            >,
+        > = futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
+            let auth = &contexts
+                .get(&trigger.query_id)
+                .expect(
+                    "every captured query stores its resolve context at register time, \
+                     trigger.query_id must exist in `contexts`",
+                )
+                .auth;
             let throttle = throttle.clone();
             async move {
                 let _guard = acquire_permit(throttle.as_ref(), trigger.query_id).await;
-                let result = connector.execute_scalar(&sql, column_kind, auth).await;
-                result.map(|r| (trigger, r))
+                let answer = Self::run_job(connector, job, max_page_bytes, auth).await?;
+                Ok::<_, ReExecError<X::Error>>((trigger, answer))
             }
         }))
-        .buffer_unordered(actionable_len)
-        .try_collect()
-        .await
-        .map_err(ReExecError::Connector)?;
+        .buffer_unordered(jobs_len)
+        .collect::<Vec<_>>()
+        .await;
 
-        // All borrows released. Apply the resolutions.
-        for (trigger, (value, _db_checkpoint)) in resolved {
-            self.inner.install(trigger.query_id, value.clone());
+        // One failure fails the call, so nothing is delivered and every key
+        // taken goes back. Collected rather than short-circuited for exactly
+        // that reason: `try_collect` drops the other jobs, and their keys with
+        // them.
+        let answers = match Self::first_failure(resolved) {
+            Ok(answers) => answers,
+            Err(e) => {
+                self.restore_borrowed(borrowed);
+                return Err(e);
+            }
+        };
+
+        // Phase three: borrows released, apply what came back.
+        for (trigger, answer) in answers {
             self.stamp_reexec(trigger.query_id);
-            scalar_updates.push(ScalarUpdate {
-                query_id: trigger.query_id,
-                consumer_id: trigger.consumer_id,
-                value,
-                checkpoint: trigger.checkpoint.clone(),
-            });
+            self.apply_resolved(
+                &trigger,
+                answer,
+                &mut scalar_updates,
+                &mut rows_updates,
+                &mut row_deltas,
+            );
         }
 
         Ok(BatchOutcome {
             per_event,
             scalar_updates,
+            rows_updates,
+            row_deltas,
             triggers: Vec::new(),
         })
     }

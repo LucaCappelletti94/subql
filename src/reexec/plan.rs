@@ -5,7 +5,7 @@
 //! only runs for rejected queries and produces a [`QueryPlan`] describing how
 //! the re-execution layer should maintain it.
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::parser;
 use crate::compiler::sql_shape::{extract_scalar_aggregate, ScalarAggKind};
@@ -35,6 +35,9 @@ pub(super) enum QueryPlan<B: Backend> {
     /// A query nothing in process can maintain, re-read in full whenever a
     /// table it reads changes.
     Total(TotalPlan),
+    /// A filter over one table, maintained by asking the database only about
+    /// the rows that changed.
+    Keyed(alloc::boxed::Box<KeyedPlan>),
 }
 
 /// Plan for a query served by re-reading it whole.
@@ -93,11 +96,13 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    // The scalar plan is the narrow, cheap case. Anything else the engine
-    // refused is a candidate for a whole re-read, including the filters the
-    // predicate language cannot compile, which is why that attempt's error is
-    // discarded rather than surfaced.
+    // Cheapest first. The scalar plan is the narrowest, then a filter over one
+    // table whose changed rows can be asked about individually, then a whole
+    // re-read for everything else. Each attempt's error is discarded rather
+    // than surfaced, because being outside one tier is how a query reaches the
+    // next.
     scalar_plan::<B, DB>(sql, dialect, database)
+        .or_else(|_| keyed_plan::<B, DB>(sql, dialect, database))
         .or_else(|_| total_plan::<B, DB>(sql, dialect, database))
 }
 
@@ -255,3 +260,488 @@ fn render_aliased_scalar(stmt: &Statement) -> Option<String> {
 }
 
 // Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
+
+/// Plan for a query maintained by asking the database only about the rows that
+/// changed.
+///
+/// The cheap tier. A change to one row cannot move any other row of the answer
+/// when the answer is a filter over one table, so the maintenance is that
+/// filter applied to the changed keys, which is the standard incremental view
+/// maintenance rule rather than an optimisation invented here. The filter
+/// itself is whatever the caller wrote, evaluated by the database, which is why
+/// this serves filters the in-process language cannot compile.
+#[derive(Clone)]
+pub(super) struct KeyedPlan {
+    /// Table the query reads.
+    pub table: TableId,
+    /// Where each key column lands in the projection, so the resolver reads a
+    /// delivered row's key by position without assuming the projection is the
+    /// table's own column order.
+    pub key_positions: Vec<usize>,
+    /// The key columns as identifiers to render, quoted the way the dialect
+    /// wants them.
+    ///
+    /// Built here rather than in the resolver because an unquoted identifier is
+    /// not always the same column: Postgres folds `OrderId` to `orderid`, so a
+    /// column created as `"OrderId"` is not found, and the subscription
+    /// registers cleanly and then fails on every change.
+    pub key_idents: Vec<Ident>,
+    /// The statement as parsed, so a scoped read can be built by adding a
+    /// predicate to its WHERE rather than by rebuilding the query from parts.
+    pub statement: Statement,
+    /// Every column of the table: a filter the engine could not compile may
+    /// read any of them, so narrowing this would mean guessing which UPDATEs
+    /// matter.
+    pub dependency_columns: Vec<ColumnId>,
+}
+
+/// Plan a filter over one table whose changed rows can be asked about one by
+/// one.
+///
+/// Qualifies when the statement is a clause-free single-table `SELECT` whose
+/// projection carries the table's whole primary key. Clause-free matters
+/// because a `DISTINCT`, a row bound or a grouping makes one row's membership
+/// depend on other rows, and then asking about the changed row alone answers
+/// the wrong question. The projection has to carry the key because that key is
+/// how a delivered row is identified and how a removal is expressed.
+///
+/// The filter is deliberately unconstrained: a filter the in-process language
+/// cannot compile is the reason the query is here, and the database evaluates
+/// it either way.
+fn keyed_plan<B, DB>(
+    sql: &str,
+    dialect: &B::Dialect,
+    database: &DB,
+) -> Result<QueryPlan<B>, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let statement =
+        crate::compiler::sql_shape::parse_single_statement(sql, dialect as &dyn Dialect)?;
+    // Succeeds only for a clause-free single-table SELECT, which is exactly the
+    // shape whose rows can be asked about individually.
+    let (table_name, _) = crate::compiler::sql_shape::extract_single_table_and_where(&statement)?;
+    let name = crate::compiler::parser::SqlTableName::from_object_name(&table_name)?;
+    let table = crate::table_resolution::resolve_table_reference(
+        name.qualified.as_deref(),
+        &name.unqualified,
+        database,
+    )
+    .map_err(|_| RegisterError::UnknownTable(name.unqualified.clone()))?;
+
+    let key_columns =
+        crate::catalog_helpers::primary_key_columns(database, table).ok_or_else(|| {
+            RegisterError::UnsupportedSql(
+                "a keyed read needs a primary key to identify a delivered row by".to_string(),
+            )
+        })?;
+    if key_columns.is_empty() {
+        return Err(RegisterError::UnsupportedSql(
+            "a keyed read needs a primary key to identify a delivered row by".to_string(),
+        ));
+    }
+    let Some(key_positions) = key_projection_positions(&statement, table, &key_columns, database)
+    else {
+        return Err(RegisterError::UnsupportedSql(
+            "a keyed read needs the projection to carry the primary key, since that key is \
+             both how a delivered row is identified and how its removal is expressed"
+                .to_string(),
+        ));
+    };
+    // A key value is rendered back into the scoped read as a SQL literal, so a
+    // key whose type has no literal spelling would register cleanly and then
+    // fail on every single change. Refused here so it falls to a tier that
+    // needs no key.
+    for column in &key_columns {
+        let kind = crate::catalog_helpers::column_builtin_kind(database, table, *column);
+        if !key_kind_has_literal_spelling(kind) {
+            return Err(RegisterError::UnsupportedSql(alloc::format!(
+                "a keyed read renders its key as a SQL literal, and {kind:?} has no literal \
+                 spelling, so this query cannot be scoped to its changed rows"
+            )));
+        }
+    }
+    // One table in the whole statement, not just in FROM. A subquery reading
+    // another table makes membership depend on rows this tier never watches, so
+    // a change over there would never be delivered at all.
+    if statement_reads_more_than(&statement, &table_name) {
+        return Err(RegisterError::UnsupportedSql(
+            "a keyed read must depend on one table only: membership that also depends on \
+             another table cannot be maintained by asking about this table's changed rows"
+                .to_string(),
+        ));
+    }
+
+    let mut key_idents = Vec::with_capacity(key_columns.len());
+    for column in &key_columns {
+        let name = crate::catalog_helpers::column_name(database, table, *column)
+            .ok_or_else(|| RegisterError::UnknownTable(name.unqualified.clone()))?;
+        key_idents.push(
+            (dialect as &dyn Dialect)
+                .identifier_quote_style(&name)
+                .map_or_else(|| Ident::new(name.clone()), |q| Ident::with_quote(q, &name)),
+        );
+    }
+
+    let arity = crate::catalog_helpers::table_arity(database, table).unwrap_or(0);
+    let dependency_columns = (0..arity)
+        .filter_map(|o| ColumnId::try_from(o).ok())
+        .collect();
+
+    Ok(QueryPlan::Keyed(alloc::boxed::Box::new(KeyedPlan {
+        table,
+        key_positions,
+        key_idents,
+        statement,
+        dependency_columns,
+    })))
+}
+
+/// Can a key of this kind be written back into SQL as a literal?
+///
+/// Mirrors [`crate::compiler::parser::value_to_sql_value`], which is what
+/// actually renders it. Exhaustive rather than a wildcard, so a new kind has to
+/// be classified here instead of silently joining whichever side is the
+/// default.
+const fn key_kind_has_literal_spelling(kind: Option<crate::backend::BuiltinKind>) -> bool {
+    use crate::backend::ScalarKind;
+    match kind {
+        Some(ScalarKind::Int | ScalarKind::String | ScalarKind::Bytes) => true,
+        // Float is refused despite being spellable, because it cannot identify
+        // a row: a float column may hold NaN, `NaN = NaN` is false in SQL, so a
+        // scoped read can never match such a row and would report it as having
+        // left the answer while it is still in it. Infinity has no literal
+        // spelling at all. Bool has no uniform spelling across backends, and
+        // the rest render through typed constructors rather than literals. An
+        // unknown column type is not a licence to guess, so `None` joins them.
+        Some(
+            ScalarKind::Float
+            | ScalarKind::Bool
+            | ScalarKind::Uuid
+            | ScalarKind::Timestamp
+            | ScalarKind::TimestampTz
+            | ScalarKind::Date
+            | ScalarKind::Time
+            | ScalarKind::Decimal
+            | ScalarKind::Json
+            | ScalarKind::Jsonb
+            | ScalarKind::Custom(_),
+        )
+        | None => false,
+    }
+}
+
+/// Does the statement read any table other than `table_name`?
+///
+/// Walks every relation the statement names, including ones inside subqueries,
+/// which is the point: `FROM` alone would miss `WHERE id IN (SELECT ...)`, and
+/// a change to that other table can move a row of this answer in or out.
+fn statement_reads_more_than(
+    statement: &Statement,
+    table_name: &sqlparser::ast::ObjectName,
+) -> bool {
+    let mut other = false;
+    let _ = sqlparser::ast::visit_relations(statement, |name| {
+        if name != table_name {
+            other = true;
+        }
+        core::ops::ControlFlow::<()>::Continue(())
+    });
+    other
+}
+
+/// Where in the projection each primary key column lands.
+///
+/// `None` when the projection does not carry the whole key. The positions
+/// matter as much as their presence: the resolver reads keys out of returned
+/// rows by index, so a key column's table ordinal is the wrong answer for any
+/// projection that is not a wildcard in table order.
+fn key_projection_positions<DB: DatabaseLike>(
+    statement: &Statement,
+    table: TableId,
+    key_columns: &[ColumnId],
+    database: &DB,
+) -> Option<Vec<usize>> {
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    // A wildcard returns the table's columns in the table's own order, so a key
+    // column's ordinal is its position.
+    if select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_)))
+    {
+        return (select.projection.len() == 1).then(|| {
+            key_columns
+                .iter()
+                .map(|column| *column as usize)
+                .collect::<Vec<_>>()
+        });
+    }
+    let mut named: Vec<Option<String>> = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        named.push(match item {
+            SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
+                Some(ident.value.clone())
+            }
+            SelectItem::UnnamedExpr(sqlparser::ast::Expr::CompoundIdentifier(parts)) => {
+                parts.last().map(|last| last.value.clone())
+            }
+            // An expression, an alias over one, or a qualified wildcard: the
+            // delivered column is not the table's key column even if it
+            // computes the same value.
+            _ => None,
+        });
+    }
+    key_columns
+        .iter()
+        .map(|column| {
+            let name = crate::catalog_helpers::column_name(database, table, *column)?;
+            named.iter().position(|got| {
+                got.as_ref()
+                    .is_some_and(|got| got.eq_ignore_ascii_case(&name))
+            })
+        })
+        .collect()
+}
+
+/// Render the caller's own query restricted to the rows whose keys changed.
+///
+/// `SELECT ... FROM t WHERE (<the caller's filter>) AND (k1, k2) IN ((..), (..))`,
+/// built as AST and rendered by sqlparser so the quoting is the parser's own
+/// rather than hand-rolled. A key value with no SQL literal spelling refuses,
+/// because guessing one is how an injection or a silently wrong comparison gets
+/// in.
+///
+/// Returns `None` when `keys` is empty: there is nothing to ask about.
+pub(super) fn render_scoped_read<B: Backend>(
+    plan: &KeyedPlan,
+    keys: &[Vec<Value<B>>],
+) -> Result<Option<String>, RegisterError> {
+    use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr};
+    let key_names = &plan.key_idents;
+
+    if keys.is_empty() {
+        return Ok(None);
+    }
+
+    let mut statement = plan.statement.clone();
+    let Statement::Query(query) = &mut statement else {
+        return Err(RegisterError::UnsupportedSql(
+            "a keyed read needs a SELECT to restrict".to_string(),
+        ));
+    };
+    let Query { body, .. } = &mut **query;
+    let SetExpr::Select(select) = &mut **body else {
+        return Err(RegisterError::UnsupportedSql(
+            "a keyed read needs a plain SELECT to restrict".to_string(),
+        ));
+    };
+
+    // One key column reads as `k IN (a, b)`; several as a row comparison, which
+    // is what a composite key needs and what sqlparser spells as a tuple. The
+    // identifiers come from the plan already quoted the way the dialect wants,
+    // because an unquoted name is not always the same column.
+    let key_expr = if key_names.len() == 1 {
+        Expr::Identifier(key_names[0].clone())
+    } else {
+        Expr::Tuple(
+            key_names
+                .iter()
+                .map(|ident| Expr::Identifier(ident.clone()))
+                .collect(),
+        )
+    };
+
+    let mut list = Vec::with_capacity(keys.len());
+    for key in keys {
+        if key.len() != key_names.len() {
+            return Err(RegisterError::UnsupportedSql(alloc::format!(
+                "a changed row carried {} key value(s) for a {}-column key",
+                key.len(),
+                key_names.len()
+            )));
+        }
+        let mut parts = Vec::with_capacity(key.len());
+        for value in key {
+            parts.push(Expr::Value(
+                crate::compiler::parser::value_to_sql_value(value)?.into(),
+            ));
+        }
+        // A single key column compares directly; several compare as a tuple,
+        // which is what a compound key needs.
+        list.push(match <[Expr; 1]>::try_from(parts) {
+            Ok([only]) => only,
+            Err(parts) => Expr::Tuple(parts),
+        });
+    }
+
+    let scoped = Expr::InList {
+        expr: alloc::boxed::Box::new(key_expr),
+        list,
+        negated: false,
+    };
+    // The caller's filter is kept whole and parenthesised: `AND`-ing into an
+    // `OR` without brackets would widen the answer rather than narrow it.
+    select.selection = Some(match select.selection.take() {
+        Some(existing) => Expr::BinaryOp {
+            left: alloc::boxed::Box::new(Expr::Nested(alloc::boxed::Box::new(existing))),
+            op: BinaryOperator::And,
+            right: alloc::boxed::Box::new(scoped),
+        },
+        None => scoped,
+    });
+
+    Ok(Some(alloc::format!("{statement}")))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod scoped_read_tests {
+    use super::{render_scoped_read, KeyedPlan};
+    use crate::backend::{Postgres, Value};
+
+    /// A plan over `sql` whose key columns are `columns`, rendered unquoted.
+    fn plan_keyed(sql: &str, columns: &[&str]) -> KeyedPlan {
+        let statement = crate::compiler::sql_shape::parse_single_statement(
+            sql,
+            &sqlparser::dialect::PostgreSqlDialect {} as &dyn sqlparser::dialect::Dialect,
+        )
+        .unwrap();
+        KeyedPlan {
+            table: 0,
+            key_positions: (0..columns.len()).collect(),
+            key_idents: columns
+                .iter()
+                .map(|c| sqlparser::ast::Ident::new(*c))
+                .collect(),
+            statement,
+            dependency_columns: alloc::vec![0],
+        }
+    }
+
+    /// The caller's filter survives whole and the key restriction is added, so
+    /// the read answers "which of these rows belong" rather than a new question.
+    #[test]
+    fn a_scoped_read_keeps_the_callers_filter_and_adds_the_keys() {
+        let plan = plan_keyed("SELECT * FROM t WHERE lower(name) = 'x'", &["id"]);
+        let sql = render_scoped_read::<Postgres>(
+            &plan,
+            &alloc::vec![alloc::vec![Value::Int(7)], alloc::vec![Value::Int(9)]],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(sql.contains("lower(name) = 'x'"), "filter kept: {sql}");
+        assert!(sql.contains("id IN (7, 9)"), "keys added: {sql}");
+    }
+
+    /// An `OR` filter is bracketed before the key restriction is `AND`-ed on.
+    /// Without the brackets `a OR b AND keys` binds as `a OR (b AND keys)`,
+    /// which widens the answer to every row satisfying `a` instead of
+    /// narrowing it to the changed ones.
+    #[test]
+    fn an_or_filter_is_bracketed_so_the_keys_narrow_rather_than_widen() {
+        let plan = plan_keyed("SELECT * FROM t WHERE a = 1 OR b = 2", &["id"]);
+        let sql = render_scoped_read::<Postgres>(&plan, &alloc::vec![alloc::vec![Value::Int(1)]])
+            .unwrap()
+            .unwrap();
+        assert!(
+            sql.contains("(a = 1 OR b = 2) AND id IN (1)"),
+            "the filter must be bracketed: {sql}"
+        );
+    }
+
+    /// A filterless query still gets restricted, and gets no stray `AND`.
+    #[test]
+    fn a_query_with_no_filter_is_restricted_by_the_keys_alone() {
+        let plan = plan_keyed("SELECT * FROM t", &["id"]);
+        let sql = render_scoped_read::<Postgres>(&plan, &alloc::vec![alloc::vec![Value::Int(3)]])
+            .unwrap()
+            .unwrap();
+        assert!(sql.ends_with("WHERE id IN (3)"), "{sql}");
+    }
+
+    /// A composite key reads as a tuple comparison, which is what lets one
+    /// read cover several changed rows of a compound-keyed table.
+    #[test]
+    fn a_composite_key_reads_as_a_tuple() {
+        let plan = plan_keyed("SELECT * FROM t", &["country", "code"]);
+        let sql = render_scoped_read::<Postgres>(
+            &plan,
+            &alloc::vec![
+                alloc::vec![Value::String("it".into()), Value::Int(1)],
+                alloc::vec![Value::String("fr".into()), Value::Int(2)],
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            sql.contains("(country, code) IN (('it', 1), ('fr', 2))"),
+            "{sql}"
+        );
+    }
+
+    /// Quoting is sqlparser's, not subql's. A key carrying a quote must come
+    /// back escaped rather than closing the literal, which is the difference
+    /// between a filter and an injection.
+    #[test]
+    fn a_key_containing_a_quote_is_escaped_by_the_parser() {
+        let plan = plan_keyed("SELECT * FROM t", &["name"]);
+        let sql = render_scoped_read::<Postgres>(
+            &plan,
+            &alloc::vec![alloc::vec![Value::String(
+                "o'brien'; DROP TABLE t --".into()
+            )]],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            sql.contains("'o''brien''; DROP TABLE t --'"),
+            "the quote must be doubled, got {sql}"
+        );
+        // And the statement still parses as one statement, so nothing escaped
+        // the literal.
+        let reparsed = crate::compiler::sql_shape::parse_single_statement(
+            &sql,
+            &sqlparser::dialect::PostgreSqlDialect {} as &dyn sqlparser::dialect::Dialect,
+        );
+        assert!(reparsed.is_ok(), "round trip: {sql}");
+    }
+
+    /// No changed keys means no question to ask, which is not the same as a
+    /// query that returns nothing.
+    #[test]
+    fn no_keys_renders_no_read() {
+        let plan = plan_keyed("SELECT * FROM t", &["id"]);
+        assert!(render_scoped_read::<Postgres>(&plan, &[])
+            .unwrap()
+            .is_none());
+    }
+
+    /// A key value with no SQL literal spelling refuses rather than guessing
+    /// one, following the same rule the bind path already applies.
+    #[test]
+    fn a_key_with_no_literal_spelling_is_refused() {
+        let plan = plan_keyed("SELECT * FROM t", &["id"]);
+        assert!(
+            render_scoped_read::<Postgres>(&plan, &alloc::vec![alloc::vec![Value::Missing]],)
+                .is_err()
+        );
+    }
+
+    /// A row whose key arity disagrees with the table's is refused, because
+    /// building a tuple comparison from it would compare the wrong columns.
+    #[test]
+    fn a_key_of_the_wrong_arity_is_refused() {
+        let plan = plan_keyed("SELECT * FROM t", &["country", "code"]);
+        assert!(
+            render_scoped_read::<Postgres>(&plan, &alloc::vec![alloc::vec![Value::Int(1)]],)
+                .is_err()
+        );
+    }
+}

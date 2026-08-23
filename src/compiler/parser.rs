@@ -394,7 +394,7 @@ fn extract_table_and_where(
 /// trips through [`SqlLiteralParse::parse_literal`]. Every other scalar
 /// returns [`RegisterError::BindResolution`] until a downstream test
 /// exercises it and pins a canonical round-trip format.
-fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterError> {
+pub(crate) fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterError> {
     match v {
         Value::Custom(_) => Err(RegisterError::BindResolution(
             "a bind of a custom type has no SQL literal spelling, so it cannot be re-rendered"

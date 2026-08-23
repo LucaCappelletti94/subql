@@ -96,6 +96,22 @@ pub enum RegisterError {
         table_id: TableId,
     },
 
+    /// A row-returning subscription over an RLS-protected table was captured
+    /// for re-execution, which cannot be shared.
+    ///
+    /// Same cause as [`Self::AggregatorOnRlsTable`] and a different query: this
+    /// one delivers rows rather than an aggregate, so the message must not call
+    /// it an aggregator. Row-level security means each consumer sees a
+    /// different set of rows, while a captured query holds one answer per
+    /// query, so per-consumer re-execution is the planned follow-on.
+    #[error(
+        "Row subscription on RLS-protected table {table_id} requires per-consumer re-execution (not yet supported)"
+    )]
+    RowCaptureOnRlsTable {
+        /// Table whose RLS made the captured rows unsafe to share.
+        table_id: TableId,
+    },
+
     /// Storage/persistence error during registration
     #[error("Storage error during registration: {0}")]
     Storage(String),
@@ -226,6 +242,20 @@ pub enum DispatchError {
     /// (for example a value above `i64::MAX` for an integer column).
     #[error("value decode error: {0}")]
     Value(#[from] ValueError),
+    /// A captured query maintained by asking about changed rows received an
+    /// event carrying no readable primary key for table `{0}`.
+    ///
+    /// The change stream is not delivering what the subscription needs, which
+    /// is a source configuration problem rather than unusual data:
+    /// [`REPLICA_IDENTITY_AUDIT_SQL`](crate::REPLICA_IDENTITY_AUDIT_SQL) names
+    /// the tables it happens for. Loud on purpose, because the alternative is a
+    /// subscription that quietly stops reflecting reality.
+    #[error(
+        "table {0} sent a change with no readable primary key, so a keyed \
+         subscription cannot ask which rows moved; check the table's replica \
+         identity (see REPLICA_IDENTITY_AUDIT_SQL)"
+    )]
+    KeyedChangeWithoutKey(crate::TableId),
 }
 
 /// Errors during persistence operations

@@ -652,7 +652,7 @@ apply-patchset-mysql = [
 # backend-agnostic surface, no libpq or libmysqlclient. First-class peer of
 # the sync `executor-diesel` ladder, additive: the sync surface is
 # unchanged. The user activates a backend below.
-executor-diesel-async = ["executor-diesel", "dep:diesel-async"]
+executor-diesel-async = ["executor-diesel", "dep:diesel-async", "dep:parking_lot"]
 # Opt-in: ship `PgAsyncDieselConnector`, the async LSN-aware analogue of
 # `PgDieselConnector`. Wraps a `bb8` pool over `AsyncPgConnection`, is
 # `Send + Sync`, and reads `pg_current_wal_lsn()` inside the same

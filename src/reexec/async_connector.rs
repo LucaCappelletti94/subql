@@ -92,7 +92,23 @@ pub trait AsyncConnector: Send + Sync {
     }
 
     /// Async peer of
-    /// [`Connector::fetch_cursor`](super::Connector::fetch_cursor).
+    /// [`Connector::fetch_cursor`](super::Connector::fetch_cursor), under the
+    /// same contract, restated because an implementor reads this trait and not
+    /// its sync twin.
+    ///
+    /// A cursor is serial, so an implementation MUST report a concurrent read
+    /// as [`CursorError::Busy`](super::CursorError::Busy) rather than queueing
+    /// behind the first. On failure the cursor's server-side state is unknown,
+    /// so an implementation MUST drop it, after which this and
+    /// [`close_cursor`](Self::close_cursor) behave as they do for a cursor that
+    /// was never opened.
+    ///
+    /// Cleanup cannot be done in a destructor here: ending a transaction needs
+    /// I/O and a destructor cannot await. An implementation that holds a
+    /// transaction open across calls MUST therefore open it through its
+    /// driver's own transaction bookkeeping, so that a connection released by a
+    /// cancelled read is recognised as dirty by its pool rather than handed to
+    /// the next caller.
     fn fetch_cursor(
         &self,
         cursor: super::CursorId,
