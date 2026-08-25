@@ -926,7 +926,7 @@ fn describe_terms_names_what_a_seed_read_needs() {
     let described = engine
         .describe_terms(&SubscriptionRequest::new(1u64, TERM))
         .expect("the canonical term is describable");
-    let [term] = described.as_slice() else {
+    let [subql::term::TermDescription::Membership(term)] = described.as_slice() else {
         panic!("one membership subquery, got {described:?}");
     };
 
@@ -1102,6 +1102,9 @@ fn describe_terms_answers_once_per_subquery() {
     let pairs: Vec<(&str, bool)> = described
         .iter()
         .map(|term| {
+            let subql::term::TermDescription::Membership(term) = term else {
+                panic!("a membership subquery describes a seed read, got {term:?}");
+            };
             (
                 term.pairs[0].column.as_str(),
                 term.seed_sql.contains("AS pm"),

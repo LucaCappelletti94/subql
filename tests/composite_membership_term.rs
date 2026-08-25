@@ -306,7 +306,7 @@ fn describe_terms_names_both_pairs_and_the_seed_read() {
     let described = engine
         .describe_terms(&SubscriptionRequest::new(1u64, TERM))
         .expect("the composite term is describable");
-    let [term] = described.as_slice() else {
+    let [subql::term::TermDescription::Membership(term)] = described.as_slice() else {
         panic!("one membership subquery, got {described:?}");
     };
     assert_eq!(term.member_table, "shares");

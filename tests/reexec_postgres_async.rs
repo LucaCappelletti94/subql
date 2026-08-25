@@ -1225,3 +1225,40 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
         );
     });
 }
+
+/// The async twin of the narrow-integer decode: `MIN` over `INT` and
+/// `SMALLINT` columns decodes without the caller spelling `::bigint`.
+#[test]
+#[ignore = "requires Docker"]
+fn a_scalar_over_a_narrow_integer_column_decodes_async() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0)]);
+    sql_query("CREATE TABLE probe (small INT, tiny SMALLINT)")
+        .execute(&mut conn)
+        .expect("probe table");
+    sql_query("INSERT INTO probe VALUES (7, 3), (9, 4)")
+        .execute(&mut conn)
+        .expect("probe rows");
+
+    let rt = common::multi_thread_rt();
+    let connector = PgAsyncDieselConnector::new(rt.block_on(pg_async_pool(port)));
+    let (value, _) = rt
+        .block_on(connector.execute_scalar(
+            "SELECT MIN(quantity) FROM orders",
+            ScalarKind::Int,
+            &(),
+        ))
+        .expect("INT column decodes");
+    assert_eq!(value, Value::Int(1));
+    let (value, _) = rt
+        .block_on(connector.execute_scalar("SELECT MIN(small) FROM probe", ScalarKind::Int, &()))
+        .expect("INT column decodes");
+    assert_eq!(value, Value::Int(7));
+    let (value, _) = rt
+        .block_on(connector.execute_scalar("SELECT MAX(tiny) FROM probe", ScalarKind::Int, &()))
+        .expect("SMALLINT column decodes");
+    assert_eq!(value, Value::Int(4));
+}

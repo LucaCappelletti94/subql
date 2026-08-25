@@ -247,7 +247,7 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
     /// membership subquery the identity is what a changed membership row is
     /// matched against, and for a caller comparison it is the one value the
     /// comparison admits. Build it at
-    /// [`TermDescription::subject_kind`](crate::term::TermDescription::subject_kind):
+    /// [`MembershipTermDescription::subject_kind`](crate::term::MembershipTermDescription::subject_kind):
     /// the lookup keys a string and a UUID under different variants, so an
     /// identity of another kind matches no membership row and admits nobody in
     /// silence. A caller comparison checks instead of trusting, since the

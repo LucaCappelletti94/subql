@@ -99,18 +99,31 @@ pub struct TermMovement {
     pub member_subject: ColumnId,
 }
 
-/// What a caller has to read, and at which kinds, to seed one membership term
-/// before registering the filter that names it.
+/// What a caller has to state, and at which kinds, to register one membership
+/// term.
 ///
-/// [`TermPlan`] in the catalog's own words, plus the seed read itself.
-/// Registration consumes the seed and an absent one admits nobody, so the caller
-/// needs this before it registers, and deriving it a second time from the SQL
-/// leaves two readers of one text that can disagree.
+/// [`TermPlan`] in the catalog's own words. A membership subquery carries the
+/// seed read itself: registration consumes the seed and an absent one admits
+/// nobody, so the caller needs this before it registers, and deriving it a
+/// second time from the SQL leaves two readers of one text that can disagree.
+/// A caller comparison carries the kind the subscriber has to be built at,
+/// since one built at another kind is refused.
 ///
 /// Answered by
 /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TermDescription {
+pub enum TermDescription {
+    /// A membership subquery: run [`seed_sql`](MembershipTermDescription::seed_sql)
+    /// as the caller and state what came back.
+    Membership(MembershipTermDescription),
+    /// A comparison of a column to the caller: build the subscriber the
+    /// request states at the named kind. It seeds itself, so there is no read.
+    Caller(CallerTermDescription),
+}
+
+/// The seed read one membership subquery needs, and the columns it pairs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MembershipTermDescription {
     /// The compared columns and the membership columns they pair with, in the
     /// order the filter wrote them, which is also the order
     /// [`seed_sql`](Self::seed_sql) projects and each stated row follows.
@@ -155,7 +168,7 @@ pub struct TermColumnPair {
     /// [`SubscriptionRequest::term_values`](crate::SubscriptionRequest::term_values)
     /// is keyed by, since the compared columns are what both sides share.
     pub column: String,
-    /// The column of `member_table` [`seed_sql`](TermDescription::seed_sql)
+    /// The column of `member_table` [`seed_sql`](MembershipTermDescription::seed_sql)
     /// projects at this position.
     pub member_key: String,
     /// The kind the seed column decodes as, which is also the kind
@@ -163,6 +176,20 @@ pub struct TermColumnPair {
     pub kind: BuiltinKind,
     /// The custom type [`kind`](Self::kind) carries, when the column is one,
     /// as it prints.
+    pub custom: Option<String>,
+}
+
+/// The kind the subscriber a caller comparison admits has to be built at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallerTermDescription {
+    /// The compared column of the subscribed table, by catalog name.
+    pub column: String,
+    /// The kind to build the subscriber at. One built at another kind is
+    /// refused at registration, since the lookup matches by kind before
+    /// value and a mismatched identity would serve the subscription dead.
+    pub kind: BuiltinKind,
+    /// The custom type [`kind`](Self::kind) carries, when the compared
+    /// column is one, as it prints.
     pub custom: Option<String>,
 }
 
@@ -180,6 +207,17 @@ impl TermDescription {
         table: TableId,
         database: &DB,
     ) -> Result<Self, RegisterError> {
+        // A caller comparison seeds itself from the subscriber, so it has no
+        // read. What it does have is the kind the identity must be built at.
+        let Some(movement) = &plan.moved_by else {
+            let compared = kind::<B, DB>(database, table, plan.columns[0])?;
+            return Ok(Self::Caller(CallerTermDescription {
+                column: name(database, table, plan.columns[0])?,
+                kind: carrier_of::<B>(compared),
+                custom: custom_name::<B>(compared),
+            }));
+        };
+
         // A term compiles from `IN (SELECT ...)` or the bounded `EXISTS`,
         // whose shapes the compiler already checked. A shape a later compiler
         // lifts a term from is refused rather than served with no seed read,
@@ -204,16 +242,6 @@ impl TermDescription {
                 ))
             }
         };
-        // A caller comparison seeds itself from the subscriber, so no read
-        // describes it. `describe_terms` skips such plans, and this is what a
-        // later caller of `resolve` gets instead of a fabricated read.
-        let Some(movement) = &plan.moved_by else {
-            return Err(RegisterError::MembershipTermRefused(
-                "this membership term seeds itself from the subscriber, so there is no read to \
-                 describe"
-                    .into(),
-            ));
-        };
 
         let subject = kind::<B, DB>(database, movement.member_table, movement.member_subject)?;
         let mut pairs = Vec::with_capacity(plan.columns.len());
@@ -226,14 +254,14 @@ impl TermDescription {
                 custom: custom_name::<B>(compared_kind),
             });
         }
-        Ok(Self {
+        Ok(Self::Membership(MembershipTermDescription {
             pairs,
             member_table: table_name_of(database, movement.member_table)?,
             member_subject: name(database, movement.member_table, movement.member_subject)?,
             subject_kind: carrier_of::<B>(subject),
             subject_custom: custom_name::<B>(subject),
             seed_sql,
-        })
+        }))
     }
 }
 

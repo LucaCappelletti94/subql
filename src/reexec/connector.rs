@@ -404,6 +404,14 @@ pub trait DieselBackend: crate::backend::Backend + Sized {
     fn double_cast_type() -> &'static str {
         "DOUBLE PRECISION"
     }
+    /// SQL type name to cast an integer scalar read to eight bytes, so an
+    /// aggregate over a column narrower than `bigint` decodes through
+    /// `Nullable<BigInt>`. Defaults to `BIGINT` (PostgreSQL, and SQLite via
+    /// `INTEGER` affinity); MySQL overrides to `SIGNED`, its `CAST` spelling.
+    #[must_use]
+    fn int_cast_type() -> &'static str {
+        "BIGINT"
+    }
 }
 
 #[cfg(feature = "executor-diesel")]
@@ -432,6 +440,9 @@ impl DieselBackend for crate::backend::MySql {
     }
     fn double_cast_type() -> &'static str {
         "DOUBLE"
+    }
+    fn int_cast_type() -> &'static str {
+        "SIGNED"
     }
 }
 
@@ -531,10 +542,20 @@ where
         LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
 {
     let value = match kind {
-        ScalarKind::Int => sql_query(sql)
-            .get_result::<IntRow>(conn)?
-            .v
-            .map_or(Value::Null, B::value_from_i64),
+        // Raw SQL of necessity: the statement is the subscription's own text,
+        // so no `table!` exists to type it. Wrapped as a scalar subquery so
+        // the read produces what the row decodes: eight bytes, under the
+        // alias `v`, whatever width and name the inner projection has.
+        ScalarKind::Int => {
+            let widened = alloc::format!(
+                "SELECT CAST(({sql}) AS {cast}) AS v",
+                cast = B::int_cast_type()
+            );
+            sql_query(widened)
+                .get_result::<IntRow>(conn)?
+                .v
+                .map_or(Value::Null, B::value_from_i64)
+        }
         ScalarKind::Float => sql_query(sql)
             .get_result::<FloatRow>(conn)?
             .v

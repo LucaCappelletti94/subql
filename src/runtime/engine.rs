@@ -490,7 +490,7 @@ where
     /// [`Self::register`] consumes the seed and an absent one admits nobody, so
     /// the caller's obligation runs before registration, and this is the only
     /// thing that runs the classification `register` runs. Describe the request,
-    /// read each [`TermDescription::seed_sql`] as the caller, state what came
+    /// read each [`MembershipTermDescription::seed_sql`](crate::term::MembershipTermDescription::seed_sql) as the caller, state what came
     /// back through [`SubscriptionRequest::subscriber`] and
     /// [`SubscriptionRequest::term_values`], then register that same request.
     ///
@@ -512,7 +512,6 @@ where
         plans
             .iter()
             .zip(&compiled.terms)
-            .filter(|(plan, _)| plan.moved_by.is_some())
             .map(|(plan, term)| {
                 TermDescription::resolve::<E::Backend, _>(
                     plan,

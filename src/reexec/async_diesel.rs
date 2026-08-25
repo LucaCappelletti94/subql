@@ -83,11 +83,20 @@ where
         + diesel_async::methods::LoadQuery<'q, C, TextRow>,
 {
     let value = match kind {
-        ScalarKind::Int => sql_query(sql)
-            .get_result::<IntRow>(conn)
-            .await?
-            .v
-            .map_or(Value::Null, B::value_from_i64),
+        // Raw SQL of necessity, wrapped exactly as the sync twin: the
+        // statement is the subscription's own text, and the cast makes the
+        // read produce the eight bytes the row decodes under the alias `v`.
+        ScalarKind::Int => {
+            let widened = alloc::format!(
+                "SELECT CAST(({sql}) AS {cast}) AS v",
+                cast = B::int_cast_type()
+            );
+            sql_query(widened)
+                .get_result::<IntRow>(conn)
+                .await?
+                .v
+                .map_or(Value::Null, B::value_from_i64)
+        }
         ScalarKind::Float => sql_query(sql)
             .get_result::<FloatRow>(conn)
             .await?

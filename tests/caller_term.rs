@@ -15,7 +15,7 @@ use rls2fga::classifier::patterns::ConfidenceLevel;
 use rls2fga::translator::{Translator, TranslatorBuilder};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
+use subql::backend::{Postgres, ScalarKind, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId,
@@ -467,24 +467,46 @@ fn an_aggregate_with_a_caller_comparison_is_refused() {
 // What a caller has to read before it can register
 // ---------------------------------------------------------------------------
 
-/// A caller comparison needs nothing seeded beyond the subscriber the request
-/// already states, so it appears in no description.
+/// A caller comparison needs nothing seeded, but the subscriber has to be
+/// built at the compared column's kind, so the description says which.
 #[test]
-fn describe_terms_is_empty_for_a_caller_comparison() {
-    let (engine, _) = engine();
-    let described = engine
+fn describe_terms_names_the_kind_for_a_caller_comparison() {
+    let (describing, _) = engine();
+    let described = describing
         .describe_terms(&SubscriptionRequest::new(1u64, CALLER))
         .unwrap();
+    let [subql::term::TermDescription::Caller(caller)] = described.as_slice() else {
+        panic!("one caller comparison, got {described:?}");
+    };
+    assert_eq!(caller.column, "owner", "the compared column");
+    assert_eq!(
+        caller.kind,
+        ScalarKind::String,
+        "owner is TEXT, the kind the subscriber must be built at"
+    );
+    assert_eq!(caller.custom, None);
+
+    // The description and registration agree: the named kind registers, and
+    // another kind is refused with the message that already exists.
+    let (mut registering, _) = engine();
+    registering
+        .register(subscribe(1, "alice"))
+        .expect("a subscriber built at the described kind registers");
+    let reason = refusal(
+        &mut registering,
+        SubscriptionRequest::new(2u64, CALLER).subscriber(Value::Int(7)),
+    );
     assert!(
-        described.is_empty(),
-        "nothing has to be read to seed a caller comparison"
+        reason.contains("kind"),
+        "a subscriber built at another kind is refused: {reason}"
     );
 }
 
-/// In a mixed filter only the membership subquery has a seed read, so only it
-/// is described.
+/// A mixed filter describes both halves: the membership subquery with its
+/// seed read, and the caller comparison with the kind to build the
+/// subscriber at.
 #[test]
-fn describe_terms_names_only_the_membership_subquery_of_a_mixed_filter() {
+fn describe_terms_names_both_halves_of_a_mixed_filter() {
     let (engine, _) = engine();
     let mixed = "SELECT * FROM notes WHERE owner = current_setting('app.user_id', true) \
          AND project_id IN (SELECT project_id FROM project_members \
@@ -492,11 +514,27 @@ fn describe_terms_names_only_the_membership_subquery_of_a_mixed_filter() {
     let described = engine
         .describe_terms(&SubscriptionRequest::new(1u64, mixed))
         .unwrap();
-    assert_eq!(described.len(), 1, "one seed read, for the subquery");
+    assert_eq!(described.len(), 2, "one entry per term");
+    let membership = described
+        .iter()
+        .find_map(|term| match term {
+            subql::term::TermDescription::Membership(membership) => Some(membership),
+            subql::term::TermDescription::Caller(_) => None,
+        })
+        .expect("the subquery is described with its seed read");
     assert_eq!(
-        described[0].pairs[0].column, "project_id",
-        "and it is the subquery's compared column"
+        membership.pairs[0].column, "project_id",
+        "the subquery's compared column"
     );
+    let caller = described
+        .iter()
+        .find_map(|term| match term {
+            subql::term::TermDescription::Caller(caller) => Some(caller),
+            subql::term::TermDescription::Membership(_) => None,
+        })
+        .expect("the caller comparison is described with its kind");
+    assert_eq!(caller.column, "owner");
+    assert_eq!(caller.kind, ScalarKind::String);
 }
 
 /// Describing and registering the same request refuse alike for the caller

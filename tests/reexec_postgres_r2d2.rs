@@ -1169,3 +1169,36 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
         AggregateValueChange::Set(AggregateResultValue::Scalar(Value::Float(9.0)))
     );
 }
+
+/// An aggregate over a Postgres integer narrower than `bigint` decodes: the
+/// connector casts the read to eight bytes rather than requiring the caller
+/// to spell `::bigint` in the SQL.
+#[test]
+#[ignore = "requires Docker"]
+fn a_scalar_over_a_narrow_integer_column_decodes() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0), (2, 9.0)]);
+    sql_query("CREATE TABLE probe (small INT, tiny SMALLINT)")
+        .execute(&mut conn)
+        .expect("probe table");
+    sql_query("INSERT INTO probe VALUES (7, 3), (9, 4)")
+        .execute(&mut conn)
+        .expect("probe rows");
+
+    let connector = PgR2D2DieselConnector::new(build_pool(port));
+    let (value, _) = connector
+        .execute_scalar("SELECT MIN(quantity) FROM orders", ScalarKind::Int, &())
+        .expect("INT column decodes");
+    assert_eq!(value, Value::Int(1));
+    let (value, _) = connector
+        .execute_scalar("SELECT MIN(small) FROM probe", ScalarKind::Int, &())
+        .expect("INT column decodes");
+    assert_eq!(value, Value::Int(7));
+    let (value, _) = connector
+        .execute_scalar("SELECT MAX(tiny) FROM probe", ScalarKind::Int, &())
+        .expect("SMALLINT column decodes");
+    assert_eq!(value, Value::Int(4));
+}
