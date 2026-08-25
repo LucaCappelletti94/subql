@@ -96,6 +96,22 @@ pub enum RegisterError {
         table_id: TableId,
     },
 
+    /// A row-returning subscription over an RLS-protected table was captured
+    /// for re-execution, which cannot be shared.
+    ///
+    /// Same cause as [`Self::AggregatorOnRlsTable`] and a different query: this
+    /// one delivers rows rather than an aggregate, so the message must not call
+    /// it an aggregator. Row-level security means each consumer sees a
+    /// different set of rows, while a captured query holds one answer per
+    /// query, so per-consumer re-execution is the planned follow-on.
+    #[error(
+        "Row subscription on RLS-protected table {table_id} requires per-consumer re-execution (not yet supported)"
+    )]
+    RowCaptureOnRlsTable {
+        /// Table whose RLS made the captured rows unsafe to share.
+        table_id: TableId,
+    },
+
     /// Storage/persistence error during registration
     #[error("Storage error during registration: {0}")]
     Storage(String),
@@ -215,17 +231,25 @@ pub enum DispatchError {
     #[error("VM evaluation error: {0}")]
     VmError(String),
 
-    /// TRUNCATE received while aggregate subscriptions are active.
-    ///
-    /// The engine cannot compute count deltas for TRUNCATE (no row images).
-    /// Caller must re-query the database to obtain the correct count.
-    #[error("TRUNCATE on table {0} requires aggregate count reset. Re-query the database")]
-    TruncateRequiresReset(crate::TableId),
-
     /// A carried CDC cell could not be decoded to its declared type
     /// (for example a value above `i64::MAX` for an integer column).
     #[error("value decode error: {0}")]
     Value(#[from] ValueError),
+    /// Opaque encoding of the GROUP BY values failed.
+    #[error("group key encoding failed")]
+    GroupKeyEncoding,
+    /// A registered aggregate could not be rebuilt as a complete row read.
+    ///
+    /// Raised from the dispatch path when a limit or missing row forces a
+    /// tier change mid-event. The install path's twin lives on
+    /// [`AggregateInstallError::TierTransition`](crate::AggregateInstallError::TierTransition).
+    #[error("subscription {subscription} could not change tier: {message}")]
+    TierTransition {
+        /// Aggregate subscription.
+        subscription: crate::SubscriptionId,
+        /// Planner or registry invariant that failed.
+        message: String,
+    },
 }
 
 /// Errors during persistence operations

@@ -15,11 +15,12 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
-use subql::reexec::{ReExecEngine, Registered};
 use subql::testing::TestEvent;
-use subql::{DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId};
+use subql::{
+    DefaultIds, RegisterError, Registered, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
+};
 
-type Engine = ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 const RLS_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, status TEXT); \
      ALTER TABLE t ENABLE ROW LEVEL SECURITY;";
@@ -40,7 +41,7 @@ const INPROCESS_AGGREGATES: &[&str] = &[
 
 fn engine_from(ddl: &str) -> Engine {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(ddl).unwrap();
-    ReExecEngine::new(SubscriptionEngine::new(catalog, PostgreSqlDialect {}))
+    SubscriptionEngine::new(catalog, PostgreSqlDialect {})
 }
 
 /// Deterministic `table_id` for `t` in a catalog parsed from `ddl`.
@@ -77,7 +78,10 @@ fn allows_inprocess_aggregators_without_rls() {
     for sql in INPROCESS_AGGREGATES {
         let mut engine = engine_from(PLAIN_DDL);
         match register(&mut engine, sql) {
-            Ok(Registered::Engine(result)) => {
+            Ok(Registered {
+                tier: Tier::InProcess(result),
+                ..
+            }) => {
                 assert!(
                     result.aggregate_spec().is_some(),
                     "`{sql}` should register as an aggregate projection"
@@ -92,7 +96,10 @@ fn allows_inprocess_aggregators_without_rls() {
 fn allows_row_subscription_on_rls_table() {
     let mut engine = engine_from(RLS_DDL);
     match register(&mut engine, "SELECT * FROM t WHERE amount > 10") {
-        Ok(Registered::Engine(result)) => {
+        Ok(Registered {
+            tier: Tier::InProcess(result),
+            ..
+        }) => {
             assert!(
                 result.aggregate_spec().is_none(),
                 "row subscription must not carry an aggregate spec"
@@ -124,7 +131,10 @@ fn min_max_without_rls_still_captured() {
     for sql in ["SELECT MIN(amount) FROM t", "SELECT MAX(amount) FROM t"] {
         let mut engine = engine_from(PLAIN_DDL);
         match register(&mut engine, sql) {
-            Ok(Registered::ReExec { .. }) => {}
+            Ok(Registered {
+                tier: Tier::Scalar { .. },
+                ..
+            }) => {}
             other => panic!("`{sql}` without RLS should be captured for reexec, got {other:?}"),
         }
     }

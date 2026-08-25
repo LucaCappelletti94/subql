@@ -701,6 +701,26 @@ impl JsonDocument for serde_json::Value {
 ///   `sql_types`; Postgres assigns them different OIDs). Both use
 ///   [`serde_json::Value`] for the Rust representation.
 pub trait Backend: 'static {
+    /// Whether two text values that differ in bytes are two different values
+    /// to this database.
+    ///
+    /// Grouping needs it. A grouped fold decides a row's group by encoding the
+    /// group columns, while the database decides it by its own equality, and
+    /// the two must agree or a seed row and a later change land in different
+    /// groups and both totals go wrong with nothing failing.
+    ///
+    /// Measured rather than assumed. Postgres text collations are deterministic
+    /// unless a column declares otherwise, and SQLite's default is `BINARY`, so
+    /// `'a'` and `'A'` are two groups on both. MySQL 8.0 ships
+    /// `utf8mb4_0900_ai_ci` as the server default, so they are one group there
+    /// out of the box, and because that collation comes from server and table
+    /// defaults rather than the column's DDL it is not even visible in the
+    /// schema text, so it cannot be detected per column.
+    ///
+    /// [`ScalarKind::Uuid`] rides this too, since MySQL and SQLite carry a uuid
+    /// as text while Postgres carries a parsed one.
+    const TEXT_GROUPS_BY_BYTES: bool;
+
     /// sqlparser dialect for parsing subscription text and DDL under this
     /// backend.
     type Dialect: sqlparser::dialect::Dialect;
@@ -779,6 +799,7 @@ pub trait Backend: 'static {
 pub struct Postgres;
 
 impl Backend for Postgres {
+    const TEXT_GROUPS_BY_BYTES: bool = true;
     type Custom = NoCustomScalars<Self>;
     type Dialect = sqlparser::dialect::PostgreSqlDialect;
     type Bool = bool;
@@ -801,6 +822,7 @@ impl Backend for Postgres {
 pub struct MySql;
 
 impl Backend for MySql {
+    const TEXT_GROUPS_BY_BYTES: bool = false;
     type Custom = NoCustomScalars<Self>;
     type Dialect = sqlparser::dialect::MySqlDialect;
     type Bool = bool;
@@ -827,6 +849,7 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    const TEXT_GROUPS_BY_BYTES: bool = true;
     type Custom = NoCustomScalars<Self>;
     type Dialect = sqlparser::dialect::SQLiteDialect;
     // SQLite has no native BOOL; the column-type contract stores 0 / 1
@@ -1003,4 +1026,236 @@ where
             column,
             custom: alloc::format!("{custom:?}"),
         })
+}
+
+/// Encode a tuple of values into stable bytes usable as a map key.
+///
+/// [`Value`] carries floats, so it has neither [`Hash`](core::hash::Hash) nor
+/// [`Ord`] and cannot key a map directly. Postcard's encoding is
+/// length-prefixed per element, so `["a", "b"]` and `["ab", ""]` differ, which
+/// a naive concatenation would not.
+///
+/// Public because it is the encoding behind the opaque group key on
+/// [`AggregateValueUpdate`](crate::AggregateValueUpdate), pinned byte for
+/// byte, so a consumer may compute a group's key from its values.
+///
+/// Returns `None` when the tuple cannot be encoded. Callers must not treat
+/// that as "no match": a keyed read falls back to comparing values, and a
+/// grouped fold refuses the column kinds that could produce it before any row
+/// is read.
+pub fn encode_value_key<B: Backend>(values: &[Value<B>]) -> Option<alloc::vec::Vec<u8>> {
+    postcard::to_allocvec(values).ok()
+}
+
+/// Can a column of this kind identify a group?
+///
+/// A grouped fold decides a row's group by encoding the group columns with
+/// [`encode_value_key`], while the database decides it with its own equality.
+/// A kind qualifies only when the two agree, so that two rows the database
+/// puts in one group always encode alike and two rows it separates never do.
+/// Where they disagree the fold would seed one group and then open a second
+/// from zero on the next change, leaving both totals wrong and nothing failing,
+/// so such a query is refused here and served by re-reading it instead.
+///
+/// Exhaustive rather than a wildcard, so a new kind has to be classified
+/// instead of silently joining whichever side is the default.
+///
+/// Measured, not reasoned. Postgres and SQLite both put `0.0` and `-0.0` in one
+/// group and two `NaN`s in one group while their bit patterns differ, and
+/// Postgres puts `1.0::numeric` and `1.00::numeric` in one group while subql
+/// carries decimals as text to keep precision. Text and uuid vary by backend
+/// and ride [`Backend::TEXT_GROUPS_BY_BYTES`].
+pub(crate) const fn kind_groups_one_to_one<B: Backend>(kind: Option<BuiltinKind>) -> bool {
+    match kind {
+        // Exact values with a canonical representation. `Timestamp`, `Date` and
+        // `Time` are parsed `chrono` types and `TimestampTz` normalises to UTC
+        // before subql sees it, so two spellings of one instant are one value.
+        Some(
+            ScalarKind::Int
+            | ScalarKind::Bool
+            | ScalarKind::Bytes
+            | ScalarKind::Timestamp
+            | ScalarKind::TimestampTz
+            | ScalarKind::Date
+            | ScalarKind::Time,
+        ) => true,
+        Some(ScalarKind::String | ScalarKind::Uuid) => B::TEXT_GROUPS_BY_BYTES,
+        // Float: the database groups `-0.0` with `0.0` and `NaN` with `NaN`.
+        // Decimal: it groups `1.0` with `1.00`, which differ as text.
+        // Json: whitespace and key order vary without changing the document.
+        // Custom and unknown: subql cannot know how the database compares them.
+        Some(
+            ScalarKind::Float
+            | ScalarKind::Decimal
+            | ScalarKind::Json
+            | ScalarKind::Jsonb
+            | ScalarKind::Custom(_),
+        )
+        | None => false,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod value_key_tests {
+    use super::{encode_value_key, Postgres, Value};
+    use alloc::vec;
+
+    /// The encoding is frozen, byte for byte.
+    ///
+    /// These bytes leave the process. A consumer stores them as the key of a
+    /// row it keeps across restarts and across subql versions, so changing how
+    /// a value encodes does not produce a migration, it produces a second row
+    /// for a group that already had one, with the old row never updated again.
+    /// Injectivity is deliberately not pinned here: postcard gives it
+    /// structurally, and both wrong implementations tried against an
+    /// injectivity test kept it, so such a test asserts nothing. Stability is
+    /// what nothing else defends.
+    #[test]
+    fn the_encoding_is_frozen() {
+        let cases: vec::Vec<(vec::Vec<Value<Postgres>>, &[u8])> = vec![
+            (vec![], &[0]),
+            (vec![Value::Int(1)], &[1, 3, 2]),
+            (vec![Value::String("eu".into())], &[1, 5, 2, b'e', b'u']),
+            (
+                vec![Value::String("a".into()), Value::String("b".into())],
+                &[2, 5, 1, b'a', 5, 1, b'b'],
+            ),
+            (
+                vec![
+                    Value::String("ab".into()),
+                    Value::String(alloc::string::String::new()),
+                ],
+                &[2, 5, 2, b'a', b'b', 5, 0],
+            ),
+            (vec![Value::Null], &[1, 1]),
+            (vec![Value::Bool(true)], &[1, 2, 1]),
+            (vec![Value::Bytes(vec![1, 2])], &[1, 6, 2, 1, 2]),
+            (
+                vec![Value::Uuid(
+                    uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("valid UUID"),
+                )],
+                &[
+                    1, 7, 16, 85, 14, 132, 0, 226, 155, 65, 212, 167, 22, 68, 102, 85, 68, 0, 0,
+                ],
+            ),
+            (
+                vec![Value::Timestamp(
+                    chrono::NaiveDate::from_ymd_opt(2026, 1, 2)
+                        .expect("valid date")
+                        .and_hms_opt(3, 4, 5)
+                        .expect("valid time"),
+                )],
+                &[
+                    1, 8, 19, 50, 48, 50, 54, 45, 48, 49, 45, 48, 50, 84, 48, 51, 58, 48, 52, 58,
+                    48, 53,
+                ],
+            ),
+            (
+                vec![Value::TimestampTz(
+                    chrono::NaiveDate::from_ymd_opt(2026, 1, 2)
+                        .expect("valid date")
+                        .and_hms_opt(3, 4, 5)
+                        .expect("valid time")
+                        .and_utc(),
+                )],
+                &[
+                    1, 9, 20, 50, 48, 50, 54, 45, 48, 49, 45, 48, 50, 84, 48, 51, 58, 48, 52, 58,
+                    48, 53, 90,
+                ],
+            ),
+            (
+                vec![Value::Date(
+                    chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("valid date"),
+                )],
+                &[1, 10, 10, 50, 48, 50, 54, 45, 48, 49, 45, 48, 50],
+            ),
+            (
+                vec![Value::Time(
+                    chrono::NaiveTime::from_hms_opt(3, 4, 5).expect("valid time"),
+                )],
+                &[1, 11, 8, 48, 51, 58, 48, 52, 58, 48, 53],
+            ),
+        ];
+        for (tuple, want) in cases {
+            let got = encode_value_key(&tuple).expect("every kind here is encodable");
+            assert_eq!(
+                got, want,
+                "the encoding of {tuple:?} changed, which orphans every stored key that used it"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod grouping_kind_tests {
+    use super::{kind_groups_one_to_one, MySql, Postgres, SQLite, ScalarKind};
+
+    /// Every kind, classified, on every backend.
+    ///
+    /// Exhaustive by construction rather than by sampling: a new [`ScalarKind`]
+    /// makes this fail to compile until it is classified, which is the point.
+    /// Getting one wrong is silent, since the fold and the database would
+    /// simply disagree about how many groups there are.
+    fn expect<B: super::Backend>(text_safe: bool) {
+        for kind in [
+            ScalarKind::Int,
+            ScalarKind::Bool,
+            ScalarKind::Bytes,
+            ScalarKind::Timestamp,
+            ScalarKind::TimestampTz,
+            ScalarKind::Date,
+            ScalarKind::Time,
+        ] {
+            assert!(
+                kind_groups_one_to_one::<B>(Some(kind)),
+                "{kind:?} encodes one-to-one on every backend"
+            );
+        }
+        for kind in [
+            ScalarKind::Float,
+            ScalarKind::Decimal,
+            ScalarKind::Json,
+            ScalarKind::Jsonb,
+        ] {
+            assert!(
+                !kind_groups_one_to_one::<B>(Some(kind)),
+                "{kind:?} has values the database groups together and the encoding separates"
+            );
+        }
+        // Text, and uuid where the backend carries it as text.
+        assert_eq!(
+            kind_groups_one_to_one::<B>(Some(ScalarKind::String)),
+            text_safe
+        );
+        assert_eq!(
+            kind_groups_one_to_one::<B>(Some(ScalarKind::Uuid)),
+            text_safe
+        );
+        // An unknown column type is not a licence to guess.
+        assert!(!kind_groups_one_to_one::<B>(None));
+    }
+
+    /// Postgres text collations are deterministic unless one is declared
+    /// otherwise per column, measured as two groups for 'a' and 'A'.
+    #[test]
+    fn postgres_groups_text_by_bytes() {
+        expect::<Postgres>(true);
+    }
+
+    /// SQLite's default collation is BINARY, measured as two groups.
+    #[test]
+    fn sqlite_groups_text_by_bytes() {
+        expect::<SQLite>(true);
+    }
+
+    /// MySQL's server default is `utf8mb4_0900_ai_ci`, so 'a' and 'A' are one
+    /// group, measured on the image this repo's tests use. The collation comes
+    /// from server and table defaults rather than the column's DDL, so it is
+    /// absent from the schema text and cannot be detected per column either.
+    #[test]
+    fn mysql_does_not_group_text_by_bytes() {
+        expect::<MySql>(false);
+    }
 }

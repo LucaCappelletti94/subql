@@ -17,6 +17,7 @@ use rls2fga::generator::relations::RelationShapes;
 use rls2fga::term::{describe_membership_term, TermChain, TermShapes};
 use rls2fga::translator::Translator;
 use sql_traits::prelude::DatabaseLike;
+use sqlparser::ast::Expr;
 
 use crate::term::{CompiledTerm, TermMovement, TermPlan};
 use crate::{catalog_helpers, RegisterError, TableId};
@@ -53,30 +54,33 @@ pub fn plan_term<B: crate::backend::Backend, DB: DatabaseLike>(
         return caller_plan(term, table, database, &shapes);
     }
 
-    let movement = member_columns(&shapes, database)?;
+    let movement = member_columns(term, table, &shapes, database)?;
 
-    // The value the term compares has to be the value the membership row keys
-    // its object on, or the lookup stores under one key and reads under another.
-    // The two coincide by construction for the chain `rls2fga` reports, and this
-    // says so rather than trusting it, since a mismatch admits nobody in
-    // silence.
-    let compared = catalog_helpers::column_scalar_kind::<B, DB>(database, table, term.column);
-    let keyed = catalog_helpers::column_scalar_kind::<B, DB>(
-        database,
-        movement.member_table,
-        movement.member_key,
-    );
-    if compared != keyed {
-        return Err(RegisterError::MembershipTermRefused(format!(
-            "the column this filter compares and the column the relationship is keyed on hold \
-             different kinds of value ({compared:?} against {keyed:?}), so a row's value could \
-             never be found in the set the relationship admits"
-        )));
+    // Each value the term compares has to be the value the membership row keys
+    // its object on at the same position, or the lookup stores under one key
+    // and reads under another. The two coincide by construction for the chain
+    // `rls2fga` reports, and this says so rather than trusting it, since a
+    // mismatch admits nobody in silence.
+    for (compared_column, member_key) in term.columns.iter().zip(&movement.member_keys) {
+        let compared =
+            catalog_helpers::column_scalar_kind::<B, DB>(database, table, *compared_column);
+        let keyed = catalog_helpers::column_scalar_kind::<B, DB>(
+            database,
+            movement.member_table,
+            *member_key,
+        );
+        if compared != keyed {
+            return Err(RegisterError::MembershipTermRefused(format!(
+                "a column this filter compares and the column the relationship is keyed on hold \
+                 different kinds of value ({compared:?} against {keyed:?}), so a row's value \
+                 could never be found in the set the relationship admits"
+            )));
+        }
     }
 
     Ok(TermPlan {
         slot: term.slot,
-        column: term.column,
+        columns: term.columns.clone(),
         moved_by: Some(movement),
     })
 }
@@ -142,7 +146,7 @@ fn caller_plan<DB: DatabaseLike>(
     // other guard admits records only for rows the term never re-checks.
     let enforced_by_the_lookup = |guard: &Guard| {
         matches!(guard, Guard::NotNull(column)
-            if catalog_helpers::column_id(database, table, column.as_str()) == Some(term.column))
+            if catalog_helpers::column_id(database, table, column.as_str()) == Some(term.columns[0]))
     };
     if !guards.iter().all(enforced_by_the_lookup) {
         return Err(refuse(
@@ -152,7 +156,7 @@ fn caller_plan<DB: DatabaseLike>(
     if catalog_helpers::table_id(database, row_table) != Some(table) {
         return Err(refuse("read a table other than the subscribed one"));
     }
-    if column_of(template.subject_key.part(), database, table) != Some(term.column) {
+    if column_of(template.subject_key.part(), database, table) != Some(term.columns[0]) {
         return Err(refuse(
             "name the caller from something other than the compared column",
         ));
@@ -160,18 +164,26 @@ fn caller_plan<DB: DatabaseLike>(
 
     Ok(TermPlan {
         slot: term.slot,
-        column: term.column,
+        columns: term.columns.clone(),
         moved_by: None,
     })
 }
 
-/// The table and the two columns of the shape that names a caller.
+/// The table and the columns of the shape that names a caller.
 ///
 /// One walk for both chains. `Direct` names the caller from a row of the
 /// subscribed table, `Through` from a row of the membership table, and in both
 /// cases the shape to read is the one filling the relation whose records name a
 /// caller.
+///
+/// The membership keys come back aligned with the term's own compared columns:
+/// for the `EXISTS` spelling the written pairs say which membership column
+/// each compared column meets, and the shape's key set is verified against
+/// them rather than trusted for its order, since `rls2fga` orders a composite
+/// key by the object it names rather than by the filter's text.
 fn member_columns<DB: DatabaseLike>(
+    term: &CompiledTerm,
+    table: TableId,
     shapes: &TermShapes,
     database: &DB,
 ) -> Result<TermMovement, RegisterError> {
@@ -201,7 +213,60 @@ fn member_columns<DB: DatabaseLike>(
             ))
         })?;
 
-    read_from_one_row(entry, database)
+    let movement = read_from_one_row(entry, database)?;
+    align_with_the_filter(term, table, movement, database)
+}
+
+/// Reorder the shape's membership keys into the filter's own pair order, or
+/// refuse when the two disagree about which columns key the relationship.
+fn align_with_the_filter<DB: DatabaseLike>(
+    term: &CompiledTerm,
+    table: TableId,
+    mut movement: TermMovement,
+    database: &DB,
+) -> Result<TermMovement, RegisterError> {
+    let refuse = |what: &str| {
+        RegisterError::MembershipTermRefused(format!(
+            "the relationship `rls2fga` compiled {what}, so a changed membership row could not \
+             be matched against what this filter compares"
+        ))
+    };
+    if movement.member_keys.len() != term.columns.len() {
+        return Err(refuse(
+            "is keyed on a different number of columns than this filter compares",
+        ));
+    }
+    let Expr::Exists { subquery, .. } = &term.expr else {
+        // The `IN` spelling compares one column, and a one-wide key needs no
+        // reordering.
+        return Ok(movement);
+    };
+    let parts = crate::compiler::sql_shape::membership_exists_parts(subquery, table, database)
+        .map_err(|_| refuse("was compiled from an EXISTS that lost its recognized shape"))?;
+    if parts.member_table != movement.member_table {
+        return Err(refuse(
+            "reads a different table than the filter's own membership subquery",
+        ));
+    }
+    let written: Vec<crate::ColumnId> = parts.pairs.iter().map(|pair| pair.inner).collect();
+    // Set equality, not mere containment: `written` naming one membership
+    // column twice while the shape keys on two would slip through a
+    // containment check and store rows under a key no event ever builds.
+    let matches_pairwise = written
+        .iter()
+        .all(|inner| movement.member_keys.contains(inner))
+        && movement.member_keys.iter().all(|key| written.contains(key))
+        && written
+            .iter()
+            .enumerate()
+            .all(|(at, inner)| !written[..at].contains(inner));
+    if !matches_pairwise {
+        return Err(refuse(
+            "is keyed on different membership columns than the filter's own pair equalities",
+        ));
+    }
+    movement.member_keys = written;
+    Ok(movement)
 }
 
 /// Resolve the one shape of `entry` that a changed row settles.
@@ -229,17 +294,19 @@ fn read_from_one_row<DB: DatabaseLike>(
 
     let table_id = catalog_helpers::table_id(database, table)
         .ok_or_else(|| refuse("read a table the catalog does not know"))?;
-    let [object_part] = template.object_key.parts() else {
-        return Err(refuse("name their object from more than one column"));
-    };
-    let key = column_of(object_part, database, table_id)
-        .ok_or_else(|| refuse("name their object from something other than a column"))?;
+    let member_keys = template
+        .object_key
+        .parts()
+        .iter()
+        .map(|part| column_of(part, database, table_id))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| refuse("name their object from something other than columns"))?;
     let subject = column_of(template.subject_key.part(), database, table_id)
         .ok_or_else(|| refuse("name their subject from something other than a column"))?;
 
     Ok(TermMovement {
         member_table: table_id,
-        member_key: key,
+        member_keys,
         member_subject: subject,
     })
 }

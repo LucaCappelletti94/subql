@@ -26,6 +26,7 @@ use subql::{DefaultIds, SubscriptionEngine};
 
 diesel::table! {
     users (id) {
+        #[auto_increment]
         id -> Integer,
         name -> Text,
     }

@@ -56,13 +56,16 @@ pub(super) fn text_to_pg_value_by_kind(text: &str, kind: BuiltinKind) -> Value<P
 /// (`\x` prefix followed by an even number of hex digits). Returns `None`
 /// on a missing prefix, non-hex digits, or an odd nibble count.
 fn decode_pg_bytea_hex(text: &str) -> Option<alloc::vec::Vec<u8>> {
-    let hex = text.strip_prefix(r"\x")?;
-    if !hex.is_ascii() || hex.len() % 2 != 0 {
+    decode_hex_bytes(text.strip_prefix(r"\x")?)
+}
+
+fn decode_hex_bytes(hex: &str) -> Option<alloc::vec::Vec<u8>> {
+    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).ok())
         .collect()
 }
 
@@ -85,7 +88,7 @@ pub(super) fn json_value_to_pg_value_by_kind(
         ScalarKind::Float => json_f64(value).map_or(Value::Missing, Value::Float),
         ScalarKind::Decimal => json_bigdecimal(value).map_or(Value::Missing, Value::Decimal),
         ScalarKind::String => Value::String(json_string(value)),
-        ScalarKind::Bytes => json_bytea(value).map_or(Value::Missing, Value::Bytes),
+        ScalarKind::Bytes => json_pg_bytea(value).map_or(Value::Missing, Value::Bytes),
         ScalarKind::Uuid => value
             .as_str()
             .and_then(|s| Uuid::parse_str(s).ok())
@@ -202,6 +205,12 @@ fn json_string(value: &serde_json::Value) -> alloc::string::String {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+fn json_pg_bytea(value: &serde_json::Value) -> Option<alloc::vec::Vec<u8>> {
+    value
+        .as_str()
+        .and_then(|text| decode_pg_bytea_hex(text).or_else(|| decode_hex_bytes(text)))
 }
 
 fn json_bytea(value: &serde_json::Value) -> Option<alloc::vec::Vec<u8>> {
@@ -595,14 +604,17 @@ mod tests {
     }
 
     #[test]
-    fn json_kind_bytea_decodes_pg_hex_only() {
+    fn json_kind_bytea_decodes_pg_hex_forms() {
         assert_eq!(
             json_value_to_pg_value_by_kind(&serde_json::json!(r"\x0102ff"), ScalarKind::Bytes),
             Value::Bytes(alloc::vec![0x01, 0x02, 0xff])
         );
-        // Missing prefix or non-hex -> Missing (no MySQL base64 support yet).
         assert_eq!(
             json_value_to_pg_value_by_kind(&serde_json::json!("0102ff"), ScalarKind::Bytes),
+            Value::Bytes(alloc::vec![0x01, 0x02, 0xff])
+        );
+        assert_eq!(
+            json_value_to_mysql_value_by_kind(&serde_json::json!("0102ff"), ScalarKind::Bytes),
             Value::Missing
         );
         assert_eq!(

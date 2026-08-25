@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used)]
 
 use subql::backend::{BuiltinKind, Postgres, ScalarKind, Value};
-use subql::reexec::{Connector, ScalarRowError, Snapshot};
+use subql::reexec::{Connector, RowPage, ScalarRowError, Snapshot};
 use subql::NoCheckpoint;
 
 /// A connector implementing only the required trait methods, leaving
@@ -29,12 +29,13 @@ impl Connector for MinimalConnector {
         Ok((Value::Int(0), None))
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
         _sql: &str,
+        _max_bytes: usize,
         _auth: &(),
-    ) -> Result<Snapshot<Vec<Vec<Value<Postgres>>>, NoCheckpoint>, String> {
-        Err("rows unsupported".to_string())
+    ) -> Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, String> {
+        Err("this connector reads no rows".to_string())
     }
 }
 

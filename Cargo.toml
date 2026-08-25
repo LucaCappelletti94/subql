@@ -87,16 +87,23 @@ required-features = ["testing"]
 # Integration test for the DieselConnector. Uses in-memory SQLite. Gated
 # behind the `executor-diesel` feature so default `cargo test` does not try
 # to compile it.
+# Docker-free proof that a result of unknown shape decodes and that the byte
+# budget bounds a page. Needs the SQLite backend for a real connection plus the
+# connector seam under test.
+[[test]]
+name = "dynamic_row_decode"
+required-features = ["diesel-typed-sqlite", "executor-diesel"]
+
 [[test]]
 name = "reexec_diesel"
-required-features = ["executor-diesel"]
+required-features = ["executor-diesel", "diesel-typed-sqlite"]
 
 # Docker-free connector round-trip for the multi-column aggregate seed
 # (`execute_scalar_row`) over in-memory SQLite. Gated behind
 # `executor-diesel` like `reexec_diesel`.
 [[test]]
 name = "execute_scalar_row_sqlite"
-required-features = ["executor-diesel"]
+required-features = ["executor-diesel", "diesel-typed-sqlite"]
 
 # Docker-backed integration test for AutoResolvingEngine + DieselConnector
 # against a real Postgres with logical replication. Tests are #[ignore]d;
@@ -294,7 +301,10 @@ required-features = [
 
 [dependencies]
 # SQL parsing (supports multiple dialects).
-sqlparser = { version = "0.62", default-features = false }
+# `visitor` provides the derived AST walk. The capture classifier needs every
+# table a statement reads, and a table it missed would be a table whose changes
+# never trigger the query, so totality by derivation beats a hand-rolled walk.
+sqlparser = { version = "0.62", default-features = false, features = ["visitor"] }
 
 # Generic SQL schema traits + canonical SchemaFingerprint (FINGERPRINT_SPEC).
 # `default-features = false` follows sql-traits' own gating. The `std`
@@ -441,6 +451,11 @@ tokio = { version = "1", optional = true, features = ["sync", "rt", "macros", "t
 tokio-util = { version = "0.7", optional = true }
 bytes = { version = "1", default-features = false }
 
+# Non-poisoning lock guarding the cursors the pooled connector holds open.
+# The workspace rs-parking-lot rule bans `std::sync::Mutex` where the guard
+# would be unwrapped, and a cursor map is exactly that shape.
+parking_lot = { version = "0.12", optional = true }
+
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -529,7 +544,17 @@ observability = ["dep:tracing", "tracing/std"]
 # `std`, so a configuration that actually connects has it, which is why the
 # `std` that used to sit here read as necessary. The user activates their
 # backend on their own diesel dep.
-executor-diesel = ["dep:diesel"]
+# Row reading needs diesel's raw-value accessors, which sit behind the
+# third-party-backend flag, so a connector that decodes a returned row carries
+# it just as `diesel-typed` does for binds. The flag gates diesel's own API
+# surface only and pulls in no crate.
+executor-diesel = [
+    "dep:diesel",
+    "diesel?/chrono",
+    "diesel?/numeric",
+    "diesel?/serde_json",
+    "diesel?/i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+]
 # Opt-in: the diesel-typed subscription/follow API. Renders a typed diesel
 # query to placeholder SQL plus a list of bind `Value<B>`s and registers it
 # via the string+binds core. This base feature covers the Postgres backend
@@ -541,6 +566,13 @@ diesel-typed = [
     "dep:diesel",
     "diesel?/postgres_backend",
     "diesel?/uuid",
+    # `Value` carries temporal, decimal and JSON payloads, so the decoders need
+    # diesel's readers for them. These add no crate to the graph: `Backend for
+    # Postgres` already names `chrono::NaiveDateTime`, `bigdecimal::BigDecimal`
+    # and `serde_json::Value` as its payload types.
+    "diesel?/chrono",
+    "diesel?/numeric",
+    "diesel?/serde_json",
     "diesel?/i-implement-a-third-party-backend-and-opt-into-breaking-changes",
 ]
 # Opt-in: extend the diesel-typed follow API to SQLite. Adds `FollowRowDecode for
@@ -566,7 +598,7 @@ diesel-typed-mysql = [
 # through this connector carry a `PgLsn` checkpoint read from
 # `pg_current_wal_lsn()` inside the same transaction as the user query,
 # so the snapshot value and the LSN agree on a single point in the WAL.
-executor-diesel-postgres = ["executor-diesel", "diesel?/postgres"]
+executor-diesel-postgres = ["executor-diesel", "diesel?/postgres", "diesel?/uuid"]
 # Opt-in: ship `PgR2D2DieselConnector`, the pool-backed analogue of
 # `PgDieselConnector`. Wraps `r2d2::Pool<ConnectionManager<PgConnection>>`,
 # is `Send + Sync`, and reads `pg_current_wal_lsn()` inside the same
@@ -576,6 +608,7 @@ executor-diesel-postgres = ["executor-diesel", "diesel?/postgres"]
 executor-diesel-postgres-r2d2 = [
     "executor-diesel-postgres",
     "dep:r2d2",
+    "dep:parking_lot",
     "diesel?/r2d2",
 ]
 # Opt-in: ship the `patchset::PgAdapter` and the
@@ -619,7 +652,7 @@ apply-patchset-mysql = [
 # backend-agnostic surface, no libpq or libmysqlclient. First-class peer of
 # the sync `executor-diesel` ladder, additive: the sync surface is
 # unchanged. The user activates a backend below.
-executor-diesel-async = ["executor-diesel", "dep:diesel-async"]
+executor-diesel-async = ["executor-diesel", "dep:diesel-async", "dep:parking_lot"]
 # Opt-in: ship `PgAsyncDieselConnector`, the async LSN-aware analogue of
 # `PgDieselConnector`. Wraps a `bb8` pool over `AsyncPgConnection`, is
 # `Send + Sync`, and reads `pg_current_wal_lsn()` inside the same
@@ -629,6 +662,8 @@ executor-diesel-async-postgres = [
     "executor-diesel-async",
     "diesel-async/postgres",
     "diesel-async/bb8",
+    # The row decoder reads a `uuid` column through diesel's own reader.
+    "diesel?/uuid",
 ]
 # Opt-in: ship `MysqlAsyncDieselConnector`, the async binlog-position-aware
 # analogue of `MysqlDieselConnector`. Wraps a `bb8` pool over
@@ -786,6 +821,18 @@ inherits = "release"
 inherits = "release"
 lto = false
 codegen-units = 16
+
+# Iteration profile for local test runs. Under `cargo test --release` every
+# one of the ~78 integration test binaries pays release's fat-LTO,
+# single-codegen-unit link: 5m54s of rebuild after touching one source
+# file. Tests still want release-grade codegen, so only the link-time
+# knobs relax, plus incremental compilation, which brings the same rebuild
+# to 10s. Use via `cargo +1.88 nextest run --cargo-profile testfast`.
+[profile.testfast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
 
 
 [lints]

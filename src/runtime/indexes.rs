@@ -237,7 +237,10 @@ impl HybridIndexes {
     ) {
         let pred_id_u32 = pred_id.as_u32();
 
-        if matches!(projection, QueryProjection::Aggregate(_)) {
+        if matches!(
+            projection,
+            QueryProjection::Aggregate(_) | QueryProjection::GroupedAggregate { .. }
+        ) {
             // An aggregate's value moves only when a column it reads moves, so
             // per-column dependencies prune its UPDATE candidates.
             if deps.is_empty() {

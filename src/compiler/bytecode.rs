@@ -259,13 +259,13 @@ pub struct BytecodeProgram<B: Backend> {
     /// The column each membership term slot compares, indexed by slot.
     ///
     /// Empty for a filter carrying no term, which is every filter the
-    /// `membership-term` feature does not compile. Dispatch reads the column at
+    /// `membership-term` feature does not compile. Dispatch reads the columns at
     /// `term_columns[slot]` off the changed row to learn which subscribers the
     /// row admits through that term, so it travels with the program rather than
     /// beside it: the program is what persistence stores and reloads, and a
-    /// reloaded term with no column would narrow nothing and deliver the row to
+    /// reloaded term with no columns would narrow nothing and deliver the row to
     /// every subscriber sharing the predicate.
-    pub term_columns: Vec<ColumnId>,
+    pub term_columns: Vec<Vec<ColumnId>>,
 }
 
 impl<B: Backend> BytecodeProgram<B> {
@@ -277,13 +277,13 @@ impl<B: Backend> BytecodeProgram<B> {
     }
 
     /// Build a program whose slot `i` carries a membership term comparing
-    /// `term_columns[i]`.
+    /// `term_columns[i]`, one entry per compared column and in written order.
     ///
     /// A term column is a dependency like any other: an UPDATE touching only
-    /// the column a term compares moves which subscribers the row admits, so a
+    /// a column a term compares moves which subscribers the row admits, so a
     /// program pruned on the load set alone would miss it.
     #[must_use]
-    pub fn with_terms(instructions: Vec<Instruction<B>>, term_columns: Vec<ColumnId>) -> Self {
+    pub fn with_terms(instructions: Vec<Instruction<B>>, term_columns: Vec<Vec<ColumnId>>) -> Self {
         let dependency_columns = Self::extract_dependencies(&instructions, &term_columns);
         Self {
             instructions,
@@ -297,7 +297,7 @@ impl<B: Backend> BytecodeProgram<B> {
     /// deduplicated.
     fn extract_dependencies(
         instructions: &[Instruction<B>],
-        term_columns: &[ColumnId],
+        term_columns: &[Vec<ColumnId>],
     ) -> Vec<ColumnId> {
         let mut cols: Vec<ColumnId> = instructions
             .iter()
@@ -308,7 +308,7 @@ impl<B: Backend> BytecodeProgram<B> {
                     None
                 }
             })
-            .chain(term_columns.iter().copied())
+            .chain(term_columns.iter().flatten().copied())
             .collect();
         cols.sort_unstable();
         cols.dedup();
@@ -524,9 +524,9 @@ mod tests {
             Instruction::And,
         ];
 
-        let program = BytecodeProgram::with_terms(instructions, vec![9]);
+        let program = BytecodeProgram::with_terms(instructions, vec![vec![9]]);
         assert_eq!(program.dependency_columns, vec![5, 9]);
-        assert_eq!(program.term_columns, vec![9]);
+        assert_eq!(program.term_columns, vec![vec![9]]);
         assert!(!program.is_constant());
     }
 
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn a_filter_of_one_term_alone_is_not_constant() {
         let program: BytecodeProgram<Postgres> =
-            BytecodeProgram::with_terms(vec![Instruction::TermTruth(0)], vec![3]);
+            BytecodeProgram::with_terms(vec![Instruction::TermTruth(0)], vec![vec![3]]);
         assert_eq!(program.dependency_columns, vec![3]);
         assert!(!program.is_constant());
     }

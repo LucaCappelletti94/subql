@@ -1,11 +1,12 @@
 //! Bootstrap and reset path for in-process delta aggregators.
 //!
-//! `RegisterResult::aggregate_bootstrap` bundles a runnable component seed
-//! query per `AggSpec` with its decode kinds, and `AggAccumulator::seed_from_row`
-//! decodes the returned component row into a seeded accumulator. Together they let
-//! a caller obtain the seed for the in-process aggregate family and re-seed
-//! after the resets subql mandates (`TruncateRequiresReset`, RLS/ACL policy
-//! changes), the same courtesy `Registered::ReExec` already gives `MIN`/`MAX`.
+//! `Served::aggregate_bootstrap` bundles a runnable component seed
+//! query per `AggSpec` with its decode kinds, and
+//! `Install<AggregateSeedInstall>` decodes the returned component
+//! row into the running total the engine holds. Together they let a caller
+//! start an in-process aggregate and start it over after the resets subql
+//! mandates (a permission change, through `reset_aggregate_value`), the same
+//! courtesy `Tier::Scalar` already gives `MIN`/`MAX`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -13,10 +14,7 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{BuiltinKind, Postgres, ScalarKind, Value};
 use subql::testing::TestEvent;
-use subql::{
-    AggAccumulator, AggSpec, AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine,
-    SubscriptionRequest,
-};
+use subql::{AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT, status TEXT);";
 
@@ -31,7 +29,33 @@ fn bootstrap_of(sql: &str) -> Option<AggregateBootstrap> {
     engine()
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql))
         .unwrap()
+        .served()
+        .expect("the engine maintains this one in process")
         .aggregate_bootstrap
+        .clone()
+}
+
+/// Register `sql`, hand it `row` as its starting numbers, and answer with the
+/// value it then holds. Nothing has been folded against it, so the read cannot
+/// have raced a change and needs no stream position.
+fn seeded_value(sql: &str, row: &[Value<Postgres>]) -> AggValue {
+    let mut engine = engine();
+    let registered = engine
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql))
+        .unwrap();
+    let updates = subql::Install::install(
+        &mut engine,
+        registered.subscription_id,
+        subql::AggregateSeedInstall {
+            rows: vec![row.to_vec()],
+            read_at: None,
+        },
+    )
+    .expect("the starting numbers land");
+    assert_eq!(updates.len(), 1);
+    updates[0]
+        .folded_value()
+        .expect("ungrouped install sets a value")
 }
 
 #[test]
@@ -127,111 +151,114 @@ fn bootstrap_sql_is_row_subscription_safe() {
 }
 
 #[test]
-fn seed_from_row_decodes_components() {
+fn a_seed_row_decodes_into_the_value_it_describes() {
     // COUNT family: single `c` component.
     assert_eq!(
-        AggAccumulator::seed_from_row(&AggSpec::CountStar, &[Value::<Postgres>::Int(5)]).value(),
+        seeded_value("SELECT COUNT(*) FROM t", &[Value::Int(5)]),
         AggValue::Count(5),
     );
     assert_eq!(
-        AggAccumulator::seed_from_row(
-            &AggSpec::CountColumn { column: 1 },
-            &[Value::<Postgres>::Int(3)]
-        )
-        .value(),
+        seeded_value("SELECT COUNT(amount) FROM t", &[Value::Int(3)]),
         AggValue::Count(3),
     );
     // SUM: single `s` component, from an integer or float column.
     assert_eq!(
-        AggAccumulator::seed_from_row(&AggSpec::Sum { column: 1 }, &[Value::<Postgres>::Int(10)])
-            .value(),
+        seeded_value("SELECT SUM(amount) FROM t", &[Value::Int(10)]),
         AggValue::Sum(10.0),
     );
     assert_eq!(
-        AggAccumulator::seed_from_row(
-            &AggSpec::Sum { column: 1 },
-            &[Value::<Postgres>::Float(2.5)]
-        )
-        .value(),
+        seeded_value("SELECT SUM(amount) FROM t", &[Value::Float(2.5)]),
         AggValue::Sum(2.5),
     );
     // AVG: `(s, c)` components.
     assert_eq!(
-        AggAccumulator::seed_from_row(
-            &AggSpec::Avg { column: 1 },
-            &[Value::<Postgres>::Float(10.0), Value::Int(4)],
-        )
-        .value(),
+        seeded_value(
+            "SELECT AVG(amount) FROM t",
+            &[Value::Float(10.0), Value::Int(4)],
+        ),
         AggValue::Real(Some(2.5)),
     );
     // VAR_POP: `(s, sq, c)`. amounts [2, 4, 6] -> sum=12, sum_sq=56, n=3.
     // var_pop = 56/3 - (12/3)^2 = 2.6666666666666665.
-    let var_pop = AggAccumulator::seed_from_row(
-        &AggSpec::VarPop { column: 1 },
-        &[
-            Value::<Postgres>::Float(12.0),
-            Value::Float(56.0),
-            Value::Int(3),
-        ],
-    );
-    assert_eq!(var_pop.value(), AggValue::Real(Some(56.0 / 3.0 - 16.0)));
-    // STDDEV_POP over the same components is sqrt(var_pop).
-    let stddev_pop = AggAccumulator::seed_from_row(
-        &AggSpec::StddevPop { column: 1 },
-        &[
-            Value::<Postgres>::Float(12.0),
-            Value::Float(56.0),
-            Value::Int(3),
-        ],
-    );
     assert_eq!(
-        stddev_pop.value(),
+        seeded_value(
+            "SELECT VAR_POP(amount) FROM t",
+            &[Value::Float(12.0), Value::Float(56.0), Value::Int(3)],
+        ),
+        AggValue::Real(Some(56.0 / 3.0 - 16.0)),
+    );
+    // STDDEV_POP over the same components is sqrt(var_pop).
+    assert_eq!(
+        seeded_value(
+            "SELECT STDDEV_POP(amount) FROM t",
+            &[Value::Float(12.0), Value::Float(56.0), Value::Int(3)],
+        ),
         AggValue::Real(Some((56.0f64 / 3.0 - 16.0).sqrt())),
     );
 }
 
 #[test]
-fn seed_from_row_empty_result_is_empty_state() {
+fn a_seed_over_an_empty_table_is_the_empty_value() {
     // Zero matching rows: COUNT returns 0, SUM/variance components are NULL.
     assert_eq!(
-        AggAccumulator::seed_from_row(&AggSpec::CountStar, &[Value::<Postgres>::Int(0)]).value(),
+        seeded_value("SELECT COUNT(*) FROM t", &[Value::Int(0)]),
         AggValue::Count(0),
     );
     assert_eq!(
-        AggAccumulator::seed_from_row(&AggSpec::Sum { column: 1 }, &[Value::<Postgres>::Null])
-            .value(),
+        seeded_value("SELECT SUM(amount) FROM t", &[Value::Null]),
         AggValue::Sum(0.0),
     );
     assert_eq!(
-        AggAccumulator::seed_from_row(
-            &AggSpec::Avg { column: 1 },
-            &[Value::<Postgres>::Null, Value::Int(0)],
-        )
-        .value(),
+        seeded_value("SELECT AVG(amount) FROM t", &[Value::Null, Value::Int(0)],),
         AggValue::Real(None),
     );
     assert_eq!(
-        AggAccumulator::seed_from_row(
-            &AggSpec::VarPop { column: 1 },
-            &[Value::<Postgres>::Null, Value::Null, Value::Int(0)],
-        )
-        .value(),
+        seeded_value(
+            "SELECT VAR_POP(amount) FROM t",
+            &[Value::Null, Value::Null, Value::Int(0)],
+        ),
         AggValue::Real(None),
     );
 }
 
-/// The reset contract is actually runnable: re-seeding from the bootstrap
+/// The reset contract is actually runnable: seeding again from the bootstrap
 /// components computed over the current table equals a direct recompute.
 #[test]
 fn reseed_matches_recompute() {
-    // A registration must expose runnable bootstrap SQL to re-seed after a
-    // reset (TruncateRequiresReset, policy change).
+    // A registration must expose runnable bootstrap SQL to seed again after a
+    // reset for a permission change.
     assert!(bootstrap_of("SELECT AVG(amount) FROM t").is_some());
 
-    // Current table amounts after a reset: [2, 4, 6]. Oracle AVG = 4.0.
-    let seeded = AggAccumulator::seed_from_row(
-        &AggSpec::Avg { column: 1 },
-        &[Value::<Postgres>::Float(12.0), Value::Int(3)],
-    );
-    assert_eq!(seeded.value(), AggValue::Real(Some(4.0)));
+    let mut engine = engine();
+    let registered = engine
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
+            1u64,
+            "SELECT AVG(amount) FROM t",
+        ))
+        .unwrap();
+    let subscription = registered.subscription_id;
+    subql::Install::install(
+        &mut engine,
+        subscription,
+        subql::AggregateSeedInstall {
+            rows: vec![vec![Value::Float(3.0), Value::Int(1)]],
+            read_at: None,
+        },
+    )
+    .expect("the first numbers land");
+
+    // A permission change moved the answer without any event saying so, so the
+    // caller resets and reads again. Current table amounts: [2, 4, 6].
+    assert!(engine.reset_aggregate_value(subscription));
+    let updates = subql::Install::install(
+        &mut engine,
+        subscription,
+        subql::AggregateSeedInstall {
+            rows: vec![vec![Value::Float(12.0), Value::Int(3)]],
+            read_at: None,
+        },
+    )
+    .expect("the new starting numbers land");
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].folded_value(), Some(AggValue::Real(Some(4.0))));
 }

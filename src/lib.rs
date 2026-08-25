@@ -7,16 +7,16 @@
 extern crate alloc;
 
 // Re-export public API
-pub use compiler::{AggSpec, QueryProjection};
+pub use compiler::{AggHaving, AggSpec, HavingFunction, HavingOp, HavingSubject, QueryProjection};
 pub use errors::*;
 #[cfg(feature = "pg-sqlite-emu")]
 pub use pg_sqlite_emu::{PgSqliteEmuError, PgSqliteEmuSource};
 #[cfg(feature = "pg-streaming")]
 pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
-pub use runtime::{
-    agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SubscriptionEngine,
-    SumKernel,
+pub use runtime::aggregate::{
+    DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ, DEFAULT_MAX_GROUPS_PER_AGGREGATE,
 };
+pub use runtime::SubscriptionEngine;
 #[cfg(feature = "sqlite-cdc")]
 pub use sqlite_cdc::{SqliteCdcError, SqliteCdcSource};
 pub use sqlite_cdc::{SqliteChangesetEvent, SqliteChangesetParser};
@@ -83,6 +83,12 @@ pub mod term;
 mod term_compile;
 pub mod visibility;
 pub mod wal;
+
+// Value decoding shared by the diesel-typed query API and the diesel-backed
+// re-execution connectors. Both need the same raw-value readers, so the
+// convention lives in one place rather than one per consumer.
+#[cfg(any(feature = "diesel-typed", feature = "executor-diesel"))]
+pub mod diesel_decode;
 
 // Diesel-typed subscription and follow API. Only compiles when the
 // `diesel-typed` family of features pulls in `diesel` with the third-party

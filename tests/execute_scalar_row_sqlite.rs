@@ -23,24 +23,54 @@ use subql::backend::{Postgres, Value};
 use subql::reexec::{Connector, DieselConnector};
 use subql::testing::TestEvent;
 use subql::{
-    AggAccumulator, AggSpec, AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine,
+    AggSpec, AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine, SubscriptionId,
     SubscriptionRequest,
 };
 
 const CATALOG: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT);";
 
-/// Register `sql` and return its bootstrap bundle (`sql` + `kinds`).
-fn bootstrap(sql: &str) -> AggregateBootstrap {
+type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+
+/// Register `sql` and return the engine, the subscription holding its running
+/// total, and its bootstrap bundle (`sql` + `kinds`).
+fn registered(sql: &str) -> (Engine, SubscriptionId, AggregateBootstrap) {
     let db = ParserDB::parse::<PostgreSqlDialect>(CATALOG).unwrap();
-    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
-        SubscriptionEngine::new(db, PostgreSqlDialect {});
-    engine
+    let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let result = engine
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql))
-        .unwrap()
+        .unwrap();
+    let bootstrap = result
+        .served()
+        .expect("the engine maintains this one in process")
         .aggregate_bootstrap
-        .expect("aggregate registration carries a bootstrap")
+        .clone()
+        .expect("aggregate registration carries a bootstrap");
+    (engine, result.subscription_id, bootstrap)
 }
 
+/// Just the bootstrap bundle, for the tests that only read the SQL.
+fn bootstrap(sql: &str) -> AggregateBootstrap {
+    registered(sql).2
+}
+
+fn install_seed(
+    engine: &mut Engine,
+    subscription: SubscriptionId,
+    row: Vec<Value<Postgres>>,
+) -> Result<AggValue, subql::AggregateInstallError> {
+    let updates = subql::Install::install(
+        engine,
+        subscription,
+        subql::AggregateSeedInstall {
+            rows: vec![row],
+            read_at: None,
+        },
+    )?;
+    assert_eq!(updates.len(), 1);
+    Ok(updates[0]
+        .folded_value()
+        .expect("ungrouped install sets a value"))
+}
 /// In-memory SQLite `t` seeded with `amounts` (None = NULL amount).
 fn sqlite_with(amounts: &[Option<i64>]) -> DieselConnector<SqliteConnection, Postgres> {
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
@@ -141,14 +171,14 @@ fn execute_scalar_row_empty_table_is_empty_state() {
     let b = bootstrap("SELECT COUNT(*) FROM t");
     let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
     assert_eq!(row, vec![Value::Int(0)]);
-    // SUM over empty is NULL; COUNT(amount) is 0.
-    let b = bootstrap("SELECT AVG(amount) FROM t");
+    // SUM over empty is NULL, COUNT(amount) is 0.
+    let (mut engine, subscription, b) = registered("SELECT AVG(amount) FROM t");
     let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
     assert_eq!(row, vec![Value::Null, Value::Int(0)]);
-    // The empty row folds to the empty aggregate.
+    // The empty row seeds the empty aggregate.
     assert_eq!(
-        AggAccumulator::seed_from_row(&AggSpec::Avg { column: 1 }, &row).value(),
-        AggValue::Real(None),
+        install_seed(&mut engine, subscription, row),
+        Ok(AggValue::Real(None)),
     );
 }
 
@@ -158,12 +188,11 @@ fn seed_through_connector_matches_recompute() {
     let amounts = [Some(2i64), Some(4), Some(6), None];
     let connector = sqlite_with(&amounts);
     for (sql, spec) in all_specs() {
-        let b = bootstrap(sql);
+        let (mut engine, subscription, b) = registered(sql);
         let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
-        let acc = AggAccumulator::seed_from_row(&spec, &row);
         assert_eq!(
-            acc.value(),
-            oracle(&spec, &amounts),
+            install_seed(&mut engine, subscription, row),
+            Ok(oracle(&spec, &amounts)),
             "seed-through-connector mismatch for `{sql}`"
         );
     }
@@ -185,12 +214,11 @@ proptest! {
     ) {
         let connector = sqlite_with(&amounts);
         for (sql, spec) in all_specs() {
-            let b = bootstrap(sql);
+            let (mut engine, subscription, b) = registered(sql);
             let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
-            let acc = AggAccumulator::seed_from_row(&spec, &row);
             prop_assert_eq!(
-                acc.value(),
-                oracle(&spec, &amounts),
+                install_seed(&mut engine, subscription, row),
+                Ok(oracle(&spec, &amounts)),
                 "seed-through-connector mismatch for `{}` over {:?}", sql, amounts
             );
         }

@@ -25,12 +25,15 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
 use subql::backend::{MySql, ScalarKind, Value};
 use subql::reexec::{
-    AutoResolvingEngine, Connector, MysqlDieselConnector, ReExecEngine, Registered, SnapshotResult,
+    AutoResolvingEngine, Connector, MysqlDieselConnector, SnapshotResult, SyncMode,
 };
 use subql::testing::TestEvent;
-use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
+use subql::{
+    catalog_helpers, DefaultIds, Registered, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
+};
 
-type Engine = AutoResolvingEngine<TestEvent<MySql>, DefaultIds, ParserDB, MysqlDieselConnector>;
+type Engine =
+    AutoResolvingEngine<TestEvent<MySql>, DefaultIds, ParserDB, SyncMode<MysqlDieselConnector>>;
 
 /// Catalog DDL shared by the engine + planner. `FLOAT` maps to subql's
 /// `Float` scalar kind under the MySQL parser.
@@ -58,6 +61,11 @@ fn setup_mysql(conn: &mut MysqlConnection, seed: &[(i64, f64)]) {
     }
 }
 
+/// One more row, for a commit that lands while a read is parked.
+fn insert(id: i64) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
+}
+
 fn catalog() -> ParserDB {
     ParserDB::parse::<MySqlDialect>(DDL).expect("parse DDL")
 }
@@ -65,10 +73,7 @@ fn catalog() -> ParserDB {
 fn build_engine(catalog: ParserDB, conn_exec: MysqlConnection) -> Engine {
     let inner =
         SubscriptionEngine::<TestEvent<MySql>, DefaultIds, ParserDB>::new(catalog, MySqlDialect {});
-    AutoResolvingEngine::new(
-        ReExecEngine::new(inner),
-        MysqlDieselConnector::new(conn_exec),
-    )
+    AutoResolvingEngine::new(inner, SyncMode(MysqlDieselConnector::new(conn_exec)))
 }
 
 /// Build the full `orders` row image for the hand-built delete event.
@@ -106,8 +111,11 @@ fn scaffold_registers_both_and_executes_scalar() {
         )
         .expect("engine-supported registration");
     match engine_reg {
-        Registered::Engine(_) => {}
-        Registered::ReExec { .. } => panic!("expected Engine variant"),
+        Registered {
+            tier: Tier::InProcess(_),
+            ..
+        } => {}
+        other => panic!("expected the Engine variant, got {other:?}"),
     }
 
     let captured_reg = engine
@@ -117,10 +125,22 @@ fn scaffold_registers_both_and_executes_scalar() {
         )
         .expect("captured registration");
     match captured_reg {
-        Registered::ReExec { query_id, .. } => {
-            assert!(engine.install(query_id, Value::Float(5.0)));
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => {
+            assert!(subql::Install::install(
+                &mut engine,
+                subscription_id,
+                subql::ScalarInstall {
+                    value: Value::Float(5.0),
+                    checkpoint: None::<subql::NoCheckpoint>
+                }
+            )
+            .is_ok());
         }
-        Registered::Engine(_) => panic!("expected ReExec variant"),
+        other => panic!("expected ReExec variant, got {other:?}"),
     }
 
     let (value, _checkpoint) = engine
@@ -151,14 +171,18 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql() {
         )
         .expect("captured registration")
     {
-        Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected ReExec, got {other:?}"),
     };
 
     let snap = engine
         .snapshot(captured_qid)
         .expect("snapshot")
-        .expect("query_id exists");
+        .expect("subscription_id exists");
     let (value, checkpoint) = match snap {
         SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
         other => panic!("unexpected snapshot variant: {other:?}"),
@@ -197,10 +221,22 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
         )
         .expect("captured registration")
     {
-        Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected ReExec, got {other:?}"),
     };
-    assert!(engine.install(captured_qid, Value::Float(5.0)));
+    assert!(subql::Install::install(
+        &mut engine,
+        captured_qid,
+        subql::ScalarInstall {
+            value: Value::Float(5.0),
+            checkpoint: None::<subql::NoCheckpoint>
+        }
+    )
+    .is_ok());
 
     sql_query("DELETE FROM orders WHERE id = 1")
         .execute(&mut conn_dml)
@@ -215,7 +251,7 @@ fn delete_displacing_extreme_resolves_via_mysql_connector() {
         "expected exactly one ScalarUpdate, got {}",
         notifs.scalar_updates.len()
     );
-    assert_eq!(notifs.scalar_updates[0].query_id, captured_qid);
+    assert_eq!(notifs.scalar_updates[0].subscription_id, captured_qid);
     assert_eq!(
         notifs.scalar_updates[0].value,
         Value::Float(9.0),
@@ -260,7 +296,10 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
             "SELECT VAR_POP(amount) FROM nums",
         ))
         .expect("register aggregate")
+        .served()
+        .expect("the engine maintains this one in process")
         .aggregate_bootstrap
+        .clone()
         .expect("aggregate carries a bootstrap");
 
     // MySQL SUM(int) -> DECIMAL, cast to DOUBLE; sum=12, sum_sq=56, count=3.
@@ -271,5 +310,84 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     assert_eq!(
         row,
         vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
+    );
+}
+
+/// Every read reports a position taken before its own snapshot opened.
+///
+/// The contract a caller replays from: a position at or behind the snapshot
+/// re-delivers changes the snapshot already holds, while a position ahead of
+/// it silently drops a transaction the snapshot never saw. A user-level lock
+/// parks each read inside its own snapshot, a commit lands while it waits, and
+/// the returned coordinate has to sit behind that commit. The row count is
+/// asserted too, because a read that somehow saw the commit would make the
+/// coordinate comparison meaningless.
+///
+/// A connector each, because this one owns its connection outright and a
+/// parked read holds it for the length of the park.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn every_read_reports_a_position_taken_before_its_snapshot() {
+    common::assert_docker_available();
+    let container = common::mysql_8();
+    let port = common::mysql_port(&container);
+    let mut conn = common::mysql_connect(port);
+    setup_mysql(&mut conn, &[(1, 5.0)]);
+
+    // Each lock name carries a column, so MySQL cannot fold the condition to a
+    // constant and take the lock before its read view exists. The gate holds
+    // the name the lowest id builds, which a clustered-index scan reaches
+    // first.
+    let sql = "SELECT count(*) AS v FROM orders WHERE GET_LOCK(CONCAT('park_scalar_', id), 60) = 1";
+    let ((value, position), after_commit) =
+        common::park_a_mysql_read(port, "park_scalar_1", &insert(2), move || {
+            MysqlDieselConnector::new(common::mysql_connect(port))
+                .execute_scalar(sql, ScalarKind::Int, &())
+                .expect("scalar read")
+        });
+    assert_eq!(
+        value,
+        Value::Int(1),
+        "the scalar read's snapshot holds one row"
+    );
+    assert!(
+        position.expect("binary logging is on, so a coordinate is reported") < after_commit,
+        "the scalar read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let sql = "SELECT id FROM orders WHERE GET_LOCK(CONCAT('park_page_', id), 60) = 1 ORDER BY id";
+    let (page, after_commit) =
+        common::park_a_mysql_read(port, "park_page_1", &insert(3), move || {
+            MysqlDieselConnector::new(common::mysql_connect(port))
+                .read_page(sql, 1 << 20, &())
+                .expect("page read")
+        });
+    assert_eq!(
+        page.value.rows.len(),
+        2,
+        "the page's snapshot holds two rows"
+    );
+    assert!(
+        page.checkpoint
+            .expect("binary logging is on, so a coordinate is reported")
+            < after_commit,
+        "the page read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let sql = "SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT('park_seed_', id), 60) = 1";
+    let ((values, position), after_commit) =
+        common::park_a_mysql_read(port, "park_seed_1", &insert(4), move || {
+            MysqlDieselConnector::new(common::mysql_connect(port))
+                .execute_scalar_row(sql, &[ScalarKind::Int], &())
+                .expect("seed read")
+        });
+    assert_eq!(
+        values,
+        vec![Value::Int(3)],
+        "the seed read's snapshot holds three rows"
+    );
+    assert!(
+        position.expect("binary logging is on, so a coordinate is reported") < after_commit,
+        "the seed read's position must sit behind the commit at {after_commit:?}"
     );
 }

@@ -48,9 +48,11 @@ assert_eq!(notifs.inserted(), vec![42]);
 
 ## Streaming Aggregates
 
-Alongside row-match subscriptions, register a `SELECT COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, or variance/stddev (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) query instead of `SELECT *`. The engine emits signed deltas via `aggregate_deltas()` and the caller keeps the running total.
+Alongside row-match subscriptions, register a `SELECT COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, or variance/stddev (`VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) query instead of `SELECT *`. The engine keeps the running value and reports it whenever it moves, so the caller stores nothing and folds nothing.
 
-Aggregate subscribers never appear in `consumers()` output, and vice versa. `UPDATE` deltas need both old and new row images. If a source omits old images (`before` / `old`), `aggregate_deltas()` returns an error for update events.
+A registration answers with an `aggregate_bootstrap`, a runnable query for the starting numbers. Run it, then pass an `AggregateSeedInstall` to `Install::install` with the decoded row and stream position the read was taken at. Take that position **before** the read's snapshot opens: it is what lets the engine drop the changes the read already saw rather than counting them twice. Until the numbers land the subscription reports nothing, and a read the engine cannot line up against what it folded is refused with a `AggregateInstallError` so the caller can `reset_aggregate` and read again.
+
+Aggregate subscribers never appear in `consumers()` output, and vice versa. `UPDATE` deltas need both old and new row images, so a source that omits old images (`before` / `old`) gets an error for update events. A `TRUNCATE` needs nothing from the caller: the table is empty afterwards, so the engine empties the value itself and reports it.
 
 ```rust
 use sql_traits::structs::ParserDB;
@@ -58,25 +60,49 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest,
+    catalog_helpers, AggValue, DefaultIds, SubscriptionEngine, SubscriptionRequest,
 };
 
 let catalog = ParserDB::parse::<PostgreSqlDialect>(
     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
-)?;
-let orders_id = catalog_helpers::table_id(&catalog, "orders").unwrap();
+)
+.expect("the DDL parses");
+let orders_id = catalog_helpers::table_id(&catalog, "orders").expect("orders is cataloged");
 let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
-// Live count of active orders for consumer 42.
-engine.register(SubscriptionRequest::new(
-    42, "SELECT COUNT(*) FROM orders WHERE status = 'active'",
-))?;
+// Live count of active orders, and their running total, both for consumer 42.
+let counted = engine
+    .register(SubscriptionRequest::new(
+        42, "SELECT COUNT(*) FROM orders WHERE status = 'active'",
+    ))
+    .expect("the count registers");
+let totalled = engine
+    .register(SubscriptionRequest::new(
+        42, "SELECT SUM(amount) FROM orders WHERE status = 'active'",
+    ))
+    .expect("the sum registers");
 
-// Running total of active order amounts for consumer 42.
-engine.register(SubscriptionRequest::new(
-    42, "SELECT SUM(amount) FROM orders WHERE status = 'active'",
-))?;
+// Starting numbers over an empty table. Nothing has been folded yet, so this
+// read cannot have raced a change and needs no stream position.
+subql::Install::install(
+    &mut engine,
+    counted.subscription_id,
+    subql::AggregateSeedInstall {
+        rows: vec![vec![Value::Int(0)]],
+        read_at: None,
+    },
+)
+.expect("the count's numbers land");
+subql::Install::install(
+    &mut engine,
+    totalled.subscription_id,
+    subql::AggregateSeedInstall {
+        rows: vec![vec![Value::Int(0)]],
+        read_at: None,
+    },
+)
+.expect("the sum's numbers land");
 
 let event = TestEvent::<Postgres>::insert(
     orders_id,
@@ -84,80 +110,39 @@ let event = TestEvent::<Postgres>::insert(
 )
 .with_pk_columns([0u16]);
 
-let mut deltas: Vec<(u64, AggDelta)> = engine.aggregate_deltas(&event)?;
-// Sort for deterministic comparison (Count before Sum).
-deltas.sort_by_key(|(_, d)| match d {
-    AggDelta::Count(_) => 0,
-    AggDelta::Sum(_) => 1,
-    AggDelta::Avg { .. } => 2,
-    _ => 3,
-});
-assert_eq!(deltas, vec![
-    (42, AggDelta::Count(1)),
-    (42, AggDelta::Sum(250.0)),
-]);
-
-# Ok::<(), Box<dyn std::error::Error>>(())
+// One report per subscription, because one consumer's two aggregates are two
+// separate values.
+let mut updates = engine.aggregate_updates(&event).expect("the event folds");
+updates.sort_by_key(|update| update.subscription);
+assert_eq!(updates[0].subscription, counted.subscription_id);
+assert_eq!(updates[0].consumer, 42);
+assert_eq!(
+    updates[0].change,
+    subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
+        AggValue::Count(1),
+    )),
+);
+assert_eq!(
+    updates[1].change,
+    subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
+        AggValue::Sum(250.0),
+    )),
+);
 ```
 
 ### Aggregate variants
 
-| SQL | `AggDelta` variant | Notes |
+| SQL | `AggValue` variant | Notes |
 |-----|--------------------|-------|
 | `SELECT COUNT(*) FROM t WHERE ...` | `Count(i64)` | +/-1 per matching row |
 | `SELECT COUNT(col) FROM t WHERE ...` | `Count(i64)` | skips `NULL` cells |
 | `SELECT SUM(col) FROM t WHERE ...` | `Sum(f64)` | skips `NULL`/`NaN`/`Inf` |
-| `SELECT AVG(col) FROM t WHERE ...` | `Avg { sum_delta, count_delta }` | caller divides to get the new average |
-| `SELECT VAR_POP(col) FROM t WHERE ...` (also `VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) | `Stats { sum_delta, sum_sq_delta, count_delta }` | caller maintains running sum, sum-of-squares, and count |
-
-For `AVG`, the caller accumulates `running_sum` and `running_count` separately, then computes the average as `running_sum / running_count` on demand:
-
-```rust
-use sql_traits::structs::ParserDB;
-use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
-use subql::testing::TestEvent;
-use subql::{
-    catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest,
-};
-
-let catalog = ParserDB::parse::<PostgreSqlDialect>(
-    "CREATE TABLE scores (id INT PRIMARY KEY, value INT);",
-)?;
-let scores_id = catalog_helpers::table_id(&catalog, "scores").unwrap();
-let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
-    SubscriptionEngine::new(catalog, PostgreSqlDialect {});
-
-engine.register(SubscriptionRequest::new(
-    7, "SELECT AVG(value) FROM scores WHERE id > 0",
-))?;
-
-let event = TestEvent::<Postgres>::insert(
-    scores_id,
-    vec![Value::Int(1), Value::Int(100)],
-)
-.with_pk_columns([0u16]);
-
-let deltas = engine.aggregate_deltas(&event)?;
-let (_, delta) = &deltas[0];
-
-// Accumulate running statistics across events:
-let mut running_sum = 0.0_f64;
-let mut running_count = 0_i64;
-
-if let AggDelta::Avg { sum_delta, count_delta } = delta {
-    running_sum += sum_delta;
-    running_count += count_delta;
-    let avg = running_sum / running_count as f64;
-    assert_eq!(avg, 100.0);
-}
-
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
+| `SELECT AVG(col) FROM t WHERE ...` | `Real(Option<f64>)` | `None` when no row contributes |
+| `SELECT VAR_POP(col) FROM t WHERE ...` (also `VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`) | `Real(Option<f64>)` | `None` until the row count makes the statistic defined |
 
 ### Type validation
 
-Column types come from the SQL DDL parsed into `ParserDB`. When a column's type can be determined (e.g. `INT`, `REAL`, `TEXT`), the engine rejects `SUM` or `AVG` over non-numeric columns (`Bool`, `String`) at registration time with a `RegisterError::UnsupportedSql`.
+Column types come from the SQL DDL parsed into `ParserDB`. When a column's type can be determined (e.g. `INT`, `REAL`, `TEXT`), the engine will not fold `SUM` or `AVG` over a non-numeric column (`Bool`, `String`). Such a query still registers, on a tier that re-reads it against the database, and `Registered::not_served_because` carries the reason it is not folded in process.
 
 ```rust
 use sql_traits::structs::ParserDB;
@@ -177,12 +162,13 @@ engine.register(SubscriptionRequest::new(
     1, "SELECT SUM(price) FROM products WHERE id > 0",
 ))?;
 
-// Rejected at registration, name is String:
-assert!(engine
-    .register(SubscriptionRequest::new(
-        1, "SELECT SUM(name) FROM products WHERE id > 0",
-    ))
-    .is_err());
+// Registered, but not folded in process: name is String, so the answer comes
+// from re-reading rather than from the change stream.
+let rows = engine.register(SubscriptionRequest::new(
+    1, "SELECT SUM(name) FROM products WHERE id > 0",
+))?;
+assert!(rows.served().is_none());
+assert!(rows.not_served_because.is_some());
 
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

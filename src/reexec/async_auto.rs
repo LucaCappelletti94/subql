@@ -8,30 +8,23 @@
 //! testing surface.
 
 use super::async_connector::AsyncConnector;
-use super::auto::{ResolveContext, SnapshotResult};
+use super::auto::{reconcile_checkpoint, AutoResolvingEngine, ResolverMode, SnapshotResult};
 use super::connector::ReExecError;
-use super::engine::{
-    BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
-    Registered, ScalarUpdate,
-};
+use super::engine::{BatchOutcome, ReExecNotifications, ScalarUpdate};
 use crate::backend::{Backend, CdcEvent, Value};
-use crate::clock::{duration_between, ClockHandle};
 use crate::compiler::literals::SqlLiteralParse;
-use crate::{IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport};
+use crate::{IdTypes, RegisterError, SubscriptionId, UnregisterReport};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use async_lock::{Semaphore, SemaphoreGuardArc};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::time::Duration;
-use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 
 /// Internal state for the persistent re-execution concurrency cap.
 ///
 /// The cap is enforced by an [`async_lock::Semaphore`]. The
-/// [`AtomicUsize`] tracks how many permits are currently held so callers
-/// can read [`AsyncAutoResolvingEngine::inflight`] without re-deriving
-/// it from the semaphore itself (which `async-lock` does not expose).
+/// [`AtomicUsize`] tracks how many permits are held so callers can read
+/// [`AutoResolvingEngine::inflight`] without deriving it from the semaphore.
 struct ThrottleState {
     sem: Arc<Semaphore>,
     inflight: Arc<AtomicUsize>,
@@ -61,17 +54,17 @@ impl Drop for InflightGuard {
 /// the caller cancelled) leaves the semaphore in a clean state.
 async fn acquire_permit(
     throttle: Option<&(Arc<Semaphore>, Arc<AtomicUsize>)>,
-    query_id: ReExecQueryId,
+    subscription_id: SubscriptionId,
 ) -> Option<InflightGuard> {
     let Some((sem, inflight)) = throttle else {
-        let _ = query_id;
+        let _ = subscription_id;
         return None;
     };
     let permit = Arc::clone(sem).acquire_arc().await;
     let now = inflight.fetch_add(1, Ordering::AcqRel) + 1;
     #[cfg(feature = "observability")]
     tracing::trace!(
-        query_id,
+        subscription_id,
         inflight = now,
         "subql reexec throttle: permit acquired",
     );
@@ -83,44 +76,110 @@ async fn acquire_permit(
     })
 }
 
-/// Auto-resolving engine driven by an [`AsyncConnector`].
+/// What one triggered query needs from the database, with every borrow of the
+/// engine already resolved.
 ///
-/// Mirrors [`AutoResolvingEngine`](super::AutoResolvingEngine) one-for-one.
-/// See there for the behavior contract. The only difference is that
-/// methods which call the connector ([`snapshot`](Self::snapshot),
-/// [`consumers`](Self::consumers)) return futures.
-///
-/// The struct itself is `Send + Sync` whenever `X: AsyncConnector` and
-/// `X::AuthContext: Send + Sync` (the trait bound already requires this),
-/// so the engine can be moved between async tasks freely.
-pub struct AsyncAutoResolvingEngine<E, I, DB, X>
-where
-    E: CdcEvent,
-    E::Backend: SqlLiteralParse,
-    I: IdTypes,
-    DB: DatabaseLike,
-    X: AsyncConnector<Backend = E::Backend>,
-{
-    inner: ReExecEngine<E, I, DB>,
-    connector: X,
-    contexts: HashMap<ReExecQueryId, ResolveContext<I, X::AuthContext>>,
-    /// Optional [`Clock`](crate::Clock) used for per-query debounce.
-    clock: Option<ClockHandle>,
-    /// Minimum interval between two re-executions of the same captured
-    /// query. Requires `clock` to be set.
-    debounce: Option<Duration>,
-    /// Last `now_micros` at which each captured query was re-executed.
-    last_reexec_at: HashMap<ReExecQueryId, u64>,
-    /// Persistent throttle state that caps how many
-    /// `connector.execute_scalar` calls are in flight at any moment
-    /// across every [`consumers`](Self::consumers) and
-    /// [`consumers_batch`](Self::consumers_batch) call.
-    ///
-    /// `None` means unbounded (no throttle).
+/// The async resolve runs in three phases: decide and take (needs `&mut self`),
+/// read concurrently (needs only shared borrows), install and emit (needs
+/// `&mut self` again). This type is what crosses the first boundary, so
+/// anything the read needs from engine state is owned by the time it is built.
+/// Pending keys in particular are *taken* in phase one, which is why they
+/// cannot be re-read later.
+type KeyedRows<B> = Vec<(Vec<Value<B>>, Vec<Value<B>>)>;
+
+/// Keys a resolve took from the engine, per query, so a failure can give them
+/// back.
+type BorrowedKeys<B> = Vec<(SubscriptionId, Vec<Vec<Value<B>>>)>;
+
+enum ResolveJob<B: Backend> {
+    /// A scalar the connector reads in one call.
+    Scalar {
+        sql: alloc::string::String,
+        column_kind: crate::backend::BuiltinKind,
+    },
+    /// One grouped extreme and its source-row count.
+    GroupedScalar {
+        group: Vec<u8>,
+        sql: alloc::string::String,
+    },
+    /// Rows for the keys that changed, read scoped to those keys. Boxed: this
+    /// variant carries a parsed statement, and the others carry a string.
+    Keyed(alloc::boxed::Box<KeyedJob<B>>),
+    /// The whole result, paged. The generation is taken when the job is built,
+    /// so a read that fails part way cannot let a later one reuse it.
+    Whole {
+        sql: alloc::string::String,
+        generation: u64,
+    },
+}
+
+/// The keyed tier's read, as planned.
+struct KeyedJob<B: Backend> {
+    plan: super::plan::KeyedPlan,
+    key_positions: Vec<usize>,
+    keys: Vec<Vec<Value<B>>>,
+    /// Keys one statement may name, carried so the read needs nothing from the
+    /// engine once it is planned.
+    max_keys: usize,
+}
+
+/// What the database answered, still owned, ready to install.
+enum Resolved<B: Backend> {
+    Scalar(Value<B>),
+    GroupedScalar {
+        group: Vec<u8>,
+        row: Vec<Value<B>>,
+    },
+    Keyed {
+        keys: Vec<Vec<Value<B>>>,
+        columns: Vec<alloc::string::String>,
+        present: KeyedRows<B>,
+    },
+
+    Whole {
+        generation: u64,
+        pages: Vec<ReadPage<B>>,
+    },
+}
+struct ResolveOutputs<'a, I: IdTypes, B: Backend, C: crate::Checkpoint> {
+    aggregate_updates: &'a mut Vec<crate::AggregateValueUpdate<I, B>>,
+    scalar_updates: &'a mut Vec<ScalarUpdate<I, B, C>>,
+    rows_updates: &'a mut Vec<super::engine::RowsUpdate<I, B, C>>,
+    row_deltas: &'a mut Vec<super::engine::RowDelta<I, B, C>>,
+    followup: &'a mut Vec<super::ReExecutionTrigger<I, C>>,
+    transitions: &'a mut Vec<crate::MaintenanceTransition>,
+}
+
+/// One page of a whole re-read, as it will be delivered.
+struct ReadPage<B: Backend> {
+    columns: Vec<alloc::string::String>,
+    rows: Vec<Vec<Value<B>>>,
+    more: bool,
+}
+
+/// Asynchronous [`AsyncConnector`] mode.
+pub struct AsyncMode<X> {
+    /// Connector called by asynchronous methods.
+    pub connector: X,
+    /// Persistent concurrency throttle.
     permits: Option<ThrottleState>,
 }
 
-impl<E, I, DB, X> AsyncAutoResolvingEngine<E, I, DB, X>
+impl<X> AsyncMode<X> {
+    /// Wrap an asynchronous connector with no concurrency cap.
+    pub const fn new(connector: X) -> Self {
+        Self {
+            connector,
+            permits: None,
+        }
+    }
+}
+
+impl<B: Backend, X: AsyncConnector<Backend = B>> ResolverMode<B> for AsyncMode<X> {
+    type AuthContext = X::AuthContext;
+}
+
+impl<E, I, DB, X> AutoResolvingEngine<E, I, DB, AsyncMode<X>>
 where
     E: CdcEvent + Sync,
     E::Backend: SqlLiteralParse,
@@ -128,19 +187,6 @@ where
     DB: DatabaseLike + 'static,
     X: AsyncConnector<Backend = E::Backend>,
 {
-    /// Wrap an existing [`ReExecEngine`] with the given [`AsyncConnector`].
-    pub fn new(inner: ReExecEngine<E, I, DB>, connector: X) -> Self {
-        Self {
-            inner,
-            connector,
-            contexts: HashMap::new(),
-            clock: None,
-            debounce: None,
-            last_reexec_at: HashMap::new(),
-            permits: None,
-        }
-    }
-
     /// Cap the number of trigger re-executions that may be in flight
     /// simultaneously across all [`consumers`](Self::consumers) and
     /// [`consumers_batch`](Self::consumers_batch) calls.
@@ -159,7 +205,7 @@ where
     #[must_use]
     pub fn with_max_concurrent_reexecutions(mut self, cap: usize) -> Self {
         let cap = cap.max(1);
-        self.permits = Some(ThrottleState {
+        self.mode.permits = Some(ThrottleState {
             sem: Arc::new(Semaphore::new(cap)),
             inflight: Arc::new(AtomicUsize::new(0)),
             cap,
@@ -173,7 +219,8 @@ where
     /// dashboards alerting on sustained `inflight ~= cap`.
     #[must_use]
     pub fn inflight(&self) -> usize {
-        self.permits
+        self.mode
+            .permits
             .as_ref()
             .map_or(0, |state| state.inflight.load(Ordering::Acquire))
     }
@@ -181,116 +228,165 @@ where
     /// Configured concurrency cap, if any. `None` means unbounded.
     #[must_use]
     pub fn concurrency_cap(&self) -> Option<usize> {
-        self.permits.as_ref().map(|s| s.cap)
-    }
-
-    /// Attach a [`Clock`](crate::Clock) for per-query debounce. See
-    /// [`AutoResolvingEngine::with_clock`](super::AutoResolvingEngine::with_clock).
-    #[must_use]
-    pub fn with_clock(mut self, clock: ClockHandle) -> Self {
-        self.clock = Some(clock);
-        self
-    }
-
-    /// Configure a minimum interval between two re-executions of the same
-    /// captured query.
-    ///
-    /// See [`AutoResolvingEngine::with_debounce_per_query`](super::AutoResolvingEngine::with_debounce_per_query)
-    /// for the contract.
-    #[must_use]
-    pub const fn with_debounce_per_query(mut self, debounce: Duration) -> Self {
-        self.debounce = Some(debounce);
-        self
-    }
-
-    fn debounce_skip(&self, query_id: ReExecQueryId) -> bool {
-        let (Some(clock), Some(window)) = (self.clock.as_ref(), self.debounce) else {
-            return false;
-        };
-        let Some(last_micros) = self.last_reexec_at.get(&query_id).copied() else {
-            return false;
-        };
-        duration_between(last_micros, clock.now_micros()) < window
-    }
-
-    fn stamp_reexec(&mut self, query_id: ReExecQueryId) {
-        if let Some(clock) = self.clock.as_ref() {
-            self.last_reexec_at.insert(query_id, clock.now_micros());
-        }
-    }
-
-    /// The wrapped trigger-emitting engine.
-    pub const fn inner(&self) -> &ReExecEngine<E, I, DB> {
-        &self.inner
+        self.mode.permits.as_ref().map(|s| s.cap)
     }
 
     /// The connector this engine drives.
     pub const fn connector(&self) -> &X {
-        &self.connector
+        &self.mode.connector
     }
 
-    /// Number of captured re-execution queries (matches the inner engine).
-    pub fn reexec_query_count(&self) -> usize {
-        self.inner.reexec_query_count()
-    }
-
-    /// Register a subscription. Sync because registration only touches
-    /// in-memory engine state. The connector is not called.
-    pub fn register(
-        &mut self,
-        spec: SubscriptionRequest<I, E::Backend>,
-        auth: X::AuthContext,
-    ) -> Result<Registered, RegisterError> {
-        let session = match &spec.scope {
-            SubscriptionScope::Session(s) => Some(*s),
-            SubscriptionScope::Durable => None,
-        };
-        let result = self.inner.register(spec)?;
-        if let Registered::ReExec {
-            query_id,
-            sql,
-            column_kind,
-        } = &result
-        {
-            self.contexts.insert(
-                *query_id,
-                ResolveContext {
-                    sql: sql.clone(),
-                    column_kind: *column_kind,
-                    session,
-                    auth,
-                },
-            );
-        }
-        Ok(result)
-    }
-
-    /// Install a value directly, bypassing the connector.
-    pub fn install(&mut self, query_id: ReExecQueryId, value: Value<E::Backend>) -> bool {
-        self.inner.install(query_id, value)
-    }
-
-    /// Bootstrap a captured query by reading its current value through the
-    /// async connector and installing the result. Async analogue of
-    /// [`AutoResolvingEngine::snapshot`](super::AutoResolvingEngine::snapshot).
+    /// Bootstrap a captured query by reading its current answer through the
+    /// async connector. Async analogue of
+    /// [`AutoResolvingEngine::snapshot`](super::AutoResolvingEngine::snapshot),
+    /// including the tier split: `Scalar` for a scalar capture, `Rows` for
+    /// either row tier, and only the scalar is installed.
     ///
     /// # Errors
     ///
-    /// Returns [`ReExecError::Connector`] if the connector fails. Returns
-    /// `Ok(None)` if `query_id` does not exist.
+    /// Returns [`ReExecError::Connector`] if the connector fails, and
+    /// [`ReExecError::Cursor`] if a row tier's read fails or the connector
+    /// holds no cursors. Returns `Ok(None)` if `subscription_id` does not exist.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "snapshot handles each explicit read tier and always closes grouped cursors"
+    )]
     pub async fn snapshot(
         &mut self,
-        query_id: ReExecQueryId,
-    ) -> Result<Option<SnapshotResult<E::Backend, X::Checkpoint>>, ReExecError<X::Error>> {
-        let Some(ctx) = self.contexts.get(&query_id) else {
+        subscription_id: SubscriptionId,
+    ) -> Result<Option<SnapshotResult<E::Backend, X::Checkpoint, I>>, ReExecError<X::Error>> {
+        let Some(context) = self.contexts.get(&subscription_id) else {
             return Ok(None);
         };
+        let grouped_bootstrap = context.grouped_bootstrap.clone();
+        if let Some(bootstrap) = grouped_bootstrap {
+            let (pages, checkpoint) = Self::read_whole_with(
+                &self.mode.connector,
+                &bootstrap.sql,
+                self.max_page_bytes,
+                &context.auth,
+            )
+            .await?;
+            let rows = pages.into_iter().flat_map(|page| page.rows).collect();
+            let mut installed = crate::Install::install(
+                &mut self.inner,
+                subscription_id,
+                crate::GroupedScalarSeedInstall {
+                    rows,
+                    read_at: reconcile_checkpoint(checkpoint.as_ref()),
+                },
+            )?;
+            self.apply_transitions(&installed.transitions);
+            let mut pending = core::mem::take(&mut installed.triggers);
+            while let Some(trigger) = pending.pop() {
+                match &trigger.read {
+                    super::ReExecutionRead::GroupedScalar { group, sql, .. } => {
+                        let context = self
+                            .contexts
+                            .get(&subscription_id)
+                            .expect("a grouped scalar read keeps its connector context");
+                        let page = self
+                            .mode
+                            .connector
+                            .read_page(sql, self.max_page_bytes, &context.auth)
+                            .await
+                            .map_err(ReExecError::Connector)?;
+                        if page.value.more || page.value.rows.len() != 1 {
+                            return Err(crate::AggregateInstallError::RowCount {
+                                subscription: subscription_id,
+                                rows: page.value.rows.len(),
+                            }
+                            .into());
+                        }
+                        let resolved = crate::Install::install(
+                            &mut self.inner,
+                            subscription_id,
+                            crate::GroupedScalarInstall {
+                                group: group.clone(),
+                                row: page
+                                    .value
+                                    .rows
+                                    .into_iter()
+                                    .next()
+                                    .expect("the row count was checked"),
+                                checkpoint: trigger.checkpoint.clone(),
+                            },
+                        )?;
+                        self.apply_transitions(&resolved.transitions);
+                        pending.extend(resolved.triggers);
+                        installed.updates.extend(resolved.updates);
+                        installed.transitions.extend(resolved.transitions);
+                    }
+                    super::ReExecutionRead::Subscription => {
+                        let context = self
+                            .contexts
+                            .get(&subscription_id)
+                            .expect("a transitioned read keeps its connector context");
+                        let (pages, checkpoint) = Self::read_whole_with(
+                            &self.mode.connector,
+                            &context.sql,
+                            self.max_page_bytes,
+                            &context.auth,
+                        )
+                        .await?;
+                        let mut columns = Vec::new();
+                        let mut rows = Vec::new();
+                        for page in pages {
+                            if columns.is_empty() {
+                                columns = page.columns;
+                            }
+                            rows.extend(page.rows);
+                        }
+                        return Ok(Some(SnapshotResult::Rows {
+                            columns,
+                            rows,
+                            checkpoint,
+                        }));
+                    }
+                }
+            }
+            return Ok(Some(SnapshotResult::GroupedAggregate {
+                updates: installed.updates,
+                checkpoint,
+            }));
+        }
+        if context.whole_result || context.keyed {
+            let sql = context.sql.clone();
+            let (pages, checkpoint) = Self::read_whole_with(
+                &self.mode.connector,
+                &sql,
+                self.max_page_bytes,
+                &context.auth,
+            )
+            .await?;
+            let mut columns = Vec::new();
+            let mut rows = Vec::new();
+            for page in pages {
+                if columns.is_empty() {
+                    columns = page.columns;
+                }
+                rows.extend(page.rows);
+            }
+            return Ok(Some(SnapshotResult::Rows {
+                columns,
+                rows,
+                checkpoint,
+            }));
+        }
         let (value, checkpoint) = self
+            .mode
             .connector
-            .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
+            .execute_scalar(&context.sql, context.column_kind, &context.auth)
             .await
             .map_err(ReExecError::Connector)?;
-        self.inner.install(query_id, value.clone());
+        let _installed = crate::Install::install(
+            &mut self.inner,
+            subscription_id,
+            crate::ScalarInstall {
+                value: value.clone(),
+                checkpoint: checkpoint.clone(),
+            },
+        )?;
         Ok(Some(SnapshotResult::Scalar(value, checkpoint)))
     }
 
@@ -303,83 +399,589 @@ where
     /// rest of the batch and is surfaced as [`ReExecError::Connector`].
     ///
     /// [`ReExecutionTrigger`]: super::ReExecutionTrigger
+    #[allow(clippy::too_many_lines)]
     pub async fn consumers(
         &mut self,
         event: &E,
     ) -> Result<ReExecNotifications<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
-        use futures_util::stream::{StreamExt, TryStreamExt};
+        use futures_util::stream::StreamExt;
 
         let ReExecNotifications {
             engine,
+            mut aggregate_updates,
             mut scalar_updates,
+            mut rows_updates,
+            mut row_deltas,
             triggers,
-        } = self.inner.consumers(event).map_err(ReExecError::Dispatch)?;
+            mut transitions,
+        } = self
+            .inner
+            .reread_notifications(event)
+            .map_err(ReExecError::Dispatch)?;
+        self.apply_transitions(&transitions);
 
         // Pre-filter debounced triggers.
         let actionable: Vec<_> = triggers
             .into_iter()
-            .filter(|t| !self.debounce_skip(t.query_id))
+            .filter(|t| !self.debounce_skip(t.subscription_id, &t.read))
             .collect();
 
         if actionable.is_empty() {
             return Ok(ReExecNotifications {
                 engine,
+                aggregate_updates,
                 scalar_updates,
+                rows_updates,
+                row_deltas,
                 triggers: Vec::new(),
+                transitions,
             });
         }
 
-        // Borrow the immutable fields the futures need. `inner` and
-        // `last_reexec_at` stay free for the post-resolution mutation.
-        let connector = &self.connector;
+        // Phase one, under `&mut self`: decide each query's tier and take the
+        // engine state its read needs. Pending keys are consumed here, so this
+        // cannot be folded into the concurrent phase below.
+        let (jobs, borrowed) = self.plan_jobs(actionable);
+        if jobs.is_empty() {
+            return Ok(ReExecNotifications {
+                engine,
+                aggregate_updates,
+                scalar_updates,
+                rows_updates,
+                row_deltas,
+                triggers: Vec::new(),
+                transitions,
+            });
+        }
+
+        // Phase two: shared borrows only, so the reads can run concurrently.
+        // `inner` and `last_reexec_at` stay free for the mutation afterwards.
+        let connector = &self.mode.connector;
         let contexts = &self.contexts;
+        let max_page_bytes = self.max_page_bytes;
         let throttle = self
+            .mode
             .permits
             .as_ref()
             .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
-        let actionable_len = actionable.len();
+        let jobs_len = jobs.len();
 
         #[allow(clippy::type_complexity)]
-        let resolved: Vec<(
-            super::ReExecutionTrigger<I, E::Checkpoint>,
-            (Value<E::Backend>, Option<X::Checkpoint>),
-        )> = futures_util::stream::iter(actionable.into_iter().map(|trigger| {
-            let ctx = contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time, \
-                 trigger.query_id must exist in `contexts`",
-            );
-            let sql = ctx.sql.clone();
-            let column_kind = ctx.column_kind;
-            let auth = &ctx.auth;
+        let resolved: Vec<
+            Result<
+                (
+                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    Resolved<E::Backend>,
+                ),
+                ReExecError<X::Error>,
+            >,
+        > = futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
+            let auth = &contexts
+                .get(&trigger.subscription_id)
+                .expect(
+                    "every captured query stores its resolve context at register time, \
+                     trigger.subscription_id must exist in `contexts`",
+                )
+                .auth;
             let throttle = throttle.clone();
             async move {
-                let _guard = acquire_permit(throttle.as_ref(), trigger.query_id).await;
-                let result = connector.execute_scalar(&sql, column_kind, auth).await;
-                result.map(|r| (trigger, r))
+                let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
+                let answer = Self::run_job(connector, job, max_page_bytes, auth).await?;
+                Ok::<_, ReExecError<X::Error>>((trigger, answer))
             }
         }))
-        .buffer_unordered(actionable_len)
-        .try_collect()
-        .await
-        .map_err(ReExecError::Connector)?;
+        .buffer_unordered(jobs_len)
+        .collect::<Vec<_>>()
+        .await;
 
-        // All borrows released. Apply the resolutions.
-        for (trigger, (value, _db_checkpoint)) in resolved {
-            self.inner.install(trigger.query_id, value.clone());
-            self.stamp_reexec(trigger.query_id);
-            scalar_updates.push(ScalarUpdate {
-                query_id: trigger.query_id,
-                consumer_id: trigger.consumer_id,
-                value,
-                checkpoint: trigger.checkpoint.clone(),
-            });
+        // One failure fails the call, so nothing is delivered and every key
+        // taken goes back. Collected rather than short-circuited for exactly
+        // that reason: `try_collect` drops the other jobs, and their keys with
+        // them.
+        let answers = match Self::first_failure(resolved) {
+            Ok(answers) => answers,
+            Err(e) => {
+                self.restore_borrowed(borrowed);
+                return Err(e);
+            }
+        };
+
+        // Phase three: borrows released, apply what came back.
+        let mut followup = Vec::new();
+        for (trigger, answer) in answers {
+            self.stamp_reexec(trigger.subscription_id, &trigger.read);
+            self.apply_resolved(
+                &trigger,
+                answer,
+                &mut ResolveOutputs {
+                    aggregate_updates: &mut aggregate_updates,
+                    scalar_updates: &mut scalar_updates,
+                    rows_updates: &mut rows_updates,
+                    row_deltas: &mut row_deltas,
+                    followup: &mut followup,
+                    transitions: &mut transitions,
+                },
+            )?;
         }
+        self.drain_followup(
+            &mut followup,
+            &mut aggregate_updates,
+            &mut scalar_updates,
+            &mut rows_updates,
+            &mut row_deltas,
+            &mut transitions,
+        )
+        .await?;
 
         Ok(ReExecNotifications {
             engine,
+            aggregate_updates,
             scalar_updates,
+            rows_updates,
+            row_deltas,
             triggers: Vec::new(),
+            transitions,
         })
+    }
+
+    /// Decide every triggered query's read, and record what was taken.
+    ///
+    /// Phase one of the resolve, and the only part needing `&mut self`, which
+    /// is what lets the reads themselves run concurrently. A failure here gives
+    /// back whatever earlier queries in the same call already took.
+    #[allow(clippy::type_complexity)]
+    fn plan_jobs(
+        &mut self,
+        actionable: Vec<super::ReExecutionTrigger<I, E::Checkpoint>>,
+    ) -> (
+        Vec<(
+            super::ReExecutionTrigger<I, E::Checkpoint>,
+            ResolveJob<E::Backend>,
+        )>,
+        BorrowedKeys<E::Backend>,
+    ) {
+        let mut jobs = Vec::with_capacity(actionable.len());
+        // Taking a key is a promise to ask the database about it, and an error
+        // means nothing was delivered, so every key taken has to survive it.
+        let mut borrowed: BorrowedKeys<E::Backend> = Vec::new();
+        for trigger in actionable {
+            if let Some(job) = self.plan_job(&trigger) {
+                if let ResolveJob::Keyed(keyed) = &job {
+                    borrowed.push((trigger.subscription_id, keyed.keys.clone()));
+                }
+                jobs.push((trigger, job));
+            } else {
+                // Nothing to ask about, but the query was still triggered, so
+                // its debounce stamp moves as if it had been read.
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+            }
+        }
+        (jobs, borrowed)
+    }
+
+    /// Split collected outcomes into every answer, or the first failure.
+    ///
+    /// Safe against dropped keys only because the caller materialises every
+    /// outcome with `.collect()` before calling this: the `?`-style walk
+    /// below does short-circuit, but by then every sibling job has already
+    /// finished and returned its keys. Swapping that `collect` for a lazy
+    /// try-collect would reintroduce the loss.
+    #[allow(clippy::type_complexity)]
+    fn first_failure(
+        resolved: Vec<
+            Result<
+                (
+                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    Resolved<E::Backend>,
+                ),
+                ReExecError<X::Error>,
+            >,
+        >,
+    ) -> Result<
+        Vec<(
+            super::ReExecutionTrigger<I, E::Checkpoint>,
+            Resolved<E::Backend>,
+        )>,
+        ReExecError<X::Error>,
+    > {
+        let mut answers = Vec::with_capacity(resolved.len());
+        for outcome in resolved {
+            answers.push(outcome?);
+        }
+        Ok(answers)
+    }
+
+    /// Give back every key a failed call had taken.
+    fn restore_borrowed(&mut self, borrowed: BorrowedKeys<E::Backend>) {
+        for (subscription_id, keys) in borrowed {
+            self.inner.restore_pending_keys(subscription_id, keys);
+        }
+    }
+
+    /// Install one answer and record what the caller should be told.
+    ///
+    /// Shared by the single-event and batch paths so the two cannot drift on
+    /// what a tier delivers.
+    fn apply_resolved(
+        &mut self,
+        trigger: &super::ReExecutionTrigger<I, E::Checkpoint>,
+        answer: Resolved<E::Backend>,
+        outputs: &mut ResolveOutputs<'_, I, E::Backend, E::Checkpoint>,
+    ) -> Result<(), ReExecError<X::Error>> {
+        match answer {
+            Resolved::Scalar(value) => {
+                outputs.scalar_updates.push(crate::Install::install(
+                    &mut self.inner,
+                    trigger.subscription_id,
+                    crate::ScalarInstall {
+                        value,
+                        checkpoint: trigger.checkpoint.clone(),
+                    },
+                )?);
+            }
+            Resolved::GroupedScalar { group, row } => {
+                let installed = crate::Install::install(
+                    &mut self.inner,
+                    trigger.subscription_id,
+                    crate::GroupedScalarInstall {
+                        group,
+                        row,
+                        checkpoint: trigger.checkpoint.clone(),
+                    },
+                )?;
+                self.apply_transitions(&installed.transitions);
+                outputs.aggregate_updates.extend(installed.updates);
+                outputs.followup.extend(installed.triggers);
+                outputs.transitions.extend(installed.transitions);
+            }
+            Resolved::Keyed {
+                keys,
+                columns,
+                present,
+            } => outputs.row_deltas.extend(super::auto::deltas_from(
+                trigger.subscription_id,
+                trigger.consumer_id,
+                trigger.checkpoint.as_ref(),
+                &keys,
+                &present,
+                &columns,
+            )),
+            // One update per page, same as the sync engine: a re-read is
+            // delivered in pages sharing a generation, not as one message.
+            Resolved::Whole { generation, pages } => {
+                outputs.rows_updates.extend(pages.into_iter().map(|page| {
+                    super::engine::RowsUpdate {
+                        subscription_id: trigger.subscription_id,
+                        consumer_id: trigger.consumer_id,
+                        generation,
+                        columns: page.columns,
+                        rows: page.rows,
+                        more: page.more,
+                        checkpoint: trigger.checkpoint.clone(),
+                    }
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Serve the follow-up triggers a resolve produced (a grouped read can
+    /// displace further groups), one at a time so each may push more.
+    /// Shared by [`consumers`](Self::consumers) and
+    /// [`consumers_batch`](Self::consumers_batch), which once carried
+    /// diverging copies of this loop.
+    async fn drain_followup(
+        &mut self,
+        followup: &mut Vec<super::ReExecutionTrigger<I, E::Checkpoint>>,
+        aggregate_updates: &mut Vec<crate::AggregateValueUpdate<I, E::Backend>>,
+        scalar_updates: &mut Vec<ScalarUpdate<I, E::Backend, E::Checkpoint>>,
+        rows_updates: &mut Vec<super::engine::RowsUpdate<I, E::Backend, E::Checkpoint>>,
+        row_deltas: &mut Vec<super::engine::RowDelta<I, E::Backend, E::Checkpoint>>,
+        transitions: &mut Vec<crate::MaintenanceTransition>,
+    ) -> Result<(), ReExecError<X::Error>> {
+        while let Some(trigger) = followup.pop() {
+            if self.debounce_skip(trigger.subscription_id, &trigger.read) {
+                continue;
+            }
+            let Some(job) = self.plan_job(&trigger) else {
+                continue;
+            };
+            let auth = &self
+                .contexts
+                .get(&trigger.subscription_id)
+                .expect("a follow-up read stores its connector context")
+                .auth;
+            let answer =
+                Self::run_job(&self.mode.connector, job, self.max_page_bytes, auth).await?;
+            self.stamp_reexec(trigger.subscription_id, &trigger.read);
+            self.apply_resolved(
+                &trigger,
+                answer,
+                &mut ResolveOutputs {
+                    aggregate_updates,
+                    scalar_updates,
+                    rows_updates,
+                    row_deltas,
+                    followup,
+                    transitions,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Decide what a triggered query has to ask the database, taking whatever
+    /// engine state the read needs.
+    ///
+    /// `None` means there is nothing to ask: a keyed query whose changed keys
+    /// were already drained, or a plan that cannot be scoped. The caller still
+    /// stamps the query, because it was triggered.
+    ///
+    /// This is the only part of the resolve that needs `&mut self`, which is
+    /// what lets the reads themselves run concurrently.
+    fn plan_job(
+        &mut self,
+        trigger: &super::ReExecutionTrigger<I, E::Checkpoint>,
+    ) -> Option<ResolveJob<E::Backend>> {
+        let subscription_id = trigger.subscription_id;
+        if let super::ReExecutionRead::GroupedScalar { group, sql, .. } = &trigger.read {
+            return Some(ResolveJob::GroupedScalar {
+                group: group.clone(),
+                sql: sql.clone(),
+            });
+        }
+        let ctx = self.contexts.get(&subscription_id).expect(
+            "every captured query stores its resolve context at register time, \
+             subscription_id must exist in `contexts`",
+        );
+        if !ctx.keyed {
+            if !ctx.whole_result {
+                return Some(ResolveJob::Scalar {
+                    sql: ctx.sql.clone(),
+                    column_kind: ctx.column_kind,
+                });
+            }
+            let ctx = self
+                .contexts
+                .get_mut(&subscription_id)
+                .expect("just read above");
+            let sql = ctx.sql.clone();
+            // Bump first: a read that fails part way through must not let a
+            // later one reuse the generation its partial pages carried.
+            ctx.generation = ctx.generation.saturating_add(1);
+            return Some(ResolveJob::Whole {
+                sql,
+                generation: ctx.generation,
+            });
+        }
+
+        let keys = self.inner.take_pending_keys(subscription_id);
+        if keys.is_empty() {
+            return None;
+        }
+        let plan = self.inner.keyed_plan(subscription_id)?;
+        let plan = plan.clone();
+        let key_positions = plan.key_positions.clone();
+        Some(ResolveJob::Keyed(alloc::boxed::Box::new(KeyedJob {
+            plan,
+            key_positions,
+            keys,
+            max_keys: self.max_keys_per_read,
+        })))
+    }
+
+    /// Run one planned read. Holds no borrow of the engine, so callers can run
+    /// these concurrently.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive tier dispatch keeps async read semantics aligned"
+    )]
+    async fn run_job(
+        connector: &X,
+        job: ResolveJob<E::Backend>,
+        max_page_bytes: usize,
+        auth: &X::AuthContext,
+    ) -> Result<Resolved<E::Backend>, ReExecError<X::Error>> {
+        match job {
+            ResolveJob::Scalar { sql, column_kind } => {
+                let (value, _db_checkpoint) = connector
+                    .execute_scalar(&sql, column_kind, auth)
+                    .await
+                    .map_err(ReExecError::Connector)?;
+                Ok(Resolved::Scalar(value))
+            }
+            ResolveJob::GroupedScalar { group, sql } => {
+                let page = connector
+                    .read_page(&sql, max_page_bytes, auth)
+                    .await
+                    .map_err(ReExecError::Connector)?;
+                if page.value.more || page.value.rows.len() != 1 {
+                    return Err(crate::AggregateInstallError::RowCount {
+                        subscription: 0,
+                        rows: page.value.rows.len(),
+                    }
+                    .into());
+                }
+                Ok(Resolved::GroupedScalar {
+                    group,
+                    row: page
+                        .value
+                        .rows
+                        .into_iter()
+                        .next()
+                        .expect("the row count was checked"),
+                })
+            }
+            ResolveJob::Keyed(job) => {
+                let KeyedJob {
+                    plan,
+                    key_positions,
+                    keys,
+                    max_keys,
+                } = *job;
+                let mut columns = Vec::new();
+                let mut present: KeyedRows<E::Backend> = Vec::new();
+                // Bounded batches, same reason as the sync engine: statement
+                // duration tracks how many keys a statement names, and a
+                // caller's statement timeout applies per statement, so one
+                // unbounded request disables the only read ceiling it has.
+                for batch in super::auto::KeyBatches::new(&keys, max_keys) {
+                    let Some(sql) = super::plan::render_scoped_read::<E::Backend>(&plan, batch)
+                        .map_err(|e| {
+                            ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!(
+                                "{e}"
+                            )))
+                        })?
+                    else {
+                        continue;
+                    };
+                    let mut page_sql = sql;
+                    // Accumulated across pages, not per page. Resetting it
+                    // would let a key answered on an earlier page back into the
+                    // next statement, which delivers it twice and, with a
+                    // stable row order, never terminates.
+                    let mut seen_in_batch: Vec<Vec<Value<E::Backend>>> = Vec::new();
+                    loop {
+                        let page = connector
+                            .read_page(&page_sql, max_page_bytes, auth)
+                            .await
+                            .map_err(ReExecError::Connector)?;
+                        if columns.is_empty() {
+                            columns.clone_from(&page.value.columns);
+                        }
+                        let before = seen_in_batch.len();
+                        for row in page.value.rows {
+                            let key: Vec<Value<E::Backend>> = key_positions
+                                .iter()
+                                .filter_map(|i| row.get(*i).cloned())
+                                .collect();
+                            seen_in_batch.push(key.clone());
+                            present.push((key, row));
+                        }
+                        // A page with no rows ends the read whatever it claims
+                        // about there being more. Our own reader cannot report
+                        // that combination, but this trait has outside
+                        // implementors, and without this a connector that did
+                        // would loop here forever.
+                        if !page.value.more || seen_in_batch.len() == before {
+                            break;
+                        }
+                        // A batch whose rows do not fit one page resumes inside
+                        // the batch, so the statement stays bounded. No cursor
+                        // is needed, which is what keeps this tier
+                        // cancellation-safe with no server-side state to strand.
+                        let remaining: Vec<Vec<Value<E::Backend>>> = batch
+                            .iter()
+                            .filter(|k| !seen_in_batch.contains(k))
+                            .cloned()
+                            .collect();
+                        if remaining.is_empty() {
+                            break;
+                        }
+                        let Some(next) =
+                            super::plan::render_scoped_read::<E::Backend>(&plan, &remaining)
+                                .map_err(|e| {
+                                    ReExecError::Dispatch(crate::DispatchError::VmError(
+                                        alloc::format!("{e}"),
+                                    ))
+                                })?
+                        else {
+                            break;
+                        };
+                        page_sql = next;
+                    }
+                }
+                Ok(Resolved::Keyed {
+                    keys,
+                    columns,
+                    present,
+                })
+            }
+            ResolveJob::Whole { sql, generation } => {
+                // The read's own position is discarded here on purpose: a
+                // re-read is delivered against the position of the event that
+                // triggered it, which is what a consumer reconciles by.
+                let (pages, _) =
+                    Self::read_whole_with(connector, &sql, max_page_bytes, auth).await?;
+                Ok(Resolved::Whole { generation, pages })
+            }
+        }
+    }
+
+    /// Page a whole result through a cursor, closing it on every path this
+    /// function can take.
+    ///
+    /// Cancellation is the path it cannot cover: dropping this future runs no
+    /// cleanup, because a destructor cannot await. What makes that safe is the
+    /// connector opening the cursor's transaction through diesel's own
+    /// transaction manager, so the pool sees a released connection is still
+    /// inside a transaction and discards it instead of handing it to the next
+    /// caller. A raw `BEGIN` leaves diesel's depth counter at zero and the pool
+    /// blind, which was measured to hand an unrelated caller a transaction it
+    /// never opened and silently lose its write.
+    async fn read_whole_with(
+        connector: &X,
+        sql: &str,
+        max_page_bytes: usize,
+        auth: &X::AuthContext,
+    ) -> Result<(Vec<ReadPage<E::Backend>>, Option<X::Checkpoint>), ReExecError<X::Error>> {
+        let cursor = connector
+            .open_cursor(sql, auth)
+            .await
+            .map_err(ReExecError::Cursor)?;
+
+        let mut pages = Vec::new();
+        let mut checkpoint = None;
+        let outcome = async {
+            loop {
+                let page = connector
+                    .fetch_cursor(cursor, max_page_bytes)
+                    .await
+                    .map_err(ReExecError::Cursor)?;
+                let more = page.value.more;
+                checkpoint = page.checkpoint;
+                pages.push(ReadPage {
+                    columns: page.value.columns,
+                    rows: page.value.rows,
+                    more,
+                });
+                if !more {
+                    return Ok::<(), ReExecError<X::Error>>(());
+                }
+            }
+        }
+        .await;
+
+        // Close either way: a read error must not leave the cursor holding a
+        // transaction and a connection. A read error outranks a close failure,
+        // being the reason the caller asked.
+        let closed = connector
+            .close_cursor(cursor)
+            .await
+            .map_err(ReExecError::Cursor);
+        outcome?;
+        closed?;
+        Ok((pages, checkpoint))
     }
 
     /// Async batch variant of [`consumers`](Self::consumers).
@@ -395,102 +997,164 @@ where
     /// The first connector failure aborts the whole batch (remaining
     /// in-flight futures are dropped). Partial notifications are
     /// discarded. The caller retries.
+    #[allow(clippy::too_many_lines)]
     pub async fn consumers_batch(
         &mut self,
         events: &[E],
     ) -> Result<BatchOutcome<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
-        use futures_util::stream::{StreamExt, TryStreamExt};
+        use futures_util::stream::StreamExt;
 
         let BatchOutcome {
             per_event,
+            mut aggregate_updates,
             mut scalar_updates,
+            mut rows_updates,
+            mut row_deltas,
             triggers,
+            mut transitions,
         } = self
             .inner
-            .consumers_batch(events)
+            .reread_batch(events)
             .map_err(ReExecError::Dispatch)?;
+        self.apply_transitions(&transitions);
 
         // Pre-filter debounced triggers.
         let actionable: alloc::vec::Vec<_> = triggers
             .into_iter()
-            .filter(|t| !self.debounce_skip(t.query_id))
+            .filter(|t| !self.debounce_skip(t.subscription_id, &t.read))
             .collect();
 
         if actionable.is_empty() {
             return Ok(BatchOutcome {
                 per_event,
+                aggregate_updates,
                 scalar_updates,
+                rows_updates,
+                row_deltas,
                 triggers: Vec::new(),
+                transitions,
             });
         }
 
-        // Borrow the immutable fields the futures need. `inner` and
-        // `last_reexec_at` stay free for the mutation pass below.
-        let connector = &self.connector;
+        // Phase one, under `&mut self`: same tier split as the single-event
+        // path. The batch already coalesced to one trigger per query, so a
+        // keyed job here carries every key the batch changed and reads once.
+        let (jobs, borrowed) = self.plan_jobs(actionable);
+        if jobs.is_empty() {
+            return Ok(BatchOutcome {
+                per_event,
+                aggregate_updates,
+                scalar_updates,
+                rows_updates,
+                row_deltas,
+                triggers: Vec::new(),
+                transitions,
+            });
+        }
+
+        // Phase two: shared borrows only, so the reads run concurrently.
+        let connector = &self.mode.connector;
         let contexts = &self.contexts;
+        let max_page_bytes = self.max_page_bytes;
         let throttle = self
+            .mode
             .permits
             .as_ref()
             .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
-        let actionable_len = actionable.len();
+        let jobs_len = jobs.len();
 
         #[allow(clippy::type_complexity)]
-        let resolved: alloc::vec::Vec<(
-            super::ReExecutionTrigger<I, E::Checkpoint>,
-            (Value<E::Backend>, Option<X::Checkpoint>),
-        )> = futures_util::stream::iter(actionable.into_iter().map(|trigger| {
-            let ctx = contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time, \
-                 trigger.query_id must exist in `contexts`",
-            );
-            let sql = ctx.sql.clone();
-            let column_kind = ctx.column_kind;
-            let auth = &ctx.auth;
+        let resolved: alloc::vec::Vec<
+            Result<
+                (
+                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    Resolved<E::Backend>,
+                ),
+                ReExecError<X::Error>,
+            >,
+        > = futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
+            let auth = &contexts
+                .get(&trigger.subscription_id)
+                .expect(
+                    "every captured query stores its resolve context at register time, \
+                     trigger.subscription_id must exist in `contexts`",
+                )
+                .auth;
             let throttle = throttle.clone();
             async move {
-                let _guard = acquire_permit(throttle.as_ref(), trigger.query_id).await;
-                let result = connector.execute_scalar(&sql, column_kind, auth).await;
-                result.map(|r| (trigger, r))
+                let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
+                let answer = Self::run_job(connector, job, max_page_bytes, auth).await?;
+                Ok::<_, ReExecError<X::Error>>((trigger, answer))
             }
         }))
-        .buffer_unordered(actionable_len)
-        .try_collect()
-        .await
-        .map_err(ReExecError::Connector)?;
+        .buffer_unordered(jobs_len)
+        .collect::<Vec<_>>()
+        .await;
 
-        // All borrows released. Apply the resolutions.
-        for (trigger, (value, _db_checkpoint)) in resolved {
-            self.inner.install(trigger.query_id, value.clone());
-            self.stamp_reexec(trigger.query_id);
-            scalar_updates.push(ScalarUpdate {
-                query_id: trigger.query_id,
-                consumer_id: trigger.consumer_id,
-                value,
-                checkpoint: trigger.checkpoint.clone(),
-            });
+        // One failure fails the call, so nothing is delivered and every key
+        // taken goes back. Collected rather than short-circuited for exactly
+        // that reason: `try_collect` drops the other jobs, and their keys with
+        // them.
+        let answers = match Self::first_failure(resolved) {
+            Ok(answers) => answers,
+            Err(e) => {
+                self.restore_borrowed(borrowed);
+                return Err(e);
+            }
+        };
+
+        // Phase three: borrows released, apply what came back.
+        let mut followup = Vec::new();
+        for (trigger, answer) in answers {
+            self.stamp_reexec(trigger.subscription_id, &trigger.read);
+            self.apply_resolved(
+                &trigger,
+                answer,
+                &mut ResolveOutputs {
+                    aggregate_updates: &mut aggregate_updates,
+                    scalar_updates: &mut scalar_updates,
+                    rows_updates: &mut rows_updates,
+                    row_deltas: &mut row_deltas,
+                    followup: &mut followup,
+                    transitions: &mut transitions,
+                },
+            )?;
         }
+        self.drain_followup(
+            &mut followup,
+            &mut aggregate_updates,
+            &mut scalar_updates,
+            &mut rows_updates,
+            &mut row_deltas,
+            &mut transitions,
+        )
+        .await?;
 
         Ok(BatchOutcome {
             per_event,
+            aggregate_updates,
             scalar_updates,
+            rows_updates,
+            row_deltas,
             triggers: Vec::new(),
+            transitions,
         })
     }
 
     /// Unregister a session and drop every stored auth context that
     /// belonged to it.
-    pub fn unregister_session(&mut self, session_id: I::SessionId) -> ReExecUnregisterReport {
-        let report = self.inner.unregister_session(session_id);
+    pub fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
+        let engine = self.inner.unregister_session(session_id);
         self.contexts
             .retain(|_, ctx| ctx.session != Some(session_id));
-        report
+        engine
     }
 
     /// Unregister a captured query by id. Drops its auth context too.
-    pub fn unregister_reexec_query(&mut self, query_id: ReExecQueryId) -> bool {
-        let removed = self.inner.unregister_reexec_query(query_id);
+    pub fn unregister_reexec_query(&mut self, subscription_id: SubscriptionId) -> bool {
+        let removed = self.inner.unregister_reread(subscription_id);
         if removed {
-            self.contexts.remove(&query_id);
+            self.contexts.remove(&subscription_id);
         }
         removed
     }
@@ -505,7 +1169,8 @@ where
     }
 }
 
-impl<E, I, DB, X> crate::AsyncSubscriptionDispatch<I, E> for AsyncAutoResolvingEngine<E, I, DB, X>
+impl<E, I, DB, X> crate::AsyncSubscriptionDispatch<I, E>
+    for AutoResolvingEngine<E, I, DB, AsyncMode<X>>
 where
     E: CdcEvent + Send + Sync,
     E::Backend: SqlLiteralParse,
@@ -537,7 +1202,10 @@ mod tests {
     use super::*;
     use crate::backend::{BuiltinKind, Postgres};
     use crate::testing::TestEvent;
-    use crate::{DefaultIds, NoCheckpoint, SubscriptionEngine, SubscriptionRequest, TableId};
+    use crate::{
+        DefaultIds, NoCheckpoint, Registered, SubscriptionEngine, SubscriptionRequest, TableId,
+        Tier,
+    };
     use core::future::Future;
     use core::pin::pin;
     use core::task::{Context, Poll};
@@ -629,14 +1297,18 @@ mod tests {
             }
         }
 
-        fn execute_rows(
+        fn read_page(
             &self,
             _sql: &str,
+            _max_bytes: usize,
             _auth: &(),
         ) -> impl Future<
-            Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>,
+            Output = Result<
+                Snapshot<crate::reexec::RowPage<Postgres>, Self::Checkpoint>,
+                Self::Error,
+            >,
         > + Send {
-            async move { Err(MockError("execute_rows not exercised in v1 tests")) }
+            async move { Err(MockError("read_page is not exercised by the scalar tests")) }
         }
     }
 
@@ -666,7 +1338,12 @@ mod tests {
     fn engine_with_values(
         values: Vec<Value<Postgres>>,
     ) -> (
-        AsyncAutoResolvingEngine<TestEvent<Postgres>, DefaultIds, ParserDB, MockAsyncConnector>,
+        AutoResolvingEngine<
+            TestEvent<Postgres>,
+            DefaultIds,
+            ParserDB,
+            AsyncMode<MockAsyncConnector>,
+        >,
         TableId,
     ) {
         let database = catalog();
@@ -677,10 +1354,7 @@ mod tests {
             PostgreSqlDialect {},
         );
         (
-            AsyncAutoResolvingEngine::new(
-                ReExecEngine::new(inner),
-                MockAsyncConnector::new(values),
-            ),
+            AutoResolvingEngine::new(inner, AsyncMode::new(MockAsyncConnector::new(values))),
             orders_id,
         )
     }
@@ -701,12 +1375,18 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
 
         // Snapshot bootstraps. Future is Send-bound and ready immediately.
-        let snap = block_on(e.snapshot(qid)).unwrap().expect("query_id exists");
+        let snap = block_on(e.snapshot(qid))
+            .unwrap()
+            .expect("subscription_id exists");
         match snap {
             SnapshotResult::Scalar(Value::Float(v), None) => {
                 assert!((v - 5.0).abs() < f64::EPSILON);
@@ -723,7 +1403,7 @@ mod tests {
         // Delete the extreme: trigger -> connector -> ScalarUpdate.
         let n = block_on(e.consumers(&delete_event(tid, 1, 5.0))).unwrap();
         assert_eq!(n.scalar_updates.len(), 1);
-        assert_eq!(n.scalar_updates[0].query_id, qid);
+        assert_eq!(n.scalar_updates[0].subscription_id, qid);
         assert_eq!(n.scalar_updates[0].value, Value::Float(9.0));
         assert!(n.triggers.is_empty(), "async engine drains triggers");
         assert_eq!(e.connector().call_count(), 2);
@@ -741,10 +1421,22 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid, Value::Float(10.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(10.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         let event = update_status_only(tid, 1, 10.0);
 
@@ -773,10 +1465,22 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid, Value::Float(5.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         match block_on(e.consumers(&delete_event(tid, 1, 5.0))) {
             Ok(_) => panic!("expected Connector error, got Ok"),
@@ -797,10 +1501,22 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid, Value::Float(5.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         let events = vec![
             delete_event(tid, 1, 5.0),
@@ -837,8 +1553,12 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec for MIN"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec for MIN, got {other:?}"),
         };
         let qid2 = match e
             .register(
@@ -847,18 +1567,41 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec for MAX"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec for MAX, got {other:?}"),
         };
-        assert!(e.install(qid1, Value::Float(7.0)));
-        assert!(e.install(qid2, Value::Float(7.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid1,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
+        assert!(crate::Install::install(
+            &mut e,
+            qid2,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         let events = vec![delete_event(tid, 1, 7.0)];
         let outcome = block_on(e.consumers_batch(&events)).unwrap();
         assert_eq!(e.connector().call_count(), 2);
         assert_eq!(outcome.scalar_updates.len(), 2);
-        let qids: std::collections::BTreeSet<_> =
-            outcome.scalar_updates.iter().map(|u| u.query_id).collect();
+        let qids: std::collections::BTreeSet<_> = outcome
+            .scalar_updates
+            .iter()
+            .map(|u| u.subscription_id)
+            .collect();
         assert!(qids.contains(&qid1));
         assert!(qids.contains(&qid2));
     }
@@ -874,8 +1617,12 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert_eq!(e.contexts.len(), 1);
         assert!(e.unregister_reexec_query(qid));
@@ -935,8 +1682,12 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
         let qid2 = match e
             .register(
@@ -945,11 +1696,31 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid1, Value::Float(7.0)));
-        assert!(e.install(qid2, Value::Float(7.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid1,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
+        assert!(crate::Install::install(
+            &mut e,
+            qid2,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         let _ = block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).unwrap();
         assert_eq!(
@@ -974,8 +1745,12 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
         let qid2 = match e
             .register(
@@ -984,11 +1759,31 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid1, Value::Float(7.0)));
-        assert!(e.install(qid2, Value::Float(7.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid1,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
+        assert!(crate::Install::install(
+            &mut e,
+            qid2,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         assert!(block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).is_err());
         assert_eq!(
@@ -1018,13 +1813,25 @@ mod tests {
                     )
                     .unwrap()
                 {
-                    Registered::ReExec { query_id, .. } => query_id,
-                    Registered::Engine(_) => panic!("expected ReExec"),
+                    Registered {
+                        subscription_id,
+                        tier: Tier::Scalar { .. },
+                        ..
+                    } => subscription_id,
+                    other => panic!("expected ReExec, got {other:?}"),
                 }
             })
             .collect();
         for q in &qids {
-            assert!(e.install(*q, Value::Float(7.0)));
+            assert!(crate::Install::install(
+                &mut e,
+                *q,
+                crate::ScalarInstall {
+                    value: Value::Float(7.0),
+                    checkpoint: None::<crate::NoCheckpoint>
+                }
+            )
+            .is_ok());
         }
         let outcome = block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).unwrap();
         assert_eq!(
@@ -1033,5 +1840,28 @@ mod tests {
             "three distinct queries each get one connector call regardless of cap"
         );
         assert_eq!(outcome.scalar_updates.len(), 3);
+    }
+
+    #[test]
+    fn grouped_debounce_is_scoped_by_group_key_async() {
+        let clock = alloc::sync::Arc::new(crate::ManualClock::new(0));
+        let engine_clock: crate::ClockHandle = clock;
+        let (engine, _) = engine_with_values(Vec::new());
+        let mut engine = engine
+            .with_clock(engine_clock)
+            .with_debounce_per_query(core::time::Duration::from_secs(1));
+        let first = super::super::ReExecutionRead::GroupedScalar {
+            group: vec![1],
+            sql: String::new(),
+            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+        };
+        let second = super::super::ReExecutionRead::GroupedScalar {
+            group: vec![2],
+            sql: String::new(),
+            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
+        };
+        engine.stamp_reexec(7, &first);
+        assert!(engine.debounce_skip(7, &first));
+        assert!(!engine.debounce_skip(7, &second));
     }
 }

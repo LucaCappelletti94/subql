@@ -19,8 +19,8 @@
 //! Gated via `[[test]] required-features = ["executor-diesel-postgres"]`
 //! in `Cargo.toml`. The companion test against in-memory SQLite is
 //! `tests/reexec_diesel.rs`. That one is a plumbing smoke check, this one
-//! is the production-path proof and pulls LSN information from
-//! `pg_current_wal_lsn()` inside snapshot transactions.
+//! is the production-path proof and reads `pg_current_wal_lsn()` just before
+//! each snapshot transaction.
 #![cfg(feature = "executor-diesel-postgres")]
 #![allow(clippy::unwrap_used)]
 
@@ -29,11 +29,12 @@ mod common;
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
-use subql::reexec::{
-    AutoResolvingEngine, Connector, PgDieselConnector, ReExecEngine, Registered, SnapshotResult,
+use subql::backend::{Postgres, ScalarKind, Value};
+use subql::reexec::{AutoResolvingEngine, Connector, PgDieselConnector, SnapshotResult, SyncMode};
+use subql::{
+    parse_wal2json_v2, DefaultIds, MessageV2, Registered, SubscriptionEngine, SubscriptionRequest,
+    Tier,
 };
-use subql::{parse_wal2json_v2, DefaultIds, MessageV2, SubscriptionEngine, SubscriptionRequest};
 
 const SLOT: &str = "subql_test";
 const DDL: &str =
@@ -69,6 +70,11 @@ fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
     common::create_slot(conn, SLOT);
 }
 
+/// One more row, for a commit that lands while a read is parked.
+fn insert(id: i64) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
+}
+
 /// Build the in-process catalog the engine + parser share.
 fn catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
@@ -77,10 +83,10 @@ fn catalog() -> ParserDB {
 fn build_engine(
     catalog: ParserDB,
     conn_exec: PgConnection,
-) -> AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, PgDieselConnector> {
+) -> AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, SyncMode<PgDieselConnector>> {
     let inner =
         SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
-    AutoResolvingEngine::new(ReExecEngine::new(inner), PgDieselConnector::new(conn_exec))
+    AutoResolvingEngine::new(inner, SyncMode(PgDieselConnector::new(conn_exec)))
 }
 
 /// Parse one wal2json v2 message into zero or more [`MessageV2`]s.
@@ -119,8 +125,11 @@ fn scaffold_registers_both_subscription_kinds() {
         )
         .expect("engine-supported registration");
     match engine_reg {
-        Registered::Engine(_) => {}
-        Registered::ReExec { .. } => panic!("expected Engine variant"),
+        Registered {
+            tier: Tier::InProcess(_),
+            ..
+        } => {}
+        other => panic!("expected the Engine variant, got {other:?}"),
     }
 
     let captured_reg = engine
@@ -130,10 +139,22 @@ fn scaffold_registers_both_subscription_kinds() {
         )
         .expect("captured registration");
     match captured_reg {
-        Registered::ReExec { query_id, .. } => {
-            assert!(engine.install(query_id, Value::Float(5.0)));
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => {
+            assert!(subql::Install::install(
+                &mut engine,
+                subscription_id,
+                subql::ScalarInstall {
+                    value: Value::Float(5.0),
+                    checkpoint: None::<subql::NoCheckpoint>
+                }
+            )
+            .is_ok());
         }
-        Registered::Engine(_) => panic!("expected ReExec variant"),
+        other => panic!("expected ReExec variant, got {other:?}"),
     }
 
     // Sanity: connector still callable (proves the PG connection survived
@@ -185,7 +206,13 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
             (),
         )
         .expect("engine registration");
-    assert!(matches!(engine_reg, Registered::Engine(_)));
+    assert!(matches!(
+        engine_reg,
+        Registered {
+            tier: Tier::InProcess(_),
+            ..
+        }
+    ));
 
     let captured_qid = match engine
         .register(
@@ -194,10 +221,22 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         )
         .expect("captured registration")
     {
-        Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected ReExec, got {other:?}"),
     };
-    assert!(engine.install(captured_qid, Value::Float(5.0)));
+    assert!(subql::Install::install(
+        &mut engine,
+        captured_qid,
+        subql::ScalarInstall {
+            value: Value::Float(5.0),
+            checkpoint: None::<subql::NoCheckpoint>
+        }
+    )
+    .is_ok());
 
     // The replication slot was created after the seed inserts, so it's
     // already empty. No pre-drain needed.
@@ -262,7 +301,7 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
         "expected exactly one ScalarUpdate, got {}",
         total_scalar_updates.len()
     );
-    assert_eq!(total_scalar_updates[0].query_id, captured_qid);
+    assert_eq!(total_scalar_updates[0].subscription_id, captured_qid);
     assert_eq!(total_scalar_updates[0].value, Value::Float(9.0));
     assert_eq!(total_triggers, 0, "auto-resolving engine drains triggers");
 }
@@ -297,10 +336,22 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
         )
         .expect("captured registration")
     {
-        Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected ReExec, got {other:?}"),
     };
-    assert!(engine.install(captured_qid, Value::Float(5.0)));
+    assert!(subql::Install::install(
+        &mut engine,
+        captured_qid,
+        subql::ScalarInstall {
+            value: Value::Float(5.0),
+            checkpoint: None::<subql::NoCheckpoint>
+        }
+    )
+    .is_ok());
 
     sql_query("UPDATE orders SET price = 20.0 WHERE id = 1")
         .execute(&mut conn_dml)
@@ -315,7 +366,7 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
 
     let notifs = engine.consumers(&events[0]).expect("consumers dispatch");
     assert_eq!(notifs.scalar_updates.len(), 1, "expected one ScalarUpdate");
-    assert_eq!(notifs.scalar_updates[0].query_id, captured_qid);
+    assert_eq!(notifs.scalar_updates[0].subscription_id, captured_qid);
     assert_eq!(notifs.scalar_updates[0].value, Value::Float(20.0));
     assert!(notifs.triggers.is_empty());
 }
@@ -349,15 +400,19 @@ fn snapshot_reads_value_and_lsn_from_pg() {
         )
         .expect("captured registration")
     {
-        Registered::ReExec { query_id, .. } => query_id,
-        Registered::Engine(_) => panic!("expected ReExec"),
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected ReExec, got {other:?}"),
     };
 
     // Snapshot reads value + LSN inside a single transaction.
     let snap = engine
         .snapshot(captured_qid)
         .expect("snapshot")
-        .expect("query_id exists");
+        .expect("subscription_id exists");
     let (value, checkpoint) = match snap {
         SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
         other => panic!("unexpected snapshot variant: {other:?}"),
@@ -406,7 +461,10 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
             "SELECT VAR_POP(amount) FROM nums",
         ))
         .expect("register aggregate")
+        .served()
+        .expect("the engine maintains this one in process")
         .aggregate_bootstrap
+        .clone()
         .expect("aggregate carries a bootstrap");
 
     // sum=12 (bigint), sum_sq=56 (bigint), count=3, decoded through the
@@ -421,4 +479,138 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     );
     // The read is LSN-anchored like execute_scalar.
     assert!(checkpoint.is_some());
+}
+
+/// A key column whose name needs quoting must still be readable.
+///
+/// Postgres folds an unquoted identifier to lower case, so a column created as
+/// `"OrderId"` is not found by `OrderId`. Building the scoped read's identifiers
+/// from catalog names without quoting them registered the subscription cleanly
+/// and then failed on every single change with `column "orderid" does not
+/// exist`. SQLite cannot show this: its identifiers are case-insensitive.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_key_column_needing_quotes_is_still_readable() {
+    use subql::testing::TestEvent;
+
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut setup = common::pg_connect(port);
+    sql_query(r#"CREATE TABLE quoted ("OrderId" INT PRIMARY KEY, status TEXT)"#)
+        .execute(&mut setup)
+        .expect("create");
+    sql_query("INSERT INTO quoted VALUES (1, 'paid'), (2, 'void')")
+        .execute(&mut setup)
+        .expect("seed");
+
+    let cat = ParserDB::parse::<PostgreSqlDialect>(
+        r#"CREATE TABLE quoted ("OrderId" INT PRIMARY KEY, status TEXT);"#,
+    )
+    .expect("catalog");
+    let table = subql::catalog_helpers::table_id(&cat, "quoted").expect("quoted");
+    let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+        cat,
+        PostgreSqlDialect {},
+    );
+    let mut engine = AutoResolvingEngine::new(
+        inner,
+        SyncMode(PgDieselConnector::new(common::pg_connect(port))),
+    );
+    engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT * FROM quoted WHERE lower(status) = 'paid'",
+            ),
+            (),
+        )
+        .expect("captured");
+
+    let event = TestEvent::<Postgres>::update(
+        table,
+        vec![Value::Int(1), Value::String("paid".into())],
+        vec![Value::Int(1), Value::String("paid".into())],
+    )
+    .with_pk_columns([0u16]);
+    let notifications = engine
+        .consumers(&event)
+        .expect("a quoted key column must be readable, not fail on every change");
+
+    assert_eq!(notifications.row_deltas.len(), 1);
+    assert_eq!(notifications.row_deltas[0].key, vec![Value::Int(1)]);
+    assert!(
+        notifications.row_deltas[0].row.is_some(),
+        "the row still matches, so it arrives as itself"
+    );
+}
+
+/// Every read reports a position taken before its own snapshot opened.
+///
+/// The contract a caller replays from: a position at or behind the snapshot
+/// re-delivers changes the snapshot already holds, which keyed application
+/// absorbs, while a position ahead of it silently drops a transaction the
+/// snapshot never saw. An advisory lock parks each read inside its own
+/// snapshot, a commit lands while it waits, and the returned position has to
+/// sit behind that commit. The row count is asserted too, because a read that
+/// somehow saw the commit would make the position comparison meaningless.
+///
+/// A connector each, because this one owns its connection outright and a
+/// parked read holds it for the length of the park.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn every_read_reports_a_position_taken_before_its_snapshot() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0)]);
+
+    let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
+    let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
+        PgDieselConnector::new(common::pg_connect(port))
+            .execute_scalar(&sql, ScalarKind::Int, &())
+            .expect("scalar read")
+    });
+    assert_eq!(
+        value,
+        Value::Int(1),
+        "the scalar read's snapshot holds one row"
+    );
+    assert!(
+        position.expect("a PG connector reports a position") < after_commit,
+        "the scalar read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
+    let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
+        PgDieselConnector::new(common::pg_connect(port))
+            .read_page(&sql, 1 << 20, &())
+            .expect("page read")
+    });
+    assert_eq!(
+        page.value.rows.len(),
+        2,
+        "the page's snapshot holds two rows"
+    );
+    assert!(
+        page.checkpoint.expect("a PG connector reports a position") < after_commit,
+        "the page read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
+    let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
+        PgDieselConnector::new(common::pg_connect(port))
+            .execute_scalar_row(&sql, &[ScalarKind::Int], &())
+            .expect("seed read")
+    });
+    assert_eq!(
+        values,
+        vec![Value::Int(3)],
+        "the seed read's snapshot holds three rows"
+    );
+    assert!(
+        position.expect("a PG connector reports a position") < after_commit,
+        "the seed read's position must sit behind the commit at {after_commit:?}"
+    );
 }

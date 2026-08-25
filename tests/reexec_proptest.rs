@@ -19,9 +19,10 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::BTreeMap;
 use subql::backend::{Postgres, Value};
-use subql::reexec::{ReExecEngine, Registered};
 use subql::testing::TestEvent;
-use subql::{ColumnId, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
+use subql::{
+    ColumnId, DefaultIds, Registered, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
+};
 
 const PRICE: ColumnId = 1;
 const STATUS: ColumnId = 3;
@@ -86,7 +87,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
-type Engine = ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 const fn value(price: i64) -> Value<Postgres> {
     Value::Float(price as f64)
@@ -112,12 +113,25 @@ fn register(engine: &mut Engine, is_min: bool) -> u64 {
     let r = engine
         .register(SubscriptionRequest::new(1u64, sql))
         .unwrap();
-    let Registered::ReExec { query_id, .. } = r else {
+    let Registered {
+        subscription_id,
+        tier: Tier::Scalar { .. },
+        ..
+    } = r
+    else {
         panic!("expected ReExec");
     };
     // Bootstrap against the empty model.
-    assert!(engine.install(query_id, Value::Null));
-    query_id
+    assert!(subql::Install::install(
+        engine,
+        subscription_id,
+        subql::ScalarInstall {
+            value: Value::Null,
+            checkpoint: None::<subql::NoCheckpoint>
+        }
+    )
+    .is_ok());
+    subscription_id
 }
 
 /// Apply an event, count emitted updates/triggers, and (for any trigger)
@@ -131,16 +145,24 @@ fn dispatch_and_service(
     is_min: bool,
     current: &mut Value<Postgres>,
 ) -> (usize, usize) {
-    let n = engine.consumers(event).unwrap();
+    let n = engine.dispatch(event).unwrap();
     let mut updates = 0;
     let mut triggers = 0;
-    for u in n.scalar_updates {
-        *current = u.value;
+    for u in n.scalar_updates() {
+        *current = u.value.clone();
         updates += 1;
     }
-    for _ in n.triggers {
+    for _ in n.triggers() {
         let next = extremum(model, is_min);
-        engine.install(qid, next.clone());
+        assert!(subql::Install::install(
+            engine,
+            qid,
+            subql::ScalarInstall {
+                value: next.clone(),
+                checkpoint: None::<subql::NoCheckpoint>,
+            },
+        )
+        .is_ok());
         *current = next;
         triggers += 1;
     }
@@ -157,7 +179,7 @@ proptest! {
             database,
             PostgreSqlDialect {},
         );
-        let mut engine = ReExecEngine::new(inner);
+        let mut engine = inner;
         let qid = register(&mut engine, true);
         let mut current: Value<Postgres> = Value::Null;
         let mut model: BTreeMap<i64, i64> = BTreeMap::new();
@@ -217,7 +239,7 @@ proptest! {
             database,
             PostgreSqlDialect {},
         );
-        let mut engine = ReExecEngine::new(inner);
+        let mut engine = inner;
         let qid = register(&mut engine, false);
         let mut current: Value<Postgres> = Value::Null;
         let mut model: BTreeMap<i64, i64> = BTreeMap::new();

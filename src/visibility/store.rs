@@ -858,7 +858,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         );
 
         let diff = store.diff(&event).unwrap();
-        assert!(diff.added.is_empty());
+        assert!(diff.added.is_empty(), "{:?}", diff.added);
         assert_eq!(
             diff.removed,
             [record("teams:3", member_relation(), "user:alice")],
@@ -899,7 +899,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         );
 
         let diff = store.diff(&event).unwrap();
-        assert!(diff.added.is_empty());
+        assert!(diff.added.is_empty(), "{:?}", diff.added);
         assert!(
             diff.removed.is_empty(),
             "no row image evaluates the clock, so the replay is the remover"

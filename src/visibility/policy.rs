@@ -1754,7 +1754,7 @@ CREATE POLICY pu ON docs FOR UPDATE USING (EXISTS (SELECT 1 FROM team_members
         let (db, relations) = translated(UPDATE_TWO_SIDED);
         let docs = docs_id(&db);
         // alice owns it, and bob rewrites it naming himself owner and editor.
-        let event = TestEvent::update(
+        let event: TestEvent<_> = TestEvent::update(
             docs,
             docs_row(text("alice"), Value::Null),
             docs_row(text("bob"), text("bob")),
@@ -1798,7 +1798,7 @@ CREATE POLICY pu ON docs FOR UPDATE USING (EXISTS (SELECT 1 FROM team_members
     fn a_replacement_the_new_version_refuses_is_refused() {
         let (db, relations) = translated(UPDATE_TWO_SIDED);
         let docs = docs_id(&db);
-        let event = TestEvent::update(
+        let event: TestEvent<_> = TestEvent::update(
             docs,
             docs_row(text("alice"), text("alice")),
             docs_row(text("alice"), text("bob")),
@@ -1861,7 +1861,7 @@ CREATE POLICY pu ON docs FOR UPDATE USING (EXISTS (SELECT 1 FROM team_members
     fn a_refusal_on_the_row_as_it_is_needs_no_second_half() {
         let (db, relations) = translated(UPDATE_TWO_SIDED);
         let docs = docs_id(&db);
-        let event = TestEvent::update(
+        let event: TestEvent<_> = TestEvent::update(
             docs,
             docs_row(text("alice"), Value::Null),
             docs_row(text("alice"), text("bob")),
@@ -1900,7 +1900,7 @@ CREATE POLICY pu ON docs FOR UPDATE USING (EXISTS (SELECT 1 FROM team_members
     fn a_grant_on_the_row_as_it_is_still_needs_the_second_half() {
         let (db, relations) = translated(UPDATE_USING_ONLY);
         let docs = docs_id(&db);
-        let event = TestEvent::update(
+        let event: TestEvent<_> = TestEvent::update(
             docs,
             docs_team_row(text("alice"), Value::Null),
             docs_team_row(text("alice"), text("alice")),
@@ -1941,7 +1941,7 @@ CREATE POLICY pu ON docs FOR UPDATE USING (EXISTS (SELECT 1 FROM team_members
     fn an_undecidable_first_half_delegates_the_whole_replacement() {
         let (db, relations) = translated(UPDATE_CHECK_ONLY);
         let docs = docs_id(&db);
-        let event = TestEvent::update(
+        let event: TestEvent<_> = TestEvent::update(
             docs,
             docs_team_row(text("alice"), Value::Null),
             docs_team_row(text("alice"), text("bob")),
@@ -2556,7 +2556,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
 
         // alice holds the row and hands it to bob, so the row as it will be
         // refuses her even though the row as it is grants her.
-        let handover =
+        let handover: TestEvent<_> =
             TestEvent::update(notes, notes_row("alice"), notes_row("bob")).with_pk_columns([0u16]);
         let old = EventRow::previous(&handover, policy.catalog()).unwrap();
         let new = EventRow::current(&handover, policy.catalog()).unwrap();
@@ -2582,7 +2582,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
         );
 
         // Keeping it is granted, since both versions name her.
-        let kept = TestEvent::update(notes, notes_row("alice"), notes_row("alice"))
+        let kept: TestEvent<_> = TestEvent::update(notes, notes_row("alice"), notes_row("alice"))
             .with_pk_columns([0u16]);
         let old = EventRow::previous(&kept, policy.catalog()).unwrap();
         let new = EventRow::current(&kept, policy.catalog()).unwrap();
@@ -2647,7 +2647,8 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
         let (db, relations) = translated(TEAM);
         let teams = catalog_helpers::table_id(&db, "teams").unwrap();
         let policy = RowPolicy::new(shared(db, &relations), Named::<Principal>::default());
-        let event = TestEvent::insert(teams, vec![Value::Int(1)]).with_pk_columns([0u16]);
+        let event: TestEvent<_> =
+            TestEvent::insert(teams, vec![Value::Int(1)]).with_pk_columns([0u16]);
         let view = EventRow::current(&event, policy.catalog()).unwrap();
 
         assert!(policy.answers_locally(teams, ActionStatement::Insert));

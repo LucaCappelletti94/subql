@@ -54,7 +54,7 @@ impl<B: Backend> Compiling<B> {
     ///
     /// The cap is what keeps the `2^k` enumeration small. Four terms is sixteen
     /// evaluations per row version, and one term, the ordinary case, is two.
-    fn term_slot(&mut self, expr: &Expr, column: ColumnId) -> Result<u16, RegisterError> {
+    fn term_slot(&mut self, expr: &Expr, columns: Vec<ColumnId>) -> Result<u16, RegisterError> {
         if let Some(existing) = self.terms.iter().find(|term| &term.expr == expr) {
             return Ok(existing.slot);
         }
@@ -68,7 +68,7 @@ impl<B: Backend> Compiling<B> {
         }
         self.terms.push(CompiledTerm {
             slot,
-            column,
+            columns,
             expr: expr.clone(),
         });
         Ok(slot)
@@ -114,13 +114,13 @@ pub struct CompiledQuery<B: Backend> {
     pub terms: Vec<CompiledTerm>,
 }
 
-struct SqlTableName {
-    unqualified: String,
-    qualified: Option<String>,
+pub(crate) struct SqlTableName {
+    pub(crate) unqualified: String,
+    pub(crate) qualified: Option<String>,
 }
 
 impl SqlTableName {
-    fn from_object_name(name: &ObjectName) -> Result<Self, RegisterError> {
+    pub(crate) fn from_object_name(name: &ObjectName) -> Result<Self, RegisterError> {
         let mut parts = Vec::with_capacity(name.0.len());
         for part in &name.0 {
             let ident = part
@@ -208,7 +208,7 @@ where
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
     let where_clause = resolve_where_placeholders::<B>(where_clause, binds)?;
     let table_id = resolve_table_id(&table_name, database)?;
-    let projection = sql_shape::extract_projection(&stmt, table_id, database)?;
+    let projection = sql_shape::extract_projection::<B, DB>(&stmt, table_id, database)?;
     let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
     Ok(ParsedQuery {
         table_id,
@@ -394,7 +394,7 @@ fn extract_table_and_where(
 /// trips through [`SqlLiteralParse::parse_literal`]. Every other scalar
 /// returns [`RegisterError::BindResolution`] until a downstream test
 /// exercises it and pins a canonical round-trip format.
-fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterError> {
+pub(crate) fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterError> {
     match v {
         Value::Custom(_) => Err(RegisterError::BindResolution(
             "a bind of a custom type has no SQL literal spelling, so it cannot be re-rendered"
@@ -411,12 +411,6 @@ fn value_to_sql_value<B: Backend>(v: &Value<B>) -> Result<SqlValue, RegisterErro
         // leg (`parse_literal` -> `parse_hex_bytes`) accepts either case,
         // so `parse_literal(value_to_sql_value(Bytes(v))) == Bytes(v)`.
         Value::Bytes(b) => Ok(SqlValue::HexStringLiteral(hex_upper(b.as_ref()))),
-        // Boolean binds are backend-specific (`Postgres::Bool = bool`,
-        // `SQLite::Bool = i64`) and don't have a uniform sqlparser
-        // spelling under a generic `B`. Reject at placeholder-injection
-        // time; callers writing SQL should pass the literal `true` /
-        // `false` inline (which the compiler routes through
-        // `SqlLiteralParse::parse_literal` with the right coercion).
         Value::Bool(_)
         | Value::Uuid(_)
         | Value::Timestamp(_)
@@ -535,34 +529,65 @@ fn resolve_where_placeholders<B: Backend>(
 /// clause and a projection kind.
 ///
 /// Same WHERE clause with different projection (e.g. `SELECT *` vs
-/// `SELECT COUNT(*)`) must hash to distinct predicates.
+/// `SELECT COUNT(*)`) must hash to distinct predicates, and so must the same
+/// aggregate grouped differently, since one maintains a value per group and
+/// the other one value in total.
 pub(crate) fn projection_hash_input(normalized: &str, projection: &QueryProjection) -> String {
     match projection {
         QueryProjection::Rows => normalized.to_owned(),
-        QueryProjection::Aggregate(AggSpec::CountStar) => {
-            format!("{normalized}\x00COUNT(*)")
+        QueryProjection::Aggregate(spec) => {
+            format!("{normalized}\x00{}", agg_tag(spec))
         }
-        QueryProjection::Aggregate(AggSpec::CountColumn { column }) => {
-            format!("{normalized}\x00COUNT({column})")
+        QueryProjection::GroupedAggregate {
+            groups,
+            agg,
+            having,
+        } => {
+            let mut out = format!("{normalized}\x00{}\x00BY", agg_tag(agg));
+            // Ordered as written: `GROUP BY a, b` and `GROUP BY b, a` produce
+            // the same groups, but a group's key encodes its values in this
+            // order, so two subscriptions sharing one predicate would hand the
+            // same group two different keys.
+            for column in groups {
+                out.push('\x00');
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{column}"));
+            }
+            // The same fold filtered differently answers differently, so the
+            // condition joins the identity, spelled through the enums' own
+            // stable hash strings rather than AST `Debug`, which embeds
+            // source offsets.
+            if let Some(having) = having {
+                let subject = match having.subject {
+                    crate::HavingSubject::RowCount => "COUNT(*)",
+                    crate::HavingSubject::Aggregate(function) => function.as_hash_str(),
+                };
+                let _ = core::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "\x00HAVING\x00{subject}{}{}",
+                        having.op.as_hash_str(),
+                        having.threshold
+                    ),
+                );
+            }
+            out
         }
-        QueryProjection::Aggregate(AggSpec::Sum { column }) => {
-            format!("{normalized}\x00SUM({column})")
-        }
-        QueryProjection::Aggregate(AggSpec::Avg { column }) => {
-            format!("{normalized}\x00AVG({column})")
-        }
-        QueryProjection::Aggregate(AggSpec::VarPop { column }) => {
-            format!("{normalized}\x00VAR_POP({column})")
-        }
-        QueryProjection::Aggregate(AggSpec::VarSamp { column }) => {
-            format!("{normalized}\x00VAR_SAMP({column})")
-        }
-        QueryProjection::Aggregate(AggSpec::StddevPop { column }) => {
-            format!("{normalized}\x00STDDEV_POP({column})")
-        }
-        QueryProjection::Aggregate(AggSpec::StddevSamp { column }) => {
-            format!("{normalized}\x00STDDEV_SAMP({column})")
-        }
+    }
+}
+
+/// The aggregate's spelling inside a predicate's identity. Explicit per
+/// variant rather than derived, so a new aggregate has to be spelled here
+/// instead of silently sharing another's identity.
+fn agg_tag(spec: &AggSpec) -> String {
+    match spec {
+        AggSpec::CountStar => "COUNT(*)".to_owned(),
+        AggSpec::CountColumn { column } => format!("COUNT({column})"),
+        AggSpec::Sum { column } => format!("SUM({column})"),
+        AggSpec::Avg { column } => format!("AVG({column})"),
+        AggSpec::VarPop { column } => format!("VAR_POP({column})"),
+        AggSpec::VarSamp { column } => format!("VAR_SAMP({column})"),
+        AggSpec::StddevPop { column } => format!("STDDEV_POP({column})"),
+        AggSpec::StddevSamp { column } => format!("STDDEV_SAMP({column})"),
     }
 }
 
@@ -867,7 +892,7 @@ where
                             right
                         };
                         if let Some(column) = resolve_column_ref(tested, table_id, database) {
-                            let slot = out.term_slot(expr, column)?;
+                            let slot = out.term_slot(expr, alloc::vec![column])?;
                             out.push(Instruction::TermTruth(slot));
                             return Ok(());
                         }
@@ -1023,6 +1048,19 @@ where
                 return Err(negated_term_refusal());
             }
 
+            // The row-value form compares several columns at once, and the
+            // same relationship translates through the EXISTS spelling, so the
+            // refusal names the respelling rather than a resolution problem.
+            if matches!(tested.as_ref(), Expr::Tuple(_)) {
+                return Err(RegisterError::MembershipTermRefused(
+                    "a row-value IN compares several columns at once, which SubQL serves \
+                     through the EXISTS spelling instead: EXISTS (SELECT 1 FROM member m \
+                     WHERE m.k1 = t.a AND m.k2 = t.b AND m.user = current_setting(...)), \
+                     with one equality per column"
+                        .to_string(),
+                ));
+            }
+
             let Some(column) = resolve_column_ref(tested, table_id, database) else {
                 return Err(RegisterError::UnsupportedSql(
                     "A membership subquery must test a column of the subscribed table. SubQL \
@@ -1034,7 +1072,20 @@ where
 
             sql_shape::check_membership_subquery_bound(subquery)?;
 
-            let slot = out.term_slot(expr, column)?;
+            let slot = out.term_slot(expr, alloc::vec![column])?;
+            out.push(Instruction::TermTruth(slot));
+        }
+
+        // The EXISTS spelling of the same membership, and the only spelling of
+        // one whose linking key spans several columns. The bounded form is
+        // recognized here, in every build, and the bound itself says what is
+        // wrong with anything outside it.
+        Expr::Exists { subquery, negated } => {
+            if *negated {
+                return Err(negated_term_refusal());
+            }
+            let columns = sql_shape::check_membership_exists_bound(subquery, table_id, database)?;
+            let slot = out.term_slot(expr, columns)?;
             out.push(Instruction::TermTruth(slot));
         }
 
@@ -1258,13 +1309,15 @@ where
 }
 
 /// Why a negated membership subquery is refused, in one place so that
-/// `x NOT IN (SELECT ...)` and `NOT (x IN (SELECT ...))`, which reach different
-/// arms, cannot drift into two different sentences for one filter.
+/// `x NOT IN (SELECT ...)`, `NOT (x IN (SELECT ...))` and `NOT EXISTS (...)`,
+/// which reach different arms, cannot drift into different sentences for one
+/// filter.
 fn negated_term_refusal() -> RegisterError {
     RegisterError::UnsupportedSql(
-        "NOT IN with a subquery is not supported. SubQL serves a membership subquery by \
-         tracking the relationship it names, and subtraction names no relationship to track. \
-         Use NOT IN with a literal list, or run this as a regular SQL query in your database."
+        "A negated membership subquery (NOT IN, NOT EXISTS) is not supported. SubQL serves \
+         a membership subquery by tracking the relationship it names, and subtraction names \
+         no relationship to track. Use NOT IN with a literal list, or run this as a regular \
+         SQL query in your database."
             .to_string(),
     )
 }

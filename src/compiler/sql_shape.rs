@@ -3,8 +3,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, LimitClause, ObjectName, Query, Select, SelectItem,
+    SelectModifiers, SetExpr, Statement, TableFactor,
 };
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
@@ -13,14 +14,52 @@ const UNSUPPORTED_PROJECTION: &str =
      VAR_POP(col), VAR_SAMP(col), STDDEV_POP(col), or STDDEV_SAMP(col) are supported \
      (VARIANCE/STDDEV are accepted as aliases for VAR_SAMP/STDDEV_SAMP)";
 
+/// Whether a `GROUP BY` is a served shape where the clause gate is applied.
+///
+/// A parameter rather than a default, so a new call site has to say which it
+/// is. Letting one inherit the permissive answer is how a grouping reaches
+/// code that ignores it, which answers a different query than the caller
+/// wrote and is the failure this whole gate exists to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Grouping {
+    /// The outer statement of a subscription, where `extract_projection`
+    /// decides whether this particular grouping is one the fold can maintain.
+    Served,
+    /// Everywhere else. A membership subquery matches its inner query value by
+    /// value and a keyed capture asks about one changed row, and a grouping
+    /// invalidates both without failing.
+    Refused,
+}
+
 /// Projection kind for a subscription SQL statement.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QueryProjection {
     /// `SELECT *`: deliver row events (default, current behaviour).
     Rows,
-    /// `SELECT <aggregate>`: deliver signed count deltas.
+    /// `SELECT <aggregate>`: deliver one maintained value.
     Aggregate(AggSpec),
+    /// `SELECT g1, ..., gn, <aggregate> FROM t WHERE p GROUP BY g1, ..., gn`:
+    /// deliver one maintained value per group.
+    ///
+    /// Every group column is a bare column, so a changed row names its own
+    /// group without evaluating anything, and every one is of a kind whose
+    /// values encode one-to-one with how the database groups them
+    /// (`backend::kind_groups_one_to_one`). `groups` is in the order
+    /// the `GROUP BY` names them, which is the order a group's key encodes in.
+    ///
+    /// The enum-level `non_exhaustive` does NOT cover this variant's fields:
+    /// match it with `..` or a future field addition breaks the match, as
+    /// `having`'s arrival did.
+    GroupedAggregate {
+        /// The grouping columns, in `GROUP BY` order.
+        groups: Vec<crate::ColumnId>,
+        /// The single aggregate maintained per group.
+        agg: AggSpec,
+        /// The `HAVING` comparison checked per group after each fold, when
+        /// the statement carries one the fold can evaluate in process.
+        having: Option<AggHaving>,
+    },
 }
 
 /// Aggregate function specification.
@@ -52,6 +91,218 @@ pub enum AggSpec {
     /// deviation. Same `Stats` deltas as `VarSamp`. Consumer takes
     /// `sqrt(var_samp)`.
     StddevSamp { column: crate::ColumnId },
+}
+
+impl AggSpec {
+    /// The column this aggregate reads, `None` for `COUNT(*)`.
+    #[must_use]
+    pub const fn column(&self) -> Option<crate::ColumnId> {
+        match self {
+            Self::CountStar => None,
+            Self::CountColumn { column }
+            | Self::Sum { column }
+            | Self::Avg { column }
+            | Self::VarPop { column }
+            | Self::VarSamp { column }
+            | Self::StddevPop { column }
+            | Self::StddevSamp { column } => Some(*column),
+        }
+    }
+}
+
+/// Comparison operator of a fast-path `HAVING`, subject on the left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HavingOp {
+    /// `=`
+    Eq,
+    /// `<>`
+    NotEq,
+    /// `<`
+    Lt,
+    /// `<=`
+    LtEq,
+    /// `>`
+    Gt,
+    /// `>=`
+    GtEq,
+}
+
+impl HavingOp {
+    /// The same comparison with its operands swapped.
+    #[must_use]
+    pub const fn mirrored(self) -> Self {
+        match self {
+            Self::Eq => Self::Eq,
+            Self::NotEq => Self::NotEq,
+            Self::Lt => Self::Gt,
+            Self::LtEq => Self::GtEq,
+            Self::Gt => Self::Lt,
+            Self::GtEq => Self::LtEq,
+        }
+    }
+
+    /// Whether `left op right` holds under this comparison.
+    #[must_use]
+    pub const fn admits(self, ordering: core::cmp::Ordering) -> bool {
+        match self {
+            Self::Eq => ordering.is_eq(),
+            Self::NotEq => !ordering.is_eq(),
+            Self::Lt => ordering.is_lt(),
+            Self::LtEq => ordering.is_le(),
+            Self::Gt => ordering.is_gt(),
+            Self::GtEq => ordering.is_ge(),
+        }
+    }
+
+    /// The served subset of comparison operators, `None` for the rest.
+    pub(crate) const fn from_operator(op: &sqlparser::ast::BinaryOperator) -> Option<Self> {
+        use sqlparser::ast::BinaryOperator;
+        match op {
+            BinaryOperator::Eq => Some(Self::Eq),
+            BinaryOperator::NotEq => Some(Self::NotEq),
+            BinaryOperator::Lt => Some(Self::Lt),
+            BinaryOperator::LtEq => Some(Self::LtEq),
+            BinaryOperator::Gt => Some(Self::Gt),
+            BinaryOperator::GtEq => Some(Self::GtEq),
+            _ => None,
+        }
+    }
+
+    /// Stable spelling inside a predicate's identity hash. Attached to the
+    /// variant so a new operator cannot ship without one.
+    pub(crate) const fn as_hash_str(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::NotEq => "<>",
+            Self::Lt => "<",
+            Self::LtEq => "<=",
+            Self::Gt => ">",
+            Self::GtEq => ">=",
+        }
+    }
+}
+
+/// The accumulable-family function a fast-path `HAVING` reads. Always over
+/// the same column the projection aggregates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HavingFunction {
+    /// `COUNT(column)`: the non-null contribution count.
+    CountColumn,
+    /// `SUM(column)`
+    Sum,
+    /// `AVG(column)`
+    Avg,
+    /// `VAR_POP(column)`
+    VarPop,
+    /// `VAR_SAMP(column)`
+    VarSamp,
+    /// `STDDEV_POP(column)`
+    StddevPop,
+    /// `STDDEV_SAMP(column)`
+    StddevSamp,
+}
+
+impl HavingFunction {
+    /// The function a projected spec maintains, `None` for `COUNT(*)`,
+    /// which aggregates no column.
+    #[must_use]
+    pub const fn of(spec: &AggSpec) -> Option<Self> {
+        match spec {
+            AggSpec::CountStar => None,
+            AggSpec::CountColumn { .. } => Some(Self::CountColumn),
+            AggSpec::Sum { .. } => Some(Self::Sum),
+            AggSpec::Avg { .. } => Some(Self::Avg),
+            AggSpec::VarPop { .. } => Some(Self::VarPop),
+            AggSpec::VarSamp { .. } => Some(Self::VarSamp),
+            AggSpec::StddevPop { .. } => Some(Self::StddevPop),
+            AggSpec::StddevSamp { .. } => Some(Self::StddevSamp),
+        }
+    }
+
+    /// Stable spelling inside a predicate's identity hash. Attached to the
+    /// variant so a new function cannot ship without one.
+    pub(crate) const fn as_hash_str(self) -> &'static str {
+        match self {
+            Self::CountColumn => "COUNT(col)",
+            Self::Sum => "SUM",
+            Self::Avg => "AVG",
+            Self::VarPop => "VAR_POP",
+            Self::VarSamp => "VAR_SAMP",
+            Self::StddevPop => "STDDEV_POP",
+            Self::StddevSamp => "STDDEV_SAMP",
+        }
+    }
+}
+
+/// The column name a bare identifier or a two-part `table.column` spells.
+/// `None` for wildcards, longer qualifications, and expressions, which
+/// keeps the two-part assumption in one place.
+fn ident_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(ident) => Some(&ident.value),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(&parts[1].value),
+        _ => None,
+    }
+}
+
+/// The `Select` of a plain single-`SELECT` statement, `None` for set
+/// operations and non-queries. The one place that unwraps the
+/// statement-to-select nesting, so a future statement shape lands here.
+pub(crate) fn select_of(stmt: &Statement) -> Option<&Select> {
+    let Statement::Query(query) = stmt else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    Some(select)
+}
+
+/// Mutable twin of [`select_of`].
+pub(crate) fn select_mut(stmt: &mut Statement) -> Option<&mut Select> {
+    let Statement::Query(query) = stmt else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    Some(select)
+}
+
+/// What a fast-path `HAVING` comparison reads from a group's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HavingSubject {
+    /// `COUNT(*)`: the group's source-row count.
+    RowCount,
+    /// A family function over the column the projection aggregates.
+    Aggregate(HavingFunction),
+}
+
+/// The `HAVING` comparison a grouped fold checks per group after each fold.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AggHaving {
+    /// What the comparison reads.
+    pub subject: HavingSubject,
+    /// Comparison with the subject on the left.
+    pub op: HavingOp,
+    /// The constant compared against, as its SQL spelling. Validated to
+    /// parse as a float at registration.
+    pub threshold: String,
+}
+
+impl AggHaving {
+    /// Whether evaluating this condition needs the complete component set
+    /// (sum, sum of squares, count) rather than the projected function's own.
+    #[must_use]
+    pub fn widens(&self, projected: &AggSpec) -> bool {
+        match self.subject {
+            HavingSubject::RowCount => false,
+            // `Sum`'s running value cannot express NULL (the empty sum reads
+            // 0.0), so a `SUM` subject always needs the contribution count.
+            HavingSubject::Aggregate(HavingFunction::Sum) => true,
+            HavingSubject::Aggregate(function) => HavingFunction::of(projected) != Some(function),
+        }
+    }
 }
 
 /// Extract a plain column name from a function argument, if it is a bare
@@ -207,10 +458,8 @@ fn is_complete_column_list<DB: DatabaseLike>(
         let SelectItem::UnnamedExpr(expr) = item else {
             return false;
         };
-        let name = match expr {
-            Expr::Identifier(ident) => ident.value.as_str(),
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => parts[1].value.as_str(),
-            _ => return false,
+        let Some(name) = ident_name(expr) else {
+            return false;
         };
         let Some(col) = catalog_helpers::column_id(database, table_id, name) else {
             return false;
@@ -224,20 +473,31 @@ fn is_complete_column_list<DB: DatabaseLike>(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn extract_projection<DB: DatabaseLike>(
+pub(super) fn extract_projection<B: crate::backend::Backend, DB: DatabaseLike>(
     stmt: &Statement,
     table_id: crate::TableId,
     database: &DB,
 ) -> Result<QueryProjection, RegisterError> {
-    let select = match stmt {
-        Statement::Query(query) => match query.body.as_ref() {
-            SetExpr::Select(s) => s,
-            _ => {
-                return Ok(QueryProjection::Rows);
-            }
-        },
-        _ => return Ok(QueryProjection::Rows),
+    let Some(select) = select_of(stmt) else {
+        return Ok(QueryProjection::Rows);
     };
+    // A grouped statement is a different shape with different rules, and the
+    // clause gate deliberately let it through for this to decide. Handled
+    // before anything else so no ungrouped path can accept one by accident: a
+    // wildcard projection alongside a `GROUP BY` used to look like a plain row
+    // subscription, which is the silent drop this whole surface exists to stop.
+    if let Some(groups) = group_columns(select, table_id, database)? {
+        return grouped_projection::<B, DB>(select, &groups, table_id, database);
+    }
+
+    // A `HAVING` filters grouped results. The grouped path above parses it
+    // into the per-group check, so reaching here with one means the shape
+    // cannot serve it and silence would drop the clause.
+    if select.having.is_some() {
+        return Err(RegisterError::UnsupportedSql(
+            "HAVING is not supported outside a grouped aggregate subscription".to_string(),
+        ));
+    }
 
     let items = &select.projection;
 
@@ -273,104 +533,345 @@ pub(super) fn extract_projection<DB: DatabaseLike>(
             }
             SelectItem::Wildcard(_) => unreachable!("handled above"),
         };
-
-        if let Expr::Function(f) = expr {
-            // Get the (unqualified) function name (last ObjectName part).
-            let func_name = f
-                .name
-                .0
-                .last()
-                .and_then(|part| part.as_ident())
-                .map(|ident| ident.value.to_lowercase());
-
-            match func_name.as_deref() {
-                Some("count") => {
-                    // Supports COUNT(*) and COUNT(column): no FILTER, OVER, or DISTINCT.
-                    if f.filter.is_some() {
-                        return Err(RegisterError::UnsupportedSql(
-                            "COUNT FILTER (WHERE ...) not supported".to_string(),
-                        ));
-                    }
-                    if f.over.is_some() {
-                        return Err(RegisterError::UnsupportedSql(
-                            WINDOW_FUNCTIONS_NOT_SUPPORTED.to_string(),
-                        ));
-                    }
-
-                    match &f.args {
-                        FunctionArguments::List(list) => {
-                            // Reject DISTINCT
-                            if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
-                                return Err(RegisterError::UnsupportedSql(
-                                    "COUNT(DISTINCT ...) not supported".to_string(),
-                                ));
-                            }
-                            if list.args.len() != 1 {
-                                return Err(RegisterError::UnsupportedSql(
-                                    "COUNT requires exactly one argument".to_string(),
-                                ));
-                            }
-                            // COUNT(*): wildcard arg
-                            if matches!(
-                                &list.args[0],
-                                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                            ) {
-                                return Ok(QueryProjection::Aggregate(AggSpec::CountStar));
-                            }
-                            // COUNT(column): plain column identifier
-                            let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
-                                RegisterError::UnsupportedSql(
-                                    "COUNT argument must be * or a plain column name, not an expression"
-                                        .to_string(),
-                                )
-                            })?;
-                            let column = catalog_helpers::column_id(database, table_id, &col_name)
-                                .ok_or(RegisterError::UnknownColumn {
-                                    table_id,
-                                    column: col_name,
-                                })?;
-                            Ok(QueryProjection::Aggregate(AggSpec::CountColumn { column }))
-                        }
-                        _ => Err(RegisterError::UnsupportedSql(
-                            "COUNT requires an argument".to_string(),
-                        )),
-                    }
-                }
-                Some(
-                    func @ ("sum" | "avg" | "var_pop" | "var_samp" | "variance" | "stddev_pop"
-                    | "stddev_samp" | "stddev"),
-                ) => {
-                    let column = resolve_numeric_agg_column(func, f, table_id, database)?;
-                    let spec = match func {
-                        "sum" => AggSpec::Sum { column },
-                        "avg" => AggSpec::Avg { column },
-                        "var_pop" => AggSpec::VarPop { column },
-                        "var_samp" | "variance" => AggSpec::VarSamp { column },
-                        "stddev_pop" => AggSpec::StddevPop { column },
-                        "stddev_samp" | "stddev" => AggSpec::StddevSamp { column },
-                        _ => unreachable!("matched function name above"),
-                    };
-                    Ok(QueryProjection::Aggregate(spec))
-                }
-                Some(name @ ("min" | "max")) => Err(RegisterError::UnsupportedSql(format!(
-                    "{} aggregate not supported, not delta-composable. \
-                     See MILESTONES.md for design notes.",
-                    name.to_uppercase()
-                ))),
-                _ => Err(RegisterError::UnsupportedSql(
-                    UNSUPPORTED_PROJECTION.to_string(),
-                )),
-            }
-        } else {
-            Err(RegisterError::UnsupportedSql(
-                UNSUPPORTED_PROJECTION.to_string(),
-            ))
-        }
+        aggregate_from_expr(expr, table_id, database).map(QueryProjection::Aggregate)
     } else {
         Err(RegisterError::UnsupportedSql(
             UNSUPPORTED_PROJECTION.to_string(),
         ))
     }
+}
+
+/// Classify one projected expression as an aggregate of the accumulable family.
+///
+/// Shared by the plain and grouped paths so the two cannot drift on which
+/// aggregates are served or on how their arguments are read.
+fn aggregate_from_expr<DB: DatabaseLike>(
+    expr: &Expr,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<AggSpec, RegisterError> {
+    let Expr::Function(f) = expr else {
+        return Err(RegisterError::UnsupportedSql(
+            UNSUPPORTED_PROJECTION.to_string(),
+        ));
+    };
+    // The (unqualified) function name, its last `ObjectName` part.
+    let func_name = f
+        .name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_lowercase());
+
+    match func_name.as_deref() {
+        Some("count") => {
+            // Supports COUNT(*) and COUNT(column): no FILTER, OVER, or DISTINCT.
+            if f.filter.is_some() {
+                return Err(RegisterError::UnsupportedSql(
+                    "COUNT FILTER (WHERE ...) not supported".to_string(),
+                ));
+            }
+            if f.over.is_some() {
+                return Err(RegisterError::UnsupportedSql(
+                    WINDOW_FUNCTIONS_NOT_SUPPORTED.to_string(),
+                ));
+            }
+
+            match &f.args {
+                FunctionArguments::List(list) => {
+                    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+                        return Err(RegisterError::UnsupportedSql(
+                            "COUNT(DISTINCT ...) not supported".to_string(),
+                        ));
+                    }
+                    if list.args.len() != 1 {
+                        return Err(RegisterError::UnsupportedSql(
+                            "COUNT requires exactly one argument".to_string(),
+                        ));
+                    }
+                    // COUNT(*): wildcard arg
+                    if matches!(
+                        &list.args[0],
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                    ) {
+                        return Ok(AggSpec::CountStar);
+                    }
+                    // COUNT(column): plain column identifier
+                    let col_name = extract_column_arg(&list.args[0]).ok_or_else(|| {
+                        RegisterError::UnsupportedSql(
+                            "COUNT argument must be * or a plain column name, not an expression"
+                                .to_string(),
+                        )
+                    })?;
+                    let column = catalog_helpers::column_id(database, table_id, &col_name).ok_or(
+                        RegisterError::UnknownColumn {
+                            table_id,
+                            column: col_name,
+                        },
+                    )?;
+                    Ok(AggSpec::CountColumn { column })
+                }
+                _ => Err(RegisterError::UnsupportedSql(
+                    "COUNT requires an argument".to_string(),
+                )),
+            }
+        }
+        Some(
+            func @ ("sum" | "avg" | "var_pop" | "var_samp" | "variance" | "stddev_pop"
+            | "stddev_samp" | "stddev"),
+        ) => {
+            let column = resolve_numeric_agg_column(func, f, table_id, database)?;
+            Ok(match func {
+                "sum" => AggSpec::Sum { column },
+                "avg" => AggSpec::Avg { column },
+                "var_pop" => AggSpec::VarPop { column },
+                "var_samp" | "variance" => AggSpec::VarSamp { column },
+                "stddev_pop" => AggSpec::StddevPop { column },
+                "stddev_samp" | "stddev" => AggSpec::StddevSamp { column },
+                _ => unreachable!("matched function name above"),
+            })
+        }
+        Some(name @ ("min" | "max")) => Err(RegisterError::UnsupportedSql(format!(
+            "{} aggregate not supported, not delta-composable. \
+             See MILESTONES.md for design notes.",
+            name.to_uppercase()
+        ))),
+        _ => Err(RegisterError::UnsupportedSql(
+            UNSUPPORTED_PROJECTION.to_string(),
+        )),
+    }
+}
+
+/// Resolve the bare columns named by `GROUP BY`.
+/// `Ok(None)` when the statement is not grouped. Refuses a grouping that is
+/// anything other than bare columns of this table: the fold works by letting a
+/// changed row name its own group, and it can only do that when the group is
+/// read from the row rather than computed from it.
+pub(crate) fn group_columns<DB: DatabaseLike>(
+    select: &Select,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<Option<Vec<crate::ColumnId>>, RegisterError> {
+    let exprs = match &select.group_by {
+        // Refused by the clause gate before this runs.
+        GroupByExpr::All(_) => return Ok(None),
+        GroupByExpr::Expressions(exprs, _) if exprs.is_empty() => return Ok(None),
+        GroupByExpr::Expressions(exprs, _) => exprs,
+    };
+
+    let mut columns = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let Some(name) = ident_name(expr) else {
+            return Err(RegisterError::UnsupportedSql(
+                "GROUP BY must name bare columns: a grouped fold works by letting a \
+                 changed row say which group it is in, which it cannot do for a group \
+                 computed from the row"
+                    .to_string(),
+            ));
+        };
+        let column = catalog_helpers::column_id(database, table_id, name).ok_or_else(|| {
+            RegisterError::UnknownColumn {
+                table_id,
+                column: name.to_string(),
+            }
+        })?;
+        if columns.contains(&column) {
+            return Err(RegisterError::UnsupportedSql(
+                "GROUP BY names the same column twice".to_string(),
+            ));
+        }
+        columns.push(column);
+    }
+    Ok(Some(columns))
+}
+
+/// Classify a grouped statement, given the columns its `GROUP BY` names.
+///
+/// Served only in the one shape the fold maintains: every group column
+/// projected as a bare column, plus exactly one aggregate from the accumulable
+/// family, and nothing else. Anything wider is a question about rows the fold
+/// does not hold, so it is refused here and re-read by the tier above.
+///
+/// [`extract_grouped_extreme`] walks the same projection shape with `Ok(None)`
+/// where this errors. A change to what either accepts belongs in both.
+fn grouped_projection<B: crate::backend::Backend, DB: DatabaseLike>(
+    select: &Select,
+    groups: &[crate::ColumnId],
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<QueryProjection, RegisterError> {
+    // A group column whose values the database groups together while their
+    // encoding separates them would seed one group and then open a second from
+    // zero, leaving both totals wrong with nothing failing.
+    for column in groups {
+        let kind = catalog_helpers::column_builtin_kind(database, table_id, *column);
+        if !crate::backend::kind_groups_one_to_one::<B>(kind) {
+            let name = catalog_helpers::column_name(database, table_id, *column)
+                .unwrap_or_else(|| alloc::format!("column {column}"));
+            return Err(RegisterError::UnsupportedSql(alloc::format!(
+                "{name} cannot identify a group: this database treats values of {kind:?} as \
+                 equal that subql would encode apart, so the seeded group and a later change \
+                 would land in different groups and both totals would be wrong"
+            )));
+        }
+    }
+
+    let mut projected_groups = Vec::with_capacity(groups.len());
+    let mut agg = None;
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e)
+            | SelectItem::ExprWithAlias { expr: e, .. }
+            | SelectItem::ExprWithAliases { expr: e, .. } => e,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                return Err(RegisterError::UnsupportedSql(
+                    "GROUP BY with a wildcard projection not supported - a grouped \
+                     subscription projects its group columns and one aggregate, and a \
+                     wildcard projects rows a grouped answer does not have"
+                        .to_string(),
+                ));
+            }
+        };
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                let Some(name) = ident_name(expr) else {
+                    return Err(RegisterError::UnsupportedSql(
+                        UNSUPPORTED_PROJECTION.to_string(),
+                    ));
+                };
+                let column =
+                    catalog_helpers::column_id(database, table_id, name).ok_or_else(|| {
+                        RegisterError::UnknownColumn {
+                            table_id,
+                            column: name.to_string(),
+                        }
+                    })?;
+                if !groups.contains(&column) {
+                    return Err(RegisterError::UnsupportedSql(alloc::format!(
+                        "{name} is projected but not grouped by, so its value differs between \
+                         the rows of a group and the answer would depend on which row was read"
+                    )));
+                }
+                projected_groups.push(column);
+            }
+            Expr::Function(_) => {
+                if agg.is_some() {
+                    return Err(RegisterError::UnsupportedSql(
+                        "a grouped subscription maintains one aggregate per group, so it \
+                         projects exactly one"
+                            .to_string(),
+                    ));
+                }
+                agg = Some(aggregate_from_expr(expr, table_id, database)?);
+            }
+            _ => {
+                return Err(RegisterError::UnsupportedSql(
+                    UNSUPPORTED_PROJECTION.to_string(),
+                ))
+            }
+        }
+    }
+
+    let Some(agg) = agg else {
+        return Err(RegisterError::UnsupportedSql(
+            "a grouped subscription projects one aggregate, and this projects none".to_string(),
+        ));
+    };
+    // Every group column has to be delivered, or a value could not be
+    // attributed to anything the caller asked for.
+    for column in groups {
+        if !projected_groups.contains(column) {
+            let name = catalog_helpers::column_name(database, table_id, *column)
+                .unwrap_or_else(|| alloc::format!("column {column}"));
+            return Err(RegisterError::UnsupportedSql(alloc::format!(
+                "{name} is grouped by but not projected, so a delivered value could not be \
+                 attributed to a group"
+            )));
+        }
+    }
+
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| having_from_expr(expr, &agg, table_id, database))
+        .transpose()?;
+    Ok(QueryProjection::GroupedAggregate {
+        groups: groups.to_vec(),
+        agg,
+        having,
+    })
+}
+
+/// The numeric text of a constant comparison operand, sign folded in.
+/// `None` for anything that is not a plain, non-null numeric literal.
+fn having_literal_text(expr: &Expr) -> Option<String> {
+    match extreme_literal(expr)? {
+        sqlparser::ast::Value::Number(text, _) => Some(text),
+        _ => None,
+    }
+}
+
+/// Parse the one `HAVING` comparison a grouped fold can check in process:
+/// `COUNT(*)` or a family function over the projected column, against a
+/// numeric constant, either operand order.
+fn having_from_expr<DB: DatabaseLike>(
+    having: &Expr,
+    projected: &AggSpec,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<AggHaving, RegisterError> {
+    let Expr::BinaryOp { left, op, right } = having else {
+        return Err(RegisterError::UnsupportedSql(
+            "HAVING is served as one comparison between an aggregate and a constant".to_string(),
+        ));
+    };
+    let Some(op) = HavingOp::from_operator(op) else {
+        return Err(RegisterError::UnsupportedSql(
+            "HAVING is served as one comparison between an aggregate and a constant".to_string(),
+        ));
+    };
+    let (subject_expr, op, threshold) =
+        match (having_literal_text(left), having_literal_text(right)) {
+            (None, Some(text)) => (left.as_ref(), op, text),
+            (Some(text), None) => (right.as_ref(), op.mirrored(), text),
+            _ => {
+                return Err(RegisterError::UnsupportedSql(
+                    "HAVING compares the aggregate against one numeric constant".to_string(),
+                ))
+            }
+        };
+    if threshold.parse::<f64>().is_err() {
+        return Err(RegisterError::UnsupportedSql(alloc::format!(
+            "HAVING threshold {threshold} is not a numeric constant"
+        )));
+    }
+    let compared = aggregate_from_expr(subject_expr, table_id, database)?;
+    let subject = match &compared {
+        AggSpec::CountStar => HavingSubject::RowCount,
+        spec => {
+            let Some(projected_column) = projected.column() else {
+                return Err(RegisterError::UnsupportedSql(
+                    "COUNT(*) aggregates no column, so its HAVING can compare only COUNT(*)"
+                        .to_string(),
+                ));
+            };
+            let column = spec
+                .column()
+                .expect("every non-COUNT(*) family spec names its column");
+            if column != projected_column {
+                return Err(RegisterError::UnsupportedSql(
+                    "HAVING is evaluable only over the column the projection aggregates"
+                        .to_string(),
+                ));
+            }
+            HavingSubject::Aggregate(HavingFunction::of(spec).expect("checked non-COUNT(*) above"))
+        }
+    };
+    Ok(AggHaving {
+        subject,
+        op,
+        threshold,
+    })
 }
 
 /// A scalar `MIN`/`MAX` aggregate, which the core engine cannot evaluate
@@ -382,6 +883,224 @@ pub(crate) enum ScalarAggKind {
     Min,
     /// `MAX(column)`
     Max,
+}
+
+/// Grouped `MIN` or `MAX` projection served by the hybrid read tier.
+pub(crate) struct GroupedExtremeProjection {
+    pub groups: Vec<crate::ColumnId>,
+    pub kind: ScalarAggKind,
+    pub column: crate::ColumnId,
+    pub having: Option<ExtremeHaving>,
+}
+
+/// What a grouped extreme's `HAVING` comparison reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtremeHavingSubject {
+    /// The projected extreme itself.
+    Extreme,
+    /// `COUNT(*)`: the group's source-row count.
+    RowCount,
+}
+
+/// The `HAVING` comparison a grouped extreme checks per group. The literal
+/// stays as parsed SQL: the plan parses it to a backend value against the
+/// extreme column's kind, or as an integer for a row count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExtremeHaving {
+    pub subject: ExtremeHavingSubject,
+    pub op: HavingOp,
+    pub literal: sqlparser::ast::Value,
+}
+
+/// A constant comparison operand for an extreme's `HAVING`, sign folded
+/// into a numeric literal. `None` for NULL and for anything non-constant.
+fn extreme_literal(expr: &Expr) -> Option<sqlparser::ast::Value> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            sqlparser::ast::Value::Null => None,
+            other => Some(other.clone()),
+        },
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(value) => match &value.value {
+                sqlparser::ast::Value::Number(text, long) => Some(sqlparser::ast::Value::Number(
+                    alloc::format!("-{text}"),
+                    *long,
+                )),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Parse the one `HAVING` comparison a grouped extreme can check in
+/// process: the projected extreme or `COUNT(*)` against a constant, either
+/// operand order. `None` sends the statement to the capture tier.
+fn extreme_having<DB: DatabaseLike>(
+    having: &Expr,
+    kind: ScalarAggKind,
+    extreme_column: crate::ColumnId,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Option<ExtremeHaving> {
+    let Expr::BinaryOp { left, op, right } = having else {
+        return None;
+    };
+    let op = HavingOp::from_operator(op)?;
+    let (subject_expr, op, literal) = match (extreme_literal(left), extreme_literal(right)) {
+        (None, Some(literal)) => (left.as_ref(), op, literal),
+        (Some(literal), None) => (right.as_ref(), op.mirrored(), literal),
+        _ => return None,
+    };
+    let Expr::Function(function) = subject_expr else {
+        return None;
+    };
+    let name = function
+        .name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_lowercase());
+    let subject = match name.as_deref() {
+        Some("count") => {
+            let FunctionArguments::List(list) = &function.args else {
+                return None;
+            };
+            let [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] = list.args.as_slice() else {
+                return None;
+            };
+            ExtremeHavingSubject::RowCount
+        }
+        Some(called @ ("min" | "max")) => {
+            let called_kind = if called == "min" {
+                ScalarAggKind::Min
+            } else {
+                ScalarAggKind::Max
+            };
+            if called_kind != kind {
+                return None;
+            }
+            let display = match kind {
+                ScalarAggKind::Min => "MIN",
+                ScalarAggKind::Max => "MAX",
+            };
+            let column = resolve_single_column_arg(display, function, table_id, database).ok()?;
+            if column != extreme_column {
+                return None;
+            }
+            ExtremeHavingSubject::Extreme
+        }
+        _ => return None,
+    };
+    Some(ExtremeHaving {
+        subject,
+        op,
+        literal,
+    })
+}
+
+/// Detect and validate one grouped bare-column extreme.
+///
+/// [`grouped_projection`] walks the same projection shape with pinned errors
+/// where this answers `Ok(None)`. A change to what either accepts belongs in
+/// both. Unifying them was tried and rejected: keeping the fold's error
+/// precedence through a shared walker needs a three-outcome callback and a
+/// refusal-to-message map longer than the loops themselves.
+pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLike>(
+    stmt: &Statement,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<Option<GroupedExtremeProjection>, RegisterError> {
+    let Some(select) = select_of(stmt) else {
+        return Ok(None);
+    };
+    let Some(groups) = group_columns(select, table_id, database)? else {
+        return Ok(None);
+    };
+    for column in &groups {
+        let kind = catalog_helpers::column_builtin_kind(database, table_id, *column);
+        if !crate::backend::kind_groups_one_to_one::<B>(kind) {
+            return Ok(None);
+        }
+    }
+
+    let mut projected_groups = Vec::with_capacity(groups.len());
+    let mut extreme = None;
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr)
+            | SelectItem::ExprWithAlias { expr, .. }
+            | SelectItem::ExprWithAliases { expr, .. } => expr,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return Ok(None),
+        };
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                let Some(name) = ident_name(expr) else {
+                    return Ok(None);
+                };
+                let Some(column) = catalog_helpers::column_id(database, table_id, name) else {
+                    return Err(RegisterError::UnknownColumn {
+                        table_id,
+                        column: name.to_string(),
+                    });
+                };
+                if !groups.contains(&column) {
+                    return Ok(None);
+                }
+                projected_groups.push(column);
+            }
+            Expr::Function(function) => {
+                if extreme.is_some() {
+                    return Ok(None);
+                }
+                let name = function
+                    .name
+                    .0
+                    .last()
+                    .and_then(|part| part.as_ident())
+                    .map(|ident| ident.value.to_lowercase());
+                let kind = match name.as_deref() {
+                    Some("min") => ScalarAggKind::Min,
+                    Some("max") => ScalarAggKind::Max,
+                    _ => return Ok(None),
+                };
+                let display = match kind {
+                    ScalarAggKind::Min => "MIN",
+                    ScalarAggKind::Max => "MAX",
+                };
+                let column = resolve_single_column_arg(display, function, table_id, database)?;
+                extreme = Some((kind, column));
+            }
+            _ => return Ok(None),
+        }
+    }
+    if groups
+        .iter()
+        .any(|column| !projected_groups.contains(column))
+    {
+        return Ok(None);
+    }
+    let Some((kind, column)) = extreme else {
+        return Ok(None);
+    };
+    let having = match &select.having {
+        None => None,
+        Some(expr) => match extreme_having(expr, kind, column, table_id, database) {
+            Some(having) => Some(having),
+            // Outside the fast path: the capture tier answers instead.
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(GroupedExtremeProjection {
+        groups,
+        kind,
+        column,
+        having,
+    }))
 }
 
 /// Detect a single-column scalar `MIN`/`MAX` projection.
@@ -403,13 +1122,19 @@ pub(crate) fn extract_scalar_aggregate<DB: DatabaseLike>(
     table_id: crate::TableId,
     database: &DB,
 ) -> Result<Option<(ScalarAggKind, crate::ColumnId)>, RegisterError> {
-    let select = match stmt {
-        Statement::Query(query) => match query.body.as_ref() {
-            SetExpr::Select(s) => s,
-            _ => return Ok(None),
-        },
-        _ => return Ok(None),
+    let Some(select) = select_of(stmt) else {
+        return Ok(None);
     };
+
+    // The scalar tier maintains one value and re-queries for it, so a grouping
+    // it kept in the SQL would return a row per group and the value it holds
+    // would be one arbitrary group's. Answering `None` sends the statement to
+    // the tier that re-reads it whole, which is the correct answer for it.
+    if !matches!(&select.group_by, GroupByExpr::Expressions(exprs, modifiers)
+        if exprs.is_empty() && modifiers.is_empty())
+    {
+        return Ok(None);
+    }
 
     let items = &select.projection;
     if items.len() != 1 {
@@ -452,7 +1177,7 @@ pub(crate) fn extract_scalar_aggregate<DB: DatabaseLike>(
 ///
 /// Encapsulates the common sequence: length / sanity check -> parse ->
 /// single-statement assertion.
-pub(super) fn parse_single_statement(
+pub(crate) fn parse_single_statement(
     sql: &str,
     dialect: &dyn sqlparser::dialect::Dialect,
 ) -> Result<sqlparser::ast::Statement, crate::RegisterError> {
@@ -487,20 +1212,42 @@ pub(super) fn parse_single_statement(
 
 /// Render the runnable component-seed bundle for an in-process aggregate.
 ///
-/// Reuses the parsed statement's FROM and WHERE verbatim and rewrites only
-/// the projection to the accumulator's seed components, aliased
-/// positionally (`c0`, `c1`, ...) in the order [`crate::AggAccumulator::seed_from_row`]
-/// consumes them, paired with the per-column decode kinds. Returns `None`
-/// when `sql` is not the single-aggregate SELECT shape
-/// [`extract_projection`] already validated.
-pub(crate) fn render_aggregate_bootstrap(
+/// Reuses the parsed statement's FROM, WHERE and GROUP BY verbatim and
+/// rewrites only the projection: the group columns as written, then the
+/// accumulator's seed components aliased positionally (`c0`, `c1`, ...) in the
+/// order [`crate::AggAccumulator::seed_from_row`] consumes them, paired with
+/// the per-column decode kinds. Returns `None` when `sql` is not the SELECT
+/// shape [`extract_projection`] already validated.
+pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
     sql: &str,
-    spec: &AggSpec,
+    projection: &QueryProjection,
     dialect: &dyn sqlparser::dialect::Dialect,
+    table_id: crate::TableId,
+    database: &DB,
 ) -> Option<crate::AggregateBootstrap> {
+    let (spec, groups, having) = match projection {
+        QueryProjection::Rows => return None,
+        QueryProjection::Aggregate(spec) => (spec, &[][..], None),
+        QueryProjection::GroupedAggregate {
+            groups,
+            agg,
+            having,
+        } => (agg, groups.as_slice(), having.as_ref()),
+    };
+    // A sibling condition reads components the projected function alone does
+    // not maintain, so its seed carries the complete set.
+    let widened = having.is_some_and(|having| having.widens(spec));
     let mut stmt = parse_single_statement(sql, dialect).ok()?;
+    // The seed fetches every group. Groups failing the condition install
+    // silently and are needed the moment they cross into the result.
+    if let Some(select) = select_mut(&mut stmt) {
+        select.having = None;
+    }
     let col = aggregate_arg_text(&stmt)?;
-    let components = match spec {
+    let mut components = match spec {
+        _ if widened => {
+            format!("SUM({col}) AS c0, SUM({col} * 1.0 * {col}) AS c1, COUNT({col}) AS c2")
+        }
         AggSpec::CountStar => "COUNT(*) AS c0".to_string(),
         AggSpec::CountColumn { .. } => format!("COUNT({col}) AS c0"),
         AggSpec::Sum { .. } => format!("SUM({col}) AS c0"),
@@ -517,20 +1264,57 @@ pub(crate) fn render_aggregate_bootstrap(
             format!("SUM({col}) AS c0, SUM({col} * 1.0 * {col}) AS c1, COUNT({col}) AS c2")
         }
     };
-    let template = parse_single_statement(&format!("SELECT {components}"), dialect).ok()?;
-    let projection = select_projection(&template)?.to_vec();
-    *select_projection_mut(&mut stmt)? = projection;
+    if !groups.is_empty() {
+        use core::fmt::Write as _;
+        let row_count_slot = if widened {
+            3
+        } else {
+            aggregate_bootstrap_kinds(spec).len()
+        };
+        let _ = write!(components, ", COUNT(*) AS c{row_count_slot}");
+    }
+    // Group columns lead, in `GROUP BY` order rather than projection order, so
+    // a seeded group's values line up with the order its key encodes in.
+    let mut selected = String::new();
+    let mut group_kinds = Vec::with_capacity(groups.len());
+    for column in groups {
+        let name = catalog_helpers::column_name(database, table_id, *column)?;
+        let quoted = (dialect)
+            .identifier_quote_style(&name)
+            .map_or_else(|| name.clone(), |q| format!("{q}{name}{q}"));
+        selected.push_str(&quoted);
+        selected.push_str(", ");
+        group_kinds.push(catalog_helpers::column_builtin_kind(
+            database, table_id, *column,
+        )?);
+    }
+    selected.push_str(&components);
+
+    let template = parse_single_statement(&format!("SELECT {selected}"), dialect).ok()?;
+    let projection_items = select_projection(&template)?.to_vec();
+    *select_projection_mut(&mut stmt)? = projection_items;
+    let mut kinds = group_kinds;
+    if widened {
+        use crate::backend::ScalarKind::{Float, Int};
+        kinds.extend([Float, Float, Int]);
+    } else {
+        kinds.extend(aggregate_bootstrap_kinds(spec));
+    }
+    if !groups.is_empty() {
+        kinds.push(crate::backend::ScalarKind::Int);
+    }
     Some(crate::AggregateBootstrap {
         sql: stmt.to_string(),
-        kinds: aggregate_bootstrap_kinds(spec),
+        kinds,
+        group_columns: groups.len(),
     })
 }
 
-/// Per-column decode kinds for [`render_aggregate_bootstrap`], in column
-/// order. `COUNT` components are exact integers ([`crate::backend::ScalarKind::Int`]);
-/// `SUM` and `SUM(x*x)` components are decoded as double
-/// ([`crate::backend::ScalarKind::Float`]) regardless of the source column
-/// type, matching the `f64` accumulator, since `SUM` promotes to
+/// Per-column decode kinds for an aggregate's seed components, in component
+/// order. `COUNT` components are exact integers
+/// ([`crate::backend::ScalarKind::Int`]); `SUM` and `SUM(x*x)` components are
+/// decoded as double ([`crate::backend::ScalarKind::Float`]) regardless of the
+/// source column type, matching the `f64` accumulator, since `SUM` promotes to
 /// `bigint`/`numeric`/`DECIMAL` depending on the backend.
 pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::BuiltinKind> {
     use crate::backend::ScalarKind::{Float, Int};
@@ -545,21 +1329,23 @@ pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::B
     }
 }
 
-/// The column-argument text of the single aggregate projection, or `"*"`
-/// for `COUNT(*)`. `None` when `stmt` is not that shape.
+/// The column-argument text of the statement's aggregate projection, or `"*"`
+/// for `COUNT(*)`. `None` when no projected item is a function call.
 fn aggregate_arg_text(stmt: &Statement) -> Option<String> {
-    let [item] = select_projection(stmt)? else {
-        return None;
-    };
-    let expr = match item {
-        SelectItem::UnnamedExpr(e)
-        | SelectItem::ExprWithAlias { expr: e, .. }
-        | SelectItem::ExprWithAliases { expr: e, .. } => e,
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
-    };
-    let Expr::Function(f) = expr else {
-        return None;
-    };
+    // Scans rather than requiring a single projected item, because a grouped
+    // statement projects its group columns alongside the aggregate.
+    let f = select_projection(stmt)?.iter().find_map(|item| {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e)
+            | SelectItem::ExprWithAlias { expr: e, .. }
+            | SelectItem::ExprWithAliases { expr: e, .. } => e,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+        };
+        match expr {
+            Expr::Function(f) => Some(f),
+            _ => None,
+        }
+    })?;
     match &f.args {
         FunctionArguments::List(list) if list.args.len() == 1 => match &list.args[0] {
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Some("*".to_string()),
@@ -571,23 +1357,11 @@ fn aggregate_arg_text(stmt: &Statement) -> Option<String> {
 }
 
 fn select_projection(stmt: &Statement) -> Option<&[SelectItem]> {
-    let Statement::Query(query) = stmt else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    Some(&select.projection)
+    select_of(stmt).map(|select| select.projection.as_slice())
 }
 
 fn select_projection_mut(stmt: &mut Statement) -> Option<&mut Vec<SelectItem>> {
-    let Statement::Query(query) = stmt else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_mut() else {
-        return None;
-    };
-    Some(&mut select.projection)
+    select_mut(stmt).map(|select| &mut select.projection)
 }
 
 /// Maximum expression nesting depth to prevent stack overflow from fuzzer-crafted SQL.
@@ -672,54 +1446,257 @@ fn check_sql_sanity(sql: &str) -> Result<(), crate::RegisterError> {
 
 /// The one `SELECT` a query reduces to, with the table it reads.
 ///
-/// This is SubQL's statement-shape rule: single table, no joins, no set
-/// operations, no derived tables. It is stated once and applied both to the
-/// subscription statement and to the inner query of a membership subquery, so
-/// the two cannot drift apart.
-fn single_table_select(query: &Query) -> Result<(&Select, &ObjectName), RegisterError> {
-    match query.body.as_ref() {
-        SetExpr::Select(select) => {
-            if select.from.len() != 1 {
-                return Err(RegisterError::UnsupportedSql(
-                    "Exactly one table required (no joins)".to_string(),
-                ));
-            }
-
-            if !select.from[0].joins.is_empty() {
-                return Err(RegisterError::UnsupportedSql(
-                    "JOINs not supported - SubQL is for single-table CDC event filtering. \
-                     For multi-table queries, run this as a regular SQL query in your database."
-                        .to_string(),
-                ));
-            }
-
-            match &select.from[0].relation {
-                TableFactor::Table { name, .. } => Ok((select, name)),
-                _ => Err(RegisterError::UnsupportedSql(
-                    "Subqueries and derived tables not supported - SubQL is for single-table WHERE clauses. \
-                     Run this as a regular SQL query in your database instead."
-                        .to_string(),
-                )),
-            }
-        }
-        _ => Err(RegisterError::UnsupportedSql(
+/// This is SubQL's statement-shape rule: one table, and of the statement only
+/// the projection, that table, and the WHERE clause. A subscription is the
+/// rows of one table that satisfy one filter, delivered as they change, so
+/// every other clause asks a question no single change event can answer, and
+/// answering the reduced query instead is silent wrongness. Refusing is also
+/// what routes a statement upward: the re-execution wrapper triggers on
+/// [`RegisterError::UnsupportedSql`], so a clause accepted here is a clause no
+/// tier above can serve.
+///
+/// Stated once and applied both to the subscription statement and to the inner
+/// query of a membership subquery, so the two cannot drift apart.
+fn single_table_select(
+    query: &Query,
+    grouping: Grouping,
+) -> Result<(&Select, &ObjectName), RegisterError> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(RegisterError::UnsupportedSql(
             "Set operations (UNION, INTERSECT, EXCEPT) not supported - SubQL is for single-table CDC event filtering. \
              For queries combining multiple result sets, run this as a regular SQL query in your database."
                 .to_string(),
-        )),
+        ));
+    };
+
+    if select.from.len() != 1 {
+        return Err(RegisterError::UnsupportedSql(
+            "Exactly one table required (no joins)".to_string(),
+        ));
+    }
+
+    if !select.from[0].joins.is_empty() {
+        return Err(RegisterError::UnsupportedSql(
+            "JOINs not supported - SubQL is for single-table CDC event filtering. \
+             For multi-table queries, run this as a regular SQL query in your database."
+                .to_string(),
+        ));
+    }
+
+    let TableFactor::Table { name, .. } = &select.from[0].relation else {
+        return Err(RegisterError::UnsupportedSql(
+            "Subqueries and derived tables not supported - SubQL is for single-table WHERE clauses. \
+             Run this as a regular SQL query in your database."
+                .to_string(),
+        ));
+    };
+
+    check_served_clauses(query, select, grouping)?;
+
+    Ok((select, name))
+}
+
+/// Refuse every clause of `query` and `select` outside the projection, the
+/// table, and the WHERE clause.
+fn check_served_clauses(
+    query: &Query,
+    select: &Select,
+    grouping: Grouping,
+) -> Result<(), RegisterError> {
+    // Destructured exhaustively, no `..`, on purpose: sqlparser is tracked by
+    // branch, so a clause it learns to parse arrives here as a compile error
+    // demanding a decision instead of as a silently dropped clause. sqlparser
+    // guards `SelectModifiers::is_any_set` the same way.
+    let Query {
+        with,
+        // Reduced to `select` by the caller.
+        body: _,
+        order_by,
+        limit_clause,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = query;
+
+    let Select {
+        // Span of the `SELECT` keyword, not a clause.
+        select_token: _,
+        optimizer_hints,
+        distinct,
+        select_modifiers,
+        top,
+        // Only meaningful alongside `top`, refused below.
+        top_before_distinct: _,
+        projection: _,
+        exclude,
+        into,
+        // Reduced to the one table by the caller.
+        from: _,
+        lateral_views,
+        prewhere,
+        selection: _,
+        connect_by,
+        group_by,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having,
+        named_window,
+        qualify,
+        // Only meaningful alongside `named_window` and `qualify`, both refused below.
+        window_before_qualify: _,
+        value_table_mode,
+        // `FROM t SELECT *` spells the same query as `SELECT * FROM t`.
+        flavor: _,
+    } = select;
+
+    // A `GROUP BY` is a served shape only where a grouped fold can be built
+    // from it, which is the outer statement of a subscription. There
+    // `extract_projection` decides, refusing every grouped shape the fold
+    // cannot maintain, including a grouped row subscription. Everywhere else
+    // it is refused here, because nothing downstream would look at it: a
+    // membership subquery's inner query is matched value by value, and a keyed
+    // capture asks about one changed row, both of which a grouping invalidates
+    // without failing.
+    //
+    // `GROUP BY ALL` is refused even where grouping is served, since it names
+    // its groups by position in the projection rather than by column.
+    let (grouped, grouped_by_position) = match group_by {
+        GroupByExpr::All(_) => (true, true),
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            (!exprs.is_empty() || !modifiers.is_empty(), false)
+        }
+    };
+    let grouping_refused = grouped_by_position || (grouped && grouping == Grouping::Refused);
+
+    // `SELECT ALL` asks for every row and no deduplication, which is the served
+    // shape spelled out, so only the deduplicating spellings are refused.
+    let deduplicating = match distinct {
+        None | Some(Distinct::All) => false,
+        Some(Distinct::Distinct | Distinct::On(_)) => true,
+    };
+
+    // Ordered most-written first. Later entries name clauses no backend's
+    // dialect here parses (ClickHouse, Hive, Snowflake, MSSQL, BigQuery), so no
+    // test reaches them: they are the decision the exhaustive destructuring
+    // demands, and refusing is the only safe one to make blind.
+    for (present, clause) in [
+        (with.is_some(), "WITH"),
+        (grouping_refused, "GROUP BY"),
+        // Like `GROUP BY`: on the served path the projection logic decides,
+        // parsing the fast-path comparison and refusing everything else, so
+        // no shape can silently drop the clause. Everywhere else it is
+        // refused outright.
+        (having.is_some() && grouping == Grouping::Refused, "HAVING"),
+        (deduplicating, "DISTINCT"),
+        (order_by.is_some(), "ORDER BY"),
+        (
+            limit_clause.is_some(),
+            limit_clause_name(limit_clause.as_ref()),
+        ),
+        (fetch.is_some(), "FETCH"),
+        (!locks.is_empty(), "FOR UPDATE / FOR SHARE"),
+        (for_clause.is_some(), "FOR XML / FOR JSON"),
+        (settings.is_some(), "SETTINGS"),
+        (format_clause.is_some(), "FORMAT"),
+        (!pipe_operators.is_empty(), "a pipe operator"),
+        (!optimizer_hints.is_empty(), "an optimizer hint"),
+        (
+            select_modifiers
+                .as_ref()
+                .is_some_and(SelectModifiers::is_any_set),
+            "a SELECT modifier",
+        ),
+        (top.is_some(), "TOP"),
+        (exclude.is_some(), "EXCLUDE"),
+        (into.is_some(), "INTO"),
+        (!lateral_views.is_empty(), "LATERAL VIEW"),
+        (prewhere.is_some(), "PREWHERE"),
+        (!connect_by.is_empty(), "CONNECT BY"),
+        (!cluster_by.is_empty(), "CLUSTER BY"),
+        (!distribute_by.is_empty(), "DISTRIBUTE BY"),
+        (!sort_by.is_empty(), "SORT BY"),
+        (!named_window.is_empty(), "WINDOW"),
+        (qualify.is_some(), "QUALIFY"),
+        (
+            value_table_mode.is_some(),
+            "SELECT AS VALUE / SELECT AS STRUCT",
+        ),
+    ] {
+        if present {
+            return Err(unserved_clause(clause));
+        }
+    }
+
+    Ok(())
+}
+
+/// Which part of a `LIMIT` clause the caller actually wrote, so the refusal
+/// quotes their own keyword.
+const fn limit_clause_name(limit: Option<&LimitClause>) -> &'static str {
+    match limit {
+        Some(LimitClause::LimitOffset {
+            limit: None,
+            offset,
+            limit_by,
+        }) => {
+            if offset.is_some() {
+                "OFFSET"
+            } else if limit_by.is_empty() {
+                "LIMIT"
+            } else {
+                "LIMIT BY"
+            }
+        }
+        None | Some(LimitClause::LimitOffset { .. } | LimitClause::OffsetCommaLimit { .. }) => {
+            "LIMIT"
+        }
     }
 }
 
-/// Extract the single table name and WHERE clause from a supported SELECT.
+/// Refuse a clause outside the shape SubQL serves.
+fn unserved_clause(clause: &str) -> RegisterError {
+    RegisterError::UnsupportedSql(format!(
+        "{clause} not supported - a SubQL subscription is the rows of one table that satisfy one \
+         WHERE clause, delivered as they change, and nothing else in a SELECT survives that \
+         reduction. Run this as a regular SQL query in your database."
+    ))
+}
+
+/// Extract the single table name and WHERE clause from a supported SELECT,
+/// where a grouped statement is one of the supported shapes.
 ///
-/// This enforces SubQL's statement-shape constraints (single table, no joins,
-/// no set operations, no derived tables) so parser and canonicalizer stay in sync.
-pub(super) fn extract_single_table_and_where(
+/// This enforces SubQL's statement-shape constraints (see
+/// [`single_table_select`]) so parser and canonicalizer stay in sync. Whether
+/// this particular grouping is servable is [`extract_projection`]'s answer,
+/// which every caller of this runs afterwards.
+pub(crate) fn extract_single_table_and_where(
     stmt: &Statement,
+) -> Result<(ObjectName, Option<Expr>), RegisterError> {
+    extract_table_and_where_with(stmt, Grouping::Served)
+}
+
+/// As [`extract_single_table_and_where`], but refusing a grouped statement.
+///
+/// For callers that do something with the rows themselves rather than build a
+/// fold: a keyed capture asks the database about one changed row, and a
+/// grouping makes that row's membership depend on the others.
+pub(crate) fn extract_ungrouped_table_and_where(
+    stmt: &Statement,
+) -> Result<(ObjectName, Option<Expr>), RegisterError> {
+    extract_table_and_where_with(stmt, Grouping::Refused)
+}
+
+fn extract_table_and_where_with(
+    stmt: &Statement,
+    grouping: Grouping,
 ) -> Result<(ObjectName, Option<Expr>), RegisterError> {
     match stmt {
         Statement::Query(query) => {
-            let (select, name) = single_table_select(query)?;
+            let (select, name) = single_table_select(query, grouping)?;
             Ok((name.clone(), select.selection.clone()))
         }
         _ => Err(RegisterError::UnsupportedSql(
@@ -777,11 +1754,14 @@ fn contains_subquery(expr: &Expr) -> bool {
 
 /// Is there a membership subquery anywhere in `expr`?
 ///
-/// Narrower than [`contains_subquery`] on purpose: a `NOT` over one of these is
-/// refused as subtraction, and saying that about an `EXISTS` would describe the
-/// wrong thing.
+/// Narrower than [`contains_subquery`] on purpose: a `NOT` over one of these
+/// is refused as subtraction, and saying that about a bare scalar subquery
+/// would describe the wrong thing. `EXISTS` counts, since the bounded
+/// membership `EXISTS` is a term and its negation is the same subtraction.
 pub(super) fn contains_membership_subquery(expr: &Expr) -> bool {
-    contains_matching(expr, |inner| matches!(inner, Expr::InSubquery { .. }))
+    contains_matching(expr, |inner| {
+        matches!(inner, Expr::InSubquery { .. } | Expr::Exists { .. })
+    })
 }
 
 /// Whether `expr` is a call carrying no column reference: a bare keyword
@@ -860,16 +1840,7 @@ pub(super) fn contains_caller_comparison(expr: &Expr) -> bool {
 /// Whether the projected value is a column, and whether the relationship is one
 /// SubQL can serve, are not decided here.
 pub(super) fn check_membership_subquery_bound(query: &Query) -> Result<(), RegisterError> {
-    if query.with.is_some() {
-        return Err(RegisterError::UnsupportedSql(
-            "A membership subquery cannot contain another subquery. SubQL tracks one \
-             relationship for the subscription, and a WITH clause names another query it \
-             cannot follow."
-                .to_string(),
-        ));
-    }
-
-    let (select, _) = single_table_select(query)?;
+    let (select, _) = single_table_select(query, Grouping::Refused)?;
 
     match select.projection.as_slice() {
         [SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }] => {}
@@ -893,6 +1864,250 @@ pub(super) fn check_membership_subquery_bound(query: &Query) -> Result<(), Regis
     }
 
     Ok(())
+}
+
+/// The parts of a bounded membership `EXISTS`, from one recognizer for both
+/// the compiler and the seed synthesis, so the two cannot drift.
+pub(crate) struct ExistsParts<'a> {
+    /// One entry per pair equality, in written order.
+    pub pairs: Vec<ExistsPair<'a>>,
+    /// The caller comparison conjunct, verbatim.
+    pub caller: &'a Expr,
+    /// The membership table clause, verbatim, alias included.
+    pub from: &'a sqlparser::ast::TableWithJoins,
+    /// The membership table, resolved.
+    pub member_table: crate::TableId,
+}
+
+/// One pair equality of a bounded membership `EXISTS`.
+pub(crate) struct ExistsPair<'a> {
+    /// The membership-side expression, verbatim, for the seed projection.
+    pub inner_expr: &'a Expr,
+    /// The membership column it names, resolved on the membership table.
+    pub inner: crate::ColumnId,
+    /// The compared column, resolved on the subscribed table.
+    pub outer: crate::ColumnId,
+}
+
+/// The refusal every violation of the bounded `EXISTS` form shares its frame
+/// with: name what the form is, then what this filter got wrong.
+fn exists_refusal(what: &str) -> RegisterError {
+    RegisterError::UnsupportedSql(alloc::format!(
+        "A membership EXISTS is served in one bounded form: a single-table subquery whose \
+         WHERE is one or more pair equalities (membership column against a column of the \
+         subscribed table, written qualified as its table) plus exactly one comparison \
+         naming the caller. This filter {what}."
+    ))
+}
+
+/// Append `expr`'s AND-conjuncts to `out`, in written order.
+fn conjuncts_of<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            conjuncts_of(left, out);
+            conjuncts_of(right, out);
+        }
+        Expr::Nested(inner) => conjuncts_of(inner, out),
+        other => out.push(other),
+    }
+}
+
+/// The qualifier and column of a one- or two-part column reference.
+const fn qualified_parts(expr: &Expr) -> Option<(Option<&str>, &str)> {
+    match expr {
+        Expr::Identifier(ident) => Some((None, ident.value.as_str())),
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [qualifier, column] => Some((Some(qualifier.value.as_str()), column.value.as_str())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Recognize and bound the membership `EXISTS` form.
+///
+/// The membership side of a pair may be bare or qualified by the membership
+/// table's name or alias. The subscribed side must be qualified by the
+/// subscribed table's name: a bare name resolves to the membership table
+/// inside the subquery under SQL's own rules, so accepting one as the
+/// subscribed column would serve a filter the database reads differently.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass classifies every conjunct against resolvers that close over the \
+              subquery's alias, and splitting it would hand the closures around"
+)]
+pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
+    query: &'a Query,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<ExistsParts<'a>, RegisterError> {
+    let (select, member_name) = single_table_select(query, Grouping::Refused)?;
+    if select.selection.as_ref().is_some_and(contains_subquery) {
+        return Err(RegisterError::UnsupportedSql(
+            "A membership subquery cannot contain another subquery. SubQL tracks one \
+             relationship for the subscription, and a nested subquery names a second one it \
+             cannot follow."
+                .to_string(),
+        ));
+    }
+    let member_table_name = member_name
+        .0
+        .last()
+        .and_then(sqlparser::ast::ObjectNamePart::as_ident)
+        .map(|ident| ident.value.as_str())
+        .ok_or_else(|| exists_refusal("names its membership table in a form SubQL cannot read"))?;
+    let member_table = catalog_helpers::table_id(database, member_table_name)
+        .ok_or_else(|| exists_refusal("reads a membership table the catalog does not know"))?;
+    let alias = match &select.from[0].relation {
+        TableFactor::Table { alias, .. } => alias.as_ref().map(|alias| alias.name.value.as_str()),
+        _ => None,
+    };
+    // A qualifier names the membership side when it is the alias or the
+    // membership table's own name, and the subscribed side when it resolves to
+    // the subscribed table. Checked in that order, because inside the subquery
+    // the alias shadows everything else.
+    let is_member_qualifier = |qualifier: &str| {
+        Some(qualifier) == alias
+            || catalog_helpers::table_id(database, qualifier) == Some(member_table)
+    };
+    let member_column = |expr: &Expr| -> Option<crate::ColumnId> {
+        let (qualifier, column) = qualified_parts(expr)?;
+        if qualifier.is_some_and(|qualifier| !is_member_qualifier(qualifier)) {
+            return None;
+        }
+        catalog_helpers::column_id(database, member_table, column)
+    };
+    let subscribed_column = |expr: &Expr| -> Option<crate::ColumnId> {
+        let (qualifier, column) = qualified_parts(expr)?;
+        let qualifier = qualifier?;
+        if is_member_qualifier(qualifier)
+            || catalog_helpers::table_id(database, qualifier) != Some(table_id)
+        {
+            return None;
+        }
+        catalog_helpers::column_id(database, table_id, column)
+    };
+
+    let Some(selection) = select.selection.as_ref() else {
+        return Err(exists_refusal(
+            "has no WHERE, so it correlates with nothing",
+        ));
+    };
+    let mut flat = Vec::new();
+    conjuncts_of(selection, &mut flat);
+
+    let mut pairs = Vec::new();
+    let mut caller = None;
+    for conjunct in flat {
+        if is_caller_comparison(conjunct) {
+            if caller.is_some() {
+                return Err(exists_refusal("compares the caller twice"));
+            }
+            let Expr::BinaryOp { left, right, .. } = conjunct else {
+                unreachable!("a caller comparison is a binary comparison by construction");
+            };
+            let column_side = if qualified_parts(left).is_some() {
+                left
+            } else {
+                right
+            };
+            if member_column(column_side).is_none() {
+                return Err(exists_refusal(
+                    "compares the caller against something other than a membership column",
+                ));
+            }
+            caller = Some(conjunct);
+            continue;
+        }
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = conjunct
+        else {
+            return Err(exists_refusal(
+                "carries a condition that is neither a pair equality nor a caller comparison",
+            ));
+        };
+        let pair = match (member_column(left), subscribed_column(right)) {
+            (Some(inner), Some(outer)) => Some(ExistsPair {
+                inner_expr: left.as_ref(),
+                inner,
+                outer,
+            }),
+            _ => match (member_column(right), subscribed_column(left)) {
+                (Some(inner), Some(outer)) => Some(ExistsPair {
+                    inner_expr: right.as_ref(),
+                    inner,
+                    outer,
+                }),
+                _ => None,
+            },
+        };
+        let Some(pair) = pair else {
+            return Err(exists_refusal(
+                "carries an equality that does not pair a membership column with a qualified \
+                 column of the subscribed table",
+            ));
+        };
+        pairs.push(pair);
+    }
+    let Some(caller) = caller else {
+        return Err(exists_refusal("never names the caller"));
+    };
+    if pairs.is_empty() {
+        return Err(exists_refusal(
+            "correlates no membership column with the subscribed table",
+        ));
+    }
+    Ok(ExistsParts {
+        pairs,
+        caller,
+        from: &select.from[0],
+        member_table,
+    })
+}
+
+/// The compared columns of a bounded membership `EXISTS`, in written order.
+pub(super) fn check_membership_exists_bound<DB: DatabaseLike>(
+    query: &Query,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Result<Vec<crate::ColumnId>, RegisterError> {
+    Ok(membership_exists_parts(query, table_id, database)?
+        .pairs
+        .into_iter()
+        .map(|pair| pair.outer)
+        .collect())
+}
+
+/// The seed read of a bounded membership `EXISTS`: the membership columns the
+/// pairs name, projected in pair order, for the rows naming the caller.
+///
+/// `None` when `query` is not the recognized form, which `resolve` reports as
+/// a shape that lost its seed read.
+pub(crate) fn exists_seed_select<DB: DatabaseLike>(
+    query: &Query,
+    table_id: crate::TableId,
+    database: &DB,
+) -> Option<String> {
+    let parts = membership_exists_parts(query, table_id, database).ok()?;
+    let mut projection = String::new();
+    for (position, pair) in parts.pairs.iter().enumerate() {
+        if position > 0 {
+            projection.push_str(", ");
+        }
+        projection.push_str(&pair.inner_expr.to_string());
+    }
+    Some(alloc::format!(
+        "SELECT {projection} FROM {} WHERE {}",
+        parts.from,
+        parts.caller
+    ))
 }
 
 /// Derive the follow-subscription SELECT from an UPDATE statement:

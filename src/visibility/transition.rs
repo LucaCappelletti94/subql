@@ -545,7 +545,8 @@ mod tests {
     #[test]
     fn a_failing_policy_errors_and_leaves_the_buffer_fail_closed() {
         let (db, docs) = catalog();
-        let event = TestEvent::update(docs, row(1, 7), row(1, 7)).with_pk_columns([0u16]);
+        let event: TestEvent<_> =
+            TestEvent::update(docs, row(1, 7), row(1, 7)).with_pk_columns([0u16]);
         let policy = OwnerPolicy {
             fail: true,
             ..OwnerPolicy::default()
@@ -570,12 +571,12 @@ mod tests {
         let policy = OwnerPolicy::default();
         let mut buffers = Transitions::new();
 
-        let first = TestEvent::insert(docs, row(1, 7)).with_pk_columns([0u16]);
+        let first: TestEvent<_> = TestEvent::insert(docs, row(1, 7)).with_pk_columns([0u16]);
         buffers.reset(1);
         block_on(transitions(&policy, &first, &db, &[7], &mut buffers)).unwrap();
         assert_eq!(buffers.get(), [Transition::Deliver]);
 
-        let second = TestEvent::insert(docs, row(2, 9)).with_pk_columns([0u16]);
+        let second: TestEvent<_> = TestEvent::insert(docs, row(2, 9)).with_pk_columns([0u16]);
         buffers.reset(1);
         block_on(transitions(&policy, &second, &db, &[7], &mut buffers)).unwrap();
         assert_eq!(buffers.get(), [Transition::Nothing], "no stale Deliver");
@@ -707,7 +708,7 @@ mod tests {
     fn the_returned_future_is_send() {
         const fn assert_send<T: Send>(_: &T) {}
         let (db, docs) = catalog();
-        let event = TestEvent::insert(docs, row(1, 7)).with_pk_columns([0u16]);
+        let event: TestEvent<_> = TestEvent::insert(docs, row(1, 7)).with_pk_columns([0u16]);
         let policy = OwnerPolicy::default();
         let watchers = [7i64];
         let mut buffers = Transitions::new();
@@ -736,7 +737,8 @@ mod tests {
             }
         }
         let (db, docs) = catalog();
-        let event = TestEvent::update(docs, row(1, 7), row(1, 9)).with_pk_columns([0u16]);
+        let event: TestEvent<_> =
+            TestEvent::update(docs, row(1, 7), row(1, 9)).with_pk_columns([0u16]);
         assert!(
             super::is_key_only(&Detached, &event, &db),
             "an unmeasurable image must not be judged"

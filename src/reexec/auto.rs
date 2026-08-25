@@ -1,45 +1,107 @@
 #![allow(clippy::type_complexity)]
-//! Auto-resolving re-execution engine: wraps [`ReExecEngine`] with a
-//! [`Connector`] and converts in-flight [`ReExecutionTrigger`]s into
-//! [`ScalarUpdate`]s inline.
+//! Connector-calling wrapper over [`SubscriptionEngine`](crate::SubscriptionEngine).
 //!
-//! Pick this engine when you want subql to drive the re-execution loop end
-//! to end: pass a `Connector` impl over your database handle and receive
-//! `ScalarUpdate`s directly. Keep the bare [`ReExecEngine`] when you want
-//! explicit control over re-execution (e.g. cross-batch coalescing,
-//! retry-with-backoff, or auth that does not fit the [`Connector::AuthContext`]
-//! shape).
+//! Use this when subql should call a database connector for every
+//! [`ReExecutionTrigger`](super::ReExecutionTrigger). Use
+//! `SubscriptionEngine` directly when downstream Rust code executes the SQL.
 //!
 //! See [`super::connector`] for the trait contract and error semantics.
 //!
 //! [`ReExecutionTrigger`]: super::ReExecutionTrigger
 
 use super::connector::{Connector, ReExecError};
-use super::engine::{
-    BatchOutcome, ReExecEngine, ReExecNotifications, ReExecQueryId, ReExecUnregisterReport,
-    Registered, ScalarUpdate,
-};
+use super::engine::{BatchOutcome, ReExecNotifications, RowDelta, RowsUpdate};
 use crate::backend::{Backend, BuiltinKind, CdcEvent, Value};
 use crate::clock::{duration_between, ClockHandle};
 use crate::compiler::literals::SqlLiteralParse;
-use crate::{IdTypes, RegisterError, SubscriptionRequest, SubscriptionScope, UnregisterReport};
+#[cfg(test)]
+use crate::SubscriptionRequest;
+use crate::{
+    IdTypes, RegisterError, Registered, SubscriptionId, SubscriptionScope, Tier, UnregisterReport,
+};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
 use hashbrown::HashMap;
+
+/// Default byte budget for one page of a re-read captured query.
+///
+/// A quarter of a mebibyte: large enough that a small result arrives in one
+/// page, small enough that a large one cannot exhaust memory before the caller
+/// sees anything.
+pub const DEFAULT_PAGE_BYTES: usize = 256 * 1024;
+
+/// Keys named in one scoped read by default.
+///
+/// A keyed read's duration tracks how many keys it names, and a caller's
+/// statement timeout applies per statement, so an unbounded request disables
+/// the only read ceiling the caller has. Measured against Postgres 16: a 50,000
+/// key request is cancelled outright under a 25 ms ceiling that an ordinary
+/// read clears in under 1 ms, and because a failed read returns its keys, the
+/// next ordinary change carries the whole backlog and fails again.
+///
+/// The value is a measured optimum rather than a round number. Splitting 10,000
+/// keys was fastest near this size, 28 percent quicker than one statement,
+/// while 1,000 was 14 percent slower than not splitting at all and 200 was
+/// three times slower. The curve is shallow above this point and steep below
+/// it, so err upwards. That measurement ran over a local socket where round
+/// trips are nearly free, and real network latency moves the optimum higher,
+/// which is why this is configurable.
+pub const DEFAULT_MAX_KEYS_PER_READ: usize = 4096;
 use sql_traits::prelude::DatabaseLike;
 
-/// Result of [`AutoResolvingEngine::snapshot`]: the captured query's
-/// current value at a known position in the source stream.
+/// Carry a connector's read position into the event-checkpoint domain.
+///
+/// Identity when the two domains are the same type, which is every shipped
+/// pairing (`PgLsn` reads with `PgLsn` events, and so on). `None` when one
+/// side has no position domain (`NoCheckpoint`): a Maxwell-fed MySQL engine
+/// reads binlog positions its events cannot spell, and a positionless seed
+/// is what the install layer already handles. Two DIFFERENT real position
+/// domains are a wiring mistake, caught by the debug assertion rather than
+/// degraded into a silent `None`.
+pub(super) fn reconcile_checkpoint<F: crate::Checkpoint, T: crate::Checkpoint>(
+    checkpoint: Option<&F>,
+) -> Option<T> {
+    use core::any::{Any, TypeId};
+    debug_assert!(
+        TypeId::of::<F>() == TypeId::of::<T>()
+            || TypeId::of::<F>() == TypeId::of::<crate::NoCheckpoint>()
+            || TypeId::of::<T>() == TypeId::of::<crate::NoCheckpoint>(),
+        "a connector and its events speak different position domains"
+    );
+    checkpoint
+        .and_then(|value| (value as &dyn Any).downcast_ref::<T>())
+        .cloned()
+}
+
+/// Result of [`AutoResolvingEngine::snapshot`]: the captured query's current value.
 ///
 /// Tagged so future captured-query flavors (single-table row re-execution,
 /// multi-table aggregate re-execution) can be added without changing the
 /// engine method's signature.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub enum SnapshotResult<B: Backend, C: crate::Checkpoint> {
-    /// Single-table scalar (today's only flavor): a `MIN`/`MAX` value.
+pub enum SnapshotResult<B: Backend, C: crate::Checkpoint, I: IdTypes = crate::DefaultIds> {
+    /// A scalar captured query: a `MIN`/`MAX` value.
     Scalar(Value<B>, Option<C>),
+    /// Initial grouped aggregate rows installed under one checkpoint.
+    GroupedAggregate {
+        updates: Vec<crate::AggregateValueUpdate<I, B>>,
+        checkpoint: Option<C>,
+    },
+    /// A whole-re-read captured query: its answer, in pages, all read from one
+    /// snapshot so they describe a single instant.
+    ///
+    /// Every page carries that snapshot's position, so a caller can anchor the
+    /// answer to the change stream and know which events follow it.
+    Rows {
+        /// Column names as the database reported them, in projection order.
+        columns: Vec<String>,
+        /// Every row of the answer, in `columns` order, pages concatenated.
+        rows: Vec<Vec<Value<B>>>,
+        /// Position the snapshot was read at, when the connector reports one.
+        checkpoint: Option<C>,
+    },
 }
 
 /// Per-query state needed to drive an automatic re-execution.
@@ -49,8 +111,19 @@ pub enum SnapshotResult<B: Backend, C: crate::Checkpoint> {
 pub(super) struct ResolveContext<I: IdTypes, A> {
     /// Re-execution SQL produced by the plan.
     pub(super) sql: String,
-    /// Decode kind for the scalar result.
+    /// Decode kind for the scalar result. Meaningless for a whole re-read,
+    /// which has no single column.
     pub(super) column_kind: BuiltinKind,
+    /// Initial grouped extreme read, present only for that tier.
+    pub(super) grouped_bootstrap: Option<crate::AggregateBootstrap>,
+    /// Whether resolving means reading one scalar or re-reading every row.
+    /// The trigger does not say, and the two are resolved differently.
+    pub(super) whole_result: bool,
+    /// Whether resolving means asking only about the rows that changed.
+    pub(super) keyed: bool,
+    /// Which re-read the next page belongs to, so a consumer can tell a new
+    /// answer from a continuation of the old one.
+    pub(super) generation: u64,
     /// Session owning the query, used to drop contexts on
     /// [`unregister_session`](AutoResolvingEngine::unregister_session).
     pub(super) session: Option<I::SessionId>,
@@ -58,65 +131,154 @@ pub(super) struct ResolveContext<I: IdTypes, A> {
     pub(super) auth: A,
 }
 
-/// Opt-in wrapper that auto-resolves [`ReExecutionTrigger`](super::ReExecutionTrigger)s
-/// by calling a [`Connector`].
+/// Connector execution mode used by [`AutoResolvingEngine`].
 ///
-/// Behavior contract:
-/// * `register` delegates to the inner [`ReExecEngine`] and stores the
-///   per-subscription [`Connector::AuthContext`] alongside the SQL and
-///   decode kind returned via [`Registered::ReExec`].
-/// * `consumers` delegates to the inner engine for filtering, then drains
-///   each emitted trigger: for each, the connector is called with the
-///   stored auth context, the returned value is installed via the inner
-///   engine, and a [`ScalarUpdate`] is appended to the result. The
-///   returned [`ReExecNotifications::triggers`] is always empty.
-/// * A single connector failure aborts the rest of the batch and returns
-///   [`ReExecError::Connector`].
-pub struct AutoResolvingEngine<E, I, DB, X>
+/// The associated type is the authorization value stored per subscription.
+pub trait ResolverMode<B: Backend> {
+    /// Per-subscription authorization value stored by the wrapper.
+    type AuthContext;
+}
+
+/// Synchronous [`Connector`] mode.
+pub struct SyncMode<X>(pub X);
+
+impl<B: Backend, X: Connector<Backend = B>> ResolverMode<B> for SyncMode<X> {
+    type AuthContext = X::AuthContext;
+}
+
+/// Calls a database connector for every read requested by a
+/// [`SubscriptionEngine`](crate::SubscriptionEngine).
+///
+/// `SyncMode<X>` provides synchronous methods for `X: Connector`.
+/// [`AsyncMode`](super::AsyncMode) provides asynchronous methods for
+/// `X: AsyncConnector`.
+pub struct AutoResolvingEngine<E, I, DB, M>
 where
     E: CdcEvent,
     E::Backend: SqlLiteralParse,
     I: IdTypes,
     DB: DatabaseLike,
-    X: Connector<Backend = E::Backend>,
+    M: ResolverMode<E::Backend>,
 {
-    inner: ReExecEngine<E, I, DB>,
-    connector: X,
-    contexts: HashMap<ReExecQueryId, ResolveContext<I, X::AuthContext>>,
-    /// Optional [`Clock`](crate::Clock) used for per-query debounce.
-    clock: Option<ClockHandle>,
-    /// Minimum interval between two re-executions of the same captured
-    /// query. `None` means no debounce. Requires `clock` to be set.
-    debounce: Option<Duration>,
-    /// Last `now_micros` at which each captured query was re-executed.
-    /// Populated only when `clock` + `debounce` are set.
-    last_reexec_at: HashMap<ReExecQueryId, u64>,
+    pub(super) inner: crate::SubscriptionEngine<E, I, DB>,
+    pub(super) mode: M,
+    pub(super) contexts: HashMap<SubscriptionId, ResolveContext<I, M::AuthContext>>,
+    /// Byte budget for one page of a re-read captured query.
+    pub(super) max_page_bytes: usize,
+    /// Keys named in one scoped read of the keyed tier.
+    pub(super) max_keys_per_read: usize,
+    /// Optional clock used for per-query debounce.
+    pub(super) clock: Option<ClockHandle>,
+    /// Minimum interval between two re-executions of the same query.
+    pub(super) debounce: Option<Duration>,
+    /// Last execution time per subscription and optional group.
+    pub(super) last_reexec_at: HashMap<(SubscriptionId, Option<Vec<u8>>), u64>,
 }
 
-impl<E, I, DB, X> AutoResolvingEngine<E, I, DB, X>
+impl<E, I, DB, M> AutoResolvingEngine<E, I, DB, M>
 where
     E: CdcEvent,
     E::Backend: SqlLiteralParse,
     I: IdTypes,
     DB: DatabaseLike + 'static,
-    X: Connector<Backend = E::Backend>,
+    M: ResolverMode<E::Backend>,
 {
-    /// Wrap an existing [`ReExecEngine`] with the given [`Connector`].
-    pub fn new(inner: ReExecEngine<E, I, DB>, connector: X) -> Self {
+    /// Wrap a registry shell and one explicit connector mode.
+    pub fn new(inner: crate::SubscriptionEngine<E, I, DB>, mode: M) -> Self {
         Self {
             inner,
-            connector,
+            mode,
             contexts: HashMap::new(),
+            max_page_bytes: DEFAULT_PAGE_BYTES,
+            max_keys_per_read: DEFAULT_MAX_KEYS_PER_READ,
             clock: None,
             debounce: None,
             last_reexec_at: HashMap::new(),
         }
     }
 
-    /// Attach a [`Clock`](crate::Clock) for time-based decisions
-    /// (per-query debounce). Defaults to no clock. Without one, debounce
-    /// is silently disabled even if [`with_debounce_per_query`](Self::with_debounce_per_query)
-    /// is set.
+    /// Update connector-call metadata after the registry changes a subscription
+    /// tier under the same identity.
+    pub(super) fn apply_transitions(&mut self, transitions: &[crate::MaintenanceTransition]) {
+        for transition in transitions {
+            let Some(context) = self.contexts.get_mut(&transition.subscription_id) else {
+                continue;
+            };
+            match &transition.to {
+                Tier::Scalar { sql, column_kind } => {
+                    context.sql.clone_from(sql);
+                    context.column_kind = *column_kind;
+                    context.whole_result = false;
+                    context.keyed = false;
+                    context.grouped_bootstrap = None;
+                }
+                Tier::GroupedScalar { bootstrap } => {
+                    context.sql.clone_from(&bootstrap.sql);
+                    context.column_kind = bootstrap
+                        .kinds
+                        .get(bootstrap.group_columns)
+                        .copied()
+                        .unwrap_or(BuiltinKind::String);
+                    context.grouped_bootstrap = Some(bootstrap.clone());
+                    context.whole_result = false;
+                    context.keyed = false;
+                }
+                Tier::KeyedRows { sql, .. } => {
+                    context.sql.clone_from(sql);
+                    context.column_kind = BuiltinKind::String;
+                    context.whole_result = false;
+                    context.keyed = true;
+                    context.grouped_bootstrap = None;
+                }
+                Tier::WholeRows { sql, .. } => {
+                    context.sql.clone_from(sql);
+                    context.column_kind = BuiltinKind::String;
+                    context.whole_result = true;
+                    context.keyed = false;
+                    context.grouped_bootstrap = None;
+                }
+                Tier::InProcess(_) => {}
+            }
+            context.generation = 0;
+        }
+    }
+
+    /// Set how many keys one scoped read of the keyed tier may name.
+    ///
+    /// Bounds statement size and therefore statement duration, which is what
+    /// keeps a caller's statement timeout meaningful under a burst: that
+    /// ceiling applies per statement, so one unbounded request puts the
+    /// duration under the burst's control rather than the caller's.
+    ///
+    /// Lower costs round trips, and below roughly a thousand keys that cost
+    /// dominates. Zero is clamped to one rather than meaning "no limit".
+    /// Defaults to [`DEFAULT_MAX_KEYS_PER_READ`].
+    #[must_use]
+    pub const fn with_max_keys_per_read(mut self, max_keys: usize) -> Self {
+        // Zero would make no progress possible, so it means one at a time.
+        self.max_keys_per_read = if max_keys == 0 { 1 } else { max_keys };
+        self
+    }
+
+    /// Set the byte budget for one page of a re-read captured query.
+    ///
+    /// A smaller budget bounds memory and wire size per message at the cost of
+    /// more round trips. Zero is clamped to one rather than meaning "no limit",
+    /// and a page always carries at least one row whatever the budget, because
+    /// a budget smaller than a single row would otherwise make no progress.
+    /// Defaults to [`DEFAULT_PAGE_BYTES`].
+    #[must_use]
+    pub const fn with_max_page_bytes(mut self, max_bytes: usize) -> Self {
+        // Zero would make no progress, and the read guarantees at least one row
+        // per page anyway, so clamp rather than accept a budget that lies.
+        self.max_page_bytes = if max_bytes == 0 { 1 } else { max_bytes };
+        self
+    }
+
+    /// Attach a [`Clock`](crate::Clock) for time-based decisions (per-query
+    /// debounce). Defaults to no clock. Without one, debounce is silently
+    /// disabled even if
+    /// [`with_debounce_per_query`](Self::with_debounce_per_query) is set.
     #[must_use]
     pub fn with_clock(mut self, clock: ClockHandle) -> Self {
         self.clock = Some(clock);
@@ -127,7 +289,7 @@ where
     /// same captured query.
     ///
     /// Triggers within the window are silently dropped: the connector is
-    /// not called and no [`ScalarUpdate`] is emitted (the engine's stored
+    /// not called and no [`ScalarUpdate`](super::ScalarUpdate) is emitted (the engine's stored
     /// value, set by the prior re-execution, remains current). Requires
     /// [`with_clock`](Self::with_clock). Without a clock the debounce
     /// config is ignored.
@@ -137,115 +299,378 @@ where
         self
     }
 
-    /// The wrapped trigger-emitting engine.
-    pub const fn inner(&self) -> &ReExecEngine<E, I, DB> {
+    /// The wrapped registry.
+    pub const fn inner(&self) -> &crate::SubscriptionEngine<E, I, DB> {
         &self.inner
     }
 
-    /// The connector this engine drives.
-    pub const fn connector(&self) -> &X {
-        &self.connector
+    /// Number of captured re-execution queries (matches the inner engine).
+    pub fn reexec_query_count(&self) -> usize {
+        self.inner.reread_count()
     }
 
-    /// Whether the trigger for `query_id` should be skipped under the
-    /// debounce policy. Returns `false` (proceed) when no clock + debounce
-    /// is configured, when no prior re-exec is known, or when enough time
-    /// has elapsed.
-    fn debounce_skip(&self, query_id: ReExecQueryId) -> bool {
+    pub(super) fn debounce_skip(
+        &self,
+        subscription_id: SubscriptionId,
+        read: &super::ReExecutionRead,
+    ) -> bool {
         let (Some(clock), Some(window)) = (self.clock.as_ref(), self.debounce) else {
             return false;
         };
-        let Some(last_micros) = self.last_reexec_at.get(&query_id).copied() else {
+        let key = (subscription_id, read.group_key().map(<[u8]>::to_vec));
+        let Some(last_micros) = self.last_reexec_at.get(&key).copied() else {
             return false;
         };
         duration_between(last_micros, clock.now_micros()) < window
     }
 
-    /// Stamp `query_id` with the current clock instant. No-op if clock is
-    /// not configured. Debounce stamping is unnecessary without a clock.
-    fn stamp_reexec(&mut self, query_id: ReExecQueryId) {
+    pub(super) fn stamp_reexec(
+        &mut self,
+        subscription_id: SubscriptionId,
+        read: &super::ReExecutionRead,
+    ) {
         if let Some(clock) = self.clock.as_ref() {
-            self.last_reexec_at.insert(query_id, clock.now_micros());
+            self.last_reexec_at.insert(
+                (subscription_id, read.group_key().map(<[u8]>::to_vec)),
+                clock.now_micros(),
+            );
         }
-    }
-
-    /// Number of captured re-execution queries (matches the inner engine).
-    pub fn reexec_query_count(&self) -> usize {
-        self.inner.reexec_query_count()
     }
 
     /// Register a subscription. `auth` is stored alongside the captured
-    /// query and re-presented to the [`Connector`] on each re-execution.
+    /// query and re-presented to the connector on each re-execution.
     /// Engine-supported queries pass through unchanged (no auth stored).
-    pub fn register(
+    /// Sync in both modes because registration only touches in-memory
+    /// engine state.
+    pub fn register<R>(
         &mut self,
-        spec: SubscriptionRequest<I, E::Backend>,
-        auth: X::AuthContext,
-    ) -> Result<Registered, RegisterError> {
-        let session = match &spec.scope {
-            SubscriptionScope::Session(s) => Some(*s),
+        spec: R,
+        auth: M::AuthContext,
+    ) -> Result<Registered, RegisterError>
+    where
+        R: crate::RegistrationRequest<I, E::Backend>,
+    {
+        let session = match spec.scope() {
+            SubscriptionScope::Session(s) => Some(s),
             SubscriptionScope::Durable => None,
         };
         let result = self.inner.register(spec)?;
-        if let Registered::ReExec {
-            query_id,
-            sql,
-            column_kind,
-        } = &result
-        {
-            self.contexts.insert(
-                *query_id,
-                ResolveContext {
-                    sql: sql.clone(),
-                    column_kind: *column_kind,
-                    session,
-                    auth,
-                },
-            );
+        match &result.tier {
+            Tier::Scalar { sql, column_kind } => {
+                self.contexts.insert(
+                    result.subscription_id,
+                    ResolveContext {
+                        sql: sql.clone(),
+                        column_kind: *column_kind,
+                        grouped_bootstrap: None,
+                        whole_result: false,
+                        keyed: false,
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
+            }
+            Tier::GroupedScalar { bootstrap } => {
+                self.contexts.insert(
+                    result.subscription_id,
+                    ResolveContext {
+                        sql: bootstrap.sql.clone(),
+                        column_kind: bootstrap
+                            .kinds
+                            .get(bootstrap.group_columns)
+                            .copied()
+                            .unwrap_or(BuiltinKind::String),
+                        grouped_bootstrap: Some(bootstrap.clone()),
+                        whole_result: false,
+                        keyed: false,
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
+            }
+            Tier::KeyedRows { sql, .. } | Tier::WholeRows { sql, .. } => {
+                self.contexts.insert(
+                    result.subscription_id,
+                    ResolveContext {
+                        sql: sql.clone(),
+                        // No single column to decode: the rows carry their own
+                        // shape, which is why `RowPage` reports column names.
+                        column_kind: BuiltinKind::String,
+                        grouped_bootstrap: None,
+                        // The tier decides which read serves a change, so it
+                        // comes from the registration rather than a default.
+                        // Defaulting here once made every keyed capture resolve
+                        // as a whole re-read, which is correct output produced
+                        // the expensive way, so nothing failed and nothing said
+                        // so.
+                        whole_result: matches!(result.tier, Tier::WholeRows { .. }),
+                        keyed: matches!(result.tier, Tier::KeyedRows { .. }),
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
+            }
+            Tier::InProcess(_) => {}
         }
         Ok(result)
     }
+}
 
-    /// Install a value directly, bypassing the connector. Mirrors
-    /// [`ReExecEngine::install`] for callers that occasionally need to seed
-    /// or override a captured query's state (e.g. a snapshot bootstrap).
-    pub fn install(&mut self, query_id: ReExecQueryId, value: Value<E::Backend>) -> bool {
-        self.inner.install(query_id, value)
+/// Walks a key set in bounded batches.
+///
+/// Bounded because statement duration tracks how many keys a statement names,
+/// and a caller's statement timeout applies per statement, so one unbounded
+/// request puts the duration under the burst's control rather than the
+/// caller's.
+pub(super) struct KeyBatches<'a, B: Backend> {
+    keys: &'a [Vec<Value<B>>],
+    size: usize,
+    at: usize,
+}
+
+impl<'a, B: Backend> KeyBatches<'a, B> {
+    pub(super) const fn new(keys: &'a [Vec<Value<B>>], size: usize) -> Self {
+        Self {
+            keys,
+            // Zero would never advance.
+            size: if size == 0 { 1 } else { size },
+            at: 0,
+        }
+    }
+}
+
+impl<'a, B: Backend> Iterator for KeyBatches<'a, B> {
+    type Item = &'a [Vec<Value<B>>];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at >= self.keys.len() {
+            return None;
+        }
+        let start = self.at;
+        let end = self.keys.len().min(start + self.size);
+        self.at = end;
+        Some(&self.keys[start..end])
+    }
+}
+
+/// Closes a cursor if the read using it is abandoned by an unwinding panic.
+///
+/// The ordinary path closes explicitly and disarms this, which is what lets a
+/// close failure be reported instead of swallowed. Unwinding runs nothing but
+/// destructors, so without this a panic mid-read would strand the connector's
+/// map entry, holding a pooled connection inside an open transaction forever.
+struct CloseOnUnwind<'a, X: Connector> {
+    connector: &'a X,
+    cursor: super::CursorId,
+    armed: bool,
+}
+
+impl<X: Connector> Drop for CloseOnUnwind<'_, X> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: there is no caller left to report to, and nothing
+            // here may panic.
+            let _ = self.connector.close_cursor(self.cursor);
+        }
+    }
+}
+
+impl<E, I, DB, X> AutoResolvingEngine<E, I, DB, SyncMode<X>>
+where
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
+    I: IdTypes,
+    DB: DatabaseLike + 'static,
+    X: Connector<Backend = E::Backend>,
+{
+    /// The connector this engine drives.
+    pub const fn connector(&self) -> &X {
+        &self.mode.0
     }
 
-    /// Bootstrap a captured query by reading its current value through the
-    /// connector and installing the result.
+    /// Bootstrap a captured query by reading its current answer through the
+    /// connector.
     ///
     /// Returns a [`SnapshotResult`] tagged with the connector's
-    /// [`Checkpoint`](Connector::Checkpoint). Today every captured query
-    /// is a scalar (single-table `MIN`/`MAX`), so the variant is always
-    /// `Scalar`. The enum leaves room for the future single-table row
-    /// re-execution flavor without a breaking-bump.
+    /// [`Checkoint`](Connector::Checkpoint): `Scalar` for a scalar capture,
+    /// `Rows` for either row tier.
     ///
-    /// The value is also installed via [`ReExecEngine::install`], so the
-    /// engine is fully primed once this returns. Subsequent
-    /// [`consumers`](Self::consumers) calls see the snapshot as the
-    /// starting state.
+    /// Without this a captured subscription would deliver nothing until
+    /// something happened to change a table it reads, so a caller registering
+    /// against a quiet database would sit empty holding a correct answer it
+    /// had never been told. A keyed capture cannot recover from that later
+    /// either: no change ever fires for a row that was already in the answer
+    /// and stayed there.
+    ///
+    /// A scalar's value is also installed via [`Install::install`](crate::Install::install), so the
+    /// engine is fully primed once this returns. Neither row tier installs
+    /// anything, because neither holds an answer: the rows go to the caller.
     ///
     /// # Errors
     ///
-    /// Returns [`ReExecError::Connector`] if the connector fails. Returns
-    /// `Ok(None)` if `query_id` does not exist. The absence is signaled
-    /// (rather than panicking) so callers can race a snapshot against an
-    /// `unregister_*` without crashing.
+    /// Returns [`ReExecError::Connector`] if the connector fails, and
+    /// [`ReExecError::Cursor`] if a row tier's read fails or the connector
+    /// holds no cursors. Returns `Ok(None)` if `subscription_id` does not exist. The
+    /// absence is signaled (rather than panicking) so callers can race a
+    /// snapshot against an `unregister_*` without crashing.
     pub fn snapshot(
         &mut self,
-        query_id: ReExecQueryId,
-    ) -> Result<Option<SnapshotResult<E::Backend, X::Checkpoint>>, ReExecError<X::Error>> {
-        let Some(ctx) = self.contexts.get(&query_id) else {
+        subscription_id: SubscriptionId,
+    ) -> Result<Option<SnapshotResult<E::Backend, X::Checkpoint, I>>, ReExecError<X::Error>> {
+        let Some(context) = self.contexts.get(&subscription_id) else {
             return Ok(None);
         };
+        let grouped_bootstrap = context.grouped_bootstrap.clone();
+        if let Some(bootstrap) = grouped_bootstrap {
+            let (_, rows, checkpoint) = self.read_whole(&bootstrap.sql, subscription_id)?;
+            let mut installed = crate::Install::install(
+                &mut self.inner,
+                subscription_id,
+                crate::GroupedScalarSeedInstall {
+                    rows,
+                    read_at: reconcile_checkpoint(checkpoint.as_ref()),
+                },
+            )?;
+            let mut pending = core::mem::take(&mut installed.triggers);
+            while let Some(trigger) = pending.pop() {
+                match &trigger.read {
+                    super::ReExecutionRead::GroupedScalar {
+                        group,
+                        sql,
+                        column_kinds,
+                    } => {
+                        let resolved = self.resolve_grouped_scalar(
+                            subscription_id,
+                            group,
+                            sql,
+                            *column_kinds,
+                            trigger.checkpoint.clone(),
+                        )?;
+                        self.apply_transitions(&resolved.transitions);
+                        pending.extend(resolved.triggers);
+                        installed.updates.extend(resolved.updates);
+                        installed.transitions.extend(resolved.transitions);
+                    }
+                    super::ReExecutionRead::Subscription => {
+                        let sql = self
+                            .contexts
+                            .get(&subscription_id)
+                            .expect("a transitioned read keeps its connector context")
+                            .sql
+                            .clone();
+                        let (columns, rows, checkpoint) = self.read_whole(&sql, subscription_id)?;
+                        return Ok(Some(SnapshotResult::Rows {
+                            columns,
+                            rows,
+                            checkpoint,
+                        }));
+                    }
+                }
+            }
+            return Ok(Some(SnapshotResult::GroupedAggregate {
+                updates: installed.updates,
+                checkpoint,
+            }));
+        }
+        if context.whole_result || context.keyed {
+            let sql = context.sql.clone();
+            let (columns, rows, checkpoint) = self.read_whole(&sql, subscription_id)?;
+            return Ok(Some(SnapshotResult::Rows {
+                columns,
+                rows,
+                checkpoint,
+            }));
+        }
         let (value, checkpoint) = self
-            .connector
-            .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
+            .mode
+            .0
+            .execute_scalar(&context.sql, context.column_kind, &context.auth)
             .map_err(ReExecError::Connector)?;
-        self.inner.install(query_id, value.clone());
+        let _installed = crate::Install::install(
+            &mut self.inner,
+            subscription_id,
+            crate::ScalarInstall {
+                value: value.clone(),
+                checkpoint: checkpoint.clone(),
+            },
+        )?;
         Ok(Some(SnapshotResult::Scalar(value, checkpoint)))
+    }
+
+    /// Read a captured query's whole answer from one cursor, concatenating its
+    /// pages.
+    ///
+    /// One snapshot for the lot, which is what makes the concatenation mean
+    /// something: pages from separate reads would describe no single instant.
+    /// The page budget still bounds each round trip, so a large answer is read
+    /// in bounded steps even though it is returned whole.
+    fn read_whole(
+        &self,
+        sql: &str,
+        subscription_id: SubscriptionId,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<Vec<Value<E::Backend>>>,
+            Option<X::Checkpoint>,
+        ),
+        ReExecError<X::Error>,
+    > {
+        let auth = &self
+            .contexts
+            .get(&subscription_id)
+            .expect("the caller just read this context")
+            .auth;
+        let cursor = self
+            .mode
+            .0
+            .open_cursor(sql, auth)
+            .map_err(ReExecError::Cursor)?;
+
+        // The cursor is closed on every exit from here, including a panic. An
+        // early return is handled by closing before `outcome?` below, but a
+        // panic unwinds straight past that, and the connector's map would keep
+        // the entry alive forever with a pooled connection inside an open
+        // transaction. `Drop` is the only thing unwinding runs.
+        let mut guard = CloseOnUnwind {
+            connector: &self.mode.0,
+            cursor,
+            armed: true,
+        };
+
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        let mut checkpoint = None;
+        let outcome = (|| -> Result<(), ReExecError<X::Error>> {
+            loop {
+                let page = self
+                    .mode
+                    .0
+                    .fetch_cursor(cursor, self.max_page_bytes)
+                    .map_err(ReExecError::Cursor)?;
+                if columns.is_empty() {
+                    columns = page.value.columns;
+                }
+                checkpoint = page.checkpoint;
+                let more = page.value.more;
+                rows.extend(page.value.rows);
+                if !more {
+                    return Ok(());
+                }
+            }
+        })();
+        let closed = self
+            .mode
+            .0
+            .close_cursor(cursor)
+            .map_err(ReExecError::Cursor);
+        guard.armed = false;
+        outcome?;
+        closed?;
+        Ok((columns, rows, checkpoint))
     }
 
     /// Dispatch a CDC event.
@@ -253,8 +678,8 @@ where
     /// For every [`ReExecutionTrigger`] the inner engine emits, this method
     /// looks up the captured query's auth context, calls
     /// [`Connector::execute_scalar`] with the plan's SQL and decode kind,
-    /// installs the result via [`ReExecEngine::install`], and pushes a
-    /// [`ScalarUpdate`] in the trigger's place. The returned
+    /// installs the result via [`Install::install`](crate::Install::install), and pushes a
+    /// [`ScalarUpdate`](super::ScalarUpdate) in the trigger's place. The returned
     /// [`ReExecNotifications::triggers`] is always empty under this engine.
     ///
     /// The first connector failure aborts the rest of the batch and is
@@ -267,46 +692,424 @@ where
     ) -> Result<ReExecNotifications<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
         let ReExecNotifications {
             engine,
+            mut aggregate_updates,
             mut scalar_updates,
+            mut rows_updates,
+            mut row_deltas,
             triggers,
-        } = self.inner.consumers(event).map_err(ReExecError::Dispatch)?;
-
-        for trigger in triggers {
-            // Debounce: drop the trigger if we re-executed this query
-            // within the configured window. The engine's installed value
-            // (set by the prior re-exec) stays the current view, no
-            // ScalarUpdate emitted.
-            if self.debounce_skip(trigger.query_id) {
+            mut transitions,
+        } = self
+            .inner
+            .reread_notifications(event)
+            .map_err(ReExecError::Dispatch)?;
+        self.apply_transitions(&transitions);
+        let mut pending = triggers;
+        while let Some(trigger) = pending.pop() {
+            if self.debounce_skip(trigger.subscription_id, &trigger.read) {
                 continue;
             }
-            let ctx = self.contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time, \
-                 trigger.query_id must exist in `contexts`",
-            );
-            // The connector also reports the position at which it took
-            // the read (in `_db_checkpoint`), we ignore it here because
-            // the ScalarUpdate is correlated with the *event* that
-            // triggered the re-execution, not the DB-side read position.
-            // Snapshots use the DB-side checkpoint instead (see `snapshot`).
+            if let super::ReExecutionRead::GroupedScalar {
+                group,
+                sql,
+                column_kinds,
+            } = &trigger.read
+            {
+                let installed = self.resolve_grouped_scalar(
+                    trigger.subscription_id,
+                    group,
+                    sql,
+                    *column_kinds,
+                    trigger.checkpoint.clone(),
+                )?;
+                self.apply_transitions(&installed.transitions);
+                pending.extend(installed.triggers);
+                aggregate_updates.extend(installed.updates);
+                transitions.extend(installed.transitions);
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+                continue;
+            }
+            let ctx = self
+                .contexts
+                .get(&trigger.subscription_id)
+                .expect("every read tier stores its connector context at registration");
+            if ctx.keyed {
+                let deltas = self.resolve_keyed(
+                    trigger.subscription_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                )?;
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+                row_deltas.extend(deltas);
+                continue;
+            }
+            if ctx.whole_result {
+                let pages = self.reread(
+                    trigger.subscription_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                )?;
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+                rows_updates.extend(pages);
+                continue;
+            }
             let (value, _db_checkpoint) = self
-                .connector
+                .mode
+                .0
                 .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
                 .map_err(ReExecError::Connector)?;
-            self.inner.install(trigger.query_id, value.clone());
-            self.stamp_reexec(trigger.query_id);
-            scalar_updates.push(ScalarUpdate {
-                query_id: trigger.query_id,
-                consumer_id: trigger.consumer_id,
-                value,
-                checkpoint: trigger.checkpoint.clone(),
-            });
+            let update = crate::Install::install(
+                &mut self.inner,
+                trigger.subscription_id,
+                crate::ScalarInstall {
+                    value,
+                    checkpoint: trigger.checkpoint.clone(),
+                },
+            )?;
+            self.stamp_reexec(trigger.subscription_id, &trigger.read);
+            scalar_updates.push(update);
         }
 
         Ok(ReExecNotifications {
             engine,
+            aggregate_updates,
             scalar_updates,
+            rows_updates,
+            row_deltas,
             triggers: Vec::new(),
+            transitions,
         })
+    }
+
+    fn resolve_grouped_scalar(
+        &mut self,
+        subscription_id: SubscriptionId,
+        group: &[u8],
+        sql: &str,
+        _column_kinds: [BuiltinKind; 2],
+        checkpoint: Option<E::Checkpoint>,
+    ) -> Result<
+        crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
+        ReExecError<X::Error>,
+    > {
+        let context = self
+            .contexts
+            .get(&subscription_id)
+            .expect("a grouped scalar read stores its connector context");
+        let snapshot = self
+            .mode
+            .0
+            .read_page(sql, self.max_page_bytes, &context.auth)
+            .map_err(ReExecError::Connector)?;
+        if snapshot.value.more || snapshot.value.rows.len() != 1 {
+            return Err(crate::AggregateInstallError::RowCount {
+                subscription: subscription_id,
+                rows: snapshot.value.rows.len(),
+            }
+            .into());
+        }
+        let row = snapshot
+            .value
+            .rows
+            .into_iter()
+            .next()
+            .expect("the row count was checked");
+        crate::Install::install(
+            &mut self.inner,
+            subscription_id,
+            crate::GroupedScalarInstall {
+                group: group.to_vec(),
+                row,
+                checkpoint,
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    /// Ask the database which of the changed rows are in the answer, and turn
+    /// that into one delta per row.
+    ///
+    /// A key that comes back is in the answer and is delivered as its current
+    /// row. A key that comes back empty is not, and is delivered as a removal,
+    /// which is harmless for a row the caller never held. That is why this tier
+    /// holds no state: the answer to "is it in" is asked rather than remembered.
+    fn resolve_keyed(
+        &mut self,
+        subscription_id: SubscriptionId,
+        consumer_id: I::ConsumerId,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> Result<Vec<RowDelta<I, E::Backend, E::Checkpoint>>, ReExecError<X::Error>> {
+        let keys = self.inner.take_pending_keys(subscription_id);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(plan) = self.inner.keyed_plan(subscription_id) else {
+            return Ok(Vec::new());
+        };
+        let key_positions = plan.key_positions.clone();
+        let plan_ref = plan.clone();
+
+        // Asked in bounded batches. Statement duration tracks how many keys a
+        // statement names, and a caller's statement timeout applies per
+        // statement, so one unbounded request disables the only read ceiling
+        // the caller has. Each key appears in exactly one batch, so no key is
+        // asked about twice however many rows come back.
+        let mut columns = Vec::new();
+        let mut present: Vec<(Vec<Value<E::Backend>>, Vec<Value<E::Backend>>)> = Vec::new();
+        for batch in KeyBatches::new(&keys, self.max_keys_per_read) {
+            if let Err(e) = self.read_one_batch(
+                subscription_id,
+                &plan_ref,
+                &key_positions,
+                batch,
+                &mut columns,
+                &mut present,
+            ) {
+                // Every key goes back, including those of batches that already
+                // succeeded. A failure fails the whole call, so their rows were
+                // never delivered, and keeping their keys would leave those rows
+                // stale for good. Asking again is the cost of an all-or-nothing
+                // result.
+                self.inner.restore_pending_keys(subscription_id, keys);
+                return Err(e);
+            }
+        }
+
+        Ok(Self::deltas_from(
+            subscription_id,
+            consumer_id,
+            checkpoint,
+            &keys,
+            &present,
+            &columns,
+        ))
+    }
+
+    /// Read one bounded batch of keys, resuming inside the batch if its rows do
+    /// not fit one page.
+    ///
+    /// Split out so the batch loop reads as the one thing it is, and so the
+    /// caller owns the decision about which keys go back on a failure.
+    #[allow(clippy::too_many_arguments)]
+    fn read_one_batch(
+        &self,
+        subscription_id: SubscriptionId,
+        plan: &crate::reexec::plan::KeyedPlan,
+        key_positions: &[usize],
+        batch: &[Vec<Value<E::Backend>>],
+        columns: &mut Vec<String>,
+        present: &mut Vec<(Vec<Value<E::Backend>>, Vec<Value<E::Backend>>)>,
+    ) -> Result<(), ReExecError<X::Error>> {
+        let auth = &self
+            .contexts
+            .get(&subscription_id)
+            .expect("a captured query stores its context at register time")
+            .auth;
+        let render = |keys: &[Vec<Value<E::Backend>>]| {
+            crate::reexec::plan::render_scoped_read::<E::Backend>(plan, keys).map_err(|e| {
+                ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!("{e}")))
+            })
+        };
+        let Some(mut page_sql) = render(batch)? else {
+            return Ok(());
+        };
+        // Accumulated across pages, not per page. Resetting it would let a key
+        // answered on an earlier page back into the next statement, which
+        // delivers it twice and, with a stable row order, never terminates:
+        // the remaining sets oscillate between the halves of the batch.
+        let mut seen: Vec<Vec<Value<E::Backend>>> = Vec::new();
+        loop {
+            let page = self
+                .mode
+                .0
+                .read_page(&page_sql, self.max_page_bytes, auth)
+                .map_err(ReExecError::Connector)?;
+            if columns.is_empty() {
+                columns.clone_from(&page.value.columns);
+            }
+            let before = seen.len();
+            for row in page.value.rows {
+                let key: Vec<Value<E::Backend>> = key_positions
+                    .iter()
+                    .filter_map(|i| row.get(*i).cloned())
+                    .collect();
+                seen.push(key.clone());
+                present.push((key, row));
+            }
+            // A page with no rows ends the read whatever it claims about there
+            // being more. Our own reader cannot report that combination, but
+            // this trait has outside implementors, and without this a connector
+            // that did would loop here forever.
+            if !page.value.more || seen.len() == before {
+                return Ok(());
+            }
+            // Resume within the batch, excluding the keys already returned, so
+            // the statement stays bounded by the batch. `seen` accumulates
+            // across pages, so `remaining` strictly shrinks and the loop ends.
+            let remaining: Vec<Vec<Value<E::Backend>>> = batch
+                .iter()
+                .filter(|k| !seen.contains(k))
+                .cloned()
+                .collect();
+            if remaining.is_empty() {
+                return Ok(());
+            }
+            match render(&remaining)? {
+                Some(next) => page_sql = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Turn "these keys were asked about, these rows came back" into one delta
+    /// per key. Shared with the async engine, which asks the same question.
+    fn deltas_from(
+        subscription_id: SubscriptionId,
+        consumer_id: I::ConsumerId,
+        checkpoint: Option<&E::Checkpoint>,
+        keys: &[Vec<Value<E::Backend>>],
+        present: &[(Vec<Value<E::Backend>>, Vec<Value<E::Backend>>)],
+        columns: &[String],
+    ) -> Vec<RowDelta<I, E::Backend, E::Checkpoint>> {
+        deltas_from(
+            subscription_id,
+            consumer_id,
+            checkpoint,
+            keys,
+            present,
+            columns,
+        )
+    }
+}
+
+/// Turn "these keys were asked about, these rows came back" into one delta per
+/// key: present is an upsert, absent is a removal.
+///
+/// A free function because both engines produce it from the same answer, and a
+/// method on the sync engine would drag its [`Connector`] bound into the async
+/// one. `columns` is empty on a removal: there is no row to describe.
+pub(super) fn deltas_from<I, B, C>(
+    subscription_id: SubscriptionId,
+    consumer_id: I::ConsumerId,
+    checkpoint: Option<&C>,
+    keys: &[Vec<Value<B>>],
+    present: &[(Vec<Value<B>>, Vec<Value<B>>)],
+    columns: &[String],
+) -> Vec<RowDelta<I, B, C>>
+where
+    I: IdTypes,
+    B: Backend,
+    C: crate::Checkpoint,
+{
+    let mut deltas = Vec::with_capacity(keys.len());
+    // Which keys came back, by encoded form. `Value` carries floats so it has
+    // neither `Hash` nor `Ord`, and scanning the returned rows once per key
+    // asked about is the product of the two counts.
+    let mut returned: hashbrown::HashSet<Vec<u8>> = hashbrown::HashSet::new();
+    for (key, row) in present {
+        if let Some(encoded) = crate::backend::encode_value_key(key) {
+            returned.insert(encoded);
+        }
+        deltas.push(RowDelta {
+            subscription_id,
+            consumer_id,
+            key: key.clone(),
+            columns: columns.to_vec(),
+            row: Some(row.clone()),
+            checkpoint: checkpoint.cloned(),
+        });
+    }
+    for key in keys {
+        // A key that could not be encoded falls back to the scan, which is
+        // correct and merely slower, rather than being reported as removed.
+        let came_back = crate::backend::encode_value_key(key).map_or_else(
+            || present.iter().any(|(k, _)| k == key),
+            |encoded| returned.contains(&encoded),
+        );
+        if !came_back {
+            deltas.push(RowDelta {
+                subscription_id,
+                consumer_id,
+                key: key.clone(),
+                columns: Vec::new(),
+                row: None,
+                checkpoint: checkpoint.cloned(),
+            });
+        }
+    }
+    deltas
+}
+
+impl<E, I, DB, X> AutoResolvingEngine<E, I, DB, SyncMode<X>>
+where
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
+    I: IdTypes,
+    DB: DatabaseLike + 'static,
+    X: Connector<Backend = E::Backend>,
+{
+    /// Re-read a captured query in full and hand back its pages.
+    ///
+    /// Every page comes from one cursor in one transaction, which is what makes
+    /// the pages add up to a single instant. A keyed result could instead be
+    /// paged statelessly through [`Connector::read_page`], avoiding the
+    /// transaction, and that is an optimisation to add per shape rather than a
+    /// different delivered contract: these same pages, same generation, same
+    /// `more`.
+    fn reread(
+        &mut self,
+        subscription_id: SubscriptionId,
+        consumer_id: I::ConsumerId,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> Result<Vec<RowsUpdate<I, E::Backend, E::Checkpoint>>, ReExecError<X::Error>> {
+        let ctx = self
+            .contexts
+            .get_mut(&subscription_id)
+            .expect("every read tier stores its connector context at registration");
+        let sql = ctx.sql.clone();
+        ctx.generation = ctx.generation.saturating_add(1);
+        let generation = ctx.generation;
+        let cursor = self
+            .mode
+            .0
+            .open_cursor(&sql, &self.contexts[&subscription_id].auth)
+            .map_err(ReExecError::Cursor)?;
+        let mut guard = CloseOnUnwind {
+            connector: &self.mode.0,
+            cursor,
+            armed: true,
+        };
+        let mut pages = Vec::new();
+        let outcome = (|| -> Result<(), ReExecError<X::Error>> {
+            loop {
+                let page = self
+                    .mode
+                    .0
+                    .fetch_cursor(cursor, self.max_page_bytes)
+                    .map_err(ReExecError::Cursor)?;
+                let more = page.value.more;
+                pages.push(RowsUpdate {
+                    subscription_id,
+                    consumer_id,
+                    generation,
+                    columns: page.value.columns,
+                    rows: page.value.rows,
+                    more,
+                    checkpoint: checkpoint.cloned(),
+                });
+                if !more {
+                    return Ok(());
+                }
+            }
+        })();
+        let closed = self
+            .mode
+            .0
+            .close_cursor(cursor)
+            .map_err(ReExecError::Cursor);
+        guard.armed = false;
+        outcome?;
+        closed?;
+        Ok(pages)
     }
 
     /// Batch variant of [`consumers`](Self::consumers).
@@ -327,63 +1130,114 @@ where
     ) -> Result<BatchOutcome<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
         let BatchOutcome {
             per_event,
+            mut aggregate_updates,
             mut scalar_updates,
+            mut rows_updates,
+            mut row_deltas,
             triggers,
+            mut transitions,
         } = self
             .inner
-            .consumers_batch(events)
+            .reread_batch(events)
             .map_err(ReExecError::Dispatch)?;
-
-        for trigger in triggers {
-            if self.debounce_skip(trigger.query_id) {
+        self.apply_transitions(&transitions);
+        let mut pending = triggers;
+        while let Some(trigger) = pending.pop() {
+            if self.debounce_skip(trigger.subscription_id, &trigger.read) {
                 continue;
             }
-            let ctx = self.contexts.get(&trigger.query_id).expect(
-                "every captured query stores its resolve context at register time, \
-                 trigger.query_id must exist in `contexts`",
-            );
+            if let super::ReExecutionRead::GroupedScalar {
+                group,
+                sql,
+                column_kinds,
+            } = &trigger.read
+            {
+                let installed = self.resolve_grouped_scalar(
+                    trigger.subscription_id,
+                    group,
+                    sql,
+                    *column_kinds,
+                    trigger.checkpoint.clone(),
+                )?;
+                self.apply_transitions(&installed.transitions);
+                pending.extend(installed.triggers);
+                aggregate_updates.extend(installed.updates);
+                transitions.extend(installed.transitions);
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+                continue;
+            }
+            let ctx = self
+                .contexts
+                .get(&trigger.subscription_id)
+                .expect("every read tier stores its connector context at registration");
+            if ctx.keyed {
+                let deltas = self.resolve_keyed(
+                    trigger.subscription_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                )?;
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+                row_deltas.extend(deltas);
+                continue;
+            }
+            if ctx.whole_result {
+                let pages = self.reread(
+                    trigger.subscription_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                )?;
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+                rows_updates.extend(pages);
+                continue;
+            }
             let (value, _db_checkpoint) = self
-                .connector
+                .mode
+                .0
                 .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
                 .map_err(ReExecError::Connector)?;
-            self.inner.install(trigger.query_id, value.clone());
-            self.stamp_reexec(trigger.query_id);
-            scalar_updates.push(ScalarUpdate {
-                query_id: trigger.query_id,
-                consumer_id: trigger.consumer_id,
-                value,
-                checkpoint: trigger.checkpoint.clone(),
-            });
+            let update = crate::Install::install(
+                &mut self.inner,
+                trigger.subscription_id,
+                crate::ScalarInstall {
+                    value,
+                    checkpoint: trigger.checkpoint.clone(),
+                },
+            )?;
+            self.stamp_reexec(trigger.subscription_id, &trigger.read);
+            scalar_updates.push(update);
         }
 
         Ok(BatchOutcome {
             per_event,
+            aggregate_updates,
             scalar_updates,
+            rows_updates,
+            row_deltas,
             triggers: Vec::new(),
+            transitions,
         })
     }
 
     /// Unregister a session and drop every stored auth context that
     /// belonged to it.
-    pub fn unregister_session(&mut self, session_id: I::SessionId) -> ReExecUnregisterReport {
-        let report = self.inner.unregister_session(session_id);
+    pub fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
+        let engine = self.inner.unregister_session(session_id);
         self.contexts
             .retain(|_, ctx| ctx.session != Some(session_id));
-        report
+        engine
     }
 
     /// Unregister a captured query by id. Drops its auth context too.
     /// Returns false if no such query existed.
-    pub fn unregister_reexec_query(&mut self, query_id: ReExecQueryId) -> bool {
-        let removed = self.inner.unregister_reexec_query(query_id);
+    pub fn unregister_reexec_query(&mut self, subscription_id: SubscriptionId) -> bool {
+        let removed = self.inner.unregister_reread(subscription_id);
         if removed {
-            self.contexts.remove(&query_id);
+            self.contexts.remove(&subscription_id);
         }
         removed
     }
 
-    /// Unregister an engine subscription by `(consumer_id, sql)`. No
-    /// captured query is affected. Mirrors [`ReExecEngine::unregister_query`].
+    /// Unregister an in-process subscription by `(consumer_id, sql)`.
     pub fn unregister_query(
         &mut self,
         consumer_id: I::ConsumerId,
@@ -393,7 +1247,28 @@ where
     }
 }
 
-impl<E, I, DB, X> crate::SubscriptionDispatch<I, E> for AutoResolvingEngine<E, I, DB, X>
+impl<E, I, DB, M, T> crate::Install<T> for AutoResolvingEngine<E, I, DB, M>
+where
+    E: CdcEvent,
+    E::Backend: SqlLiteralParse,
+    I: IdTypes,
+    DB: DatabaseLike + 'static,
+    M: ResolverMode<E::Backend>,
+    crate::SubscriptionEngine<E, I, DB>: crate::Install<T>,
+{
+    type Output = <crate::SubscriptionEngine<E, I, DB> as crate::Install<T>>::Output;
+    type Error = <crate::SubscriptionEngine<E, I, DB> as crate::Install<T>>::Error;
+
+    fn install(
+        &mut self,
+        subscription_id: SubscriptionId,
+        input: T,
+    ) -> Result<Self::Output, Self::Error> {
+        crate::Install::install(&mut self.inner, subscription_id, input)
+    }
+}
+
+impl<E, I, DB, X> crate::SubscriptionDispatch<I, E> for AutoResolvingEngine<E, I, DB, SyncMode<X>>
 where
     E: CdcEvent + Send,
     E::Backend: SqlLiteralParse,
@@ -482,18 +1357,19 @@ mod tests {
             Ok((value, None))
         }
 
-        fn execute_rows(
+        fn read_page(
             &self,
             _sql: &str,
+            _max_bytes: usize,
             _auth: &(),
         ) -> Result<
-            super::super::connector::Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>,
+            super::super::connector::Snapshot<
+                super::super::connector::RowPage<Postgres>,
+                Self::Checkpoint,
+            >,
             Self::Error,
         > {
-            #[allow(clippy::unimplemented)]
-            {
-                unimplemented!("MockConnector::execute_rows is not exercised in v1 tests")
-            }
+            Err(MockError("read_page is not exercised by the scalar tests"))
         }
     }
 
@@ -524,7 +1400,7 @@ mod tests {
     fn engine_with_values(
         values: alloc::vec::Vec<Value<Postgres>>,
     ) -> (
-        AutoResolvingEngine<TestEvent<Postgres>, DefaultIds, ParserDB, MockConnector>,
+        AutoResolvingEngine<TestEvent<Postgres>, DefaultIds, ParserDB, SyncMode<MockConnector>>,
         TableId,
     ) {
         let database = catalog();
@@ -535,7 +1411,7 @@ mod tests {
             PostgreSqlDialect {},
         );
         (
-            AutoResolvingEngine::new(ReExecEngine::new(inner), MockConnector::new(values)),
+            AutoResolvingEngine::new(inner, SyncMode(MockConnector::new(values))),
             orders_id,
         )
     }
@@ -556,11 +1432,23 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
         // Bootstrap: model = {1=>5.0}. Current MIN = 5.0.
-        assert!(e.install(qid, Value::Float(5.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         // Insert price=9.0 (>5.0): in-process Unchanged, no scalar update, no trigger.
         let n = e.consumers(&insert_event(tid, 2, 9.0)).unwrap();
@@ -571,7 +1459,7 @@ mod tests {
         // Delete id=1, price=5.0 (the current extreme): trigger -> connector -> 7.0.
         let n = e.consumers(&delete_event(tid, 1, 5.0)).unwrap();
         assert_eq!(n.scalar_updates.len(), 1);
-        assert_eq!(n.scalar_updates[0].query_id, qid);
+        assert_eq!(n.scalar_updates[0].subscription_id, qid);
         assert_eq!(n.scalar_updates[0].value, Value::Float(7.0));
         assert!(
             n.triggers.is_empty(),
@@ -593,10 +1481,22 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid, Value::Float(10.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(10.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         let n = e.consumers(&update_status_only(tid, 1, 10.0)).unwrap();
         assert!(n.scalar_updates.is_empty());
@@ -615,10 +1515,22 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid, Value::Float(5.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         match e.consumers(&delete_event(tid, 1, 5.0)) {
             Ok(_) => panic!("expected Connector error, got Ok"),
@@ -627,7 +1539,7 @@ mod tests {
         }
     }
 
-    /// `snapshot(query_id)` reads through the connector and installs the
+    /// `snapshot(subscription_id)` reads through the connector and installs the
     /// value so subsequent dispatches see it as the current state.
     #[test]
     fn snapshot_installs_via_connector() {
@@ -639,18 +1551,23 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
 
         // No bootstrap install: snapshot does it.
-        let snap = e.snapshot(qid).unwrap().expect("query_id exists");
+        let snap = e.snapshot(qid).unwrap().expect("subscription_id exists");
         match snap {
             SnapshotResult::Scalar(value, checkpoint) => {
                 assert_eq!(value, Value::Float(12.5));
                 // MockConnector returns checkpoint = None.
                 assert!(checkpoint.is_none());
             }
+            other => panic!("a scalar capture snapshots as a scalar, got {other:?}"),
         }
         assert_eq!(e.connector().call_count(), 1);
 
@@ -663,7 +1580,7 @@ mod tests {
         assert_eq!(e.connector().call_count(), 1);
     }
 
-    /// `snapshot(query_id)` on an unknown id returns `Ok(None)` rather
+    /// `snapshot(subscription_id)` on an unknown id returns `Ok(None)` rather
     /// than panicking so callers can race snapshot against unregister.
     #[test]
     fn snapshot_unknown_query_returns_none() {
@@ -688,11 +1605,23 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
         // Bootstrap: extreme is 5.0.
-        assert!(e.install(qid, Value::Float(5.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         // Three DELETEs of the current extreme. Each one in isolation
         // would emit a trigger, the batch should collapse them.
@@ -734,10 +1663,22 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid, Value::Float(5.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         let events = alloc::vec![delete_event(tid, 1, 5.0)];
 
@@ -748,7 +1689,7 @@ mod tests {
         }
     }
 
-    /// Coalescing only collapses the **same** `query_id`. Distinct captured
+    /// Coalescing only collapses the **same** `subscription_id`. Distinct captured
     /// queries each trigger their own connector call.
     #[test]
     #[allow(clippy::similar_names)]
@@ -765,8 +1706,12 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec for MIN"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec for MIN, got {other:?}"),
         };
         let qid2 = match e
             .register(
@@ -775,19 +1720,42 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec for MAX"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec for MAX, got {other:?}"),
         };
         // Bootstrap both at 7.0 so deleting price=7.0 displaces both.
-        assert!(e.install(qid1, Value::Float(7.0)));
-        assert!(e.install(qid2, Value::Float(7.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid1,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
+        assert!(crate::Install::install(
+            &mut e,
+            qid2,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         let events = alloc::vec![delete_event(tid, 1, 7.0)];
         let outcome = e.consumers_batch(&events).unwrap();
         assert_eq!(e.connector().call_count(), 2, "one call per distinct query");
         assert_eq!(outcome.scalar_updates.len(), 2);
-        let qids: alloc::collections::BTreeSet<_> =
-            outcome.scalar_updates.iter().map(|u| u.query_id).collect();
+        let qids: alloc::collections::BTreeSet<_> = outcome
+            .scalar_updates
+            .iter()
+            .map(|u| u.subscription_id)
+            .collect();
         assert!(qids.contains(&qid1));
         assert!(qids.contains(&qid2));
     }
@@ -819,10 +1787,22 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid, Value::Float(5.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         // First displacing event: re-exec proceeds (no prior stamp).
         let n = e.consumers(&delete_event(tid, 1, 5.0)).unwrap();
@@ -850,7 +1830,15 @@ mod tests {
         // Reinstall the value the engine thinks is current so the next
         // displacement is well-defined. The test exercises debounce,
         // not the state machine.
-        assert!(e.install(qid, Value::Float(7.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(7.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
         let n = e.consumers(&delete_event(tid, 3, 7.0)).unwrap();
         assert_eq!(n.scalar_updates.len(), 1, "post-window trigger must fire");
         assert_eq!(n.scalar_updates[0].value, Value::Float(20.0));
@@ -871,10 +1859,22 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(e.install(qid, Value::Float(5.0)));
+        assert!(crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         assert!(!e
             .consumers(&delete_event(tid, 1, 5.0))
@@ -898,12 +1898,98 @@ mod tests {
             )
             .unwrap()
         {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec, got Engine"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec, got {other:?}"),
         };
         assert_eq!(e.contexts.len(), 1);
         assert!(e.unregister_reexec_query(qid));
         assert_eq!(e.contexts.len(), 0);
         assert!(!e.unregister_reexec_query(qid), "second drop is a no-op");
+    }
+    #[test]
+    fn grouped_batch_keeps_one_trigger_per_displaced_group() {
+        let (mut engine, table) = engine_with_values(Vec::new());
+        let subscription = engine
+            .register(
+                SubscriptionRequest::new(
+                    1u64,
+                    "SELECT status, MIN(price) FROM orders GROUP BY status",
+                ),
+                (),
+            )
+            .expect("grouped minimum registers")
+            .subscription_id;
+        crate::Install::install(
+            &mut engine.inner,
+            subscription,
+            crate::GroupedScalarSeedInstall {
+                rows: vec![
+                    vec![
+                        Value::String("paid".into()),
+                        Value::Float(5.0),
+                        Value::Int(2),
+                    ],
+                    vec![
+                        Value::String("void".into()),
+                        Value::Float(7.0),
+                        Value::Int(2),
+                    ],
+                ],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .expect("group map installs");
+        let delete = |id, price, status: &str| {
+            TestEvent::<Postgres>::delete(
+                table,
+                vec![
+                    Value::Int(id),
+                    Value::Float(price),
+                    Value::Int(1),
+                    Value::String(status.into()),
+                ],
+            )
+            .with_pk_columns([0u16])
+        };
+        let output = engine
+            .inner
+            .reread_batch(&[delete(1, 5.0, "paid"), delete(2, 7.0, "void")])
+            .expect("batch dispatches");
+        assert_eq!(output.triggers.len(), 2);
+        let mut groups: Vec<_> = output
+            .triggers
+            .iter()
+            .filter_map(|trigger| trigger.read.group_key().map(<[u8]>::to_vec))
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn grouped_debounce_is_scoped_by_group_key() {
+        let clock = alloc::sync::Arc::new(crate::ManualClock::new(0));
+        let engine_clock: crate::ClockHandle = clock;
+        let (engine, _) = engine_with_values(Vec::new());
+        let mut engine = engine
+            .with_clock(engine_clock)
+            .with_debounce_per_query(core::time::Duration::from_secs(1));
+        let first = super::super::ReExecutionRead::GroupedScalar {
+            group: vec![1],
+            sql: String::new(),
+            column_kinds: [ScalarKind::Int, ScalarKind::Int],
+        };
+        let second = super::super::ReExecutionRead::GroupedScalar {
+            group: vec![2],
+            sql: String::new(),
+            column_kinds: [ScalarKind::Int, ScalarKind::Int],
+        };
+        engine.stamp_reexec(7, &first);
+        assert!(engine.debounce_skip(7, &first));
+        assert!(!engine.debounce_skip(7, &second));
     }
 }

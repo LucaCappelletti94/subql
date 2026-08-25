@@ -469,6 +469,11 @@ CREATE POLICY p ON docs FOR SELECT USING (owner_id = current_user);
 /// was stale and kept granting for ever.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario walks grant, withdrawal, empty reconcile and refreshed reconcile \
+              in order, and each step's report is asserted where it happens"
+)]
 async fn a_withdrawn_grant_only_a_replay_reaches_is_reconciled_out() {
     // Nothing keys (team, user) uniquely, so several rows can carry one
     // grant and the latest deadline wins, which no single row image can say:
@@ -549,17 +554,27 @@ CREATE POLICY p ON docs FOR SELECT USING (
         "the row alone cannot say what the slice still holds"
     );
 
-    backend
+    let emptied = backend
         .reconcile_records(requery, &[])
         .await
         .expect("reconcile the emptied slice");
+    assert!(
+        emptied.added.is_empty(),
+        "an empty replay writes nothing: {emptied:?}"
+    );
+    let [withdrawn_fact] = emptied.removed.as_slice() else {
+        panic!("one stale fact deleted, got {emptied:?}");
+    };
+    assert_eq!(withdrawn_fact.subject, "user:alice");
+    assert_eq!(withdrawn_fact.object, "teams:3");
+    assert_eq!(withdrawn_fact.relation, member_relation().to_string());
 
     assert_eq!(
         stored_members(&mut client, &store).await,
         Vec::<String>::new()
     );
 
-    backend
+    let refreshed = backend
         .reconcile_records(
             requery,
             &[membership(
@@ -570,6 +585,16 @@ CREATE POLICY p ON docs FOR SELECT USING (
         )
         .await
         .expect("reconcile the replayed truth");
+    assert_eq!(
+        refreshed.added,
+        vec![membership(
+            "user:bob",
+            condition,
+            "2027-01-01T00:00:00+00:00",
+        )],
+        "the report names the fresh fact it wrote"
+    );
+    assert!(refreshed.removed.is_empty(), "nothing left to withdraw");
 
     assert_eq!(
         stored_members(&mut client, &store).await,

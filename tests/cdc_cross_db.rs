@@ -131,7 +131,9 @@ fn start_postgres() -> testcontainers::Container<GenericImage> {
             // rather than extends, so the two it ships with are repeated here.
             "output_plugin_libraries=pgoutput,test_decoding,wal2json",
         ])
-        .with_startup_timeout(Duration::from_secs(60))
+        // 180s: parallel sweeps start many containers at once, see
+        // `common::pg_with_wal2json`.
+        .with_startup_timeout(Duration::from_secs(180))
         .start()
         .expect("start postgres")
 }

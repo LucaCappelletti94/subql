@@ -12,7 +12,8 @@
 //! SQL and don't need the sqlparser dependency in their bounds.
 
 use crate::backend::{
-    Backend, BuiltinKind, CustomScalars, MySql, Postgres, SQLite, ScalarKind, ScalarKindOf, Value,
+    Backend, BuiltinKind, CustomScalars, MySql, Postgres, SQLite, ScalarKind, ScalarKindOf,
+    ScalarText, ScalarTruth, Value,
 };
 use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
 use alloc::format;
@@ -55,6 +56,11 @@ pub trait SqlLiteralParse: Backend + Sized {
         sql: &SqlValue,
         target: ScalarKindOf<Self>,
     ) -> Result<Value<Self>, RegisterError>;
+
+    /// Render one exact group value as a backend-valid SQL expression.
+    fn render_group_literal(value: &Value<Self>) -> Result<Expr, RegisterError> {
+        render_group_literal(value, false)
+    }
 }
 
 // ============================================================================
@@ -131,6 +137,39 @@ pub(super) fn hex_upper(bytes: &[u8]) -> String {
         out.push(char::from(HEX[usize::from(b & 0x0f)]));
     }
     out
+}
+
+fn render_group_literal<B: Backend>(
+    value: &Value<B>,
+    postgres_bytes: bool,
+) -> Result<Expr, RegisterError> {
+    let sql = match value {
+        Value::Null => SqlValue::Null,
+        Value::Int(value) => SqlValue::Number(format!("{value:?}"), false),
+        Value::String(value) => SqlValue::SingleQuotedString(value.as_ref().to_string()),
+        Value::Bytes(value) if postgres_bytes => {
+            SqlValue::SingleQuotedString(alloc::format!("\\x{}", hex_upper(value.as_ref())))
+        }
+        Value::Bytes(value) => SqlValue::HexStringLiteral(hex_upper(value.as_ref())),
+        Value::Bool(value) => SqlValue::Boolean(value.scalar_truth()),
+        Value::Uuid(value) => SqlValue::SingleQuotedString(value.scalar_text().into_owned()),
+        Value::Timestamp(value) => SqlValue::SingleQuotedString(value.scalar_text().into_owned()),
+        Value::TimestampTz(value) => SqlValue::SingleQuotedString(value.scalar_text().into_owned()),
+        Value::Date(value) => SqlValue::SingleQuotedString(value.scalar_text().into_owned()),
+        Value::Time(value) => SqlValue::SingleQuotedString(value.scalar_text().into_owned()),
+        Value::Missing
+        | Value::Float(_)
+        | Value::Decimal(_)
+        | Value::Json(_)
+        | Value::Jsonb(_)
+        | Value::Custom(_) => {
+            return Err(RegisterError::BindResolution(alloc::format!(
+                "a group value of {kind:?} has no exact SQL literal spelling",
+                kind = value.scalar_kind(),
+            )));
+        }
+    };
+    Ok(Expr::Value(sql.into()))
 }
 
 fn parse_uuid(s: &str, sql: &SqlValue) -> Result<uuid::Uuid, RegisterError> {
@@ -272,6 +311,10 @@ impl SqlLiteralParse for Postgres {
             (ScalarKind::Custom(custom), _) => parse_custom_literal::<Self>(sql, custom),
             _ => Err(err_shape(sql, target)),
         }
+    }
+
+    fn render_group_literal(value: &Value<Self>) -> Result<Expr, RegisterError> {
+        render_group_literal(value, true)
     }
 }
 
@@ -553,5 +596,26 @@ mod tests {
                 "{text:?} must not parse as {kind:?}"
             );
         }
+    }
+    #[test]
+    fn group_byte_literals_follow_each_backend() {
+        assert_eq!(
+            Postgres::render_group_literal(&Value::Bytes(vec![1, 2]))
+                .expect("Postgres byte literal")
+                .to_string(),
+            "'\\x0102'"
+        );
+        assert_eq!(
+            MySql::render_group_literal(&Value::Bytes(vec![1, 2]))
+                .expect("MySQL byte literal")
+                .to_string(),
+            "X'0102'"
+        );
+        assert_eq!(
+            SQLite::render_group_literal(&Value::Bytes(vec![1, 2]))
+                .expect("SQLite byte literal")
+                .to_string(),
+            "X'0102'"
+        );
     }
 }

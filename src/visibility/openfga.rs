@@ -317,8 +317,7 @@ where
             .ok_or(OpenFgaError::RowCannotBeNamed)?;
         let values = crate::visibility::records::row_values(row, self.shapes.catalog());
         naming
-            .key
-            .render(&naming.type_name, &values)
+            .render(&values)
             .ok()
             .flatten()
             .ok_or(OpenFgaError::RowCannotBeNamed)
@@ -785,7 +784,7 @@ where
     }
 
     /// Replace what the store holds for the slice `requery` determines with
-    /// `records`, which is what replaying it returned.
+    /// `records`, which is what replaying it returned, and report what moved.
     ///
     /// The replay's result is the whole truth for its slice, so a stored fact
     /// in the slice the result no longer states is stale and is deleted, which
@@ -808,7 +807,7 @@ where
         &self,
         requery: &Requery<'_, B>,
         records: &[Record],
-    ) -> Result<(), OpenFgaError> {
+    ) -> Result<Reconciled, OpenFgaError> {
         let scope = &requery.query.scope;
         let mut rendered = Vec::with_capacity(requery.key.len());
         for value in &requery.key {
@@ -858,29 +857,43 @@ where
             );
         }
 
-        // A context that moved is a delete and a write of the same key, which
-        // `write_difference` already refuses to send as one call and orders
-        // removals first.
-        let deletes: Vec<TupleKeyWithoutCondition> = stored
+        // The report and the sent difference come from one filtering each, so
+        // the two cannot disagree about what moved.
+        let removed: Vec<WithdrawnFact> = stored
             .iter()
             .filter(|(key, condition)| desired.get(*key) != Some(condition))
-            .map(|((user, relation, object), _)| TupleKeyWithoutCondition {
-                user: user.clone(),
+            .map(|((subject, relation, object), _)| WithdrawnFact {
+                subject: subject.clone(),
                 relation: relation.clone(),
                 object: object.clone(),
             })
             .collect();
-        let writes: Vec<TupleKey> = desired
-            .into_iter()
-            .filter(|(key, condition)| stored.get(key) != Some(condition))
-            .map(|((user, relation, object), condition)| TupleKey {
-                user,
-                relation,
-                object,
-                condition,
+        let mut added = Vec::new();
+        let mut taken = alloc::collections::BTreeSet::new();
+        for record in records {
+            let key = triple_of(record);
+            if !taken.insert(key.clone()) {
+                continue;
+            }
+            if stored.get(&key) != Some(&record.context.as_ref().map(condition_of)) {
+                added.push(record.clone());
+            }
+        }
+
+        // A context that moved is a delete and a write of the same key, which
+        // `write_difference` already refuses to send as one call and orders
+        // removals first.
+        let deletes: Vec<TupleKeyWithoutCondition> = removed
+            .iter()
+            .map(|fact| TupleKeyWithoutCondition {
+                user: fact.subject.clone(),
+                relation: fact.relation.clone(),
+                object: fact.object.clone(),
             })
             .collect();
-        self.write_difference(writes, deletes).await
+        let writes: Vec<TupleKey> = added.iter().map(tuple_of).collect();
+        self.write_difference(writes, deletes).await?;
+        Ok(Reconciled { added, removed })
     }
 
     /// Every tuple the store holds in `slice`, read page by page.
@@ -1069,6 +1082,37 @@ where
             }
         }
     }
+}
+
+/// What [`OpenFgaPolicy::reconcile_records`] moved.
+///
+/// `added` is in the differenced path's own currency, since those facts are
+/// the caller's records. `removed` came back from the server, and a
+/// [`Record`]'s relation is a name only `rls2fga` can mint (holding one is
+/// proof its clamp and collision check ran), so what the store held reports
+/// at the server's own spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Facts the slice now states and the store did not hold.
+    pub added: Vec<Record>,
+    /// Facts the store held and the slice no longer states, deleted by this
+    /// call.
+    pub removed: Vec<WithdrawnFact>,
+}
+
+/// One fact the store held and the reconciled slice no longer states.
+///
+/// The condition a conditional tuple carried is not repeated here: the fact's
+/// identity is the triple, and the triple is what a consumer telling somebody
+/// their access changed needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WithdrawnFact {
+    /// `type:key`, or `user:*` for a wildcard.
+    pub subject: String,
+    /// Relation name, as the server spells it.
+    pub relation: String,
+    /// `type:key`.
+    pub object: String,
 }
 
 /// One tuple's identity to the server: subject, relation, object. A condition's

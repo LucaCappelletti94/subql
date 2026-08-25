@@ -33,17 +33,18 @@ use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{BuiltinKind, Postgres, Value};
-use subql::reexec::{AsyncAutoResolvingEngine, AsyncConnector, ReExecEngine, Registered, Snapshot};
+use subql::reexec::{AsyncConnector, AsyncMode, AutoResolvingEngine, RowPage, Snapshot};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, DefaultIds, NoCheckpoint, SubscriptionEngine, SubscriptionRequest, TableId,
+    catalog_helpers, DefaultIds, NoCheckpoint, Registered, SubscriptionEngine, SubscriptionRequest,
+    TableId, Tier,
 };
 
-type Engine = AsyncAutoResolvingEngine<
+type Engine = AutoResolvingEngine<
     TestEvent<Postgres>,
     DefaultIds,
     ParserDB,
-    ConcurrencyProbingConnector,
+    AsyncMode<ConcurrencyProbingConnector>,
 >;
 
 /// Async connector that delays every `execute_scalar` and exposes
@@ -118,14 +119,14 @@ impl AsyncConnector for ConcurrencyProbingConnector {
         }
     }
 
-    fn execute_rows(
+    fn read_page(
         &self,
         _sql: &str,
+        _max_bytes: usize,
         _auth: &(),
-    ) -> impl Future<
-        Output = Result<Snapshot<Vec<Vec<Value<Postgres>>>, Self::Checkpoint>, Self::Error>,
-    > + Send {
-        async move { Err(ProbeError("execute_rows not exercised in this test")) }
+    ) -> impl Future<Output = Result<Snapshot<RowPage<Postgres>, Self::Checkpoint>, Self::Error>> + Send
+    {
+        async move { Err(ProbeError("read_page is not exercised by this test")) }
     }
 }
 
@@ -173,7 +174,7 @@ fn engine_with_first_n_queries(n: usize, cap: usize, delay: Duration) -> (Engine
         database,
         PostgreSqlDialect {},
     );
-    let mut engine = AsyncAutoResolvingEngine::new(ReExecEngine::new(inner), connector)
+    let mut engine = AutoResolvingEngine::new(inner, AsyncMode::new(connector))
         .with_max_concurrent_reexecutions(cap);
 
     for (i, (sql, install_value)) in QUERIES.iter().take(n).enumerate() {
@@ -184,10 +185,22 @@ fn engine_with_first_n_queries(n: usize, cap: usize, delay: Duration) -> (Engine
             )
             .unwrap();
         let qid = match registered {
-            Registered::ReExec { query_id, .. } => query_id,
-            Registered::Engine(_) => panic!("expected ReExec capture for `{sql}`"),
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected ReExec capture for `{sql}`, got {other:?}"),
         };
-        assert!(engine.install(qid, install_value()));
+        assert!(subql::Install::install(
+            &mut engine,
+            qid,
+            subql::ScalarInstall {
+                value: install_value(),
+                checkpoint: None::<subql::NoCheckpoint>
+            }
+        )
+        .is_ok());
     }
     (engine, tid)
 }

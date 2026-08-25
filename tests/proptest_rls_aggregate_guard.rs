@@ -5,8 +5,8 @@
 //! This pins the guard against a future aggregate variant that forgets
 //! the RLS check: rejection is keyed on `has_row_level_security()`, never
 //! on the specific aggregate. "Accepted" means `Ok(_)` (a delta-composable
-//! aggregate returns `Registered::Engine`, a captured `MIN`/`MAX` returns
-//! `Registered::ReExec`); "rejected" means `Err(AggregatorOnRlsTable)`.
+//! aggregate returns an in-process tier, a captured `MIN`/`MAX` returns
+//! `Tier::Scalar`); "rejected" means `Err(AggregatorOnRlsTable)`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -16,15 +16,16 @@ use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
-use subql::reexec::{ReExecEngine, Registered};
 use subql::testing::TestEvent;
-use subql::{DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId};
+use subql::{
+    DefaultIds, RegisterError, Registered, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
+};
 
-type Engine = ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 /// Aggregate flavors spanning both families. `engine_accepts` records
-/// whether a non-RLS acceptance is the delta-composable `Registered::Engine`
-/// (in-process family) or the captured `Registered::ReExec` (`MIN`/`MAX`).
+/// whether a non-RLS acceptance is the delta-composable an in-process tier
+/// (in-process family) or the captured `Tier::Scalar` (`MIN`/`MAX`).
 struct Flavor {
     keyword: &'static str,
     engine_accepts: bool,
@@ -105,8 +106,7 @@ proptest! {
             .map(|i| table_id_of(&catalog, &format!("t{i}")))
             .collect();
 
-        let mut engine: Engine =
-            ReExecEngine::new(SubscriptionEngine::new(catalog, PostgreSqlDialect {}));
+        let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
 
         let mut consumer_id = 1u64;
         for (i, &rls) in rls_flags.iter().enumerate() {
@@ -132,7 +132,7 @@ proptest! {
                     }
                 } else {
                     match registered {
-                        Ok(Registered::Engine(result)) => {
+                        Ok(Registered { tier: Tier::InProcess(result), .. }) => {
                             prop_assert!(
                                 flavor.engine_accepts,
                                 "`{}` unexpectedly took the engine path", sql
@@ -142,7 +142,7 @@ proptest! {
                                 "`{}` should carry an aggregate spec", sql
                             );
                         }
-                        Ok(Registered::ReExec { .. }) => {
+                        Ok(Registered { tier: Tier::Scalar { .. }, .. }) => {
                             prop_assert!(
                                 !flavor.engine_accepts,
                                 "`{}` unexpectedly took the reexec path", sql
