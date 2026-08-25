@@ -412,6 +412,24 @@ where
         }
         Ok(result)
     }
+
+    /// Describe the membership terms a registration would compile, without
+    /// registering. The read-only sibling of [`register`](Self::register),
+    /// delegating to
+    /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms),
+    /// so a caller can learn what a filter needs seeded before it registers,
+    /// without reaching the inner engine.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the same registration would answer short of the seed:
+    /// [`RegisterError`] for a filter outside SubQL's shape.
+    pub fn describe_terms(
+        &self,
+        spec: &crate::SubscriptionRequest<I, E::Backend>,
+    ) -> Result<Vec<crate::term::TermDescription>, RegisterError> {
+        self.inner.describe_terms(spec)
+    }
 }
 
 /// Walks a key set in bounded batches.
@@ -583,7 +601,10 @@ where
             .mode
             .0
             .execute_scalar(&context.sql, context.column_kind, &context.auth)
-            .map_err(ReExecError::Connector)?;
+            .map_err(|error| ReExecError::Connector {
+                subscription: subscription_id,
+                error,
+            })?;
         let _installed = crate::Install::install(
             &mut self.inner,
             subscription_id,
@@ -623,7 +644,10 @@ where
             .mode
             .0
             .open_cursor(sql, auth)
-            .map_err(ReExecError::Cursor)?;
+            .map_err(|error| ReExecError::Cursor {
+                subscription: subscription_id,
+                error,
+            })?;
 
         // The cursor is closed on every exit from here, including a panic. An
         // early return is handled by closing before `outcome?` below, but a
@@ -645,7 +669,10 @@ where
                     .mode
                     .0
                     .fetch_cursor(cursor, self.max_page_bytes)
-                    .map_err(ReExecError::Cursor)?;
+                    .map_err(|error| ReExecError::Cursor {
+                        subscription: subscription_id,
+                        error,
+                    })?;
                 if columns.is_empty() {
                     columns = page.value.columns;
                 }
@@ -661,7 +688,10 @@ where
             .mode
             .0
             .close_cursor(cursor)
-            .map_err(ReExecError::Cursor);
+            .map_err(|error| ReExecError::Cursor {
+                subscription: subscription_id,
+                error,
+            });
         guard.armed = false;
         outcome?;
         closed?;
@@ -751,7 +781,10 @@ where
                 .mode
                 .0
                 .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
-                .map_err(ReExecError::Connector)?;
+                .map_err(|error| ReExecError::Connector {
+                    subscription: trigger.subscription_id,
+                    error,
+                })?;
             let update = crate::Install::install(
                 &mut self.inner,
                 trigger.subscription_id,
@@ -794,7 +827,10 @@ where
             .mode
             .0
             .read_page(sql, self.max_page_bytes, &context.auth)
-            .map_err(ReExecError::Connector)?;
+            .map_err(|error| ReExecError::Connector {
+                subscription: subscription_id,
+                error,
+            })?;
         if snapshot.value.more || snapshot.value.rows.len() != 1 {
             return Err(crate::AggregateInstallError::RowCount {
                 subscription: subscription_id,
@@ -917,7 +953,10 @@ where
                 .mode
                 .0
                 .read_page(&page_sql, self.max_page_bytes, auth)
-                .map_err(ReExecError::Connector)?;
+                .map_err(|error| ReExecError::Connector {
+                    subscription: subscription_id,
+                    error,
+                })?;
             if columns.is_empty() {
                 columns.clone_from(&page.value.columns);
             }
@@ -1067,7 +1106,10 @@ where
             .mode
             .0
             .open_cursor(&sql, &self.contexts[&subscription_id].auth)
-            .map_err(ReExecError::Cursor)?;
+            .map_err(|error| ReExecError::Cursor {
+                subscription: subscription_id,
+                error,
+            })?;
         let mut guard = CloseOnUnwind {
             connector: &self.mode.0,
             cursor,
@@ -1080,7 +1122,10 @@ where
                     .mode
                     .0
                     .fetch_cursor(cursor, self.max_page_bytes)
-                    .map_err(ReExecError::Cursor)?;
+                    .map_err(|error| ReExecError::Cursor {
+                        subscription: subscription_id,
+                        error,
+                    })?;
                 let more = page.value.more;
                 pages.push(RowsUpdate {
                     subscription_id,
@@ -1100,7 +1145,10 @@ where
             .mode
             .0
             .close_cursor(cursor)
-            .map_err(ReExecError::Cursor);
+            .map_err(|error| ReExecError::Cursor {
+                subscription: subscription_id,
+                error,
+            });
         guard.armed = false;
         outcome?;
         closed?;
@@ -1189,7 +1237,10 @@ where
                 .mode
                 .0
                 .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
-                .map_err(ReExecError::Connector)?;
+                .map_err(|error| ReExecError::Connector {
+                    subscription: trigger.subscription_id,
+                    error,
+                })?;
             let update = crate::Install::install(
                 &mut self.inner,
                 trigger.subscription_id,
@@ -1616,7 +1667,10 @@ mod tests {
 
         match e.consumers(&delete_event(tid, 1, 5.0)) {
             Ok(_) => panic!("expected Connector error, got Ok"),
-            Err(ReExecError::Connector(MockError(msg))) => assert_eq!(msg, "queue empty"),
+            Err(ReExecError::Connector {
+                error: MockError(msg),
+                ..
+            }) => assert_eq!(msg, "queue empty"),
             Err(other) => panic!("expected Connector error, got {other:?}"),
         }
     }
@@ -1766,7 +1820,10 @@ mod tests {
 
         match e.consumers_batch(&events) {
             Ok(_) => panic!("expected Connector error, got Ok"),
-            Err(ReExecError::Connector(MockError(msg))) => assert_eq!(msg, "queue empty"),
+            Err(ReExecError::Connector {
+                error: MockError(msg),
+                ..
+            }) => assert_eq!(msg, "queue empty"),
             Err(other) => panic!("expected Connector error, got {other:?}"),
         }
     }
@@ -2245,5 +2302,100 @@ mod tests {
         );
         assert_eq!(live.scalar_updates.len(), 1);
         assert_eq!(live.scalar_updates[0].value, Value::Float(7.0));
+    }
+
+    #[test]
+    fn describe_terms_is_reachable_through_the_wrapper() {
+        let (e, _tid) = engine_with_values(alloc::vec![]);
+        // A filter naming no membership subquery describes as empty.
+        let plain = e
+            .describe_terms(&SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE price > 100",
+            ))
+            .expect("a plain filter is describable");
+        assert!(plain.is_empty(), "a plain filter has no membership terms");
+        // A filter subql cannot compile is refused, which proves the call
+        // reaches the engine's compiler rather than returning a stub.
+        let refused = e.describe_terms(&SubscriptionRequest::new(
+            2u64,
+            "SELECT * FROM orders WHERE nonexistent_column > 5",
+        ));
+        assert!(
+            refused.is_err(),
+            "an unknown-column filter is refused, got {refused:?}"
+        );
+    }
+
+    #[test]
+    fn connector_error_names_its_subscription() {
+        // Empty queue: the connector errors on the triggered read.
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        match e.consumers(&delete_event(tid, 1, 5.0)) {
+            Ok(_) => panic!("expected the triggered read to fail"),
+            Err(ReExecError::Connector {
+                subscription,
+                error,
+            }) => {
+                assert_eq!(subscription, qid, "the failing subscription is named");
+                assert_eq!(error, MockError("queue empty"));
+            }
+            Err(other) => panic!("expected Connector naming its subscription, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_error_names_its_subscription() {
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT DISTINCT status FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::WholeRows { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected WholeRows, got {other:?}"),
+        };
+        // snapshot reads the whole result through a cursor. The mock connector
+        // holds none, so the read fails, and the error must name the query.
+        match e.snapshot(qid) {
+            Ok(_) => panic!("expected the cursorless read to fail"),
+            Err(ReExecError::Cursor {
+                subscription,
+                error,
+            }) => {
+                assert_eq!(subscription, qid, "the failing subscription is named");
+                assert!(matches!(error, super::super::CursorError::Unsupported));
+            }
+            Err(other) => panic!("expected Cursor naming its subscription, got {other:?}"),
+        }
     }
 }

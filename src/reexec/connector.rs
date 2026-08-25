@@ -384,10 +384,18 @@ pub enum ReExecError<E> {
     /// missing required row image).
     #[error("dispatch failed: {0}")]
     Dispatch(#[from] DispatchError),
-    /// The [`Connector`] failed to execute the re-execution SQL. The whole
-    /// batch is aborted. The caller is expected to retry it.
-    #[error("connector failed: {0}")]
-    Connector(E),
+    /// The [`Connector`] failed to execute the re-execution SQL for
+    /// `subscription`. The whole batch is aborted. The id names the read that
+    /// failed, so a caller whose read fails deterministically (a statement
+    /// timeout on a query that always exceeds its budget) can end that one
+    /// subscription rather than retrying the same failure forever.
+    #[error("connector failed for subscription {subscription}: {error}")]
+    Connector {
+        /// The subscription whose triggered read failed.
+        subscription: crate::SubscriptionId,
+        /// The connector's error.
+        error: E,
+    },
     /// The database result does not match the subscription it was read for.
     #[error("install failed: {0}")]
     Install(#[from] crate::InstallError),
@@ -398,8 +406,13 @@ pub enum ReExecError<E> {
     /// serve a captured query that has to be re-read whole. Kept apart from
     /// [`Self::Connector`] because "this connector cannot do that" is a
     /// configuration answer and a failed read is a retry answer.
-    #[error("cursor read failed: {0}")]
-    Cursor(CursorError<E>),
+    #[error("cursor read failed for subscription {subscription}: {error}")]
+    Cursor {
+        /// The subscription whose cursor read failed.
+        subscription: crate::SubscriptionId,
+        /// The cursor error.
+        error: CursorError<E>,
+    },
 }
 
 /// Error from [`Connector::execute_scalar_row`] and its async peer.

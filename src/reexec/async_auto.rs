@@ -262,6 +262,7 @@ where
         if let Some(bootstrap) = grouped_bootstrap {
             let (pages, checkpoint) = Self::read_whole_with(
                 &self.mode.connector,
+                subscription_id,
                 &bootstrap.sql,
                 self.max_page_bytes,
                 &context.auth,
@@ -290,7 +291,10 @@ where
                             .connector
                             .read_page(sql, self.max_page_bytes, &context.auth)
                             .await
-                            .map_err(ReExecError::Connector)?;
+                            .map_err(|error| ReExecError::Connector {
+                                subscription: subscription_id,
+                                error,
+                            })?;
                         if page.value.more || page.value.rows.len() != 1 {
                             return Err(crate::AggregateInstallError::RowCount {
                                 subscription: subscription_id,
@@ -324,6 +328,7 @@ where
                             .expect("a transitioned read keeps its connector context");
                         let (pages, checkpoint) = Self::read_whole_with(
                             &self.mode.connector,
+                            subscription_id,
                             &context.sql,
                             self.max_page_bytes,
                             &context.auth,
@@ -354,6 +359,7 @@ where
             let sql = context.sql.clone();
             let (pages, checkpoint) = Self::read_whole_with(
                 &self.mode.connector,
+                subscription_id,
                 &sql,
                 self.max_page_bytes,
                 &context.auth,
@@ -378,7 +384,10 @@ where
             .connector
             .execute_scalar(&context.sql, context.column_kind, &context.auth)
             .await
-            .map_err(ReExecError::Connector)?;
+            .map_err(|error| ReExecError::Connector {
+                subscription: subscription_id,
+                error,
+            })?;
         let _installed = crate::Install::install(
             &mut self.inner,
             subscription_id,
@@ -486,7 +495,14 @@ where
             let throttle = throttle.clone();
             async move {
                 let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
-                let answer = Self::run_job(connector, job, max_page_bytes, auth).await?;
+                let answer = Self::run_job(
+                    connector,
+                    job,
+                    trigger.subscription_id,
+                    max_page_bytes,
+                    auth,
+                )
+                .await?;
                 Ok::<_, ReExecError<X::Error>>((trigger, answer))
             }
         }))
@@ -711,8 +727,14 @@ where
                 .get(&trigger.subscription_id)
                 .expect("a follow-up read stores its connector context")
                 .auth;
-            let answer =
-                Self::run_job(&self.mode.connector, job, self.max_page_bytes, auth).await?;
+            let answer = Self::run_job(
+                &self.mode.connector,
+                job,
+                trigger.subscription_id,
+                self.max_page_bytes,
+                auth,
+            )
+            .await?;
             self.stamp_reexec(trigger.subscription_id, &trigger.read);
             self.apply_resolved(
                 &trigger,
@@ -799,6 +821,7 @@ where
     async fn run_job(
         connector: &X,
         job: ResolveJob<E::Backend>,
+        subscription: SubscriptionId,
         max_page_bytes: usize,
         auth: &X::AuthContext,
     ) -> Result<Resolved<E::Backend>, ReExecError<X::Error>> {
@@ -807,17 +830,23 @@ where
                 let (value, _db_checkpoint) = connector
                     .execute_scalar(&sql, column_kind, auth)
                     .await
-                    .map_err(ReExecError::Connector)?;
+                    .map_err(|error| ReExecError::Connector {
+                        subscription,
+                        error,
+                    })?;
                 Ok(Resolved::Scalar(value))
             }
             ResolveJob::GroupedScalar { group, sql } => {
                 let page = connector
                     .read_page(&sql, max_page_bytes, auth)
                     .await
-                    .map_err(ReExecError::Connector)?;
+                    .map_err(|error| ReExecError::Connector {
+                        subscription,
+                        error,
+                    })?;
                 if page.value.more || page.value.rows.len() != 1 {
                     return Err(crate::AggregateInstallError::RowCount {
-                        subscription: 0,
+                        subscription,
                         rows: page.value.rows.len(),
                     }
                     .into());
@@ -865,7 +894,10 @@ where
                         let page = connector
                             .read_page(&page_sql, max_page_bytes, auth)
                             .await
-                            .map_err(ReExecError::Connector)?;
+                            .map_err(|error| ReExecError::Connector {
+                                subscription,
+                                error,
+                            })?;
                         if columns.is_empty() {
                             columns.clone_from(&page.value.columns);
                         }
@@ -922,7 +954,8 @@ where
                 // re-read is delivered against the position of the event that
                 // triggered it, which is what a consumer reconciles by.
                 let (pages, _) =
-                    Self::read_whole_with(connector, &sql, max_page_bytes, auth).await?;
+                    Self::read_whole_with(connector, subscription, &sql, max_page_bytes, auth)
+                        .await?;
                 Ok(Resolved::Whole { generation, pages })
             }
         }
@@ -941,14 +974,19 @@ where
     /// never opened and silently lose its write.
     async fn read_whole_with(
         connector: &X,
+        subscription: SubscriptionId,
         sql: &str,
         max_page_bytes: usize,
         auth: &X::AuthContext,
     ) -> Result<(Vec<ReadPage<E::Backend>>, Option<X::Checkpoint>), ReExecError<X::Error>> {
-        let cursor = connector
-            .open_cursor(sql, auth)
-            .await
-            .map_err(ReExecError::Cursor)?;
+        let cursor =
+            connector
+                .open_cursor(sql, auth)
+                .await
+                .map_err(|error| ReExecError::Cursor {
+                    subscription,
+                    error,
+                })?;
 
         let mut pages = Vec::new();
         let mut checkpoint = None;
@@ -957,7 +995,10 @@ where
                 let page = connector
                     .fetch_cursor(cursor, max_page_bytes)
                     .await
-                    .map_err(ReExecError::Cursor)?;
+                    .map_err(|error| ReExecError::Cursor {
+                        subscription,
+                        error,
+                    })?;
                 let more = page.value.more;
                 checkpoint = page.checkpoint;
                 pages.push(ReadPage {
@@ -978,7 +1019,10 @@ where
         let closed = connector
             .close_cursor(cursor)
             .await
-            .map_err(ReExecError::Cursor);
+            .map_err(|error| ReExecError::Cursor {
+                subscription,
+                error,
+            });
         outcome?;
         closed?;
         Ok((pages, checkpoint))
@@ -1083,7 +1127,14 @@ where
             let throttle = throttle.clone();
             async move {
                 let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
-                let answer = Self::run_job(connector, job, max_page_bytes, auth).await?;
+                let answer = Self::run_job(
+                    connector,
+                    job,
+                    trigger.subscription_id,
+                    max_page_bytes,
+                    auth,
+                )
+                .await?;
                 Ok::<_, ReExecError<X::Error>>((trigger, answer))
             }
         }))
@@ -1571,7 +1622,10 @@ mod tests {
 
         match block_on(e.consumers(&delete_event(tid, 1, 5.0))) {
             Ok(_) => panic!("expected Connector error, got Ok"),
-            Err(ReExecError::Connector(MockError(msg))) => assert_eq!(msg, "queue empty"),
+            Err(ReExecError::Connector {
+                error: MockError(msg),
+                ..
+            }) => assert_eq!(msg, "queue empty"),
             Err(other) => panic!("expected Connector error, got {other:?}"),
         }
     }
@@ -2113,5 +2167,96 @@ mod tests {
         );
         assert_eq!(live.scalar_updates.len(), 1);
         assert_eq!(live.scalar_updates[0].value, Value::Float(7.0));
+    }
+
+    #[test]
+    fn async_describe_terms_is_reachable_through_the_wrapper() {
+        // Sync method even on the async wrapper: it only reads the engine's
+        // compiler, no I/O, so no block_on.
+        let (e, _tid) = engine_with_values(vec![]);
+        let plain = e
+            .describe_terms(&SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM orders WHERE price > 100",
+            ))
+            .expect("a plain filter is describable");
+        assert!(plain.is_empty(), "a plain filter has no membership terms");
+        let refused = e.describe_terms(&SubscriptionRequest::new(
+            2u64,
+            "SELECT * FROM orders WHERE nonexistent_column > 5",
+        ));
+        assert!(
+            refused.is_err(),
+            "an unknown-column filter is refused, got {refused:?}"
+        );
+    }
+
+    #[test]
+    fn async_connector_error_names_its_subscription() {
+        let (mut e, tid) = engine_with_values(vec![]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        match block_on(e.consumers(&delete_event(tid, 1, 5.0))) {
+            Ok(_) => panic!("expected the triggered read to fail"),
+            Err(ReExecError::Connector {
+                subscription,
+                error: MockError(msg),
+            }) => {
+                assert_eq!(subscription, qid, "the failing subscription is named");
+                assert_eq!(msg, "queue empty");
+            }
+            Err(other) => panic!("expected Connector naming its subscription, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn async_cursor_error_names_its_subscription() {
+        let (mut e, _tid) = engine_with_values(vec![]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT DISTINCT status FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::WholeRows { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected WholeRows, got {other:?}"),
+        };
+        match block_on(e.snapshot(qid)) {
+            Ok(_) => panic!("expected the cursorless read to fail"),
+            Err(ReExecError::Cursor {
+                subscription,
+                error,
+            }) => {
+                assert_eq!(subscription, qid, "the failing subscription is named");
+                assert!(matches!(error, super::super::CursorError::Unsupported));
+            }
+            Err(other) => panic!("expected Cursor naming its subscription, got {other:?}"),
+        }
     }
 }
