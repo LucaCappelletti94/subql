@@ -2,7 +2,8 @@
 //! Event dispatch pipeline
 
 use super::{
-    agg::{agg_delta_for_row, AggCellRead},
+    agg::{agg_delta_for_row, AggCellRead, DeltaSpec},
+    aggregate::AggDelta,
     ids::{ConsumerOrdinal, PredicateId},
     partition::{ColumnProbe, TablePartition},
     predicate::{Predicate, PredicateStore},
@@ -12,10 +13,10 @@ use crate::runtime::indexes::IndexableCell;
 use crate::term::TermLookup;
 use crate::{
     compiler::{sql_shape::QueryProjection, Tri, Vm, VmError},
-    AggDelta, ConsumerNotifications, DispatchError, EventKind, IdTypes, SubscriptionId,
+    ConsumerNotifications, DispatchError, EventKind, IdTypes, SubscriptionId,
 };
 use alloc::vec::Vec;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use roaring::RoaringBitmap;
 use sql_traits::prelude::DatabaseLike;
 
@@ -155,19 +156,34 @@ where
     }
 
     let mut facts: Vec<TermFacts<'a>> = Vec::with_capacity(pred.bytecode.term_columns.len());
-    for (slot, column) in pred.bytecode.term_columns.iter().enumerate() {
-        let value = event
-            .value_at(db, row, *column)
-            .map_err(DispatchError::Value)?;
+    for (slot, columns) in pred.bytecode.term_columns.iter().enumerate() {
         let slot = u16::try_from(slot).unwrap_or(u16::MAX);
-        facts.push(match TermLookup::of(value) {
-            TermLookup::Key(key) => TermFacts::Admits(
+        // A NULL cell dominates an unreadable one: SQL never matches through a
+        // NULL, so the term admits nobody whatever the other cells hold, while
+        // an unreadable cell alone leaves the term unable to say.
+        let mut keys = Vec::with_capacity(columns.len());
+        let mut nobody = false;
+        let mut unknown = false;
+        for column in columns {
+            let value = event
+                .value_at(db, row, *column)
+                .map_err(DispatchError::Value)?;
+            match TermLookup::of(value) {
+                TermLookup::Key(key) => keys.push(key),
+                TermLookup::Nobody => nobody = true,
+                TermLookup::Unknown => unknown = true,
+            }
+        }
+        facts.push(if nobody {
+            TermFacts::Admits(None)
+        } else if unknown {
+            TermFacts::CannotSay
+        } else {
+            TermFacts::Admits(
                 store
                     .term_members(pred.id, slot)
-                    .and_then(|members| members.admits(&key)),
-            ),
-            TermLookup::Nobody => TermFacts::Admits(None),
-            TermLookup::Unknown => TermFacts::CannotSay,
+                    .and_then(|members| members.admits(&keys)),
+            )
         });
     }
 
@@ -687,58 +703,131 @@ where
     Ok(())
 }
 
+/// The delta shape an aggregate subscription folds, plus its group columns.
+/// `None` for a row projection.
+fn delta_spec_and_groups(
+    projection: &QueryProjection,
+) -> Option<(DeltaSpec<'_>, &[crate::ColumnId])> {
+    match projection {
+        QueryProjection::Aggregate(spec) => Some((DeltaSpec::Projected(spec), &[])),
+        QueryProjection::GroupedAggregate {
+            groups,
+            agg,
+            having,
+        } => {
+            let spec = match having {
+                // Registration refuses a sibling on a columnless
+                // projection, so the fallback arm is unreachable and
+                // keeps the unwidened delta, which stays correct for
+                // the projected value.
+                Some(having) if having.widens(agg) => agg
+                    .column()
+                    .map_or(DeltaSpec::Projected(agg), DeltaSpec::FullStats),
+                _ => DeltaSpec::Projected(agg),
+            };
+            Some((spec, groups))
+        }
+        QueryProjection::Rows => None,
+    }
+}
+
 /// Weighted-row pairs for aggregate delta computation.
 ///
 /// Delta normalization per event kind:
 /// * `Insert`   -> `[(+1, RowKind::New)]`
 /// * `Delete`   -> `[(-1, RowKind::Old)]`
 /// * `Update`   -> `[(-1, RowKind::Old), (+1, RowKind::New)]`
-/// * `Truncate` -> `Err(TruncateRequiresReset)`
-fn weighted_rows_for_agg<E: CdcEvent, DB: DatabaseLike>(
-    event: &E,
-    db: &DB,
-) -> Result<Vec<(i64, RowKind)>, DispatchError> {
+/// * `Truncate` -> nothing, because emptying a table is not a row change.
+///   [`SubscriptionEngine::aggregate_updates`](crate::SubscriptionEngine::aggregate_updates)
+///   answers it from the held totals before reaching here.
+fn weighted_rows_for_agg<E: CdcEvent>(event: &E) -> Vec<(i64, RowKind)> {
     match event.kind() {
-        EventKind::Insert => Ok(vec![(1, RowKind::New)]),
-        EventKind::Delete => Ok(vec![(-1, RowKind::Old)]),
-        EventKind::Update => Ok(vec![(-1, RowKind::Old), (1, RowKind::New)]),
-        EventKind::Truncate => Err(DispatchError::TruncateRequiresReset(event.table_id(db))),
+        EventKind::Insert => vec![(1, RowKind::New)],
+        EventKind::Delete => vec![(-1, RowKind::Old)],
+        EventKind::Update => vec![(-1, RowKind::Old), (1, RowKind::New)],
+        EventKind::Truncate => Vec::new(),
     }
 }
 
-/// Compute typed signed deltas for aggregate subscriptions
-/// (`COUNT(*)`, `SUM(col)`, `AVG(col)`, ...).
-///
-/// See [`weighted_rows_for_agg`] for the per-event-kind normalization.
-/// For each `(weight, row_kind)` pair, selects agg candidate predicates,
-/// VM-evaluates them, and accumulates weight per user through the
-/// appropriate [`AggDelta`] variant. Zero-net entries are filtered out.
-/// The same user may appear multiple times in the result (once per
-/// aggregate kind).
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-pub(crate) fn compute_agg_deltas<I, E, DB>(
+/// Net aggregate change per subscription and encoded group this event touched.
+#[derive(Debug)]
+pub(crate) struct AggregateDelta {
+    pub subscription: SubscriptionId,
+    pub group: Option<Vec<u8>>,
+    pub delta: Option<AggDelta>,
+    /// Source-row change, independent of NULL aggregate cells.
+    pub rows: i64,
+}
+
+pub(crate) struct AggregateComputation {
+    pub deltas: Vec<AggregateDelta>,
+    pub missing_old: Vec<SubscriptionId>,
+}
+
+fn subscriptions_missing_old<I, E, DB>(
     event: &E,
-    partition: &TablePartition<I, E::Backend>,
-    consumer_dict: &ConsumerDictionary<I>,
-    vm: &mut Vm<E::Backend>,
-    arity: usize,
+    candidates: &RoaringBitmap,
+    store: &PredicateStore<I, E::Backend>,
     db: &DB,
-) -> Result<Vec<(I::ConsumerId, AggDelta)>, DispatchError>
+) -> HashSet<SubscriptionId>
 where
     I: IdTypes,
     E: CdcEvent,
     DB: DatabaseLike,
 {
-    let weighted_rows = weighted_rows_for_agg(event, db)?;
+    let mut missing = HashSet::new();
+    if event.kind() != EventKind::Update {
+        return missing;
+    }
+    for pred_id_u32 in candidates {
+        let Some(pred_id) = PredicateId::try_from_u32(pred_id_u32) else {
+            continue;
+        };
+        let Some(pred) = store.get_predicate(pred_id) else {
+            continue;
+        };
+        if pred.dependency_columns.is_empty()
+            || !matches!(
+                pred.projection,
+                QueryProjection::Aggregate(_) | QueryProjection::GroupedAggregate { .. }
+            )
+            || !pred.dependency_columns.iter().any(|column| {
+                event
+                    .value_at(db, RowKind::Old, *column)
+                    .is_ok_and(|value| value.is_missing())
+            })
+        {
+            continue;
+        }
+        let Some(consumers) = store.predicate_consumers.get(&pred_id) else {
+            continue;
+        };
+        for ord_u32 in consumers {
+            let ord = ConsumerOrdinal::new(ord_u32);
+            if let Some(subscriptions) = store.binding_lookup.get(&(pred_id, ord)) {
+                missing.extend(subscriptions.iter().copied());
+            }
+        }
+    }
+    missing
+}
 
-    // Separate accumulators for each aggregate kind (avoids mixed-type confusion).
-    let mut count_weights: HashMap<ConsumerOrdinal, i64> = HashMap::new();
-    let mut sum_weights: HashMap<ConsumerOrdinal, f64> = HashMap::new();
-    // AVG accumulator: (sum_delta, count_delta).
-    let mut avg_accum: HashMap<ConsumerOrdinal, (f64, i64)> = HashMap::new();
-    // VAR / STDDEV accumulator: (sum_delta, sum_sq_delta, count_delta).
-    let mut stats_accum: HashMap<ConsumerOrdinal, (f64, f64, i64)> = HashMap::new();
-
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn compute_agg_deltas<I, E, DB>(
+    event: &E,
+    partition: &TablePartition<I, E::Backend>,
+    vm: &mut Vm<E::Backend>,
+    arity: usize,
+    db: &DB,
+) -> Result<AggregateComputation, DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    let weighted_rows = weighted_rows_for_agg(event);
+    let mut net: HashMap<(SubscriptionId, Option<Vec<u8>>), (Option<AggDelta>, i64)> =
+        HashMap::new();
     let snapshot = partition.load_snapshot();
 
     // For UPDATE, use dependency-aware candidate selection; for INSERT /
@@ -749,6 +838,7 @@ where
         Vec::new()
     };
     let candidates = partition.select_agg_candidates(event.kind(), &changed_cols);
+    let missing_old = subscriptions_missing_old(event, &candidates, &snapshot.predicates, db);
 
     for (weight, row) in weighted_rows {
         for_each_matching_predicate(
@@ -759,10 +849,9 @@ where
             vm,
             db,
             |pred, consumers| {
-                let QueryProjection::Aggregate(spec) = &pred.projection else {
+                let Some((spec, groups)) = delta_spec_and_groups(&pred.projection) else {
                     return Ok(());
                 };
-
                 let mut decode_err: Option<crate::ValueError> = None;
                 let maybe_delta =
                     agg_delta_for_row(spec, weight, |col| {
@@ -777,36 +866,39 @@ where
                 if let Some(error) = decode_err {
                     return Err(DispatchError::Value(error));
                 }
-                let Some(delta) = maybe_delta else {
-                    return Ok(());
+                let group = if groups.is_empty() {
+                    None
+                } else {
+                    let values: Vec<_> = groups
+                        .iter()
+                        .map(|column| event.value_at(db, row, *column))
+                        .collect::<Result<_, _>>()?;
+                    Some(
+                        crate::backend::encode_value_key(&values)
+                            .ok_or(DispatchError::GroupKeyEncoding)?,
+                    )
                 };
 
                 for ord_u32 in consumers {
                     let ord = ConsumerOrdinal::new(ord_u32);
-                    match &delta {
-                        AggDelta::Count(n) => {
-                            *count_weights.entry(ord).or_default() += *n;
+                    let Some(subscriptions) =
+                        snapshot.predicates.binding_lookup.get(&(pred.id, ord))
+                    else {
+                        continue;
+                    };
+                    for &subscription in subscriptions {
+                        if missing_old.contains(&subscription) {
+                            continue;
                         }
-                        AggDelta::Sum(v) => {
-                            *sum_weights.entry(ord).or_default() += *v;
-                        }
-                        AggDelta::Avg {
-                            sum_delta,
-                            count_delta,
-                        } => {
-                            let entry = avg_accum.entry(ord).or_default();
-                            entry.0 += *sum_delta;
-                            entry.1 += *count_delta;
-                        }
-                        AggDelta::Stats {
-                            sum_delta,
-                            sum_sq_delta,
-                            count_delta,
-                        } => {
-                            let entry = stats_accum.entry(ord).or_default();
-                            entry.0 += *sum_delta;
-                            entry.1 += *sum_sq_delta;
-                            entry.2 += *count_delta;
+                        let held = net
+                            .entry((subscription, group.clone()))
+                            .or_insert((None, 0));
+                        held.1 += weight;
+                        if let Some(delta) = maybe_delta {
+                            match &mut held.0 {
+                                Some(existing) => existing.merge(&delta),
+                                slot @ None => *slot = Some(delta),
+                            }
                         }
                     }
                 }
@@ -816,49 +908,25 @@ where
         )?;
     }
 
-    // Translate ordinals to user IDs; filter out zero-net entries.
-    let mut result: Vec<(I::ConsumerId, AggDelta)> = Vec::new();
-    for (ord, n) in count_weights.into_iter().filter(|(_, n)| *n != 0) {
-        if let Some(uid) = consumer_dict.get_consumer(ord) {
-            result.push((uid, AggDelta::Count(n)));
-        }
-    }
-    for (ord, v) in sum_weights.into_iter().filter(|(_, v)| *v != 0.0) {
-        if let Some(uid) = consumer_dict.get_consumer(ord) {
-            result.push((uid, AggDelta::Sum(v)));
-        }
-    }
-    for (ord, (s, c)) in avg_accum
+    let deltas = net
         .into_iter()
-        .filter(|(_, (s, c))| *s != 0.0 || *c != 0)
-    {
-        if let Some(uid) = consumer_dict.get_consumer(ord) {
-            result.push((
-                uid,
-                AggDelta::Avg {
-                    sum_delta: s,
-                    count_delta: c,
+        .filter_map(|((subscription, group), (delta, rows))| {
+            (rows != 0 || delta.as_ref().is_some_and(|delta| !delta.is_zero())).then_some(
+                AggregateDelta {
+                    subscription,
+                    group,
+                    delta,
+                    rows,
                 },
-            ));
-        }
-    }
-    for (ord, (s, sq, c)) in stats_accum
-        .into_iter()
-        .filter(|(_, (s, sq, c))| *s != 0.0 || *sq != 0.0 || *c != 0)
-    {
-        if let Some(uid) = consumer_dict.get_consumer(ord) {
-            result.push((
-                uid,
-                AggDelta::Stats {
-                    sum_delta: s,
-                    sum_sq_delta: sq,
-                    count_delta: c,
-                },
-            ));
-        }
-    }
-
-    Ok(result)
+            )
+        })
+        .collect();
+    let mut missing_old: Vec<_> = missing_old.into_iter().collect();
+    missing_old.sort_unstable();
+    Ok(AggregateComputation {
+        deltas,
+        missing_old,
+    })
 }
 
 // ============================================================================

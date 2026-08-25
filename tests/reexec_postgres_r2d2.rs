@@ -19,17 +19,34 @@
 #![allow(clippy::unwrap_used)]
 
 mod common;
+use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::r2d2::ConnectionManager;
-use diesel::{sql_query, PgConnection, RunQueryDsl};
+use diesel::{sql_query, ExpressionMethods, PgConnection, QueryDsl, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{CdcEvent, Postgres, Value};
+use subql::backend::{CdcEvent, Postgres, ScalarKind, Value};
 use subql::reexec::{
-    AutoResolvingEngine, Connector, PgR2D2DieselConnector, ReExecEngine, Registered, SnapshotResult,
+    AutoResolvingEngine, Connector, PgR2D2DieselConnector, SnapshotResult, SyncMode,
 };
-use subql::{parse_wal2json_v2, DefaultIds, MessageV2, SubscriptionEngine, SubscriptionRequest};
+use subql::{
+    parse_wal2json_v2, AggregateResultValue, AggregateValueChange, DefaultIds,
+    MaintenanceStopReason, MessageV2, Registered, SubscriptionEngine, SubscriptionRequest, Tier,
+    TierKind,
+};
+
+mod grouped_schema {
+    diesel::table! {
+        orders (id) {
+            id -> Integer,
+            price -> Double,
+            quantity -> Integer,
+            status -> Text,
+            bucket -> Binary,
+        }
+    }
+}
 
 /// One `BigInt` column, for the `count(*)` and `pg_backend_pid()` probes the
 /// cursor tests make against `pg_stat_activity`.
@@ -87,6 +104,11 @@ fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
     common::create_slot(conn, SLOT);
 }
 
+/// One more row, for a commit that lands while a read is parked.
+fn insert(id: i64) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
+}
+
 fn catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
 }
@@ -104,10 +126,10 @@ fn build_pool(port: u16) -> r2d2::Pool<ConnectionManager<PgConnection>> {
 fn build_engine(
     catalog: ParserDB,
     pool: r2d2::Pool<ConnectionManager<PgConnection>>,
-) -> AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, PgR2D2DieselConnector> {
+) -> AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, SyncMode<PgR2D2DieselConnector>> {
     let inner =
         SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
-    AutoResolvingEngine::new(ReExecEngine::new(inner), PgR2D2DieselConnector::new(pool))
+    AutoResolvingEngine::new(inner, SyncMode(PgR2D2DieselConnector::new(pool)))
 }
 
 fn parse_message(msg: &str) -> Vec<MessageV2> {
@@ -138,7 +160,11 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
         )
         .expect("captured registration")
     {
-        Registered::ReExec { query_id, .. } => query_id,
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => subscription_id,
         other => panic!("expected ReExec, got {other:?}"),
     };
 
@@ -146,7 +172,7 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
     let snap = engine
         .snapshot(captured_qid)
         .expect("snapshot")
-        .expect("query_id exists");
+        .expect("subscription_id exists");
     let (value, snapshot_lsn) = match snap {
         SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
         other => panic!("unexpected variant: {other:?}"),
@@ -269,8 +295,6 @@ fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
-    use subql::reexec::Registered;
-
     common::assert_docker_available();
     let container = common::pg_with_wal2json();
     let port = common::pg_port(&container);
@@ -296,10 +320,12 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
             (),
         )
         .expect("a filter outside the language is captured, not refused");
-    let (query_id, tables) = match registered {
-        Registered::Captured {
-            query_id, tables, ..
-        } => (query_id, tables),
+    let (subscription_id, tables) = match registered {
+        Registered {
+            subscription_id,
+            tier: Tier::WholeRows { tables, .. },
+            ..
+        } => (subscription_id, tables),
         other => panic!("expected a whole-re-read capture, got {other:?}"),
     };
     assert_eq!(tables.len(), 1, "one table triggers this query");
@@ -322,7 +348,7 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
     for event in &events {
         let notifications = engine.consumers(event).expect("dispatch");
         for update in &notifications.rows_updates {
-            assert_eq!(update.query_id, query_id);
+            assert_eq!(update.subscription_id, subscription_id);
             generations.push(update.generation);
             pages += 1;
             if !update.more {
@@ -366,7 +392,7 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn a_captured_query_snapshots_its_answer_at_registration() {
-    use subql::reexec::{Registered, SnapshotResult};
+    use subql::reexec::SnapshotResult;
 
     common::assert_docker_available();
     let container = common::pg_with_wal2json();
@@ -379,7 +405,7 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
     setup_pg(&mut conn_setup, &seed);
 
     let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(64);
-    let query_id = match engine
+    let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
                 1u64,
@@ -389,12 +415,16 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
         )
         .expect("captured registration")
     {
-        Registered::Captured { query_id, .. } => query_id,
+        Registered {
+            subscription_id,
+            tier: Tier::WholeRows { .. },
+            ..
+        } => subscription_id,
         other => panic!("expected a whole-re-read capture, got {other:?}"),
     };
 
     let snapshot = engine
-        .snapshot(query_id)
+        .snapshot(subscription_id)
         .expect("snapshot reads")
         .expect("the query exists");
     match snapshot {
@@ -429,8 +459,6 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn a_joined_capture_is_triggered_by_either_table() {
-    use subql::reexec::Registered;
-
     common::assert_docker_available();
     let container = common::pg_with_wal2json();
     let port = common::pg_port(&container);
@@ -466,7 +494,10 @@ fn a_joined_capture_is_triggered_by_either_table() {
         )
         .expect("a join is captured, not refused")
     {
-        Registered::Captured { tables, .. } => tables,
+        Registered {
+            tier: Tier::WholeRows { tables, .. },
+            ..
+        } => tables,
         other => panic!("expected a whole-re-read capture, got {other:?}"),
     };
     assert_eq!(tables.len(), 2, "both sides of the join trigger it");
@@ -507,10 +538,9 @@ fn a_joined_capture_is_triggered_by_either_table() {
 /// replaying the change stream from it would skip that commit entirely.
 ///
 /// The connectors read the position before opening the snapshot for exactly
-/// this reason. That ordering is internal to one call, so no black-box test can
-/// distinguish it; what a test can do is pin the premise, which is this. If a
-/// future PostgreSQL made the function snapshot-bound, this test fails and the
-/// ordering constraint can be revisited.
+/// this reason, and the parked-read test below pins that per read. This one
+/// pins the premise underneath: if a future PostgreSQL made the function
+/// snapshot-bound, it fails and the ordering constraint can be revisited.
 #[test]
 #[ignore = "requires Docker; run with --ignored"]
 fn the_wal_position_is_not_bound_to_the_transaction_snapshot() {
@@ -567,6 +597,73 @@ fn the_wal_position_is_not_bound_to_the_transaction_snapshot() {
         "yet the position advanced, so it is not snapshot-bound: a position read \
          after the rows would sit ahead of the snapshot and a replay from it \
          would lose the commit"
+    );
+}
+
+/// Every read reports a position taken before its own snapshot opened.
+///
+/// The contract a caller replays from: a position at or behind the snapshot
+/// re-delivers changes the snapshot already holds, which keyed application
+/// absorbs, while a position ahead of it silently drops a transaction the
+/// snapshot never saw. An advisory lock parks each read inside its own
+/// snapshot, a commit lands while it waits, and the returned position has to
+/// sit behind that commit. The row count is asserted too, because a read that
+/// somehow saw the commit would make the position comparison meaningless.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn every_read_reports_a_position_taken_before_its_snapshot() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0)]);
+    let connector = Arc::new(PgR2D2DieselConnector::new(build_pool(port)));
+
+    let held = Arc::clone(&connector);
+    let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
+    let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
+        held.execute_scalar(&sql, ScalarKind::Int, &())
+            .expect("scalar read")
+    });
+    assert_eq!(
+        value,
+        Value::Int(1),
+        "the scalar read's snapshot holds one row"
+    );
+    assert!(
+        position.expect("a PG connector reports a position") < after_commit,
+        "the scalar read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let held = Arc::clone(&connector);
+    let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
+    let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
+        held.read_page(&sql, 1 << 20, &()).expect("page read")
+    });
+    assert_eq!(
+        page.value.rows.len(),
+        2,
+        "the page's snapshot holds two rows"
+    );
+    assert!(
+        page.checkpoint.expect("a PG connector reports a position") < after_commit,
+        "the page read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let held = Arc::clone(&connector);
+    let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
+    let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
+        held.execute_scalar_row(&sql, &[ScalarKind::Int], &())
+            .expect("seed read")
+    });
+    assert_eq!(
+        values,
+        vec![Value::Int(3)],
+        "the seed read's snapshot holds three rows"
+    );
+    assert!(
+        position.expect("a PG connector reports a position") < after_commit,
+        "the seed read's position must sit behind the commit at {after_commit:?}"
     );
 }
 
@@ -805,8 +902,7 @@ fn a_panic_during_a_read_leaves_no_transaction_behind() {
             PostgreSqlDialect {},
         );
     // One row per page, so the read needs a second fetch and reaches the panic.
-    let mut engine =
-        AutoResolvingEngine::new(ReExecEngine::new(inner), connector).with_max_page_bytes(1);
+    let mut engine = AutoResolvingEngine::new(inner, SyncMode(connector)).with_max_page_bytes(1);
     engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
@@ -843,5 +939,233 @@ fn a_panic_during_a_read_leaves_no_transaction_behind() {
         scalar(&mut observer, IDLE_IN_TXN),
         0,
         "the guard must close the cursor as the panic unwinds through the read loop"
+    );
+}
+
+/// A keyed capture has starting rows too.
+///
+/// The tier serves later changes one row at a time, but a subscriber still has
+/// to be told what the answer was before anything changed, and it cannot
+/// reconstruct that from deltas: no change ever fires for a row that was
+/// already in the answer and stayed there. Without this the subscription looks
+/// empty and correct at the same time.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_keyed_capture_snapshots_its_rows() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let mut conn_setup = common::pg_connect(port);
+    let seed: Vec<(i64, f64)> = (1..=12_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn_setup, &seed);
+    // One row outside the filter, so a snapshot that ignored the WHERE would
+    // deliver it and be caught.
+    sql_query("UPDATE orders SET status = 'void' WHERE id = 7")
+        .execute(&mut conn_setup)
+        .expect("take one row out of the answer");
+
+    // A page budget below one row's size, so the answer only arrives complete
+    // if the read pages. A single-page read would pass with the paging deleted.
+    let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(1);
+    let subscription_id = match engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT * FROM orders WHERE lower(status) = 'paid'",
+            ),
+            (),
+        )
+        .expect("captured registration")
+    {
+        Registered {
+            subscription_id,
+            tier: Tier::KeyedRows { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected a keyed capture, got {other:?}"),
+    };
+
+    let snapshot = engine
+        .snapshot(subscription_id)
+        .expect("snapshot reads")
+        .expect("the query exists");
+    match snapshot {
+        SnapshotResult::Rows {
+            columns,
+            rows,
+            checkpoint,
+        } => {
+            assert_eq!(columns, vec!["id", "price", "quantity", "status"]);
+            let ids: Vec<i64> = rows
+                .iter()
+                .map(|row| match row[0] {
+                    Value::Int(id) => id,
+                    ref other => panic!("id should decode as an integer, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                ids,
+                (1..=12_i64).filter(|id| *id != 7).collect::<Vec<_>>(),
+                "every matching row and only the matching rows"
+            );
+            assert!(
+                checkpoint.is_some(),
+                "the starting rows are anchored to a position in the change stream, \
+                 which is what lets a consumer replay from there without a gap"
+            );
+        }
+        other => panic!("a keyed capture snapshots as rows, got {other:?}"),
+    }
+}
+
+/// A keyless change replaces a keyed read and the sync connector resolves the
+/// complete row read in the same dispatch.
+#[test]
+#[ignore = "requires Docker, run with --ignored"]
+fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn_setup = common::pg_connect(port);
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0)]);
+
+    let mut engine = build_engine(catalog(), build_pool(port));
+    let subscription_id = match engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT * FROM orders WHERE lower(status) = 'paid'",
+            ),
+            (),
+        )
+        .expect("captured registration")
+    {
+        Registered {
+            subscription_id,
+            tier: Tier::KeyedRows { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected a keyed capture, got {other:?}"),
+    };
+
+    let events = parse_message(r#"{"action":"U","schema":"public","table":"orders"}"#);
+    let notifications = engine
+        .consumers(&events[0])
+        .expect("keyless change transitions and re-reads");
+
+    assert_eq!(notifications.transitions.len(), 1);
+    assert_eq!(
+        notifications.transitions[0].subscription_id,
+        subscription_id
+    );
+    assert_eq!(notifications.transitions[0].from, TierKind::KeyedRows);
+    let Tier::WholeRows { tables, .. } = &notifications.transitions[0].to else {
+        panic!("expected whole-row replacement")
+    };
+    assert_eq!(tables.len(), 1);
+    assert_eq!(
+        notifications.transitions[0].reason,
+        MaintenanceStopReason::KeyedChangeWithoutKey {
+            table_id: tables[0],
+        }
+    );
+    let mut ids: Vec<_> = notifications
+        .rows_updates
+        .iter()
+        .flat_map(|update| &update.rows)
+        .map(|row| match row[0] {
+            Value::Int(id) => id,
+            ref other => panic!("id should decode as an integer, got {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+    assert!(notifications.triggers.is_empty());
+}
+
+/// The sync wrapper seeds grouped extrema and resolves a displaced group.
+#[test]
+#[ignore = "requires Docker, run with --ignored"]
+fn grouped_min_snapshots_and_rereads_one_group_sync() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0), (2, 9.0), (3, 11.0)]);
+    // Diesel has no DDL query builder.
+    sql_query(r"ALTER TABLE orders ADD COLUMN bucket BYTEA NOT NULL DEFAULT '\x01'")
+        .execute(&mut conn)
+        .expect("add byte group");
+    diesel::update(grouped_schema::orders::table.find(3))
+        .set(grouped_schema::orders::bucket.eq(vec![2u8]))
+        .execute(&mut conn)
+        .expect("seed second group");
+    let _ = common::drain_slot(&mut conn, SLOT);
+
+    let grouped_catalog = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            price FLOAT,
+            quantity INT,
+            status TEXT,
+            bucket BYTEA
+        );",
+    )
+    .expect("parse grouped catalog");
+    let mut engine = build_engine(grouped_catalog, build_pool(port));
+    let subscription = match engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(
+                1u64,
+                "SELECT bucket, MIN(price) FROM orders GROUP BY bucket",
+            ),
+            (),
+        )
+        .expect("grouped min registers")
+    {
+        Registered {
+            subscription_id,
+            tier: Tier::GroupedScalar { .. },
+            ..
+        } => subscription_id,
+        other => panic!("expected grouped scalar tier, got {other:?}"),
+    };
+    let snapshot = engine
+        .snapshot(subscription)
+        .expect("snapshot reads")
+        .expect("subscription exists");
+    let SnapshotResult::GroupedAggregate { updates, .. } = snapshot else {
+        panic!("expected grouped aggregate snapshot")
+    };
+    assert_eq!(updates.len(), 2);
+    let bucket_one = updates
+        .iter()
+        .find(|update| {
+            update.change
+                == AggregateValueChange::Set(AggregateResultValue::Scalar(Value::Float(5.0)))
+        })
+        .and_then(|update| update.group.clone())
+        .expect("first byte group");
+
+    diesel::delete(grouped_schema::orders::table.find(1))
+        .execute(&mut conn)
+        .expect("delete current minimum");
+    let events: Vec<_> = common::drain_slot(&mut conn, SLOT)
+        .iter()
+        .flat_map(|message| parse_message(message))
+        .collect();
+    let output = engine.consumers(&events[0]).expect("group re-read");
+    assert!(output.triggers.is_empty());
+    assert_eq!(output.aggregate_updates.len(), 1);
+    assert_eq!(
+        output.aggregate_updates[0].group.as_deref(),
+        Some(bucket_one.as_slice())
+    );
+    assert_eq!(
+        output.aggregate_updates[0].change,
+        AggregateValueChange::Set(AggregateResultValue::Scalar(Value::Float(9.0)))
     );
 }

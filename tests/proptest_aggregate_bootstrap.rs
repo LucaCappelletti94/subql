@@ -1,8 +1,8 @@
-//! Property: for every `AggSpec` and every starting table, seeding an
-//! accumulator from the bootstrap component row equals a direct aggregate
-//! recompute over that table. This pins `AggAccumulator::seed_from_row`'s
-//! component-to-slot mapping against textbook aggregate math and catches
-//! any future `AggSpec` variant that decodes its components wrong.
+//! Property: for every `AggSpec` and every starting table, the value the engine
+//! holds after being given the bootstrap component row equals a direct
+//! aggregate recompute over that table. This pins the component-to-slot
+//! mapping against textbook aggregate math and catches any future `AggSpec`
+//! variant that decodes its components wrong.
 //!
 //! subql has no database, so "run the bootstrap SQL" is modeled by
 //! computing the component cells (`c`, `s`, `sq`) a correct executor would
@@ -12,8 +12,13 @@
 #![allow(clippy::unwrap_used)]
 
 use proptest::prelude::*;
+use sql_traits::structs::ParserDB;
+use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
-use subql::{AggAccumulator, AggSpec, AggValue};
+use subql::testing::TestEvent;
+use subql::{AggSpec, AggValue, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+
+const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT);";
 
 /// Component cells the bootstrap query returns for `amounts` (None = NULL
 /// `amount`). Bounded amounts keep `sum` and `sum_sq` exact in `f64`.
@@ -93,17 +98,58 @@ fn oracle(spec: &AggSpec, c: &Components) -> AggValue {
     }
 }
 
-fn all_specs() -> Vec<AggSpec> {
+/// Every aggregate the in-process family maintains, as the SQL that registers
+/// it paired with the spec the oracle reads.
+fn all_specs() -> Vec<(&'static str, AggSpec)> {
     vec![
-        AggSpec::CountStar,
-        AggSpec::CountColumn { column: 1 },
-        AggSpec::Sum { column: 1 },
-        AggSpec::Avg { column: 1 },
-        AggSpec::VarPop { column: 1 },
-        AggSpec::VarSamp { column: 1 },
-        AggSpec::StddevPop { column: 1 },
-        AggSpec::StddevSamp { column: 1 },
+        ("SELECT COUNT(*) FROM t", AggSpec::CountStar),
+        (
+            "SELECT COUNT(amount) FROM t",
+            AggSpec::CountColumn { column: 1 },
+        ),
+        ("SELECT SUM(amount) FROM t", AggSpec::Sum { column: 1 }),
+        ("SELECT AVG(amount) FROM t", AggSpec::Avg { column: 1 }),
+        (
+            "SELECT VAR_POP(amount) FROM t",
+            AggSpec::VarPop { column: 1 },
+        ),
+        (
+            "SELECT VAR_SAMP(amount) FROM t",
+            AggSpec::VarSamp { column: 1 },
+        ),
+        (
+            "SELECT STDDEV_POP(amount) FROM t",
+            AggSpec::StddevPop { column: 1 },
+        ),
+        (
+            "SELECT STDDEV_SAMP(amount) FROM t",
+            AggSpec::StddevSamp { column: 1 },
+        ),
     ]
+}
+
+/// Register `sql` on `db`, hand it `row` as its starting numbers, and answer
+/// with the value it then holds. Nothing has been folded against it, so the
+/// read cannot have raced a change and needs no stream position.
+fn seeded_value(db: &ParserDB, sql: &str, row: &[Value<Postgres>]) -> AggValue {
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db.clone(), PostgreSqlDialect {});
+    let registered = engine
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql))
+        .unwrap();
+    let updates = subql::Install::install(
+        &mut engine,
+        registered.subscription_id,
+        subql::AggregateSeedInstall {
+            rows: vec![row.to_vec()],
+            read_at: None,
+        },
+    )
+    .expect("the starting numbers land");
+    assert_eq!(updates.len(), 1);
+    updates[0]
+        .folded_value()
+        .expect("ungrouped install sets a value")
 }
 
 proptest! {
@@ -116,11 +162,11 @@ proptest! {
             0..=50,
         ),
     ) {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
         let c = components(&amounts);
-        for spec in all_specs() {
-            let seeded = AggAccumulator::seed_from_row(&spec, &seed_row(&spec, &c));
+        for (sql, spec) in all_specs() {
             prop_assert_eq!(
-                seeded.value(),
+                seeded_value(&db, sql, &seed_row(&spec, &c)),
                 oracle(&spec, &c),
                 "seed mismatch for {:?} over {:?}", spec, amounts
             );

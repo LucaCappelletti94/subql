@@ -479,7 +479,7 @@ proptest! {
                     && notifs.deleted().is_empty(),
                 "unsubscribed table should notify nobody",
             );
-            prop_assert!(engine.aggregate_deltas(&event).expect("no agg path").is_empty());
+            prop_assert!(engine.aggregate_updates(&event).expect("no agg path").is_empty());
             prop_assert!(engine.dispatch(&event).expect("dispatch ok").notified().is_empty());
         }
     }

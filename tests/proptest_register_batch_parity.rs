@@ -42,8 +42,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::testing::TestEvent;
 use subql::{
-    DefaultIds, EvictionPolicy, RegisterError, RegisterResult, SubscriptionEngine,
-    SubscriptionRequest, SubscriptionScope, SubscriptionsView,
+    DefaultIds, EvictionPolicy, RegisterError, Registered, SubscriptionEngine, SubscriptionRequest,
+    SubscriptionScope, SubscriptionsView,
 };
 
 const CATALOG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
@@ -130,7 +130,7 @@ fn lowest_consumer_evictor(
         .map(|m| m.subscription_id)
 }
 
-/// Per-index equality check. `RegisterResult` derives `PartialEq` and
+/// Per-index equality check. `Registered` derives `PartialEq` and
 /// is compared directly. `RegisterError` does NOT derive `PartialEq`,
 /// so we project it to a `(discriminant, payload)` tuple that captures
 /// every variant + interesting field.
@@ -169,8 +169,8 @@ fn err_signature(e: &RegisterError) -> (u8, String) {
 }
 
 fn assert_results_match(
-    batch_results: &[Result<RegisterResult, RegisterError>],
-    seq_results: &[Result<RegisterResult, RegisterError>],
+    batch_results: &[Result<Registered, RegisterError>],
+    seq_results: &[Result<Registered, RegisterError>],
 ) -> Result<(), TestCaseError> {
     prop_assert_eq!(
         batch_results.len(),
@@ -180,7 +180,7 @@ fn assert_results_match(
     for (i, (b, s)) in batch_results.iter().zip(seq_results.iter()).enumerate() {
         match (b, s) {
             (Ok(br), Ok(sr)) => {
-                prop_assert_eq!(br, sr, "RegisterResult divergence at index {}", i);
+                prop_assert_eq!(br, sr, "Registered divergence at index {}", i);
             }
             (Err(be), Err(se)) => {
                 prop_assert_eq!(
@@ -228,7 +228,7 @@ fn assert_engine_state_match(
 fn run_sequential(
     engine: &mut Engine,
     specs: Vec<SubscriptionRequest<DefaultIds, Postgres>>,
-) -> Vec<Result<RegisterResult, RegisterError>> {
+) -> Vec<Result<Registered, RegisterError>> {
     specs.into_iter().map(|s| engine.register(s)).collect()
 }
 

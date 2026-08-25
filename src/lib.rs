@@ -7,16 +7,16 @@
 extern crate alloc;
 
 // Re-export public API
-pub use compiler::{AggSpec, QueryProjection};
+pub use compiler::{AggHaving, AggSpec, HavingFunction, HavingOp, HavingSubject, QueryProjection};
 pub use errors::*;
 #[cfg(feature = "pg-sqlite-emu")]
 pub use pg_sqlite_emu::{PgSqliteEmuError, PgSqliteEmuSource};
 #[cfg(feature = "pg-streaming")]
 pub use polling::{PollingPgCdcConfig, PollingPgCdcError, PollingPgCdcSource};
-pub use runtime::{
-    agg_delta_for_row, AggKernel, AvgKernel, CountColumnKernel, CountKernel, SubscriptionEngine,
-    SumKernel,
+pub use runtime::aggregate::{
+    DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ, DEFAULT_MAX_GROUPS_PER_AGGREGATE,
 };
+pub use runtime::SubscriptionEngine;
 #[cfg(feature = "sqlite-cdc")]
 pub use sqlite_cdc::{SqliteCdcError, SqliteCdcSource};
 pub use sqlite_cdc::{SqliteChangesetEvent, SqliteChangesetParser};

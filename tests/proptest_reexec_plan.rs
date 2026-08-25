@@ -2,17 +2,17 @@
 //! single-table scalar `MIN`/`MAX` queries.
 //!
 //! The classifier (`src/reexec/plan.rs::build_plan`) is reached
-//! through the public `ReExecEngine::register` entry point: queries
+//! through the public `SubscriptionEngine::register` entry point: queries
 //! the core engine rejects (because they aren't delta-composable) fall
 //! through to `build_plan`, which returns either a `Partial` plan for
 //! single-table scalar MIN/MAX or an `UnsupportedSql` error. Anything
 //! the engine accepts directly (rows, COUNT/SUM/AVG, view-relative
-//! deltas) is surfaced via `Registered::Engine` and bypasses this code
+//! deltas) is surfaced via an in-process tier and bypasses this code
 //! path entirely.
 //!
 //! Properties tested
 //! 1. **Every `SELECT {MIN,MAX}(col) FROM orders [WHERE ...]` over any
-//!    typed column yields `Registered::ReExec`**, never the engine
+//!    typed column yields `Tier::Scalar`**, never the engine
 //!    variant and never an error. `MIN`/`MAX` are orderable across
 //!    every cell type, so neither the classifier nor the engine has
 //!    grounds to reject them.
@@ -22,7 +22,7 @@
 //!    `BuiltinKind::String`.
 //! 3. **The returned SQL carries the canonical projection alias `v`.**
 //!    Materializers load the scalar back by that alias.
-//! 4. **Distinct queries get distinct `query_id`s within one engine.**
+//! 4. **Distinct queries get distinct `subscription_id`s within one engine.**
 
 #![allow(clippy::unwrap_used, clippy::print_stdout)]
 
@@ -32,18 +32,17 @@ use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{BuiltinKind, Postgres};
-use subql::reexec::{ReExecEngine, Registered};
 use subql::testing::TestEvent;
-use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use subql::{DefaultIds, Registered, SubscriptionEngine, SubscriptionRequest, Tier};
 
 const CATALOG_DDL: &str = "CREATE TABLE orders (\
     id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 
-type Engine = ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn fresh_engine() -> Engine {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(CATALOG_DDL).unwrap();
-    ReExecEngine::new(SubscriptionEngine::new(catalog, PostgreSqlDialect {}))
+    SubscriptionEngine::new(catalog, PostgreSqlDialect {})
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -190,7 +189,7 @@ proptest! {
     })]
 
     /// Every well-formed `MIN`/`MAX` query against a typed numeric
-    /// column returns `Registered::ReExec`, carries the column's
+    /// column returns `Tier::Scalar`, carries the column's
     /// declared type, and emits a re-exec SQL string containing the
     /// canonical alias `v`.
     #[test]
@@ -204,9 +203,8 @@ proptest! {
             .unwrap_or_else(|e| panic!("`{sql}` should classify as ReExec, got error: {e:?}"));
 
         match registered {
-            Registered::ReExec {
-                column_kind,
-                sql: reexec_sql,
+            Registered {
+                tier: Tier::Scalar { column_kind, sql: reexec_sql },
                 ..
             } => {
                 prop_assert_eq!(
@@ -234,7 +232,7 @@ proptest! {
     }
 
     /// Distinct re-exec queries in the same engine get distinct
-    /// `query_id`s. Reusing the same SQL is allowed to dedup or not.
+    /// `subscription_id`s. Reusing the same SQL is allowed to dedup or not.
     /// This test only asserts uniqueness when the SQL strings differ
     /// after the classifier's canonical rendering, so we restrict to
     /// `(agg, col)` combinations that produce distinct rendered SQL.
@@ -252,10 +250,14 @@ proptest! {
                 let registered = engine
                     .register(SubscriptionRequest::<DefaultIds, Postgres>::new(i as u64, sql.clone()))
                     .unwrap();
-                if let Registered::ReExec { query_id, .. } = registered {
+                if let Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } = registered {
                     prop_assert!(
-                        seen_qids.insert(query_id),
-                        "duplicate query_id {query_id} for distinct SQL `{sql}`",
+                        seen_qids.insert(subscription_id),
+                        "duplicate subscription_id {subscription_id} for distinct SQL `{sql}`",
                     );
                 }
                 continue;

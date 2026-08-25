@@ -137,7 +137,8 @@ fn uuid_consumer_ids_survive_snapshot_restore() {
     {
         let mut engine: SubscriptionEngine<TestEvent<Postgres>, UuidIds, ParserDB> =
             SubscriptionEngine::with_storage(catalog(), PostgreSqlDialect {}, path.clone())
-                .expect("with_storage");
+                .expect("with_storage")
+                .0;
         engine
             .register(SubscriptionRequest::<UuidIds, Postgres>::new(
                 consumer,
@@ -150,7 +151,8 @@ fn uuid_consumer_ids_survive_snapshot_restore() {
     // Fresh engine over the same directory restores the binding from disk.
     let mut restored: SubscriptionEngine<TestEvent<Postgres>, UuidIds, ParserDB> =
         SubscriptionEngine::with_storage(catalog(), PostgreSqlDialect {}, path)
-            .expect("restore with_storage");
+            .expect("restore with_storage")
+            .0;
 
     let notifs = restored.consumers(&insert_event(orders, 1, 250)).unwrap();
     assert_eq!(notifs.inserted(), vec![consumer]);

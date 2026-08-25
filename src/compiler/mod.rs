@@ -19,6 +19,6 @@ pub use parser::{
     parse_compile_normalize_and_prefilter_with_binds, CompiledQuery, MAX_TERMS_PER_FILTER,
 };
 pub use prefilter::{PlannerAtom, PlannerValue, PrefilterPlan};
-pub use sql_shape::{AggSpec, QueryProjection};
+pub use sql_shape::{AggHaving, AggSpec, HavingFunction, HavingOp, HavingSubject, QueryProjection};
 pub use tristate::Tri;
 pub use vm::{Vm, VmError};

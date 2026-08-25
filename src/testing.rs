@@ -12,7 +12,7 @@
 use alloc::vec::Vec;
 
 use crate::backend::{Backend, CdcEvent, RowKind, Value};
-use crate::checkpoint::NoCheckpoint;
+use crate::checkpoint::{Checkpoint, NoCheckpoint};
 use crate::{ColumnId, EventKind, TableId};
 use sql_traits::prelude::DatabaseLike;
 
@@ -30,7 +30,7 @@ use sql_traits::prelude::DatabaseLike;
 /// * [`RowKind::Pk`] on a `col` not listed in `pk_columns` returns
 ///   [`Value::Missing`], matching the design contract.
 #[derive(Clone, Debug)]
-pub struct TestEvent<B: Backend> {
+pub struct TestEvent<B: Backend, C: Checkpoint = NoCheckpoint> {
     /// Event kind ([`EventKind::Insert`], [`EventKind::Update`],
     /// [`EventKind::Delete`], [`EventKind::Truncate`]).
     pub kind: EventKind,
@@ -47,9 +47,13 @@ pub struct TestEvent<B: Backend> {
     /// Pre-image values, index-aligned with [`ColumnId`]. Empty for
     /// insert / truncate.
     pub old_row: Vec<Value<B>>,
+    /// Position in the change stream. `None` unless
+    /// [`with_checkpoint`](Self::with_checkpoint) set one, which is what
+    /// the default `C = NoCheckpoint` leaves it at.
+    pub checkpoint: Option<C>,
 }
 
-impl<B: Backend> TestEvent<B> {
+impl<B: Backend, C: Checkpoint> TestEvent<B, C> {
     /// Build an [`EventKind::Insert`] event for `table_id` carrying
     /// `new_row`. `pk_columns` defaults to empty (chain
     /// [`with_pk_columns`](Self::with_pk_columns) when the test needs a
@@ -63,6 +67,7 @@ impl<B: Backend> TestEvent<B> {
             changed_columns: Vec::new(),
             new_row,
             old_row: Vec::new(),
+            checkpoint: None,
         }
     }
 
@@ -76,6 +81,7 @@ impl<B: Backend> TestEvent<B> {
             changed_columns: Vec::new(),
             new_row,
             old_row,
+            checkpoint: None,
         }
     }
 
@@ -90,6 +96,7 @@ impl<B: Backend> TestEvent<B> {
             changed_columns: Vec::new(),
             new_row: Vec::new(),
             old_row,
+            checkpoint: None,
         }
     }
 
@@ -103,6 +110,7 @@ impl<B: Backend> TestEvent<B> {
             changed_columns: Vec::new(),
             new_row: Vec::new(),
             old_row: Vec::new(),
+            checkpoint: None,
         }
     }
 
@@ -121,6 +129,13 @@ impl<B: Backend> TestEvent<B> {
         changed_columns: impl IntoIterator<Item = ColumnId>,
     ) -> Self {
         self.changed_columns = changed_columns.into_iter().collect();
+        self
+    }
+
+    /// Place the event at `checkpoint` in the change stream.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: C) -> Self {
+        self.checkpoint = Some(checkpoint);
         self
     }
 
@@ -148,9 +163,9 @@ impl<B: Backend> TestEvent<B> {
     }
 }
 
-impl<B: Backend> CdcEvent for TestEvent<B> {
+impl<B: Backend, C: Checkpoint> CdcEvent for TestEvent<B, C> {
     type Backend = B;
-    type Checkpoint = NoCheckpoint;
+    type Checkpoint = C;
 
     fn kind(&self) -> EventKind {
         self.kind
@@ -158,8 +173,8 @@ impl<B: Backend> CdcEvent for TestEvent<B> {
     fn table_id<DB: DatabaseLike>(&self, _db: &DB) -> TableId {
         self.table_id
     }
-    fn checkpoint(&self) -> Option<NoCheckpoint> {
-        None
+    fn checkpoint(&self) -> Option<C> {
+        self.checkpoint.clone()
     }
     fn pk_columns<DB: DatabaseLike>(&self, _db: &DB) -> Vec<ColumnId> {
         self.pk_columns.clone()

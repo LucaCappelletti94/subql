@@ -23,15 +23,17 @@ use diesel::{sql_query, Connection, RunQueryDsl, SqliteConnection};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
-use subql::reexec::{AutoResolvingEngine, DieselConnector, ReExecEngine, Registered};
+use subql::reexec::{AutoResolvingEngine, DieselConnector, SyncMode};
 use subql::testing::TestEvent;
-use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
+use subql::{
+    catalog_helpers, DefaultIds, Registered, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
+};
 
 type Engine = AutoResolvingEngine<
     TestEvent<Postgres>,
     DefaultIds,
     ParserDB,
-    DieselConnector<SqliteConnection, Postgres>,
+    SyncMode<DieselConnector<SqliteConnection, Postgres>>,
 >;
 
 fn catalog() -> ParserDB {
@@ -87,7 +89,7 @@ fn build_engine(conn: SqliteConnection) -> (Engine, TableId) {
         PostgreSqlDialect {},
     );
     (
-        AutoResolvingEngine::new(ReExecEngine::new(inner), DieselConnector::new(conn)),
+        AutoResolvingEngine::new(inner, SyncMode(DieselConnector::new(conn))),
         tid,
     )
 }
@@ -100,10 +102,22 @@ fn register_min(e: &mut Engine, bootstrap: Value<Postgres>) -> u64 {
         )
         .unwrap()
     {
-        Registered::ReExec { query_id, .. } => query_id,
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar { .. },
+            ..
+        } => subscription_id,
         other => panic!("expected ReExec, got Engine, got {other:?}"),
     };
-    assert!(e.install(qid, bootstrap));
+    assert!(subql::Install::install(
+        e,
+        qid,
+        subql::ScalarInstall {
+            value: bootstrap,
+            checkpoint: None::<subql::NoCheckpoint>
+        }
+    )
+    .is_ok());
     qid
 }
 
@@ -123,7 +137,7 @@ fn delete_of_extreme_resolves_via_diesel_connector() {
         "AutoResolvingEngine drains triggers internally"
     );
     assert_eq!(n.scalar_updates.len(), 1, "expected MIN to be re-executed");
-    assert_eq!(n.scalar_updates[0].query_id, qid);
+    assert_eq!(n.scalar_updates[0].subscription_id, qid);
     assert_eq!(
         n.scalar_updates[0].value,
         Value::Float(9.0),
@@ -141,7 +155,7 @@ fn empty_set_min_decodes_as_null() {
 
     let n = e.consumers(&delete_event(tid, 1, 5.0)).unwrap();
     assert_eq!(n.scalar_updates.len(), 1);
-    assert_eq!(n.scalar_updates[0].query_id, qid);
+    assert_eq!(n.scalar_updates[0].subscription_id, qid);
     assert_eq!(
         n.scalar_updates[0].value,
         Value::Null,

@@ -130,7 +130,8 @@ pub enum EventKind {
     /// **Fanout semantics**: TRUNCATE does not carry a row image, so `consumers()`
     /// skips predicate VM evaluation and notifies row subscriptions for the
     /// table. Aggregate subscriptions are handled separately by
-    /// `aggregate_deltas()`, which returns `TruncateRequiresReset`.
+    /// `aggregate_updates()`, which empties each of that table's held values
+    /// and reports the ones that moved.
     Truncate,
 }
 
@@ -174,8 +175,8 @@ pub struct SubscriptionRequest<I: IdTypes, B: crate::backend::Backend = crate::b
     /// another identity receives nothing it is not permitted to see, it only
     /// fails to receive its own rows.
     pub(crate) subscriber: Option<crate::backend::Value<B>>,
-    /// The values this subscriber currently matches, grouped by the column each
-    /// membership subquery compares.
+    /// The value rows this subscriber currently matches, grouped by the columns
+    /// each membership subquery compares.
     ///
     /// Read them from the membership table, which
     /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms)
@@ -184,15 +185,22 @@ pub struct SubscriptionRequest<I: IdTypes, B: crate::backend::Backend = crate::b
     /// supplies it, because the membership never changed, so every row inserted
     /// under that value afterwards is silently never delivered.
     ///
-    /// Grouped by column name because a filter may name several subqueries and
-    /// the compared column is the one name both sides share. The list is taken on
-    /// trust, and only a membership row naming the same pair ever moves it, so it
-    /// bounds this subscriber's own results and nobody else's. Neither direction
-    /// self-corrects: a missing value admits nobody until a membership row adds
-    /// it, and a value the subscriber does not match keeps admitting rows to it,
-    /// with no row to withdraw a value whose membership never existed.
-    pub(crate) term_values: alloc::vec::Vec<(String, alloc::vec::Vec<crate::backend::Value<B>>)>,
+    /// Grouped by column names because a filter may name several subqueries and
+    /// the compared columns are the names both sides share. The list is taken on
+    /// trust, and only a membership row naming the same values ever moves it, so
+    /// it bounds this subscriber's own results and nobody else's. Neither
+    /// direction self-corrects: a missing row admits nobody until a membership
+    /// row adds it, and a row the subscriber does not match keeps admitting rows
+    /// to it, with no row to withdraw values whose membership never existed.
+    pub(crate) term_values: StatedTermValues<B>,
 }
+
+/// Value rows stated per membership term: the compared column names, then the
+/// rows, each following the names' order.
+pub type StatedTermValues<B> = alloc::vec::Vec<(
+    alloc::vec::Vec<String>,
+    alloc::vec::Vec<alloc::vec::Vec<crate::backend::Value<B>>>,
+)>;
 
 impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
     /// Create a new subscription request with default scope (`Durable`)
@@ -251,29 +259,96 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
         self
     }
 
-    /// State the values this subscriber currently matches for `column`, the
-    /// column one of the filter's membership subqueries compares (default: none
-    /// for every column).
+    /// State the value rows this subscriber currently matches for `columns`,
+    /// the columns one of the filter's membership subqueries compares (default:
+    /// none for every term).
     ///
-    /// Both the column and the read that yields the values come from
+    /// One name and one value per row entry for the ordinary single-column
+    /// term, several for a term whose `EXISTS` pairs span a composite key. Each
+    /// row follows the order of `columns`, which may differ from the filter's
+    /// own order: the engine matches by name. With a static diesel schema,
+    /// prefer `term_values_for` (feature `diesel-typed`), which takes the
+    /// columns themselves and cannot misspell a name.
+    ///
+    /// Both the columns and the read that yields the rows come from
     /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms),
     /// which reads the membership table. Deriving them from the snapshot rows
     /// instead loses every value whose rows do not exist yet, permanently.
     ///
-    /// A value the subscriber does not match is trusted just as readily, and
-    /// keeps admitting rows to it until a membership row naming that pair is
+    /// A row the subscriber does not match is trusted just as readily, and
+    /// keeps admitting rows to it until a membership row naming those values is
     /// deleted. A membership that never existed has none to delete.
     ///
-    /// Called once per compared column. Calling it twice for one column adds to
-    /// what that column already carries rather than replacing it.
+    /// Called once per term. Calling it twice for one term's columns adds to
+    /// what those columns already carry rather than replacing it.
     #[must_use]
-    pub fn term_values(
+    pub fn term_values<C: Into<String>>(
         mut self,
-        column: impl Into<String>,
-        values: alloc::vec::Vec<crate::backend::Value<B>>,
+        columns: alloc::vec::Vec<C>,
+        rows: alloc::vec::Vec<alloc::vec::Vec<crate::backend::Value<B>>>,
     ) -> Self {
-        self.term_values.push((column.into(), values));
+        self.term_values
+            .push((columns.into_iter().map(Into::into).collect(), rows));
         self
+    }
+    /// Declare that downstream Rust code executes database reads under this
+    /// consumer's database identity.
+    ///
+    /// Required for row re-reads on a table with row-level security. This is a
+    /// compile-time request type, not a runtime flag.
+    #[must_use]
+    pub const fn database_reads_per_consumer(self) -> PerConsumerDatabaseReads<I, B> {
+        PerConsumerDatabaseReads(self)
+    }
+}
+
+/// Input accepted by [`SubscriptionEngine::register`](crate::SubscriptionEngine::register).
+///
+/// The associated constant states whether downstream Rust code executes every
+/// database read under the individual consumer's database identity.
+pub trait RegistrationRequest<I: IdTypes, B: crate::backend::Backend> {
+    /// `true` only when database reads are isolated per consumer.
+    const DATABASE_READS_PER_CONSUMER: bool;
+
+    /// Recover the SQL request consumed by registration.
+    fn into_request(self) -> SubscriptionRequest<I, B>;
+
+    /// Lifetime scope before registration consumes the request.
+    fn scope(&self) -> SubscriptionScope<I>;
+}
+
+impl<I: IdTypes, B: crate::backend::Backend> RegistrationRequest<I, B>
+    for SubscriptionRequest<I, B>
+{
+    const DATABASE_READS_PER_CONSUMER: bool = false;
+
+    fn into_request(self) -> Self {
+        self
+    }
+
+    fn scope(&self) -> SubscriptionScope<I> {
+        self.scope
+    }
+}
+
+/// A subscription request whose database reads are isolated per consumer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PerConsumerDatabaseReads<
+    I: IdTypes,
+    B: crate::backend::Backend = crate::backend::Postgres,
+>(SubscriptionRequest<I, B>);
+
+impl<I: IdTypes, B: crate::backend::Backend> RegistrationRequest<I, B>
+    for PerConsumerDatabaseReads<I, B>
+{
+    const DATABASE_READS_PER_CONSUMER: bool = true;
+
+    fn into_request(self) -> SubscriptionRequest<I, B> {
+        self.0
+    }
+
+    fn scope(&self) -> SubscriptionScope<I> {
+        self.0.scope
     }
 }
 
@@ -282,7 +357,7 @@ impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
 /// Default is `Reject`: registrations past the cap fail with
 /// [`crate::RegisterError::RegistryFull`]. Other variants make room for
 /// the incoming subscription by removing an existing one and surface the
-/// evicted [`SubscriptionId`]s in [`RegisterResult::evicted`].
+/// evicted [`SubscriptionId`]s in [`Registered::evicted`].
 ///
 /// For closure-based policies that pick the victim per-call (e.g. fair
 /// share across tenants, custom heuristics that read live activity
@@ -361,7 +436,7 @@ pub enum EvictionPolicy {
     #[default]
     Reject,
     /// Evict the oldest subscription (lowest `SubscriptionId`) and proceed.
-    /// Reports the evicted id via [`RegisterResult::evicted`].
+    /// Reports the evicted id via [`Registered::evicted`].
     ///
     /// See the [enum-level doctest](EvictionPolicy) for a runnable
     /// example.
@@ -688,27 +763,169 @@ impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
 /// Runnable component-seed query for an aggregate registration, bundling
 /// the SQL with its per-column decode kinds so the two cannot drift apart.
 ///
-/// [`sql`](Self::sql) projects the seed components aliased positionally
-/// (`c0`, `c1`, ...) in the order [`AggAccumulator::seed_from_row`]
-/// consumes them, and [`kinds`](Self::kinds) gives the decode kind per
-/// column `ci`. `COUNT` components are [`ScalarKind::Int`](crate::backend::ScalarKind::Int);
-/// `SUM` and `SUM(x*x)` components are
-/// [`ScalarKind::Float`](crate::backend::ScalarKind::Float), decoded as
-/// double to match the `f64` accumulator (since `SUM` promotes to
+/// [`sql`](Self::sql) projects [`group_columns`](Self::group_columns) group
+/// values first, then the seed components aliased positionally (`c0`, `c1`,
+/// ...) in the order
+/// [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall)
+/// consumes them, and
+/// [`kinds`](Self::kinds) gives the decode kind for every column in that same
+/// order. `COUNT` components are
+/// [`ScalarKind::Int`](crate::backend::ScalarKind::Int); `SUM` and `SUM(x*x)`
+/// components are [`ScalarKind::Float`](crate::backend::ScalarKind::Float),
+/// decoded as double to match the `f64` accumulator (since `SUM` promotes to
 /// `bigint`/`numeric`/`DECIMAL` depending on the backend).
+///
+/// An ungrouped seed returns exactly one row. A grouped one returns a row per
+/// group, and returns none at all over an empty table, where the ungrouped
+/// spelling still returns its empty-aggregate row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AggregateBootstrap {
-    /// Runnable single-row seed query with positionally-aliased columns.
+    /// Runnable seed query with positionally-aliased component columns.
     pub sql: String,
-    /// Per-column decode kinds, in column order.
+    /// Per-column decode kinds, in column order, group columns included.
     pub kinds: Vec<crate::backend::BuiltinKind>,
+    /// How many leading columns of each row are group values.
+    ///
+    /// Zero for an ungrouped aggregate, in which case every column is a
+    /// component and the query returns one row.
+    pub group_columns: usize,
 }
 
-/// Result of successful subscription registration
+/// What a registration produced: the identity, and the tier that maintains it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RegisterResult {
-    /// Engine-assigned subscription identifier
+pub struct Registered {
+    /// Engine-assigned identity, from the one counter every maintained answer
+    /// draws from.
     pub subscription_id: SubscriptionId,
+    /// How the answer is maintained, carrying whatever that tier needs.
+    pub tier: Tier,
+    /// Subscriptions evicted to make room for this registration.
+    ///
+    /// Empty under the default policy ([`EvictionPolicy::Reject`]) and when the
+    /// registry is below cap. Populated when an eviction policy freed space, so
+    /// a caller can tell the affected clients.
+    pub evicted: Vec<SubscriptionId>,
+    /// Why this answer needs a database read, in the compiler's own words.
+    ///
+    /// `None` for [`Tier::InProcess`], which needs no read. For every other
+    /// tier this is what the in-process evaluator said it could not do, which
+    /// is the only thing telling a caller why its query costs a read per
+    /// change rather than being answered from memory.
+    pub not_served_because: Option<String>,
+}
+
+impl Registered {
+    /// The registry's own record, for an answer it maintains in process.
+    ///
+    /// `None` for every tier that needs a read, which have no predicate and no
+    /// normalized statement to report.
+    #[must_use]
+    pub const fn served(&self) -> Option<&Served> {
+        match &self.tier {
+            Tier::InProcess(served) => Some(served),
+            Tier::Scalar { .. }
+            | Tier::GroupedScalar { .. }
+            | Tier::KeyedRows { .. }
+            | Tier::WholeRows { .. } => None,
+        }
+    }
+
+    /// The aggregate this registration maintains, when it maintains one.
+    ///
+    /// `None` for a row subscription and for every tier that needs a read.
+    #[must_use]
+    pub const fn aggregate_spec(&self) -> Option<&crate::AggSpec> {
+        match &self.tier {
+            Tier::InProcess(served) => served.aggregate_spec(),
+            Tier::Scalar { .. }
+            | Tier::GroupedScalar { .. }
+            | Tier::KeyedRows { .. }
+            | Tier::WholeRows { .. } => None,
+        }
+    }
+}
+
+/// How a registered answer is maintained, and what its tier hands back.
+///
+/// Every variant other than [`Self::InProcess`] needs a database read the
+/// engine cannot do itself, so it hands the caller the statement to run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Tier {
+    /// Maintained from the change stream alone, with no read at all.
+    ///
+    /// Rows or a fold: [`Served::projection`] says which, and a fold carries
+    /// the query that seeds it.
+    InProcess(Served),
+    /// A scalar extreme, re-read when the extreme itself leaves the answer.
+    Scalar {
+        /// SQL to run for the initial value and for any later trigger.
+        sql: String,
+        /// Decode hint for the scalar result.
+        column_kind: crate::backend::BuiltinKind,
+    },
+    /// Grouped extrema seeded together and re-read one displaced group at a time.
+    GroupedScalar {
+        /// SQL and decode kinds for the initial group map.
+        bootstrap: AggregateBootstrap,
+    },
+    /// One table's rows, re-read for the keys that changed.
+    KeyedRows {
+        /// The statement, unchanged: this tier promises exactly the rows the
+        /// caller asked for.
+        sql: String,
+        /// The one table this tier reads, and the only one that triggers it.
+        table_id: TableId,
+    },
+    /// The whole answer, re-read when any table it reads changes.
+    WholeRows {
+        /// The statement, unchanged.
+        sql: String,
+        /// Tables whose changes trigger a read.
+        tables: Vec<TableId>,
+    },
+}
+
+impl Tier {
+    /// This tier's bare name, for reporting and comparison.
+    #[must_use]
+    pub const fn kind(&self) -> TierKind {
+        match self {
+            Self::InProcess(_) => TierKind::InProcess,
+            Self::Scalar { .. } => TierKind::Scalar,
+            Self::GroupedScalar { .. } => TierKind::GroupedScalar,
+            Self::KeyedRows { .. } => TierKind::KeyedRows,
+            Self::WholeRows { .. } => TierKind::WholeRows,
+        }
+    }
+}
+
+/// Which read serves an answer, without the payload that goes with it.
+///
+/// [`Tier`] carries a statement and the tables behind it, which a stored record
+/// does not need twice: it keeps the caller's SQL and this, and the statement is
+/// planned again on load.
+///
+/// One of three spellings of the same ladder: [`Tier`] is the registration
+/// answer with payloads, [`TierKind`] is the bare name a transition reports,
+/// and this is the persisted subset (in-process answers are never stored as
+/// reads). A new tier must appear in all three, which is what the
+/// [`From<ReadTier>`](TierKind#impl-From<ReadTier>-for-TierKind) conversion
+/// and [`Tier::kind`] exist to keep honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReadTier {
+    /// A scalar extreme, re-read when the extreme leaves.
+    Scalar,
+    /// Grouped extrema with reads scoped to one displaced group.
+    GroupedScalar,
+    /// One table's rows, re-read for the keys that changed.
+    KeyedRows,
+    /// The whole answer, re-read when any table it reads changes.
+    WholeRows,
+}
+
+/// What the registry recorded for an answer it maintains itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Served {
     /// Table this subscription applies to
     pub table_id: TableId,
     /// Normalized/canonicalized SQL
@@ -719,27 +936,27 @@ pub struct RegisterResult {
     pub created_new_predicate: bool,
     /// Projection kind for this subscription
     pub projection: crate::compiler::sql_shape::QueryProjection,
-    /// Subscriptions evicted to make room for this registration.
-    ///
-    /// Empty under the default policy ([`EvictionPolicy::Reject`]) and
-    /// when the registry is below cap. Populated when an eviction policy
-    /// freed space. The caller may use this to notify the affected
-    /// clients (e.g. send an "evicted" signal over their transport).
-    pub evicted: Vec<SubscriptionId>,
     /// Component-seed query for the aggregate, for bootstrap or reset.
     /// `None` for a row subscription. Run [`AggregateBootstrap::sql`]
     /// (typing each column by [`AggregateBootstrap::kinds`]) and pass the
-    /// decoded row to [`AggAccumulator::seed_from_row`].
+    /// decoded row to
+    /// [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall).
     pub aggregate_bootstrap: Option<AggregateBootstrap>,
 }
 
-impl RegisterResult {
-    /// The aggregate spec when the registered query is an aggregate, else
-    /// `None` for a row-set (`SELECT *`) query.
+impl Served {
+    /// The aggregate spec when the registered query is an aggregate, grouped
+    /// or not, else `None` for a row-set (`SELECT *`) query.
+    ///
+    /// A grouped registration answers with its aggregate here and its group
+    /// columns on the projection, because every caller of this wants to know
+    /// which function is maintained rather than how many values of it there
+    /// are.
     #[must_use]
     pub const fn aggregate_spec(&self) -> Option<&crate::AggSpec> {
         match &self.projection {
-            crate::QueryProjection::Aggregate(spec) => Some(spec),
+            crate::QueryProjection::Aggregate(spec)
+            | crate::QueryProjection::GroupedAggregate { agg: spec, .. } => Some(spec),
             crate::QueryProjection::Rows => None,
         }
     }
@@ -765,6 +982,257 @@ pub struct UnregisterReport {
     pub removed_predicates: usize,
     /// Number of consumer dictionary entries removed
     pub removed_consumers: usize,
+    /// Number of re-read answers removed, which have no predicate of their own
+    pub removed_reads: usize,
+}
+/// Write a database result back into the registry.
+///
+/// `T` is a concrete Rust struct. Each supported struct has its own
+/// implementation, output and error type.
+pub trait Install<T> {
+    /// Value produced after the registry accepts `T`.
+    type Output;
+    /// Why the registry could not accept `T`.
+    type Error;
+
+    /// Apply `input` to `subscription_id`.
+    fn install(
+        &mut self,
+        subscription_id: SubscriptionId,
+        input: T,
+    ) -> Result<Self::Output, Self::Error>;
+}
+
+/// Result of a scalar SQL read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScalarInstall<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
+    /// Scalar returned by SQL.
+    pub value: crate::backend::Value<B>,
+    /// Position of the change that caused the read, when known.
+    pub checkpoint: Option<C>,
+}
+
+/// One page in a complete row result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstalledPage<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
+    /// Column names reported by the database.
+    pub columns: Vec<String>,
+    /// Rows in column order.
+    pub rows: Vec<Vec<crate::backend::Value<B>>>,
+    /// Whether another page follows.
+    pub more: bool,
+    /// Position the read is tied to, when known.
+    pub checkpoint: Option<C>,
+}
+
+/// Complete row result from one database read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WholeRowsInstall<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
+    /// Read generation used to group pages from one replacement.
+    pub generation: u64,
+    /// Pages in delivery order.
+    pub pages: Vec<InstalledPage<B, C>>,
+}
+
+/// One keyed row change returned by a database read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstalledRowDelta<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
+    /// Primary-key values in key-column order.
+    pub key: Vec<crate::backend::Value<B>>,
+    /// Current row, or `None` when the row left the result.
+    pub row: Option<Vec<crate::backend::Value<B>>>,
+    /// Position of the change that caused the read, when known.
+    pub checkpoint: Option<C>,
+}
+
+/// Keyed row changes from one database read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyedRowsInstall<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
+    /// Column names for `row`, in projection order.
+    pub columns: Vec<String>,
+    /// Changes in delivery order.
+    pub deltas: Vec<InstalledRowDelta<B, C>>,
+}
+
+/// Starting rows for an in-process aggregate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateSeedInstall<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
+    /// Decoded rows returned by the aggregate seed SQL.
+    ///
+    /// An ungrouped aggregate supplies exactly one row. A grouped aggregate
+    /// supplies one row per group.
+    pub rows: Vec<Vec<crate::backend::Value<B>>>,
+    /// Stream position taken before the read snapshot opened.
+    pub read_at: Option<C>,
+}
+
+/// Starting rows for a grouped extreme.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupedScalarSeedInstall<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
+    /// Group values, extreme and source-row count in bootstrap order.
+    pub rows: Vec<Vec<crate::backend::Value<B>>>,
+    /// Stream position taken before the read snapshot opened.
+    pub read_at: Option<C>,
+}
+
+/// Result of re-reading one displaced extreme.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupedScalarInstall<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
+    /// Opaque key of the group the SQL constrained.
+    pub group: Vec<u8>,
+    /// Current extreme and source-row count returned by the scoped SQL.
+    pub row: Vec<crate::backend::Value<B>>,
+    /// Position of the change that caused the read.
+    pub checkpoint: Option<C>,
+}
+
+/// A result struct does not match the registered tier or identity.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InstallError {
+    /// No re-read subscription has this identity.
+    #[error("subscription {0} is not a re-read subscription")]
+    UnknownSubscription(SubscriptionId),
+    /// The concrete input struct is for another tier.
+    #[error("subscription {subscription} does not accept {input}")]
+    WrongTier {
+        /// Subscription that was addressed.
+        subscription: SubscriptionId,
+        /// Concrete input struct the caller supplied.
+        input: &'static str,
+    },
+}
+
+/// Why aggregate starting rows could not be reconciled with changes during the
+/// database read.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AggregateInstallError {
+    /// No aggregate subscription with this id, or it was unregistered.
+    #[error("subscription {0} is not a live aggregate subscription")]
+    UnknownAggregate(SubscriptionId),
+    /// The subscription already holds a total. Reset it first.
+    #[error("subscription {0} is already seeded")]
+    AlreadySeeded(SubscriptionId),
+    /// Grouped starting rows or pending changes exceed the configured limit.
+    #[error("subscription {subscription} exceeds its {limit}-group limit")]
+    GroupLimit {
+        /// Grouped aggregate subscription.
+        subscription: SubscriptionId,
+        /// Configured maximum groups.
+        limit: usize,
+    },
+    /// Changes and the read cannot be ordered because a stream position is
+    /// missing on one side.
+    #[error("subscription {0} cannot order changes against the database read")]
+    PositionUnknown(SubscriptionId),
+    /// More changes arrived during the read than the registry kept.
+    #[error("subscription {subscription} held more than {cap} changes during the read")]
+    TooManyChangesDuringRead {
+        /// Aggregate subscription.
+        subscription: SubscriptionId,
+        /// Configured ceiling.
+        cap: usize,
+    },
+    /// This phase accepts exactly one ungrouped aggregate row.
+    #[error("ungrouped aggregate {subscription} needs one seed row, got {rows}")]
+    RowCount {
+        /// Aggregate subscription.
+        subscription: SubscriptionId,
+        /// Rows supplied.
+        rows: usize,
+    },
+    /// A grouped seed or replacement row has the wrong number of cells.
+    #[error(
+        "subscription {subscription} received a grouped row of {got} cells \
+         where {expected} were selected"
+    )]
+    GroupedRowArity {
+        /// Grouped aggregate subscription.
+        subscription: SubscriptionId,
+        /// Cells the seed or scoped read selects.
+        expected: usize,
+        /// Cells the row carried.
+        got: usize,
+    },
+    /// A grouped row's group values do not encode into a group key.
+    #[error("subscription {0} received group values that do not encode to a key")]
+    GroupKeyUnencodable(SubscriptionId),
+    /// A grouped row's source-row count is missing, non-integer, or not
+    /// positive.
+    #[error("subscription {0} received a grouped row without a positive source-row count")]
+    GroupedRowCount(SubscriptionId),
+    /// A scoped read delivered a group the registry was not waiting for.
+    #[error("subscription {0} received a scoped read it never asked for")]
+    UnexpectedGroupRead(SubscriptionId),
+    /// Aggregate state could not be rebuilt as a complete row read.
+    ///
+    /// Raised from the install paths when seed reconciliation cannot plan a
+    /// tier change. The dispatch path's twin lives on
+    /// [`DispatchError::TierTransition`](crate::DispatchError::TierTransition).
+    #[error("subscription {subscription} could not change tier: {message}")]
+    TierTransition {
+        /// Aggregate subscription.
+        subscription: SubscriptionId,
+        /// Planner or registry invariant that failed.
+        message: String,
+    },
+    /// Seed SQL returned the same encoded group twice.
+    #[error("subscription {0} received the same aggregate group twice")]
+    DuplicateGroup(SubscriptionId),
+}
+
+/// What reading the re-read answers' file restored, and what it could not.
+///
+/// Every restored answer comes back not knowing its value, so each one needs a
+/// read before it can report anything: this is that list as well as the record
+/// of what was dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RestoredReads {
+    /// Answers that came back, each needing a read to fill it in.
+    pub restored: Vec<RestoredRead>,
+    /// Answers that could not come back, with the reason.
+    pub dropped: Vec<DroppedRead>,
+}
+
+/// One answer that came back from the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredRead {
+    /// The identity it had before the restart, which it keeps.
+    pub subscription_id: SubscriptionId,
+    /// The tier planning its SQL chose this time.
+    pub tier: Tier,
+    /// Whether that tier differs from the one it was saved with.
+    pub tier_changed: bool,
+}
+
+/// One answer the file held that could not be restored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedRead {
+    /// The identity it had. A caller still holding it has nothing behind it.
+    pub subscription_id: SubscriptionId,
+    /// Its statement, so a caller can register it again if it wants to.
+    pub sql: String,
+    /// Why it could not come back.
+    pub reason: DropReason,
+}
+
+/// Why a saved answer could not be restored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DropReason {
+    /// A table it reads has a different shape than when it was saved.
+    TableChanged {
+        /// The table whose shape moved.
+        table_id: TableId,
+    },
+    /// A table it reads is not in the catalog at all any more.
+    TableGone {
+        /// The table the statement named.
+        table_id: TableId,
+    },
+    /// Its statement no longer plans: no tier can serve it.
+    Unplannable {
+        /// What planning said.
+        message: String,
+    },
 }
 
 /// Report from background merge operation
@@ -800,7 +1268,7 @@ pub trait SubscriptionRegistration<I: IdTypes, B: crate::backend::Backend>: Send
     fn register(
         &mut self,
         spec: SubscriptionRequest<I, B>,
-    ) -> Result<RegisterResult, crate::RegisterError>;
+    ) -> Result<Registered, crate::RegisterError>;
 
     /// Unregister a subscription by ID.
     ///
@@ -880,60 +1348,8 @@ pub trait DurableShardStore: Send {
     fn snapshot_table(&self, table_id: TableId) -> Result<(), crate::StorageError>;
 }
 
-/// Typed signed delta from an aggregate subscription.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum AggDelta {
-    /// COUNT(*) / COUNT(column) delta: always +/-1 per matching (non-NULL) row.
-    Count(i64),
-    /// SUM(column) delta: signed change in the column sum.
-    Sum(f64),
-    /// AVG(column) delta: both components needed to update a running average.
-    ///
-    /// Caller maintains `running_sum` and `running_count` separately:
-    /// ```text
-    /// running_sum   += sum_delta
-    /// running_count += count_delta
-    /// avg            = running_sum / running_count  (when running_count > 0)
-    /// ```
-    Avg { sum_delta: f64, count_delta: i64 },
-    /// VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP delta. Carries the
-    /// three components needed to update a running variance or standard
-    /// deviation.
-    ///
-    /// The kernel is the same for all four functions. The consumer
-    /// applies the appropriate derivation to the running tuple:
-    /// ```text
-    /// running_sum    += sum_delta
-    /// running_sum_sq += sum_sq_delta
-    /// running_count  += count_delta
-    ///
-    /// // population variance:
-    /// var_pop  = running_sum_sq / N - (running_sum / N)^2
-    /// // sample variance (N >= 2):
-    /// var_samp = (running_sum_sq - (running_sum)^2 / N) / (N - 1)
-    /// stddev_*  = sqrt(var_*)
-    /// ```
-    /// where `N = running_count`.
-    Stats {
-        sum_delta: f64,
-        sum_sq_delta: f64,
-        count_delta: i64,
-    },
-}
-
-#[derive(Clone, Copy, Debug)]
-enum AggKind {
-    Count,
-    Sum,
-    Avg,
-    VarPop,
-    VarSamp,
-    StddevPop,
-    StddevSamp,
-}
-
-/// Current value of an [`AggAccumulator`].
+/// Current value of an aggregate subscription, as the engine reports it on
+/// [`AggregateValueUpdate`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AggValue {
     /// `COUNT(*)` or `COUNT(col)`.
@@ -945,197 +1361,13 @@ pub enum AggValue {
     Real(Option<f64>),
 }
 
-/// Running value of an aggregate subscription, folded from [`AggDelta`]s and
-/// seeded from the registration's [`AggSpec`](crate::AggSpec).
-///
-/// ```
-/// use subql::{AggAccumulator, AggDelta, AggSpec, AggValue};
-///
-/// let mut count = AggAccumulator::from_spec(&AggSpec::CountStar);
-/// count.apply(&AggDelta::Count(3));
-/// count.apply(&AggDelta::Count(-1));
-/// assert_eq!(count.value(), AggValue::Count(2));
-/// assert_eq!(count.to_string(), "2");
-///
-/// let mut avg = AggAccumulator::from_spec(&AggSpec::Avg { column: 1 });
-/// avg.apply(&AggDelta::Avg { sum_delta: 10.0, count_delta: 4 });
-/// assert_eq!(avg.value(), AggValue::Real(Some(2.5)));
-/// ```
-#[derive(Clone, Debug)]
-pub struct AggAccumulator {
-    kind: AggKind,
-    count: i64,
-    sum: f64,
-    sum_sq: f64,
-}
-
-impl AggAccumulator {
-    /// Seed an accumulator for the aggregate described by `spec`.
-    #[must_use]
-    pub const fn from_spec(spec: &crate::AggSpec) -> Self {
-        use crate::AggSpec as S;
-        let kind = match spec {
-            S::CountStar | S::CountColumn { .. } => AggKind::Count,
-            S::Sum { .. } => AggKind::Sum,
-            S::Avg { .. } => AggKind::Avg,
-            S::VarPop { .. } => AggKind::VarPop,
-            S::VarSamp { .. } => AggKind::VarSamp,
-            S::StddevPop { .. } => AggKind::StddevPop,
-            S::StddevSamp { .. } => AggKind::StddevSamp,
-        };
-        Self {
-            kind,
-            count: 0,
-            sum: 0.0,
-            sum_sq: 0.0,
-        }
-    }
-
-    /// Seed an accumulator from a bootstrap component row produced by
-    /// [`AggregateBootstrap`](crate::AggregateBootstrap).
-    ///
-    /// Consumes the components in the documented column order: `[c]` for
-    /// COUNT, `[s]` for SUM, `[s, c]` for AVG, and `[s, sq, c]` for the
-    /// variance and stddev family. A zero-row result (COUNT `0`, NULL
-    /// sum components) seeds the empty-aggregate state, matching the
-    /// "set went empty" semantics of the re-execution family.
-    #[must_use]
-    pub fn seed_from_row<B: crate::backend::Backend>(
-        spec: &crate::AggSpec,
-        row: &[crate::backend::Value<B>],
-    ) -> Self {
-        use crate::AggSpec as S;
-        let mut acc = Self::from_spec(spec);
-        match spec {
-            S::CountStar | S::CountColumn { .. } => {
-                acc.count = row.first().and_then(|v| Self::seed_i64(v)).unwrap_or(0);
-            }
-            S::Sum { .. } => {
-                acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-            }
-            S::Avg { .. } => {
-                acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-                acc.count = row.get(1).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
-            }
-            S::VarPop { .. } | S::VarSamp { .. } | S::StddevPop { .. } | S::StddevSamp { .. } => {
-                acc.sum = row.first().and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-                acc.sum_sq = row.get(1).and_then(|v| Self::seed_f64(v)).unwrap_or(0.0);
-                acc.count = row.get(2).and_then(|v| Self::seed_i64(v)).unwrap_or(0);
-            }
-        }
-        acc
-    }
-
-    /// Decode a numeric component cell to `f64`. NULL/Missing/non-numeric
-    /// cells return `None` (the caller defaults them to `0.0`, safe because
-    /// a zero-count accumulator reports the empty state regardless of sum).
-    #[allow(clippy::cast_precision_loss)]
-    fn seed_f64<B: crate::backend::Backend>(v: &crate::backend::Value<B>) -> Option<f64> {
-        use crate::backend::Value;
-        use core::any::Any;
-        match v {
-            // i64 -> f64 loses precision above 2^53; the seed path accepts
-            // the same bounded loss the delta path (`probe_column_for_agg`)
-            // already does for realistic aggregate magnitudes.
-            Value::Int(i) => (i as &dyn Any).downcast_ref::<i64>().map(|x| *x as f64),
-            Value::Float(f) => (f as &dyn Any)
-                .downcast_ref::<f64>()
-                .copied()
-                .filter(|x| x.is_finite()),
-            // NUMERIC/DECIMAL sums (e.g. Postgres `SUM(int_col)`) arrive as
-            // BigDecimal; parse through its decimal string to avoid a
-            // num-traits import.
-            Value::Decimal(d) => (d as &dyn Any)
-                .downcast_ref::<bigdecimal::BigDecimal>()
-                .and_then(|x| x.to_string().parse::<f64>().ok()),
-            _ => None,
-        }
-    }
-
-    /// Decode the COUNT component cell to `i64`. COUNT is exact and integer
-    /// on every backend, so only `Value::Int` is accepted.
-    fn seed_i64<B: crate::backend::Backend>(v: &crate::backend::Value<B>) -> Option<i64> {
-        use crate::backend::Value;
-        use core::any::Any;
-        match v {
-            Value::Int(i) => (i as &dyn Any).downcast_ref::<i64>().copied(),
-            _ => None,
-        }
-    }
-
-    /// Fold one delta into the running value.
-    pub fn apply(&mut self, delta: &AggDelta) {
-        match delta {
-            AggDelta::Count(d) => self.count += d,
-            AggDelta::Sum(d) => self.sum += d,
-            AggDelta::Avg {
-                sum_delta,
-                count_delta,
-            } => {
-                self.sum += sum_delta;
-                self.count += count_delta;
-            }
-            AggDelta::Stats {
-                sum_delta,
-                sum_sq_delta,
-                count_delta,
-            } => {
-                self.sum += sum_delta;
-                self.sum_sq += sum_sq_delta;
-                self.count += count_delta;
-            }
-        }
-    }
-
-    /// Rows currently contributing to the aggregate.
-    #[must_use]
-    pub const fn count(&self) -> i64 {
-        self.count
-    }
-
-    /// Current aggregate value.
-    #[must_use]
-    pub fn value(&self) -> AggValue {
-        match self.kind {
-            AggKind::Count => AggValue::Count(self.count),
-            AggKind::Sum => AggValue::Sum(self.sum),
-            AggKind::Avg => AggValue::Real(self.mean()),
-            AggKind::VarPop => AggValue::Real(self.var_pop()),
-            AggKind::VarSamp => AggValue::Real(self.var_samp()),
-            AggKind::StddevPop => AggValue::Real(self.var_pop().map(f64::sqrt)),
-            AggKind::StddevSamp => AggValue::Real(self.var_samp().map(f64::sqrt)),
-        }
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    fn mean(&self) -> Option<f64> {
-        (self.count > 0).then(|| self.sum / self.count as f64)
-    }
-
-    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
-    fn var_pop(&self) -> Option<f64> {
-        (self.count > 0).then(|| {
-            let n = self.count as f64;
-            self.sum_sq / n - (self.sum / n).powi(2)
-        })
-    }
-
-    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
-    fn var_samp(&self) -> Option<f64> {
-        (self.count >= 2).then(|| {
-            let n = self.count as f64;
-            (self.sum_sq - self.sum.powi(2) / n) / (n - 1.0)
-        })
-    }
-}
-
-impl core::fmt::Display for AggAccumulator {
+impl core::fmt::Display for AggValue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.value() {
-            AggValue::Count(c) => write!(f, "{c}"),
-            AggValue::Sum(s) => write!(f, "{s}"),
-            AggValue::Real(Some(v)) => write!(f, "{v}"),
-            AggValue::Real(None) => write!(f, "-"),
+        match self {
+            Self::Count(c) => write!(f, "{c}"),
+            Self::Sum(s) => write!(f, "{s}"),
+            Self::Real(Some(v)) => write!(f, "{v}"),
+            Self::Real(None) => f.write_str("-"),
         }
     }
 }
@@ -1159,11 +1391,12 @@ pub struct TermNarrowing<B: crate::backend::Backend> {
     pub subscription: SubscriptionId,
     /// The table that subscription reads.
     pub table: TableId,
-    /// The column its membership subquery compares.
-    pub column: ColumnId,
-    /// The value that column now matches, or stopped matching.
-    pub value: crate::backend::Value<B>,
-    /// Whether the value entered the subscription's set or left it.
+    /// The columns its membership subquery compares, in the filter's order.
+    pub columns: alloc::vec::Vec<ColumnId>,
+    /// The value row those columns now match, or stopped matching, pairwise
+    /// with [`columns`](Self::columns).
+    pub values: alloc::vec::Vec<crate::backend::Value<B>>,
+    /// Whether the values entered the subscription's set or left it.
     pub entered: bool,
 }
 
@@ -1172,8 +1405,8 @@ impl<B: crate::backend::Backend> Clone for TermNarrowing<B> {
         Self {
             subscription: self.subscription,
             table: self.table,
-            column: self.column,
-            value: self.value.clone(),
+            columns: self.columns.clone(),
+            values: self.values.clone(),
             entered: self.entered,
         }
     }
@@ -1184,8 +1417,8 @@ impl<B: crate::backend::Backend> core::fmt::Debug for TermNarrowing<B> {
         f.debug_struct("TermNarrowing")
             .field("subscription", &self.subscription)
             .field("table", &self.table)
-            .field("column", &self.column)
-            .field("value", &self.value)
+            .field("columns", &self.columns)
+            .field("values", &self.values)
             .field("entered", &self.entered)
             .finish()
     }
@@ -1195,8 +1428,8 @@ impl<B: crate::backend::Backend> PartialEq for TermNarrowing<B> {
     fn eq(&self, other: &Self) -> bool {
         self.subscription == other.subscription
             && self.table == other.table
-            && self.column == other.column
-            && self.value == other.value
+            && self.columns == other.columns
+            && self.values == other.values
             && self.entered == other.entered
     }
 }
@@ -1240,20 +1473,11 @@ pub struct ConsumerNotifications<
 }
 
 impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> ConsumerNotifications<I, C, B> {
-    /// Create empty notifications with no checkpoint.
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self {
-            inserted: Vec::new(),
-            deleted: Vec::new(),
-            updated: Vec::new(),
-            checkpoint: None,
-            narrowings: Vec::new(),
-        }
+    /// No consumer notified, no checkpoint, no narrowing.
+    pub(crate) const fn empty() -> Self {
+        Self::from_parts(Vec::new(), Vec::new(), Vec::new())
     }
 
-    /// Construct notifications from explicit buckets.
-    #[must_use]
     pub(crate) const fn from_parts(
         inserted: Vec<I::ConsumerId>,
         deleted: Vec<I::ConsumerId>,
@@ -1339,42 +1563,243 @@ impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> core::fmt::Debug
     }
 }
 
-/// Combined output of [`dispatch`](crate::SubscriptionEngine::dispatch): row-set
-/// notifications plus aggregate deltas for one event.
+/// One aggregate subscription's grouped SQL result changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateValueUpdate<I: IdTypes, B: crate::backend::Backend = crate::backend::Postgres> {
+    /// The registration whose value moved.
+    pub subscription: SubscriptionId,
+    /// The consumer that registration belongs to.
+    pub consumer: I::ConsumerId,
+    /// Opaque encoded group key, or `None` for an ungrouped aggregate.
+    pub group: Option<Vec<u8>>,
+    /// Write or remove the grouped SQL result row.
+    pub change: AggregateValueChange<B>,
+}
+
+/// Value produced by either aggregate maintenance algorithm.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AggregateResultValue<B: crate::backend::Backend> {
+    /// Numeric value maintained by additive folding.
+    Folded(AggValue),
+    /// Ordered value maintained by grouped extreme reads.
+    Scalar(crate::backend::Value<B>),
+}
+
+/// Operation applied to one grouped aggregate result row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AggregateValueChange<B: crate::backend::Backend = crate::backend::Postgres> {
+    /// Write this aggregate value.
+    Set(AggregateResultValue<B>),
+    /// Remove the group because it has no source rows left.
+    Remove,
+}
+
+impl<I: IdTypes, B: crate::backend::Backend> AggregateValueUpdate<I, B> {
+    /// Value carried by `Set`, or `None` for `Remove`.
+    #[must_use]
+    pub const fn result_value(&self) -> Option<&AggregateResultValue<B>> {
+        match &self.change {
+            AggregateValueChange::Set(value) => Some(value),
+            AggregateValueChange::Remove => None,
+        }
+    }
+
+    /// Additive value carried by `Set`, or `None` for another result kind.
+    #[must_use]
+    pub const fn folded_value(&self) -> Option<AggValue> {
+        match &self.change {
+            AggregateValueChange::Set(AggregateResultValue::Folded(value)) => Some(*value),
+            AggregateValueChange::Set(AggregateResultValue::Scalar(_))
+            | AggregateValueChange::Remove => None,
+        }
+    }
+}
+
+/// Tier names without the data carried by [`Tier`].
+///
+/// The bare-name spelling of the ladder [`Tier`] answers registrations with
+/// and [`ReadTier`] persists. A new tier must appear in all three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierKind {
+    /// Maintained from CDC events.
+    InProcess,
+    /// One scalar database read.
+    Scalar,
+    /// Grouped extrema with reads scoped to one displaced group.
+    GroupedScalar,
+    /// Database reads scoped to changed primary keys.
+    KeyedRows,
+    /// Complete database result replacement.
+    WholeRows,
+}
+
+impl From<ReadTier> for TierKind {
+    fn from(tier: ReadTier) -> Self {
+        match tier {
+            ReadTier::Scalar => Self::Scalar,
+            ReadTier::GroupedScalar => Self::GroupedScalar,
+            ReadTier::KeyedRows => Self::KeyedRows,
+            ReadTier::WholeRows => Self::WholeRows,
+        }
+    }
+}
+
+/// Why the registry stopped maintaining one subscription in process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MaintenanceStopReason {
+    /// A new group would exceed the configured per-subscription limit.
+    GroupLimit {
+        /// Configured maximum live groups.
+        limit: usize,
+    },
+    /// An UPDATE omitted columns from its old row that the aggregate reads.
+    MissingOldRow {
+        /// Source table whose event was incomplete.
+        table_id: TableId,
+    },
+    /// A keyed row read received a CDC change with no readable primary key.
+    KeyedChangeWithoutKey {
+        /// Source table whose event lacked the key.
+        table_id: TableId,
+    },
+}
+
+/// One subscription changed maintenance tier without changing identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaintenanceTransition {
+    /// Subscription that changed tier.
+    pub subscription_id: SubscriptionId,
+    /// Previous tier.
+    pub from: TierKind,
+    /// Replacement tier, including the SQL downstream Rust code executes.
+    pub to: Tier,
+    /// Why the previous tier could not continue.
+    pub reason: MaintenanceStopReason,
+}
+
+/// Aggregate processing result from either an event or seed installation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateMaintenanceOutput<
+    I: IdTypes,
+    B: crate::backend::Backend = crate::backend::Postgres,
+    C: Checkpoint = NoCheckpoint,
+> {
+    /// Aggregate result rows written or removed.
+    pub updates: Vec<AggregateValueUpdate<I, B>>,
+    /// Database reads required after a tier transition.
+    pub triggers: Vec<crate::reexec::ReExecutionTrigger<I, C>>,
+    /// Tier changes caused by this operation.
+    pub transitions: Vec<MaintenanceTransition>,
+}
+
+impl<I: IdTypes, B: crate::backend::Backend, C: Checkpoint> AggregateMaintenanceOutput<I, B, C> {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            updates: Vec::new(),
+            triggers: Vec::new(),
+            transitions: Vec::new(),
+        }
+    }
+}
+
+impl<I: IdTypes, B: crate::backend::Backend, C: Checkpoint> core::ops::Deref
+    for AggregateMaintenanceOutput<I, B, C>
+{
+    type Target = [AggregateValueUpdate<I, B>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.updates
+    }
+}
+
+impl<I: IdTypes, B: crate::backend::Backend, C: Checkpoint> core::ops::DerefMut
+    for AggregateMaintenanceOutput<I, B, C>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.updates
+    }
+}
+
+impl<I: IdTypes, B: crate::backend::Backend, C: Checkpoint> IntoIterator
+    for AggregateMaintenanceOutput<I, B, C>
+{
+    type Item = AggregateValueUpdate<I, B>;
+    type IntoIter = alloc::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.updates.into_iter()
+    }
+}
+
+/// Combined output of [`dispatch`](crate::SubscriptionEngine::dispatch).
+///
+/// Row matches, in-process aggregate changes, scalar changes and required
+/// database reads share this one registry output. A caller that ignores
+/// `triggers` leaves those subscriptions without a current result.
 pub struct DispatchOutput<
     I: IdTypes,
     C: Checkpoint = NoCheckpoint,
     B: crate::backend::Backend = crate::backend::Postgres,
 > {
     notifications: ConsumerNotifications<I, C, B>,
-    aggregate_deltas: Vec<(I::ConsumerId, AggDelta)>,
+    aggregate_updates: Vec<AggregateValueUpdate<I, B>>,
+    scalar_updates: Vec<crate::reexec::ScalarUpdate<I, B, C>>,
+    triggers: Vec<crate::reexec::ReExecutionTrigger<I, C>>,
+    transitions: Vec<MaintenanceTransition>,
 }
 
 impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> DispatchOutput<I, C, B> {
     pub(crate) const fn from_parts(
         notifications: ConsumerNotifications<I, C, B>,
-        aggregate_deltas: Vec<(I::ConsumerId, AggDelta)>,
+        aggregate_updates: Vec<AggregateValueUpdate<I, B>>,
+        scalar_updates: Vec<crate::reexec::ScalarUpdate<I, B, C>>,
+        triggers: Vec<crate::reexec::ReExecutionTrigger<I, C>>,
+        transitions: Vec<MaintenanceTransition>,
     ) -> Self {
         Self {
             notifications,
-            aggregate_deltas,
+            aggregate_updates,
+            scalar_updates,
+            triggers,
+            transitions,
         }
     }
 
-    /// Per-consumer, view-relative row notifications (insert/delete/update).
+    /// Per-consumer, view-relative row notifications.
     #[must_use]
     pub const fn notifications(&self) -> &ConsumerNotifications<I, C, B> {
         &self.notifications
     }
 
-    /// Signed aggregate deltas, one entry per `(consumer, aggregate kind)`.
+    /// In-process aggregate values that moved on this event.
+    ///
+    /// An aggregate missing its starting rows appears in [`Self::triggers`]
+    /// instead.
     #[must_use]
-    pub fn aggregate_deltas(&self) -> &[(I::ConsumerId, AggDelta)] {
-        &self.aggregate_deltas
+    pub fn aggregate_updates(&self) -> &[AggregateValueUpdate<I, B>] {
+        &self.aggregate_updates
     }
 
-    /// Every consumer affected by this event, from either path, sorted and
-    /// deduplicated.
+    /// Scalar values a re-read subscription updated from this event alone.
+    #[must_use]
+    pub fn scalar_updates(&self) -> &[crate::reexec::ScalarUpdate<I, B, C>] {
+        &self.scalar_updates
+    }
+
+    /// Database reads required by this event.
+    #[must_use]
+    pub fn triggers(&self) -> &[crate::reexec::ReExecutionTrigger<I, C>] {
+        &self.triggers
+    }
+
+    /// Subscriptions that changed maintenance tier during this event.
+    #[must_use]
+    pub fn transitions(&self) -> &[MaintenanceTransition] {
+        &self.transitions
+    }
+
+    /// Every consumer whose client-visible data moved, sorted and deduplicated.
     #[must_use]
     pub fn notified(&self) -> Vec<I::ConsumerId> {
         let mut ids: Vec<I::ConsumerId> = self
@@ -1385,16 +1810,20 @@ impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> DispatchOutput<I, C,
             .chain(self.notifications.deleted())
             .copied()
             .collect();
-        ids.extend(self.aggregate_deltas.iter().map(|(cid, _)| *cid));
+        ids.extend(self.aggregate_updates.iter().map(|u| u.consumer));
+        ids.extend(self.scalar_updates.iter().map(|u| u.consumer_id));
         ids.sort_unstable();
         ids.dedup();
         ids
     }
 
-    /// `true` when no consumer was affected by this event.
+    /// `true` when no client-visible data moved and no database read is due.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.aggregate_deltas.is_empty()
+        self.aggregate_updates.is_empty()
+            && self.scalar_updates.is_empty()
+            && self.triggers.is_empty()
+            && self.transitions.is_empty()
             && self.notifications.inserted().is_empty()
             && self.notifications.updated().is_empty()
             && self.notifications.deleted().is_empty()
@@ -1435,34 +1864,41 @@ impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> IntoIterator
     }
 }
 
-/// Aggregate dispatch: delivers typed signed deltas for aggregate subscriptions.
+/// Aggregate dispatch: reports the values of aggregate subscriptions that moved.
 ///
 /// Separate from [`SubscriptionDispatch`] because:
 /// - UPDATE events require evaluating **both** the old row and the new row.
-/// - Returns signed deltas, not consumer bitmaps.
+/// - Returns values, not consumer bitmaps.
 /// - Aggregate predicates are **never** included in `consumers()` results.
 ///
 /// # Caller contract
 ///
-/// The engine handles only WAL-driven deltas. Callers must:
-/// 1. **Bootstrap**: query the DB for the initial aggregate **before** subscribing.
-/// 2. **Accumulate**: `running_value += delta` on each call.
-/// 3. **Reset on policy change**: RLS/ACL changes produce no WAL events.
-///    Re-query the DB and replace the stored value.
-/// 4. **Reset on TRUNCATE**: engine returns `Err(TruncateRequiresReset)`.
-///    Re-query and replace the stored value.
+/// The engine holds the running value. What the caller still owes it:
+/// 1. **Starting numbers.** Run
+///    [`Served::aggregate_bootstrap`](crate::Served::aggregate_bootstrap)
+///    and hand the decoded row to
+///    [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall)
+///    together with the stream position the read was taken at. Take that
+///    position **before** the read's snapshot opens. Until the numbers land the
+///    subscription reports nothing.
+/// 2. **Old UPDATE images.** Aggregate UPDATE deltas need both the old and the
+///    new row. A source that omits `before`/`old` images gets
+///    [`DispatchError::AggregateUpdateRequiresOldRow`](crate::DispatchError::AggregateUpdateRequiresOldRow).
+/// 3. **A word after a permission change.** An RLS or ACL change produces no
+///    WAL event, so the engine cannot see it. Call
+///    [`reset_aggregate_value`](crate::SubscriptionEngine::reset_aggregate_value) and seed
+///    again. `TRUNCATE` needs nothing: the table is empty afterwards, so the
+///    engine empties the value itself and reports it.
 pub trait AggregateDispatch<I: IdTypes, E: crate::backend::CdcEvent>: Send {
-    /// Compute typed signed deltas for all matching aggregate
-    /// subscriptions.
+    /// Report every aggregate subscription whose value moved on this event.
     ///
-    /// Returns `Vec<(ConsumerId, AggDelta)>` where each entry is the
-    /// signed change for that consumer's subscription. Zero-net entries
-    /// are omitted. The same consumer may appear multiple times (once
-    /// per aggregate kind).
-    fn aggregate_deltas(
+    /// One entry per subscription, naming its consumer alongside. A
+    /// subscription whose value did not move, and one that has not been seeded,
+    /// are both absent.
+    fn aggregate_updates(
         &mut self,
         event: &E,
-    ) -> Result<Vec<(I::ConsumerId, AggDelta)>, crate::DispatchError>;
+    ) -> Result<AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>, crate::DispatchError>;
 }
 
 /// Background merge operations

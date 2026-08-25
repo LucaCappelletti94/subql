@@ -1,4 +1,4 @@
-//! Docker-backed integration test for [`AsyncAutoResolvingEngine`] +
+//! Docker-backed integration test for [`AutoResolvingEngine`] with [`AsyncMode`] +
 //! [`MysqlAsyncDieselConnector`] against a real MySQL 8.0 with binary
 //! logging.
 //!
@@ -7,7 +7,7 @@
 //! instead of decoding one from a replication stream. The point is the
 //! same: prove the async connector re-executes the captured query's SQL
 //! against live MySQL over a `diesel-async` pool and decodes a scalar
-//! [`Value`] correctly, reading the binlog coordinate in the same
+//! [`Value`] correctly, reading the binlog coordinate just before the read's
 //! transaction. The engine is driven on a multi-thread tokio runtime.
 //!
 //! Requires Docker. Tests are `#[ignore]`d. Run with:
@@ -22,22 +22,29 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use diesel::{sql_query, MysqlConnection, RunQueryDsl};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::AsyncMysqlConnection;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
-use subql::backend::{MySql, Value};
+use subql::backend::{MySql, ScalarKind, Value};
 use subql::reexec::{
-    AsyncAutoResolvingEngine, AsyncConnector, MysqlAsyncDieselConnector, ReExecEngine, Registered,
-    SnapshotResult,
+    AsyncConnector, AsyncMode, AutoResolvingEngine, MysqlAsyncDieselConnector, SnapshotResult,
 };
 use subql::testing::TestEvent;
-use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
+use subql::{
+    catalog_helpers, DefaultIds, Registered, SubscriptionEngine, SubscriptionRequest, TableId, Tier,
+};
 
-type Engine =
-    AsyncAutoResolvingEngine<TestEvent<MySql>, DefaultIds, ParserDB, MysqlAsyncDieselConnector>;
+type Engine = AutoResolvingEngine<
+    TestEvent<MySql>,
+    DefaultIds,
+    ParserDB,
+    AsyncMode<MysqlAsyncDieselConnector>,
+>;
 
 const DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -70,6 +77,11 @@ fn setup_mysql(conn: &mut MysqlConnection, seed: &[(i64, f64)]) {
     }
 }
 
+/// One more row, for a commit that lands while a read is parked.
+fn insert(id: i64) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
+}
+
 fn catalog() -> ParserDB {
     ParserDB::parse::<MySqlDialect>(DDL).expect("parse DDL")
 }
@@ -77,10 +89,7 @@ fn catalog() -> ParserDB {
 fn build_engine(catalog: ParserDB, pool: Pool<AsyncMysqlConnection>) -> Engine {
     let inner =
         SubscriptionEngine::<TestEvent<MySql>, DefaultIds, ParserDB>::new(catalog, MySqlDialect {});
-    AsyncAutoResolvingEngine::new(
-        ReExecEngine::new(inner),
-        MysqlAsyncDieselConnector::new(pool),
-    )
+    AutoResolvingEngine::new(inner, AsyncMode::new(MysqlAsyncDieselConnector::new(pool)))
 }
 
 /// Column order matches the catalog: id=0, price=1, quantity=2, status=3.
@@ -119,7 +128,11 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql_async() {
             )
             .expect("captured registration")
         {
-            Registered::ReExec { query_id, .. } => query_id,
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
             other => panic!("expected ReExec, got {other:?}"),
         };
 
@@ -127,7 +140,7 @@ fn snapshot_reads_value_and_binlog_pos_from_mysql_async() {
             .snapshot(captured_qid)
             .await
             .expect("snapshot")
-            .expect("query_id exists");
+            .expect("subscription_id exists");
         let (value, checkpoint) = match snap {
             SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
             other => panic!("unexpected snapshot variant: {other:?}"),
@@ -172,10 +185,22 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
             )
             .expect("captured registration")
         {
-            Registered::ReExec { query_id, .. } => query_id,
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
             other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(engine.install(captured_qid, Value::Float(5.0)));
+        assert!(subql::Install::install(
+            &mut engine,
+            captured_qid,
+            subql::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<subql::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         sql_query("DELETE FROM orders WHERE id = 1")
             .execute(&mut conn_dml)
@@ -191,7 +216,7 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
             "expected exactly one ScalarUpdate, got {}",
             notifs.scalar_updates.len()
         );
-        assert_eq!(notifs.scalar_updates[0].query_id, captured_qid);
+        assert_eq!(notifs.scalar_updates[0].subscription_id, captured_qid);
         assert_eq!(
             notifs.scalar_updates[0].value,
             Value::Float(9.0),
@@ -236,7 +261,10 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
             "SELECT VAR_POP(amount) FROM nums",
         ))
         .expect("register aggregate")
+        .served()
+        .expect("the engine maintains this one in process")
         .aggregate_bootstrap
+        .clone()
         .expect("aggregate carries a bootstrap");
 
     common::multi_thread_rt().block_on(async move {
@@ -251,4 +279,67 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
             vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
         );
     });
+}
+
+/// Both position-carrying reads report a position taken before their snapshot.
+///
+/// The contract a caller replays from: a position at or behind the snapshot
+/// re-delivers changes the snapshot already holds, while a position ahead of
+/// it silently drops a transaction the snapshot never saw. A user-level lock
+/// parks each read inside its own snapshot, a commit lands while it waits, and
+/// the returned coordinate has to sit behind that commit. The page read is not
+/// here because this connector reports no coordinate for it.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn every_read_reports_a_position_taken_before_its_snapshot() {
+    common::assert_docker_available();
+    let container = common::mysql_8();
+    let port = common::mysql_port(&container);
+    let mut conn = common::mysql_connect(port);
+    setup_mysql(&mut conn, &[(1, 5.0)]);
+
+    let rt = common::multi_thread_rt();
+    let connector = Arc::new(MysqlAsyncDieselConnector::new(
+        rt.block_on(mysql_async_pool(port)),
+    ));
+
+    let held = Arc::clone(&connector);
+    let on = rt.handle().clone();
+    // Each lock name carries a column, so MySQL cannot fold the condition to a
+    // constant and take the lock before its read view exists. The gate holds
+    // the name the lowest id builds, which a clustered-index scan reaches
+    // first.
+    let sql = "SELECT count(*) AS v FROM orders WHERE GET_LOCK(CONCAT('park_scalar_', id), 60) = 1";
+    let ((value, position), after_commit) =
+        common::park_a_mysql_read(port, "park_scalar_1", &insert(2), move || {
+            on.block_on(async move { held.execute_scalar(sql, ScalarKind::Int, &()).await })
+                .expect("scalar read")
+        });
+    assert_eq!(
+        value,
+        Value::Int(1),
+        "the scalar read's snapshot holds one row"
+    );
+    assert!(
+        position.expect("binary logging is on, so a coordinate is reported") < after_commit,
+        "the scalar read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let held = Arc::clone(&connector);
+    let on = rt.handle().clone();
+    let sql = "SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT('park_seed_', id), 60) = 1";
+    let ((values, position), after_commit) =
+        common::park_a_mysql_read(port, "park_seed_1", &insert(3), move || {
+            on.block_on(async move { held.execute_scalar_row(sql, &[ScalarKind::Int], &()).await })
+                .expect("seed read")
+        });
+    assert_eq!(
+        values,
+        vec![Value::Int(2)],
+        "the seed read's snapshot holds two rows"
+    );
+    assert!(
+        position.expect("binary logging is on, so a coordinate is reported") < after_commit,
+        "the seed read's position must sit behind the commit at {after_commit:?}"
+    );
 }

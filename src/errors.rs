@@ -231,31 +231,25 @@ pub enum DispatchError {
     #[error("VM evaluation error: {0}")]
     VmError(String),
 
-    /// TRUNCATE received while aggregate subscriptions are active.
-    ///
-    /// The engine cannot compute count deltas for TRUNCATE (no row images).
-    /// Caller must re-query the database to obtain the correct count.
-    #[error("TRUNCATE on table {0} requires aggregate count reset. Re-query the database")]
-    TruncateRequiresReset(crate::TableId),
-
     /// A carried CDC cell could not be decoded to its declared type
     /// (for example a value above `i64::MAX` for an integer column).
     #[error("value decode error: {0}")]
     Value(#[from] ValueError),
-    /// A captured query maintained by asking about changed rows received an
-    /// event carrying no readable primary key for table `{0}`.
+    /// Opaque encoding of the GROUP BY values failed.
+    #[error("group key encoding failed")]
+    GroupKeyEncoding,
+    /// A registered aggregate could not be rebuilt as a complete row read.
     ///
-    /// The change stream is not delivering what the subscription needs, which
-    /// is a source configuration problem rather than unusual data:
-    /// [`REPLICA_IDENTITY_AUDIT_SQL`](crate::REPLICA_IDENTITY_AUDIT_SQL) names
-    /// the tables it happens for. Loud on purpose, because the alternative is a
-    /// subscription that quietly stops reflecting reality.
-    #[error(
-        "table {0} sent a change with no readable primary key, so a keyed \
-         subscription cannot ask which rows moved; check the table's replica \
-         identity (see REPLICA_IDENTITY_AUDIT_SQL)"
-    )]
-    KeyedChangeWithoutKey(crate::TableId),
+    /// Raised from the dispatch path when a limit or missing row forces a
+    /// tier change mid-event. The install path's twin lives on
+    /// [`AggregateInstallError::TierTransition`](crate::AggregateInstallError::TierTransition).
+    #[error("subscription {subscription} could not change tier: {message}")]
+    TierTransition {
+        /// Aggregate subscription.
+        subscription: crate::SubscriptionId,
+        /// Planner or registry invariant that failed.
+        message: String,
+    },
 }
 
 /// Errors during persistence operations

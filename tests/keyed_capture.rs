@@ -17,9 +17,12 @@ use diesel::sqlite::SqliteConnection;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::SQLiteDialect;
 use subql::backend::{SQLite, Value};
-use subql::reexec::{AutoResolvingEngine, CaptureTier, DieselConnector, ReExecEngine, Registered};
+use subql::reexec::{AutoResolvingEngine, DieselConnector, SyncMode};
 use subql::testing::TestEvent;
-use subql::{DefaultIds, DispatchError, SubscriptionEngine, SubscriptionRequest, TableId};
+use subql::{
+    DefaultIds, Install, MaintenanceStopReason, Registered, SubscriptionEngine,
+    SubscriptionRequest, TableId, Tier, TierKind, WholeRowsInstall,
+};
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
 
@@ -27,7 +30,7 @@ type Engine = AutoResolvingEngine<
     TestEvent<SQLite>,
     DefaultIds,
     ParserDB,
-    DieselConnector<SqliteConnection, SQLite>,
+    SyncMode<DieselConnector<SqliteConnection, SQLite>>,
 >;
 
 /// Wraps the connector and records every statement, so a test can assert what
@@ -115,7 +118,8 @@ impl subql::reexec::Connector for Counting {
     }
 }
 
-type CountingEngine = AutoResolvingEngine<TestEvent<SQLite>, DefaultIds, ParserDB, Counting>;
+type CountingEngine =
+    AutoResolvingEngine<TestEvent<SQLite>, DefaultIds, ParserDB, SyncMode<Counting>>;
 
 /// A keyed read must never name more keys in one statement than it was told to.
 ///
@@ -145,8 +149,7 @@ fn a_keyed_read_names_no_more_keys_per_statement_than_its_budget() {
         SQLiteDialect {},
     );
     let mut engine: CountingEngine =
-        AutoResolvingEngine::new(ReExecEngine::new(inner), Counting::new(conn))
-            .with_max_keys_per_read(3);
+        AutoResolvingEngine::new(inner, SyncMode(Counting::new(conn))).with_max_keys_per_read(3);
     engine
         .register(
             SubscriptionRequest::<DefaultIds, SQLite>::new(1u64, SQL),
@@ -211,7 +214,7 @@ fn setup(rows: &[(i64, &str)]) -> (Engine, TableId) {
         SQLiteDialect {},
     );
     (
-        AutoResolvingEngine::new(ReExecEngine::new(inner), DieselConnector::new(conn)),
+        AutoResolvingEngine::new(inner, SyncMode(DieselConnector::new(conn))),
         table,
     )
 }
@@ -224,11 +227,11 @@ fn register(engine: &mut Engine) -> u64 {
         )
         .expect("a filter outside the language is captured, not refused")
     {
-        Registered::Captured {
-            query_id,
-            tier: CaptureTier::ChangedRowsOnly,
+        Registered {
+            subscription_id,
+            tier: Tier::KeyedRows { .. },
             ..
-        } => query_id,
+        } => subscription_id,
         other => panic!("expected a keyed capture, got {other:?}"),
     }
 }
@@ -250,7 +253,7 @@ fn a_single_table_filter_is_captured_as_the_keyed_tier() {
 #[test]
 fn a_changed_row_that_still_matches_arrives_as_itself() {
     let (mut engine, table) = setup(&[(1, "paid"), (2, "void")]);
-    let query_id = register(&mut engine);
+    let subscription_id = register(&mut engine);
 
     let event =
         TestEvent::<SQLite>::update(table, row(1, "paid"), row(1, "paid")).with_pk_columns([0u16]);
@@ -258,7 +261,7 @@ fn a_changed_row_that_still_matches_arrives_as_itself() {
 
     assert_eq!(notifications.row_deltas.len(), 1);
     let delta = &notifications.row_deltas[0];
-    assert_eq!(delta.query_id, query_id);
+    assert_eq!(delta.subscription_id, subscription_id);
     assert_eq!(delta.key, vec![Value::Int(1)]);
     assert_eq!(
         delta.row.as_deref(),
@@ -337,25 +340,47 @@ fn several_changed_rows_are_answered_in_one_pass() {
     );
 }
 
-/// A change carrying no readable key fails loudly and names the table, because
-/// without a key this tier cannot ask which rows moved and delivering nothing
-/// would leave the subscription silently stale.
+/// A change carrying no readable key changes the existing subscription to a
+/// complete row read under the same identity.
 #[test]
-fn a_change_with_no_readable_key_fails_and_names_the_table() {
-    let (mut engine, table) = setup(&[(1, "paid")]);
-    let _ = register(&mut engine);
+fn a_change_with_no_readable_key_transitions_to_whole_rows() {
+    let catalog = ParserDB::parse::<SQLiteDialect>(DDL).expect("catalog");
+    let table = subql::catalog_helpers::table_id(&catalog, "orders").expect("orders");
+    let mut registry = SubscriptionEngine::<TestEvent<SQLite>, DefaultIds, ParserDB>::new(
+        catalog,
+        SQLiteDialect {},
+    );
+    let registered = registry
+        .register(SubscriptionRequest::new(1u64, SQL))
+        .expect("keyed read registers");
+    assert!(matches!(registered.tier, Tier::KeyedRows { .. }));
 
-    // No primary-key projection: the stream is not carrying what the tier needs.
     let event = TestEvent::<SQLite>::update(table, row(1, "paid"), row(1, "paid"));
-    let outcome = engine.consumers(&event);
+    let output = registry.dispatch(&event).expect("transition succeeds");
 
-    match outcome {
-        Err(subql::reexec::ReExecError::Dispatch(DispatchError::KeyedChangeWithoutKey(named))) => {
-            assert_eq!(named, table, "the refusal names the table at fault");
-        }
-        Err(other) => panic!("expected a keyless-change failure, got {other:?}"),
-        Ok(_) => panic!("a change with no readable key must not resolve quietly"),
-    }
+    assert_eq!(output.transitions().len(), 1);
+    let transition = &output.transitions()[0];
+    assert_eq!(transition.subscription_id, registered.subscription_id);
+    assert_eq!(transition.from, TierKind::KeyedRows);
+    assert_eq!(
+        transition.reason,
+        MaintenanceStopReason::KeyedChangeWithoutKey { table_id: table }
+    );
+    assert!(matches!(transition.to, Tier::WholeRows { .. }));
+    assert_eq!(
+        output.triggers()[0].subscription_id,
+        registered.subscription_id
+    );
+    let installed = Install::install(
+        &mut registry,
+        registered.subscription_id,
+        WholeRowsInstall::<SQLite, subql::NoCheckpoint> {
+            generation: 1,
+            pages: Vec::new(),
+        },
+    )
+    .expect("the original id now accepts whole-row results");
+    assert!(installed.is_empty());
 }
 
 /// The delivered key must be the row's primary key, whatever order the
@@ -369,18 +394,18 @@ fn an_explicit_projection_still_delivers_the_primary_key() {
     let (mut engine, table) = setup(&[(1, "paid")]);
     // `status` first, so a key taken by table ordinal would read the status.
     let reordered = "SELECT status, id FROM orders WHERE lower(status) = 'paid'";
-    let query_id = match engine
+    let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, SQLite>::new(9u64, reordered),
             (),
         )
         .expect("a filter outside the language is captured")
     {
-        Registered::Captured {
-            query_id,
-            tier: CaptureTier::ChangedRowsOnly,
+        Registered {
+            subscription_id,
+            tier: Tier::KeyedRows { .. },
             ..
-        } => query_id,
+        } => subscription_id,
         other => panic!("expected a keyed capture, got {other:?}"),
     };
 
@@ -394,7 +419,7 @@ fn an_explicit_projection_still_delivers_the_primary_key() {
         "one changed row is one delta, not an upsert plus a phantom removal"
     );
     let delta = &notifications.row_deltas[0];
-    assert_eq!(delta.query_id, query_id);
+    assert_eq!(delta.subscription_id, subscription_id);
     assert_eq!(
         delta.key,
         vec![Value::Int(1)],
@@ -432,8 +457,7 @@ fn a_filter_reading_a_second_table_is_not_served_by_the_keyed_tier() {
         catalog,
         SQLiteDialect {},
     );
-    let mut engine: Engine =
-        AutoResolvingEngine::new(ReExecEngine::new(inner), DieselConnector::new(conn));
+    let mut engine: Engine = AutoResolvingEngine::new(inner, SyncMode(DieselConnector::new(conn)));
 
     let sql = "SELECT * FROM orders WHERE lower(status) = 'paid' \
                AND id IN (SELECT id FROM managers)";
@@ -444,13 +468,10 @@ fn a_filter_reading_a_second_table_is_not_served_by_the_keyed_tier() {
         )
         .expect("captured")
     {
-        Registered::Captured { tier, tables, .. } => {
-            assert_eq!(
-                tier,
-                CaptureTier::WholeReread,
-                "a filter whose membership depends on another table cannot ask only about \
-                 changed rows of this one"
-            );
+        Registered {
+            tier: Tier::WholeRows { tables, .. },
+            ..
+        } => {
             assert_eq!(
                 tables.len(),
                 2,
@@ -480,8 +501,7 @@ fn a_key_with_no_literal_spelling_is_refused_at_registration() {
         catalog,
         SQLiteDialect {},
     );
-    let mut engine: Engine =
-        AutoResolvingEngine::new(ReExecEngine::new(inner), DieselConnector::new(conn));
+    let mut engine: Engine = AutoResolvingEngine::new(inner, SyncMode(DieselConnector::new(conn)));
 
     let sql = "SELECT * FROM events WHERE lower(status) = 'paid'";
     match engine
@@ -491,12 +511,10 @@ fn a_key_with_no_literal_spelling_is_refused_at_registration() {
         )
         .expect("captured rather than refused outright")
     {
-        Registered::Captured { tier, .. } => assert_eq!(
-            tier,
-            CaptureTier::WholeReread,
-            "a timestamp key cannot be rendered into a scoped read, so this belongs to the \
-             tier that needs no key rather than to one that fails on every change"
-        ),
+        Registered {
+            tier: Tier::WholeRows { .. },
+            ..
+        } => {}
         other => panic!("expected a capture, got {other:?}"),
     }
 }
@@ -533,7 +551,7 @@ fn a_failed_read_keeps_the_keys_it_was_going_to_ask_about() {
         SQLiteDialect {},
     );
     let mut engine: Engine =
-        AutoResolvingEngine::new(ReExecEngine::new(inner), DieselConnector::new(engine_conn));
+        AutoResolvingEngine::new(inner, SyncMode(DieselConnector::new(engine_conn)));
     let _ = register(&mut engine);
 
     // Make the scoped read fail: the catalog still names `orders`, the database
@@ -645,8 +663,7 @@ fn a_failure_on_a_later_batch_gives_back_every_key() {
     );
     // Three keys per statement, so seven keys are three batches.
     let mut engine: CountingEngine =
-        AutoResolvingEngine::new(ReExecEngine::new(inner), Counting::new(conn))
-            .with_max_keys_per_read(3);
+        AutoResolvingEngine::new(inner, SyncMode(Counting::new(conn))).with_max_keys_per_read(3);
     engine
         .register(
             SubscriptionRequest::<DefaultIds, SQLite>::new(1u64, SQL),
@@ -726,8 +743,7 @@ fn a_compound_key_is_delivered_in_key_column_order() {
     // An explicit projection in an order that is neither the table's nor the
     // key's, so a position taken from anywhere but the projection is wrong.
     let sql = "SELECT status, line_no, order_id FROM lines WHERE lower(status) = 'paid'";
-    let mut engine: CountingEngine =
-        AutoResolvingEngine::new(ReExecEngine::new(inner), Counting::new(conn));
+    let mut engine: CountingEngine = AutoResolvingEngine::new(inner, SyncMode(Counting::new(conn)));
     engine
         .register(
             SubscriptionRequest::<DefaultIds, SQLite>::new(1u64, sql),
@@ -804,10 +820,9 @@ fn a_batch_spanning_several_pages_answers_every_key_once() {
     );
     // One batch holds every key, and a one-byte page budget forces that batch to
     // be read over several pages, which is the path being tested.
-    let mut engine: CountingEngine =
-        AutoResolvingEngine::new(ReExecEngine::new(inner), Counting::new(conn))
-            .with_max_keys_per_read(6)
-            .with_max_page_bytes(1);
+    let mut engine: CountingEngine = AutoResolvingEngine::new(inner, SyncMode(Counting::new(conn)))
+        .with_max_keys_per_read(6)
+        .with_max_page_bytes(1);
     engine
         .register(
             SubscriptionRequest::<DefaultIds, SQLite>::new(1u64, SQL),

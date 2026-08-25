@@ -317,8 +317,7 @@ where
             .ok_or(OpenFgaError::RowCannotBeNamed)?;
         let values = crate::visibility::records::row_values(row, self.shapes.catalog());
         naming
-            .key
-            .render(&naming.type_name, &values)
+            .render(&values)
             .ok()
             .flatten()
             .ok_or(OpenFgaError::RowCannotBeNamed)

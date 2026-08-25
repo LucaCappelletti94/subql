@@ -67,7 +67,7 @@ use crate::diesel_decode::mysql_canonical;
 use crate::diesel_decode::owned_sqlite_canonical;
 use crate::diesel_decode::pg_canonical;
 use crate::diesel_decode::{RowFieldDecode, SpellCanonical};
-use crate::{IdTypes, RegisterError, RegisterResult, SubscriptionEngine, SubscriptionRequest};
+use crate::{IdTypes, RegisterError, Registered, SubscriptionEngine, SubscriptionRequest};
 
 /// A metadata lookup that resolves nothing. Built-in scalar Postgres types
 /// report their OID statically without consulting the lookup, so this suffices
@@ -296,7 +296,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         query: &Q,
-    ) -> Result<RegisterResult, RegisterError>
+    ) -> Result<Registered, RegisterError>
     where
         D: BindDecode<SubqlBackend = E::Backend>,
         Q: QueryFragment<D>,
@@ -310,7 +310,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         update: &Q,
-    ) -> Result<RegisterResult, RegisterError>
+    ) -> Result<Registered, RegisterError>
     where
         D: BindDecode<SubqlBackend = E::Backend>,
         Q: QueryFragment<D>,
@@ -336,7 +336,7 @@ where
         consumer_id: I::ConsumerId,
         insert: InsertStatement<T, U, Op>,
         conn: &mut C,
-    ) -> Result<alloc::vec::Vec<RegisterResult>, FollowInsertError>
+    ) -> Result<alloc::vec::Vec<Registered>, FollowInsertError>
     where
         C: LoadConnection<DefaultLoadingMode>,
         E::Backend: SpellCanonical,
@@ -382,6 +382,96 @@ where
             );
         }
         Ok(results)
+    }
+}
+
+/// Diesel columns naming the compared columns of one membership term, in the
+/// order the stated value rows follow.
+///
+/// Implemented for tuples of one to eight columns, so a static schema states
+/// values as `term_values_for((docs::id,), rows)` or
+/// `term_values_for((docs::tenant_id, docs::id), rows)` and can never
+/// misspell a name. The one-wide spelling keeps its trailing comma: a bare
+/// column cannot carry this trait beside a foreign `Column` bound, since a
+/// later diesel could implement `Column` for tuples and the two impls would
+/// then overlap.
+pub trait TermColumns {
+    /// The column names, in tuple order.
+    fn names() -> Vec<String>;
+}
+
+macro_rules! term_columns_tuple {
+    ($($column:ident),+) => {
+        impl<$($column: diesel::Column),+> TermColumns for ($($column,)+) {
+            fn names() -> Vec<String> {
+                alloc::vec![$($column::NAME.to_string()),+]
+            }
+        }
+    };
+}
+term_columns_tuple!(C1);
+term_columns_tuple!(C1, C2);
+term_columns_tuple!(C1, C2, C3);
+term_columns_tuple!(C1, C2, C3, C4);
+term_columns_tuple!(C1, C2, C3, C4, C5);
+term_columns_tuple!(C1, C2, C3, C4, C5, C6);
+term_columns_tuple!(C1, C2, C3, C4, C5, C6, C7);
+term_columns_tuple!(C1, C2, C3, C4, C5, C6, C7, C8);
+
+impl<I: IdTypes, B: crate::backend::Backend> SubscriptionRequest<I, B> {
+    /// State the value rows this subscriber currently matches, naming the
+    /// compared columns as diesel columns rather than as strings.
+    ///
+    /// The typed spelling of [`SubscriptionRequest::term_values`], and the
+    /// preferred one wherever a static `table!` schema exists: the names come
+    /// from the schema and cannot be misspelled. Each row follows the tuple's
+    /// order, which may differ from the filter's own, since the engine
+    /// matches by name.
+    #[must_use]
+    pub fn term_values_for<T: TermColumns>(self, _columns: T, rows: Vec<Vec<Value<B>>>) -> Self {
+        self.term_values(T::names(), rows)
+    }
+}
+
+#[cfg(test)]
+mod term_columns_tests {
+    use super::TermColumns;
+    use crate::backend::{Postgres, Value};
+    use crate::{DefaultIds, SubscriptionRequest};
+
+    diesel::table! {
+        docs (tenant_id, id) {
+            tenant_id -> Integer,
+            id -> Integer,
+            title -> Text,
+        }
+    }
+
+    /// The typed door and the string door state the same thing: one produces
+    /// exactly what the other spells by hand, one-wide and two-wide.
+    #[test]
+    fn the_typed_columns_spell_the_catalog_names() {
+        assert_eq!(
+            <(docs::id,) as TermColumns>::names(),
+            vec!["id".to_string()],
+            "a one-wide tuple spells one name"
+        );
+        assert_eq!(
+            <(docs::tenant_id, docs::id) as TermColumns>::names(),
+            vec!["tenant_id".to_string(), "id".to_string()],
+            "a tuple keeps its order"
+        );
+
+        let rows = vec![vec![Value::<Postgres>::Int(1), Value::<Postgres>::Int(5)]];
+        let typed: SubscriptionRequest<DefaultIds, Postgres> =
+            SubscriptionRequest::new(1u64, "SELECT 1")
+                .term_values_for((docs::tenant_id, docs::id), rows.clone());
+        let spelled: SubscriptionRequest<DefaultIds, Postgres> =
+            SubscriptionRequest::new(1u64, "SELECT 1").term_values(vec!["tenant_id", "id"], rows);
+        assert_eq!(
+            typed.term_values, spelled.term_values,
+            "the two doors fill the request identically"
+        );
     }
 }
 

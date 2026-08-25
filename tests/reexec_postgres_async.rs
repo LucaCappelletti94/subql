@@ -1,4 +1,4 @@
-//! Docker-backed integration test for [`AsyncAutoResolvingEngine`] +
+//! Docker-backed integration test for [`AutoResolvingEngine`] with [`AsyncMode`] +
 //! [`PgAsyncDieselConnector`] against a real Postgres with logical
 //! replication.
 //!
@@ -7,8 +7,9 @@
 //! coexist on one async engine, WAL events flow through wal2json, and the
 //! `PgAsyncDieselConnector` re-executes the captured query against real
 //! Postgres over a `diesel-async` pool, decoding a scalar
-//! [`Value<Postgres>`](subql::backend::Value) and reading the WAL LSN in the
-//! same transaction. The engine is driven on a multi-thread tokio runtime.
+//! [`Value<Postgres>`](subql::backend::Value) and reading the WAL LSN just
+//! before the read's transaction. The engine is driven on a multi-thread
+//! tokio runtime.
 //!
 //! Requires Docker. Tests are `#[ignore]`d. Run with:
 //!
@@ -22,18 +23,34 @@
 
 mod common;
 
-use diesel::{sql_query, PgConnection, RunQueryDsl};
+use std::sync::Arc;
+
+use diesel::{sql_query, ExpressionMethods, PgConnection, QueryDsl, RunQueryDsl};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::AsyncPgConnection;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
+use subql::backend::{Postgres, ScalarKind, Value};
 use subql::reexec::{
-    AsyncAutoResolvingEngine, AsyncConnector, PgAsyncDieselConnector, ReExecEngine, Registered,
-    SnapshotResult,
+    AsyncConnector, AsyncMode, AutoResolvingEngine, PgAsyncDieselConnector, SnapshotResult,
 };
-use subql::{parse_wal2json_v2, DefaultIds, MessageV2, SubscriptionEngine, SubscriptionRequest};
+use subql::{
+    parse_wal2json_v2, AggregateResultValue, AggregateValueChange, DefaultIds,
+    MaintenanceStopReason, MessageV2, Registered, SubscriptionEngine, SubscriptionRequest, Tier,
+    TierKind,
+};
+
+mod grouped_schema {
+    diesel::table! {
+        orders (id) {
+            id -> Integer,
+            price -> Double,
+            quantity -> Integer,
+            status -> Text,
+        }
+    }
+}
 
 /// One `BigInt` column, for the `count(*)` and `pg_backend_pid()` probes the
 /// cursor tests make against `pg_stat_activity`.
@@ -79,7 +96,8 @@ const PG_DDL: &str = "CREATE TABLE orders (
     status TEXT
 )";
 
-type Engine = AsyncAutoResolvingEngine<MessageV2, DefaultIds, ParserDB, PgAsyncDieselConnector>;
+type Engine =
+    AutoResolvingEngine<MessageV2, DefaultIds, ParserDB, AsyncMode<PgAsyncDieselConnector>>;
 
 /// Build a `bb8` pool over `AsyncPgConnection` for the container at `port`.
 async fn pg_async_pool(port: u16) -> Pool<AsyncPgConnection> {
@@ -108,6 +126,11 @@ fn setup_pg(conn: &mut PgConnection, seed: &[(i64, f64)]) {
     common::create_slot(conn, SLOT);
 }
 
+/// One more row, for a commit that lands while a read is parked.
+fn insert(id: i64) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 7.0, 1, 'paid')")
+}
+
 fn catalog() -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL")
 }
@@ -115,7 +138,7 @@ fn catalog() -> ParserDB {
 fn build_engine(catalog: ParserDB, pool: Pool<AsyncPgConnection>) -> Engine {
     let inner =
         SubscriptionEngine::<MessageV2, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
-    AsyncAutoResolvingEngine::new(ReExecEngine::new(inner), PgAsyncDieselConnector::new(pool))
+    AutoResolvingEngine::new(inner, AsyncMode::new(PgAsyncDieselConnector::new(pool)))
 }
 
 fn parse_message(msg: &str) -> Vec<MessageV2> {
@@ -151,7 +174,13 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
                 (),
             )
             .expect("engine registration");
-        assert!(matches!(engine_reg, Registered::Engine(_)));
+        assert!(matches!(
+            engine_reg,
+            Registered {
+                tier: Tier::InProcess(_),
+                ..
+            }
+        ));
 
         let captured_qid = match engine
             .register(
@@ -163,10 +192,22 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
             )
             .expect("captured registration")
         {
-            Registered::ReExec { query_id, .. } => query_id,
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
             other => panic!("expected ReExec, got {other:?}"),
         };
-        assert!(engine.install(captured_qid, Value::Float(5.0)));
+        assert!(subql::Install::install(
+            &mut engine,
+            captured_qid,
+            subql::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<subql::NoCheckpoint>
+            }
+        )
+        .is_ok());
 
         sql_query("INSERT INTO orders (id, price, quantity, status) VALUES (3, 11.0, 1, 'paid')")
             .execute(&mut conn_dml)
@@ -212,7 +253,7 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
             "expected exactly one ScalarUpdate, got {}",
             total_scalar_updates.len()
         );
-        assert_eq!(total_scalar_updates[0].query_id, captured_qid);
+        assert_eq!(total_scalar_updates[0].subscription_id, captured_qid);
         assert_eq!(total_scalar_updates[0].value, Value::Float(9.0));
         assert_eq!(total_triggers, 0, "auto-resolving engine drains triggers");
     });
@@ -244,7 +285,11 @@ fn snapshot_reads_value_and_lsn_from_pg_async() {
             )
             .expect("captured registration")
         {
-            Registered::ReExec { query_id, .. } => query_id,
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
             other => panic!("expected ReExec, got {other:?}"),
         };
 
@@ -252,7 +297,7 @@ fn snapshot_reads_value_and_lsn_from_pg_async() {
             .snapshot(captured_qid)
             .await
             .expect("snapshot")
-            .expect("query_id exists");
+            .expect("subscription_id exists");
         let (value, checkpoint) = match snap {
             SnapshotResult::Scalar(value, checkpoint) => (value, checkpoint),
             other => panic!("unexpected snapshot variant: {other:?}"),
@@ -300,7 +345,10 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
             "SELECT VAR_POP(amount) FROM nums",
         ))
         .expect("register aggregate")
+        .served()
+        .expect("the engine maintains this one in process")
         .aggregate_bootstrap
+        .clone()
         .expect("aggregate carries a bootstrap");
 
     common::multi_thread_rt().block_on(async move {
@@ -632,7 +680,7 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
 
         // `lower(status)` is a function call the in-process language cannot
         // evaluate, over one table with a primary key, so this is the keyed tier.
-        let query_id = match engine
+        let subscription_id = match engine
             .register(
                 SubscriptionRequest::<DefaultIds, Postgres>::new(
                     1u64,
@@ -642,11 +690,11 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
             )
             .expect("captured")
         {
-            Registered::Captured {
-                query_id,
-                tier: subql::reexec::CaptureTier::ChangedRowsOnly,
+            Registered {
+                subscription_id,
+                tier: Tier::KeyedRows { .. },
                 ..
-            } => query_id,
+            } => subscription_id,
             other => panic!("expected a keyed capture, got {other:?}"),
         };
 
@@ -678,7 +726,7 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
         }
 
         assert!(
-            deltas.iter().all(|d| d.query_id == query_id),
+            deltas.iter().all(|d| d.subscription_id == subscription_id),
             "every delta belongs to the registered query"
         );
         let removed: Vec<_> = deltas
@@ -735,7 +783,7 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
 
         // `DISTINCT` has no key to resume from, so this is the whole-re-read
         // tier rather than the keyed one.
-        let query_id = match engine
+        let subscription_id = match engine
             .register(
                 SubscriptionRequest::<DefaultIds, Postgres>::new(
                     1u64,
@@ -745,11 +793,11 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
             )
             .expect("captured")
         {
-            Registered::Captured {
-                query_id,
-                tier: subql::reexec::CaptureTier::WholeReread,
+            Registered {
+                subscription_id,
+                tier: Tier::WholeRows { .. },
                 ..
-            } => query_id,
+            } => subscription_id,
             other => panic!("expected a whole-re-read capture, got {other:?}"),
         };
 
@@ -772,7 +820,7 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
 
         assert!(!pages.is_empty(), "a change must produce at least one page");
         assert!(
-            pages.iter().all(|p| p.query_id == query_id),
+            pages.iter().all(|p| p.subscription_id == subscription_id),
             "every page belongs to the registered query"
         );
         let generation = pages[0].generation;
@@ -798,16 +846,13 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
     });
 }
 
-/// The async batch path delivers row tiers, and a change carrying no key still
-/// fails loudly there.
+/// The async batch path delivers keyed row deltas, then a keyless change
+/// changes the same subscription to a complete row read.
 ///
-/// `consumers_batch` is separate code from `consumers` on this engine, and the
-/// one thing it does differently, coalescing several events per query into one
-/// read, is exactly what the keyed tier depends on. The keyless refusal was
-/// pinned on the sync engine only.
+/// This pins both async dispatch paths in one subscription lifecycle.
 #[test]
-#[ignore = "requires Docker; run with --ignored"]
-fn the_async_batch_path_delivers_row_deltas_and_refuses_a_keyless_change() {
+#[ignore = "requires Docker, run with --ignored"]
+fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
     common::assert_docker_available();
     let container = common::pg_with_wal2json();
     let port = common::pg_port(&container);
@@ -818,7 +863,7 @@ fn the_async_batch_path_delivers_row_deltas_and_refuses_a_keyless_change() {
     common::multi_thread_rt().block_on(async move {
         let pool = pg_async_pool(port).await;
         let mut engine = build_engine(catalog(), pool);
-        let query_id = match engine
+        let subscription_id = match engine
             .register(
                 SubscriptionRequest::<DefaultIds, Postgres>::new(
                     1u64,
@@ -828,11 +873,11 @@ fn the_async_batch_path_delivers_row_deltas_and_refuses_a_keyless_change() {
             )
             .expect("captured")
         {
-            Registered::Captured {
-                query_id,
-                tier: subql::reexec::CaptureTier::ChangedRowsOnly,
+            Registered {
+                subscription_id,
+                tier: Tier::KeyedRows { .. },
                 ..
-            } => query_id,
+            } => subscription_id,
             other => panic!("expected the keyed tier, got {other:?}"),
         };
 
@@ -853,7 +898,10 @@ fn the_async_batch_path_delivers_row_deltas_and_refuses_a_keyless_change() {
             "the keyed tier delivers per-row deltas only"
         );
         assert!(
-            outcome.row_deltas.iter().all(|d| d.query_id == query_id),
+            outcome
+                .row_deltas
+                .iter()
+                .all(|d| d.subscription_id == subscription_id),
             "every delta belongs to the registered query"
         );
         let mut removed: Vec<_> = outcome
@@ -879,18 +927,301 @@ fn the_async_batch_path_delivers_row_deltas_and_refuses_a_keyless_change() {
             "the row that still matches arrives as itself, exactly once"
         );
 
-        // A change carrying no readable key cannot be asked about, so it must
-        // be reported rather than silently leaving the subscription stale.
-        // An update carrying neither a new image nor an identity: nothing to
-        // read a key out of.
+        // A change carrying no readable key changes the same subscription to a
+        // complete row read, which this connector resolves immediately.
         let keyless = parse_message(r#"{"action":"U","schema":"public","table":"orders"}"#);
         assert_eq!(keyless.len(), 1, "the probe must parse as one message");
-        match engine.consumers(&keyless[0]).await {
-            Err(subql::reexec::ReExecError::Dispatch(
-                subql::DispatchError::KeyedChangeWithoutKey(_),
-            )) => {}
-            Err(other) => panic!("expected a keyless refusal, got {other:?}"),
-            Ok(_) => panic!("a change with no readable key must not resolve quietly"),
+        let output = engine
+            .consumers(&keyless[0])
+            .await
+            .expect("keyless change transitions and re-reads");
+        assert_eq!(output.transitions.len(), 1);
+        assert_eq!(output.transitions[0].subscription_id, subscription_id);
+        assert_eq!(output.transitions[0].from, TierKind::KeyedRows);
+        let Tier::WholeRows { tables, .. } = &output.transitions[0].to else {
+            panic!("expected whole-row replacement")
+        };
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            output.transitions[0].reason,
+            MaintenanceStopReason::KeyedChangeWithoutKey {
+                table_id: tables[0],
+            }
+        );
+        assert!(
+            !output.rows_updates.is_empty(),
+            "the replacement read is delivered"
+        );
+    });
+}
+
+/// A captured query's starting rows arrive as rows on the async engine, on
+/// either tier.
+///
+/// The sync engine has read a capture's answer at registration since the tier
+/// landed. The async engine sends every capture through the scalar path
+/// instead, so a subscriber is handed the first column of the first row
+/// decoded as a string and told that is its answer. Both tiers are registered
+/// here because the async engine branches on neither, and because a keyed
+/// capture cannot rebuild its starting rows from later deltas: no change ever
+/// fires for a row that was already in the answer and stayed there.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn a_captured_query_snapshots_its_rows_on_either_tier_async() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn_setup = common::pg_connect(port);
+    let seed: Vec<(i64, f64)> = (1..=12_u32)
+        .map(|id| (i64::from(id), f64::from(id)))
+        .collect();
+    setup_pg(&mut conn_setup, &seed);
+    // One row outside both filters, so a read that dropped the WHERE is caught.
+    sql_query("UPDATE orders SET status = 'void' WHERE id = 7")
+        .execute(&mut conn_setup)
+        .expect("take one row out of the answer");
+
+    common::multi_thread_rt().block_on(async move {
+        let pool = pg_async_pool(port).await;
+        // Below one row's size, so the answer is only complete if the read
+        // pages. One big page would pass with the paging deleted.
+        let mut engine = build_engine(catalog(), pool).with_max_page_bytes(1);
+
+        // Clause-free, so the keyed tier claims it.
+        let keyed = register_captured(
+            &mut engine,
+            1u64,
+            "SELECT * FROM orders WHERE lower(status) = 'paid'",
+            true,
+        );
+        // ORDER BY makes it not clause-free, so it falls to the whole re-read.
+        let whole = register_captured(
+            &mut engine,
+            2u64,
+            "SELECT * FROM orders WHERE lower(status) = 'paid' ORDER BY id",
+            false,
+        );
+
+        let expected: Vec<i64> = (1..=12_i64).filter(|id| *id != 7).collect();
+        for (subscription_id, tier) in [(keyed, "keyed"), (whole, "whole re-read")] {
+            let snapshot = engine
+                .snapshot(subscription_id)
+                .await
+                .expect("snapshot reads")
+                .expect("the query exists");
+            match snapshot {
+                SnapshotResult::Rows {
+                    columns,
+                    rows,
+                    checkpoint,
+                } => {
+                    assert_eq!(columns, vec!["id", "price", "quantity", "status"]);
+                    let mut ids: Vec<i64> = rows
+                        .iter()
+                        .map(|row| match row[0] {
+                            Value::Int(id) => id,
+                            ref other => panic!("id should decode as an integer, got {other:?}"),
+                        })
+                        .collect();
+                    ids.sort_unstable();
+                    assert_eq!(
+                        ids, expected,
+                        "the {tier} tier must snapshot every matching row and only those"
+                    );
+                    assert!(
+                        checkpoint.is_some(),
+                        "the {tier} tier's starting rows are anchored to a position in the \
+                         change stream, which is what lets a consumer replay from there"
+                    );
+                }
+                other => panic!("the {tier} tier must snapshot as rows, got {other:?}"),
+            }
         }
+    });
+}
+
+/// Register `sql` and assert it landed on `tier`, returning its id.
+fn register_captured(engine: &mut Engine, consumer: u64, sql: &str, keyed: bool) -> u64 {
+    match engine
+        .register(
+            SubscriptionRequest::<DefaultIds, Postgres>::new(consumer, sql),
+            (),
+        )
+        .expect("captured registration")
+    {
+        Registered {
+            subscription_id,
+            tier: Tier::KeyedRows { .. },
+            ..
+        } if keyed => subscription_id,
+        Registered {
+            subscription_id,
+            tier: Tier::WholeRows { .. },
+            ..
+        } if !keyed => subscription_id,
+        other => panic!("expected a capture on the other tier, got {other:?}"),
+    }
+}
+
+/// Every read reports a position taken before its own snapshot opened.
+///
+/// The contract a caller replays from: a position at or behind the snapshot
+/// re-delivers changes the snapshot already holds, which keyed application
+/// absorbs, while a position ahead of it silently drops a transaction the
+/// snapshot never saw. An advisory lock parks each read inside its own
+/// snapshot, a commit lands while it waits, and the returned position has to
+/// sit behind that commit. The row count is asserted too, because a read that
+/// somehow saw the commit would make the position comparison meaningless.
+///
+/// The park blocks a thread, so each read is driven from the runtime's handle
+/// off the test thread rather than by entering the runtime here.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn every_read_reports_a_position_taken_before_its_snapshot() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn = common::pg_connect(port);
+    setup_pg(&mut conn, &[(1, 5.0)]);
+
+    let rt = common::multi_thread_rt();
+    let connector = Arc::new(PgAsyncDieselConnector::new(
+        rt.block_on(pg_async_pool(port)),
+    ));
+
+    let held = Arc::clone(&connector);
+    let on = rt.handle().clone();
+    let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
+    let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
+        on.block_on(async move { held.execute_scalar(&sql, ScalarKind::Int, &()).await })
+            .expect("scalar read")
+    });
+    assert_eq!(
+        value,
+        Value::Int(1),
+        "the scalar read's snapshot holds one row"
+    );
+    assert!(
+        position.expect("a PG connector reports a position") < after_commit,
+        "the scalar read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let held = Arc::clone(&connector);
+    let on = rt.handle().clone();
+    let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
+    let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
+        on.block_on(async move { held.read_page(&sql, 1 << 20, &()).await })
+            .expect("page read")
+    });
+    assert_eq!(
+        page.value.rows.len(),
+        2,
+        "the page's snapshot holds two rows"
+    );
+    assert!(
+        page.checkpoint.expect("a PG connector reports a position") < after_commit,
+        "the page read's position must sit behind the commit at {after_commit:?}"
+    );
+
+    let held = Arc::clone(&connector);
+    let on = rt.handle().clone();
+    let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
+    let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
+        on.block_on(async move { held.execute_scalar_row(&sql, &[ScalarKind::Int], &()).await })
+            .expect("seed read")
+    });
+    assert_eq!(
+        values,
+        vec![Value::Int(3)],
+        "the seed read's snapshot holds three rows"
+    );
+    assert!(
+        position.expect("a PG connector reports a position") < after_commit,
+        "the seed read's position must sit behind the commit at {after_commit:?}"
+    );
+}
+
+/// The async wrapper seeds grouped extrema and resolves a displaced group.
+#[test]
+#[ignore = "requires Docker, run with --ignored"]
+fn grouped_min_snapshots_and_rereads_one_group_async() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut conn_setup = common::pg_connect(port);
+    setup_pg(&mut conn_setup, &[(1, 5.0), (2, 9.0), (3, 11.0)]);
+    diesel::update(grouped_schema::orders::table.find(3))
+        .set(grouped_schema::orders::status.eq("void"))
+        .execute(&mut conn_setup)
+        .expect("seed second group");
+    let _ = common::drain_slot(&mut conn_setup, SLOT);
+
+    common::multi_thread_rt().block_on(async move {
+        let pool = pg_async_pool(port).await;
+        let mut engine = build_engine(catalog(), pool.clone());
+        let subscription = match engine
+            .register(
+                SubscriptionRequest::<DefaultIds, Postgres>::new(
+                    1u64,
+                    "SELECT status, MIN(price) FROM orders GROUP BY status",
+                ),
+                (),
+            )
+            .expect("grouped min registers")
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::GroupedScalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected grouped scalar tier, got {other:?}"),
+        };
+        let snapshot = engine
+            .snapshot(subscription)
+            .await
+            .expect("snapshot reads")
+            .expect("subscription exists");
+        let SnapshotResult::GroupedAggregate { updates, .. } = snapshot else {
+            panic!("expected grouped aggregate snapshot")
+        };
+        assert_eq!(updates.len(), 2);
+        let paid = updates
+            .iter()
+            .find(|update| {
+                update.change
+                    == AggregateValueChange::Set(AggregateResultValue::Scalar(Value::Float(5.0)))
+            })
+            .and_then(|update| update.group.clone())
+            .expect("paid group");
+
+        let mut connection = pool.get().await.expect("pooled connection");
+        diesel_async::RunQueryDsl::execute(
+            diesel::delete(grouped_schema::orders::table.find(1)),
+            &mut connection,
+        )
+        .await
+        .expect("delete current minimum");
+        drop(connection);
+        let messages = tokio::task::spawn_blocking(move || {
+            let mut connection = common::pg_connect(port);
+            common::drain_slot(&mut connection, SLOT)
+        })
+        .await
+        .expect("slot reader joins");
+        let events: Vec<_> = messages
+            .iter()
+            .flat_map(|message| parse_message(message))
+            .collect();
+        let output = engine.consumers(&events[0]).await.expect("group re-read");
+        assert!(output.triggers.is_empty());
+        assert_eq!(output.aggregate_updates.len(), 1);
+        assert_eq!(
+            output.aggregate_updates[0].group.as_deref(),
+            Some(paid.as_slice())
+        );
+        assert_eq!(
+            output.aggregate_updates[0].change,
+            AggregateValueChange::Set(AggregateResultValue::Scalar(Value::Float(9.0)))
+        );
     });
 }

@@ -188,7 +188,7 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         pred_id: PredicateId,
         ordinal: ConsumerOrdinal,
         subscriber: &TermKey<B>,
-        seeds: &[Vec<TermKey<B>>],
+        seeds: &[Vec<crate::term::TermRow<B>>],
     ) {
         let store = Arc::make_mut(&mut self.mutable_predicates);
         for (slot, values) in seeds.iter().enumerate() {
@@ -210,7 +210,7 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         &mut self,
         pred_id: PredicateId,
         slot: u16,
-        value: TermKey<B>,
+        values: crate::term::TermRow<B>,
         ordinals: &RoaringBitmap,
         widen: bool,
     ) {
@@ -219,9 +219,9 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
             return;
         };
         if widen {
-            members.widen(value, ordinals);
+            members.widen(values, ordinals);
         } else {
-            members.narrow(&value, ordinals);
+            members.narrow(&values, ordinals);
         }
         self.update_snapshot();
     }
@@ -234,7 +234,7 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         &mut self,
         pred_id: PredicateId,
         slot: u16,
-    ) -> Vec<(TermKey<B>, RoaringBitmap)> {
+    ) -> Vec<(crate::term::TermRow<B>, RoaringBitmap)> {
         let store = Arc::make_mut(&mut self.mutable_predicates);
         let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
             return Vec::new();

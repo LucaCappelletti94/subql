@@ -15,28 +15,37 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
 use subql::backend::{MySql, Postgres};
-use subql::reexec::{ReExecEngine, Registered};
 use subql::testing::TestEvent;
-use subql::{DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest};
+use subql::{DefaultIds, RegisterError, Registered, SubscriptionEngine, SubscriptionRequest, Tier};
 
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, status TEXT, amount INT); \
-     CREATE TABLE m (id INT PRIMARY KEY, t_id INT, owner TEXT);";
+     CREATE TABLE m (id INT PRIMARY KEY, t_id INT, owner TEXT); \
+     CREATE TABLE g (id INT PRIMARY KEY, status TEXT, amount INT, price DOUBLE PRECISION, \
+     paid NUMERIC, doc JSON, at TIMESTAMP);";
 
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
-type Wrapper = ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+type Wrapper = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn engine() -> Engine {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
     SubscriptionEngine::new(db, PostgreSqlDialect {})
 }
 
-/// Register `sql` and return the refusal message, failing loudly on anything
-/// else. Every clause outside the served shape is `UnsupportedSql`, which is
-/// also the variant the re-execution wrapper listens for.
+/// Register `sql` and return why it is not served in process, failing loudly
+/// on anything else. A clause outside the served shape is not turned away any
+/// more: it lands on a tier that re-reads the caller's own statement, which
+/// honours the clause the in-process evaluator would have dropped.
 fn refusal(sql: &str) -> String {
     match engine().register(SubscriptionRequest::new(1u64, sql)) {
+        Ok(Registered {
+            tier: Tier::InProcess(served),
+            ..
+        }) => panic!("{sql} should not be served in process, got {served:?}"),
+        Ok(registered) => registered
+            .not_served_because
+            .expect("a tier that needs a read says why"),
         Err(RegisterError::UnsupportedSql(message)) => message,
-        other => panic!("{sql} should be refused as unsupported SQL, got {other:?}"),
+        Err(other) => panic!("{sql} should land on a read tier, got {other:?}"),
     }
 }
 
@@ -50,21 +59,86 @@ fn refused_naming(sql: &str, clause: &str) {
     );
 }
 
-/// The two assertions connetto's finding document states as the expected
-/// behaviour. `GROUP BY` asks for one count per group while the maintained
-/// state is a single accumulator, and the seed SQL kept the clause, so the
-/// caller started from one arbitrary group's count and folded global deltas
-/// onto it.
+/// A grouped aggregate over columns that identify a group is served as a
+/// grouped fold rather than refused.
+///
+/// The clause used to be refused outright because delta maintenance ignored it
+/// while the seed SQL kept it, so the two answered different questions. It is
+/// served now, and the shape is exactly the one the fold can maintain: the
+/// group columns projected alongside one aggregate, grouped by those same
+/// columns.
 #[test]
-fn a_grouped_or_filtered_aggregate_is_refused() {
-    refused_naming("SELECT COUNT(*) FROM t GROUP BY status", "GROUP BY");
+fn a_grouped_aggregate_over_groupable_columns_is_served() {
+    for sql in [
+        "SELECT status, COUNT(*) FROM g GROUP BY status",
+        "SELECT status, SUM(amount) FROM g GROUP BY status",
+        "SELECT status, id, COUNT(*) FROM g GROUP BY status, id",
+        "SELECT at, AVG(amount) FROM g GROUP BY at",
+        "SELECT status, COUNT(*) FROM g WHERE amount > 3 GROUP BY status",
+    ] {
+        let result = engine().register(SubscriptionRequest::new(1u64, sql));
+        assert!(
+            result.is_ok(),
+            "{sql} should register as a grouped fold, got {result:?}"
+        );
+    }
+}
+
+/// `HAVING` off the fast path stays refused: without a grouped fold to check
+/// it against, the seed and the live stream would answer different questions.
+/// The served fast-path shape is pinned in `tests/grouped_having.rs`.
+#[test]
+fn having_outside_the_fast_path_is_refused() {
     refused_naming("SELECT COUNT(*) FROM t HAVING COUNT(*) > 3", "HAVING");
     refused_naming(
-        "SELECT COUNT(*) FROM t GROUP BY status HAVING COUNT(*) > 3",
-        "GROUP BY",
+        "SELECT status, COUNT(*) FROM g GROUP BY status HAVING SUM(price) > 3",
+        "HAVING",
     );
-    refused_naming("SELECT SUM(amount) FROM t GROUP BY status", "GROUP BY");
-    refused_naming("SELECT COUNT(*) FROM t GROUP BY ALL", "GROUP BY");
+}
+
+/// A group column whose values the database groups together while their
+/// encoding separates them cannot identify a group.
+///
+/// Measured: Postgres puts `0.0` with `-0.0` and `1.0::numeric` with
+/// `1.00::numeric` in one group, and json documents differing only in
+/// whitespace or key order are one value. The fold decides a group by encoding
+/// the value, so it would seed one group and then open a second from zero,
+/// leaving both totals wrong with nothing failing. Refused, so the query is
+/// served by re-reading it instead.
+#[test]
+fn a_group_column_that_cannot_identify_a_group_is_refused() {
+    for sql in [
+        "SELECT price, COUNT(*) FROM g GROUP BY price",
+        "SELECT paid, COUNT(*) FROM g GROUP BY paid",
+        "SELECT doc, COUNT(*) FROM g GROUP BY doc",
+    ] {
+        let message = refusal(sql);
+        assert!(
+            message.contains("group"),
+            "the refusal of {sql} should say the column cannot identify a group, got {message:?}"
+        );
+    }
+}
+
+/// Only the shape the fold can maintain is served. Everything else is a
+/// question about rows the fold does not hold, so it is refused here and
+/// re-read by the tier above.
+#[test]
+fn a_grouped_shape_the_fold_cannot_maintain_is_refused() {
+    // Grouped by an expression rather than a bare column: the changed row
+    // cannot name its own group without evaluating it.
+    refusal("SELECT lower(status), COUNT(*) FROM g GROUP BY lower(status)");
+    // `GROUP BY ALL` names its groups by position in the projection.
+    refusal("SELECT status, COUNT(*) FROM g GROUP BY ALL");
+    // Projects a column that is not grouped by.
+    refusal("SELECT amount, COUNT(*) FROM g GROUP BY status");
+    // Groups by a column the projection does not carry, so a delivered value
+    // could not be attributed to anything the caller asked for.
+    refusal("SELECT COUNT(*) FROM g GROUP BY status");
+    // Two aggregates: the fold maintains one accumulator per group.
+    refusal("SELECT status, COUNT(*), SUM(amount) FROM g GROUP BY status");
+    // An aggregate outside the accumulable family.
+    refusal("SELECT status, MIN(amount) FROM g GROUP BY status");
 }
 
 /// The same clauses on a row subscription. Nothing about the projection makes
@@ -166,11 +240,70 @@ fn an_accepted_aggregate_seeds_from_the_statement_it_maintains() {
             "SELECT COUNT(*) FROM t WHERE status = 'a'",
         ))
         .unwrap();
-    let bootstrap = report.aggregate_bootstrap.expect("an aggregate seeds");
+    let bootstrap = report
+        .served()
+        .expect("the engine maintains this one in process")
+        .aggregate_bootstrap
+        .clone()
+        .expect("an aggregate seeds");
     assert_eq!(
         bootstrap.sql,
         "SELECT COUNT(*) AS c0 FROM t WHERE status = 'a'"
     );
+}
+
+/// A grouped aggregate's seed keeps the grouping and projects the group
+/// columns ahead of the components, one row per group.
+///
+/// This is the half that made the clause a defect before it was served: the
+/// seed SQL kept the `GROUP BY` while the maintenance ignored it, so the two
+/// answered different questions. They agree now only because the seed says
+/// which group each row is, and `group_columns` is how a caller knows where
+/// the group values stop and the components begin.
+#[test]
+fn a_grouped_aggregate_seeds_one_row_per_group() {
+    let report = engine()
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT status, COUNT(*) FROM g WHERE amount > 3 GROUP BY status",
+        ))
+        .unwrap();
+    let bootstrap = report
+        .served()
+        .expect("the engine maintains this one in process")
+        .aggregate_bootstrap
+        .clone()
+        .expect("a grouped aggregate seeds");
+    assert_eq!(
+        bootstrap.sql,
+        "SELECT \"status\", COUNT(*) AS c0, COUNT(*) AS c1 FROM g WHERE amount > 3 GROUP BY status"
+    );
+    assert_eq!(bootstrap.group_columns, 1);
+    assert_eq!(
+        bootstrap.kinds.len(),
+        3,
+        "one group column, one component, one source-row count"
+    );
+
+    // Two group columns lead in GROUP BY order, which is the order a group's
+    // key encodes in, so a seeded group lines up with a later change's.
+    let report = engine()
+        .register(SubscriptionRequest::new(
+            2u64,
+            "SELECT id, status, SUM(amount) FROM g GROUP BY status, id",
+        ))
+        .unwrap();
+    let bootstrap = report
+        .served()
+        .expect("the engine maintains this one in process")
+        .aggregate_bootstrap
+        .clone()
+        .expect("a grouped aggregate seeds");
+    assert_eq!(
+        bootstrap.sql,
+        "SELECT \"status\", \"id\", SUM(amount) AS c0, COUNT(*) AS c1 FROM g GROUP BY status, id"
+    );
+    assert_eq!(bootstrap.group_columns, 2);
 }
 
 /// A dropped clause must never ride a *scalar* re-execution. That would make
@@ -194,10 +327,12 @@ fn a_dropped_clause_never_rides_a_scalar_reexecution() {
         refused_naming(sql, "not supported");
 
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-        let mut wrapper: Wrapper =
-            ReExecEngine::new(SubscriptionEngine::new(db, PostgreSqlDialect {}));
+        let mut wrapper: Wrapper = SubscriptionEngine::new(db, PostgreSqlDialect {});
         match wrapper.register(SubscriptionRequest::new(1u64, sql)) {
-            Ok(Registered::Captured { sql: captured, .. }) => {
+            Ok(Registered {
+                tier: Tier::WholeRows { sql: captured, .. },
+                ..
+            }) => {
                 assert_eq!(captured, sql, "the tier re-reads the statement as written");
             }
             other => panic!("{sql} should be captured for a whole re-read, got {other:?}"),
@@ -210,10 +345,16 @@ fn a_dropped_clause_never_rides_a_scalar_reexecution() {
 #[test]
 fn the_reexecution_wrapper_still_captures_a_bare_scalar() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
-    let mut wrapper: Wrapper = ReExecEngine::new(SubscriptionEngine::new(db, PostgreSqlDialect {}));
+    let mut wrapper: Wrapper = SubscriptionEngine::new(db, PostgreSqlDialect {});
     let outcome = wrapper.register(SubscriptionRequest::new(1u64, "SELECT MIN(amount) FROM t"));
     assert!(
-        matches!(outcome, Ok(Registered::ReExec { .. })),
+        matches!(
+            outcome,
+            Ok(Registered {
+                tier: Tier::Scalar { .. },
+                ..
+            })
+        ),
         "a bare scalar MIN should still be captured, got {outcome:?}"
     );
 }
@@ -268,11 +409,20 @@ fn a_mysql_only_clause_is_refused() {
         let db = ParserDB::parse::<MySqlDialect>(DDL).unwrap();
         let mut engine: MySqlEngine = SubscriptionEngine::new(db, MySqlDialect {});
         match engine.register(SubscriptionRequest::new(1u64, sql)) {
-            Err(RegisterError::UnsupportedSql(message)) => assert!(
-                message.contains(clause),
-                "the refusal of {sql} should name {clause}, got {message:?}"
-            ),
-            other => panic!("{sql} should be refused, got {other:?}"),
+            Ok(Registered {
+                tier: Tier::InProcess(served),
+                ..
+            }) => panic!("{sql} should not be served in process, got {served:?}"),
+            Ok(registered) => {
+                let reason = registered
+                    .not_served_because
+                    .expect("a tier that needs a read says why");
+                assert!(
+                    reason.contains(clause),
+                    "the reason for {sql} should name {clause}, got {reason:?}"
+                );
+            }
+            Err(other) => panic!("{sql} should land on a read tier, got {other:?}"),
         }
     }
 }
@@ -291,5 +441,63 @@ fn the_served_shape_still_registers_on_mysql() {
     assert!(
         outcome.is_ok(),
         "the served shape should register, got {outcome:?}"
+    );
+}
+
+/// Grouping by text is served on Postgres and refused on MySQL, because the
+/// two databases disagree about when two text values are one group.
+///
+/// Measured on `mysql:8.0` as this repo's own container starts it: the server
+/// collation is `utf8mb4_0900_ai_ci`, so `'a'` and `'A'` are one group, while
+/// Postgres and SQLite give two. A fold decides a group by encoding the value,
+/// so on MySQL it would seed one group and then open a second from zero and
+/// both totals would be wrong. Worse than a per-column setting could fix,
+/// since that collation comes from server and table defaults and is absent
+/// from the schema text subql parses. Grouping by an integer stays served on
+/// both, so this pins the text difference rather than a broken dialect.
+#[test]
+fn text_grouping_is_served_on_postgres_and_refused_on_mysql() {
+    let outcome = engine().register(SubscriptionRequest::new(
+        1u64,
+        "SELECT status, COUNT(*) FROM g GROUP BY status",
+    ));
+    assert!(
+        outcome.is_ok(),
+        "Postgres groups text by bytes, so this is served, got {outcome:?}"
+    );
+
+    let db = ParserDB::parse::<MySqlDialect>(DDL).unwrap();
+    let mut mysql: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, MySqlDialect {});
+    match mysql.register(SubscriptionRequest::new(
+        1u64,
+        "SELECT status, COUNT(*) FROM g GROUP BY status",
+    )) {
+        Ok(Registered {
+            tier: Tier::InProcess(served),
+            ..
+        }) => panic!("MySQL must not fold a text group in process, got {served:?}"),
+        Ok(registered) => {
+            let reason = registered
+                .not_served_because
+                .expect("a tier that needs a read says why");
+            assert!(
+                reason.contains("group"),
+                "the reason should name the group column, got {reason:?}"
+            );
+        }
+        Err(other) => panic!("MySQL should re-read it instead, got {other:?}"),
+    }
+
+    let db = ParserDB::parse::<MySqlDialect>(DDL).unwrap();
+    let mut mysql: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, MySqlDialect {});
+    let outcome = mysql.register(SubscriptionRequest::new(
+        1u64,
+        "SELECT amount, COUNT(*) FROM g GROUP BY amount",
+    ));
+    assert!(
+        outcome.is_ok(),
+        "an integer group column is served on MySQL too, got {outcome:?}"
     );
 }

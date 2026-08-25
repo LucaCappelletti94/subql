@@ -19,7 +19,14 @@ use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId,
+    Tier,
 };
+
+/// One-wide value rows, the shape the tuple-stating API takes for the
+/// ordinary single-column term.
+fn rows_of(values: Vec<Value<Postgres>>) -> Vec<Vec<Value<Postgres>>> {
+    values.into_iter().map(|value| vec![value]).collect()
+}
 
 const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
      CREATE TABLE project_members(project_id INTEGER REFERENCES projects(id), user_id TEXT, PRIMARY KEY(project_id, user_id));
@@ -251,7 +258,7 @@ fn a_caller_comparison_composes_with_a_membership_subquery() {
         .register(
             SubscriptionRequest::new(1u64, mixed)
                 .subscriber(Value::String("alice".into()))
-                .term_values("project_id", vec![Value::Int(7)]),
+                .term_values(vec!["project_id"], rows_of(vec![Value::Int(7)])),
         )
         .unwrap();
 
@@ -371,7 +378,8 @@ fn values_stated_for_the_caller_comparison_are_refused() {
     let (mut engine, _) = engine();
     let reason = refusal(
         &mut engine,
-        subscribe(1, "alice").term_values("owner", vec![Value::String("bob".into())]),
+        subscribe(1, "alice")
+            .term_values(vec!["owner"], rows_of(vec![Value::String("bob".into())])),
     );
     assert!(
         reason.contains("owner"),
@@ -380,39 +388,47 @@ fn values_stated_for_the_caller_comparison_are_refused() {
 }
 
 /// `NOT` over a caller comparison admits everybody but the caller, including
-/// through a NULL cell that SQL's own three-valued logic admits for nobody, so
-/// it is refused as SQL rather than served with different semantics.
+/// rows the caller cannot see, so it is not served in process and the reason
+/// says so rather than the engine quietly serving different semantics.
 #[test]
-fn a_negated_caller_comparison_is_refused() {
+fn a_negated_caller_comparison_is_not_served_in_process() {
     let (mut engine, _) = engine();
     let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
         1u64,
         "SELECT * FROM notes WHERE NOT (owner = current_setting('app.user_id', true))",
     )
     .subscriber(Value::String("alice".into()));
-    match engine.register(spec) {
-        Err(RegisterError::UnsupportedSql(reason)) => {
-            assert!(
-                reason.contains("caller"),
-                "the refusal names the shape: {reason}"
-            );
-        }
-        other => panic!("expected an unsupported-SQL refusal, got {other:?}"),
-    }
+    let registered = engine
+        .register(spec)
+        .expect("a shape the evaluator refuses is re-read, not turned away");
+    assert!(
+        !matches!(registered.tier, Tier::InProcess(_)),
+        "got {:?}",
+        registered.tier
+    );
+    let reason = registered
+        .not_served_because
+        .expect("a read tier says why it is one");
+    assert!(
+        reason.contains("caller"),
+        "the reason names the shape: {reason}"
+    );
 }
 
-/// A function reading a column is not a caller comparison, and keeps the
-/// unsupported-SQL refusal it always had.
+/// A function reading a column is not a caller comparison, so it too lands on
+/// a tier that re-reads rather than being maintained in process.
 #[test]
-fn a_function_of_a_column_is_still_unsupported_sql() {
+fn a_function_of_a_column_is_not_served_in_process() {
     let (mut engine, _) = engine();
     let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
         1u64,
         "SELECT * FROM notes WHERE owner = lower(title)",
     );
+    let registered = engine.register(spec).expect("re-read, not refused");
     assert!(
-        matches!(engine.register(spec), Err(RegisterError::UnsupportedSql(_))),
-        "a column-reading function is outside the lifted shape"
+        !matches!(registered.tier, Tier::InProcess(_)),
+        "a column-reading function is outside the lifted shape, got {:?}",
+        registered.tier
     );
 }
 
@@ -478,7 +494,7 @@ fn describe_terms_names_only_the_membership_subquery_of_a_mixed_filter() {
         .unwrap();
     assert_eq!(described.len(), 1, "one seed read, for the subquery");
     assert_eq!(
-        described[0].column, "project_id",
+        described[0].pairs[0].column, "project_id",
         "and it is the subquery's compared column"
     );
 }

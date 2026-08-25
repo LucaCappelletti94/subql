@@ -1,10 +1,10 @@
 #![allow(clippy::type_complexity)]
 //! Opt-in connector abstraction for auto-resolving re-execution.
 //!
-//! The bare [`ReExecEngine`](super::ReExecEngine) emits
-//! [`ReExecutionTrigger`](super::ReExecutionTrigger)s and leaves the
-//! re-execution to its caller. Some consumers prefer subql to run the
-//! re-execution itself: they implement [`Connector`] over their database
+//! [`SubscriptionEngine`](crate::SubscriptionEngine) emits
+//! [`ReExecutionTrigger`](super::ReExecutionTrigger) and leaves SQL execution
+//! to downstream Rust code. Code that wants subql to call the database uses
+//! [`AutoResolvingEngine`](super::AutoResolvingEngine) with [`SyncMode`](super::SyncMode) and implements [`Connector`] over its database
 //! handle, hand it to an [`AutoResolvingEngine`](super::AutoResolvingEngine),
 //! and receive [`ScalarUpdate`](super::ScalarUpdate)s directly. Consumers
 //! that want explicit control (e.g. cross-batch coalescing,
@@ -102,8 +102,8 @@ impl<B: Backend> RowPage<B> {
 /// last row", so those pages come from one cursor inside one read-only
 /// repeatable-read transaction, which is the only way successive pages describe
 /// a single instant. The id is opaque and connector-minted, matching how this
-/// module already addresses captured queries by
-/// [`ReExecQueryId`](super::ReExecQueryId).
+/// module already addresses a maintained answer by
+/// [`SubscriptionId`](crate::SubscriptionId).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CursorId(pub u64);
 
@@ -176,8 +176,12 @@ pub trait Connector {
     type Error;
     /// Position token the connector tags reads with.
     ///
-    /// PG-aware connectors choose [`crate::PgLsn`] and call
-    /// `pg_current_wal_lsn()` inside the same transaction as the read.
+    /// An implementation MUST take the position before the read's snapshot
+    /// opens, never after: behind the snapshot re-delivers changes the
+    /// snapshot already holds, which keyed application absorbs, while ahead
+    /// of it silently drops a transaction the snapshot never saw. PG-aware
+    /// connectors choose [`crate::PgLsn`] and read `pg_current_wal_lsn()`,
+    /// which is not snapshot-bound, before opening the read's transaction.
     /// Backends with no native position (in-memory SQLite, MySQL absent of
     /// binlog tracking) choose [`crate::NoCheckpoint`] and return `None`.
     type Checkpoint: Checkpoint;
@@ -189,7 +193,7 @@ pub trait Connector {
     /// the read was taken.
     ///
     /// `sql` is exactly the string the plan rendered for re-execution and
-    /// returned via [`Registered::ReExec`](super::Registered::ReExec) at
+    /// returned via [`Tier::Scalar`](crate::Tier::Scalar) at
     /// registration, with its projection already aliased. `kind` is the
     /// plan's decode hint. Impls may use it to pick the right diesel
     /// `QueryableByName` row, sqlx `Row::try_get` slot, etc., or ignore it
@@ -197,8 +201,10 @@ pub trait Connector {
     ///
     /// The returned tuple is `(value, Option<checkpoint>)`. The checkpoint
     /// is informational for downstream replay layers. Subql does not gate
-    /// on it. An empty result set must return [`Value::Null`] as the
-    /// value (matches the "set went empty" semantics of MIN/MAX).
+    /// on it. Which side of the snapshot the position is taken on is
+    /// [`Checkpoint`](Self::Checkpoint)'s rule. An empty result set must
+    /// return [`Value::Null`] as the value (matches the "set went empty"
+    /// semantics of MIN/MAX).
     fn execute_scalar(
         &self,
         sql: &str,
@@ -217,6 +223,9 @@ pub trait Connector {
     /// that successive pages see successive states, which the caller
     /// reconciles against the change stream using
     /// [`Snapshot::checkpoint`].
+    ///
+    /// Which side of the snapshot the position is taken on is
+    /// [`Checkpoint`](Self::Checkpoint)'s rule.
     ///
     /// Stop at the first row that would take the page past `max_bytes`, and
     /// report [`RowPage::more`] as whether the result had further rows. A page
@@ -238,6 +247,9 @@ pub trait Connector {
     /// all come from one snapshot. That costs a transaction and a borrowed
     /// connection until [`close_cursor`](Self::close_cursor), which is why it
     /// is not the path a keyed result takes.
+    ///
+    /// The snapshot opens when the cursor is declared, so
+    /// [`Checkpoint`](Self::Checkpoint)'s rule puts the position before that.
     ///
     /// The default refuses: a connector over a source with no cursors is
     /// honest to say so, and the refusal names what the caller loses.
@@ -285,16 +297,17 @@ pub trait Connector {
     /// column by the matching [`ScalarKind`].
     ///
     /// Bootstraps or re-seeds an in-process aggregate accumulator from
-    /// [`RegisterResult::aggregate_bootstrap`](crate::RegisterResult::aggregate_bootstrap):
+    /// [`Served::aggregate_bootstrap`](crate::Served::aggregate_bootstrap):
     /// run [`AggregateBootstrap::sql`](crate::AggregateBootstrap::sql), typing
     /// each column by [`AggregateBootstrap::kinds`](crate::AggregateBootstrap::kinds),
     /// then feed the returned row to
-    /// [`AggAccumulator::seed_from_row`](crate::AggAccumulator::seed_from_row).
+    /// [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall).
     /// `sql` returns exactly one row (aggregate queries always do, yielding
     /// the empty-aggregate row over an empty table). Run the components in
     /// the same read-only repeatable-read transaction
     /// [`execute_scalar`](Self::execute_scalar) uses so they share one
-    /// snapshot; the single returned checkpoint is the transaction's.
+    /// snapshot. The single returned checkpoint is the transaction's, taken on
+    /// the side [`Checkpoint`](Self::Checkpoint) requires.
     ///
     /// The default rejects the seed with [`ScalarRowError::Unsupported`] so
     /// existing external impls keep compiling. The shipped diesel connectors
@@ -330,6 +343,12 @@ pub enum ReExecError<E> {
     /// batch is aborted. The caller is expected to retry it.
     #[error("connector failed: {0}")]
     Connector(E),
+    /// The database result does not match the subscription it was read for.
+    #[error("install failed: {0}")]
+    Install(#[from] crate::InstallError),
+    /// A grouped aggregate result does not match its maintained state.
+    #[error("aggregate install failed: {0}")]
+    AggregateInstall(#[from] crate::AggregateInstallError),
     /// A cursor read failed, or the connector holds no cursors and so cannot
     /// serve a captured query that has to be re-read whole. Kept apart from
     /// [`Self::Connector`] because "this connector cannot do that" is a
@@ -592,7 +611,7 @@ where
     /// Backend-agnostic v1 default: this connector does not read the
     /// underlying source's position. PG-aware variants
     /// (`PgDieselConnector`) override this to `PgLsn` and read
-    /// `pg_current_wal_lsn()` inside the snapshot transaction.
+    /// `pg_current_wal_lsn()` before the snapshot transaction.
     type Checkpoint = crate::NoCheckpoint;
     type Backend = B;
 
@@ -800,8 +819,8 @@ impl Connector for PgDieselConnector {
 /// Sync [`Connector`] backed by a diesel `MysqlConnection` that anchors every
 /// read to a MySQL binary-log position.
 ///
-/// On each `execute_scalar` call the connector runs the user's SQL and then
-/// reads `performance_schema.log_status` inside one transaction, returning the
+/// On each `execute_scalar` call the connector reads
+/// `performance_schema.log_status` and then runs the user's SQL, returning the
 /// resulting [`Value<crate::backend::MySql>`] together with the parsed
 /// [`crate::MysqlBinlogPos`] (the
 /// binlog file's numeric suffix + byte offset).
@@ -813,9 +832,9 @@ impl Connector for PgDieselConnector {
 ///
 /// Unlike PostgreSQL's `pg_current_wal_lsn()`, this reports the server's
 /// *current* binlog coordinate rather than one tied to the transaction's
-/// snapshot, so the anchor is a best-effort "at or after the read" marker -
-/// adequate for chaining binlog events onto the snapshot, but not a strict
-/// MVCC-consistent position. Returns `None` for the checkpoint when binary
+/// snapshot, so reading it first makes it an "at or before the read" marker
+/// rather than a strict MVCC-consistent position. Returns `None` for the
+/// checkpoint when binary
 /// logging is disabled (no `log_status` row).
 ///
 /// Holds the connection in a [`RefCell`]; not `Send`/`Sync`. Requires MySQL
@@ -910,9 +929,12 @@ impl Connector for MysqlDieselConnector {
         _auth: &(),
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
+        // Position before snapshot, per `Connector::Checkpoint`: the coordinate
+        // is the server's current one, so taken after the read it can sit ahead
+        // of the snapshot and a replay from there loses a commit.
+        let pos = read_binlog_pos(&mut conn);
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
-            let pos = read_binlog_pos(conn);
             Ok((value, pos))
         })
     }
@@ -924,9 +946,10 @@ impl Connector for MysqlDieselConnector {
         _auth: &(),
     ) -> Result<Snapshot<RowPage<crate::backend::MySql>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.conn.borrow_mut();
+        // Position before snapshot, per `Connector::Checkpoint`.
+        let pos = read_binlog_pos(&mut conn);
         conn.transaction(|conn| {
             let value = load_page::<_, crate::backend::MySql>(conn, sql, max_bytes)?;
-            let pos = read_binlog_pos(conn);
             Ok(Snapshot {
                 value,
                 checkpoint: pos,
@@ -947,9 +970,10 @@ impl Connector for MysqlDieselConnector {
         ScalarRowError<Self::Error>,
     > {
         let mut conn = self.conn.borrow_mut();
+        // Position before snapshot, per `Connector::Checkpoint`.
+        let pos = read_binlog_pos(&mut conn);
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
-            let pos = read_binlog_pos(conn);
             Ok((values, pos))
         })
         .map_err(ScalarRowError::Connector)
@@ -963,8 +987,8 @@ impl Connector for MysqlDieselConnector {
 /// Pool-backed [`Connector`] for PostgreSQL.
 ///
 /// Wraps an `r2d2::Pool` over `ConnectionManager<PgConnection>`, is
-/// `Send + Sync`, and reads `pg_current_wal_lsn()` inside the same
-/// transaction as the user query for LSN-anchored snapshots.
+/// `Send + Sync`, and reads `pg_current_wal_lsn()` before the user query's
+/// transaction for LSN-anchored snapshots.
 ///
 /// Use this connector when the engine dispatches re-executions
 /// concurrently (the async engine with `consumers_batch`) or when
@@ -1316,6 +1340,36 @@ impl Connector for PgR2D2DieselConnector {
     }
 }
 
+/// Drain buffered cursor rows into `rows` until the byte budget stops it.
+///
+/// `true` when the budget was hit with buffered rows left, which is the
+/// page's `more`. The budget rule lives here once, shared by the sync and
+/// async cursor loops, whose only real difference is the await on the
+/// `FETCH` round trip.
+#[cfg(any(
+    feature = "executor-diesel-postgres-r2d2",
+    feature = "executor-diesel-async"
+))]
+pub(super) fn drain_cursor_buffer<B: crate::backend::Backend>(
+    leftover: &mut alloc::collections::VecDeque<alloc::vec::Vec<Value<B>>>,
+    rows: &mut alloc::vec::Vec<alloc::vec::Vec<Value<B>>>,
+    spent: &mut usize,
+    max_bytes: usize,
+) -> bool {
+    while let Some(row) = leftover.front() {
+        let cost = RowPage::<B>::row_bytes_of(row);
+        if !rows.is_empty() && *spent + cost > max_bytes {
+            return true;
+        }
+        *spent += cost;
+        // Total: `front` just answered `Some`.
+        if let Some(row) = leftover.pop_front() {
+            rows.push(row);
+        }
+    }
+    false
+}
+
 /// Fill one page from an open cursor, buffering whatever a `FETCH` overshot.
 ///
 /// The sync twin of `PgAsyncDieselConnector::fetch_from`, split out for the
@@ -1331,23 +1385,15 @@ fn fetch_page_from(
         alloc::vec::Vec::new();
     let mut spent = 0_usize;
     loop {
-        while let Some(row) = held.leftover.front() {
-            let cost = RowPage::<crate::backend::Postgres>::row_bytes_of(row);
-            if !rows.is_empty() && spent + cost > max_bytes {
-                return Ok(Snapshot {
-                    value: RowPage {
-                        columns: held.columns.clone(),
-                        rows,
-                        more: true,
-                    },
-                    checkpoint: held.checkpoint,
-                });
-            }
-            spent += cost;
-            // Total: `front` just answered `Some`.
-            if let Some(row) = held.leftover.pop_front() {
-                rows.push(row);
-            }
+        if drain_cursor_buffer(&mut held.leftover, &mut rows, &mut spent, max_bytes) {
+            return Ok(Snapshot {
+                value: RowPage {
+                    columns: held.columns.clone(),
+                    rows,
+                    more: true,
+                },
+                checkpoint: held.checkpoint,
+            });
         }
         let page = load_page::<_, crate::backend::Postgres>(
             &mut held.conn,

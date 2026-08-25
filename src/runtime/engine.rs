@@ -1,6 +1,9 @@
 #![allow(clippy::type_complexity)]
 //! Subscription engine - main public API
 
+mod agg_maintenance;
+mod install;
+
 use super::indexes::IndexableAtom;
 use super::{
     dispatch::{dispatch_consumers, dispatch_consumers_with_stamps, ConsumerDictionary},
@@ -14,14 +17,12 @@ use crate::{
     catalog_helpers,
     compiler::{
         canonicalize, parse_and_resolve_hash, parse_compile_normalize_and_prefilter_with_binds,
-        parser::CompiledQuery,
-        sql_shape::{AggSpec, QueryProjection},
-        BytecodeProgram, PrefilterPlan, Vm,
+        parser::CompiledQuery, sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan, Vm,
     },
     term::{kind_can_key, CompiledTerm, TermDescription, TermKey, TermLookup, TermPlan},
-    DispatchError, EventKind, IdTypes, RegisterError, RegisterResult, SubscriptionDispatch,
-    SubscriptionId, SubscriptionRegistration, SubscriptionRequest, SubscriptionScope,
-    SubscriptionUnregistration, TableId, UnregisterReport,
+    ColumnId, DispatchError, EventKind, IdTypes, RegisterError, Registered, Served,
+    SubscriptionDispatch, SubscriptionId, SubscriptionRegistration, SubscriptionRequest,
+    SubscriptionScope, SubscriptionUnregistration, TableId, Tier, UnregisterReport,
 };
 #[cfg(feature = "std")]
 use crate::{
@@ -34,8 +35,8 @@ use crate::{
             ShardPayload,
         },
     },
-    DurabilityMode, DurableShardMerge, DurableShardStore, MergeError, MergeJobId, MergeReport,
-    StorageError,
+    DropReason, DroppedRead, DurabilityMode, DurableShardMerge, DurableShardStore, MergeError,
+    MergeJobId, MergeReport, RestoredRead, RestoredReads, StorageError,
 };
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -136,8 +137,30 @@ struct CompiledSpec<I: IdTypes, B: Backend> {
     /// The subscriber this subscription filters for, in the form the term lookup
     /// is keyed by. `Some` exactly when the filter names a term.
     term_subscriber: Option<TermKey<B>>,
-    /// Per term slot, the values the subscription states it matches today.
-    term_seeds: Vec<Vec<TermKey<B>>>,
+    /// Per term slot, the value rows the subscription states it matches today.
+    term_seeds: Vec<Vec<crate::term::TermRow<B>>>,
+}
+
+struct AggregateRegistration<I: IdTypes> {
+    consumer: I::ConsumerId,
+    scope: SubscriptionScope<I>,
+    sql: String,
+    /// Whether the registration declared per-consumer database reads, so a
+    /// tier transition builds its replacement read under the same contract.
+    /// Not persisted: a restored in-process aggregate starts shared, like
+    /// every batch registration.
+    database_reads_per_consumer: bool,
+}
+
+impl<I: IdTypes> Clone for AggregateRegistration<I> {
+    fn clone(&self) -> Self {
+        Self {
+            consumer: self.consumer,
+            scope: self.scope,
+            sql: self.sql.clone(),
+            database_reads_per_consumer: self.database_reads_per_consumer,
+        }
+    }
 }
 
 #[cfg(feature = "std")]
@@ -277,13 +300,46 @@ where
     /// until the client registers again. That is the freshness-losing direction,
     /// never a row delivered to somebody the filter excludes.
     term_watch: HashMap<TableId, Vec<TermWatch>>,
+    /// Running total per aggregate subscription.
+    ///
+    /// The engine owns these, so an aggregate subscription reports its value
+    /// rather than a delta the caller folds. Populated at registration and
+    /// dropped with the subscription, and in-memory only: after a restart a
+    /// durable aggregate subscription comes back unseeded and reports nothing
+    /// until the caller reads its starting numbers again, which is the
+    /// silent direction rather than the wrong-number one.
+    aggregates:
+        HashMap<SubscriptionId, crate::runtime::aggregate::AggregateTotal<I, E::Checkpoint>>,
+    /// Running group maps for grouped aggregate subscriptions.
+    grouped_aggregates:
+        HashMap<SubscriptionId, crate::runtime::aggregate::GroupedAggregateTotal<I, E::Checkpoint>>,
+    /// Original SQL and registration metadata retained for an in-place
+    /// transition from aggregate maintenance to a complete row read.
+    aggregate_registrations: HashMap<SubscriptionId, AggregateRegistration<I>>,
+    /// Maximum changes held while aggregate starting rows are read.
+    max_changes_during_aggregate_read: usize,
+    /// Maximum live groups for one grouped aggregate before it changes tier.
+    max_groups_per_aggregate: usize,
+    /// Answers this engine cannot maintain from the change stream, each with
+    /// the tier that re-reads it and the state machine that decides when.
+    ///
+    /// Keyed by the same identity a served subscription carries, since both are
+    /// registrations of the same registry.
+    reexec: HashMap<SubscriptionId, crate::reexec::ReExecEntry<I, E::Backend, E::Checkpoint>>,
+    /// Table -> the re-read answers a change to it may move.
+    table_deps: HashMap<TableId, hashbrown::HashSet<SubscriptionId>>,
+    /// Plans for keyed re-reads, kept so a read renders the scoped statement
+    /// from the caller's own SQL rather than from a reconstruction.
+    keyed_plans: HashMap<SubscriptionId, crate::reexec::plan::KeyedPlan>,
+    /// Session -> its re-read answers, for session-scoped cleanup.
+    reexec_sessions: HashMap<I::SessionId, Vec<SubscriptionId>>,
 }
 
 /// One term whose subscriber set a change to some table moves.
 ///
 /// Keyed from the membership table's side, so it carries where to put the answer
 /// back: the subscribed table names the partition holding the predicate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TermWatch {
     /// The subscribed table, whose partition holds the predicate.
     subscribed: TableId,
@@ -294,12 +350,12 @@ struct TermWatch {
     predicate: PredicateId,
     /// The term's slot in that predicate.
     slot: u16,
-    /// The column of the subscribed table the term compares, which is what the
-    /// narrowing message names.
-    column: crate::ColumnId,
-    /// The column of the changed row carrying the value the term compares
-    /// against.
-    member_key: crate::ColumnId,
+    /// The columns of the subscribed table the term compares, which is what
+    /// the narrowing message names.
+    columns: Vec<crate::ColumnId>,
+    /// The columns of the changed row carrying the values the term compares
+    /// against, pairwise with `columns`.
+    member_keys: Vec<crate::ColumnId>,
     /// The column of the changed row naming the subscriber it admits.
     member_subject: crate::ColumnId,
 }
@@ -310,7 +366,7 @@ struct PendingSeed<B: Backend> {
     subscription: SubscriptionId,
     subscriber: TermKey<B>,
     plans: Vec<TermPlan>,
-    seeds: Vec<Vec<TermKey<B>>>,
+    seeds: Vec<Vec<crate::term::TermRow<B>>>,
 }
 
 /// The subscriptions bound to `predicate` for each ordinal in `ordinals`.
@@ -357,14 +413,12 @@ impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<E, 
 where
     E::Backend: SqlLiteralParse,
 {
-    /// The SQL dialect used for parsing. Exposed for the reexec wrapper,
-    /// which re-parses queries the engine rejects.
+    /// The SQL dialect used for parsing statements.
     pub(crate) const fn dialect(&self) -> &<E::Backend as Backend>::Dialect {
         &self.dialect
     }
 
     /// The schema catalog the engine resolves tables/columns against.
-    ///
     /// Borrow it when you need to read the schema alongside a live engine
     /// (e.g. to resolve a `TableId` for building a typed [`CdcEvent`]
     /// fixture) without keeping a separate catalog instance.
@@ -412,8 +466,10 @@ where
         // stay accepted. MIN/MAX never reach this branch: they fail the
         // compile step above with UnsupportedSql and are captured by the
         // reexec wrapper, which applies its own RLS guard.
-        if matches!(compiled.projection, QueryProjection::Aggregate(_))
-            && catalog_helpers::table_has_rls(&self.database, compiled.table_id).unwrap_or(false)
+        if matches!(
+            compiled.projection,
+            QueryProjection::Aggregate(_) | QueryProjection::GroupedAggregate { .. }
+        ) && catalog_helpers::table_has_rls(&self.database, compiled.table_id).unwrap_or(false)
         {
             return Err(RegisterError::AggregatorOnRlsTable {
                 table_id: compiled.table_id,
@@ -492,16 +548,13 @@ where
         // For an aggregate registration, render the runnable component
         // seed query so callers can bootstrap the accumulator and re-seed
         // after a mandated reset. `None` for row subscriptions.
-        let bootstrap = match &projection {
-            QueryProjection::Aggregate(agg) => {
-                crate::compiler::sql_shape::render_aggregate_bootstrap(
-                    &spec.sql,
-                    agg,
-                    &self.dialect,
-                )
-            }
-            QueryProjection::Rows => None,
-        };
+        let bootstrap = crate::compiler::sql_shape::render_aggregate_bootstrap(
+            &spec.sql,
+            &projection,
+            &self.dialect,
+            table_id,
+            &self.database,
+        );
 
         Ok(CompiledSpec {
             spec,
@@ -539,7 +592,10 @@ where
         // gives each consumer a different set of rows to aggregate, so the
         // number one subscriber reads would be another's. Same reason an
         // aggregate on a table with row-level security is refused above.
-        if matches!(projection, QueryProjection::Aggregate(_)) {
+        if matches!(
+            projection,
+            QueryProjection::Aggregate(_) | QueryProjection::GroupedAggregate { .. }
+        ) {
             return Err(RegisterError::MembershipTermRefused(
                 "an aggregate cannot carry a membership term. SubQL keeps one accumulator \
                  per aggregate and shares it between consumers, and a membership term gives \
@@ -549,43 +605,47 @@ where
         }
 
         for term in terms {
-            // The lookup is keyed by the compared column's value, so the column
-            // has to hold a kind whose equality is reflexive. A float, a JSON or
-            // a JSONB cell could not find what it stored.
-            let kind = catalog_helpers::column_scalar_kind::<E::Backend, _>(
-                &self.database,
-                table_id,
-                term.column,
-            )
-            .ok_or_else(|| {
-                RegisterError::MembershipTermRefused(format!(
-                    "column {column} of table {table_id} has a SQL type SubQL cannot read, so \
-                         a membership subquery comparing it has nothing to look up",
-                    column = term.column,
-                ))
-            })?;
-            if !kind_can_key::<E::Backend>(kind) {
-                return Err(RegisterError::MembershipTermRefused(format!(
-                    "a membership subquery cannot compare a {kind:?} column. SubQL looks the \
-                     column's value up to decide which subscribers a changed row admits, and a \
-                     {kind:?} value is not equal to itself, so the lookup could not find what it \
-                     stored."
-                )));
+            // The lookup is keyed by the compared columns' values, so each
+            // column has to hold a kind whose equality is reflexive. A float, a
+            // JSON or a JSONB cell could not find what it stored.
+            for &column in &term.columns {
+                let kind = catalog_helpers::column_scalar_kind::<E::Backend, _>(
+                    &self.database,
+                    table_id,
+                    column,
+                )
+                .ok_or_else(|| {
+                    RegisterError::MembershipTermRefused(format!(
+                        "column {column} of table {table_id} has a SQL type SubQL cannot read, \
+                         so a membership subquery comparing it has nothing to look up"
+                    ))
+                })?;
+                if !kind_can_key::<E::Backend>(kind) {
+                    return Err(RegisterError::MembershipTermRefused(format!(
+                        "a membership subquery cannot compare a {kind:?} column. SubQL looks the \
+                         column's value up to decide which subscribers a changed row admits, and \
+                         a {kind:?} value is not equal to itself, so the lookup could not find \
+                         what it stored."
+                    )));
+                }
             }
 
             // Two terms comparing one column would make that column's name
-            // ambiguous in the values a subscription states for it, and the name
-            // is the only thing both sides share.
-            if terms
-                .iter()
-                .any(|other| other.slot != term.slot && other.column == term.column)
-            {
+            // ambiguous in the values a subscription states for it, and the
+            // names are the only thing both sides share.
+            if terms.iter().any(|other| {
+                other.slot != term.slot
+                    && other
+                        .columns
+                        .iter()
+                        .any(|column| term.columns.contains(column))
+            }) {
+                let column = term.columns[0];
                 return Err(RegisterError::MembershipTermRefused(format!(
                     "two membership terms in one filter compare column {column} of table \
                      {table_id}. A subscription states the values it matches per compared column, \
                      so two terms on one column leave SubQL unable to tell which values \
                      belong to which.",
-                    column = term.column,
                 )));
             }
         }
@@ -596,16 +656,33 @@ where
     /// Turn what the subscription stated into the keys the term lookup stores,
     /// or refuse the registration.
     ///
-    /// Returns the subscriber's key and, per term slot, the values it states it
-    /// matches today. Both are empty for a filter naming no term. This runs
-    /// before anything is bound, so seeding afterwards cannot fail halfway and
-    /// leave a subscription registered against a term it was never added to.
+    /// Returns the subscriber's key and, per term slot, the value rows it
+    /// states it matches today. Both are empty for a filter naming no term.
+    /// This runs before anything is bound, so seeding afterwards cannot fail
+    /// halfway and leave a subscription registered against a term it was never
+    /// added to.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the return pairs the subscriber key with per-slot seed rows, and a name \
+                  would hide which side is which"
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass settles the caller seeds and the stated rows, and splitting it \
+                  would let the two halves disagree about the slot layout"
+    )]
     fn settle_term_seeds(
         &self,
         terms: &[CompiledTerm],
         table_id: TableId,
         spec: &SubscriptionRequest<I, E::Backend>,
-    ) -> Result<(Option<TermKey<E::Backend>>, Vec<Vec<TermKey<E::Backend>>>), RegisterError> {
+    ) -> Result<
+        (
+            Option<TermKey<E::Backend>>,
+            Vec<Vec<crate::term::TermRow<E::Backend>>>,
+        ),
+        RegisterError,
+    > {
         if terms.is_empty() {
             return Ok((None, Vec::new()));
         }
@@ -632,12 +709,13 @@ where
         // subscriber, and it has to be of the compared column's kind, or the
         // lookup would store a key no row's cell can ever equal and serve the
         // subscription dead.
-        let mut seeds: Vec<Vec<TermKey<E::Backend>>> = alloc::vec![Vec::new(); terms.len()];
+        let mut seeds: Vec<Vec<crate::term::TermRow<E::Backend>>> =
+            alloc::vec![Vec::new(); terms.len()];
         for term in terms.iter().filter(|term| term.compares_the_caller()) {
             let compared = catalog_helpers::column_scalar_kind::<E::Backend, _>(
                 &self.database,
                 table_id,
-                term.column,
+                term.columns[0],
             );
             let stated = subscriber.scalar_kind();
             if compared != Some(stated) {
@@ -647,40 +725,80 @@ where
                      name it. Build the identity at the compared column's kind."
                 )));
             }
-            seeds[usize::from(term.slot)].push(subscriber.clone());
+            seeds[usize::from(term.slot)].push(alloc::vec![subscriber.clone()]);
         }
 
-        for (column_name, values) in &spec.term_values {
-            let column = catalog_helpers::column_id(&self.database, table_id, column_name);
-            let term = column
-                .and_then(|column| terms.iter().find(|term| term.column == column))
+        for (column_names, rows) in &spec.term_values {
+            let stated: Vec<crate::ColumnId> = column_names
+                .iter()
+                .map(|name| {
+                    catalog_helpers::column_id(&self.database, table_id, name).ok_or_else(|| {
+                        RegisterError::MembershipTermRefused(format!(
+                            "this subscription states the values it matches for column {name:?}, \
+                             which table {table_id} does not carry."
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            // The one term comparing exactly this column set, since two terms
+            // sharing any column were refused above. The caller's order may
+            // differ from the filter's, so each stated row is permuted into the
+            // term's own order below.
+            let term = terms
+                .iter()
+                .find(|term| {
+                    term.columns.len() == stated.len()
+                        && stated.iter().all(|column| term.columns.contains(column))
+                        && term.columns.iter().all(|column| stated.contains(column))
+                })
                 .ok_or_else(|| {
                     RegisterError::MembershipTermRefused(format!(
-                        "this subscription states the values it matches for column \
-                         {column_name:?}, which no membership subquery in its filter compares. \
-                         The values would be stored where nothing reads them."
+                        "this subscription states the values it matches for columns \
+                         {column_names:?}, which no membership subquery in its filter compares \
+                         together. The values would be stored where nothing reads them."
                     ))
                 })?;
-            // The one term comparing this column, since two on one column were
-            // refused above.
             if term.compares_the_caller() {
                 return Err(RegisterError::MembershipTermRefused(format!(
-                    "this subscription states values for column {column_name:?}, which its \
+                    "this subscription states values for columns {column_names:?}, which its \
                      filter compares to the caller directly. A caller comparison seeds itself \
                      from the subscriber, and stated values would admit rows the filter's text \
                      never names."
                 )));
             }
+            let order: Vec<usize> = term
+                .columns
+                .iter()
+                .map(|column| {
+                    stated
+                        .iter()
+                        .position(|candidate| candidate == column)
+                        .expect("the sets were matched column for column above")
+                })
+                .collect();
             let slot = usize::from(term.slot);
-            for value in values {
-                let TermLookup::Key(key) = TermLookup::of(value.clone()) else {
+            for row in rows {
+                if row.len() != order.len() {
                     return Err(RegisterError::MembershipTermRefused(format!(
-                        "one of the values stated for column {column_name:?} is null, or of a \
-                         kind SubQL cannot look up. A value the subscriber matches has to be \
-                         equal to itself, and SQL never admits a row through a null."
+                        "a value row stated for columns {column_names:?} carries {got} values \
+                         where {expected} columns were named, so SubQL cannot say which value \
+                         belongs to which column.",
+                        got = row.len(),
+                        expected = order.len(),
                     )));
-                };
-                seeds[slot].push(key);
+                }
+                let mut keys = Vec::with_capacity(order.len());
+                for &position in &order {
+                    let TermLookup::Key(key) = TermLookup::of(row[position].clone()) else {
+                        return Err(RegisterError::MembershipTermRefused(format!(
+                            "one of the values stated for columns {column_names:?} is null, or \
+                             of a kind SubQL cannot look up. A value the subscriber matches has \
+                             to be equal to itself, and SQL never admits a row through a null."
+                        )));
+                    };
+                    keys.push(key);
+                }
+                seeds[slot].push(keys);
             }
         }
 
@@ -707,14 +825,14 @@ where
             .term_plans
             .iter()
             .filter_map(|plan| {
-                let movement = plan.moved_by?;
+                let movement = plan.moved_by.as_ref()?;
                 Some(TermWatch {
                     subscribed: compiled.table_id,
                     predicate: pred_id,
                     slot: plan.slot,
-                    column: plan.column,
+                    columns: plan.columns.clone(),
                     member_table: movement.member_table,
-                    member_key: movement.member_key,
+                    member_keys: movement.member_keys.clone(),
                     member_subject: movement.member_subject,
                 })
             })
@@ -801,18 +919,17 @@ where
         // pipeline.
         let dependency_columns: Arc<[u16]> = {
             let mut dep_cols = compiled.bytecode.dependency_columns.clone();
-            let agg_col = match &compiled.projection {
-                QueryProjection::Aggregate(
-                    AggSpec::Sum { column }
-                    | AggSpec::Avg { column }
-                    | AggSpec::CountColumn { column }
-                    | AggSpec::VarPop { column }
-                    | AggSpec::VarSamp { column }
-                    | AggSpec::StddevPop { column }
-                    | AggSpec::StddevSamp { column },
-                ) => Some(*column),
-                _ => None,
+            let (agg_col, group_cols): (Option<ColumnId>, &[ColumnId]) = match &compiled.projection
+            {
+                QueryProjection::Aggregate(spec) => (spec.column(), &[]),
+                QueryProjection::GroupedAggregate { groups, agg, .. } => (agg.column(), groups),
+                QueryProjection::Rows => (None, &[]),
             };
+            for &column in group_cols {
+                if !dep_cols.contains(&column) {
+                    dep_cols.push(column);
+                }
+            }
             if let Some(column) = agg_col {
                 if !dep_cols.contains(&column) {
                     dep_cols.push(column);
@@ -974,10 +1091,46 @@ where
             durability_mode: DurabilityMode::Required,
             resume_cursors: HashMap::new(),
             pk_follows: HashMap::new(),
+            aggregate_registrations: HashMap::new(),
             #[cfg(feature = "membership-term")]
             translator: None,
             term_watch: HashMap::new(),
+            aggregates: HashMap::new(),
+            grouped_aggregates: HashMap::new(),
+            max_changes_during_aggregate_read:
+                super::aggregate::DEFAULT_MAX_CHANGES_DURING_AGGREGATE_READ,
+            max_groups_per_aggregate: super::aggregate::DEFAULT_MAX_GROUPS_PER_AGGREGATE,
+            reexec: HashMap::new(),
+            table_deps: HashMap::new(),
+            keyed_plans: HashMap::new(),
+            reexec_sessions: HashMap::new(),
         }
+    }
+
+    /// Cap how many changes one aggregate subscription holds while its
+    /// starting numbers are being read.
+    ///
+    /// The engine keeps a change per stream position until the numbers land so
+    /// it can drop the ones the read already saw rather than counting them
+    /// twice. Past this ceiling it can no longer tell them apart, so
+    /// [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall) refuses with
+    /// [`AggregateInstallError::TooManyChangesDuringRead`](crate::AggregateInstallError::TooManyChangesDuringRead)
+    /// and the caller reads again. Zero would refuse every seed that raced at
+    /// all, so it clamps to one.
+    #[must_use]
+    pub const fn with_max_changes_during_aggregate_read(mut self, cap: usize) -> Self {
+        self.max_changes_during_aggregate_read = if cap == 0 { 1 } else { cap };
+        self
+    }
+
+    /// Set the maximum live groups for one grouped aggregate subscription.
+    ///
+    /// A new group beyond this limit changes the subscription to
+    /// [`Tier::WholeRows`] under the same identity. Zero clamps to one.
+    #[must_use]
+    pub const fn with_max_groups_per_aggregate(mut self, limit: usize) -> Self {
+        self.max_groups_per_aggregate = if limit == 0 { 1 } else { limit };
+        self
     }
 
     /// Supply the translation settings a membership subquery is judged by.
@@ -1010,7 +1163,7 @@ where
     /// [`crate::EvictionPolicy::EvictBySession`] /
     /// [`crate::EvictionPolicy::EvictByConsumer`] pick the victim from a
     /// preferred slice of the registry. In every non-`Reject` case the
-    /// evicted ids are surfaced in [`RegisterResult::evicted`].
+    /// evicted ids are surfaced in [`Registered::evicted`].
     ///
     /// For closure-based custom policies see
     /// [`Self::with_custom_eviction`].
@@ -1124,7 +1277,7 @@ where
         database: DB,
         dialect: <E::Backend as Backend>::Dialect,
         storage_path: PathBuf,
-    ) -> Result<Self, StorageError> {
+    ) -> Result<(Self, RestoredReads), StorageError> {
         let mut engine = Self::new(database, dialect);
         engine.storage_path = Some(storage_path.clone());
 
@@ -1134,8 +1287,13 @@ where
 
         // Load existing shards
         engine.load_all_shards()?;
+        // Then the answers that need a read, which are judged one at a time
+        // against the tables they name. The report is returned rather than
+        // stored because an answer that could not come back is a subscription
+        // the caller still holds an id for.
+        let reads = engine.load_reads()?;
 
-        Ok(engine)
+        Ok((engine, reads))
     }
 
     /// Register a new subscription.
@@ -1171,34 +1329,59 @@ where
     ///         .updated_at_unix_ms(1_704_067_200_001),
     /// )?;
     ///
-    /// assert!(first.created_new_predicate);
-    /// assert!(!second.created_new_predicate);
+    /// assert!(first.served().expect("in process").created_new_predicate);
+    /// assert!(!second.served().expect("in process").created_new_predicate);
     /// assert_eq!(engine.predicate_count(orders_id), 1);
     /// assert_eq!(engine.subscription_count(), 2);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn register(
-        &mut self,
-        spec: SubscriptionRequest<I, E::Backend>,
-    ) -> Result<RegisterResult, RegisterError> {
-        // 1. Parse, compile, and canonicalize in one pass.
-        let compiled = self.compile_spec(spec)?;
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    pub fn register<R>(&mut self, spec: R) -> Result<Registered, RegisterError>
+    where
+        R: crate::RegistrationRequest<I, E::Backend>,
+    {
+        let database_reads_per_consumer = R::DATABASE_READS_PER_CONSUMER;
+        let spec = spec.into_request();
+        // 1. Parse, compile, and canonicalize in one pass. A statement this
+        // engine cannot serve is planned as a re-read rather than refused:
+        // needing a database read is not grounds to turn a query away.
+        let sql = spec.sql.clone();
+        let consumer_id = spec.consumer_id;
+        let session = match &spec.scope {
+            SubscriptionScope::Session(s) => Some(*s),
+            SubscriptionScope::Durable => None,
+        };
+        let compiled = match self.compile_spec(spec) {
+            Ok(compiled) => compiled,
+            Err(RegisterError::UnsupportedSql(refusal)) => {
+                return self.plan_reread(
+                    &sql,
+                    refusal,
+                    consumer_id,
+                    session,
+                    database_reads_per_consumer,
+                )
+            }
+            Err(other) => return Err(other),
+        };
         let table_id = compiled.table_id;
         let hash = compiled.hash;
 
         // 2. Check dedup index: same (consumer_id, predicate_hash, scope) -> idempotent return.
         let natural_key = (compiled.spec.consumer_id, hash, compiled.spec.scope);
         if let Some(&existing_sub_id) = self.binding_dedup.get(&natural_key) {
-            return Ok(RegisterResult {
+            return Ok(Registered {
                 subscription_id: existing_sub_id,
-                table_id,
-                normalized_sql: compiled.normalized,
-                predicate_hash: hash,
-                created_new_predicate: false,
-                projection: compiled.projection,
+                tier: Tier::InProcess(Served {
+                    table_id,
+                    normalized_sql: compiled.normalized,
+                    predicate_hash: hash,
+                    created_new_predicate: false,
+                    projection: compiled.projection,
+                    aggregate_bootstrap: compiled.bootstrap,
+                }),
                 evicted: Vec::new(),
-                aggregate_bootstrap: compiled.bootstrap,
+                not_served_because: None,
             });
         }
 
@@ -1218,8 +1401,7 @@ where
         }
 
         // 3. Auto-assign a new subscription ID.
-        let subscription_id = self.next_subscription_id;
-        self.next_subscription_id += 1;
+        let subscription_id = self.allocate_subscription_id();
 
         // 4. Get/create table partition and consumer dictionary
         let partition = self
@@ -1259,6 +1441,12 @@ where
         // 8. Index subscription for O(1) unregister/upsert lookups.
         self.subscription_to_table.insert(subscription_id, table_id);
         self.binding_dedup.insert(natural_key, subscription_id);
+        self.open_aggregate_total(
+            subscription_id,
+            &compiled.spec,
+            &compiled.projection,
+            database_reads_per_consumer,
+        );
 
         // 9. Enforce durability policy for this table.
         #[cfg(feature = "std")]
@@ -1273,15 +1461,1008 @@ where
             return Err(RegisterError::Storage(message));
         }
 
-        Ok(RegisterResult {
+        Ok(Registered {
             subscription_id,
-            table_id,
-            normalized_sql: compiled.normalized,
-            predicate_hash: hash,
-            created_new_predicate: created_new,
-            projection: compiled.projection,
+            tier: Tier::InProcess(Served {
+                table_id,
+                normalized_sql: compiled.normalized,
+                predicate_hash: hash,
+                created_new_predicate: created_new,
+                projection: compiled.projection,
+                aggregate_bootstrap: compiled.bootstrap,
+            }),
             evicted,
-            aggregate_bootstrap: compiled.bootstrap,
+            not_served_because: None,
+        })
+    }
+
+    /// Take the next identity from the one counter every maintained answer
+    /// draws from, whether this engine serves it or a captured query needs a
+    /// read to.
+    pub(crate) const fn allocate_subscription_id(&mut self) -> SubscriptionId {
+        let id = self.next_subscription_id;
+        self.next_subscription_id += 1;
+        id
+    }
+
+    /// Plan a re-read tier for a statement this engine cannot serve itself.
+    ///
+    /// Needing a read never refuses a registration: the tier reports which
+    /// read, and whoever holds a database connection services it. `refusal` is
+    /// the compiler's own message, returned when no tier can serve it either.
+    fn plan_reread(
+        &mut self,
+        sql: &str,
+        refusal: String,
+        consumer_id: I::ConsumerId,
+        session: Option<I::SessionId>,
+        database_reads_per_consumer: bool,
+    ) -> Result<Registered, RegisterError> {
+        let planned =
+            crate::reexec::plan::build_plan::<E::Backend, DB>(sql, self.dialect(), &self.database);
+        match planned {
+            Ok(crate::reexec::plan::QueryPlan::GroupedPartial(plan)) => {
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
+                    .unwrap_or(false)
+                {
+                    return Err(RegisterError::AggregatorOnRlsTable {
+                        table_id: plan.table_id,
+                    });
+                }
+                let subscription_id = self.allocate_subscription_id();
+                let mut registered = self.capture_grouped_scalar(
+                    subscription_id,
+                    *plan,
+                    consumer_id,
+                    session,
+                    sql,
+                    database_reads_per_consumer,
+                );
+                registered.not_served_because = Some(refusal);
+                self.persist_reads_after_change(subscription_id)?;
+                Ok(registered)
+            }
+            Ok(crate::reexec::plan::QueryPlan::Partial(plan)) => {
+                // Per-viewer row filtering makes one shared answer unsafe:
+                // consumers observe different rows, and this tier holds one
+                // answer per query rather than one per viewer.
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
+                    .unwrap_or(false)
+                {
+                    return Err(RegisterError::AggregatorOnRlsTable {
+                        table_id: plan.table_id,
+                    });
+                }
+                let subscription_id = self.allocate_subscription_id();
+                let mut registered = self.capture_scalar(
+                    subscription_id,
+                    plan,
+                    consumer_id,
+                    session,
+                    sql,
+                    database_reads_per_consumer,
+                );
+                registered.not_served_because = Some(refusal);
+                self.persist_reads_after_change(subscription_id)?;
+                Ok(registered)
+            }
+            Ok(crate::reexec::plan::QueryPlan::Keyed(plan)) => {
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table)
+                    .unwrap_or(false)
+                    && !database_reads_per_consumer
+                {
+                    return Err(RegisterError::RowCaptureOnRlsTable {
+                        table_id: plan.table,
+                    });
+                }
+                let subscription_id = self.allocate_subscription_id();
+                let mut registered = self.capture_keyed(
+                    subscription_id,
+                    *plan,
+                    consumer_id,
+                    session,
+                    sql,
+                    database_reads_per_consumer,
+                );
+                registered.not_served_because = Some(refusal);
+                self.persist_reads_after_change(subscription_id)?;
+                Ok(registered)
+            }
+            Ok(crate::reexec::plan::QueryPlan::Total(plan)) => {
+                if let Some(table) = plan
+                    .tables
+                    .iter()
+                    .copied()
+                    .find(|t| {
+                        crate::catalog_helpers::table_has_rls(&self.database, *t).unwrap_or(false)
+                    })
+                    .filter(|_| !database_reads_per_consumer)
+                {
+                    return Err(RegisterError::RowCaptureOnRlsTable { table_id: table });
+                }
+                let subscription_id = self.allocate_subscription_id();
+                let mut registered = self.capture_whole(
+                    subscription_id,
+                    plan,
+                    consumer_id,
+                    session,
+                    sql,
+                    database_reads_per_consumer,
+                );
+                registered.not_served_because = Some(refusal);
+                self.persist_reads_after_change(subscription_id)?;
+                Ok(registered)
+            }
+            // No tier can serve it either, so the compiler's refusal stands.
+            Err(_) => Err(RegisterError::UnsupportedSql(refusal)),
+        }
+    }
+
+    /// Route `subscription_id` from every table in `tables`, and from its
+    /// session when it has one.
+    fn index_reread(
+        &mut self,
+        subscription_id: SubscriptionId,
+        tables: &[TableId],
+        session: Option<I::SessionId>,
+    ) {
+        for table in tables {
+            self.table_deps
+                .entry(*table)
+                .or_default()
+                .insert(subscription_id);
+        }
+        if let Some(s) = session {
+            self.reexec_sessions
+                .entry(s)
+                .or_default()
+                .push(subscription_id);
+        }
+    }
+
+    /// Register grouped extrema with reads scoped to one displaced group.
+    fn capture_grouped_scalar(
+        &mut self,
+        subscription_id: SubscriptionId,
+        plan: crate::reexec::plan::GroupedMinMaxPlan<E::Backend>,
+        consumer_id: I::ConsumerId,
+        session: Option<I::SessionId>,
+        source_sql: &str,
+        database_reads_per_consumer: bool,
+    ) -> Registered {
+        let table_id = plan.table_id;
+        let bootstrap = plan.bootstrap.clone();
+        let runtime = crate::reexec::maintain::QueryRuntime::Grouped(alloc::boxed::Box::new(
+            crate::reexec::maintain::GroupedMinMaxQuery::new(plan),
+        ));
+        self.index_reread(subscription_id, &[table_id], session);
+        self.reexec.insert(
+            subscription_id,
+            crate::reexec::ReExecEntry {
+                consumer_id,
+                session,
+                tables: alloc::vec![table_id],
+                runtime,
+                sql: String::from(source_sql),
+                tier: crate::ReadTier::GroupedScalar,
+                database_reads_per_consumer,
+            },
+        );
+        Registered {
+            subscription_id,
+            tier: Tier::GroupedScalar { bootstrap },
+            evicted: Vec::new(),
+            not_served_because: None,
+        }
+    }
+
+    /// Register a scalar extreme, re-read when the extreme itself leaves.
+    fn capture_scalar(
+        &mut self,
+        subscription_id: SubscriptionId,
+        plan: crate::reexec::plan::MinMaxPlan<E::Backend>,
+        consumer_id: I::ConsumerId,
+        session: Option<I::SessionId>,
+        source_sql: &str,
+        database_reads_per_consumer: bool,
+    ) -> Registered {
+        let crate::reexec::plan::MinMaxPlan {
+            table_id,
+            kind,
+            agg_column,
+            agg_kind,
+            dependency_columns,
+            where_program,
+            reexec_sql,
+        } = plan;
+
+        // The answer is unknown until someone reads it, which is not the same
+        // as an empty one: an unknown extreme asks rather than guessing.
+        let runtime = crate::reexec::maintain::QueryRuntime::Partial(
+            crate::reexec::maintain::MinMaxQuery::new(
+                kind,
+                agg_column,
+                where_program,
+                dependency_columns,
+            ),
+        );
+        self.index_reread(subscription_id, &[table_id], session);
+        self.reexec.insert(
+            subscription_id,
+            crate::reexec::ReExecEntry {
+                consumer_id,
+                session,
+                tables: alloc::vec![table_id],
+                runtime,
+                sql: String::from(source_sql),
+                tier: crate::ReadTier::Scalar,
+                database_reads_per_consumer,
+            },
+        );
+
+        Registered {
+            subscription_id,
+            tier: Tier::Scalar {
+                sql: reexec_sql,
+                column_kind: agg_kind,
+            },
+            evicted: Vec::new(),
+            not_served_because: None,
+        }
+    }
+
+    /// Register a whole re-read: every table it reads triggers a fresh read.
+    fn capture_whole(
+        &mut self,
+        subscription_id: SubscriptionId,
+        plan: crate::reexec::plan::TotalPlan,
+        consumer_id: I::ConsumerId,
+        session: Option<I::SessionId>,
+        source_sql: &str,
+        database_reads_per_consumer: bool,
+    ) -> Registered {
+        let crate::reexec::plan::TotalPlan {
+            tables,
+            dependency_columns,
+            reexec_sql,
+        } = plan;
+
+        self.index_reread(subscription_id, &tables, session);
+        self.reexec.insert(
+            subscription_id,
+            crate::reexec::ReExecEntry {
+                consumer_id,
+                session,
+                tables: tables.clone(),
+                runtime: crate::reexec::maintain::QueryRuntime::Total(
+                    crate::reexec::maintain::TotalQuery::new(dependency_columns),
+                ),
+                sql: String::from(source_sql),
+                tier: crate::ReadTier::WholeRows,
+                database_reads_per_consumer,
+            },
+        );
+
+        Registered {
+            subscription_id,
+            tier: Tier::WholeRows {
+                sql: reexec_sql,
+                tables,
+            },
+            evicted: Vec::new(),
+            not_served_because: None,
+        }
+    }
+
+    /// Register a keyed re-read: one table, and a change asks about the rows
+    /// that moved rather than the whole answer.
+    fn capture_keyed(
+        &mut self,
+        subscription_id: SubscriptionId,
+        plan: crate::reexec::plan::KeyedPlan,
+        consumer_id: I::ConsumerId,
+        session: Option<I::SessionId>,
+        source_sql: &str,
+        database_reads_per_consumer: bool,
+    ) -> Registered {
+        let table = plan.table;
+        self.index_reread(subscription_id, &[table], session);
+        let sql = alloc::format!("{}", plan.statement);
+        let dependency_columns = plan.dependency_columns.clone();
+        self.keyed_plans.insert(subscription_id, plan);
+        self.reexec.insert(
+            subscription_id,
+            crate::reexec::ReExecEntry {
+                consumer_id,
+                session,
+                tables: alloc::vec![table],
+                runtime: crate::reexec::maintain::QueryRuntime::Keyed(
+                    crate::reexec::maintain::KeyedQuery::new(dependency_columns),
+                ),
+                sql: String::from(source_sql),
+                tier: crate::ReadTier::KeyedRows,
+                database_reads_per_consumer,
+            },
+        );
+
+        Registered {
+            subscription_id,
+            tier: Tier::KeyedRows {
+                sql,
+                table_id: table,
+            },
+            evicted: Vec::new(),
+            not_served_because: None,
+        }
+    }
+
+    fn transition_reread_to_whole(
+        &mut self,
+        subscription_id: SubscriptionId,
+        from: crate::TierKind,
+        reason: crate::MaintenanceStopReason,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> Result<
+        (
+            crate::MaintenanceTransition,
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+        ),
+        DispatchError,
+    > {
+        let (consumer, session, sql, database_reads_per_consumer) = {
+            let entry =
+                self.reexec
+                    .get(&subscription_id)
+                    .ok_or_else(|| DispatchError::TierTransition {
+                        subscription: subscription_id,
+                        message: "read-tier metadata is missing".to_string(),
+                    })?;
+            (
+                entry.consumer_id,
+                entry.session,
+                entry.sql.clone(),
+                entry.database_reads_per_consumer,
+            )
+        };
+        let plan = crate::reexec::plan::build_whole_rows_plan::<E::Backend, DB>(
+            &sql,
+            &self.dialect,
+            &self.database,
+        )
+        .map_err(|error| DispatchError::TierTransition {
+            subscription: subscription_id,
+            message: error.to_string(),
+        })?;
+        self.unregister_reread(subscription_id);
+        let registered = self.capture_whole(
+            subscription_id,
+            plan,
+            consumer,
+            session,
+            &sql,
+            database_reads_per_consumer,
+        );
+        Ok((
+            crate::MaintenanceTransition {
+                subscription_id,
+                from,
+                to: registered.tier,
+                reason,
+            },
+            crate::reexec::ReExecutionTrigger {
+                subscription_id,
+                consumer_id: consumer,
+                read: crate::reexec::ReExecutionRead::Subscription,
+                checkpoint: checkpoint.cloned(),
+            },
+        ))
+    }
+
+    fn transition_keyed_to_whole(
+        &mut self,
+        subscription_id: SubscriptionId,
+        table_id: TableId,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> Result<
+        (
+            crate::MaintenanceTransition,
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+        ),
+        DispatchError,
+    > {
+        self.transition_reread_to_whole(
+            subscription_id,
+            crate::TierKind::KeyedRows,
+            crate::MaintenanceStopReason::KeyedChangeWithoutKey { table_id },
+            checkpoint,
+        )
+    }
+
+    fn transition_grouped_scalar_to_whole(
+        &mut self,
+        subscription_id: SubscriptionId,
+        reason: crate::MaintenanceStopReason,
+        checkpoint: Option<&E::Checkpoint>,
+    ) -> Result<
+        (
+            crate::MaintenanceTransition,
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+        ),
+        DispatchError,
+    > {
+        self.transition_reread_to_whole(
+            subscription_id,
+            crate::TierKind::GroupedScalar,
+            reason,
+            checkpoint,
+        )
+    }
+
+    /// The output a stopped tier hands back in place of updates: the same
+    /// identity's transition to a whole re-read and the trigger that primes
+    /// it, shared by every install path that can hit a limit.
+    fn stopped_output(
+        subscription_id: SubscriptionId,
+        transitioned: Result<
+            (
+                crate::MaintenanceTransition,
+                crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+            ),
+            DispatchError,
+        >,
+    ) -> Result<
+        crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
+        crate::AggregateInstallError,
+    > {
+        let (transition, trigger) =
+            transitioned.map_err(|error| crate::AggregateInstallError::TierTransition {
+                subscription: subscription_id,
+                message: error.to_string(),
+            })?;
+        Ok(crate::AggregateMaintenanceOutput {
+            updates: Vec::new(),
+            triggers: alloc::vec![trigger],
+            transitions: alloc::vec![transition],
+        })
+    }
+
+    /// Feed `event` to every re-read answer whose table it touches.
+    ///
+    /// Returns the answers that moved in process, and the reads that have to
+    /// happen because nothing in process could decide them.
+    #[allow(
+        clippy::type_complexity,
+        clippy::too_many_lines,
+        reason = "one routing pass preserves event order across every read tier"
+    )]
+    pub(crate) fn maintain(
+        &mut self,
+        event: &E,
+    ) -> Result<
+        (
+            Vec<crate::AggregateValueUpdate<I, E::Backend>>,
+            Vec<crate::reexec::ScalarUpdate<I, E::Backend, E::Checkpoint>>,
+            Vec<crate::reexec::ReExecutionTrigger<I, E::Checkpoint>>,
+            Vec<crate::MaintenanceTransition>,
+        ),
+        DispatchError,
+    > {
+        use crate::reexec::maintain::{Maintenance, QueryRuntime};
+
+        let table_id = event.table_id(&self.database);
+        let subscription_ids: Vec<SubscriptionId> = match self.table_deps.get(&table_id) {
+            Some(ids) => ids.iter().copied().collect(),
+            None => return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new())),
+        };
+        let pending_cap = self.max_changes_during_aggregate_read;
+        let group_limit = self.max_groups_per_aggregate;
+        let Self {
+            reexec,
+            vm,
+            database,
+            ..
+        } = self;
+
+        let mut aggregate_updates = Vec::new();
+        let mut scalar_updates = Vec::new();
+        let mut triggers = Vec::new();
+        let mut keyless = Vec::new();
+        let mut grouped_stops = Vec::new();
+        let mut transitions = Vec::new();
+        for subscription_id in subscription_ids {
+            let Some(entry) = reexec.get_mut(&subscription_id) else {
+                continue;
+            };
+            if event.kind() == EventKind::Update {
+                let changed = event.changed_columns(database);
+                if !changed.is_empty()
+                    && !changed
+                        .iter()
+                        .any(|column| entry.runtime.dependency_columns().contains(column))
+                {
+                    continue;
+                }
+            }
+
+            let consumer_id = entry.consumer_id;
+            let checkpoint = event.checkpoint();
+            if let QueryRuntime::Grouped(query) = &mut entry.runtime {
+                let grouped = query
+                    .on_event(event, vm, database, pending_cap, group_limit)
+                    .map_err(|error| match error {
+                        DispatchError::TierTransition { message, .. } => {
+                            DispatchError::TierTransition {
+                                subscription: subscription_id,
+                                message,
+                            }
+                        }
+                        error => error,
+                    })?;
+                let reason = if grouped.missing_group {
+                    Some(crate::MaintenanceStopReason::MissingOldRow { table_id })
+                } else if grouped.group_limit {
+                    Some(crate::MaintenanceStopReason::GroupLimit { limit: group_limit })
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    grouped_stops.push((subscription_id, reason, checkpoint));
+                    continue;
+                }
+                aggregate_updates.extend(grouped.changes.into_iter().map(|(group, change)| {
+                    crate::AggregateValueUpdate {
+                        subscription: subscription_id,
+                        consumer: consumer_id,
+                        group: Some(group),
+                        change,
+                    }
+                }));
+                triggers.extend(grouped.reads.into_iter().map(|read| {
+                    crate::reexec::ReExecutionTrigger {
+                        subscription_id,
+                        consumer_id,
+                        read: crate::reexec::ReExecutionRead::GroupedScalar {
+                            group: read.group,
+                            sql: read.sql,
+                            column_kinds: read.column_kinds,
+                        },
+                        checkpoint: read.checkpoint,
+                    }
+                }));
+                continue;
+            }
+            match entry.runtime.on_event(event, vm, database) {
+                Maintenance::Unchanged => {}
+                Maintenance::Updated(value) => {
+                    scalar_updates.push(crate::reexec::ScalarUpdate {
+                        subscription_id,
+                        consumer_id,
+                        value,
+                        checkpoint: checkpoint.clone(),
+                    });
+                }
+                Maintenance::NeedsReexecution => {
+                    if let QueryRuntime::Keyed(query) = &mut entry.runtime {
+                        if let Some(table_id) = query.take_keyless_change() {
+                            keyless.push((subscription_id, table_id, checkpoint.clone()));
+                            continue;
+                        }
+                    }
+                    triggers.push(crate::reexec::ReExecutionTrigger {
+                        subscription_id,
+                        consumer_id,
+                        read: crate::reexec::ReExecutionRead::Subscription,
+                        checkpoint: checkpoint.clone(),
+                    });
+                }
+            }
+        }
+        for (subscription_id, table_id, checkpoint) in keyless {
+            let (transition, trigger) =
+                self.transition_keyed_to_whole(subscription_id, table_id, checkpoint.as_ref())?;
+            transitions.push(transition);
+            triggers.push(trigger);
+        }
+        for (subscription_id, reason, checkpoint) in grouped_stops {
+            let (transition, trigger) = self.transition_grouped_scalar_to_whole(
+                subscription_id,
+                reason,
+                checkpoint.as_ref(),
+            )?;
+            transitions.push(transition);
+            triggers.push(trigger);
+        }
+        Ok((aggregate_updates, scalar_updates, triggers, transitions))
+    }
+
+    /// Dispatch one event into the compatibility output used by the connector
+    /// wrappers while phase B removes that output type.
+    pub(crate) fn reread_notifications(
+        &mut self,
+        event: &E,
+    ) -> Result<crate::reexec::ReExecNotifications<I, E::Backend, E::Checkpoint>, DispatchError>
+    {
+        let engine = match self.consumers(event) {
+            Ok(notifications) => notifications,
+            Err(DispatchError::UnknownTableId(_))
+                if self.routes_reread(event.table_id(&self.database)) =>
+            {
+                crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
+            }
+            Err(error) => return Err(error),
+        };
+        let (aggregate_updates, scalar_updates, triggers, transitions) = self.maintain(event)?;
+        Ok(crate::reexec::ReExecNotifications {
+            engine,
+            aggregate_updates,
+            scalar_updates,
+            rows_updates: Vec::new(),
+            row_deltas: Vec::new(),
+            triggers,
+            transitions,
+        })
+    }
+
+    /// Dispatch several events, coalescing reads by subscription identity.
+    pub(crate) fn reread_batch(
+        &mut self,
+        events: &[E],
+    ) -> Result<crate::reexec::BatchOutcome<I, E::Backend, E::Checkpoint>, DispatchError> {
+        let mut per_event = Vec::with_capacity(events.len());
+        let mut aggregate_updates = Vec::new();
+        let mut scalar_updates = Vec::new();
+        let mut transitions = Vec::new();
+        let mut triggers: HashMap<
+            (SubscriptionId, Option<Vec<u8>>),
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+        > = HashMap::new();
+        for event in events {
+            let output = self.reread_notifications(event)?;
+            per_event.push(output.engine);
+            aggregate_updates.extend(output.aggregate_updates);
+            scalar_updates.extend(output.scalar_updates);
+            transitions.extend(output.transitions);
+            for trigger in output.triggers {
+                let group = match &trigger.read {
+                    crate::reexec::ReExecutionRead::GroupedScalar { group, .. } => {
+                        Some(group.clone())
+                    }
+                    crate::reexec::ReExecutionRead::Subscription => None,
+                };
+                triggers.insert((trigger.subscription_id, group), trigger);
+            }
+        }
+        Ok(crate::reexec::BatchOutcome {
+            per_event,
+            aggregate_updates,
+            scalar_updates,
+            rows_updates: Vec::new(),
+            row_deltas: Vec::new(),
+            triggers: triggers.into_values().collect(),
+            transitions,
+        })
+    }
+    /// Whether a change to `table_id` moves any re-read answer.
+    pub(crate) fn routes_reread(&self, table_id: TableId) -> bool {
+        self.table_deps.contains_key(&table_id)
+    }
+
+    /// How many re-read answers this engine holds.
+    #[must_use]
+    pub fn reread_count(&self) -> usize {
+        self.reexec.len()
+    }
+
+    /// Take the keys a keyed re-read accumulated since the last read.
+    pub(crate) fn take_pending_keys(
+        &mut self,
+        subscription_id: SubscriptionId,
+    ) -> Vec<Vec<Value<E::Backend>>> {
+        match self
+            .reexec
+            .get_mut(&subscription_id)
+            .map(|e| &mut e.runtime)
+        {
+            Some(crate::reexec::maintain::QueryRuntime::Keyed(q)) => q.take_pending(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Put a keyed re-read's keys back after a read that never delivered them.
+    pub(crate) fn restore_pending_keys(
+        &mut self,
+        subscription_id: SubscriptionId,
+        keys: Vec<Vec<Value<E::Backend>>>,
+    ) {
+        if let Some(crate::reexec::maintain::QueryRuntime::Keyed(q)) = self
+            .reexec
+            .get_mut(&subscription_id)
+            .map(|e| &mut e.runtime)
+        {
+            q.restore_pending(keys);
+        }
+    }
+
+    /// The plan a keyed re-read reads with, for rendering its scoped query.
+    pub(crate) fn keyed_plan(
+        &self,
+        subscription_id: SubscriptionId,
+    ) -> Option<&crate::reexec::plan::KeyedPlan> {
+        self.keyed_plans.get(&subscription_id)
+    }
+
+    /// Drop a re-read answer by id, pruning its routing and session indexes.
+    pub fn unregister_reread(&mut self, subscription_id: SubscriptionId) -> bool {
+        let Some(entry) = self.reexec.remove(&subscription_id) else {
+            return false;
+        };
+        self.keyed_plans.remove(&subscription_id);
+        for table in &entry.tables {
+            if let Some(set) = self.table_deps.get_mut(table) {
+                set.remove(&subscription_id);
+                if set.is_empty() {
+                    self.table_deps.remove(table);
+                }
+            }
+        }
+        if let Some(session) = entry.session {
+            if let Some(ids) = self.reexec_sessions.get_mut(&session) {
+                ids.retain(|id| *id != subscription_id);
+                if ids.is_empty() {
+                    self.reexec_sessions.remove(&session);
+                }
+            }
+        }
+        true
+    }
+
+    /// Rewrite the re-read file after `subscription_id` was added.
+    ///
+    /// Under [`DurabilityMode::Required`] a write failure fails the
+    /// registration and takes the answer back out, so a caller never holds an
+    /// id for something the file does not know about. Under
+    /// [`DurabilityMode::BestEffort`] the failure is ignored, which is the same
+    /// bargain registration already offers for predicates.
+    #[cfg(feature = "std")]
+    fn persist_reads_after_change(
+        &mut self,
+        subscription_id: SubscriptionId,
+    ) -> Result<(), RegisterError> {
+        if self.storage_path.is_none() {
+            return Ok(());
+        }
+        match self.snapshot_reads() {
+            Ok(()) => Ok(()),
+            Err(e) => match self.durability_mode {
+                DurabilityMode::BestEffort => Ok(()),
+                DurabilityMode::Required => {
+                    self.unregister_reread(subscription_id);
+                    Err(RegisterError::Storage(e.to_string()))
+                }
+            },
+        }
+    }
+
+    /// Without the standard library there is no file to write.
+    #[cfg(not(feature = "std"))]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn persist_reads_after_change(
+        &mut self,
+        _subscription_id: SubscriptionId,
+    ) -> Result<(), RegisterError> {
+        Ok(())
+    }
+
+    /// Write every re-read answer to its own file.
+    ///
+    /// Separate from the per-table shards because an answer needing a read has
+    /// no predicate and can be woken by several tables, so it is not a property
+    /// of one of them. Does nothing when no storage path is configured.
+    #[cfg(feature = "std")]
+    pub fn snapshot_reads(&self) -> Result<(), StorageError> {
+        let Some(storage_path) = self.storage_path.as_ref() else {
+            return Ok(());
+        };
+        let mut entries = Vec::with_capacity(self.reexec.len());
+        for (subscription_id, entry) in &self.reexec {
+            let mut tables = Vec::with_capacity(entry.tables.len());
+            for table_id in &entry.tables {
+                tables.push((
+                    *table_id,
+                    crate::persistence::shard::expected_envelope(&self.database, *table_id)?,
+                ));
+            }
+            entries.push(crate::persistence::reads::ReadEntry::<I> {
+                subscription_id: *subscription_id,
+                consumer_id: entry.consumer_id,
+                scope: entry.session.map_or(SubscriptionScope::Durable, |s| {
+                    SubscriptionScope::Session(s)
+                }),
+                sql: entry.sql.clone(),
+                tables,
+                tier: entry.tier,
+                database_reads_per_consumer: entry.database_reads_per_consumer,
+            });
+        }
+        // Sorted so the file's bytes depend on the registry's contents rather
+        // than on a hash map's iteration order.
+        entries.sort_unstable_by_key(|e| e.subscription_id);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let created_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let payload = crate::persistence::reads::ReadsPayload::<I> {
+            entries,
+            created_at_unix_ms,
+        };
+        let bytes = crate::persistence::reads::serialize(&payload)?;
+        Self::durable_atomic_replace(
+            storage_path,
+            &storage_path.join("reads.shard"),
+            "reads",
+            &bytes,
+            created_at_unix_ms,
+        )
+    }
+
+    /// Restore the re-read answers from their file, judging each one against
+    /// the tables it names.
+    ///
+    /// An answer whose table changed shape, whose table is gone, or whose
+    /// statement no longer plans is reported rather than revived, since the
+    /// alternative is a subscription answering against a schema it no longer
+    /// matches. Every restored answer comes back not knowing its value.
+    #[cfg(feature = "std")]
+    fn load_reads(&mut self) -> Result<RestoredReads, StorageError> {
+        let Some(storage_path) = self.storage_path.as_ref() else {
+            return Ok(RestoredReads::default());
+        };
+        let path = storage_path.join("reads.shard");
+        if !path.exists() {
+            return Ok(RestoredReads::default());
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|e| StorageError::Io(format!("Failed to read the reads file: {e}")))?;
+        let payload: crate::persistence::reads::ReadsPayload<I> =
+            crate::persistence::reads::deserialize(&bytes)?;
+
+        let mut report = RestoredReads::default();
+        for entry in payload.entries {
+            match self.restore_one_read(&entry) {
+                Ok(restored) => report.restored.push(restored),
+                Err(reason) => report.dropped.push(DroppedRead {
+                    subscription_id: entry.subscription_id,
+                    sql: entry.sql,
+                    reason,
+                }),
+            }
+        }
+        Ok(report)
+    }
+
+    /// Judge and restore one saved answer, or say why it cannot come back.
+    #[cfg(feature = "std")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "restore validates and rebuilds every persisted read tier in one transaction"
+    )]
+    fn restore_one_read(
+        &mut self,
+        entry: &crate::persistence::reads::ReadEntry<I>,
+    ) -> Result<RestoredRead, DropReason> {
+        for (table_id, saved) in &entry.tables {
+            let live = crate::persistence::shard::expected_envelope(&self.database, *table_id)
+                .map_err(|_| DropReason::TableGone {
+                    table_id: *table_id,
+                })?;
+            if live != *saved {
+                return Err(DropReason::TableChanged {
+                    table_id: *table_id,
+                });
+            }
+        }
+
+        let session = match entry.scope {
+            SubscriptionScope::Session(s) => Some(s),
+            SubscriptionScope::Durable => None,
+        };
+        // Planning again is what decides the tier: the saved one is what it
+        // was, and a schema that still fingerprints the same can still plan
+        // differently (a new unique index, say).
+        let planned = crate::reexec::plan::build_plan::<E::Backend, DB>(
+            &entry.sql,
+            &self.dialect,
+            &self.database,
+        )
+        .map_err(|e| DropReason::Unplannable {
+            message: format!("{e:?}"),
+        })?;
+        // Row-level filtering may have been enabled without changing the SQL
+        // text. A restored shared answer is unsafe in that case for the same
+        // reason a fresh registration is: viewers can see different rows.
+        let rls_table = match &planned {
+            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
+                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
+                    .unwrap_or(false)
+                    .then_some(plan.table_id)
+            }
+            crate::reexec::plan::QueryPlan::Partial(plan) => {
+                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
+                    .unwrap_or(false)
+                    .then_some(plan.table_id)
+            }
+            crate::reexec::plan::QueryPlan::Keyed(plan) => (!entry.database_reads_per_consumer
+                && crate::catalog_helpers::table_has_rls(&self.database, plan.table)
+                    .unwrap_or(false))
+            .then_some(plan.table),
+            crate::reexec::plan::QueryPlan::Total(plan) => (!entry.database_reads_per_consumer)
+                .then(|| {
+                    plan.tables.iter().copied().find(|table_id| {
+                        crate::catalog_helpers::table_has_rls(&self.database, *table_id)
+                            .unwrap_or(false)
+                    })
+                })
+                .flatten(),
+        };
+        if let Some(table_id) = rls_table {
+            return Err(DropReason::Unplannable {
+                message: format!(
+                    "table {table_id} now filters rows per viewer, so one shared answer is unsafe"
+                ),
+            });
+        }
+        let registered = match planned {
+            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => self.capture_grouped_scalar(
+                entry.subscription_id,
+                *plan,
+                entry.consumer_id,
+                session,
+                &entry.sql,
+                entry.database_reads_per_consumer,
+            ),
+            crate::reexec::plan::QueryPlan::Partial(plan) => self.capture_scalar(
+                entry.subscription_id,
+                plan,
+                entry.consumer_id,
+                session,
+                &entry.sql,
+                entry.database_reads_per_consumer,
+            ),
+            crate::reexec::plan::QueryPlan::Keyed(plan) => self.capture_keyed(
+                entry.subscription_id,
+                *plan,
+                entry.consumer_id,
+                session,
+                &entry.sql,
+                entry.database_reads_per_consumer,
+            ),
+            crate::reexec::plan::QueryPlan::Total(plan) => self.capture_whole(
+                entry.subscription_id,
+                plan,
+                entry.consumer_id,
+                session,
+                &entry.sql,
+                entry.database_reads_per_consumer,
+            ),
+        };
+        // A restored id is taken, so the counter must never hand it out again.
+        if entry.subscription_id >= self.next_subscription_id {
+            self.next_subscription_id = entry.subscription_id + 1;
+        }
+        let now = match &registered.tier {
+            Tier::Scalar { .. } => crate::ReadTier::Scalar,
+            Tier::GroupedScalar { .. } => crate::ReadTier::GroupedScalar,
+            Tier::KeyedRows { .. } => crate::ReadTier::KeyedRows,
+            Tier::WholeRows { .. } => crate::ReadTier::WholeRows,
+            // The planner only ever hands back a read tier here.
+            Tier::InProcess(_) => entry.tier,
+        };
+        Ok(RestoredRead {
+            subscription_id: registered.subscription_id,
+            tier: registered.tier,
+            tier_changed: now != entry.tier,
         })
     }
 
@@ -1312,7 +2493,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         sql: impl Into<String>,
-    ) -> Result<RegisterResult, RegisterError> {
+    ) -> Result<Registered, RegisterError> {
         self.register(SubscriptionRequest::new(consumer_id, sql))
     }
 
@@ -1332,7 +2513,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         update_sql: impl Into<String>,
-    ) -> Result<RegisterResult, RegisterError> {
+    ) -> Result<Registered, RegisterError> {
         self.register_follow_update_with_binds(consumer_id, update_sql, Vec::new())
     }
 
@@ -1347,7 +2528,7 @@ where
         consumer_id: I::ConsumerId,
         update_sql: impl Into<String>,
         binds: Vec<crate::backend::Value<E::Backend>>,
-    ) -> Result<RegisterResult, RegisterError> {
+    ) -> Result<Registered, RegisterError> {
         let update_sql = update_sql.into();
         let select_sql = crate::compiler::derive_update_follow_select(&update_sql, &self.dialect)?;
         self.register(SubscriptionRequest::new(consumer_id, select_sql).binds(binds))
@@ -1387,7 +2568,7 @@ where
         consumer_id: I::ConsumerId,
         table: &str,
         pk: Vec<crate::backend::Value<E::Backend>>,
-    ) -> Result<RegisterResult, RegisterError> {
+    ) -> Result<Registered, RegisterError> {
         let table_id = catalog_helpers::table_id(&self.database, table)
             .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
         let pk_cols = catalog_helpers::primary_key_columns(&self.database, table_id)
@@ -1490,9 +2671,9 @@ where
     ///     .into_iter()
     ///     .collect::<Result<Vec<_>, _>>()?;
     ///
-    /// assert!(results[0].created_new_predicate);
-    /// assert!(!results[1].created_new_predicate);
-    /// assert!(results[2].created_new_predicate);
+    /// assert!(results[0].served().expect("in process").created_new_predicate);
+    /// assert!(!results[1].served().expect("in process").created_new_predicate);
+    /// assert!(results[2].served().expect("in process").created_new_predicate);
     /// assert_eq!(engine.predicate_count(orders_id), 2);
     /// assert_eq!(engine.subscription_count(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1501,7 +2682,7 @@ where
     pub fn register_batch(
         &mut self,
         specs: Vec<SubscriptionRequest<I, E::Backend>>,
-    ) -> Vec<Result<RegisterResult, RegisterError>> {
+    ) -> Vec<Result<Registered, RegisterError>> {
         // Eviction-aware fallback: when an active-eviction policy is
         // configured, within-batch eviction would have to consider
         // pending-but-not-yet-committed sub_ids that
@@ -1526,8 +2707,7 @@ where
         // Idempotent duplicates are short-circuited before binding creation.
         let mut compiled: Vec<Option<CompiledSpec<I, E::Backend>>> =
             Vec::with_capacity(specs.len());
-        let mut results: Vec<Result<RegisterResult, RegisterError>> =
-            Vec::with_capacity(specs.len());
+        let mut results: Vec<Result<Registered, RegisterError>> = Vec::with_capacity(specs.len());
         // Within-batch natural-key dedup. Maps the natural key of a
         // freshly-compiled, not-yet-committed binding to the result
         // index that owns it. When a later spec in the same batch
@@ -1554,15 +2734,18 @@ where
                         compiled_spec.spec.scope,
                     );
                     if let Some(&existing_sub_id) = self.binding_dedup.get(&natural_key) {
-                        results.push(Ok(RegisterResult {
+                        results.push(Ok(Registered {
                             subscription_id: existing_sub_id,
-                            table_id: compiled_spec.table_id,
-                            normalized_sql: compiled_spec.normalized,
-                            predicate_hash: compiled_spec.hash,
-                            created_new_predicate: false,
-                            projection: compiled_spec.projection,
+                            tier: Tier::InProcess(Served {
+                                table_id: compiled_spec.table_id,
+                                normalized_sql: compiled_spec.normalized,
+                                predicate_hash: compiled_spec.hash,
+                                created_new_predicate: false,
+                                projection: compiled_spec.projection,
+                                aggregate_bootstrap: compiled_spec.bootstrap,
+                            }),
                             evicted: Vec::new(),
-                            aggregate_bootstrap: compiled_spec.bootstrap,
+                            not_served_because: None,
                         }));
                         compiled.push(None); // already handled
                         continue;
@@ -1572,15 +2755,18 @@ where
                     if let Some(&primary_idx) = batch_natural_dedup.get(&natural_key) {
                         let dup_idx = results.len();
                         deferred_dup_copies.push((dup_idx, primary_idx));
-                        results.push(Ok(RegisterResult {
+                        results.push(Ok(Registered {
                             subscription_id: 0, // copied from primary after Phase 2
-                            table_id: compiled_spec.table_id,
-                            normalized_sql: compiled_spec.normalized,
-                            predicate_hash: compiled_spec.hash,
-                            created_new_predicate: false,
-                            projection: compiled_spec.projection,
+                            tier: Tier::InProcess(Served {
+                                table_id: compiled_spec.table_id,
+                                normalized_sql: compiled_spec.normalized,
+                                predicate_hash: compiled_spec.hash,
+                                created_new_predicate: false,
+                                projection: compiled_spec.projection,
+                                aggregate_bootstrap: compiled_spec.bootstrap,
+                            }),
                             evicted: Vec::new(),
-                            aggregate_bootstrap: compiled_spec.bootstrap,
+                            not_served_because: None,
                         }));
                         compiled.push(None);
                         continue;
@@ -1589,15 +2775,18 @@ where
                     // batch. Record so subsequent duplicates can defer
                     // onto it.
                     batch_natural_dedup.insert(natural_key, results.len());
-                    results.push(Ok(RegisterResult {
+                    results.push(Ok(Registered {
                         subscription_id: 0, // filled in phase 2
-                        table_id: compiled_spec.table_id,
-                        normalized_sql: String::new(), // filled in phase 2
-                        predicate_hash: compiled_spec.hash,
-                        created_new_predicate: false, // filled in phase 2
-                        projection: compiled_spec.projection.clone(),
+                        tier: Tier::InProcess(Served {
+                            table_id: compiled_spec.table_id,
+                            normalized_sql: String::new(), // filled in phase 2
+                            predicate_hash: compiled_spec.hash,
+                            created_new_predicate: false, // filled in phase 2
+                            projection: compiled_spec.projection.clone(),
+                            aggregate_bootstrap: None, // filled in phase 2
+                        }),
                         evicted: Vec::new(),
-                        aggregate_bootstrap: None,
+                        not_served_because: None,
                     }));
                     compiled.push(Some(compiled_spec));
                 }
@@ -1667,8 +2856,7 @@ where
             }
 
             // Auto-assign subscription ID.
-            let subscription_id = self.next_subscription_id;
-            self.next_subscription_id += 1;
+            let subscription_id = self.allocate_subscription_id();
 
             let natural_key = (c.spec.consumer_id, c.hash, c.spec.scope);
 
@@ -1754,14 +2942,19 @@ where
             }
 
             self.binding_dedup.insert(natural_key, subscription_id);
+            // Batch registration takes plain `SubscriptionRequest`, which
+            // states shared database reads.
+            self.open_aggregate_total(subscription_id, &c.spec, &c.projection, false);
 
             // Fill in the result, including any evictions credited to
             // this spec by the cap branch above.
-            if let Ok(ref mut result) = results[i] {
+            if let Ok(result) = &mut results[i] {
                 result.subscription_id = subscription_id;
-                result.normalized_sql = c.normalized;
-                result.created_new_predicate = created_new;
-                result.aggregate_bootstrap = c.bootstrap;
+                if let Tier::InProcess(served) = &mut result.tier {
+                    served.normalized_sql = c.normalized;
+                    served.created_new_predicate = created_new;
+                    served.aggregate_bootstrap = c.bootstrap;
+                }
                 if let Some(ev) = evicted_per_spec.remove(&i) {
                     result.evicted = ev;
                 }
@@ -1824,14 +3017,14 @@ where
                 &pending.seeds,
             );
             watches.extend(pending.plans.iter().filter_map(|plan| {
-                let movement = plan.moved_by?;
+                let movement = plan.moved_by.as_ref()?;
                 Some(TermWatch {
                     subscribed: pending.table,
                     member_table: movement.member_table,
                     predicate: binding.predicate_id,
                     slot: plan.slot,
-                    column: plan.column,
-                    member_key: movement.member_key,
+                    columns: plan.columns.clone(),
+                    member_keys: movement.member_keys.clone(),
                     member_subject: movement.member_subject,
                 })
             }));
@@ -1887,11 +3080,21 @@ where
             match &results[primary_idx] {
                 Ok(primary_ok) => {
                     let primary_sub_id = primary_ok.subscription_id;
-                    let primary_normalized = primary_ok.normalized_sql.clone();
+                    let primary_normalized = match &primary_ok.tier {
+                        Tier::InProcess(served) => served.normalized_sql.clone(),
+                        // The batch path registers nothing else, so there is
+                        // no normalized statement to mirror.
+                        Tier::Scalar { .. }
+                        | Tier::GroupedScalar { .. }
+                        | Tier::KeyedRows { .. }
+                        | Tier::WholeRows { .. } => String::new(),
+                    };
                     if let Ok(dup_ok) = &mut results[dup_idx] {
                         dup_ok.subscription_id = primary_sub_id;
-                        if dup_ok.normalized_sql.is_empty() {
-                            dup_ok.normalized_sql = primary_normalized;
+                        if let Tier::InProcess(served) = &mut dup_ok.tier {
+                            if served.normalized_sql.is_empty() {
+                                served.normalized_sql = primary_normalized;
+                            }
                         }
                     }
                 }
@@ -2146,6 +3349,9 @@ where
         subscription_id: SubscriptionId,
     ) -> Option<bool> {
         self.pk_follows.remove(&subscription_id);
+        self.aggregates.remove(&subscription_id);
+        self.grouped_aggregates.remove(&subscription_id);
+        self.aggregate_registrations.remove(&subscription_id);
         // Capture dedup key from binding before removing it.
         let dedup_key = self.dedup_key_for_subscription(subscription_id);
 
@@ -2385,30 +3591,38 @@ where
         out
     }
 
-    /// The value and the subscriber one membership row names, or [`None`] when
-    /// either half is absent, null, or of a kind that cannot be looked up.
+    /// The value row and the subscriber one membership row names, or [`None`]
+    /// when any half is absent, null, or of a kind that cannot be looked up.
+    #[allow(clippy::type_complexity)]
     fn read_term_pair(
         &self,
         event: &E,
         watch: &TermWatch,
         row: RowKind,
-    ) -> Option<(TermKey<E::Backend>, TermKey<E::Backend>)> {
-        let value = event.value_at(&self.database, row, watch.member_key).ok()?;
+    ) -> Option<(crate::term::TermRow<E::Backend>, TermKey<E::Backend>)> {
+        let mut values = Vec::with_capacity(watch.member_keys.len());
+        for &member_key in &watch.member_keys {
+            let value = event.value_at(&self.database, row, member_key).ok()?;
+            let TermLookup::Key(value) = TermLookup::of(value) else {
+                return None;
+            };
+            values.push(value);
+        }
         let subject = event
             .value_at(&self.database, row, watch.member_subject)
             .ok()?;
-        match (TermLookup::of(value), TermLookup::of(subject)) {
-            (TermLookup::Key(value), TermLookup::Key(subject)) => Some((value, subject)),
-            _ => None,
-        }
+        let TermLookup::Key(subject) = TermLookup::of(subject) else {
+            return None;
+        };
+        Some((values, subject))
     }
 
-    /// Add or remove the subscribers claiming `subscriber` from what `value`
-    /// admits, and report the subscriptions moved.
+    /// Add or remove the subscribers claiming `subscriber` from what `values`
+    /// admit, and report the subscriptions moved.
     fn move_term(
         &mut self,
         watch: &TermWatch,
-        value: TermKey<E::Backend>,
+        values: crate::term::TermRow<E::Backend>,
         subscriber: &TermKey<E::Backend>,
         entered: bool,
         out: &mut Vec<crate::TermNarrowing<E::Backend>>,
@@ -2442,17 +3656,17 @@ where
 
         let subscriptions = subscriptions_for(&snapshot.predicates, watch.predicate, &moved);
         drop(snapshot);
-        partition.move_term_members(watch.predicate, watch.slot, value.clone(), &moved, entered);
+        partition.move_term_members(watch.predicate, watch.slot, values.clone(), &moved, entered);
 
-        let value = value.into_value();
+        let values: Vec<_> = values.into_iter().map(TermKey::into_value).collect();
         out.extend(
             subscriptions
                 .into_iter()
                 .map(|subscription| crate::TermNarrowing {
                     subscription,
                     table: watch.subscribed,
-                    column: watch.column,
-                    value: value.clone(),
+                    columns: watch.columns.clone(),
+                    values: values.clone(),
                     entered,
                 }),
         );
@@ -2470,17 +3684,17 @@ where
         }
 
         let snapshot = partition.load_snapshot();
-        for (value, ordinals) in withdrawn {
+        for (values, ordinals) in withdrawn {
             let subscriptions = subscriptions_for(&snapshot.predicates, watch.predicate, &ordinals);
-            let value = value.into_value();
+            let values: Vec<_> = values.into_iter().map(TermKey::into_value).collect();
             out.extend(
                 subscriptions
                     .into_iter()
                     .map(|subscription| crate::TermNarrowing {
                         subscription,
                         table: watch.subscribed,
-                        column: watch.column,
-                        value: value.clone(),
+                        columns: watch.columns.clone(),
+                        values: values.clone(),
                         entered: false,
                     }),
             );
@@ -2501,116 +3715,44 @@ where
         }
     }
 
-    /// Compute typed signed deltas for aggregate subscriptions (COUNT(*), SUM(col), ...).
-    ///
-    /// Returns `Vec<(ConsumerId, AggDelta)>`` where each entry is the net signed change
-    /// for that consumer's aggregate predicate. Zero-net entries are omitted.
-    /// The same consumer may appear multiple times (once per aggregate kind).
-    ///
-    /// # Caller contract
-    /// - Bootstrap: query the DB for the initial aggregate **before** subscribing.
-    /// - Accumulate: `running_value += delta` on each call.
-    /// - UPDATE image requirement: aggregate UPDATE deltas require both
-    ///   `old_row` and `new_row`. When CDC omits old images, this API returns
-    ///   `DispatchError::AggregateUpdateRequiresOldRow`.
-    /// - Reset on policy change: RLS/ACL changes produce no WAL events.
-    ///   Re-query the DB and replace the stored value.
-    /// - Reset on TRUNCATE: engine returns `Err(TruncateRequiresReset)`.
-    ///   Caller must re-query and replace.
-    ///
-    /// # Examples
-    /// ```
-    /// use std::sync::Arc;
-    ///
-    /// use sql_traits::structs::ParserDB;
-    /// use sqlparser::dialect::PostgreSqlDialect;
-    /// use subql::backend::{Postgres, Value};
-    /// use subql::testing::TestEvent;
-    /// use subql::{
-    ///     catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine,
-    ///     SubscriptionRequest,
-    /// };
-    ///
-    /// let database = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);",
-    /// )?;
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
-    /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
-    ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
-    ///
-    /// engine.register(
-    ///     SubscriptionRequest::new(99, "SELECT COUNT(*) FROM orders WHERE status = 'paid'")
-    ///         .updated_at_unix_ms(1_704_067_200_000),
-    /// )?;
-    ///
-    /// let event = TestEvent::<Postgres>::insert(
-    ///     orders_id,
-    ///     vec![Value::Int(1), Value::String("paid".into())],
-    /// )
-    /// .with_pk_columns([0u16]);
-    ///
-    /// let deltas = engine.aggregate_deltas(&event)?;
-    /// assert_eq!(deltas, vec![(99, AggDelta::Count(1))]);
-    ///
-    /// // Aggregate subscriptions are handled by `aggregate_deltas()`, not `consumers()`.
-    /// let notifs = engine.consumers(&event)?;
-    /// assert!(notifs.inserted().is_empty());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn aggregate_deltas(
-        &mut self,
-        event: &E,
-    ) -> Result<Vec<(I::ConsumerId, crate::AggDelta)>, DispatchError> {
-        // See `consumers`: a cataloged table with no subscription
-        // contributes no aggregate deltas; only a truly unknown table id
-        // errors.
-        let table_id = event.table_id(&self.database);
-        if !self.partitions.contains_key(&table_id) {
-            return if self.table_in_catalog(table_id) {
-                Ok(Vec::new())
-            } else {
-                Err(DispatchError::UnknownTableId(table_id))
-            };
-        }
-
-        let arity = catalog_helpers::table_arity(&self.database, table_id).unwrap_or(0);
-
-        let (partition, consumer_dict) =
-            table_context(&self.partitions, &self.consumer_dictionaries, table_id)?;
-
-        super::dispatch::compute_agg_deltas(
-            event,
-            partition,
-            consumer_dict,
-            &mut self.vm,
-            arity,
-            &self.database,
-        )
-    }
-
     /// Dispatch one event through the row-set and aggregate paths at once.
     ///
     /// ```
-    /// use std::sync::Arc;
-    ///
     /// use sql_traits::structs::ParserDB;
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::backend::{Postgres, Value};
     /// use subql::testing::TestEvent;
     /// use subql::{
-    ///     catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine,
+    ///     catalog_helpers, AggValue, DefaultIds, Install, SubscriptionEngine,
     ///     SubscriptionRequest,
     /// };
     ///
     /// let database = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
-    /// )?;
-    /// let orders_id = catalog_helpers::table_id(&database, "orders").unwrap();
+    /// )
+    /// .expect("the DDL parses");
+    /// let orders_id = catalog_helpers::table_id(&database, "orders").expect("orders is cataloged");
     /// let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
     ///     SubscriptionEngine::new(database, PostgreSqlDialect {});
     ///
-    /// engine.register(SubscriptionRequest::new(7, "SELECT * FROM orders WHERE amount > 100"))?;
-    /// engine.register(SubscriptionRequest::new(9, "SELECT COUNT(*) FROM orders WHERE status = 'paid'"))?;
+    /// engine
+    ///     .register(SubscriptionRequest::new(7, "SELECT * FROM orders WHERE amount > 100"))
+    ///     .expect("the row query registers");
+    /// let counted = engine
+    ///     .register(SubscriptionRequest::new(
+    ///         9,
+    ///         "SELECT COUNT(*) FROM orders WHERE status = 'paid'",
+    ///     ))
+    ///     .expect("the aggregate registers");
+    /// Install::install(
+    ///     &mut engine,
+    ///     counted.subscription_id,
+    ///     subql::AggregateSeedInstall {
+    ///         rows: vec![vec![Value::Int(0)]],
+    ///         read_at: None,
+    ///     },
+    /// )
+    /// .expect("the starting numbers land");
     ///
     /// let event = TestEvent::<Postgres>::insert(
     ///     orders_id,
@@ -2618,19 +3760,51 @@ where
     /// )
     /// .with_pk_columns([0u16]);
     ///
-    /// let out = engine.dispatch(&event)?;
+    /// let out = engine.dispatch(&event).expect("the event dispatches");
     /// assert_eq!(out.notifications().inserted(), vec![7]);
-    /// assert_eq!(out.aggregate_deltas(), &[(9, AggDelta::Count(1))]);
+    /// assert_eq!(
+    ///     out.aggregate_updates()[0].change,
+    ///     subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(
+    ///         AggValue::Count(1),
+    ///     ))
+    /// );
     /// assert_eq!(out.notified(), vec![7, 9]); // deduped union of both paths
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn dispatch(
         &mut self,
         event: &E,
     ) -> Result<crate::DispatchOutput<I, E::Checkpoint, E::Backend>, DispatchError> {
-        let notifications = self.consumers(event)?;
-        let aggregate_deltas = self.aggregate_deltas(event)?;
-        let output = crate::DispatchOutput::from_parts(notifications, aggregate_deltas);
+        let notifications = match self.consumers(event) {
+            Ok(notifications) => notifications,
+            Err(DispatchError::UnknownTableId(_))
+                if self.routes_reread(event.table_id(&self.database)) =>
+            {
+                crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
+            }
+            Err(error) => return Err(error),
+        };
+        let mut aggregate = self.aggregate_updates(event)?;
+        let (grouped_updates, scalar_updates, mut triggers, mut transitions) =
+            self.maintain(event)?;
+        aggregate.updates.extend(grouped_updates);
+        triggers.extend(aggregate.triggers);
+        triggers.extend(self.unseeded_aggregate_triggers(event));
+        triggers.sort_unstable_by(|left, right| {
+            (left.subscription_id, left.read.group_key())
+                .cmp(&(right.subscription_id, right.read.group_key()))
+        });
+        triggers.dedup_by(|left, right| {
+            left.subscription_id == right.subscription_id
+                && left.read.group_key() == right.read.group_key()
+        });
+        transitions.extend(aggregate.transitions);
+        let output = crate::DispatchOutput::from_parts(
+            notifications,
+            aggregate.updates,
+            scalar_updates,
+            triggers,
+            transitions,
+        );
         // Any single-row (pk) follow whose row was just deleted
         // self-closes. Its `WHERE pk = <value>` predicate can never
         // match again, so leaving the subscription registered would
@@ -2749,10 +3923,25 @@ where
             }
         }
 
+        // Re-read answers are this registry's too, so a session takes its own
+        // with it rather than leaving them routed to nobody.
+        let mut removed_reads = 0;
+        for subscription_id in self
+            .reexec_sessions
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default()
+        {
+            if self.unregister_reread(subscription_id) {
+                removed_reads += 1;
+            }
+        }
+
         UnregisterReport {
             removed_bindings,
             removed_predicates,
             removed_consumers,
+            removed_reads,
         }
     }
 
@@ -2770,6 +3959,7 @@ where
             parse_and_resolve_hash::<E::Backend, DB>(sql, &self.dialect, &self.database)?;
 
         let empty = UnregisterReport {
+            removed_reads: 0,
             removed_bindings: 0,
             removed_predicates: 0,
             removed_consumers: 0,
@@ -2821,6 +4011,9 @@ where
         };
 
         Ok(UnregisterReport {
+            // Unregistering by statement touches predicates only, never the
+            // re-read answers, which are dropped by id.
+            removed_reads: 0,
             removed_bindings,
             removed_predicates,
             removed_consumers,
@@ -3447,7 +4640,7 @@ where
     fn register(
         &mut self,
         spec: SubscriptionRequest<I, E::Backend>,
-    ) -> Result<RegisterResult, RegisterError> {
+    ) -> Result<Registered, RegisterError> {
         Self::register(self, spec)
     }
 
@@ -3501,11 +4694,12 @@ where
     I: IdTypes,
     DB: DatabaseLike + Send + Sync + 'static,
 {
-    fn aggregate_deltas(
+    fn aggregate_updates(
         &mut self,
         event: &E,
-    ) -> Result<Vec<(I::ConsumerId, crate::AggDelta)>, DispatchError> {
-        Self::aggregate_deltas(self, event)
+    ) -> Result<crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>, DispatchError>
+    {
+        Self::aggregate_updates(self, event)
     }
 }
 
@@ -3588,13 +4782,25 @@ mod tests {
         SubscriptionRequest::new(consumer, format!("SELECT * FROM orders WHERE id = {id}"))
     }
 
+    /// What the in-process evaluator said it could not do with `where_clause`.
+    ///
+    /// The shape is not refused any more: it registers on a tier that re-reads
+    /// it, and carries the evaluator's own words for why. What these tests pin
+    /// is that it is not served in process, and that the reason says which
+    /// shape stopped it.
     fn refusal(where_clause: &str) -> String {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
         let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
         let sql = format!("SELECT * FROM orders WHERE {where_clause}");
         match engine.register(SubscriptionRequest::new(1, sql)) {
-            Err(RegisterError::UnsupportedSql(message)) => message,
-            other => panic!("{where_clause} should be refused as unsupported SQL, got {other:?}"),
+            Ok(Registered {
+                tier: Tier::InProcess(served),
+                ..
+            }) => panic!("{where_clause} should not be served in process, got {served:?}"),
+            Ok(registered) => registered
+                .not_served_because
+                .expect("a tier that needs a read says why"),
+            Err(e) => panic!("{where_clause} should register on a read tier, got {e:?}"),
         }
     }
 
@@ -3823,7 +5029,7 @@ mod tests {
         let pre = engine.register(spec(1, 1)).expect("pre registers");
 
         let results = engine.register_batch(vec![spec(2, 2), spec(3, 3), spec(4, 4)]);
-        let oks: Vec<&RegisterResult> = results
+        let oks: Vec<&Registered> = results
             .iter()
             .map(|r| r.as_ref().expect("entry ok"))
             .collect();

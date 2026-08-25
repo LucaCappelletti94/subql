@@ -23,12 +23,16 @@ use sqlparser::ast::Expr;
 use crate::backend::{Backend, BuiltinKind, CustomScalars, ScalarKind, ScalarKindOf, Value};
 use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
 
+/// The values one membership term compares, in the filter's column order.
+/// One-wide for the ordinary single-column term.
+pub type TermRow<B> = Vec<TermKey<B>>;
+
 /// One membership term the compiler lifted out of a filter.
 ///
 /// The compiled program carries only the slot, because that is all the VM
 /// needs. Registration needs the expression, to ask whether the relationship
-/// can be served at all, and the column, to group the subscriber's own starting
-/// values and to read the changed row later.
+/// can be served at all, and the columns, to group the subscriber's own
+/// starting values and to read the changed row later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledTerm {
     /// The slot [`Instruction::TermTruth`] names, and the index into the
@@ -36,10 +40,13 @@ pub struct CompiledTerm {
     ///
     /// [`Instruction::TermTruth`]: crate::compiler::Instruction::TermTruth
     pub slot: u16,
-    /// The column of the subscribed table the term compares.
-    pub column: ColumnId,
-    /// The whole `<column> IN (SELECT ...)` expression, which is what decides
-    /// whether the relationship it names can be served.
+    /// The columns of the subscribed table the term compares, in the order the
+    /// filter wrote them. One column for the ordinary `IN` term, one per pair
+    /// equality for the `EXISTS` spelling of a composite membership.
+    pub columns: Vec<ColumnId>,
+    /// The whole membership expression, `<column> IN (SELECT ...)` or the
+    /// bounded `EXISTS`, which is what decides whether the relationship it
+    /// names can be served.
     pub expr: Expr,
 }
 
@@ -58,15 +65,15 @@ impl CompiledTerm {
 
 /// What registration settled about one term, beyond what the compiler saw.
 ///
-/// The compiler knows which column the filter compares. Whether the
+/// The compiler knows which columns the filter compares. Whether the
 /// relationship can be served, and which table's rows move it, is what
 /// `rls2fga` answers, and this is that answer resolved to subql's own ids.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermPlan {
     /// The slot this plan belongs to.
     pub slot: u16,
-    /// The column of the subscribed table the term compares.
-    pub column: ColumnId,
+    /// The columns of the subscribed table the term compares, in written order.
+    pub columns: Vec<ColumnId>,
     /// The rows that move which subscribers the term admits.
     ///
     /// `None` for a caller comparison: its set is the subscriber itself, and an
@@ -75,7 +82,7 @@ pub struct TermPlan {
 }
 
 /// The table and columns whose changed rows move a membership term's set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermMovement {
     /// The table whose changed rows move which subscribers the term admits.
     ///
@@ -84,9 +91,10 @@ pub struct TermMovement {
     /// related row. One walk covers both, because in each case it is the table
     /// the shape that names a caller reads.
     pub member_table: TableId,
-    /// The column of `member_table` carrying the value the term's compared
-    /// column is compared against.
-    pub member_key: ColumnId,
+    /// The columns of `member_table` carrying the values the term's compared
+    /// columns are compared against, pairwise with
+    /// [`TermPlan::columns`] in the same order.
+    pub member_keys: Vec<ColumnId>,
     /// The column of `member_table` naming the subscriber a row admits.
     pub member_subject: ColumnId,
 }
@@ -103,17 +111,13 @@ pub struct TermMovement {
 /// [`SubscriptionEngine::describe_terms`](crate::SubscriptionEngine::describe_terms).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermDescription {
-    /// The compared column of the subscribed table, by catalog name.
-    ///
-    /// The name
-    /// [`SubscriptionRequest::term_values`](crate::SubscriptionRequest::term_values)
-    /// is keyed by, since the compared column is what both sides share.
-    pub column: String,
+    /// The compared columns and the membership columns they pair with, in the
+    /// order the filter wrote them, which is also the order
+    /// [`seed_sql`](Self::seed_sql) projects and each stated row follows.
+    pub pairs: Vec<TermColumnPair>,
     /// The table whose changed rows move which subscribers the term admits, by
     /// catalog name.
     pub member_table: String,
-    /// The column of `member_table` [`seed_sql`](Self::seed_sql) projects.
-    pub member_key: String,
     /// The column of `member_table` naming the subscriber a row admits.
     pub member_subject: String,
     /// The kind the subscriber value has to be built at.
@@ -129,22 +133,37 @@ pub struct TermDescription {
     /// that is what the database hands them and the conversion into the
     /// custom type is subql's to run. This names what it means.
     pub subject_custom: Option<String>,
-    /// The kind [`seed_sql`](Self::seed_sql)'s one column decodes as, which is
-    /// also the kind [`column`](Self::column) holds.
-    pub key_kind: BuiltinKind,
-    /// The custom type [`key_kind`](Self::key_kind) carries, when the seed
-    /// column is one, as it prints.
-    pub key_custom: Option<String>,
-    /// The seed read: the membership subquery itself, one column, the values
-    /// this subscriber currently matches.
+    /// The seed read: the membership columns, the values this subscriber
+    /// currently matches, one projected column per pair and in pair order.
     ///
     /// Run it as the caller, because it names the caller the way the snapshot
-    /// does, then state what came back under [`column`](Self::column). Reading
-    /// the membership table is what makes the seed complete: a snapshot of the
-    /// subscribed table omits every value whose rows do not exist yet, and no
-    /// later membership change repairs that, because the membership did not
-    /// change.
+    /// does, then state what came back under the pairs' compared columns.
+    /// Reading the membership table is what makes the seed complete: a
+    /// snapshot of the subscribed table omits every value whose rows do not
+    /// exist yet, and no later membership change repairs that, because the
+    /// membership did not change.
     pub seed_sql: String,
+}
+
+/// One compared column of the subscribed table and the membership column it
+/// pairs with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermColumnPair {
+    /// The compared column of the subscribed table, by catalog name.
+    ///
+    /// One of the names
+    /// [`SubscriptionRequest::term_values`](crate::SubscriptionRequest::term_values)
+    /// is keyed by, since the compared columns are what both sides share.
+    pub column: String,
+    /// The column of `member_table` [`seed_sql`](TermDescription::seed_sql)
+    /// projects at this position.
+    pub member_key: String,
+    /// The kind the seed column decodes as, which is also the kind
+    /// [`column`](Self::column) holds.
+    pub kind: BuiltinKind,
+    /// The custom type [`kind`](Self::kind) carries, when the column is one,
+    /// as it prints.
+    pub custom: Option<String>,
 }
 
 impl TermDescription {
@@ -161,21 +180,34 @@ impl TermDescription {
         table: TableId,
         database: &DB,
     ) -> Result<Self, RegisterError> {
-        // A term compiles from `IN (SELECT ...)` alone, whose inner query the
-        // compiler bounds to one projected column. A shape a later compiler
+        // A term compiles from `IN (SELECT ...)` or the bounded `EXISTS`,
+        // whose shapes the compiler already checked. A shape a later compiler
         // lifts a term from is refused rather than served with no seed read,
         // since an unseeded term admits nobody in silence.
-        let Expr::InSubquery { subquery, .. } = &term.expr else {
-            return Err(RegisterError::MembershipTermRefused(
-                "this membership term was not lifted from an IN (SELECT ...), so SubQL cannot say \
-                 which read seeds it"
-                    .into(),
-            ));
+        let seed_sql = match &term.expr {
+            Expr::InSubquery { subquery, .. } => subquery.to_string(),
+            Expr::Exists { subquery, .. } => {
+                crate::compiler::sql_shape::exists_seed_select(subquery, table, database)
+                    .ok_or_else(|| {
+                        RegisterError::MembershipTermRefused(
+                            "this membership term's EXISTS lost its recognized shape, so SubQL \
+                             cannot say which read seeds it"
+                                .into(),
+                        )
+                    })?
+            }
+            _ => {
+                return Err(RegisterError::MembershipTermRefused(
+                    "this membership term was not lifted from an IN (SELECT ...) or a bounded \
+                     EXISTS, so SubQL cannot say which read seeds it"
+                        .into(),
+                ))
+            }
         };
         // A caller comparison seeds itself from the subscriber, so no read
         // describes it. `describe_terms` skips such plans, and this is what a
         // later caller of `resolve` gets instead of a fabricated read.
-        let Some(movement) = plan.moved_by else {
+        let Some(movement) = &plan.moved_by else {
             return Err(RegisterError::MembershipTermRefused(
                 "this membership term seeds itself from the subscriber, so there is no read to \
                  describe"
@@ -184,17 +216,23 @@ impl TermDescription {
         };
 
         let subject = kind::<B, DB>(database, movement.member_table, movement.member_subject)?;
-        let compared = kind::<B, DB>(database, table, plan.column)?;
+        let mut pairs = Vec::with_capacity(plan.columns.len());
+        for (compared, member_key) in plan.columns.iter().zip(&movement.member_keys) {
+            let compared_kind = kind::<B, DB>(database, table, *compared)?;
+            pairs.push(TermColumnPair {
+                column: name(database, table, *compared)?,
+                member_key: name(database, movement.member_table, *member_key)?,
+                kind: carrier_of::<B>(compared_kind),
+                custom: custom_name::<B>(compared_kind),
+            });
+        }
         Ok(Self {
-            column: name(database, table, plan.column)?,
+            pairs,
             member_table: table_name_of(database, movement.member_table)?,
-            member_key: name(database, movement.member_table, movement.member_key)?,
             member_subject: name(database, movement.member_table, movement.member_subject)?,
             subject_kind: carrier_of::<B>(subject),
             subject_custom: custom_name::<B>(subject),
-            key_kind: carrier_of::<B>(compared),
-            key_custom: custom_name::<B>(compared),
-            seed_sql: subquery.to_string(),
+            seed_sql,
         })
     }
 }
@@ -255,17 +293,18 @@ fn kind<B: Backend, DB: DatabaseLike>(
     })
 }
 
-/// The columns `terms` compare, indexed by slot.
+/// The column tuples `terms` compare, indexed by slot.
 ///
 /// The compiler assigns slots densely from zero in first-occurrence order, so
 /// this is a reindexing rather than a search, and it is the table dispatch
-/// reads a changed row through.
+/// reads a changed row through. Each entry lists the compared columns in the
+/// order the filter wrote them, one for the ordinary single-column term.
 #[must_use]
-pub fn term_columns(terms: &[CompiledTerm]) -> Vec<ColumnId> {
-    let mut columns = alloc::vec![0; terms.len()];
+pub fn term_columns(terms: &[CompiledTerm]) -> Vec<Vec<ColumnId>> {
+    let mut columns = alloc::vec![Vec::new(); terms.len()];
     for term in terms {
         if let Some(slot) = columns.get_mut(usize::from(term.slot)) {
-            *slot = term.column;
+            slot.clone_from(&term.columns);
         }
     }
     columns

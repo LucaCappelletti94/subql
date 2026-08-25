@@ -28,19 +28,18 @@ use std::time::Instant;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{BuiltinKind, Postgres, Value};
-use subql::reexec::{
-    AsyncAutoResolvingEngine, AsyncConnector, ReExecEngine, Registered, RowPage, Snapshot,
-};
+use subql::reexec::{AsyncConnector, AsyncMode, AutoResolvingEngine, RowPage, Snapshot};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, DefaultIds, NoCheckpoint, SubscriptionEngine, SubscriptionRequest, TableId,
+    catalog_helpers, DefaultIds, NoCheckpoint, Registered, SubscriptionEngine, SubscriptionRequest,
+    TableId, Tier,
 };
 
-type Engine = AsyncAutoResolvingEngine<
+type Engine = AutoResolvingEngine<
     TestEvent<Postgres>,
     DefaultIds,
     ParserDB,
-    ConcurrencyProbingConnector,
+    AsyncMode<ConcurrencyProbingConnector>,
 >;
 
 /// Async connector that waits a fixed delay on every `execute_scalar`
@@ -181,7 +180,7 @@ fn engine_with_all_queries(cap: usize, delay: Duration) -> (Engine, TableId) {
         database,
         PostgreSqlDialect {},
     );
-    let mut engine = AsyncAutoResolvingEngine::new(ReExecEngine::new(inner), connector)
+    let mut engine = AutoResolvingEngine::new(inner, AsyncMode::new(connector))
         .with_max_concurrent_reexecutions(cap);
 
     for (i, (sql, install_value)) in QUERIES.iter().enumerate() {
@@ -192,10 +191,22 @@ fn engine_with_all_queries(cap: usize, delay: Duration) -> (Engine, TableId) {
             )
             .unwrap();
         let qid = match registered {
-            Registered::ReExec { query_id, .. } => query_id,
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
             other => panic!("expected ReExec capture for `{sql}`, got {other:?}"),
         };
-        assert!(engine.install(qid, install_value()));
+        assert!(subql::Install::install(
+            &mut engine,
+            qid,
+            subql::ScalarInstall {
+                value: install_value(),
+                checkpoint: None::<subql::NoCheckpoint>
+            }
+        )
+        .is_ok());
     }
     (engine, tid)
 }

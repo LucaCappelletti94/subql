@@ -186,8 +186,15 @@ fn delivers(values: &[i64], project: i64) -> bool {
     let mut request = SubscriptionRequest::new(1u64, TERM).subscriber(Value::String(CALLER.into()));
     let description = engine.describe_terms(&request).unwrap().remove(0);
     request = request.term_values(
-        description.column,
-        values.iter().copied().map(Value::Int).collect(),
+        description
+            .pairs
+            .iter()
+            .map(|pair| pair.column.clone())
+            .collect(),
+        values
+            .iter()
+            .map(|&value| vec![Value::Int(value)])
+            .collect(),
     );
     engine.register(request).unwrap();
 
@@ -224,10 +231,14 @@ fn the_described_seed_read_runs_and_admits_a_parent_with_no_rows_yet() {
         panic!("one membership subquery, got {described:?}");
     };
     assert_eq!(
-        description.member_key, "project_id",
+        description.pairs[0].member_key, "project_id",
         "the bound column name"
     );
-    assert_eq!(description.key_kind, ScalarKind::Int, "the decode kind");
+    assert_eq!(
+        description.pairs[0].kind,
+        ScalarKind::Int,
+        "the decode kind"
+    );
 
     // Runnable, and it reads the membership table rather than the snapshot.
     let from_membership = run_seed(&mut pg, description);

@@ -17,7 +17,14 @@ use subql::compiler::MAX_TERMS_PER_FILTER;
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId,
+    Tier,
 };
+
+/// One-wide value rows, the shape the tuple-stating API takes for the
+/// ordinary single-column term.
+fn rows_of(values: Vec<Value<Postgres>>) -> Vec<Vec<Value<Postgres>>> {
+    values.into_iter().map(|value| vec![value]).collect()
+}
 
 const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
      CREATE TABLE project_members(project_id INTEGER REFERENCES projects(id), user_id TEXT, PRIMARY KEY(project_id, user_id));
@@ -53,8 +60,8 @@ fn subscribe(
     SubscriptionRequest::new(consumer, TERM)
         .subscriber(Value::String(user.into()))
         .term_values(
-            "project_id",
-            projects.iter().copied().map(Value::Int).collect(),
+            vec!["project_id"],
+            rows_of(projects.iter().copied().map(Value::Int).collect()),
         )
 }
 
@@ -173,7 +180,7 @@ fn a_row_test_and_a_term_both_have_to_hold() {
         .register(
             SubscriptionRequest::new(1u64, and_filter)
                 .subscriber(Value::String("alice".into()))
-                .term_values("project_id", vec![Value::Int(7)]),
+                .term_values(vec!["project_id"], rows_of(vec![Value::Int(7)])),
         )
         .unwrap();
 
@@ -210,7 +217,7 @@ fn a_term_under_or_admits_everybody_the_other_side_admits() {
     let subscribe_or = |consumer: u64, user: &str, project: i64| {
         SubscriptionRequest::new(consumer, or_filter)
             .subscriber(Value::String(user.into()))
-            .term_values("project_id", vec![Value::Int(project)])
+            .term_values(vec!["project_id"], rows_of(vec![Value::Int(project)]))
     };
     engine.register(subscribe_or(1, "alice", 7)).unwrap();
     engine.register(subscribe_or(2, "bob", 9)).unwrap();
@@ -363,16 +370,16 @@ fn a_reversed_spelling_binds_its_values_to_the_columns_they_name() {
         .register(
             SubscriptionRequest::new(1u64, forward)
                 .subscriber(Value::String("alice".into()))
-                .term_values("project_id", vec![Value::Int(7)])
-                .term_values("a", vec![Value::Int(70)]),
+                .term_values(vec!["project_id"], rows_of(vec![Value::Int(7)]))
+                .term_values(vec!["a"], rows_of(vec![Value::Int(70)])),
         )
         .unwrap();
     engine
         .register(
             SubscriptionRequest::new(2u64, reversed)
                 .subscriber(Value::String("bob".into()))
-                .term_values("project_id", vec![Value::Int(9)])
-                .term_values("a", vec![Value::Int(90)]),
+                .term_values(vec!["project_id"], rows_of(vec![Value::Int(9)]))
+                .term_values(vec!["a"], rows_of(vec![Value::Int(90)])),
         )
         .unwrap();
 
@@ -513,7 +520,7 @@ fn values_stated_for_an_uncompared_column_are_refused() {
         &mut engine,
         SubscriptionRequest::new(1u64, TERM)
             .subscriber(Value::String("alice".into()))
-            .term_values("title", vec![Value::String("x".into())]),
+            .term_values(vec!["title"], rows_of(vec![Value::String("x".into())])),
     );
     assert!(
         reason.contains("no membership subquery"),
@@ -607,7 +614,7 @@ fn a_new_membership_row_moves_the_set_and_reports_the_narrowing() {
     assert_eq!(narrowings.len(), 1, "one subscription, one narrowing");
     assert_eq!(narrowings[0].subscription, alice.subscription_id);
     assert_eq!(narrowings[0].table, docs, "it names the subscribed table");
-    assert_eq!(narrowings[0].value, Value::Int(11));
+    assert_eq!(narrowings[0].values, vec![Value::Int(11)]);
     assert!(narrowings[0].entered, "the value entered her set");
 
     // After: the same row now reaches her.
@@ -637,7 +644,7 @@ fn a_removed_membership_row_takes_the_value_away() {
     let narrowings = notifs.narrowings();
     assert_eq!(narrowings.len(), 1);
     assert_eq!(narrowings[0].subscription, alice.subscription_id);
-    assert_eq!(narrowings[0].value, Value::Int(7));
+    assert_eq!(narrowings[0].values, vec![Value::Int(7)]);
     assert!(!narrowings[0].entered, "the value left her set");
 
     assert!(
@@ -704,7 +711,7 @@ fn a_value_the_subscriber_never_matched_keeps_admitting_it() {
         .unwrap();
     let narrowings = notifs.narrowings();
     assert_eq!(narrowings.len(), 1, "one subscription, one withdrawal");
-    assert_eq!(narrowings[0].value, Value::Int(11));
+    assert_eq!(narrowings[0].values, vec![Value::Int(11)]);
     assert!(!narrowings[0].entered, "the value left her set");
     assert!(
         engine
@@ -728,15 +735,15 @@ fn an_updated_membership_row_reports_both_halves() {
         .with_changed_columns([0u16]);
     let notifs = engine.consumers(&moved).unwrap();
 
-    let mut narrowings: Vec<(Value<Postgres>, bool)> = notifs
+    let mut narrowings: Vec<(Vec<Value<Postgres>>, bool)> = notifs
         .narrowings()
         .iter()
-        .map(|n| (n.value.clone(), n.entered))
+        .map(|n| (n.values.clone(), n.entered))
         .collect();
     narrowings.sort_by_key(|(_, entered)| *entered);
     assert_eq!(
         narrowings,
-        vec![(Value::Int(7), false), (Value::Int(11), true)],
+        vec![(vec![Value::Int(7)], false), (vec![Value::Int(11)], true)],
         "one row moved, so one value left and one arrived"
     );
 
@@ -798,7 +805,12 @@ fn truncating_the_membership_table_withdraws_every_value() {
         .iter()
         .map(|narrowing| {
             assert!(!narrowing.entered);
-            narrowing.value.clone()
+            assert_eq!(
+                narrowing.values.len(),
+                1,
+                "a one-column term withdraws one-wide rows"
+            );
+            narrowing.values[0].clone()
         })
         .collect();
     values.sort_by_key(|value| match value {
@@ -918,9 +930,12 @@ fn describe_terms_names_what_a_seed_read_needs() {
         panic!("one membership subquery, got {described:?}");
     };
 
-    assert_eq!(term.column, "project_id", "the term_values key");
+    let [pair] = term.pairs.as_slice() else {
+        panic!("one compared column, got {:?}", term.pairs);
+    };
+    assert_eq!(pair.column, "project_id", "the term_values key");
     assert_eq!(term.member_table, "project_members");
-    assert_eq!(term.member_key, "project_id");
+    assert_eq!(pair.member_key, "project_id");
     assert_eq!(term.member_subject, "user_id");
     assert_eq!(
         term.subject_kind,
@@ -928,7 +943,7 @@ fn describe_terms_names_what_a_seed_read_needs() {
         "user_id is TEXT, and a subscriber built at another kind admits nobody"
     );
     assert_eq!(
-        term.key_kind,
+        pair.kind,
         ScalarKind::Int,
         "project_id is INTEGER, which is what the seed rows decode as"
     );
@@ -992,9 +1007,11 @@ fn describe_terms_is_empty_for_a_filter_naming_no_term() {
         .is_empty());
 }
 
-/// Describing and registering the same request refuse alike, or a panic naming
-/// which of the two broke ranks. Both accepting is a failure too: a parity
-/// assertion over two successes proves nothing.
+/// Describing and registering the same request agree, or a panic naming which
+/// of the two broke ranks. Registering no longer turns these away: a shape the
+/// in-process evaluator refuses lands on a tier that re-reads it, carrying the
+/// same words describing refused with. Both serving it in process is a failure
+/// too: a parity assertion over two successes proves nothing.
 fn refuses_alike(sql: &str) {
     let (mut engine, _) = engine();
     let request = || SubscriptionRequest::new(1u64, sql).subscriber(Value::String("alice".into()));
@@ -1002,13 +1019,30 @@ fn refuses_alike(sql: &str) {
         .describe_terms(&request())
         .err()
         .map(|error| error.to_string());
-    let registered = engine.register(request()).err().map(|e| e.to_string());
-
     assert!(described.is_some(), "{sql} must be refused at all");
-    assert_eq!(
-        described, registered,
-        "describing must refuse exactly as registering does, for {sql}"
-    );
+    let described = described.expect("checked just above");
+
+    match engine.register(request()) {
+        Ok(registered) => {
+            assert!(
+                !matches!(registered.tier, Tier::InProcess(_)),
+                "{sql} must not be served in process, got {:?}",
+                registered.tier
+            );
+            let reason = registered
+                .not_served_because
+                .expect("a tier that needs a read says why");
+            assert!(
+                described.contains(&reason),
+                "describing said `{described}`, registering said `{reason}`, for {sql}"
+            );
+        }
+        Err(refused) => assert_eq!(
+            described,
+            refused.to_string(),
+            "describing must refuse exactly as registering does, for {sql}"
+        ),
+    }
 }
 
 /// The point of sharing one classification: a filter the caller was told to seed
@@ -1067,11 +1101,69 @@ fn describe_terms_answers_once_per_subquery() {
         .expect("two terms on two columns are describable");
     let pairs: Vec<(&str, bool)> = described
         .iter()
-        .map(|term| (term.column.as_str(), term.seed_sql.contains("AS pm")))
+        .map(|term| {
+            (
+                term.pairs[0].column.as_str(),
+                term.seed_sql.contains("AS pm"),
+            )
+        })
         .collect();
     assert_eq!(
         pairs,
         [("a", true), ("project_id", false)],
         "each description carries the subquery of its own compared column"
+    );
+}
+
+/// The compared column and the inner projection are spelled differently, and
+/// the guarded table also carries a decoy column named after the inner one.
+/// The filter must move by the column it compares, never by the name twin.
+/// Pins the wrong-allow shape rls2fga once had, where the bridge read the
+/// guarded table's column named after the inner projection.
+#[test]
+fn a_cross_named_correlation_moves_by_the_compared_column() {
+    const CROSS_DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE project_members(project_id INTEGER REFERENCES projects(id), user_id TEXT, PRIMARY KEY(project_id, user_id));
+         CREATE TABLE reports(id INTEGER PRIMARY KEY, proj INTEGER, project_id INTEGER, title TEXT);";
+    const CROSS_TERM: &str = "SELECT * FROM reports WHERE proj IN \
+         (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true))";
+
+    let db = ParserDB::parse::<PostgreSqlDialect>(CROSS_DDL).expect("DDL parses");
+    let reports = catalog_helpers::table_id(&db, "reports").expect("reports is in the catalog");
+    let mut engine: Engine =
+        SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(translator());
+
+    engine
+        .register(
+            SubscriptionRequest::new(1u64, CROSS_TERM)
+                .subscriber(Value::String("alice".into()))
+                .term_values(vec!["proj"], rows_of(vec![Value::Int(7)])),
+        )
+        .expect("a cross-named correlation registers");
+
+    let row = |id: i64, proj: i64, decoy: i64| {
+        vec![
+            Value::Int(id),
+            Value::Int(proj),
+            Value::Int(decoy),
+            Value::String("r".into()),
+        ]
+    };
+
+    let notifs = engine
+        .consumers(&TestEvent::insert(reports, row(1, 7, 999)))
+        .unwrap();
+    assert_eq!(
+        notifs.inserted(),
+        &[1],
+        "the compared column holds alice's project, the decoy does not"
+    );
+
+    let notifs = engine
+        .consumers(&TestEvent::insert(reports, row(2, 999, 7)))
+        .unwrap();
+    assert!(
+        notifs.inserted().is_empty(),
+        "only the decoy column holds alice's project, so the row must not reach her"
     );
 }

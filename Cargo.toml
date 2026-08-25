@@ -822,6 +822,18 @@ inherits = "release"
 lto = false
 codegen-units = 16
 
+# Iteration profile for local test runs. Under `cargo test --release` every
+# one of the ~78 integration test binaries pays release's fat-LTO,
+# single-codegen-unit link: 5m54s of rebuild after touching one source
+# file. Tests still want release-grade codegen, so only the link-time
+# knobs relax, plus incremental compilation, which brings the same rebuild
+# to 10s. Use via `cargo +1.88 nextest run --cargo-profile testfast`.
+[profile.testfast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
 
 [lints]
 workspace = true

@@ -17,7 +17,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, AggDelta, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId,
+    catalog_helpers, AggValue, DefaultIds, SubscriptionEngine, SubscriptionId, SubscriptionRequest,
+    TableId,
 };
 
 const DDL: &str = "CREATE TABLE orders (
@@ -37,15 +38,20 @@ const CONSUMER: u64 = 1;
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
 
 fn engine_with(sql: &str) -> (Engine, TableId) {
+    let (engine, orders, _) = engine_and_subscription(sql);
+    (engine, orders)
+}
+
+fn engine_and_subscription(sql: &str) -> (Engine, TableId, SubscriptionId) {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
     let orders = catalog_helpers::table_id(&db, "orders").unwrap();
     let mut engine = Engine::new(db, PostgreSqlDialect {});
-    engine
+    let registered = engine
         .register(SubscriptionRequest::<DefaultIds, Postgres>::new(
             CONSUMER, sql,
         ))
         .unwrap();
-    (engine, orders)
+    (engine, orders, registered.subscription_id)
 }
 
 /// The row image the reproduction uses, varying the two columns under test.
@@ -163,13 +169,30 @@ fn delete_of_a_matching_row_notifies_the_subscription() {
 
 #[test]
 fn aggregate_subscription_sees_an_update_of_the_column_it_sums() {
-    let (mut engine, orders) = engine_with("SELECT SUM(price) FROM orders WHERE quantity > 0");
+    let (mut engine, orders, subscription) =
+        engine_and_subscription("SELECT SUM(price) FROM orders WHERE quantity > 0");
+
+    // The engine holds the total, so it needs the starting numbers before it
+    // reports anything. Nothing has been folded yet, so the read cannot have
+    // raced a change and needs no stream position.
+    subql::Install::install(
+        &mut engine,
+        subscription,
+        subql::AggregateSeedInstall {
+            rows: vec![vec![Value::Float(9.5)]],
+            read_at: None,
+        },
+    )
+    .expect("the starting numbers land");
 
     let event = update(orders, row(9.5, 5, "v1"), row(11.5, 5, "v1"), [PRICE]);
 
+    let updates = engine.aggregate_updates(&event).unwrap();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].consumer, CONSUMER);
     assert_eq!(
-        engine.aggregate_deltas(&event).unwrap(),
-        vec![(CONSUMER, AggDelta::Sum(2.0))]
+        updates[0].change,
+        subql::AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Sum(11.5),))
     );
 }
 

@@ -3,7 +3,7 @@
 use super::ids::{ConsumerOrdinal, PredicateHash, PredicateId};
 use super::indexes::IndexableAtom;
 use crate::backend::Backend;
-use crate::term::TermKey;
+use crate::term::{TermKey, TermRow};
 use crate::{
     compiler::{sql_shape::QueryProjection, BytecodeProgram, PrefilterPlan},
     ColumnId, IdTypes, SubscriptionId, SubscriptionScope,
@@ -117,8 +117,10 @@ impl<I: IdTypes> Copy for SubscriptionBinding<I> {}
 /// subscriber and a value, and asks which of this predicate's subscribers claim
 /// that identity, so it can move them under that value.
 pub struct TermMembers<B: Backend> {
-    /// Which consumer ordinals a compared value admits.
-    by_value: HashMap<TermKey<B>, RoaringBitmap>,
+    /// Which consumer ordinals a compared value row admits, keyed by the
+    /// values in the filter's column order (one-wide for a single-column
+    /// term).
+    by_value: HashMap<TermRow<B>, RoaringBitmap>,
     /// Which consumer ordinals claim each subscriber identity.
     by_subscriber: HashMap<TermKey<B>, RoaringBitmap>,
 }
@@ -154,16 +156,16 @@ impl<B: Backend> Default for TermMembers<B> {
 }
 
 impl<B: Backend> TermMembers<B> {
-    /// The consumer ordinals `value` admits, empty when it admits none.
+    /// The consumer ordinals `values` admit, empty when they admit none.
     #[must_use]
-    pub fn admits(&self, value: &TermKey<B>) -> Option<&RoaringBitmap> {
-        self.by_value.get(value)
+    pub fn admits(&self, values: &[TermKey<B>]) -> Option<&RoaringBitmap> {
+        self.by_value.get(values)
     }
 
-    /// Record that `ordinal` matches `value` through this term.
-    fn admit(&mut self, value: TermKey<B>, ordinal: ConsumerOrdinal) {
+    /// Record that `ordinal` matches `values` through this term.
+    fn admit(&mut self, values: TermRow<B>, ordinal: ConsumerOrdinal) {
         self.by_value
-            .entry(value)
+            .entry(values)
             .or_default()
             .insert(ordinal.get());
     }
@@ -182,19 +184,19 @@ impl<B: Backend> TermMembers<B> {
         self.by_subscriber.get(subscriber)
     }
 
-    /// Add `ordinals` to the set `value` admits, as a membership row appearing
+    /// Add `ordinals` to the set `values` admit, as a membership row appearing
     /// does.
-    pub fn widen(&mut self, value: TermKey<B>, ordinals: &RoaringBitmap) {
-        *self.by_value.entry(value).or_default() |= ordinals;
+    pub fn widen(&mut self, values: TermRow<B>, ordinals: &RoaringBitmap) {
+        *self.by_value.entry(values).or_default() |= ordinals;
     }
 
-    /// Take `ordinals` out of the set `value` admits, as a membership row
+    /// Take `ordinals` out of the set `values` admit, as a membership row
     /// disappearing does.
-    pub fn narrow(&mut self, value: &TermKey<B>, ordinals: &RoaringBitmap) {
-        if let Some(admitted) = self.by_value.get_mut(value) {
+    pub fn narrow(&mut self, values: &[TermKey<B>], ordinals: &RoaringBitmap) {
+        if let Some(admitted) = self.by_value.get_mut(values) {
             *admitted -= ordinals;
             if admitted.is_empty() {
-                self.by_value.remove(value);
+                self.by_value.remove(values);
             }
         }
     }
@@ -204,7 +206,7 @@ impl<B: Backend> TermMembers<B> {
     /// The subscriber claims stay: the subscriptions are still registered and
     /// still filter for the same identities, so a membership row appearing again
     /// moves them back.
-    pub fn clear_admissions(&mut self) -> Vec<(TermKey<B>, RoaringBitmap)> {
+    pub fn clear_admissions(&mut self) -> Vec<(TermRow<B>, RoaringBitmap)> {
         self.by_value.drain().collect()
     }
 
@@ -501,12 +503,12 @@ impl<I: IdTypes, B: Backend> PredicateStore<I, B> {
         slot: u16,
         ordinal: ConsumerOrdinal,
         subscriber: TermKey<B>,
-        values: Vec<TermKey<B>>,
+        rows: Vec<TermRow<B>>,
     ) {
         let members = self.term_members.entry((pred, slot)).or_default();
         members.claim(subscriber, ordinal);
-        for value in values {
-            members.admit(value, ordinal);
+        for row in rows {
+            members.admit(row, ordinal);
         }
     }
 

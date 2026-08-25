@@ -3,7 +3,7 @@
 //!
 //! Async peers of the sync connectors in [`connector`](super::connector).
 //! Hand any of these to an
-//! [`AsyncAutoResolvingEngine`](super::AsyncAutoResolvingEngine) to drive
+//! [`AutoResolvingEngine`](super::AutoResolvingEngine) with [`AsyncMode`](super::AsyncMode) to drive
 //! re-execution end to end on an async runtime (tokio multi-thread, etc.).
 //!
 //! # Why a pool
@@ -152,9 +152,9 @@ where
 ///
 /// Wraps a `bb8` pool over
 /// [`AsyncPgConnection`](diesel_async::AsyncPgConnection). Each
-/// `execute_scalar` opens a `READ ONLY REPEATABLE READ` transaction, runs the
-/// user's SQL and `pg_current_wal_lsn()` under the same MVCC snapshot, and
-/// returns the [`Value<Postgres>`](crate::backend::Postgres) with the parsed
+/// `execute_scalar` reads `pg_current_wal_lsn()`, opens a `READ ONLY
+/// REPEATABLE READ` transaction for the user's SQL, and returns the
+/// [`Value<Postgres>`](crate::backend::Postgres) with the parsed
 /// [`PgLsn`](crate::PgLsn). Pure Rust: `diesel-async` speaks the PG wire
 /// protocol through `tokio-postgres`, no libpq.
 ///
@@ -307,23 +307,20 @@ impl PgAsyncDieselConnector {
             alloc::vec::Vec::new();
         let mut spent = 0_usize;
         loop {
-            while let Some(row) = held.leftover.front() {
-                let cost = crate::reexec::RowPage::<crate::backend::Postgres>::row_bytes_of(row);
-                if !rows.is_empty() && spent + cost > max_bytes {
-                    return Ok(Snapshot {
-                        value: crate::reexec::RowPage {
-                            columns: held.columns.clone(),
-                            rows,
-                            more: true,
-                        },
-                        checkpoint: held.checkpoint,
-                    });
-                }
-                spent += cost;
-                // Total: `front` just answered `Some`.
-                if let Some(row) = held.leftover.pop_front() {
-                    rows.push(row);
-                }
+            if crate::reexec::connector::drain_cursor_buffer(
+                &mut held.leftover,
+                &mut rows,
+                &mut spent,
+                max_bytes,
+            ) {
+                return Ok(Snapshot {
+                    value: crate::reexec::RowPage {
+                        columns: held.columns.clone(),
+                        rows,
+                        more: true,
+                    },
+                    checkpoint: held.checkpoint,
+                });
             }
             let page = load_page_async::<_, diesel::pg::Pg, crate::backend::Postgres>(
                 &mut held.conn,
@@ -762,11 +759,15 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
+            // Position before snapshot, per `Connector::Checkpoint`: the
+            // coordinate is the server's current one, so taken after the read
+            // it can sit ahead of the snapshot and a replay from there loses a
+            // commit.
+            let pos = read_binlog_pos_async(conn).await;
             conn.transaction::<(Value<Self::Backend>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
                 |c| {
                     async move {
                         let value = load_scalar_async::<_, Self::Backend>(c, &sql, kind).await?;
-                        let pos = read_binlog_pos_async(c).await;
                         Ok((value, pos))
                     }
                     .scope_boxed()
@@ -824,12 +825,13 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
                 .await
                 .map_err(|e| ScalarRowError::Connector(DieselAsyncError::Pool(e)))?;
             let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
+            // Position before snapshot, per `Connector::Checkpoint`.
+            let pos = read_binlog_pos_async(conn).await;
             conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
                 |c| {
                     async move {
                         let values =
                             load_scalar_row_async::<_, Self::Backend>(c, &sql, &kinds).await?;
-                        let pos = read_binlog_pos_async(c).await;
                         Ok((values, pos))
                     }
                     .scope_boxed()

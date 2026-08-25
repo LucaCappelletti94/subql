@@ -952,6 +952,7 @@ mod tests {
             changed_columns: Vec::new(),
             new_row: vec![Value::Int(1), Value::Int(42)],
             old_row: Vec::new(),
+            checkpoint: None,
         };
         assert_eq!(
             vm.eval(&program, &e, RowKind::Pk, &pg_catalog()).unwrap(),
@@ -1001,7 +1002,7 @@ mod tests {
     fn a_term_slot_evaluates_to_the_supplied_truth() {
         let mut vm: Vm<Postgres> = Vm::new();
         let program: BytecodeProgram<Postgres> =
-            BytecodeProgram::with_terms(vec![Instruction::TermTruth(0)], vec![0]);
+            BytecodeProgram::with_terms(vec![Instruction::TermTruth(0)], vec![vec![0]]);
         let e = insert_pg(vec![Value::Int(1)]);
 
         for truth in [Tri::True, Tri::False, Tri::Unknown] {
@@ -1027,7 +1028,7 @@ mod tests {
                 Instruction::TermTruth(1),
                 Instruction::Or,
             ],
-            vec![0, 1],
+            vec![vec![0], vec![1]],
         );
         let e = insert_pg(vec![Value::Int(1)]);
 
@@ -1057,7 +1058,7 @@ mod tests {
                 Instruction::TermTruth(0),
                 Instruction::And,
             ],
-            vec![1],
+            vec![vec![1]],
         );
 
         let matching = insert_pg(vec![Value::Int(25)]);
@@ -1108,7 +1109,7 @@ mod tests {
     fn a_term_slot_with_no_truth_supplied_is_an_error() {
         let mut vm: Vm<Postgres> = Vm::new();
         let program: BytecodeProgram<Postgres> =
-            BytecodeProgram::with_terms(vec![Instruction::TermTruth(1)], vec![0, 1]);
+            BytecodeProgram::with_terms(vec![Instruction::TermTruth(1)], vec![vec![0], vec![1]]);
         let e = insert_pg(vec![Value::Int(1)]);
 
         assert_eq!(

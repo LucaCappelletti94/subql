@@ -8,7 +8,9 @@
 use crate::backend::{Backend, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::parser;
-use crate::compiler::sql_shape::{extract_scalar_aggregate, ScalarAggKind};
+use crate::compiler::sql_shape::{
+    extract_grouped_extreme, extract_scalar_aggregate, ScalarAggKind,
+};
 use crate::compiler::BytecodeProgram;
 use crate::{ColumnId, RegisterError, TableId};
 use alloc::string::{String, ToString};
@@ -28,10 +30,12 @@ const REEXEC_VALUE_ALIAS: &str = "v";
 /// accepting the query, so it never appears here. A future `Total` variant
 /// (JOIN/HAVING/multi-table re-run on any relevant event) plugs in alongside
 /// `Partial` once the row-set executor exists.
-pub(super) enum QueryPlan<B: Backend> {
+pub enum QueryPlan<B: Backend> {
     /// A single-table scalar `MIN` / `MAX`, maintained incrementally
     /// with a database re-query only on extreme removal.
     Partial(MinMaxPlan<B>),
+    /// Grouped extrema maintained in memory with reads scoped to one group.
+    GroupedPartial(alloc::boxed::Box<GroupedMinMaxPlan<B>>),
     /// A query nothing in process can maintain, re-read in full whenever a
     /// table it reads changes.
     Total(TotalPlan),
@@ -41,7 +45,7 @@ pub(super) enum QueryPlan<B: Backend> {
 }
 
 /// Plan for a query served by re-reading it whole.
-pub(super) struct TotalPlan {
+pub struct TotalPlan {
     /// Tables whose changes mean the answer may have moved.
     pub tables: Vec<TableId>,
     /// Every column of every one of those tables: a computed projection can
@@ -54,7 +58,7 @@ pub(super) struct TotalPlan {
 }
 
 /// Plan for an incrementally-maintained single-table scalar `MIN`/`MAX`.
-pub(super) struct MinMaxPlan<B: Backend> {
+pub struct MinMaxPlan<B: Backend> {
     /// Table the aggregate reads from.
     pub table_id: TableId,
     /// `MIN` or `MAX`.
@@ -64,7 +68,7 @@ pub(super) struct MinMaxPlan<B: Backend> {
     /// [`ScalarKind`](crate::backend::ScalarKind) of the aggregated
     /// column. Not consumed by in-process maintenance (MIN/MAX compares
     /// `Value` variants directly), but returned to the materializer via
-    /// [`Registered::ReExec`](super::Registered::ReExec) as a decode hint.
+    /// [`Tier::Scalar`](crate::Tier::Scalar) as a decode hint.
     pub agg_kind: crate::backend::BuiltinKind,
     /// Columns whose change can alter the result: the aggregated column
     /// plus every column the WHERE clause reads (UPDATE routing
@@ -76,9 +80,38 @@ pub(super) struct MinMaxPlan<B: Backend> {
     /// SQL the Subscription Materializer runs after a
     /// [`ReExecutionTrigger`](super::ReExecutionTrigger), with its
     /// projection aliased. Returned to the materializer at registration
-    /// via [`Registered::ReExec`](super::Registered::ReExec). Subql
+    /// via [`Tier::Scalar`](crate::Tier::Scalar). Subql
     /// itself never executes it.
     pub reexec_sql: String,
+}
+
+/// Plan for grouped `MIN` or `MAX`.
+pub struct GroupedMinMaxPlan<B: Backend> {
+    pub table_id: TableId,
+    pub kind: ScalarAggKind,
+    pub agg_column: ColumnId,
+    pub agg_kind: crate::backend::BuiltinKind,
+    pub group_columns: Vec<ColumnId>,
+    pub group_idents: Vec<Ident>,
+    pub dependency_columns: Vec<ColumnId>,
+    pub where_dependency_columns: Vec<ColumnId>,
+    pub where_program: Arc<BytecodeProgram<B>>,
+    pub statement: Statement,
+    pub read_projection: Vec<SelectItem>,
+    pub bootstrap: crate::AggregateBootstrap,
+    pub having: Option<GroupedHavingCheck<B>>,
+}
+
+/// A grouped extreme's `HAVING` comparison, its threshold parsed at plan
+/// time so each event evaluates without touching SQL text.
+pub enum GroupedHavingCheck<B: Backend> {
+    /// Compare the group's current extreme against a constant.
+    Extreme {
+        op: crate::HavingOp,
+        threshold: Value<B>,
+    },
+    /// Compare the group's source-row count against a constant.
+    RowCount { op: crate::HavingOp, threshold: i64 },
 }
 
 /// Classify a rejected query into a [`QueryPlan`].
@@ -87,7 +120,7 @@ pub(super) struct MinMaxPlan<B: Backend> {
 /// Returns `Err(UnsupportedSql)` for anything else (the caller surfaces the
 /// engine's original rejection message instead of this one). This is where the
 /// future `Total` plan will be built for JOIN/HAVING/multi-table queries.
-pub(super) fn build_plan<B, DB>(
+pub fn build_plan<B, DB>(
     sql: &str,
     dialect: &B::Dialect,
     database: &DB,
@@ -98,12 +131,46 @@ where
 {
     // Cheapest first. The scalar plan is the narrowest, then a filter over one
     // table whose changed rows can be asked about individually, then a whole
-    // re-read for everything else. Each attempt's error is discarded rather
-    // than surfaced, because being outside one tier is how a query reaches the
-    // next.
-    scalar_plan::<B, DB>(sql, dialect, database)
-        .or_else(|_| keyed_plan::<B, DB>(sql, dialect, database))
-        .or_else(|_| total_plan::<B, DB>(sql, dialect, database))
+    // re-read for everything else. An intermediate tier's error only means the
+    // query belongs to the next tier, so it surfaces only when every tier
+    // refused, where each tier's own reason is the whole diagnosis.
+    grouped_scalar_plan::<B, DB>(sql, dialect, database)
+        .or_else(|grouped| {
+            scalar_plan::<B, DB>(sql, dialect, database).map_err(|scalar| (grouped, scalar))
+        })
+        .or_else(|(grouped, scalar)| {
+            keyed_plan::<B, DB>(sql, dialect, database).map_err(|keyed| (grouped, scalar, keyed))
+        })
+        .or_else(|(grouped, scalar, keyed)| {
+            total_plan::<B, DB>(sql, dialect, database).map_err(|total| {
+                RegisterError::UnsupportedSql(alloc::format!(
+                    "no read tier serves this statement: grouped extreme said \
+                     \"{grouped}\", scalar said \"{scalar}\", keyed said \"{keyed}\", \
+                     whole re-read said \"{total}\""
+                ))
+            })
+        })
+}
+
+/// Build the complete-row replacement tier directly.
+///
+/// Aggregate transitions call this instead of [`build_plan`], whose cheapest
+/// first ordering would select the in-process aggregate tier again.
+pub fn build_whole_rows_plan<B, DB>(
+    sql: &str,
+    dialect: &B::Dialect,
+    database: &DB,
+) -> Result<TotalPlan, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    match total_plan::<B, DB>(sql, dialect, database)? {
+        QueryPlan::Total(plan) => Ok(plan),
+        QueryPlan::Partial(_) | QueryPlan::GroupedPartial(_) | QueryPlan::Keyed(_) => {
+            unreachable!("total_plan returns Total")
+        }
+    }
 }
 
 /// Plan a query by re-reading it whole: find every table it reads, take every
@@ -182,6 +249,268 @@ where
     }))
 }
 
+fn grouped_scalar_plan<B, DB>(
+    sql: &str,
+    dialect: &B::Dialect,
+    database: &DB,
+) -> Result<QueryPlan<B>, RegisterError>
+where
+    B: Backend + SqlLiteralParse,
+    DB: DatabaseLike,
+{
+    let parsed = parser::parse_table_and_where_deps::<B, DB>(sql, dialect, database)?;
+    let projection =
+        extract_grouped_extreme::<B, DB>(&parsed.statement, parsed.table_id, database)?
+            .ok_or_else(|| {
+                RegisterError::UnsupportedSql(
+                    "query is not a grouped single-table MIN/MAX".to_string(),
+                )
+            })?;
+    let agg_kind =
+        crate::catalog_helpers::column_builtin_kind(database, parsed.table_id, projection.column)
+            .ok_or_else(|| {
+            RegisterError::UnsupportedSql(
+                "the grouped extreme column has no supported decode kind".to_string(),
+            )
+        })?;
+    let having = planned_having::<B>(projection.having.as_ref(), agg_kind)?;
+    let mut group_kinds = Vec::with_capacity(projection.groups.len());
+    let mut group_idents = Vec::with_capacity(projection.groups.len());
+    for column in &projection.groups {
+        let kind = crate::catalog_helpers::column_builtin_kind(database, parsed.table_id, *column)
+            .ok_or_else(|| {
+                RegisterError::UnsupportedSql(
+                    "a grouped extreme column has no supported decode kind".to_string(),
+                )
+            })?;
+        let name = crate::catalog_helpers::column_name(database, parsed.table_id, *column)
+            .ok_or_else(|| RegisterError::UnknownColumn {
+                table_id: parsed.table_id,
+                column: alloc::format!("column {column}"),
+            })?;
+        group_kinds.push(kind);
+        group_idents.push(
+            (dialect as &dyn Dialect)
+                .identifier_quote_style(&name)
+                .map_or_else(
+                    || Ident::new(name.clone()),
+                    |quote| Ident::with_quote(quote, &name),
+                ),
+        );
+    }
+    let agg_name =
+        crate::catalog_helpers::column_name(database, parsed.table_id, projection.column)
+            .ok_or_else(|| RegisterError::UnknownColumn {
+                table_id: parsed.table_id,
+                column: alloc::format!("column {}", projection.column),
+            })?;
+    let agg_ident = (dialect as &dyn Dialect)
+        .identifier_quote_style(&agg_name)
+        .map_or_else(
+            || Ident::new(agg_name.clone()),
+            |quote| Ident::with_quote(quote, &agg_name),
+        );
+    let bootstrap = render_grouped_scalar_bootstrap::<B>(
+        &parsed.statement,
+        &group_idents,
+        &group_kinds,
+        &agg_ident,
+        agg_kind,
+        projection.kind,
+        dialect,
+    )?;
+    let read_projection =
+        grouped_scalar_read_projection::<B>(projection.kind, &agg_ident, dialect)?;
+    let mut dependency_columns = parsed.where_dependency_columns.clone();
+    for column in projection
+        .groups
+        .iter()
+        .copied()
+        .chain(core::iter::once(projection.column))
+    {
+        if !dependency_columns.contains(&column) {
+            dependency_columns.push(column);
+        }
+    }
+    Ok(QueryPlan::GroupedPartial(alloc::boxed::Box::new(
+        GroupedMinMaxPlan {
+            table_id: parsed.table_id,
+            kind: projection.kind,
+            agg_column: projection.column,
+            agg_kind,
+            group_columns: projection.groups,
+            group_idents,
+            dependency_columns,
+            where_dependency_columns: parsed.where_dependency_columns,
+            read_projection,
+            where_program: Arc::new(parsed.where_program),
+            statement: parsed.statement,
+            bootstrap,
+            having,
+        },
+    )))
+}
+
+/// Parse an extreme's `HAVING` threshold: to the extreme column's kind for a
+/// value comparison, to a plain integer for a row count.
+fn planned_having<B: Backend + SqlLiteralParse>(
+    having: Option<&crate::compiler::sql_shape::ExtremeHaving>,
+    agg_kind: crate::backend::BuiltinKind,
+) -> Result<Option<GroupedHavingCheck<B>>, RegisterError> {
+    let Some(having) = having else {
+        return Ok(None);
+    };
+    Ok(Some(match having.subject {
+        crate::compiler::sql_shape::ExtremeHavingSubject::Extreme => GroupedHavingCheck::Extreme {
+            op: having.op,
+            threshold: B::parse_literal(
+                &having.literal,
+                crate::backend::ScalarKind::from_builtin(agg_kind),
+            )?,
+        },
+        crate::compiler::sql_shape::ExtremeHavingSubject::RowCount => {
+            let sqlparser::ast::Value::Number(text, _) = &having.literal else {
+                return Err(RegisterError::UnsupportedSql(
+                    "a row-count HAVING needs an integer constant".to_string(),
+                ));
+            };
+            GroupedHavingCheck::RowCount {
+                op: having.op,
+                threshold: text.parse().map_err(|_| {
+                    RegisterError::UnsupportedSql(
+                        "a row-count HAVING needs an integer constant".to_string(),
+                    )
+                })?,
+            }
+        }
+    }))
+}
+
+fn render_grouped_scalar_bootstrap<B: Backend>(
+    statement: &Statement,
+    group_idents: &[Ident],
+    group_kinds: &[crate::backend::BuiltinKind],
+    agg_ident: &Ident,
+    agg_kind: crate::backend::BuiltinKind,
+    kind: ScalarAggKind,
+    dialect: &B::Dialect,
+) -> Result<crate::AggregateBootstrap, RegisterError> {
+    use core::fmt::Write as _;
+    let function = match kind {
+        ScalarAggKind::Min => "MIN",
+        ScalarAggKind::Max => "MAX",
+    };
+    let mut selected = group_idents
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !selected.is_empty() {
+        selected.push_str(", ");
+    }
+    let _ = write!(selected, "{function}({agg_ident}) AS c0, COUNT(*) AS c1");
+    let template = crate::compiler::sql_shape::parse_single_statement(
+        &alloc::format!("SELECT {selected}"),
+        dialect,
+    )?;
+    let Statement::Query(template_query) = template else {
+        unreachable!("the projection template is a SELECT")
+    };
+    let SetExpr::Select(template_select) = *template_query.body else {
+        unreachable!("the projection template is a plain SELECT")
+    };
+    let mut statement = statement.clone();
+    let select = crate::compiler::sql_shape::select_mut(&mut statement).ok_or_else(|| {
+        RegisterError::UnsupportedSql("a grouped extreme seed needs a plain SELECT".to_string())
+    })?;
+    select.projection = template_select.projection;
+    // The seed fetches every group. A hidden group's numbers are needed the
+    // moment it crosses into the result.
+    select.having = None;
+    let mut kinds = group_kinds.to_vec();
+    kinds.extend([agg_kind, crate::backend::ScalarKind::Int]);
+    Ok(crate::AggregateBootstrap {
+        sql: statement.to_string(),
+        kinds,
+        group_columns: group_idents.len(),
+    })
+}
+
+fn grouped_scalar_read_projection<B: Backend>(
+    kind: ScalarAggKind,
+    agg_ident: &Ident,
+    dialect: &B::Dialect,
+) -> Result<Vec<SelectItem>, RegisterError> {
+    let function = match kind {
+        ScalarAggKind::Min => "MIN",
+        ScalarAggKind::Max => "MAX",
+    };
+    let template = crate::compiler::sql_shape::parse_single_statement(
+        &alloc::format!("SELECT {function}({agg_ident}) AS {REEXEC_VALUE_ALIAS}, COUNT(*) AS c1"),
+        dialect,
+    )?;
+    let Statement::Query(query) = template else {
+        unreachable!("the projection template is a SELECT")
+    };
+    let SetExpr::Select(select) = *query.body else {
+        unreachable!("the projection template is a plain SELECT")
+    };
+    Ok(select.projection)
+}
+
+/// Render the extreme and source-row count for one group.
+pub fn render_grouped_scalar_read<B: Backend + SqlLiteralParse>(
+    plan: &GroupedMinMaxPlan<B>,
+    group_values: &[Value<B>],
+) -> Result<String, RegisterError> {
+    use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr};
+
+    if group_values.len() != plan.group_idents.len() {
+        return Err(RegisterError::UnsupportedSql(
+            "a grouped read received the wrong number of group values".to_string(),
+        ));
+    }
+    let mut scoped = None;
+    for (ident, value) in plan.group_idents.iter().zip(group_values) {
+        let predicate = if value.is_null() {
+            Expr::IsNull(alloc::boxed::Box::new(Expr::Identifier(ident.clone())))
+        } else {
+            Expr::BinaryOp {
+                left: alloc::boxed::Box::new(Expr::Identifier(ident.clone())),
+                op: BinaryOperator::Eq,
+                right: alloc::boxed::Box::new(B::render_group_literal(value)?),
+            }
+        };
+        scoped = Some(match scoped {
+            Some(left) => Expr::BinaryOp {
+                left: alloc::boxed::Box::new(left),
+                op: BinaryOperator::And,
+                right: alloc::boxed::Box::new(predicate),
+            },
+            None => predicate,
+        });
+    }
+    let mut statement = plan.statement.clone();
+    let Some(select) = crate::compiler::sql_shape::select_mut(&mut statement) else {
+        unreachable!("a grouped extreme plan holds a plain SELECT")
+    };
+    select.projection.clone_from(&plan.read_projection);
+    select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
+    // The scoped read replaces a group's whole state, hidden groups
+    // included, so the original condition must not filter it.
+    select.having = None;
+    let scoped = scoped.expect("a grouped plan has at least one group column");
+    select.selection = Some(match select.selection.take() {
+        Some(existing) => Expr::BinaryOp {
+            left: alloc::boxed::Box::new(Expr::Nested(alloc::boxed::Box::new(existing))),
+            op: BinaryOperator::And,
+            right: alloc::boxed::Box::new(scoped),
+        },
+        None => scoped,
+    });
+    Ok(statement.to_string())
+}
+
 fn scalar_plan<B, DB>(
     sql: &str,
     dialect: &B::Dialect,
@@ -192,6 +521,17 @@ where
     DB: DatabaseLike,
 {
     let parsed = parser::parse_table_and_where_deps::<B, DB>(sql, dialect, database)?;
+    // The shared parse admits `HAVING` because the grouped plan serves it.
+    // A scalar read takes one value and cannot honour the clause, so a
+    // statement carrying one falls through to the whole re-read, which
+    // re-runs it verbatim.
+    if crate::compiler::sql_shape::select_of(&parsed.statement)
+        .is_some_and(|select| select.having.is_some())
+    {
+        return Err(RegisterError::UnsupportedSql(
+            "a scalar extreme cannot honour HAVING".to_string(),
+        ));
+    }
 
     let Some((kind, agg_column)) =
         extract_scalar_aggregate(&parsed.statement, parsed.table_id, database)?
@@ -237,12 +577,7 @@ where
 /// [`extract_scalar_aggregate`] already validated.
 fn render_aliased_scalar(stmt: &Statement) -> Option<String> {
     let mut stmt = stmt.clone();
-    let Statement::Query(query) = &mut stmt else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_mut() else {
-        return None;
-    };
+    let select = crate::compiler::sql_shape::select_mut(&mut stmt)?;
     let [item] = select.projection.as_mut_slice() else {
         return None;
     };
@@ -271,7 +606,7 @@ fn render_aliased_scalar(stmt: &Statement) -> Option<String> {
 /// itself is whatever the caller wrote, evaluated by the database, which is why
 /// this serves filters the in-process language cannot compile.
 #[derive(Clone)]
-pub(super) struct KeyedPlan {
+pub struct KeyedPlan {
     /// Table the query reads.
     pub table: TableId,
     /// Where each key column lands in the projection, so the resolver reads a
@@ -321,7 +656,8 @@ where
         crate::compiler::sql_shape::parse_single_statement(sql, dialect as &dyn Dialect)?;
     // Succeeds only for a clause-free single-table SELECT, which is exactly the
     // shape whose rows can be asked about individually.
-    let (table_name, _) = crate::compiler::sql_shape::extract_single_table_and_where(&statement)?;
+    let (table_name, _) =
+        crate::compiler::sql_shape::extract_ungrouped_table_and_where(&statement)?;
     let name = crate::compiler::parser::SqlTableName::from_object_name(&table_name)?;
     let table = crate::table_resolution::resolve_table_reference(
         name.qualified.as_deref(),
@@ -409,12 +745,13 @@ const fn key_kind_has_literal_spelling(kind: Option<crate::backend::BuiltinKind>
     match kind {
         Some(ScalarKind::Int | ScalarKind::String | ScalarKind::Bytes) => true,
         // Float is refused despite being spellable, because it cannot identify
-        // a row: a float column may hold NaN, `NaN = NaN` is false in SQL, so a
-        // scoped read can never match such a row and would report it as having
-        // left the answer while it is still in it. Infinity has no literal
-        // spelling at all. Bool has no uniform spelling across backends, and
-        // the rest render through typed constructors rather than literals. An
-        // unknown column type is not a licence to guess, so `None` joins them.
+        // a row: Infinity and negative infinity have no literal spelling, and
+        // `{f:?}` renders them as bare tokens no backend parses as numerics,
+        // so a scoped read on such a key would be broken SQL. (NaN equality is
+        // no argument: Postgres documents `'NaN'::float8 = 'NaN'::float8` as
+        // TRUE.) Bool has no uniform spelling across backends, and the rest
+        // render through typed constructors rather than literals. An unknown
+        // column type is not a licence to guess, so `None` joins them.
         Some(
             ScalarKind::Float
             | ScalarKind::Bool
@@ -463,12 +800,7 @@ fn key_projection_positions<DB: DatabaseLike>(
     key_columns: &[ColumnId],
     database: &DB,
 ) -> Option<Vec<usize>> {
-    let Statement::Query(query) = statement else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
+    let select = crate::compiler::sql_shape::select_of(statement)?;
     // A wildcard returns the table's columns in the table's own order, so a key
     // column's ordinal is its position.
     if select
@@ -519,7 +851,7 @@ fn key_projection_positions<DB: DatabaseLike>(
 /// in.
 ///
 /// Returns `None` when `keys` is empty: there is nothing to ask about.
-pub(super) fn render_scoped_read<B: Backend>(
+pub fn render_scoped_read<B: Backend>(
     plan: &KeyedPlan,
     keys: &[Vec<Value<B>>],
 ) -> Result<Option<String>, RegisterError> {

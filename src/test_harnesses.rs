@@ -34,13 +34,14 @@ use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
 use crate::persistence::codec;
 use crate::persistence::shard::{deserialize_shard, ShardPayload};
-use crate::reexec::{ReExecEngine, Registered};
+use crate::runtime::aggregate::AggAccumulator;
 use crate::testing::TestEvent;
 use crate::wal::{parse_maxwell, parse_wal2json_v1, parse_wal2json_v2};
 use crate::{
-    catalog_helpers, AggAccumulator, AggDelta, AggSpec, AggValue, DefaultIds, RegisterError,
-    SubscriptionEngine, SubscriptionRequest,
+    catalog_helpers, AggSpec, AggValue, DefaultIds, RegisterError, SubscriptionEngine,
+    SubscriptionRequest,
 };
+use crate::{Registered, Tier};
 use pg_walstream::{Lsn, PgOutputDecoder};
 
 /// Build a permissive fuzz schema as a [`ParserDB`].
@@ -484,10 +485,9 @@ pub fn harness_wal_json_postparse(data: &[u8]) {
 // ---------------------------------------------------------------------------
 
 /// Mutation operation against the virtual `orders` table used by
-/// [`harness_aggregate_consistency`]. `Truncate` is intentionally absent:
-/// subql's `aggregate_deltas` semantics on Truncate would require the
-/// engine to know per-consumer running state to negate, which is not
-/// part of the documented API.
+/// [`harness_aggregate_consistency`]. `Truncate` is absent because the engine
+/// answers it from the held totals rather than from row images, which the unit
+/// tests in `tests/aggregate_totals.rs` cover directly.
 ///
 /// `amount` is bounded to `i16` (not `i32`) so that squared values stay
 /// well inside f64's exact-integer range (2^53). Streaming variance over
@@ -571,6 +571,9 @@ struct AggEngineCell {
     engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
     table_id: crate::TableId,
     pk_col: crate::ColumnId,
+    /// Every registered aggregate in consumer order, with the id the engine
+    /// files its running total under and the function that total maintains.
+    totals: Vec<(u64, crate::SubscriptionId, AggSpec)>,
 }
 
 impl AggEngineCell {
@@ -582,42 +585,37 @@ impl AggEngineCell {
             .expect("agg_catalog `orders` must expose an `id` column");
         let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(database, PostgreSqlDialect {});
-        engine
-            .register(SubscriptionRequest::<DefaultIds>::new(
-                1,
-                "SELECT COUNT(*) FROM orders",
-            ))
-            .expect("registering COUNT(*) consumer should succeed against agg_catalog");
-        engine
-            .register(SubscriptionRequest::<DefaultIds>::new(
-                2,
-                "SELECT SUM(amount) FROM orders",
-            ))
-            .expect("registering SUM(amount) consumer should succeed against agg_catalog");
-        // Register one consumer per VAR/STDDEV flavor. All four share the
-        // same kernel and should receive byte-identical `AggDelta::Stats`
-        // deltas, so registering all four catches per-variant routing or
-        // hash-collision bugs as well as kernel correctness.
+        // One consumer per flavor. The four VAR/STDDEV flavors share one
+        // kernel and hold identical running numbers, so registering all four
+        // catches per-variant routing and hash-collision bugs as well as
+        // kernel correctness.
+        let mut totals = Vec::new();
         for (cid, sql) in [
+            (1_u64, "SELECT COUNT(*) FROM orders"),
+            (2_u64, "SELECT SUM(amount) FROM orders"),
             (3_u64, "SELECT VAR_POP(amount) FROM orders"),
             (4_u64, "SELECT VAR_SAMP(amount) FROM orders"),
             (5_u64, "SELECT STDDEV_POP(amount) FROM orders"),
             (6_u64, "SELECT STDDEV_SAMP(amount) FROM orders"),
+            (7_u64, "SELECT AVG(amount) FROM orders"),
         ] {
-            engine
+            let registered = engine
                 .register(SubscriptionRequest::<DefaultIds>::new(cid, sql))
-                .expect("registering VAR/STDDEV consumer should succeed against agg_catalog");
+                .expect("registering an aggregate consumer should succeed against agg_catalog");
+            let Tier::InProcess(served) = &registered.tier else {
+                panic!("an aggregate the engine maintains registers in process")
+            };
+            let spec = served
+                .aggregate_spec()
+                .expect("an aggregate registration carries its spec")
+                .clone();
+            totals.push((cid, registered.subscription_id, spec));
         }
-        engine
-            .register(SubscriptionRequest::<DefaultIds>::new(
-                7,
-                "SELECT AVG(amount) FROM orders",
-            ))
-            .expect("registering AVG(amount) consumer should succeed against agg_catalog");
         Self {
             engine,
             table_id,
             pk_col,
+            totals,
         }
     }
 }
@@ -658,8 +656,8 @@ fn rls_agg_catalog() -> ParserDB {
 /// invariant check adds no per-call engine allocation (same reasoning as
 /// [`AggEngineCell`]).
 struct RlsGuardCell {
-    rls_engine: ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
-    plain_engine: ReExecEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
+    rls_engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
+    plain_engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
     rls_table_id: crate::TableId,
 }
 
@@ -668,9 +666,8 @@ impl RlsGuardCell {
         let rls_db = rls_agg_catalog();
         let rls_table_id = catalog_helpers::table_id(&rls_db, "orders")
             .expect("rls_agg_catalog must expose an `orders` table");
-        let rls_engine = ReExecEngine::new(SubscriptionEngine::new(rls_db, PostgreSqlDialect {}));
-        let plain_engine =
-            ReExecEngine::new(SubscriptionEngine::new(agg_catalog(), PostgreSqlDialect {}));
+        let rls_engine = SubscriptionEngine::new(rls_db, PostgreSqlDialect {});
+        let plain_engine = SubscriptionEngine::new(agg_catalog(), PostgreSqlDialect {});
         Self {
             rls_engine,
             plain_engine,
@@ -679,7 +676,7 @@ impl RlsGuardCell {
     }
 
     /// Assert the RLS guard: every aggregate flavor is rejected on the
-    /// RLS table with `AggregatorOnRlsTable` (never `Registered::Engine`),
+    /// RLS table with `AggregatorOnRlsTable` (never an in-process tier),
     /// while `plain_flavor` is accepted on the non-RLS table. RLS
     /// registration errors before mutating engine state, so looping all
     /// flavors adds no state growth. The non-RLS acceptance is
@@ -706,11 +703,16 @@ impl RlsGuardCell {
                 consumer,
                 plain_flavor,
             )) {
-            Ok(Registered::Engine(_)) => {
+            Ok(Registered {
+                tier: Tier::InProcess(_),
+                ..
+            }) => {
                 let _ = self.plain_engine.unregister_query(consumer, plain_flavor);
             }
-            Ok(Registered::ReExec { query_id, .. } | Registered::Captured { query_id, .. }) => {
-                assert!(self.plain_engine.unregister_reexec_query(query_id));
+            Ok(Registered {
+                subscription_id, ..
+            }) => {
+                assert!(self.plain_engine.unregister_reread(subscription_id));
             }
             Err(e) => panic!("`{plain_flavor}` without RLS must be accepted, got Err({e:?})"),
         }
@@ -798,58 +800,79 @@ fn oracle_agg_value(spec: &AggSpec, c: &AggComponents) -> AggValue {
     }
 }
 
+/// Whether a value the engine folded event by event agrees with one
+/// recomputed from scratch.
+///
+/// Tolerance scales with the components in play. A variance is a difference of
+/// two large numbers, so where they nearly cancel the value keeps far fewer
+/// significant digits than its inputs, and a standard deviation takes a square
+/// root of that. Still orders of magnitude tighter than any dropped or
+/// misrouted delta, which moves these values by whole units, because the
+/// amounts driving them are `i16`.
+#[allow(clippy::cast_precision_loss)]
+fn agg_values_agree(engine: AggValue, oracle: AggValue, c: &AggComponents) -> bool {
+    match (engine, oracle) {
+        (AggValue::Count(a), AggValue::Count(b)) => a == b,
+        (AggValue::Sum(a), AggValue::Sum(b)) => {
+            (a - b).abs() <= 1e-9_f64.max(c.sum_f64().abs() * 1e-12)
+        }
+        (AggValue::Real(None), AggValue::Real(None)) => true,
+        (AggValue::Real(Some(a)), AggValue::Real(Some(b))) => {
+            (a - b).abs() <= 1e-3_f64.max(c.sum_sq_f64().abs().sqrt() * 1e-5)
+        }
+        _ => false,
+    }
+}
+
+/// The bootstrap component row for `spec` over `c`, in the column order
+/// [`crate::AggregateBootstrap`] projects.
+fn seed_row(spec: &AggSpec, c: &AggComponents) -> Vec<Value<Postgres>> {
+    match spec {
+        AggSpec::CountStar => alloc::vec![Value::Int(c.count_star)],
+        AggSpec::CountColumn { .. } => alloc::vec![Value::Int(c.count_col)],
+        AggSpec::Sum { .. } => alloc::vec![c.sum_cell()],
+        AggSpec::Avg { .. } => alloc::vec![c.sum_cell(), Value::Int(c.numeric)],
+        AggSpec::VarPop { .. }
+        | AggSpec::VarSamp { .. }
+        | AggSpec::StddevPop { .. }
+        | AggSpec::StddevSamp { .. } => {
+            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)]
+        }
+    }
+}
+
 /// Seeding from the bootstrap component row must equal a direct recompute
 /// for every `AggSpec`. Exact: seed and oracle share f64 inputs and math.
 fn assert_seed_matches_oracle(c: &AggComponents) {
-    let cases: [(AggSpec, Vec<Value<Postgres>>); 8] = [
-        (AggSpec::CountStar, alloc::vec![Value::Int(c.count_star)]),
-        (
-            AggSpec::CountColumn { column: 1 },
-            alloc::vec![Value::Int(c.count_col)],
-        ),
-        (AggSpec::Sum { column: 1 }, alloc::vec![c.sum_cell()]),
-        (
-            AggSpec::Avg { column: 1 },
-            alloc::vec![c.sum_cell(), Value::Int(c.numeric)],
-        ),
-        (
-            AggSpec::VarPop { column: 1 },
-            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)],
-        ),
-        (
-            AggSpec::VarSamp { column: 1 },
-            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)],
-        ),
-        (
-            AggSpec::StddevPop { column: 1 },
-            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)],
-        ),
-        (
-            AggSpec::StddevSamp { column: 1 },
-            alloc::vec![c.sum_cell(), c.sum_sq_cell(), Value::Int(c.numeric)],
-        ),
+    let specs = [
+        AggSpec::CountStar,
+        AggSpec::CountColumn { column: 1 },
+        AggSpec::Sum { column: 1 },
+        AggSpec::Avg { column: 1 },
+        AggSpec::VarPop { column: 1 },
+        AggSpec::VarSamp { column: 1 },
+        AggSpec::StddevPop { column: 1 },
+        AggSpec::StddevSamp { column: 1 },
     ];
-    for (spec, row) in cases {
+    for spec in specs {
         assert_eq!(
-            AggAccumulator::seed_from_row(&spec, &row).value(),
+            AggAccumulator::seed_from_row(&spec, &seed_row(&spec, c)).value(),
             oracle_agg_value(&spec, c),
             "seed decode drift for {spec:?}",
         );
     }
 }
 
-/// Drive an arbitrary sequence of insert/update/delete operations against
-/// a fixed agg-only consumer set and assert that the engine's incremental
-/// `aggregate_deltas` output matches a from-scratch oracle.
+/// Drive an arbitrary sequence of insert/update/delete operations against a
+/// fixed agg-only consumer set and assert that the value the engine holds for
+/// every subscription equals a from-scratch oracle after every event.
 ///
-/// Catches drift in:
-/// - `COUNT(*)` (`AggDelta::Count`). Should equal current virtual-table size.
-/// - `SUM(amount)` (`AggDelta::Sum`). Should equal sum of non-NULL amounts.
-/// - `AVG(amount)` (`AggDelta::Avg`). Running `(sum, count)` tuple should
-///   equal the oracle tuple recomputed from the virtual table.
-/// - `VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP(amount)` (`AggDelta::Stats`).
-///   Each of the four consumers' running `(sum, sum_sq, count)` tuple
-///   should equal the oracle tuple recomputed from the virtual table.
+/// Two properties. The held value equals the oracle after each event, and a
+/// value that moved was reported. The second is the one a silent engine
+/// breaks, and it holds because a value cannot move without a non-zero delta.
+///
+/// Covers `COUNT(*)`, `SUM`, `AVG`, and all four of
+/// `VAR_POP`/`VAR_SAMP`/`STDDEV_POP`/`STDDEV_SAMP`, one consumer each.
 ///
 /// Contract: panics are bugs. Assertion failures are bugs.
 #[allow(clippy::too_many_lines)]
@@ -857,7 +880,7 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
     // RLS guard invariant, independent of the ops stream below so it does
     // not perturb the aggregate-consistency coverage: registering any
     // aggregate flavor against an RLS-marked table is rejected with
-    // AggregatorOnRlsTable (never Registered::Engine), while the flavor
+    // AggregatorOnRlsTable (never an in-process tier), while the flavor
     // chosen from the raw input is accepted on the non-RLS table.
     RLS_GUARD.with(|cell| {
         let idx = usize::from(data.first().copied().unwrap_or(0)) % RLS_GUARD_FLAVORS.len();
@@ -882,8 +905,14 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
 
     AGG_ENGINE.with(|cell| {
         let mut cell = cell.borrow_mut();
-        let table_id = cell.table_id;
-        let pk_col = cell.pk_col;
+        let AggEngineCell {
+            engine,
+            table_id,
+            pk_col,
+            totals,
+        } = &mut *cell;
+        let table_id = *table_id;
+        let pk_col = *pk_col;
 
         // Virtual table (id -> row), the source of truth for the oracle.
         // Pre-populate an arbitrary S0 so the accumulators start from a
@@ -899,16 +928,43 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
         // bootstrap component row must equal a direct recompute.
         assert_seed_matches_oracle(&s0);
 
-        // Engine-side running state, seeded from S0 so the delta stream is
-        // folded onto a non-empty bootstrap, then folded per event.
-        let mut engine_count: i64 = s0.count_star;
-        let mut engine_sum: f64 = s0.sum_f64();
-        // AVG(amount): running (sum, count) tuple for consumer cid=7.
-        let mut engine_avg: (f64, i64) = (s0.sum_f64(), s0.numeric);
-        // Four running `(sum, sum_sq, count)` tuples, indexed by consumer
-        // id - 3 (so cid 3..=6 maps to slots 0..=3).
-        let mut engine_stats: [(f64, f64, i64); 4] =
-            [(s0.sum_f64(), s0.sum_sq_f64(), s0.numeric); 4];
+        // The engine holds the running values now, so each iteration resets
+        // every total and seeds it from S0. The cell is reused across
+        // iterations, so without the reset the second iteration would be
+        // refused as already seeded.
+        for (consumer, subscription, spec) in totals.iter() {
+            assert!(
+                engine.reset_aggregate_value(*subscription),
+                "subscription {subscription} should be a live aggregate",
+            );
+            let seeded = crate::Install::install(
+                engine,
+                *subscription,
+                crate::AggregateSeedInstall {
+                    rows: vec![seed_row(spec, &s0)],
+                    read_at: None,
+                },
+            )
+            .expect("a seed with nothing folded against it lands");
+            assert_eq!(seeded.len(), 1, "one ungrouped opening value");
+            assert_eq!(seeded[0].subscription, *subscription);
+            assert_eq!(seeded[0].consumer, *consumer);
+            assert_eq!(seeded[0].group, None);
+            assert_eq!(
+                seeded[0].change,
+                crate::AggregateValueChange::Set(crate::AggregateResultValue::Folded(
+                    oracle_agg_value(spec, &s0),
+                )),
+                "seed value drift for {spec:?}",
+            );
+        }
+
+        // The value each subscription held before the event about to be
+        // dispatched, so "a value that moved was reported" can be checked.
+        let mut previous: Vec<AggValue> = totals
+            .iter()
+            .map(|(_, _, spec)| oracle_agg_value(spec, &s0))
+            .collect();
 
         for op in ops {
             let (event, mutated): (Option<TestEvent<Postgres>>, bool) = match op {
@@ -955,118 +1011,45 @@ pub fn harness_aggregate_consistency(data: &[u8]) {
             }
             let Some(event) = event else { continue };
 
-            let deltas = match cell.engine.aggregate_deltas(&event) {
-                Ok(d) => d,
+            let updates = match engine.aggregate_updates(&event) {
+                Ok(u) => u,
                 Err(_) => return,
             };
-            for (cid, delta) in deltas {
-                match (cid, delta) {
-                    (1, AggDelta::Count(d)) => engine_count += d,
-                    (2, AggDelta::Sum(d)) => engine_sum += d,
-                    (
-                        cid @ 3..=6,
-                        AggDelta::Stats {
-                            sum_delta,
-                            sum_sq_delta,
-                            count_delta,
-                        },
-                    ) => {
-                        // cid is bounded to 3..=6 by the match guard, so the
-                        // subtraction and downcast cannot truncate.
-                        #[allow(clippy::cast_possible_truncation)]
-                        let idx = (cid - 3) as usize;
-                        let slot = &mut engine_stats[idx];
-                        slot.0 += sum_delta;
-                        slot.1 += sum_sq_delta;
-                        slot.2 += count_delta;
-                    }
-                    (
-                        7,
-                        AggDelta::Avg {
-                            sum_delta,
-                            count_delta,
-                        },
-                    ) => {
-                        engine_avg.0 += sum_delta;
-                        engine_avg.1 += count_delta;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Oracle: COUNT(*) is virtual-table size, SUM(amount) sums
-            // non-NULL amounts, VAR/STDDEV consumers share a single
-            // (sum, sum_sq, count) ground truth.
-            let oracle_count = i64::try_from(virt.len()).unwrap_or(i64::MAX);
-            // Amounts originate from `AggOp::Insert/Update.amount: i16`, so
-            // `v: i64` always fits exactly in f64.
-            #[allow(clippy::cast_precision_loss)]
-            let oracle_sum: f64 = virt
-                .values()
-                .filter_map(|r| r.amount)
-                .map(|v| v as f64)
-                .sum();
-            let oracle_stats_sum: f64 = oracle_sum;
-            // Amounts originate from `AggOp::Insert/Update.amount: i16`, so
-            // `v: i64` always fits exactly in f64. The precision-loss lint
-            // is theoretically true for arbitrary i64 but not for our range.
-            #[allow(clippy::cast_precision_loss)]
-            let oracle_stats_sum_sq: f64 = virt
-                .values()
-                .filter_map(|r| r.amount)
-                .map(|v| {
-                    let f = v as f64;
-                    f * f
+            let reported: BTreeMap<crate::SubscriptionId, AggValue> = updates
+                .iter()
+                .map(|u| {
+                    let crate::AggregateValueChange::Set(crate::AggregateResultValue::Folded(
+                        value,
+                    )) = &u.change
+                    else {
+                        panic!("ungrouped aggregate cannot remove a group")
+                    };
+                    (u.subscription, *value)
                 })
-                .sum();
-            let oracle_stats_count: i64 =
-                i64::try_from(virt.values().filter(|r| r.amount.is_some()).count())
-                    .unwrap_or(i64::MAX);
+                .collect();
 
-            assert_eq!(
-                engine_count, oracle_count,
-                "COUNT(*) drift: engine={engine_count} oracle={oracle_count}"
-            );
-            let tolerance = 1e-9_f64.max(oracle_sum.abs() * 1e-12);
-            assert!(
-                (engine_sum - oracle_sum).abs() <= tolerance,
-                "SUM(amount) drift: engine={engine_sum} oracle={oracle_sum}"
-            );
-
-            // AVG(amount): oracle reuses oracle_sum (sum of non-NULL amounts)
-            // and oracle_stats_count (count of non-NULL amounts).
-            assert_eq!(
-                engine_avg.1, oracle_stats_count,
-                "AVG(amount) count drift: engine={} oracle={oracle_stats_count}",
-                engine_avg.1,
-            );
-            assert!(
-                (engine_avg.0 - oracle_sum).abs() <= tolerance,
-                "AVG(amount) sum drift: engine={} oracle={oracle_sum}",
-                engine_avg.0,
-            );
-
-            // VAR/STDDEV: all four consumers share the same kernel, so
-            // each running tuple must match the oracle independently.
-            // Float tolerance scales with magnitude: sum_sq grows as
-            // amount^2 * count, so the same relative tolerance suffices.
-            let tol_sum_sq = 1e-6_f64.max(oracle_stats_sum_sq.abs() * 1e-10);
-            for (slot_idx, slot) in engine_stats.iter().enumerate() {
-                let cid = slot_idx as u64 + 3;
-                let (s, sq, n) = *slot;
-                assert_eq!(
-                    n, oracle_stats_count,
-                    "consumer {cid} stats count drift: engine={n} oracle={oracle_stats_count}",
-                );
+            let now = agg_components(&virt);
+            for (slot, (cid, subscription, spec)) in totals.iter().enumerate() {
+                let oracle = oracle_agg_value(spec, &now);
+                let held = engine
+                    .current_aggregate_value(*subscription)
+                    .expect("a seeded aggregate holds a value");
                 assert!(
-                    (s - oracle_stats_sum).abs() <= tolerance,
-                    "consumer {cid} stats sum drift: engine={s} oracle={oracle_stats_sum}",
+                    agg_values_agree(held, oracle, &now),
+                    "consumer {cid} value drift: engine={held:?} oracle={oracle:?}",
                 );
-                assert!(
-                    (sq - oracle_stats_sum_sq).abs() <= tol_sum_sq,
-                    "consumer {cid} stats sum_sq drift: \
-                     engine={sq} oracle={oracle_stats_sum_sq}",
-                );
+                match reported.get(subscription) {
+                    Some(&value) => assert_eq!(
+                        value, held,
+                        "consumer {cid} reported a value it does not hold",
+                    ),
+                    None => assert!(
+                        previous[slot] == oracle,
+                        "consumer {cid} moved from {:?} to {oracle:?} without reporting",
+                        previous[slot],
+                    ),
+                }
+                previous[slot] = oracle;
             }
         }
     });
@@ -1252,7 +1235,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
     let mut engine_a: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         match SubscriptionEngine::with_storage(agg_catalog(), PostgreSqlDialect {}, workdir.clone())
         {
-            Ok(e) => e,
+            Ok((e, _reads)) => e,
             Err(_) => return,
         };
 
@@ -1276,7 +1259,7 @@ pub fn harness_snapshot_restore_roundtrip(data: &[u8]) {
 
     let mut engine_b: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
         match SubscriptionEngine::with_storage(database, PostgreSqlDialect {}, workdir) {
-            Ok(e) => e,
+            Ok((e, _reads)) => e,
             Err(_) => return,
         };
 
