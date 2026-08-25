@@ -104,7 +104,10 @@ fn row_counts_follow_the_result() {
     let none: Vec<DynamicRow<SQLite>> = diesel::sql_query("SELECT id FROM readings WHERE id > 100")
         .load(&mut conn)
         .expect("load no rows");
-    assert!(none.is_empty());
+    assert_eq!(
+        none,
+        [] as [subql::diesel_decode::DynamicRow<subql::backend::SQLite>; 0]
+    );
 }
 
 /// The paged read: a budget stops the page, `more` says the result went on,

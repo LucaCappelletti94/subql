@@ -134,22 +134,25 @@ where
     // re-read for everything else. An intermediate tier's error only means the
     // query belongs to the next tier, so it surfaces only when every tier
     // refused, where each tier's own reason is the whole diagnosis.
-    grouped_scalar_plan::<B, DB>(sql, dialect, database)
-        .or_else(|grouped| {
-            scalar_plan::<B, DB>(sql, dialect, database).map_err(|scalar| (grouped, scalar))
-        })
-        .or_else(|(grouped, scalar)| {
-            keyed_plan::<B, DB>(sql, dialect, database).map_err(|keyed| (grouped, scalar, keyed))
-        })
-        .or_else(|(grouped, scalar, keyed)| {
-            total_plan::<B, DB>(sql, dialect, database).map_err(|total| {
-                RegisterError::UnsupportedSql(alloc::format!(
-                    "no read tier serves this statement: grouped extreme said \
-                     \"{grouped}\", scalar said \"{scalar}\", keyed said \"{keyed}\", \
-                     whole re-read said \"{total}\""
-                ))
-            })
-        })
+    let grouped = match grouped_scalar_plan::<B, DB>(sql, dialect, database) {
+        Ok(plan) => return Ok(plan),
+        Err(error) => error,
+    };
+    let scalar = match scalar_plan::<B, DB>(sql, dialect, database) {
+        Ok(plan) => return Ok(plan),
+        Err(error) => error,
+    };
+    let keyed = match keyed_plan::<B, DB>(sql, dialect, database) {
+        Ok(plan) => return Ok(plan),
+        Err(error) => error,
+    };
+    total_plan::<B, DB>(sql, dialect, database).map_err(|total| {
+        RegisterError::UnsupportedSql(alloc::format!(
+            "no read tier serves this statement: grouped extreme said \
+             \"{grouped}\", scalar said \"{scalar}\", keyed said \"{keyed}\", \
+             whole re-read said \"{total}\""
+        ))
+    })
 }
 
 /// Build the complete-row replacement tier directly.

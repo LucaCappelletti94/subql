@@ -313,7 +313,7 @@ fn a_readable_group_recovers_a_missing_old_extreme_with_one_group_read() {
         .with_changed_columns([2u16])
         .with_checkpoint(PgLsn(10));
     let output = engine.dispatch(&event).expect("sparse update dispatches");
-    assert!(output.transitions().is_empty());
+    assert_eq!(output.transitions(), []);
     assert_eq!(output.triggers().len(), 1);
     let ReExecutionRead::GroupedScalar { group, .. } = &output.triggers()[0].read else {
         panic!("expected grouped scalar read")

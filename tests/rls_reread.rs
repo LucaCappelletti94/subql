@@ -158,7 +158,7 @@ fn per_consumer_read_scope_survives_persistence() {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
     let (mut registry, first) =
         Registry::with_storage(catalog, PostgreSqlDialect {}, path.clone()).expect("open store");
-    assert!(first.restored.is_empty());
+    assert_eq!(first.restored, [] as [subql::RestoredRead; 0]);
     let registered = registry
         .register(SubscriptionRequest::new(1u64, KEYED_SQL).database_reads_per_consumer())
         .expect("per-consumer read registers");

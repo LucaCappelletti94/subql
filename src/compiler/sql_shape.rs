@@ -1281,7 +1281,7 @@ pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
         let name = catalog_helpers::column_name(database, table_id, *column)?;
         let quoted = (dialect)
             .identifier_quote_style(&name)
-            .map_or(name.clone(), |q| format!("{q}{name}{q}"));
+            .map_or_else(|| name.clone(), |q| format!("{q}{name}{q}"));
         selected.push_str(&quoted);
         selected.push_str(", ");
         group_kinds.push(catalog_helpers::column_builtin_kind(

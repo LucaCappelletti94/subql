@@ -145,10 +145,9 @@ proptest! {
                     .expect("every live or removed group has a known key");
                 let (minimum, count) = reference
                     .get(name)
-                    .map(|values| {
+                    .map_or((0, 0), |values| {
                         (*values.iter().min().expect("non-empty group"), values.len())
-                    })
-                    .map_or((0, 0), |(minimum, count)| (minimum, count));
+                    });
                 let installed = Install::install(
                     &mut engine,
                     subscription,
@@ -274,10 +273,9 @@ proptest! {
                     .expect("every read names one of the two groups");
                 let (minimum, count) = reference
                     .get(name)
-                    .map(|values| {
+                    .map_or((0, 0), |values| {
                         (*values.iter().min().expect("non-empty group"), values.len())
-                    })
-                    .map_or((0, 0), |(minimum, count)| (minimum, count));
+                    });
                 let installed = Install::install(
                     &mut engine,
                     subscription,

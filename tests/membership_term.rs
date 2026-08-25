@@ -998,13 +998,15 @@ fn describe_terms_registers_nothing() {
 #[test]
 fn describe_terms_is_empty_for_a_filter_naming_no_term() {
     let (engine, _) = engine();
-    assert!(engine
-        .describe_terms(&SubscriptionRequest::new(
-            1u64,
-            "SELECT * FROM docs WHERE project_id = 7"
-        ))
-        .expect("a plain filter describes")
-        .is_empty());
+    assert_eq!(
+        engine
+            .describe_terms(&SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM docs WHERE project_id = 7"
+            ))
+            .expect("a plain filter describes"),
+        [] as [subql::term::TermDescription; 0]
+    );
 }
 
 /// Describing and registering the same request agree, or a panic naming which

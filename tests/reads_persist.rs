@@ -191,7 +191,7 @@ fn a_grouped_scalar_read_restores_under_the_same_identity() {
 
     let (_engine, report) =
         Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
-    assert!(report.dropped.is_empty());
+    assert_eq!(report.dropped, [] as [subql::DroppedRead; 0]);
     assert_eq!(report.restored.len(), 1);
     assert_eq!(
         report.restored[0].subscription_id,

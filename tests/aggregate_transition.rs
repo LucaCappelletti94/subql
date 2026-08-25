@@ -246,6 +246,6 @@ fn unfiltered_count_needs_no_old_row_and_stays_in_process() {
         .with_changed_columns([3u16])
         .with_checkpoint(PgLsn(50));
     let output = engine.dispatch(&event).expect("dispatch");
-    assert!(output.transitions().is_empty());
+    assert_eq!(output.transitions(), []);
     assert!(output.triggers().is_empty());
 }

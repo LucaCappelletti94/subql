@@ -1275,7 +1275,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.12"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
 dependencies = [
  "bigdecimal",
  "bitflags 2.13.1",
@@ -1331,7 +1331,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1341,7 +1341,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.9"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -1354,7 +1354,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
 dependencies = [
  "syn 3.0.3",
 ]
@@ -1918,7 +1918,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#ac4cdfc3feeaeaa9a680d8a29777173db90a9d0c"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#705e43404056739897f3a123be6332adf2b13d7a"
 dependencies = [
  "darling 0.24.0",
  "either",
@@ -4085,7 +4085,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -4104,7 +4104,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

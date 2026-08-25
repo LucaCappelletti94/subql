@@ -178,7 +178,7 @@ fn a_null_compared_cell_admits_nobody() {
 
     let row = vec![Value::Null, Value::Int(5), Value::String("d".into())];
     let notifs = engine.consumers(&TestEvent::insert(docs, row)).unwrap();
-    assert!(notifs.inserted().is_empty());
+    assert!(notifs.inserted().is_empty(), "nobody holds that pair");
 }
 
 /// A new membership row moves the pair set and reports the narrowing with the
@@ -274,7 +274,7 @@ fn truncating_the_membership_table_withdraws_every_pair() {
     let after = engine
         .consumers(&TestEvent::insert(docs, doc(5, 1)))
         .unwrap();
-    assert!(after.inserted().is_empty());
+    assert!(after.inserted().is_empty(), "the share is gone");
 }
 
 /// The one-pair `EXISTS` says exactly what the accepted `IN` form says, and

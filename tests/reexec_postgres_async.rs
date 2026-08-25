@@ -77,12 +77,8 @@ const IDLE_IN_TXN: &str = "SELECT count(*) AS n FROM pg_stat_activity \
 /// and unlike a timer this does not depend on the runtime's timer granularity
 /// being coarser than a local database round trip, which it is not.
 fn poll_once<F: core::future::Future>(fut: &mut core::pin::Pin<Box<F>>) -> bool {
-    struct NoopWake;
-    impl std::task::Wake for NoopWake {
-        fn wake(self: std::sync::Arc<Self>) {}
-    }
-    let waker = std::sync::Arc::new(NoopWake).into();
-    let mut cx = core::task::Context::from_waker(&waker);
+    let waker = std::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
     fut.as_mut().poll(&mut cx).is_pending()
 }
 
