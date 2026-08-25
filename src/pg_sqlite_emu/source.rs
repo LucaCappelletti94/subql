@@ -13,9 +13,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use bytes::BytesMut;
-use diesel::{
-    deserialize::QueryableByName, sql_query, sql_types::Text, RunQueryDsl, SqliteConnection,
-};
+use diesel::{sql_query, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{Session, SqliteSessionExt};
 use hashbrown::{HashMap, HashSet};
 use pg2sqlite::{options::Pg2SqliteOptions, pg2sqlite::Pg2Sqlite};
@@ -651,25 +649,48 @@ const fn pg_type_oid_for_kind(kind: Option<BuiltinKind>) -> Oid {
 // Row lookup for the unchanged-column fallback
 // ---------------------------------------------------------------------
 
-/// Diesel row destination for the `json_array(...)` projection below.
-#[derive(QueryableByName)]
-struct JsonRow {
-    #[diesel(sql_type = Text)]
-    row_json: String,
-}
+/// The dynamic table the row lookup reads through. Named at runtime, so no
+/// `table!` macro can describe it.
+type DynTable = diesel_dynamic_schema::Table<String, String>;
+
+/// One `WHERE` conjunct of the row lookup, boxed because the column's SQL type
+/// is decided by the wire value at runtime.
+type KeyPredicate = alloc::boxed::Box<
+    dyn diesel::expression::BoxableExpression<
+        DynTable,
+        diesel::sqlite::Sqlite,
+        SqlType = diesel::sql_types::Bool,
+    >,
+>;
+
+/// Owned wire row image indexed by column ordinal. Result payload of
+/// [`fetch_current_row`] and the `Some` shape of
+/// [`PgSqliteEmuSource::fallback_row_for`].
+type FallbackRow = Vec<WireValue<String, Vec<u8>>>;
 
 /// Fetch the current post-image of one row through SQLite. Used only
 /// when the changeset carried `(None, None)` on some non-PK columns of
 /// an UPDATE.
 ///
-/// Projects a `json_array(col0, col1, ...)` so we get every column back
-/// in a single scalar string. The returned array elements decode into
-/// `WireValue` per each column's SQLite storage class.
+/// Built through diesel's dynamic query builder rather than assembled as text:
+/// the table and column names come from the catalog, and diesel's
+/// `push_identifier` is what escapes a name carrying its own delimiter. The key
+/// values ride as binds for the same reason.
+///
+/// The row comes back through [`crate::diesel_decode::DynamicRow`], which reads
+/// each field by its real SQLite storage class. The previous shape projected
+/// `json_array(...)` and decoded the JSON, which could not represent a BLOB at
+/// all: SQLite answers `json_array` over a BLOB column with "JSON cannot hold
+/// BLOB values" and the whole read failed.
 fn fetch_current_row(
     connection: &mut SqliteConnection,
     meta: &TableMeta,
     pk_values: &[WireValue<String, Vec<u8>>],
 ) -> Result<FallbackRow, PgSqliteEmuError> {
+    use diesel::prelude::*;
+    use diesel::sql_types::Untyped;
+    use diesel_dynamic_schema::DynamicSelectClause;
+
     if pk_values.len() != meta.pk_column_indices.len() {
         return Err(PgSqliteEmuError::UnknownTable(format!(
             "{} pk length mismatch: expected {}, got {}",
@@ -679,91 +700,91 @@ fn fetch_current_row(
         )));
     }
 
-    let cols_csv = meta
-        .columns
-        .iter()
-        .map(|c| format!("\"{}\"", c.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let where_clause = meta
-        .pk_column_indices
-        .iter()
-        .zip(pk_values)
-        .map(|(&idx, val)| {
-            let col_name = &meta.columns[idx].name;
-            let literal = wire_value_to_sql_literal(val);
-            format!("\"{col_name}\" = {literal}")
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let sql = format!(
-        "SELECT json_array({cols_csv}) AS row_json FROM \"{}\" WHERE {}",
-        meta.sqlite_table, where_clause
-    );
+    let table: DynTable = diesel_dynamic_schema::table(meta.sqlite_table.clone());
+    let mut projection = DynamicSelectClause::new();
+    for column in &meta.columns {
+        projection.add_field(table.column::<Untyped, _>(column.name.clone()));
+    }
 
-    let row: JsonRow = sql_query(&sql).get_result(connection)?;
-    let value: serde_json::Value = serde_json::from_str(&row.row_json).map_err(|e| {
-        PgSqliteEmuError::UnknownTable(format!(
-            "row lookup json decode: {e} (raw={raw})",
-            raw = row.row_json
-        ))
-    })?;
-    let arr = value.as_array().ok_or_else(|| {
-        PgSqliteEmuError::UnknownTable(format!(
-            "row lookup expected JSON array, got {}",
-            row.row_json
-        ))
-    })?;
-    if arr.len() != meta.columns.len() {
+    let mut conjuncts = Vec::with_capacity(pk_values.len());
+    for (&index, value) in meta.pk_column_indices.iter().zip(pk_values) {
+        let name = meta.columns[index].name.clone();
+        conjuncts.push(key_predicate(&table, name, value, &meta.sqlite_table)?);
+    }
+    // A row lookup with no key would match the whole table, so refuse rather
+    // than read an arbitrary row.
+    let Some(predicate) = conjuncts
+        .into_iter()
+        .reduce(|left, right| alloc::boxed::Box::new(left.and(right)))
+    else {
         return Err(PgSqliteEmuError::UnknownTable(format!(
-            "{} row lookup returned {} columns, expected {}",
-            meta.sqlite_table,
-            arr.len(),
-            meta.columns.len()
+            "{} has no primary key to look a row up by",
+            meta.sqlite_table
         )));
-    }
-    Ok(arr.iter().map(json_value_to_wire).collect())
+    };
+
+    let row: crate::diesel_decode::DynamicRow<crate::backend::SQLite> = table
+        .select(projection)
+        .filter(predicate)
+        .get_result(connection)?;
+
+    row.values
+        .into_iter()
+        .map(|value| {
+            wire_from_value(&value).ok_or_else(|| {
+                PgSqliteEmuError::UnknownTable(format!(
+                    "{} row lookup read a value SQLite has no storage class for: {value:?}",
+                    meta.sqlite_table
+                ))
+            })
+        })
+        .collect()
 }
 
-fn wire_value_to_sql_literal(v: &WireValue<String, Vec<u8>>) -> String {
-    match v {
-        WireValue::Null => "NULL".to_string(),
-        WireValue::Integer(i) => i.to_string(),
-        WireValue::Real(f) => format!("{f}"),
-        WireValue::Text(s) => format!("'{}'", s.replace('\'', "''")),
-        WireValue::Blob(b) => {
-            let mut hex = String::with_capacity(3 + b.len() * 2);
-            hex.push_str("X'");
-            for byte in b {
-                use core::fmt::Write;
-                let _ = write!(&mut hex, "{byte:02x}");
-            }
-            hex.push('\'');
-            hex
+/// `column = value`, with the column's SQL type chosen by the wire value.
+///
+/// A primary-key column is `NOT NULL`, so a null key is a contract violation
+/// rather than an `IS NULL` to render.
+fn key_predicate(
+    table: &DynTable,
+    name: String,
+    value: &WireValue<String, Vec<u8>>,
+    table_name: &str,
+) -> Result<KeyPredicate, PgSqliteEmuError> {
+    use diesel::prelude::*;
+    use diesel::sql_types::{BigInt, Binary, Double, Text};
+
+    Ok(match value {
+        WireValue::Integer(i) => alloc::boxed::Box::new(table.column::<BigInt, _>(name).eq(*i)),
+        WireValue::Real(f) => alloc::boxed::Box::new(table.column::<Double, _>(name).eq(*f)),
+        WireValue::Text(s) => alloc::boxed::Box::new(table.column::<Text, _>(name).eq(s.clone())),
+        WireValue::Blob(b) => alloc::boxed::Box::new(table.column::<Binary, _>(name).eq(b.clone())),
+        WireValue::Null => {
+            return Err(PgSqliteEmuError::UnknownTable(format!(
+                "{table_name} row lookup received a null primary-key value for {name}"
+            )))
         }
-    }
+    })
 }
 
-/// Owned wire row image indexed by column ordinal. Result payload of
-/// [`fetch_current_row`] and the `Some` shape of
-/// [`PgSqliteEmuSource::fallback_row_for`].
-type FallbackRow = Vec<WireValue<String, Vec<u8>>>;
+/// A decoded field as the pgoutput encoder's wire value.
+///
+/// Total over what SQLite can store, which is what
+/// [`crate::diesel_decode::RowFieldDecode`] for SQLite produces. Any other
+/// variant means the decode convention grew a shape this emulator has not been
+/// taught, so it refuses rather than guessing.
+fn wire_from_value(
+    value: &crate::backend::Value<crate::backend::SQLite>,
+) -> Option<WireValue<String, Vec<u8>>> {
+    use crate::backend::Value;
 
-fn json_value_to_wire(v: &serde_json::Value) -> WireValue<String, Vec<u8>> {
-    match v {
-        serde_json::Value::Bool(b) => WireValue::Integer(i64::from(*b)),
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .map(WireValue::Integer)
-            .or_else(|| n.as_f64().map(WireValue::Real))
-            .unwrap_or(WireValue::Null),
-        serde_json::Value::String(s) => WireValue::Text(s.clone()),
-        // Null, Array, Object, and anything else the enum grows: no
-        // meaningful WireValue mapping. Fuzz-schema doesn't hit Blob
-        // columns (which older SQLite json_array returns as an
-        // integer array, newer as raw string); extend when a real
-        // consumer needs BYTEA round trip.
-        _ => WireValue::Null,
+    match value {
+        Value::Null => Some(WireValue::Null),
+        Value::Int(i) => Some(WireValue::Integer(*i)),
+        Value::Float(f) => Some(WireValue::Real(*f)),
+        Value::String(s) => Some(WireValue::Text(s.clone())),
+        Value::Bytes(b) => Some(WireValue::Blob(b.clone())),
+        _ => None,
     }
 }
 
@@ -779,6 +800,46 @@ mod tests {
     fn build_source() -> PgSqliteEmuSource {
         let conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
         PgSqliteEmuSource::new(conn, ORDERS_DDL).expect("source construction")
+    }
+
+    /// The row lookup sends its key values as binds, not as SQL text.
+    ///
+    /// The escaping the old inlined-literal path did was correct, so no
+    /// behavioural test distinguishes the two shapes. This asserts the shape
+    /// directly instead, because otherwise nothing stops a future edit from
+    /// going back to pasting values into the statement.
+    #[test]
+    fn the_row_lookup_binds_its_key_values() {
+        use diesel::prelude::*;
+        use diesel::sql_types::Untyped;
+
+        const VALUE: &str = "o'brien";
+
+        let table: DynTable = diesel_dynamic_schema::table("t".to_string());
+        let predicate = key_predicate(
+            &table,
+            "k".to_string(),
+            &WireValue::Text(VALUE.to_string()),
+            "t",
+        )
+        .unwrap();
+        let query = table
+            .clone()
+            .select(table.column::<Untyped, _>("k".to_string()))
+            .filter(predicate);
+
+        let rendered = diesel::debug_query::<diesel::sqlite::Sqlite, _>(&query).to_string();
+        // `debug_query` prints the binds after the statement, so compare against
+        // the statement alone.
+        let statement = rendered.split(" -- binds").next().unwrap_or(&rendered);
+        assert!(
+            statement.contains('?'),
+            "no bind placeholder in {statement}"
+        );
+        assert!(
+            !statement.contains(VALUE),
+            "the key value was inlined into the statement: {statement}"
+        );
     }
 
     #[test]

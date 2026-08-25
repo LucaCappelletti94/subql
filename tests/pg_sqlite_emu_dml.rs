@@ -326,3 +326,95 @@ fn composite_pk_insert_update_delete_round_trip() {
         "queue is empty after DELETE",
     );
 }
+
+/// A PG table whose primary-key and non-PK column names both carry the
+/// identifier delimiter. A delimited identifier escapes its delimiter by
+/// doubling it, so these columns are named `a"b` and `lab"el`.
+const QUOTED_PG_DDL: &str = "CREATE TABLE orders (\
+    \"a\"\"b\" INT PRIMARY KEY, \"lab\"\"el\" TEXT, note TEXT);";
+
+/// An UPDATE that leaves a delimiter-carrying column unchanged still recovers
+/// that column's value.
+///
+/// SQLite's session extension records an unchanged column as `(None, None)`, so
+/// the emulator reads the current row back to fill the gap. That read builds its
+/// SQL by hand and wraps each name in a double quote without doubling an
+/// embedded one, so a name carrying the delimiter produces SQL that names
+/// something else or does not parse.
+#[test]
+fn a_quoted_column_survives_the_update_fallback() {
+    let mut source = PgSqliteEmuSource::open_in_memory(QUOTED_PG_DDL).expect("build source");
+
+    source
+        .execute_sql(
+            "INSERT INTO orders (\"a\"\"b\", \"lab\"\"el\", note) VALUES (1, 'hi', 'keep')",
+        )
+        .unwrap();
+    let insert = source
+        .poll_next_event()
+        .expect("the INSERT drains without touching the fallback")
+        .expect("an insert event");
+    assert_eq!(insert.kind(), EventKind::Insert);
+
+    // Touch only `note`, so the quoted column arrives as `(None, None)` and the
+    // emulator has to go and read it.
+    source
+        .execute_sql("UPDATE orders SET note = 'changed' WHERE \"a\"\"b\" = 1")
+        .unwrap();
+    let update = drain_one(&mut source);
+    assert_eq!(update.kind(), EventKind::Update);
+    assert_eq!(
+        update
+            .value_at(source.pg_catalog(), RowKind::New, 1)
+            .unwrap(),
+        Value::String("hi".to_string()),
+        "the unchanged quoted column must be recovered by the fallback read"
+    );
+    assert_eq!(
+        update
+            .value_at(source.pg_catalog(), RowKind::New, 2)
+            .unwrap(),
+        Value::String("changed".to_string()),
+    );
+}
+
+/// The fallback read reports a BLOB as bytes and a NULL as null.
+///
+/// A regression guard on the read's shape rather than a bug report: whether
+/// today's path already distinguishes these is recorded in the plan, and either
+/// way the distinction has to survive.
+#[test]
+fn the_update_fallback_preserves_storage_classes() {
+    const BLOB_PG_DDL: &str =
+        "CREATE TABLE blobs (id INT PRIMARY KEY, raw BYTEA, maybe TEXT, note TEXT);";
+
+    let mut source = PgSqliteEmuSource::open_in_memory(BLOB_PG_DDL).expect("build source");
+
+    source
+        .execute_sql("INSERT INTO blobs (id, raw, maybe, note) VALUES (1, X'0102', NULL, 'keep')")
+        .unwrap();
+    let insert = source
+        .poll_next_event()
+        .expect("the INSERT drains without touching the fallback")
+        .expect("an insert event");
+    assert_eq!(insert.kind(), EventKind::Insert);
+
+    source
+        .execute_sql("UPDATE blobs SET note = 'changed' WHERE id = 1")
+        .unwrap();
+    let update = drain_one(&mut source);
+    assert_eq!(update.kind(), EventKind::Update);
+    assert_eq!(
+        update
+            .value_at(source.pg_catalog(), RowKind::New, 1)
+            .unwrap(),
+        Value::Bytes(vec![1u8, 2]),
+        "a BLOB must come back as bytes, not as text"
+    );
+    assert_eq!(
+        update
+            .value_at(source.pg_catalog(), RowKind::New, 2)
+            .unwrap(),
+        Value::Null,
+    );
+}

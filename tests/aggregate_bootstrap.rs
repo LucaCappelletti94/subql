@@ -11,8 +11,8 @@
 #![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, ScalarKind, Value};
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
+use subql::backend::{BuiltinKind, MySql, Postgres, ScalarKind, Value};
 use subql::testing::TestEvent;
 use subql::{AggValue, AggregateBootstrap, DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
@@ -261,4 +261,115 @@ fn reseed_matches_recompute() {
     .expect("the new starting numbers land");
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].folded_value(), Some(AggValue::Real(Some(4.0))));
+}
+
+/// A table whose group column name carries the dialect's own identifier
+/// delimiter. Legal in Postgres, where a delimited identifier escapes its
+/// delimiter by doubling it, so the column below is named `a"b`.
+const QUOTED_DDL: &str =
+    "CREATE TABLE t (\"a\"\"b\" INT NOT NULL, amount INT, PRIMARY KEY (\"a\"\"b\"));";
+
+/// The MySQL peer of [`QUOTED_DDL`], where the delimiter is a backtick, so the
+/// column below is named ``a`b``.
+const QUOTED_DDL_MYSQL: &str =
+    "CREATE TABLE t (`a``b` INT NOT NULL, amount INT, PRIMARY KEY (`a``b`));";
+
+/// The grouped registration both quoted tables are asked about. A grouped
+/// aggregate must project its group columns, so the group column appears twice.
+const QUOTED_GROUPED_SQL: &str = "SELECT \"a\"\"b\", SUM(amount) FROM t GROUP BY \"a\"\"b\"";
+
+const QUOTED_GROUPED_SQL_MYSQL: &str = "SELECT `a``b`, SUM(amount) FROM t GROUP BY `a``b`";
+
+fn quoted_bootstrap(ddl: &str, sql: &str) -> Option<AggregateBootstrap> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(ddl).unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+    engine
+        .register(SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql))
+        .unwrap()
+        .served()
+        .expect("the engine maintains this one in process")
+        .aggregate_bootstrap
+        .clone()
+}
+
+/// The value of the first projected column of `sql`, which must be a bare
+/// identifier. Reads the delimiter back off the parse rather than off the text,
+/// so a wrongly escaped name shows up as a parse failure or a different value
+/// rather than as a string that merely looks right.
+fn first_projected_ident(dialect: &dyn sqlparser::dialect::Dialect, sql: &str) -> String {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+
+    let mut parsed = sqlparser::parser::Parser::parse_sql(dialect, sql)
+        .unwrap_or_else(|e| panic!("the seed query must re-parse, got {e} for `{sql}`"));
+    assert_eq!(parsed.len(), 1, "one statement");
+    let Statement::Query(query) = parsed.remove(0) else {
+        panic!("the seed query is a SELECT");
+    };
+    let SetExpr::Select(select) = *query.body else {
+        panic!("the seed query is a plain SELECT");
+    };
+    match select.projection.first() {
+        Some(SelectItem::UnnamedExpr(Expr::Identifier(ident))) => ident.value.clone(),
+        other => panic!("expected a bare identifier first, got {other:?}"),
+    }
+}
+
+/// A group column whose name carries the delimiter must still produce a seed
+/// query.
+///
+/// It did not. The seed projection quoted a catalog-supplied name by wrapping
+/// it in the delimiter without doubling an embedded one, the result failed to
+/// re-parse, and the failure was swallowed into the same `None` that means "this
+/// is not an aggregate". The registration then succeeded reporting
+/// `Tier::InProcess` while the consumer had no way to seed the accumulator.
+#[test]
+fn a_group_column_carrying_a_quote_still_seeds() {
+    assert!(
+        quoted_bootstrap(QUOTED_DDL, QUOTED_GROUPED_SQL).is_some(),
+        "a grouped aggregate over a delimiter-carrying column must seed"
+    );
+}
+
+/// The seeded group column names the column, delimiter intact.
+///
+/// The peer of the test above, and the one that pins the escaping rather than
+/// merely the absence of `None`: dropping the group column from the projection
+/// would also make a seed that re-parses.
+#[test]
+fn a_seeded_group_column_reparses() {
+    let bootstrap =
+        quoted_bootstrap(QUOTED_DDL, QUOTED_GROUPED_SQL).expect("a grouped aggregate seeds");
+    assert_eq!(
+        first_projected_ident(&PostgreSqlDialect {}, &bootstrap.sql),
+        "a\"b",
+        "seed SQL was `{}`",
+        bootstrap.sql
+    );
+}
+
+/// The same, on a dialect whose delimiter is not a double quote, so the fix
+/// cannot be hardcoded to `"`.
+#[test]
+fn a_group_column_carrying_a_backtick_still_seeds_on_mysql() {
+    type MysqlEngine = SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB>;
+
+    let db = ParserDB::parse::<MySqlDialect>(QUOTED_DDL_MYSQL).unwrap();
+    let mut engine: MysqlEngine = SubscriptionEngine::new(db, MySqlDialect {});
+    let bootstrap = engine
+        .register(SubscriptionRequest::<DefaultIds, MySql>::new(
+            1u64,
+            QUOTED_GROUPED_SQL_MYSQL,
+        ))
+        .unwrap()
+        .served()
+        .expect("the engine maintains this one in process")
+        .aggregate_bootstrap
+        .clone()
+        .expect("a grouped aggregate seeds");
+    assert_eq!(
+        first_projected_ident(&MySqlDialect {}, &bootstrap.sql),
+        "a`b",
+        "seed SQL was `{}`",
+        bootstrap.sql
+    );
 }

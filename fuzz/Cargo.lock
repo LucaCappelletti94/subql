@@ -347,6 +347,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "diesel-dynamic-schema"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "030a2287b125235908614c5f32f9b3bdc43c4d639846853d66e8a68c75a02756"
+dependencies = [
+ "diesel",
+]
+
+[[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
 source = "git+https://github.com/LucaCappelletti94/diesel-sqlite-session#61f2c5e5ac4d909a019b7d9fd0371dbcf7d0f446"
@@ -1253,6 +1262,7 @@ dependencies = [
  "bytes",
  "chrono",
  "diesel",
+ "diesel-dynamic-schema",
  "diesel-sqlite-session",
  "futures-util",
  "hashbrown 0.16.1",

@@ -292,14 +292,10 @@ where
                 column: alloc::format!("column {column}"),
             })?;
         group_kinds.push(kind);
-        group_idents.push(
-            (dialect as &dyn Dialect)
-                .identifier_quote_style(&name)
-                .map_or_else(
-                    || Ident::new(name.clone()),
-                    |quote| Ident::with_quote(quote, &name),
-                ),
-        );
+        group_idents.push(crate::compiler::quoted_ident(
+            dialect as &dyn Dialect,
+            &name,
+        ));
     }
     let agg_name =
         crate::catalog_helpers::column_name(database, parsed.table_id, projection.column)
@@ -307,12 +303,7 @@ where
                 table_id: parsed.table_id,
                 column: alloc::format!("column {}", projection.column),
             })?;
-    let agg_ident = (dialect as &dyn Dialect)
-        .identifier_quote_style(&agg_name)
-        .map_or_else(
-            || Ident::new(agg_name.clone()),
-            |quote| Ident::with_quote(quote, &agg_name),
-        );
+    let agg_ident = crate::compiler::quoted_ident(dialect as &dyn Dialect, &agg_name);
     let bootstrap = render_grouped_scalar_bootstrap::<B>(
         &parsed.statement,
         &group_idents,
@@ -716,11 +707,10 @@ where
     for column in &key_columns {
         let name = crate::catalog_helpers::column_name(database, table, *column)
             .ok_or_else(|| RegisterError::UnknownTable(name.unqualified.clone()))?;
-        key_idents.push(
-            (dialect as &dyn Dialect)
-                .identifier_quote_style(&name)
-                .map_or_else(|| Ident::new(name.clone()), |q| Ident::with_quote(q, &name)),
-        );
+        key_idents.push(crate::compiler::quoted_ident(
+            dialect as &dyn Dialect,
+            &name,
+        ));
     }
 
     let arity = crate::catalog_helpers::table_arity(database, table).unwrap_or(0);

@@ -42,9 +42,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 use sql_traits::prelude::DatabaseLike;
-// `Dialect` is in scope for its identifier-quoting and identifier-character
-// queries, reached through `<E::Backend as Backend>::Dialect`.
-use sqlparser::dialect::Dialect;
 #[cfg(feature = "std")]
 use std::io::Write;
 #[cfg(test)]
@@ -2533,21 +2530,6 @@ where
         self.register(SubscriptionRequest::new(consumer_id, select_sql).binds(binds))
     }
 
-    /// Delimit `ident` the way the engine's dialect does, leaving it bare for a
-    /// dialect that names no quoting style.
-    fn quote_ident(&self, ident: &str) -> String {
-        let Some(quote) = self.dialect.identifier_quote_style(ident) else {
-            return ident.to_string();
-        };
-        // A delimited identifier escapes its own delimiter by doubling it.
-        if ident.contains(quote) {
-            let escaped = ident.replace(quote, &format!("{quote}{quote}"));
-            format!("{quote}{escaped}{quote}")
-        } else {
-            format!("{quote}{ident}{quote}")
-        }
-    }
-
     /// Follow a specific row by its primary-key value(s).
     ///
     /// Registers `SELECT * FROM <table> WHERE <pk> = <value>` (an `AND` of
@@ -2588,7 +2570,10 @@ where
         // there, and it delimits identifiers with backticks, so a double-quoted
         // name becomes a string literal. Either mistake parses and then matches
         // no row.
-        let dollar_binds = !self.dialect.is_identifier_start('$');
+        let dollar_binds = matches!(
+            crate::compiler::bind_placeholder(&self.dialect),
+            crate::compiler::BindPlaceholder::Numbered
+        );
         let mut clauses = Vec::with_capacity(pk_cols.len());
         for (i, col_id) in pk_cols.iter().enumerate() {
             let name = catalog_helpers::column_name(&self.database, table_id, *col_id).ok_or_else(
@@ -2597,7 +2582,7 @@ where
                     column: format!("<primary-key ordinal {col_id}>"),
                 },
             )?;
-            let column = self.quote_ident(&name);
+            let column = crate::compiler::quoted_ident(&self.dialect, &name).to_string();
             clauses.push(if dollar_binds {
                 format!("{column} = ${}", i + 1)
             } else {
@@ -2606,7 +2591,7 @@ where
         }
         let sql = format!(
             "SELECT * FROM {} WHERE {}",
-            self.quote_ident(table),
+            crate::compiler::quoted_ident(&self.dialect, table),
             clauses.join(" AND ")
         );
         // Build the tracked key before `pk` is moved into the request binds.

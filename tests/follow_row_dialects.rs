@@ -148,3 +148,45 @@ fn follow_row_matches_a_composite_key_under_mysql() {
         "item 200 was not followed, only item 100 in region 1"
     );
 }
+
+/// A key column whose name carries the dialect's own delimiter is followed, and
+/// only its row matches.
+///
+/// A delimited identifier escapes its delimiter by doubling it, so a name that
+/// carries one has to be rendered as `"a""b"` rather than `"a"b"`. Getting that
+/// wrong here does not fail registration on Postgres, it produces a predicate
+/// over a different thing entirely, which is the quiet-mismatch failure this
+/// file exists to catch.
+///
+/// This passes today. It is here as the behavioural guard on the `follow_row`
+/// rendering, so the private quoting helper it currently uses can be replaced by
+/// a shared one without the site losing its only coverage.
+#[test]
+fn follow_row_survives_a_quoted_key_column() {
+    const QUOTED_DDL: &str = "CREATE TABLE users (\"a\"\"b\" INT PRIMARY KEY, name TEXT);";
+
+    let db = ParserDB::parse::<PostgreSqlDialect>(QUOTED_DDL).unwrap();
+    let users = catalog_helpers::table_id(&db, "users").unwrap();
+    let mut engine =
+        SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, _>::new(db, PostgreSqlDialect {});
+
+    engine
+        .follow_row(CONSUMER, "users", vec![Value::Int(7)])
+        .expect("follow row keyed on a delimiter-carrying column");
+
+    let followed =
+        TestEvent::<Postgres>::insert(users, vec![Value::Int(7), Value::String("ann".into())])
+            .with_pk_columns([0u16]);
+    assert_eq!(
+        engine.consumers(&followed).unwrap().inserted(),
+        vec![CONSUMER]
+    );
+
+    let other =
+        TestEvent::<Postgres>::insert(users, vec![Value::Int(8), Value::String("bob".into())])
+            .with_pk_columns([0u16]);
+    assert!(
+        engine.consumers(&other).unwrap().inserted().is_empty(),
+        "row 8 was not followed, only row 7"
+    );
+}

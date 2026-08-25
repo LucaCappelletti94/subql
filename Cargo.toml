@@ -403,6 +403,22 @@ sqlite-diff-rs = { version = "0.9.0", default-features = false, features = ["wal
 # `future` branch already pinned via the top-level `[patch]` blocks.
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session", optional = true }
 
+# Runtime-named tables and columns through diesel's own query builder, used by
+# the `pg-sqlite-emu` row-lookup read. That read names a table and a column set
+# it only learns at runtime, so it cannot use a `table!` macro, and building the
+# SQL by hand is what let an identifier carrying its own delimiter through.
+#
+# The one place subql depends on this crate, and deliberately so: it is
+# SELECT-only (a dynamic table has no `HasTable`, so `insert_into`, `update` and
+# `delete` do not apply) and it is std-only, while every other identifier-quoting
+# site in subql must build for `wasm32-unknown-unknown`. The emulator is the only
+# site holding a live connection, which is what puts it on diesel's side of the
+# line rather than sqlparser's.
+#
+# `default-features = false`: its `sqlite` feature is exactly `diesel/sqlite`,
+# which `pg-sqlite-emu` already carries.
+diesel-dynamic-schema = { version = "0.2", default-features = false, optional = true }
+
 # PG-DDL -> SQLite-DDL translator used by the `pg-sqlite-emu` feature
 # (a fake Postgres CDC source layered on SQLite for doctests and fuzz).
 # `default-features = false` drops the git2 + libssh2 + libz native
@@ -753,6 +769,13 @@ pg-sqlite-emu = [
     "dep:diesel-sqlite-session",
     "dep:pg2sqlite",
     "sqlite-diff-rs/pg-walstream",
+    # The row-lookup read names its table and columns at runtime and reads back
+    # a row of runtime-known shape, so it needs diesel's dynamic query builder
+    # plus subql's own `DynamicRow`. Deliberately not `diesel-typed-sqlite`,
+    # which would drag `postgres_backend`, `uuid`, `chrono`, `numeric` and
+    # `serde_json` into an emulator that needs none of them.
+    "dep:diesel-dynamic-schema",
+    "diesel-dynamic-schema?/sqlite",
 ]
 
 # Opt-in: outbound patchset emission from pgoutput `ChangeEvent`s. Turns

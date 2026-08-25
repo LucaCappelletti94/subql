@@ -748,7 +748,10 @@ impl RowFieldDecode for Pg {
     }
 }
 
-#[cfg(feature = "diesel-typed-sqlite")]
+// The emulator reads rows of runtime-known shape through this too, and it
+// carries only `diesel/sqlite`, so this impl must not require the typed-bind
+// features. It does not: `SqliteValue` and its accessors are exported ungated.
+#[cfg(any(feature = "diesel-typed-sqlite", feature = "pg-sqlite-emu"))]
 impl RowFieldDecode for diesel::sqlite::Sqlite {
     fn field_to_canonical(value: Option<Self::RawValue<'_>>) -> Result<Canonical, RegisterError> {
         use diesel::sqlite::SqliteType;

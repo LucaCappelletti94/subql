@@ -3,9 +3,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{
-    BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, LimitClause, ObjectName, Query, Select, SelectItem,
-    SelectModifiers, SetExpr, Statement, TableFactor,
+    BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, LimitClause, ObjectName, Query,
+    Select, SelectItem, SelectModifiers, SetExpr, Statement, TableFactor,
 };
 
 const WINDOW_FUNCTIONS_NOT_SUPPORTED: &str = "Window functions not supported";
@@ -1243,56 +1243,51 @@ pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
     if let Some(select) = select_mut(&mut stmt) {
         select.having = None;
     }
-    let col = aggregate_arg_text(&stmt)?;
-    let mut components = match spec {
-        _ if widened => {
-            format!("SUM({col}) AS c0, SUM({col} * 1.0 * {col}) AS c1, COUNT({col}) AS c2")
-        }
-        AggSpec::CountStar => "COUNT(*) AS c0".to_string(),
-        AggSpec::CountColumn { .. } => format!("COUNT({col}) AS c0"),
-        AggSpec::Sum { .. } => format!("SUM({col}) AS c0"),
-        AggSpec::Avg { .. } => format!("SUM({col}) AS c0, COUNT({col}) AS c1"),
-        AggSpec::VarPop { .. }
-        | AggSpec::VarSamp { .. }
-        | AggSpec::StddevPop { .. }
-        | AggSpec::StddevSamp { .. } => {
-            // The `* 1.0 *` forces the squared term into floating/decimal
-            // arithmetic on every backend, so `col * col` cannot overflow
-            // the source integer type before it is summed. Portable across
-            // PostgreSQL (numeric), MySQL (decimal), and SQLite (real),
-            // and it needs no dialect-specific cast keyword.
-            format!("SUM({col}) AS c0, SUM({col} * 1.0 * {col}) AS c1, COUNT({col}) AS c2")
-        }
-    };
-    if !groups.is_empty() {
-        use core::fmt::Write as _;
-        let row_count_slot = if widened {
-            3
-        } else {
-            aggregate_bootstrap_kinds(spec).len()
-        };
-        let _ = write!(components, ", COUNT(*) AS c{row_count_slot}");
-    }
+    let arg = aggregate_arg(&stmt)?;
+    let sum = || agg_call("SUM", arg.clone());
+    let count = || agg_call("COUNT", arg.clone());
     // Group columns lead, in `GROUP BY` order rather than projection order, so
-    // a seeded group's values line up with the order its key encodes in.
-    let mut selected = String::new();
+    // a seeded group's values line up with the order its key encodes in. Built
+    // as `Ident`s carrying the dialect's quote style, so an embedded delimiter
+    // is escaped by the same renderer that parsed it.
+    let mut items = Vec::with_capacity(groups.len() + 4);
     let mut group_kinds = Vec::with_capacity(groups.len());
     for column in groups {
         let name = catalog_helpers::column_name(database, table_id, *column)?;
-        let quoted = (dialect)
-            .identifier_quote_style(&name)
-            .map_or_else(|| name.clone(), |q| format!("{q}{name}{q}"));
-        selected.push_str(&quoted);
-        selected.push_str(", ");
+        items.push(SelectItem::UnnamedExpr(Expr::Identifier(
+            super::quoted_ident(dialect, &name),
+        )));
         group_kinds.push(catalog_helpers::column_builtin_kind(
             database, table_id, *column,
         )?);
     }
-    selected.push_str(&components);
-
-    let template = parse_single_statement(&format!("SELECT {selected}"), dialect).ok()?;
-    let projection_items = select_projection(&template)?.to_vec();
-    *select_projection_mut(&mut stmt)? = projection_items;
+    let components: Vec<Expr> = match spec {
+        _ if widened => alloc::vec![sum(), sum_of_squares(&arg)?, count()],
+        AggSpec::CountStar => alloc::vec![agg_call("COUNT", FunctionArgExpr::Wildcard)],
+        AggSpec::CountColumn { .. } => alloc::vec![count()],
+        AggSpec::Sum { .. } => alloc::vec![sum()],
+        AggSpec::Avg { .. } => alloc::vec![sum(), count()],
+        AggSpec::VarPop { .. }
+        | AggSpec::VarSamp { .. }
+        | AggSpec::StddevPop { .. }
+        | AggSpec::StddevSamp { .. } => alloc::vec![sum(), sum_of_squares(&arg)?, count()],
+    };
+    let component_count = components.len();
+    items.extend(
+        components
+            .into_iter()
+            .enumerate()
+            .map(|(slot, expr)| component(expr, slot)),
+    );
+    if !groups.is_empty() {
+        // A grouped seed also reports how many source rows each group holds,
+        // which is what lets a later change know whether it emptied one.
+        items.push(component(
+            agg_call("COUNT", FunctionArgExpr::Wildcard),
+            component_count,
+        ));
+    }
+    *select_projection_mut(&mut stmt)? = items;
     let mut kinds = group_kinds;
     if widened {
         use crate::backend::ScalarKind::{Float, Int};
@@ -1329,9 +1324,16 @@ pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::B
     }
 }
 
-/// The column-argument text of the statement's aggregate projection, or `"*"`
-/// for `COUNT(*)`. `None` when no projected item is a function call.
-fn aggregate_arg_text(stmt: &Statement) -> Option<String> {
+/// The single argument of the statement's aggregate projection, as an AST node.
+///
+/// Returns [`FunctionArgExpr::Wildcard`] for `COUNT(*)`, and `None` when no
+/// projected item is a function call of exactly one unnamed argument.
+///
+/// An AST node rather than its rendered text, because the seed projection is
+/// built as AST. Rendering here and re-parsing there used to be how a
+/// catalog-supplied identifier could break the seed query without anyone
+/// hearing about it.
+fn aggregate_arg(stmt: &Statement) -> Option<FunctionArgExpr> {
     // Scans rather than requiring a single projected item, because a grouped
     // statement projects its group columns alongside the aggregate.
     let f = select_projection(stmt)?.iter().find_map(|item| {
@@ -1348,12 +1350,74 @@ fn aggregate_arg_text(stmt: &Statement) -> Option<String> {
     })?;
     match &f.args {
         FunctionArguments::List(list) if list.args.len() == 1 => match &list.args[0] {
-            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Some("*".to_string()),
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.to_string()),
+            FunctionArg::Unnamed(arg @ (FunctionArgExpr::Wildcard | FunctionArgExpr::Expr(_))) => {
+                Some(arg.clone())
+            }
             _ => None,
         },
         _ => None,
     }
+}
+
+/// `NAME(arg)`, with every optional clause empty.
+///
+/// The seed's components are plain aggregate calls: no `DISTINCT`, no `FILTER`,
+/// no `OVER`, no `WITHIN GROUP`. Spelling each field out rather than cloning the
+/// projected call is what keeps a clause the user wrote from riding along into a
+/// component that must not carry it.
+fn agg_call(name: &str, arg: FunctionArgExpr) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName::from(alloc::vec![Ident::new(name)]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: alloc::vec![FunctionArg::Unnamed(arg)],
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
+}
+
+/// `expr AS cN`, the alias a seed component is read back by.
+fn component(expr: Expr, slot: usize) -> SelectItem {
+    SelectItem::ExprWithAlias {
+        expr,
+        alias: Ident::new(alloc::format!("c{slot}")),
+    }
+}
+
+/// `SUM(arg * 1.0 * arg)`, the squared term a variance or standard deviation
+/// seed carries.
+///
+/// The `* 1.0 *` forces the product into floating or decimal arithmetic on
+/// every backend, so `col * col` cannot overflow the source integer type before
+/// it is summed. Portable across PostgreSQL (numeric), MySQL (decimal) and
+/// SQLite (real), and it needs no dialect-specific cast keyword.
+fn sum_of_squares(arg: &FunctionArgExpr) -> Option<Expr> {
+    let FunctionArgExpr::Expr(col) = arg else {
+        // `COUNT(*)` has no column to square, and no spec that needs this term
+        // accepts a wildcard argument.
+        return None;
+    };
+    let one =
+        Expr::Value(sqlparser::ast::Value::Number("1.0".to_string(), false).with_empty_span());
+    let scaled = Expr::BinaryOp {
+        left: alloc::boxed::Box::new(col.clone()),
+        op: BinaryOperator::Multiply,
+        right: alloc::boxed::Box::new(one),
+    };
+    Some(agg_call(
+        "SUM",
+        FunctionArgExpr::Expr(Expr::BinaryOp {
+            left: alloc::boxed::Box::new(scaled),
+            op: BinaryOperator::Multiply,
+            right: alloc::boxed::Box::new(col.clone()),
+        }),
+    ))
 }
 
 fn select_projection(stmt: &Statement) -> Option<&[SelectItem]> {
