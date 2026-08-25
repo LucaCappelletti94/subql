@@ -25,7 +25,7 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
 use subql::backend::{MySql, ScalarKind, Value};
 use subql::reexec::{
-    AutoResolvingEngine, Connector, MysqlDieselConnector, SnapshotResult, SyncMode,
+    AutoResolvingEngine, Connector, MysqlDieselConnector, SessionSetup, SnapshotResult, SyncMode,
 };
 use subql::testing::TestEvent;
 use subql::{
@@ -390,4 +390,54 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         position.expect("binary logging is on, so a coordinate is reported") < after_commit,
         "the seed read's position must sit behind the commit at {after_commit:?}"
     );
+}
+
+/// A borrowed-list session setup, mirroring what a caller builds per read.
+struct MarkerSetup(Vec<String>);
+
+impl SessionSetup for MarkerSetup {
+    fn setup_statements(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// The session-setup seam runs its statements inside each read's transaction on
+/// the single-connection sync `MysqlDieselConnector`. Observed through a
+/// session variable the read reads back: a non-empty setup runs before the
+/// caller's SQL, an empty one on a fresh connection runs nothing.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn session_setup_runs_on_each_read_sync_mysql() {
+    common::assert_docker_available();
+    let container = common::mysql_8();
+    let port = common::mysql_port(&container);
+
+    let read_marker = "SELECT @@max_sort_length";
+    let setup = MarkerSetup(vec!["SET SESSION max_sort_length = 1234".to_string()]);
+    let connector: MysqlDieselConnector<MarkerSetup> =
+        MysqlDieselConnector::with_session_setup(common::mysql_connect(port));
+
+    let (value, _) = connector
+        .execute_scalar(read_marker, ScalarKind::Int, &setup)
+        .expect("scalar read");
+    assert_eq!(
+        value,
+        Value::Int(1234),
+        "execute_scalar ran the setup first"
+    );
+
+    let page = connector
+        .read_page(read_marker, 4096, &setup)
+        .expect("page read");
+    assert_eq!(
+        page.value.rows[0][0],
+        Value::Int(1234),
+        "read_page ran the setup first"
+    );
+
+    let plain = MysqlDieselConnector::new(common::mysql_connect(port));
+    let (value, _) = plain
+        .execute_scalar(read_marker, ScalarKind::Int, &())
+        .expect("scalar read");
+    assert_ne!(value, Value::Int(1234), "an empty setup runs nothing");
 }

@@ -105,6 +105,14 @@ required-features = ["executor-diesel", "diesel-typed-sqlite"]
 name = "execute_scalar_row_sqlite"
 required-features = ["executor-diesel", "diesel-typed-sqlite"]
 
+# Docker-free coverage for the connector session-setup seam (U8) over in-memory
+# SQLite, plus Docker-gated cursor and async-MySQL coverage in the connector
+# test files. The SQLite target needs the same features as the other sqlite
+# connector tests.
+[[test]]
+name = "session_setup"
+required-features = ["executor-diesel", "diesel-typed-sqlite"]
+
 # Docker-backed integration test for AutoResolvingEngine + DieselConnector
 # against a real Postgres with logical replication. Tests are #[ignore]d;
 # run explicitly via:

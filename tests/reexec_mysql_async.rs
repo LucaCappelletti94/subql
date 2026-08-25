@@ -32,7 +32,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::MySqlDialect;
 use subql::backend::{MySql, ScalarKind, Value};
 use subql::reexec::{
-    AsyncConnector, AsyncMode, AutoResolvingEngine, MysqlAsyncDieselConnector, SnapshotResult,
+    AsyncConnector, AsyncMode, AutoResolvingEngine, MysqlAsyncDieselConnector, SessionSetup,
+    SnapshotResult,
 };
 use subql::testing::TestEvent;
 use subql::{
@@ -342,4 +343,57 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         position.expect("binary logging is on, so a coordinate is reported") < after_commit,
         "the seed read's position must sit behind the commit at {after_commit:?}"
     );
+}
+
+/// A borrowed-list session setup, mirroring what a caller builds per read.
+struct MarkerSetup(Vec<String>);
+
+impl SessionSetup for MarkerSetup {
+    fn setup_statements(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// The session-setup seam reaches the async MySQL `read_page`, the one shipped
+/// path the inventory finds transaction-free. A non-empty setup runs before the
+/// caller's SQL (observed through a session variable the read then reads back),
+/// and an empty setup on a fresh connection runs nothing. The transaction-open
+/// conditional itself (a transaction only when the setup is non-empty) is
+/// pinned exactly by the generic connector's SQLite instrumentation test in
+/// `tests/session_setup.rs`, since MySQL exposes no clean in-transaction flag a
+/// read can select.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn session_setup_runs_on_the_transaction_free_read_page() {
+    common::assert_docker_available();
+    let container = common::mysql_8();
+    let port = common::mysql_port(&container);
+
+    common::multi_thread_rt().block_on(async move {
+        let read_marker = "SELECT @@max_sort_length AS v";
+        let setup = MarkerSetup(vec!["SET SESSION max_sort_length = 1234".to_string()]);
+        let with = MysqlAsyncDieselConnector::with_session_setup(mysql_async_pool(port).await);
+        let page = with
+            .read_page(read_marker, 4096, &setup)
+            .await
+            .expect("read with setup");
+        assert_eq!(
+            page.value.rows[0][0],
+            Value::Int(1234),
+            "the setup ran on read_page before the caller's SQL"
+        );
+
+        // A fresh pool that never ran the setter reads the server default,
+        // which is not the value the setup would have installed.
+        let plain = MysqlAsyncDieselConnector::new(mysql_async_pool(port).await);
+        let page = plain
+            .read_page(read_marker, 4096, &())
+            .await
+            .expect("read with empty setup");
+        assert_ne!(
+            page.value.rows[0][0],
+            Value::Int(1234),
+            "an empty setup runs nothing, so the default stands"
+        );
+    });
 }

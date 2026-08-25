@@ -299,11 +299,6 @@ where
         self
     }
 
-    /// The wrapped registry.
-    pub const fn inner(&self) -> &crate::SubscriptionEngine<E, I, DB> {
-        &self.inner
-    }
-
     /// Number of captured re-execution queries (matches the inner engine).
     pub fn reexec_query_count(&self) -> usize {
         self.inner.reread_count()
@@ -1227,14 +1222,20 @@ where
         engine
     }
 
-    /// Unregister a captured query by id. Drops its auth context too.
-    /// Returns false if no such query existed.
-    pub fn unregister_reexec_query(&mut self, subscription_id: SubscriptionId) -> bool {
-        let removed = self.inner.unregister_reread(subscription_id);
-        if removed {
+    /// Unregister a subscription by id, resolving whichever registry holds
+    /// it. Returns false if no such subscription existed.
+    ///
+    /// One id counter serves both registries (`next_subscription_id` lives
+    /// only on the inner engine), so an id cannot be claimed by both and the
+    /// order below is a resolution, not a precedence. The read registry is
+    /// tried first, and when it claims the id the stored resolve context is
+    /// dropped with it.
+    pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
+        if self.inner.unregister_reread(subscription_id) {
             self.contexts.remove(&subscription_id);
+            return true;
         }
-        removed
+        self.inner.unregister_subscription(subscription_id)
     }
 
     /// Unregister an in-process subscription by `(consumer_id, sql)`.
@@ -1244,6 +1245,87 @@ where
         sql: &str,
     ) -> Result<UnregisterReport, RegisterError> {
         self.inner.unregister_query(consumer_id, sql)
+    }
+
+    /// Advance the resume cursor for `(session_id, sub_id)`. Passthrough to
+    /// [`SubscriptionEngine::advance_cursor`](crate::SubscriptionEngine::advance_cursor).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::AdvanceCursorError::NonMonotonic`] when `checkpoint` rewinds.
+    pub fn advance_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+        checkpoint: crate::OpaqueCheckpoint,
+    ) -> Result<Option<crate::OpaqueCheckpoint>, crate::AdvanceCursorError> {
+        self.inner.advance_cursor(session_id, sub_id, checkpoint)
+    }
+
+    /// Set the resume cursor for `(session_id, sub_id)` unconditionally.
+    /// Passthrough to
+    /// [`SubscriptionEngine::force_set_cursor`](crate::SubscriptionEngine::force_set_cursor).
+    pub fn force_set_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+        checkpoint: crate::OpaqueCheckpoint,
+    ) -> Option<crate::OpaqueCheckpoint> {
+        self.inner.force_set_cursor(session_id, sub_id, checkpoint)
+    }
+
+    /// Read the resume cursor for `(session_id, sub_id)`. Passthrough to
+    /// [`SubscriptionEngine::cursor_for`](crate::SubscriptionEngine::cursor_for).
+    #[must_use]
+    pub fn cursor_for(
+        &self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+    ) -> Option<&crate::OpaqueCheckpoint> {
+        self.inner.cursor_for(session_id, sub_id)
+    }
+
+    /// Iterate `(subscription_id, cursor)` for every cursor stored against
+    /// `session_id`. Passthrough to
+    /// [`SubscriptionEngine::cursors_for_session`](crate::SubscriptionEngine::cursors_for_session).
+    pub fn cursors_for_session(
+        &self,
+        session_id: I::SessionId,
+    ) -> impl Iterator<Item = (SubscriptionId, &crate::OpaqueCheckpoint)> + '_ {
+        self.inner.cursors_for_session(session_id)
+    }
+
+    /// Remove the resume cursor for `(session_id, sub_id)`. Passthrough to
+    /// [`SubscriptionEngine::drop_cursor`](crate::SubscriptionEngine::drop_cursor).
+    pub fn drop_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+    ) -> Option<crate::OpaqueCheckpoint> {
+        self.inner.drop_cursor(session_id, sub_id)
+    }
+
+    /// Match `event` against the registered subscriptions without reading or
+    /// folding, for catchup replay of an event the caller already dispatched.
+    ///
+    /// Delegates straight to
+    /// [`SubscriptionEngine::consumers`](crate::SubscriptionEngine::consumers),
+    /// so no connector call is made and no aggregate fold advances. The return
+    /// carries more than its name suggests: alongside the row verdicts it
+    /// reports term-membership narrowings, which a replay announces a second
+    /// time. Re-applying them is a set union or difference that does not move
+    /// the stored state, but a caller acting on the announcement itself must
+    /// treat a replay's narrowings as possibly-stale repeats.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::DispatchError`] when the event cannot be matched.
+    pub fn match_rows(
+        &mut self,
+        event: &E,
+    ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, crate::DispatchError>
+    {
+        self.inner.consumers(event)
     }
 }
 
@@ -1906,9 +1988,9 @@ mod tests {
             other => panic!("expected ReExec, got {other:?}"),
         };
         assert_eq!(e.contexts.len(), 1);
-        assert!(e.unregister_reexec_query(qid));
+        assert!(e.unregister_subscription(qid));
         assert_eq!(e.contexts.len(), 0);
-        assert!(!e.unregister_reexec_query(qid), "second drop is a no-op");
+        assert!(!e.unregister_subscription(qid), "second drop is a no-op");
     }
     #[test]
     fn grouped_batch_keeps_one_trigger_per_displaced_group() {
@@ -1991,5 +2073,177 @@ mod tests {
         engine.stamp_reexec(7, &first);
         assert!(engine.debounce_skip(7, &first));
         assert!(!engine.debounce_skip(7, &second));
+    }
+
+    #[test]
+    fn unregister_subscription_resolves_either_registry() {
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
+        // Captured re-execution query: lands in the read registry with a context.
+        let captured = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        // In-process row subscription: lands in the in-process registry, no context.
+        let in_process = match e
+            .register(
+                SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE price > 100"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        assert!(
+            e.unregister_subscription(captured),
+            "read registry id resolves"
+        );
+        assert!(
+            e.unregister_subscription(in_process),
+            "in-process registry id resolves"
+        );
+        assert!(
+            !e.unregister_subscription(999u64),
+            "an unknown id resolves to neither registry"
+        );
+    }
+
+    #[test]
+    fn unregister_subscription_drops_the_resolve_context() {
+        let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(7.0)]);
+        let captured = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            captured,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        assert_eq!(e.contexts.len(), 1);
+        assert!(e.unregister_subscription(captured));
+        assert_eq!(e.contexts.len(), 0, "the resolve context is dropped");
+        // A later delete of the former extreme must not reach the connector.
+        let n = e.consumers(&delete_event(tid, 1, 5.0)).unwrap();
+        assert!(n.scalar_updates.is_empty());
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "no connector call after unregister"
+        );
+    }
+
+    #[test]
+    fn cursor_state_is_reachable_through_the_wrapper() {
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
+        let session = 1u64;
+        let sub = 7u64;
+        let cp = crate::OpaqueCheckpoint(alloc::vec![1, 2, 3]);
+        assert_eq!(e.advance_cursor(session, sub, cp.clone()), Ok(None));
+        assert_eq!(e.cursor_for(session, sub), Some(&cp));
+        // force_set bypasses the monotonic rule and returns the previous value.
+        let older = crate::OpaqueCheckpoint(alloc::vec![0]);
+        assert_eq!(e.force_set_cursor(session, sub, older.clone()), Some(cp));
+        assert_eq!(e.cursor_for(session, sub), Some(&older));
+        let listed: Vec<_> = e
+            .cursors_for_session(session)
+            .map(|(s, c)| (s, c.clone()))
+            .collect();
+        assert_eq!(listed, alloc::vec![(sub, older.clone())]);
+        assert_eq!(e.drop_cursor(session, sub), Some(older));
+        assert_eq!(e.cursor_for(session, sub), None);
+    }
+
+    #[test]
+    fn match_rows_replays_without_reading_or_folding() {
+        // One value, for the single live re-execution below. match_rows reads
+        // nothing, so it must never consume it.
+        let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(7.0)]);
+        // Captured MIN: a delete of its extreme is a read on the live path, and
+        // the connector call that read needs is the guard that match_rows stays
+        // off the resolving path.
+        let min_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            min_id,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        // In-process row subscription: gives match_rows a non-empty verdict.
+        e.register(
+            SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE price < 100"),
+            (),
+        )
+        .unwrap();
+
+        // A delete of the current extreme, replayed against the seeded model
+        // before any live dispatch has moved it, so it is still displacing.
+        let ev = delete_event(tid, 1, 5.0);
+        let replay = e.match_rows(&ev).unwrap();
+        assert!(
+            !replay.deleted().is_empty(),
+            "match_rows matched the row subscription"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "match_rows read nothing from the connector even for a displacing delete"
+        );
+
+        // The live dispatch of the same delete is still the first read, which
+        // proves match_rows left the re-execution model untouched: it resolves
+        // MIN once, to 7.0.
+        let live = e.consumers(&ev).unwrap();
+        assert_eq!(
+            e.connector().call_count(),
+            1,
+            "the re-execution model was untouched, so the live read is the first"
+        );
+        assert_eq!(live.scalar_updates.len(), 1);
+        assert_eq!(live.scalar_updates[0].value, Value::Float(7.0));
     }
 }

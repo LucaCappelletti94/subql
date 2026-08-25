@@ -31,7 +31,9 @@ use super::async_connector::AsyncConnector;
 use super::connector::LogStatusRow;
 #[cfg(feature = "executor-diesel-async-postgres")]
 use super::connector::PgLsnRow;
-use super::connector::{DieselBackend, FloatRow, IntRow, ScalarRowError, Snapshot, TextRow};
+use super::connector::{
+    DieselBackend, FloatRow, IntRow, ScalarRowError, SessionSetup, Snapshot, TextRow,
+};
 use crate::backend::{BuiltinKind, ScalarKind, Value};
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -42,6 +44,23 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
 use thiserror::Error;
+
+/// Run each setup statement in order on `conn`. The async peer of
+/// [`run_setup_statements`](super::connector) shared helper: called inside the
+/// transaction that serves the read and before the caller's SQL.
+async fn run_setup_statements_async<C>(
+    conn: &mut C,
+    statements: &[alloc::string::String],
+) -> diesel::QueryResult<()>
+where
+    C: AsyncConnection,
+    SqlQuery: diesel_async::methods::ExecuteDsl<C>,
+{
+    for statement in statements {
+        sql_query(statement.as_str()).execute(conn).await?;
+    }
+    Ok(())
+}
 
 /// Errors returned by the async diesel connectors.
 ///
@@ -171,7 +190,7 @@ where
 ///
 /// Returns [`DieselAsyncError`] for pool or database failures.
 #[cfg(feature = "executor-diesel-async-postgres")]
-pub struct PgAsyncDieselConnector {
+pub struct PgAsyncDieselConnector<S = ()> {
     pool: Pool<diesel_async::AsyncPgConnection>,
     /// Cursors held open, each pinning one pooled connection inside its own
     /// transaction until closed.
@@ -183,6 +202,7 @@ pub struct PgAsyncDieselConnector {
     /// reported a cursor that was busy as one that never existed.
     cursors: parking_lot::Mutex<hashbrown::HashMap<super::CursorId, CursorSlot>>,
     next_cursor: core::sync::atomic::AtomicU64,
+    _setup: core::marker::PhantomData<fn() -> S>,
 }
 
 /// Diesel's transaction manager for `AsyncPgConnection`.
@@ -277,12 +297,28 @@ impl PgAsyncDieselConnector {
             pool,
             cursors: parking_lot::Mutex::new(hashbrown::HashMap::new()),
             next_cursor: core::sync::atomic::AtomicU64::new(1),
+            _setup: core::marker::PhantomData,
         }
     }
 }
 
 #[cfg(feature = "executor-diesel-async-postgres")]
-impl PgAsyncDieselConnector {
+impl<S: SessionSetup + Send + Sync> PgAsyncDieselConnector<S> {
+    /// Wrap a `bb8` pool over `AsyncPgConnection` whose reads run the setup
+    /// statements carried by the per-read [`SessionSetup`] value `S`.
+    #[must_use]
+    pub fn with_session_setup(pool: Pool<diesel_async::AsyncPgConnection>) -> Self {
+        Self {
+            pool,
+            cursors: parking_lot::Mutex::new(hashbrown::HashMap::new()),
+            next_cursor: core::sync::atomic::AtomicU64::new(1),
+            _setup: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "executor-diesel-async-postgres")]
+impl<S> PgAsyncDieselConnector<S> {
     /// End a cursor: close it, then commit the transaction it was reading in.
     ///
     /// Rolls back if either step fails, so a failure cannot leave the
@@ -371,8 +407,8 @@ async fn read_current_lsn_async(
 }
 
 #[cfg(feature = "executor-diesel-async-postgres")]
-impl AsyncConnector for PgAsyncDieselConnector {
-    type AuthContext = ();
+impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S> {
+    type AuthContext = S;
     type Error = DieselAsyncError;
     type Checkpoint = crate::PgLsn;
     type Backend = crate::backend::Postgres;
@@ -381,7 +417,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
         &self,
         sql: &str,
         kind: BuiltinKind,
-        _auth: &(),
+        auth: &S,
     ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
     {
         let sql = sql.to_string();
@@ -402,6 +438,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
                         sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                             .execute(c)
                             .await?;
+                        run_setup_statements_async(c, auth.setup_statements()).await?;
                         let value = load_scalar_async::<_, Self::Backend>(c, &sql, kind).await?;
                         Ok((value, lsn))
                     }
@@ -417,7 +454,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
         &self,
         sql: &str,
         max_bytes: usize,
-        _auth: &(),
+        auth: &S,
     ) -> impl Future<
         Output = Result<
             Snapshot<crate::reexec::RowPage<Self::Backend>, Self::Checkpoint>,
@@ -442,6 +479,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
                         sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                             .execute(c)
                             .await?;
+                        run_setup_statements_async(c, auth.setup_statements()).await?;
                         let value = load_page_async::<_, diesel::pg::Pg, crate::backend::Postgres>(c, &sql, max_bytes).await?;
                         Ok(Snapshot {
                             value,
@@ -459,7 +497,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
     fn open_cursor(
         &self,
         sql: &str,
-        _auth: &(),
+        auth: &S,
     ) -> impl Future<Output = Result<super::CursorId, super::CursorError<Self::Error>>> + Send {
         let sql = sql.to_string();
         async move {
@@ -495,6 +533,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
                 sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                     .execute(&mut *conn)
                     .await?;
+                run_setup_statements_async(&mut *conn, auth.setup_statements()).await?;
                 sql_query(alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {sql}"))
                     .execute(&mut *conn)
                     .await?;
@@ -639,7 +678,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
         &self,
         sql: &str,
         kinds: &[BuiltinKind],
-        _auth: &(),
+        auth: &S,
     ) -> impl Future<
         Output = Result<
             (Vec<Value<Self::Backend>>, Option<Self::Checkpoint>),
@@ -667,6 +706,7 @@ impl AsyncConnector for PgAsyncDieselConnector {
                         sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                             .execute(c)
                             .await?;
+                        run_setup_statements_async(c, auth.setup_statements()).await?;
                         let values =
                             load_scalar_row_async::<_, Self::Backend>(c, &sql, &kinds).await?;
                         Ok((values, lsn))
@@ -703,17 +743,33 @@ impl AsyncConnector for PgAsyncDieselConnector {
 ///
 /// Returns [`DieselAsyncError`] for pool or database failures.
 #[cfg(feature = "executor-diesel-async-mysql")]
-pub struct MysqlAsyncDieselConnector {
+pub struct MysqlAsyncDieselConnector<S = ()> {
     pool: Pool<diesel_async::AsyncMysqlConnection>,
+    _setup: core::marker::PhantomData<fn() -> S>,
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
 impl MysqlAsyncDieselConnector {
-    /// Wrap a `bb8` pool over `AsyncMysqlConnection` already configured by the
-    /// caller.
+    /// Wrap a `bb8` pool over `AsyncMysqlConnection` with no session setup.
     #[must_use]
     pub const fn new(pool: Pool<diesel_async::AsyncMysqlConnection>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            _setup: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "executor-diesel-async-mysql")]
+impl<S: SessionSetup + Send + Sync> MysqlAsyncDieselConnector<S> {
+    /// Wrap a `bb8` pool over `AsyncMysqlConnection` whose reads run the setup
+    /// statements carried by the per-read [`SessionSetup`] value `S`.
+    #[must_use]
+    pub const fn with_session_setup(pool: Pool<diesel_async::AsyncMysqlConnection>) -> Self {
+        Self {
+            pool,
+            _setup: core::marker::PhantomData,
+        }
     }
 }
 
@@ -751,8 +807,8 @@ async fn read_binlog_pos_async(
 }
 
 #[cfg(feature = "executor-diesel-async-mysql")]
-impl AsyncConnector for MysqlAsyncDieselConnector {
-    type AuthContext = ();
+impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector<S> {
+    type AuthContext = S;
     type Error = DieselAsyncError;
     type Checkpoint = crate::MysqlBinlogPos;
     type Backend = crate::backend::MySql;
@@ -761,7 +817,7 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
         &self,
         sql: &str,
         kind: BuiltinKind,
-        _auth: &(),
+        auth: &S,
     ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
     {
         let sql = sql.to_string();
@@ -776,6 +832,7 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
             conn.transaction::<(Value<Self::Backend>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
                 |c| {
                     async move {
+                        run_setup_statements_async(c, auth.setup_statements()).await?;
                         let value = load_scalar_async::<_, Self::Backend>(c, &sql, kind).await?;
                         Ok((value, pos))
                     }
@@ -791,7 +848,7 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
         &self,
         sql: &str,
         max_bytes: usize,
-        _auth: &(),
+        auth: &S,
     ) -> impl Future<
         Output = Result<
             Snapshot<crate::reexec::RowPage<Self::Backend>, Self::Checkpoint>,
@@ -802,11 +859,32 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
-            let value = load_page_async::<_, diesel::mysql::Mysql, crate::backend::MySql>(
-                conn, &sql, max_bytes,
-            )
-            .await
-            .map_err(DieselAsyncError::Diesel)?;
+            let setup = auth.setup_statements();
+            // Decision 5: this path opens no transaction today, so an empty
+            // setup keeps that byte for byte, and a non-empty setup gets a real
+            // transaction so the statements take hold for this read.
+            let value = if setup.is_empty() {
+                load_page_async::<_, diesel::mysql::Mysql, crate::backend::MySql>(
+                    conn, &sql, max_bytes,
+                )
+                .await
+                .map_err(DieselAsyncError::Diesel)?
+            } else {
+                conn.transaction::<crate::reexec::RowPage<Self::Backend>, diesel::result::Error, _>(
+                    |c| {
+                        async move {
+                            run_setup_statements_async(c, setup).await?;
+                            load_page_async::<_, diesel::mysql::Mysql, crate::backend::MySql>(
+                                c, &sql, max_bytes,
+                            )
+                            .await
+                        }
+                        .scope_boxed()
+                    },
+                )
+                .await
+                .map_err(DieselAsyncError::Diesel)?
+            };
             Ok(Snapshot {
                 value,
                 checkpoint: None,
@@ -818,7 +896,7 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
         &self,
         sql: &str,
         kinds: &[BuiltinKind],
-        _auth: &(),
+        auth: &S,
     ) -> impl Future<
         Output = Result<
             (Vec<Value<Self::Backend>>, Option<Self::Checkpoint>),
@@ -839,6 +917,7 @@ impl AsyncConnector for MysqlAsyncDieselConnector {
             conn.transaction::<(Vec<Value<Self::Backend>>, Option<crate::MysqlBinlogPos>), diesel::result::Error, _>(
                 |c| {
                     async move {
+                        run_setup_statements_async(c, auth.setup_statements()).await?;
                         let values =
                             load_scalar_row_async::<_, Self::Backend>(c, &sql, &kinds).await?;
                         Ok((values, pos))

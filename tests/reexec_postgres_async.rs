@@ -33,7 +33,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, ScalarKind, Value};
 use subql::reexec::{
-    AsyncConnector, AsyncMode, AutoResolvingEngine, PgAsyncDieselConnector, SnapshotResult,
+    AsyncConnector, AsyncMode, AutoResolvingEngine, PgAsyncDieselConnector, SessionSetup,
+    SnapshotResult,
 };
 use subql::{
     parse_wal2json_v2, AggregateResultValue, AggregateValueChange, DefaultIds,
@@ -1257,4 +1258,74 @@ fn a_scalar_over_a_narrow_integer_column_decodes_async() {
         .block_on(connector.execute_scalar("SELECT MAX(tiny) FROM probe", ScalarKind::Int, &()))
         .expect("SMALLINT column decodes");
     assert_eq!(value, Value::Int(4));
+}
+
+/// A borrowed-list session setup, mirroring what a caller builds per read.
+struct MarkerSetup(Vec<String>);
+
+impl SessionSetup for MarkerSetup {
+    fn setup_statements(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// The session-setup seam runs its statements inside the transaction that
+/// serves each read on the async pooled `PgAsyncDieselConnector`, the cursor's
+/// held transaction included. `SET LOCAL` takes hold only inside its own
+/// transaction, so a read that sees the value proves the setup ran there,
+/// before the caller's SQL.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn session_setup_runs_inside_each_read_transaction_async_pg() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    common::multi_thread_rt().block_on(async move {
+        let read_marker = "SELECT current_setting('app.marker', true) AS v";
+        let setup = MarkerSetup(vec!["SET LOCAL app.marker = 'seen'".to_string()]);
+        let connector: PgAsyncDieselConnector<MarkerSetup> =
+            PgAsyncDieselConnector::with_session_setup(pg_async_pool(port).await);
+
+        let (value, _) = connector
+            .execute_scalar(read_marker, ScalarKind::String, &setup)
+            .await
+            .expect("scalar read");
+        assert_eq!(
+            value,
+            Value::String("seen".into()),
+            "execute_scalar setup takes hold"
+        );
+
+        let page = connector
+            .read_page(read_marker, 4096, &setup)
+            .await
+            .expect("page read");
+        assert_eq!(
+            page.value.rows[0][0],
+            Value::String("seen".into()),
+            "read_page setup takes hold"
+        );
+
+        // The cursor's held transaction: setup runs at open, before the
+        // DECLARE, so the cursor's snapshot carries the value.
+        let cursor = connector
+            .open_cursor(read_marker, &setup)
+            .await
+            .expect("open cursor");
+        let page = connector.fetch_cursor(cursor, 4096).await.expect("fetch");
+        assert_eq!(
+            page.value.rows[0][0],
+            Value::String("seen".into()),
+            "the cursor's held transaction ran the setup before the DECLARE"
+        );
+        connector.close_cursor(cursor).await.expect("close");
+
+        let plain = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let (value, _) = plain
+            .execute_scalar(read_marker, ScalarKind::String, &())
+            .await
+            .expect("scalar read");
+        assert_eq!(value, Value::Null, "an empty setup leaves the marker unset");
+    });
 }

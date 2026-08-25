@@ -91,7 +91,11 @@ impl<B: Backend> RowPage<B> {
     /// postcard, because that is already the crate's encoding for a row's
     /// identity (`crate::row_set`), so one row costs the same number of bytes
     /// here as it does there.
-    pub(crate) fn row_bytes_of(row: &[Value<B>]) -> usize {
+    ///
+    /// This is the canonical per-row cost an outside connector spends against
+    /// the [`read_page`](Connector::read_page) budget, so call it rather than
+    /// recompute a size that could drift from the one the budget is measured in.
+    pub fn row_bytes_of(row: &[Value<B>]) -> usize {
         postcard::experimental::serialized_size(row).unwrap_or(usize::MAX)
     }
 }
@@ -329,6 +333,47 @@ pub trait Connector {
     }
 }
 
+/// Transaction-scoped setup a connector runs before the caller's read SQL.
+///
+/// The shipped diesel connectors carry this as their
+/// [`Connector::AuthContext`]. Before each read, the connector runs every
+/// statement here in order, inside the transaction that serves the read, so a
+/// per-tier statement timeout or a per-viewer identity takes hold for that read
+/// and no other. The list is borrowed from the value the caller already builds
+/// per read, so a statement that varies per call costs no allocation the caller
+/// was not already making.
+///
+/// The bound belongs on a connector's own generic parameter, never on
+/// [`Connector::AuthContext`] itself: a third-party connector may carry an auth
+/// value that runs no SQL setup at all.
+pub trait SessionSetup {
+    /// Statements to run, in order, at the start of each read transaction.
+    fn setup_statements(&self) -> &[alloc::string::String];
+}
+
+/// The empty setup: the default every shipped connector carries, byte for byte
+/// the behaviour before the seam existed.
+impl SessionSetup for () {
+    fn setup_statements(&self) -> &[alloc::string::String] {
+        &[]
+    }
+}
+
+/// Run each setup statement in order on `conn`. Shared by every sync
+/// diesel-backed connector, called inside the transaction that serves the read
+/// and before the caller's SQL.
+#[cfg(feature = "executor-diesel")]
+fn run_setup_statements<C>(conn: &mut C, statements: &[alloc::string::String]) -> QueryResult<()>
+where
+    C: Connection,
+    for<'q> SqlQuery: diesel::query_dsl::methods::ExecuteDsl<C, C::Backend>,
+{
+    for statement in statements {
+        sql_query(statement.as_str()).execute(conn)?;
+    }
+    Ok(())
+}
+
 /// Error returned by [`AutoResolvingEngine::consumers`].
 ///
 /// [`AutoResolvingEngine::consumers`]: super::AutoResolvingEngine::consumers
@@ -489,19 +534,35 @@ impl DieselBackend for crate::backend::SQLite {
 /// Returns [`diesel::result::Error`] for any underlying database failure
 /// (network drop, statement error, decoding mismatch).
 #[cfg(feature = "executor-diesel")]
-pub struct DieselConnector<C: Connection, B: DieselBackend> {
+pub struct DieselConnector<C: Connection, B: DieselBackend, S = ()> {
     conn: RefCell<C>,
     _backend: core::marker::PhantomData<fn() -> B>,
+    _setup: core::marker::PhantomData<fn() -> S>,
 }
 
 #[cfg(feature = "executor-diesel")]
 impl<C: Connection, B: DieselBackend> DieselConnector<C, B> {
-    /// Wrap an owned connection. The connector takes exclusive ownership
-    /// and serializes access through interior mutability.
+    /// Wrap an owned connection with no session setup. The connector takes
+    /// exclusive ownership and serializes access through interior mutability.
     pub const fn new(conn: C) -> Self {
         Self {
             conn: RefCell::new(conn),
             _backend: core::marker::PhantomData,
+            _setup: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "executor-diesel")]
+impl<C: Connection, B: DieselBackend, S: SessionSetup> DieselConnector<C, B, S> {
+    /// Wrap an owned connection whose reads run the setup statements carried by
+    /// the per-read [`SessionSetup`] value `S`. `S` is named by the return
+    /// type, since the value itself arrives per read rather than being stored.
+    pub const fn with_session_setup(conn: C) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+            _backend: core::marker::PhantomData,
+            _setup: core::marker::PhantomData,
         }
     }
 }
@@ -617,17 +678,19 @@ where
 /// feature (`diesel-typed` for Postgres, `diesel-typed-sqlite`,
 /// `diesel-typed-mysql`, `executor-diesel-postgres`, `executor-diesel-mysql`),
 /// and a connector that cannot decode a row cannot honestly claim to read one.
-impl<C, B> Connector for DieselConnector<C, B>
+impl<C, B, S> Connector for DieselConnector<C, B, S>
 where
     C: Connection + diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
     C::Backend: crate::diesel_decode::RowFieldDecode + diesel::backend::DieselReserveSpecialization,
     B: DieselBackend + crate::diesel_decode::SpellCanonical,
+    S: SessionSetup,
     for<'q> SqlQuery: LoadQuery<'q, C, IntRow>
         + LoadQuery<'q, C, FloatRow>
         + LoadQuery<'q, C, TextRow>
-        + LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>,
+        + LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>
+        + diesel::query_dsl::methods::ExecuteDsl<C, C::Backend>,
 {
-    type AuthContext = ();
+    type AuthContext = S;
     type Error = diesel::result::Error;
     /// Backend-agnostic v1 default: this connector does not read the
     /// underlying source's position. PG-aware variants
@@ -640,9 +703,21 @@ where
         &self,
         sql: &str,
         kind: BuiltinKind,
-        _auth: &(),
+        auth: &S,
     ) -> Result<(Value<B>, Option<Self::Checkpoint>), Self::Error> {
-        let value = load_scalar::<_, B>(&mut self.conn.borrow_mut(), sql, kind)?;
+        let mut conn = self.conn.borrow_mut();
+        let setup = auth.setup_statements();
+        // Decision 5: this path opens no transaction today, so a caller
+        // supplying nothing gets that behaviour byte for byte, and one
+        // supplying statements gets a real transaction so the setup takes hold.
+        let value = if setup.is_empty() {
+            load_scalar::<_, B>(&mut *conn, sql, kind)?
+        } else {
+            diesel::connection::Connection::transaction(&mut *conn, |conn| {
+                run_setup_statements(conn, setup)?;
+                load_scalar::<_, B>(conn, sql, kind)
+            })?
+        };
         Ok((value, None))
     }
 
@@ -650,9 +725,20 @@ where
         &self,
         sql: &str,
         max_bytes: usize,
-        _auth: &(),
+        auth: &S,
     ) -> Result<Snapshot<RowPage<B>, Self::Checkpoint>, Self::Error> {
-        let value = load_page::<_, B>(&mut self.conn.borrow_mut(), sql, max_bytes)?;
+        let mut conn = self.conn.borrow_mut();
+        let setup = auth.setup_statements();
+        // Decision 5, as in `execute_scalar`: a transaction only when the
+        // caller supplied statements.
+        let value = if setup.is_empty() {
+            load_page::<_, B>(&mut *conn, sql, max_bytes)?
+        } else {
+            diesel::connection::Connection::transaction(&mut *conn, |conn| {
+                run_setup_statements(conn, setup)?;
+                load_page::<_, B>(conn, sql, max_bytes)
+            })?
+        };
         Ok(Snapshot {
             value,
             checkpoint: None,
@@ -663,7 +749,7 @@ where
         &self,
         sql: &str,
         kinds: &[BuiltinKind],
-        _auth: &(),
+        auth: &S,
     ) -> Result<(alloc::vec::Vec<Value<B>>, Option<Self::Checkpoint>), ScalarRowError<Self::Error>>
     {
         let mut conn = self.conn.borrow_mut();
@@ -672,6 +758,7 @@ where
         // connector uses the connection's default isolation; the LSN-aware
         // `PgDieselConnector` additionally pins REPEATABLE READ.
         let values = diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            run_setup_statements(conn, auth.setup_statements())?;
             load_scalar_row::<_, B>(conn, sql, kinds)
         })
         .map_err(ScalarRowError::Connector)?;
@@ -709,19 +796,34 @@ where
 /// Returns [`diesel::result::Error`] for any underlying database failure
 /// (network drop, statement error, malformed LSN response).
 #[cfg(feature = "executor-diesel-postgres")]
-pub struct PgDieselConnector {
+pub struct PgDieselConnector<S = ()> {
     conn: RefCell<diesel::PgConnection>,
+    _setup: core::marker::PhantomData<fn() -> S>,
 }
 
 #[cfg(feature = "executor-diesel-postgres")]
 impl PgDieselConnector {
-    /// Wrap an owned [`PgConnection`](diesel::PgConnection). The connector
-    /// takes exclusive ownership and serializes access through interior
-    /// mutability.
+    /// Wrap an owned [`PgConnection`](diesel::PgConnection) with no session
+    /// setup. The connector takes exclusive ownership and serializes access
+    /// through interior mutability.
     #[must_use]
     pub const fn new(conn: diesel::PgConnection) -> Self {
         Self {
             conn: RefCell::new(conn),
+            _setup: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "executor-diesel-postgres")]
+impl<S: SessionSetup> PgDieselConnector<S> {
+    /// Wrap an owned [`PgConnection`](diesel::PgConnection) whose reads run the
+    /// setup statements carried by the per-read [`SessionSetup`] value `S`.
+    #[must_use]
+    pub const fn with_session_setup(conn: diesel::PgConnection) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+            _setup: core::marker::PhantomData,
         }
     }
 }
@@ -743,8 +845,8 @@ fn read_current_lsn(conn: &mut diesel::PgConnection) -> diesel::QueryResult<Opti
 }
 
 #[cfg(feature = "executor-diesel-postgres")]
-impl Connector for PgDieselConnector {
-    type AuthContext = ();
+impl<S: SessionSetup> Connector for PgDieselConnector<S> {
+    type AuthContext = S;
     type Error = diesel::result::Error;
     type Checkpoint = crate::PgLsn;
     type Backend = crate::backend::Postgres;
@@ -753,7 +855,7 @@ impl Connector for PgDieselConnector {
         &self,
         sql: &str,
         kind: BuiltinKind,
-        _auth: &(),
+        auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
         // The position is read before the snapshot exists. A caller replays the
@@ -767,6 +869,7 @@ impl Connector for PgDieselConnector {
         let lsn = read_current_lsn(&mut conn)?;
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
+            run_setup_statements(conn, auth.setup_statements())?;
             let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
             Ok((value, lsn))
         })
@@ -776,7 +879,7 @@ impl Connector for PgDieselConnector {
         &self,
         sql: &str,
         max_bytes: usize,
-        _auth: &(),
+        auth: &S,
     ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.conn.borrow_mut();
         // The page and the LSN share one snapshot, so a caller reconciling
@@ -793,6 +896,7 @@ impl Connector for PgDieselConnector {
         conn.transaction(|conn| {
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(conn)?;
+            run_setup_statements(conn, auth.setup_statements())?;
             let value = load_page::<_, crate::backend::Postgres>(conn, sql, max_bytes)?;
             Ok(Snapshot {
                 value,
@@ -805,7 +909,7 @@ impl Connector for PgDieselConnector {
         &self,
         sql: &str,
         kinds: &[BuiltinKind],
-        _auth: &(),
+        auth: &S,
     ) -> Result<
         (
             alloc::vec::Vec<Value<Self::Backend>>,
@@ -825,6 +929,7 @@ impl Connector for PgDieselConnector {
         let lsn = read_current_lsn(&mut conn).map_err(ScalarRowError::Connector)?;
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
+            run_setup_statements(conn, auth.setup_statements())?;
             let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
             Ok((values, lsn))
         })
@@ -866,19 +971,34 @@ impl Connector for PgDieselConnector {
 ///
 /// Returns [`diesel::result::Error`] for any underlying database failure.
 #[cfg(feature = "executor-diesel-mysql")]
-pub struct MysqlDieselConnector {
+pub struct MysqlDieselConnector<S = ()> {
     conn: RefCell<diesel::MysqlConnection>,
+    _setup: core::marker::PhantomData<fn() -> S>,
 }
 
 #[cfg(feature = "executor-diesel-mysql")]
 impl MysqlDieselConnector {
-    /// Wrap an owned [`MysqlConnection`](diesel::MysqlConnection). The connector
-    /// takes exclusive ownership and serializes access through interior
-    /// mutability.
+    /// Wrap an owned [`MysqlConnection`](diesel::MysqlConnection) with no
+    /// session setup. The connector takes exclusive ownership and serializes
+    /// access through interior mutability.
     #[must_use]
     pub const fn new(conn: diesel::MysqlConnection) -> Self {
         Self {
             conn: RefCell::new(conn),
+            _setup: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "executor-diesel-mysql")]
+impl<S: SessionSetup> MysqlDieselConnector<S> {
+    /// Wrap an owned [`MysqlConnection`](diesel::MysqlConnection) whose reads
+    /// run the setup statements carried by the per-read [`SessionSetup`] `S`.
+    #[must_use]
+    pub const fn with_session_setup(conn: diesel::MysqlConnection) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+            _setup: core::marker::PhantomData,
         }
     }
 }
@@ -937,8 +1057,8 @@ fn read_binlog_pos(conn: &mut diesel::MysqlConnection) -> Option<crate::MysqlBin
 }
 
 #[cfg(feature = "executor-diesel-mysql")]
-impl Connector for MysqlDieselConnector {
-    type AuthContext = ();
+impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
+    type AuthContext = S;
     type Error = diesel::result::Error;
     type Checkpoint = crate::MysqlBinlogPos;
     type Backend = crate::backend::MySql;
@@ -947,7 +1067,7 @@ impl Connector for MysqlDieselConnector {
         &self,
         sql: &str,
         kind: BuiltinKind,
-        _auth: &(),
+        auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.conn.borrow_mut();
         // Position before snapshot, per `Connector::Checkpoint`: the coordinate
@@ -955,6 +1075,7 @@ impl Connector for MysqlDieselConnector {
         // of the snapshot and a replay from there loses a commit.
         let pos = read_binlog_pos(&mut conn);
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            run_setup_statements(conn, auth.setup_statements())?;
             let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
             Ok((value, pos))
         })
@@ -964,12 +1085,13 @@ impl Connector for MysqlDieselConnector {
         &self,
         sql: &str,
         max_bytes: usize,
-        _auth: &(),
+        auth: &S,
     ) -> Result<Snapshot<RowPage<crate::backend::MySql>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.conn.borrow_mut();
         // Position before snapshot, per `Connector::Checkpoint`.
         let pos = read_binlog_pos(&mut conn);
         conn.transaction(|conn| {
+            run_setup_statements(conn, auth.setup_statements())?;
             let value = load_page::<_, crate::backend::MySql>(conn, sql, max_bytes)?;
             Ok(Snapshot {
                 value,
@@ -982,7 +1104,7 @@ impl Connector for MysqlDieselConnector {
         &self,
         sql: &str,
         kinds: &[BuiltinKind],
-        _auth: &(),
+        auth: &S,
     ) -> Result<
         (
             alloc::vec::Vec<Value<Self::Backend>>,
@@ -994,6 +1116,7 @@ impl Connector for MysqlDieselConnector {
         // Position before snapshot, per `Connector::Checkpoint`.
         let pos = read_binlog_pos(&mut conn);
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
+            run_setup_statements(conn, auth.setup_statements())?;
             let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
             Ok((values, pos))
         })
@@ -1025,7 +1148,7 @@ impl Connector for MysqlDieselConnector {
 /// `Send + Sync` so it can be shared across async tasks running on a
 /// multi-threaded runtime.
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
-pub struct PgR2D2DieselConnector {
+pub struct PgR2D2DieselConnector<S = ()> {
     pool: r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
     /// Cursors this connector holds open, each pinning one pooled connection
     /// inside its own transaction until closed. A cursor is the only way pages
@@ -1039,6 +1162,7 @@ pub struct PgR2D2DieselConnector {
         hashbrown::HashMap<CursorId, alloc::sync::Arc<parking_lot::Mutex<PgCursor>>>,
     >,
     next_cursor: core::sync::atomic::AtomicU64,
+    _setup: core::marker::PhantomData<fn() -> S>,
 }
 
 /// One open cursor: the connection it pins, the position its snapshot sits at,
@@ -1107,6 +1231,24 @@ impl PgR2D2DieselConnector {
             pool,
             cursors: parking_lot::Mutex::new(hashbrown::HashMap::new()),
             next_cursor: core::sync::atomic::AtomicU64::new(1),
+            _setup: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
+impl<S: SessionSetup> PgR2D2DieselConnector<S> {
+    /// Wrap an `r2d2::Pool` whose reads run the setup statements carried by the
+    /// per-read [`SessionSetup`] value `S`.
+    #[must_use]
+    pub fn with_session_setup(
+        pool: r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>,
+    ) -> Self {
+        Self {
+            pool,
+            cursors: parking_lot::Mutex::new(hashbrown::HashMap::new()),
+            next_cursor: core::sync::atomic::AtomicU64::new(1),
+            _setup: core::marker::PhantomData,
         }
     }
 }
@@ -1142,8 +1284,8 @@ impl From<diesel::result::Error> for PgR2D2Error {
 }
 
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
-impl Connector for PgR2D2DieselConnector {
-    type AuthContext = ();
+impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
+    type AuthContext = S;
     type Error = PgR2D2Error;
     type Checkpoint = crate::PgLsn;
     type Backend = crate::backend::Postgres;
@@ -1152,7 +1294,7 @@ impl Connector for PgR2D2DieselConnector {
         &self,
         sql: &str,
         kind: BuiltinKind,
-        _auth: &(),
+        auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
         let mut conn = self.pool.get()?;
         // The position is read before the snapshot exists. A caller replays the
@@ -1168,6 +1310,7 @@ impl Connector for PgR2D2DieselConnector {
             diesel::connection::Connection::transaction(&mut *conn, |conn| {
                 sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                     .execute(conn)?;
+                run_setup_statements(conn, auth.setup_statements())?;
                 let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
                 Ok((value, lsn))
             });
@@ -1178,7 +1321,7 @@ impl Connector for PgR2D2DieselConnector {
         &self,
         sql: &str,
         max_bytes: usize,
-        _auth: &(),
+        auth: &S,
     ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
         let mut conn = self.pool.get().map_err(PgR2D2Error::Pool)?;
         // The position is read before the snapshot exists. A caller replays the
@@ -1193,6 +1336,7 @@ impl Connector for PgR2D2DieselConnector {
         let result = conn.transaction::<_, diesel::result::Error, _>(|conn| {
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(conn)?;
+            run_setup_statements(conn, auth.setup_statements())?;
             let value = load_page::<_, crate::backend::Postgres>(conn, sql, max_bytes)?;
             Ok(Snapshot {
                 value,
@@ -1206,7 +1350,7 @@ impl Connector for PgR2D2DieselConnector {
         &self,
         sql: &str,
         kinds: &[BuiltinKind],
-        _auth: &(),
+        auth: &S,
     ) -> Result<
         (
             alloc::vec::Vec<Value<Self::Backend>>,
@@ -1233,13 +1377,14 @@ impl Connector for PgR2D2DieselConnector {
             diesel::result::Error,
         > = diesel::connection::Connection::transaction(&mut *conn, |conn| {
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
+            run_setup_statements(conn, auth.setup_statements())?;
             let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
             Ok((values, lsn))
         });
         result.map_err(|e| ScalarRowError::Connector(e.into()))
     }
 
-    fn open_cursor(&self, sql: &str, _auth: &()) -> Result<CursorId, CursorError<Self::Error>> {
+    fn open_cursor(&self, sql: &str, auth: &S) -> Result<CursorId, CursorError<Self::Error>> {
         let mut conn = self
             .pool
             .get()
@@ -1274,6 +1419,7 @@ impl Connector for PgR2D2DieselConnector {
             PgTxn::begin_transaction(&mut *conn)?;
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut *conn)?;
+            run_setup_statements(&mut *conn, auth.setup_statements())?;
             diesel::sql_query(alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {sql}"))
                 .execute(&mut *conn)?;
             Ok(lsn)

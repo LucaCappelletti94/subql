@@ -30,7 +30,9 @@ use diesel::{sql_query, PgConnection, RunQueryDsl};
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, ScalarKind, Value};
-use subql::reexec::{AutoResolvingEngine, Connector, PgDieselConnector, SnapshotResult, SyncMode};
+use subql::reexec::{
+    AutoResolvingEngine, Connector, PgDieselConnector, SessionSetup, SnapshotResult, SyncMode,
+};
 use subql::{
     parse_wal2json_v2, DefaultIds, MessageV2, Registered, SubscriptionEngine, SubscriptionRequest,
     Tier,
@@ -613,4 +615,54 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
         position.expect("a PG connector reports a position") < after_commit,
         "the seed read's position must sit behind the commit at {after_commit:?}"
     );
+}
+
+/// A borrowed-list session setup, mirroring what a caller builds per read.
+struct MarkerSetup(Vec<String>);
+
+impl SessionSetup for MarkerSetup {
+    fn setup_statements(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// The session-setup seam runs its statements inside each read's transaction on
+/// the single-connection `PgDieselConnector`. `SET LOCAL` takes hold only for
+/// the transaction that runs it, so a read that sees the value proves the setup
+/// ran in that read's own transaction.
+#[test]
+#[ignore = "requires Docker; run with --ignored"]
+fn session_setup_runs_inside_each_read_transaction_sync_pg() {
+    common::assert_docker_available();
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+
+    let read_marker = "SELECT current_setting('app.marker', true) AS v";
+    let setup = MarkerSetup(vec!["SET LOCAL app.marker = 'seen'".to_string()]);
+    let connector: PgDieselConnector<MarkerSetup> =
+        PgDieselConnector::with_session_setup(common::pg_connect(port));
+
+    let (value, _) = connector
+        .execute_scalar(read_marker, ScalarKind::String, &setup)
+        .expect("scalar read");
+    assert_eq!(
+        value,
+        Value::String("seen".into()),
+        "execute_scalar setup takes hold"
+    );
+
+    let page = connector
+        .read_page(read_marker, 4096, &setup)
+        .expect("page read");
+    assert_eq!(
+        page.value.rows[0][0],
+        Value::String("seen".into()),
+        "read_page setup takes hold"
+    );
+
+    let plain = PgDieselConnector::new(common::pg_connect(port));
+    let (value, _) = plain
+        .execute_scalar(read_marker, ScalarKind::String, &())
+        .expect("scalar read");
+    assert_eq!(value, Value::Null, "an empty setup leaves the marker unset");
 }
