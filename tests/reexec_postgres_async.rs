@@ -991,11 +991,13 @@ fn a_captured_query_snapshots_its_rows_on_either_tier_async() {
             "SELECT * FROM orders WHERE lower(status) = 'paid'",
             true,
         );
-        // ORDER BY makes it not clause-free, so it falls to the whole re-read.
+        // DISTINCT is keyless, so it cannot resume by changed key and falls to
+        // the whole re-read. Every row has a unique key, so the answer is the
+        // same rows and columns as the keyed capture above.
         let whole = register_captured(
             &mut engine,
             2u64,
-            "SELECT * FROM orders WHERE lower(status) = 'paid' ORDER BY id",
+            "SELECT DISTINCT * FROM orders WHERE lower(status) = 'paid'",
             false,
         );
 

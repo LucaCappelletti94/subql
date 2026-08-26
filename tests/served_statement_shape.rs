@@ -171,14 +171,31 @@ fn a_row_bound_is_refused() {
     refused_naming("SELECT COUNT(*) FROM t LIMIT 1", "LIMIT");
 }
 
-/// Ordering is the one refused clause that does not change which rows the
-/// answer contains. It is refused anyway: a subscription that accepted it
-/// would drop it, and the re-execution tier that will serve it needs the core
-/// engine to decline it first.
+/// `ORDER BY` without a window is the one clause that does not change which
+/// rows the answer contains: it changes only the sequence they arrive in. It
+/// is served as an ordinary row subscription now, the in-process evaluator
+/// matching the same rows while a caller applies the ordering to its own
+/// snapshot. `LIMIT`/`OFFSET`, which do change membership, stay refused.
 #[test]
-fn ordering_is_refused() {
-    refused_naming("SELECT * FROM t ORDER BY id", "ORDER BY");
-    refused_naming("SELECT * FROM t ORDER BY status DESC, id", "ORDER BY");
+fn ordering_alone_is_served_but_a_window_is_refused() {
+    for sql in [
+        "SELECT * FROM t ORDER BY id",
+        "SELECT * FROM t ORDER BY status DESC, id",
+    ] {
+        let result = engine().register(SubscriptionRequest::new(1u64, sql));
+        assert!(
+            matches!(
+                result,
+                Ok(Registered {
+                    tier: Tier::InProcess(_),
+                    ..
+                })
+            ),
+            "{sql} should be served in process, got {result:?}"
+        );
+    }
+    refused_naming("SELECT * FROM t ORDER BY id LIMIT 3", "LIMIT");
+    refused_naming("SELECT * FROM t ORDER BY id OFFSET 5", "OFFSET");
 }
 
 /// The worst of the family: the CTE shadows the catalog table, so the table
@@ -320,7 +337,6 @@ fn a_dropped_clause_never_rides_a_scalar_reexecution() {
     for sql in [
         "SELECT MIN(amount) FROM t GROUP BY status",
         "SELECT MAX(amount) FROM t HAVING COUNT(*) > 1",
-        "SELECT MIN(amount) FROM t ORDER BY amount",
         "SELECT MIN(amount) FROM t LIMIT 1",
     ] {
         // The core engine's refusal is what routes it upward at all.
@@ -373,10 +389,6 @@ fn a_clause_inside_a_membership_subquery_is_refused() {
     refused_naming(
         "SELECT * FROM t WHERE id IN (SELECT t_id FROM m GROUP BY t_id)",
         "GROUP BY",
-    );
-    refused_naming(
-        "SELECT * FROM t WHERE id IN (SELECT t_id FROM m ORDER BY t_id)",
-        "ORDER BY",
     );
     refused_naming(
         "SELECT * FROM t WHERE id IN (SELECT DISTINCT t_id FROM m)",

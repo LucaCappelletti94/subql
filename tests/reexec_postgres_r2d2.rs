@@ -308,14 +308,16 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
         .collect();
     setup_pg(&mut conn_setup, &seed);
 
-    // `lower(status)` is a function call, which the in-process predicate
-    // language cannot evaluate, so the engine refuses and the wrapper captures.
+    // `lower(status)` is a function call the in-process predicate language
+    // cannot evaluate, so the engine refuses and the wrapper captures. DISTINCT
+    // is keyless, so the capture cannot resume by changed key and lands on the
+    // whole re-read tier.
     let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(64);
     let registered = engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
                 1u64,
-                "SELECT id, status FROM orders WHERE lower(status) = 'paid' ORDER BY id",
+                "SELECT DISTINCT id, status FROM orders WHERE lower(status) = 'paid'",
             ),
             (),
         )
@@ -404,12 +406,13 @@ fn a_captured_query_snapshots_its_answer_at_registration() {
         .collect();
     setup_pg(&mut conn_setup, &seed);
 
+    // DISTINCT is keyless, so the capture lands on the whole re-read tier.
     let mut engine = build_engine(catalog(), build_pool(port)).with_max_page_bytes(64);
     let subscription_id = match engine
         .register(
             SubscriptionRequest::<DefaultIds, Postgres>::new(
                 1u64,
-                "SELECT id, status FROM orders WHERE lower(status) = 'paid' ORDER BY id",
+                "SELECT DISTINCT id, status FROM orders WHERE lower(status) = 'paid'",
             ),
             (),
         )

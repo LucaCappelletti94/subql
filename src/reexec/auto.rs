@@ -121,6 +121,12 @@ pub(super) struct ResolveContext<I: IdTypes, A> {
     pub(super) whole_result: bool,
     /// Whether resolving means asking only about the rows that changed.
     pub(super) keyed: bool,
+    /// Whether this is a still-folding in-process aggregate. Such a context
+    /// carries only the auth and session for a possible demotion to a whole
+    /// re-read (an UPDATE without its old row image demotes an ungrouped
+    /// SUM/AVG). The fold itself runs in the engine, so snapshot skips it and
+    /// no read is issued until a demotion sets `whole_result`.
+    pub(super) aggregate: bool,
     /// Which re-read the next page belongs to, so a consumer can tell a new
     /// answer from a continuation of the old one.
     pub(super) generation: u64,
@@ -360,6 +366,7 @@ where
                         grouped_bootstrap: None,
                         whole_result: false,
                         keyed: false,
+                        aggregate: false,
                         generation: 0,
                         session,
                         auth,
@@ -379,6 +386,7 @@ where
                         grouped_bootstrap: Some(bootstrap.clone()),
                         whole_result: false,
                         keyed: false,
+                        aggregate: false,
                         generation: 0,
                         session,
                         auth,
@@ -402,13 +410,36 @@ where
                         // so.
                         whole_result: matches!(result.tier, Tier::WholeRows { .. }),
                         keyed: matches!(result.tier, Tier::KeyedRows { .. }),
+                        aggregate: false,
                         generation: 0,
                         session,
                         auth,
                     },
                 );
             }
-            Tier::InProcess(_) => {}
+            Tier::InProcess(served) => {
+                // A still-folding in-process aggregate keeps only its auth and
+                // session, so a later demotion to a whole re-read resolves with
+                // the caller's own auth. The fold runs in the engine; nothing is
+                // read here. A plain row subscription (no bootstrap) stores
+                // nothing, as before.
+                if served.aggregate_bootstrap.is_some() {
+                    self.contexts.insert(
+                        result.subscription_id,
+                        ResolveContext {
+                            sql: String::new(),
+                            column_kind: BuiltinKind::String,
+                            grouped_bootstrap: None,
+                            whole_result: false,
+                            keyed: false,
+                            aggregate: true,
+                            generation: 0,
+                            session,
+                            auth,
+                        },
+                    );
+                }
+            }
         }
         Ok(result)
     }
@@ -596,6 +627,12 @@ where
                 rows,
                 checkpoint,
             }));
+        }
+        // A still-folding in-process aggregate is seeded through Install, not
+        // read here. After a demotion the context is `whole_result` and handled
+        // above, so this only fires before any demotion.
+        if context.aggregate {
+            return Ok(None);
         }
         let (value, checkpoint) = self
             .mode
@@ -1286,7 +1323,13 @@ where
             self.contexts.remove(&subscription_id);
             return true;
         }
-        self.inner.unregister_subscription(subscription_id)
+        let removed = self.inner.unregister_subscription(subscription_id);
+        if removed {
+            // Drop an in-process aggregate's stored context (auth for a possible
+            // demotion); a plain row subscription has none and this is a no-op.
+            self.contexts.remove(&subscription_id);
+        }
+        removed
     }
 
     /// Unregister an in-process subscription by `(consumer_id, sql)`.
@@ -2396,6 +2439,222 @@ mod tests {
                 assert!(matches!(error, super::super::CursorError::Unsupported));
             }
             Err(other) => panic!("expected Cursor naming its subscription, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ungrouped_aggregate_folds_through_the_wrapper() {
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        let count_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            count_id,
+            crate::AggregateSeedInstall {
+                rows: alloc::vec![alloc::vec![Value::Int(5)]],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        // The seeded fold updates through the facade rather than being absorbed.
+        let n = e.consumers(&insert_event(tid, 1, 5.0)).unwrap();
+        assert_eq!(
+            n.aggregate_updates.len(),
+            1,
+            "one aggregate update through the wrapper"
+        );
+        assert_eq!(
+            n.aggregate_updates[0].folded_value(),
+            Some(crate::AggValue::Count(6)),
+            "the incremented total"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "an in-process fold reads nothing"
+        );
+    }
+
+    #[test]
+    fn ungrouped_aggregate_folds_through_the_batch_wrapper() {
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        let count_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            count_id,
+            crate::AggregateSeedInstall {
+                rows: alloc::vec![alloc::vec![Value::Int(5)]],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        let outcome = e
+            .consumers_batch(&[insert_event(tid, 1, 5.0), insert_event(tid, 2, 6.0)])
+            .unwrap();
+        // Two inserts fold to two updates through the batch facade.
+        assert_eq!(outcome.aggregate_updates.len(), 2, "each insert folds");
+        assert_eq!(
+            outcome.aggregate_updates.last().unwrap().folded_value(),
+            Some(crate::AggValue::Count(7)),
+            "the running total after both inserts"
+        );
+    }
+
+    #[test]
+    fn ungrouped_aggregate_demotion_resolves_through_the_wrapper() {
+        // A filtered count needs the old row to know whether it was matching;
+        // an UPDATE missing its old image demotes the aggregate to a whole
+        // re-read. The wrapper must resolve that with the caller's auth, not
+        // panic for want of a stored context.
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        let count_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders WHERE status = 'paid'"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            count_id,
+            crate::AggregateSeedInstall {
+                rows: alloc::vec![alloc::vec![Value::Int(1)]],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        let missing_old = TestEvent::<Postgres>::update(tid, alloc::vec![], row(1, 5.0))
+            .with_pk_columns([0u16])
+            .with_changed_columns([3u16]);
+        // The mock connector holds no cursor, so the demoted whole re-read
+        // surfaces as a Cursor error naming the aggregate rather than a panic.
+        match e.consumers(&missing_old) {
+            Err(ReExecError::Cursor { subscription, .. }) => {
+                assert_eq!(
+                    subscription, count_id,
+                    "the demoted aggregate attempts its whole read"
+                );
+            }
+            Ok(_) => panic!("expected the demotion to attempt a whole read"),
+            Err(other) => panic!("expected a Cursor error naming the aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_of_a_folding_aggregate_is_none() {
+        // An aggregate seeds through Install, so the wrapper has nothing to
+        // bootstrap for it: snapshot returns None rather than mistaking the
+        // stored aggregate context for a scalar re-read.
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
+        let count_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            count_id,
+            crate::AggregateSeedInstall {
+                rows: alloc::vec![alloc::vec![Value::Int(5)]],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        assert!(
+            e.snapshot(count_id).unwrap().is_none(),
+            "no bootstrap for a fold"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "snapshot reads nothing for a fold"
+        );
+    }
+
+    #[test]
+    fn ordered_row_query_folds_in_process() {
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders ORDER BY price"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                tier: Tier::InProcess(_),
+                ..
+            } => {}
+            other => panic!("expected InProcess for an ordered row query, got {other:?}"),
+        }
+        let n = e.consumers(&insert_event(tid, 1, 5.0)).unwrap();
+        assert!(
+            n.engine.inserted().contains(&1),
+            "the ordered row list is notified of the insert"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "an ordered row list reads nothing"
+        );
+    }
+
+    #[test]
+    fn ordered_row_query_with_a_window_stays_a_read_tier() {
+        // A window changes membership, so ordering plus LIMIT/OFFSET stays a
+        // whole-answer read tier rather than an in-process row list.
+        let (mut e, _tid) = engine_with_values(alloc::vec![]);
+        for sql in [
+            "SELECT * FROM orders ORDER BY price LIMIT 3",
+            "SELECT * FROM orders ORDER BY price OFFSET 5",
+        ] {
+            let reg = e.register(SubscriptionRequest::new(1u64, sql), ()).unwrap();
+            assert!(
+                !matches!(reg.tier, Tier::InProcess(_)),
+                "a windowed order stays a read tier: {sql} classified {:?}",
+                reg.tier
+            );
         }
     }
 }

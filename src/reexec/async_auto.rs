@@ -379,6 +379,12 @@ where
                 checkpoint,
             }));
         }
+        // A still-folding in-process aggregate is seeded through Install, not
+        // read here. After a demotion the context is `whole_result` and handled
+        // above, so this only fires before any demotion.
+        if context.aggregate {
+            return Ok(None);
+        }
         let (value, checkpoint) = self
             .mode
             .connector
@@ -1212,7 +1218,13 @@ where
             self.contexts.remove(&subscription_id);
             return true;
         }
-        self.inner.unregister_subscription(subscription_id)
+        let removed = self.inner.unregister_subscription(subscription_id);
+        if removed {
+            // Drop an in-process aggregate's stored context (auth for a possible
+            // demotion); a plain row subscription has none and this is a no-op.
+            self.contexts.remove(&subscription_id);
+        }
+        removed
     }
 
     /// Unregister an engine subscription by `(consumer_id, sql)`.
@@ -2258,5 +2270,192 @@ mod tests {
             }
             Err(other) => panic!("expected Cursor naming its subscription, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn async_ungrouped_aggregate_folds_through_the_wrapper() {
+        let (mut e, tid) = engine_with_values(vec![]);
+        let count_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            count_id,
+            crate::AggregateSeedInstall {
+                rows: vec![vec![Value::Int(5)]],
+                read_at: None::<NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        let n = block_on(e.consumers(&insert_event(tid, 1, 5.0))).unwrap();
+        assert_eq!(
+            n.aggregate_updates.len(),
+            1,
+            "one aggregate update through the wrapper"
+        );
+        assert_eq!(
+            n.aggregate_updates[0].folded_value(),
+            Some(crate::AggValue::Count(6)),
+            "the incremented total"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "an in-process fold reads nothing"
+        );
+    }
+
+    #[test]
+    fn async_ungrouped_aggregate_folds_through_the_batch_wrapper() {
+        let (mut e, tid) = engine_with_values(vec![]);
+        let count_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            count_id,
+            crate::AggregateSeedInstall {
+                rows: vec![vec![Value::Int(5)]],
+                read_at: None::<NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        let outcome =
+            block_on(e.consumers_batch(&[insert_event(tid, 1, 5.0), insert_event(tid, 2, 6.0)]))
+                .unwrap();
+        assert_eq!(outcome.aggregate_updates.len(), 2, "each insert folds");
+        assert_eq!(
+            outcome.aggregate_updates.last().unwrap().folded_value(),
+            Some(crate::AggValue::Count(7)),
+            "the running total after both inserts"
+        );
+    }
+
+    #[test]
+    fn async_ungrouped_aggregate_demotion_resolves_through_the_wrapper() {
+        let (mut e, tid) = engine_with_values(vec![]);
+        let count_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders WHERE status = 'paid'"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            count_id,
+            crate::AggregateSeedInstall {
+                rows: vec![vec![Value::Int(1)]],
+                read_at: None::<NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        let missing_old = TestEvent::<Postgres>::update(tid, vec![], row(1, 5.0))
+            .with_pk_columns([0u16])
+            .with_changed_columns([3u16]);
+        match block_on(e.consumers(&missing_old)) {
+            Err(ReExecError::Cursor { subscription, .. }) => {
+                assert_eq!(
+                    subscription, count_id,
+                    "the demoted aggregate attempts its whole read"
+                );
+            }
+            Ok(_) => panic!("expected the demotion to attempt a whole read"),
+            Err(other) => panic!("expected a Cursor error naming the aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn async_snapshot_of_a_folding_aggregate_is_none() {
+        let (mut e, _tid) = engine_with_values(vec![]);
+        let count_id = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            count_id,
+            crate::AggregateSeedInstall {
+                rows: vec![vec![Value::Int(5)]],
+                read_at: None::<NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        assert!(
+            block_on(e.snapshot(count_id)).unwrap().is_none(),
+            "no bootstrap for a fold"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "snapshot reads nothing for a fold"
+        );
+    }
+
+    #[test]
+    fn async_ordered_row_query_folds_in_process() {
+        let (mut e, tid) = engine_with_values(vec![]);
+        match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders ORDER BY price"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                tier: Tier::InProcess(_),
+                ..
+            } => {}
+            other => panic!("expected InProcess for an ordered row query, got {other:?}"),
+        }
+        let n = block_on(e.consumers(&insert_event(tid, 1, 5.0))).unwrap();
+        assert!(
+            n.engine.inserted().contains(&1),
+            "the ordered row list is notified of the insert"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "an ordered row list reads nothing"
+        );
     }
 }

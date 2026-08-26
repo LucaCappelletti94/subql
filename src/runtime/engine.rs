@@ -2087,10 +2087,29 @@ where
             }
             Err(error) => return Err(error),
         };
-        let (aggregate_updates, scalar_updates, triggers, transitions) = self.maintain(event)?;
+        // Fold the ungrouped aggregate channel too, the way `dispatch` does, so
+        // a seeded COUNT/SUM/AVG updates through the wrapper facade rather than
+        // being silently absorbed. `aggregate_updates` runs before `maintain`
+        // so a demotion it triggers is visible to the reexec registry `maintain`
+        // then reads. `unseeded_aggregate_triggers` is deliberately left out:
+        // the facade seeds an aggregate through `Install`, never auto-bootstraps.
+        let mut aggregate = self.aggregate_updates(event)?;
+        let (grouped_updates, scalar_updates, mut triggers, mut transitions) =
+            self.maintain(event)?;
+        aggregate.updates.extend(grouped_updates);
+        triggers.extend(aggregate.triggers);
+        triggers.sort_unstable_by(|left, right| {
+            (left.subscription_id, left.read.group_key())
+                .cmp(&(right.subscription_id, right.read.group_key()))
+        });
+        triggers.dedup_by(|left, right| {
+            left.subscription_id == right.subscription_id
+                && left.read.group_key() == right.read.group_key()
+        });
+        transitions.extend(aggregate.transitions);
         Ok(crate::reexec::ReExecNotifications {
             engine,
-            aggregate_updates,
+            aggregate_updates: aggregate.updates,
             scalar_updates,
             rows_updates: Vec::new(),
             row_deltas: Vec::new(),

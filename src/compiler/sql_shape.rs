@@ -1575,7 +1575,12 @@ fn check_served_clauses(
         with,
         // Reduced to `select` by the caller.
         body: _,
-        order_by,
+        // Served, not refused: `ORDER BY` changes the sequence rows arrive in,
+        // never which rows are members, so the in-process row engine matches the
+        // same set and a caller applies the ordering to its own snapshot. A
+        // window (`LIMIT`/`OFFSET`/`FETCH`) does change membership and is refused
+        // on its own line below.
+        order_by: _,
         limit_clause,
         fetch,
         locks,
@@ -1656,7 +1661,6 @@ fn check_served_clauses(
         // refused outright.
         (having.is_some() && grouping == Grouping::Refused, "HAVING"),
         (deduplicating, "DISTINCT"),
-        (order_by.is_some(), "ORDER BY"),
         (
             limit_clause.is_some(),
             limit_clause_name(limit_clause.as_ref()),
