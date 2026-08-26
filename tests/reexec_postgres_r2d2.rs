@@ -1164,8 +1164,8 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
     assert!(output.triggers.is_empty());
     assert_eq!(output.aggregate_updates.len(), 1);
     assert_eq!(
-        output.aggregate_updates[0].group.as_deref(),
-        Some(bucket_one.as_slice())
+        output.aggregate_updates[0].group.as_ref(),
+        Some(&bucket_one)
     );
     assert_eq!(
         output.aggregate_updates[0].change,

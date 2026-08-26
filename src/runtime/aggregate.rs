@@ -473,13 +473,28 @@ impl<I: IdTypes, C: Checkpoint> AggregateTotal<I, C> {
 }
 
 /// One live grouped SQL result row.
-struct GroupValue {
+struct GroupValue<B: Backend> {
+    values: Vec<Value<B>>,
     accumulator: AggAccumulator,
     rows: i64,
-    /// Whether the group is currently announced to the consumer. Always
-    /// true without a `HAVING`. A hidden group folds silently and its
-    /// removal announces nothing.
+    /// Whether the group is currently announced to the consumer.
     announced: bool,
+}
+
+impl<B: Backend> GroupValue<B> {
+    fn identity(&self, key: &[u8]) -> crate::GroupIdentity<B> {
+        crate::GroupIdentity {
+            key: key.to_vec(),
+            values: self.values.clone(),
+        }
+    }
+
+    fn into_identity(self, key: Vec<u8>) -> crate::GroupIdentity<B> {
+        crate::GroupIdentity {
+            key,
+            values: self.values,
+        }
+    }
 }
 
 /// A fold's `HAVING`, compiled once at registration: the subject to read
@@ -498,7 +513,7 @@ impl GroupHaving {
         clippy::cast_precision_loss,
         reason = "counts beyond 2^53 accept the same loss the delta path does"
     )]
-    fn passes(&self, group: &GroupValue) -> bool {
+    fn passes<B: Backend>(&self, group: &GroupValue<B>) -> bool {
         let value = match self.subject {
             crate::HavingSubject::RowCount => Some(group.rows as f64),
             // SQL's `SUM` over zero contributions is NULL, and a comparison
@@ -523,9 +538,10 @@ impl GroupHaving {
 
 /// One grouped change held until all seed rows arrive.
 #[derive(Clone, Debug)]
-enum PendingGroupChange {
+enum PendingGroupChange<B: Backend> {
     Fold {
         key: Vec<u8>,
+        values: Vec<Value<B>>,
         delta: Option<AggDelta>,
         rows: i64,
     },
@@ -533,12 +549,12 @@ enum PendingGroupChange {
 }
 
 /// Grouped changes seen while the database seed read is in flight.
-struct PendingGroups<C: Checkpoint> {
-    changes: Vec<(Option<C>, PendingGroupChange)>,
+struct PendingGroups<B: Backend, C: Checkpoint> {
+    changes: Vec<(Option<C>, PendingGroupChange<B>)>,
     overflowed: bool,
 }
 
-impl<C: Checkpoint> PendingGroups<C> {
+impl<B: Backend, C: Checkpoint> PendingGroups<B, C> {
     const fn new() -> Self {
         Self {
             changes: Vec::new(),
@@ -549,17 +565,23 @@ impl<C: Checkpoint> PendingGroups<C> {
     /// Record `change` at `at`, merging into the last entry when both the
     /// position and the group repeat, so a transaction's many rows into one
     /// group cost one slot, mirroring the ungrouped buffer.
-    fn push(&mut self, at: Option<&C>, change: PendingGroupChange, cap: usize) {
+    fn push(&mut self, at: Option<&C>, change: PendingGroupChange<B>, cap: usize) {
         if let (
             Some((
                 last_at,
                 PendingGroupChange::Fold {
                     key: held_key,
+                    values: _,
                     delta: held_delta,
                     rows: held_rows,
                 },
             )),
-            PendingGroupChange::Fold { key, delta, rows },
+            PendingGroupChange::Fold {
+                key,
+                values: _,
+                delta,
+                rows,
+            },
         ) = (self.changes.last_mut(), &change)
         {
             if last_at.is_some() && last_at.as_ref() == at && held_key == key {
@@ -580,31 +602,30 @@ impl<C: Checkpoint> PendingGroups<C> {
     }
 }
 
-type GroupedValueChanges<B> = Vec<(Vec<u8>, crate::AggregateValueChange<B>)>;
+type GroupedValueChanges<B> = Vec<(crate::GroupIdentity<B>, crate::AggregateValueChange<B>)>;
 
 /// Result of applying one grouped CDC change.
 pub enum GroupedFoldOutcome<B: Backend> {
     /// Aggregate value and group existence did not change.
     Unchanged,
     /// Emit this write or removal.
-    Change(crate::AggregateValueChange<B>),
+    Change(crate::GroupIdentity<B>, crate::AggregateValueChange<B>),
     /// A new group would exceed the configured limit.
     GroupLimit,
 }
 
-pub struct GroupedAggregateTotal<I: IdTypes, C: Checkpoint> {
+pub struct GroupedAggregateTotal<I: IdTypes, B: Backend, C: Checkpoint> {
     consumer: I::ConsumerId,
     spec: AggSpec,
     group_columns: usize,
-    groups: HashMap<Vec<u8>, GroupValue>,
-    pending: Option<PendingGroups<C>>,
+    groups: HashMap<Vec<u8>, GroupValue<B>>,
+    pending: Option<PendingGroups<B, C>>,
     having: Option<GroupHaving>,
-    /// Whether the seed carries the complete component layout because a
-    /// sibling `HAVING` reads more than the projected function maintains.
+    /// Whether the seed carries components needed only by `HAVING`.
     widened: bool,
 }
 
-impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
+impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
     pub fn new(
         consumer: I::ConsumerId,
         spec: AggSpec,
@@ -648,17 +669,27 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
 
     /// Fold one group change. `rows` counts source rows, independently of
     /// whether the aggregate column itself is NULL or contributes zero.
-    pub fn fold<B: Backend>(
+    pub fn fold(
         &mut self,
-        key: Vec<u8>,
+        group: crate::GroupIdentity<B>,
         delta: Option<AggDelta>,
         rows: i64,
         at: Option<&C>,
         cap: usize,
         group_limit: usize,
     ) -> GroupedFoldOutcome<B> {
+        let crate::GroupIdentity { key, values } = group;
         if let Some(pending) = &mut self.pending {
-            pending.push(at, PendingGroupChange::Fold { key, delta, rows }, cap);
+            pending.push(
+                at,
+                PendingGroupChange::Fold {
+                    key,
+                    values,
+                    delta,
+                    rows,
+                },
+                cap,
+            );
             return GroupedFoldOutcome::Unchanged;
         }
         if !self.groups.contains_key(&key) && rows > 0 && self.groups.len() >= group_limit {
@@ -669,21 +700,26 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
             self.having.as_ref(),
             &mut self.groups,
             &key,
+            &values,
             delta,
             rows,
         )
-        .map_or(GroupedFoldOutcome::Unchanged, GroupedFoldOutcome::Change)
+        .map_or(GroupedFoldOutcome::Unchanged, |(identity, change)| {
+            GroupedFoldOutcome::Change(identity, change)
+        })
     }
 
-    fn apply_change<B: Backend>(
+    fn apply_change(
         spec: &AggSpec,
         having: Option<&GroupHaving>,
-        groups: &mut HashMap<Vec<u8>, GroupValue>,
+        groups: &mut HashMap<Vec<u8>, GroupValue<B>>,
         key: &[u8],
+        values: &[Value<B>],
         delta: Option<AggDelta>,
         rows: i64,
-    ) -> Option<crate::AggregateValueChange<B>> {
+    ) -> Option<(crate::GroupIdentity<B>, crate::AggregateValueChange<B>)> {
         let group = groups.entry(key.to_vec()).or_insert_with(|| GroupValue {
+            values: values.to_vec(),
             accumulator: AggAccumulator::from_spec(spec),
             rows: 0,
             announced: false,
@@ -695,22 +731,29 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
             group.accumulator.apply(&delta);
         }
         if group.rows <= 0 {
-            groups.remove(key);
-            return was_announced.then_some(crate::AggregateValueChange::Remove);
+            let group = groups.remove(key).expect("the group was inserted above");
+            return was_announced.then(|| {
+                (
+                    group.into_identity(key.to_vec()),
+                    crate::AggregateValueChange::Remove,
+                )
+            });
         }
         let after = group.accumulator.value();
         let passes = having.is_none_or(|having| having.passes(group));
         group.announced = passes;
-        if passes && (!was_announced || before != after) {
-            return Some(crate::AggregateValueChange::Set(
+        let change = if passes && (!was_announced || before != after) {
+            Some(crate::AggregateValueChange::Set(
                 crate::AggregateResultValue::Folded(after),
-            ));
-        }
-        (was_announced && !passes).then_some(crate::AggregateValueChange::Remove)
+            ))
+        } else {
+            (was_announced && !passes).then_some(crate::AggregateValueChange::Remove)
+        };
+        change.map(|change| (group.identity(key), change))
     }
 
     /// Empty every group after `TRUNCATE`.
-    pub fn empty<B: Backend>(&mut self, at: Option<&C>, cap: usize) -> GroupedValueChanges<B> {
+    pub fn empty(&mut self, at: Option<&C>, cap: usize) -> GroupedValueChanges<B> {
         if let Some(pending) = &mut self.pending {
             pending.push(at, PendingGroupChange::Emptied, cap);
             return Vec::new();
@@ -719,9 +762,9 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
             .groups
             .iter()
             .filter(|(_, group)| group.announced)
-            .map(|(key, _)| (key.clone(), crate::AggregateValueChange::Remove))
+            .map(|(key, group)| (group.identity(key), crate::AggregateValueChange::Remove))
             .collect();
-        removed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        removed.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
         self.groups.clear();
         removed
     }
@@ -731,8 +774,47 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
         self.pending = Some(PendingGroups::new());
     }
 
+    fn seed_group(
+        &self,
+        subscription: SubscriptionId,
+        group_columns: usize,
+        components_len: usize,
+        row: &[Value<B>],
+    ) -> Result<(Vec<u8>, GroupValue<B>), AggregateInstallError> {
+        if row.len() != group_columns + components_len + 1 {
+            return Err(AggregateInstallError::GroupedRowArity {
+                subscription,
+                expected: group_columns + components_len + 1,
+                got: row.len(),
+            });
+        }
+        let values = row[..group_columns].to_vec();
+        let key = crate::backend::encode_value_key(&values)
+            .ok_or(AggregateInstallError::GroupKeyUnencodable(subscription))?;
+        let rows = row
+            .last()
+            .and_then(AggAccumulator::seed_i64)
+            .filter(|count| *count > 0)
+            .ok_or(AggregateInstallError::GroupedRowCount(subscription))?;
+        let components = &row[group_columns..row.len() - 1];
+        let accumulator = if self.widened {
+            AggAccumulator::seed_stats_row(&self.spec, components)
+        } else {
+            AggAccumulator::seed_from_row(&self.spec, components)
+        };
+        Ok((
+            key,
+            GroupValue {
+                values,
+                accumulator,
+                rows,
+                announced: false,
+            },
+        ))
+    }
+
     /// Install every grouped seed row as one atomic result.
-    pub fn install<B: Backend>(
+    pub fn install(
         &mut self,
         subscription: SubscriptionId,
         group_columns: usize,
@@ -763,31 +845,7 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
         };
         let mut groups = HashMap::with_capacity(rows.len());
         for row in rows {
-            if row.len() != group_columns + components_len + 1 {
-                return Err(AggregateInstallError::GroupedRowArity {
-                    subscription,
-                    expected: group_columns + components_len + 1,
-                    got: row.len(),
-                });
-            }
-            let key = crate::backend::encode_value_key(&row[..group_columns])
-                .ok_or(AggregateInstallError::GroupKeyUnencodable(subscription))?;
-            let row_count = row
-                .last()
-                .and_then(AggAccumulator::seed_i64)
-                .filter(|count| *count > 0)
-                .ok_or(AggregateInstallError::GroupedRowCount(subscription))?;
-            let components = &row[group_columns..row.len() - 1];
-            let accumulator = if self.widened {
-                AggAccumulator::seed_stats_row(&self.spec, components)
-            } else {
-                AggAccumulator::seed_from_row(&self.spec, components)
-            };
-            let value = GroupValue {
-                accumulator,
-                rows: row_count,
-                announced: false,
-            };
+            let (key, value) = self.seed_group(subscription, group_columns, components_len, row)?;
             if !groups.contains_key(&key) && groups.len() >= group_limit {
                 return Err(AggregateInstallError::GroupLimit {
                     subscription,
@@ -804,18 +862,24 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
                 continue;
             }
             match change {
-                PendingGroupChange::Fold { key, delta, rows } => {
+                PendingGroupChange::Fold {
+                    key,
+                    values,
+                    delta,
+                    rows,
+                } => {
                     if !groups.contains_key(key) && *rows > 0 && groups.len() >= group_limit {
                         return Err(AggregateInstallError::GroupLimit {
                             subscription,
                             limit: group_limit,
                         });
                     }
-                    let _ = Self::apply_change::<B>(
+                    let _ = Self::apply_change(
                         &self.spec,
                         self.having.as_ref(),
                         &mut groups,
                         key,
+                        values,
                         *delta,
                         *rows,
                     );
@@ -835,7 +899,7 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
                     .is_none_or(|having| having.passes(group));
                 group.announced.then(|| {
                     (
-                        key.clone(),
+                        group.identity(key),
                         crate::AggregateValueChange::Set(crate::AggregateResultValue::Folded(
                             group.accumulator.value(),
                         )),
@@ -843,7 +907,7 @@ impl<I: IdTypes, C: Checkpoint> GroupedAggregateTotal<I, C> {
                 })
             })
             .collect();
-        opening.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        opening.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
         self.groups = groups;
         self.pending = None;
         Ok(opening)

@@ -129,7 +129,7 @@ fn insert_folds_delete_requeries_only_the_displaced_group() {
     else {
         panic!("expected grouped scalar read")
     };
-    assert_eq!(group, &north);
+    assert_eq!(group, &north.key);
     assert_eq!(*column_kinds, [ScalarKind::Int, ScalarKind::Int]);
     assert!(sql.contains("\"region\" = 'north'"), "scoped SQL was {sql}");
     assert!(!sql.contains("south"));
@@ -138,16 +138,13 @@ fn insert_folds_delete_requeries_only_the_displaced_group() {
         &mut engine,
         subscription,
         GroupedScalarInstall {
-            group: north.clone(),
+            group: north.key.clone(),
             row: vec![Value::Int(5), Value::Int(1)],
             checkpoint: Some(PgLsn(30)),
         },
     )
     .expect("scoped result installs");
-    assert_eq!(
-        installed.updates[0].group.as_deref(),
-        Some(north.as_slice())
-    );
+    assert_eq!(installed.updates[0].group.as_ref(), Some(&north));
     assert_eq!(installed.updates[0].change, scalar(Value::Int(5)));
 }
 
@@ -171,10 +168,7 @@ fn the_last_row_removes_the_group_without_a_read() {
         .with_checkpoint(PgLsn(10));
     let output = engine.dispatch(&removed).expect("delete dispatches");
     assert_eq!(output.aggregate_updates().len(), 1);
-    assert_eq!(
-        output.aggregate_updates()[0].group.as_deref(),
-        Some(north.as_slice())
-    );
+    assert_eq!(output.aggregate_updates()[0].group.as_ref(), Some(&north));
     assert_eq!(
         output.aggregate_updates()[0].change,
         AggregateValueChange::Remove
@@ -200,7 +194,7 @@ fn null_group_values_use_is_null_in_the_scoped_read() {
     let ReExecutionRead::GroupedScalar { group, sql, .. } = &output.triggers()[0].read else {
         panic!("expected grouped scalar read")
     };
-    assert_eq!(group, &null_group);
+    assert_eq!(group, &null_group.key);
     assert!(sql.contains("\"region\" IS NULL"), "scoped SQL was {sql}");
 }
 
@@ -467,16 +461,13 @@ fn moving_an_extreme_requeries_the_old_group_and_folds_the_new_group() {
         .with_checkpoint(PgLsn(10));
     let output = engine.dispatch(&event).expect("move dispatches");
     assert_eq!(output.aggregate_updates().len(), 1);
-    assert_eq!(
-        output.aggregate_updates()[0].group.as_deref(),
-        Some(south.as_slice())
-    );
+    assert_eq!(output.aggregate_updates()[0].group.as_ref(), Some(&south));
     assert_eq!(output.aggregate_updates()[0].change, scalar(Value::Int(1)));
     assert_eq!(output.triggers().len(), 1);
     let ReExecutionRead::GroupedScalar { group, .. } = &output.triggers()[0].read else {
         panic!("expected grouped scalar read")
     };
-    assert_eq!(group, &north);
+    assert_eq!(group, &north.key);
 }
 
 #[test]
@@ -647,6 +638,14 @@ fn every_postgres_group_kind_renders_into_a_scoped_read() {
     seed_row.extend([Value::Int(2), Value::Int(2)]);
     let seeded = seed(&mut engine, registered.subscription_id, vec![seed_row]);
     assert_eq!(seeded.updates.len(), 1);
+    assert_eq!(
+        seeded.updates[0]
+            .group
+            .as_ref()
+            .expect("grouped update carries identity")
+            .values,
+        groups
+    );
 
     let mut old = vec![Value::Int(1)];
     old.extend(groups);
@@ -873,14 +872,23 @@ fn a_group_inserted_during_the_seed_window_is_announced_once() {
         "north and south once each, got {:?}",
         installed.updates
     );
-    let south_sets = installed
+    let mut south_sets = installed
         .updates
         .iter()
-        .filter(|update| update.change == scalar(Value::Int(4)))
-        .count();
-    assert_eq!(
-        south_sets, 1,
+        .filter(|update| update.change == scalar(Value::Int(4)));
+    let south = south_sets.next().expect("replayed group opens");
+    assert!(
+        south_sets.next().is_none(),
         "the replayed insert must not double-announce"
+    );
+    let identity = south
+        .group
+        .as_ref()
+        .expect("grouped update carries identity");
+    assert_eq!(identity.values, vec![Value::String("south".into())]);
+    assert_eq!(
+        subql::backend::encode_value_key(&identity.values).as_ref(),
+        Some(&identity.key)
     );
 }
 
@@ -951,10 +959,7 @@ fn truncate_removes_only_announced_groups() {
         1,
         "north was never announced"
     );
-    assert_eq!(
-        output.aggregate_updates()[0].group.as_deref(),
-        Some(south.as_slice())
-    );
+    assert_eq!(output.aggregate_updates()[0].group.as_ref(), Some(&south));
     assert_eq!(
         output.aggregate_updates()[0].change,
         AggregateValueChange::Remove

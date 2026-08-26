@@ -237,7 +237,7 @@ fn a_group_crossing_the_threshold_emits_entering_and_leaving() {
         .aggregate_updates(&insert(orders, 3, "north", 5, 10))
         .expect("insert folds");
     assert_eq!(entering.updates.len(), 1, "south stays silent");
-    assert_ne!(entering.updates[0].group.as_deref(), Some(south.as_slice()));
+    assert_ne!(entering.updates[0].group.as_ref(), Some(&south));
     assert_eq!(entering.updates[0].change, folded(AggValue::Sum(13.0)));
 
     let leaving = engine
@@ -563,7 +563,7 @@ fn truncate_removes_only_announced_groups() {
         .aggregate_updates(&truncated)
         .expect("truncate empties");
     assert_eq!(output.updates.len(), 1, "north was never announced");
-    assert_eq!(output.updates[0].group.as_deref(), Some(south.as_slice()));
+    assert_eq!(output.updates[0].group.as_ref(), Some(&south));
     assert_eq!(output.updates[0].change, AggregateValueChange::Remove);
 }
 
@@ -600,6 +600,14 @@ fn a_multi_column_group_crosses_like_a_single_one() {
     let entering = engine
         .aggregate_updates(&insert(orders, 3, "north", 5, 10))
         .expect("insert folds");
+    assert_eq!(
+        entering.updates[0]
+            .group
+            .as_ref()
+            .expect("grouped update carries identity")
+            .values,
+        vec![Value::String("north".into()), Value::String("paid".into())]
+    );
     assert_eq!(
         entering.updates[0].change,
         folded(AggValue::Sum(13.0)),

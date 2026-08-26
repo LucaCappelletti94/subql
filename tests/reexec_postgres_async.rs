@@ -1214,10 +1214,7 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
         let output = engine.consumers(&events[0]).await.expect("group re-read");
         assert!(output.triggers.is_empty());
         assert_eq!(output.aggregate_updates.len(), 1);
-        assert_eq!(
-            output.aggregate_updates[0].group.as_deref(),
-            Some(paid.as_slice())
-        );
+        assert_eq!(output.aggregate_updates[0].group.as_ref(), Some(&paid));
         assert_eq!(
             output.aggregate_updates[0].change,
             AggregateValueChange::Set(AggregateResultValue::Scalar(Value::Float(9.0)))

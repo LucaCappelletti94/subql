@@ -64,6 +64,7 @@ pub struct MinMaxQuery<B: Backend> {
     agg_column: ColumnId,
     where_program: Arc<BytecodeProgram<B>>,
     dependency_columns: Vec<ColumnId>,
+    database_reads_per_consumer: bool,
     /// The extreme, once known. `Some(Value::Null)` means the filtered set is
     /// empty, `None` means nobody has said yet, which no change can decide.
     current: Option<Value<B>>,
@@ -75,12 +76,14 @@ impl<B: Backend> MinMaxQuery<B> {
         agg_column: ColumnId,
         where_program: Arc<BytecodeProgram<B>>,
         dependency_columns: Vec<ColumnId>,
+        database_reads_per_consumer: bool,
     ) -> Self {
         Self {
             kind,
             agg_column,
             where_program,
             dependency_columns,
+            database_reads_per_consumer,
             current: None,
         }
     }
@@ -165,6 +168,9 @@ impl<B: Backend> MinMaxQuery<B> {
             // the table may hold a more extreme one this engine never saw.
             None => Maintenance::NeedsReexecution,
             Some(true) => {
+                if self.database_reads_per_consumer {
+                    return Maintenance::NeedsReexecution;
+                }
                 self.current = Some(candidate.clone());
                 Maintenance::Updated(candidate)
             }
@@ -254,6 +260,22 @@ struct GroupedExtreme<B: Backend> {
     announced: Option<Value<B>>,
 }
 
+impl<B: Backend> GroupedExtreme<B> {
+    fn identity(&self, key: &[u8]) -> crate::GroupIdentity<B> {
+        crate::GroupIdentity {
+            key: key.to_vec(),
+            values: self.values.clone(),
+        }
+    }
+
+    fn into_identity(self, key: Vec<u8>) -> crate::GroupIdentity<B> {
+        crate::GroupIdentity {
+            key,
+            values: self.values,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ExtremeRow<B: Backend> {
     key: Vec<u8>,
@@ -311,8 +333,10 @@ pub struct GroupedRead<C: Checkpoint> {
     pub checkpoint: Option<C>,
 }
 
+type GroupedValueChange<B> = (crate::GroupIdentity<B>, crate::AggregateValueChange<B>);
+
 pub struct GroupedMaintenance<B: Backend, C: Checkpoint> {
-    pub changes: Vec<(Vec<u8>, crate::AggregateValueChange<B>)>,
+    pub changes: Vec<GroupedValueChange<B>>,
     pub reads: Vec<GroupedRead<C>>,
     pub group_limit: bool,
     pub missing_group: bool,
@@ -334,15 +358,20 @@ pub struct GroupedMinMaxQuery<B: Backend, C: Checkpoint> {
     groups: HashMap<Vec<u8>, GroupedExtreme<B>>,
     pending: Option<PendingGrouped<B, C>>,
     pending_reads: HashMap<Vec<u8>, Vec<Value<B>>>,
+    database_reads_per_consumer: bool,
 }
 
 impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
-    pub fn new(plan: crate::reexec::plan::GroupedMinMaxPlan<B>) -> Self {
+    pub fn new(
+        plan: crate::reexec::plan::GroupedMinMaxPlan<B>,
+        database_reads_per_consumer: bool,
+    ) -> Self {
         Self {
             plan,
             groups: HashMap::new(),
             pending: Some(PendingGrouped::new()),
             pending_reads: HashMap::new(),
+            database_reads_per_consumer,
         }
     }
 
@@ -506,7 +535,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 self.groups
                     .iter()
                     .filter(|(_, group)| group.announced.is_some())
-                    .map(|(key, _)| (key.clone(), crate::AggregateValueChange::Remove)),
+                    .map(|(key, group)| (group.identity(key), crate::AggregateValueChange::Remove)),
             );
             self.groups.clear();
             self.pending_reads.clear();
@@ -538,9 +567,10 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                         // phase two: an announced group says goodbye now.
                         if let Some(group) = self.groups.remove(&row.key) {
                             if group.announced.is_some() {
-                                output
-                                    .changes
-                                    .push((row.key.clone(), crate::AggregateValueChange::Remove));
+                                output.changes.push((
+                                    group.into_identity(row.key.clone()),
+                                    crate::AggregateValueChange::Remove,
+                                ));
                             }
                         }
                     } else if !row.value.is_absent() && values_equal(&row.value, &group.current) {
@@ -550,7 +580,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                     }
                 }
                 GroupedRowChange::Insert(row) => {
-                    if self.apply_insert(row, group_limit, &mut output) {
+                    if self.apply_insert(row, group_limit, &mut output, &mut refresh) {
                         touch(&mut touched, &row.key);
                     }
                 }
@@ -594,21 +624,25 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 continue;
             };
             if let Some(change) = Self::crossing(having, group) {
-                output.changes.push((key, change));
+                output.changes.push((group.identity(&key), change));
             }
         }
         Ok(output)
     }
 
-    /// Fold one observed insert into its group, opening the group when the
-    /// budget allows. Returns whether the group's state moved; the caller
-    /// announces once the event has settled.
+    /// Fold one observed insert or force a scoped read when event data cannot
+    /// be trusted for this consumer.
     fn apply_insert(
         &mut self,
         row: &ExtremeRow<B>,
         group_limit: usize,
         output: &mut GroupedMaintenance<B, C>,
+        refresh: &mut HashMap<Vec<u8>, Vec<Value<B>>>,
     ) -> bool {
+        if self.database_reads_per_consumer {
+            refresh.insert(row.key.clone(), row.values.clone());
+            return false;
+        }
         if let Some(group) = self.groups.get_mut(&row.key) {
             group.rows += 1;
             if Self::candidate_wins(self.plan.kind, &row.value, &group.current) {
@@ -775,7 +809,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                         .then(|| group.current.clone());
                     group.announced.is_some().then(|| {
                         (
-                            key.clone(),
+                            group.identity(key),
                             crate::AggregateValueChange::Set(crate::AggregateResultValue::Scalar(
                                 group.current.clone(),
                             )),
@@ -785,19 +819,18 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         );
         output
             .changes
-            .sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            .sort_unstable_by(|left, right| left.0.key.cmp(&right.0.key));
         Ok(output)
     }
 
-    /// Install one scoped read's result. `None` when the group stays outside
-    /// the announced result, so silence rather than a spurious write.
+    /// Install one scoped read's result.
     pub fn install_group(
         &mut self,
         subscription: crate::SubscriptionId,
         key: &[u8],
         row: &[Value<B>],
         group_limit: usize,
-    ) -> Result<Option<crate::AggregateValueChange<B>>, crate::AggregateInstallError> {
+    ) -> Result<Option<GroupedValueChange<B>>, crate::AggregateInstallError> {
         if row.len() != 2 {
             return Err(crate::AggregateInstallError::GroupedRowArity {
                 subscription,
@@ -814,11 +847,15 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             .map_err(|_| crate::AggregateInstallError::GroupedRowCount(subscription))?;
         if count <= 0 {
             self.pending_reads.remove(key);
-            let was_announced = self
-                .groups
-                .remove(key)
-                .is_some_and(|group| group.announced.is_some());
-            return Ok(was_announced.then_some(crate::AggregateValueChange::Remove));
+            let change = self.groups.remove(key).and_then(|group| {
+                group.announced.is_some().then(|| {
+                    (
+                        group.into_identity(key.to_vec()),
+                        crate::AggregateValueChange::Remove,
+                    )
+                })
+            });
+            return Ok(change);
         }
         if !self.groups.contains_key(key) && self.groups.len() >= group_limit {
             return Err(crate::AggregateInstallError::GroupLimit {
@@ -827,26 +864,35 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             });
         }
         let having = self.plan.having.as_ref();
-        let change = if let Some(group) = self.groups.get_mut(key) {
+        let (values, change) = if let Some(group) = self.groups.get_mut(key) {
             group.current.clone_from(&row[0]);
             group.rows = count;
-            Self::crossing(having, group)
+            let change = Self::crossing(having, group);
+            (group.values.clone(), change)
         } else {
             let values = self.pending_reads.get(key).cloned().ok_or(
                 crate::AggregateInstallError::UnexpectedGroupRead(subscription),
             )?;
             let mut group = GroupedExtreme {
-                values,
+                values: values.clone(),
                 current: row[0].clone(),
                 rows: count,
                 announced: None,
             };
             let change = Self::crossing(having, &mut group);
             self.groups.insert(key.to_vec(), group);
-            change
+            (values, change)
         };
         self.pending_reads.remove(key);
-        Ok(change)
+        Ok(change.map(|change| {
+            (
+                crate::GroupIdentity {
+                    key: key.to_vec(),
+                    values,
+                },
+                change,
+            )
+        }))
     }
 }
 

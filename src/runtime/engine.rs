@@ -46,6 +46,8 @@ use sql_traits::prelude::DatabaseLike;
 use std::io::Write;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
+const RLS_AGGREGATE_NEEDS_DATABASE_READ: &str =
+    "aggregate on RLS table requires database re-execution";
 
 type BatchEntries<I, B> = Vec<(
     Predicate<B>,
@@ -308,8 +310,10 @@ where
     aggregates:
         HashMap<SubscriptionId, crate::runtime::aggregate::AggregateTotal<I, E::Checkpoint>>,
     /// Running group maps for grouped aggregate subscriptions.
-    grouped_aggregates:
-        HashMap<SubscriptionId, crate::runtime::aggregate::GroupedAggregateTotal<I, E::Checkpoint>>,
+    grouped_aggregates: HashMap<
+        SubscriptionId,
+        crate::runtime::aggregate::GroupedAggregateTotal<I, E::Backend, E::Checkpoint>,
+    >,
     /// Original SQL and registration metadata retained for an in-place
     /// transition from aggregate maintenance to a complete row read.
     aggregate_registrations: HashMap<SubscriptionId, AggregateRegistration<I>>,
@@ -446,6 +450,7 @@ where
         &self,
         sql: &str,
         binds: &[Value<E::Backend>],
+        database_reads_per_consumer: bool,
     ) -> Result<(CompiledQuery<E::Backend>, Vec<TermPlan>), RegisterError> {
         let compiled = parse_compile_normalize_and_prefilter_with_binds::<E::Backend, DB>(
             sql,
@@ -468,6 +473,11 @@ where
             QueryProjection::Aggregate(_) | QueryProjection::GroupedAggregate { .. }
         ) && catalog_helpers::table_has_rls(&self.database, compiled.table_id).unwrap_or(false)
         {
+            if database_reads_per_consumer {
+                return Err(RegisterError::UnsupportedSql(
+                    RLS_AGGREGATE_NEEDS_DATABASE_READ.to_string(),
+                ));
+            }
             return Err(RegisterError::AggregatorOnRlsTable {
                 table_id: compiled.table_id,
             });
@@ -505,7 +515,7 @@ where
         &self,
         spec: &SubscriptionRequest<I, E::Backend>,
     ) -> Result<Vec<TermDescription>, RegisterError> {
-        let (compiled, plans) = self.compile_and_plan_terms(&spec.sql, &spec.binds)?;
+        let (compiled, plans) = self.compile_and_plan_terms(&spec.sql, &spec.binds, false)?;
         plans
             .iter()
             .zip(&compiled.terms)
@@ -523,8 +533,10 @@ where
     fn compile_spec(
         &self,
         spec: SubscriptionRequest<I, E::Backend>,
+        database_reads_per_consumer: bool,
     ) -> Result<CompiledSpec<I, E::Backend>, RegisterError> {
-        let (compiled, term_plans) = self.compile_and_plan_terms(&spec.sql, &spec.binds)?;
+        let (compiled, term_plans) =
+            self.compile_and_plan_terms(&spec.sql, &spec.binds, database_reads_per_consumer)?;
         let CompiledQuery {
             table_id,
             program: bytecode,
@@ -1347,7 +1359,7 @@ where
             SubscriptionScope::Session(s) => Some(*s),
             SubscriptionScope::Durable => None,
         };
-        let compiled = match self.compile_spec(spec) {
+        let compiled = match self.compile_spec(spec, database_reads_per_consumer) {
             Ok(compiled) => compiled,
             Err(RegisterError::UnsupportedSql(refusal)) => {
                 return self.plan_reread(
@@ -1494,12 +1506,16 @@ where
         session: Option<I::SessionId>,
         database_reads_per_consumer: bool,
     ) -> Result<Registered, RegisterError> {
+        if database_reads_per_consumer && refusal == RLS_AGGREGATE_NEEDS_DATABASE_READ {
+            return self.plan_whole_reread(sql, refusal, consumer_id, session);
+        }
         let planned =
             crate::reexec::plan::build_plan::<E::Backend, DB>(sql, self.dialect(), &self.database);
         match planned {
             Ok(crate::reexec::plan::QueryPlan::GroupedPartial(plan)) => {
                 if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
                     .unwrap_or(false)
+                    && !database_reads_per_consumer
                 {
                     return Err(RegisterError::AggregatorOnRlsTable {
                         table_id: plan.table_id,
@@ -1519,11 +1535,9 @@ where
                 Ok(registered)
             }
             Ok(crate::reexec::plan::QueryPlan::Partial(plan)) => {
-                // Per-viewer row filtering makes one shared answer unsafe:
-                // consumers observe different rows, and this tier holds one
-                // answer per query rather than one per viewer.
                 if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
                     .unwrap_or(false)
+                    && !database_reads_per_consumer
                 {
                     return Err(RegisterError::AggregatorOnRlsTable {
                         table_id: plan.table_id,
@@ -1593,6 +1607,25 @@ where
             Err(_) => Err(RegisterError::UnsupportedSql(refusal)),
         }
     }
+    fn plan_whole_reread(
+        &mut self,
+        sql: &str,
+        refusal: String,
+        consumer_id: I::ConsumerId,
+        session: Option<I::SessionId>,
+    ) -> Result<Registered, RegisterError> {
+        let plan = crate::reexec::plan::build_whole_rows_plan::<E::Backend, DB>(
+            sql,
+            self.dialect(),
+            &self.database,
+        )?;
+        let subscription_id = self.allocate_subscription_id();
+        let mut registered =
+            self.capture_whole(subscription_id, plan, consumer_id, session, sql, true);
+        registered.not_served_because = Some(refusal);
+        self.persist_reads_after_change(subscription_id)?;
+        Ok(registered)
+    }
 
     /// Route `subscription_id` from every table in `tables`, and from its
     /// session when it has one.
@@ -1629,7 +1662,7 @@ where
         let table_id = plan.table_id;
         let bootstrap = plan.bootstrap.clone();
         let runtime = crate::reexec::maintain::QueryRuntime::Grouped(alloc::boxed::Box::new(
-            crate::reexec::maintain::GroupedMinMaxQuery::new(plan),
+            crate::reexec::maintain::GroupedMinMaxQuery::new(plan, database_reads_per_consumer),
         ));
         self.index_reread(subscription_id, &[table_id], session);
         self.reexec.insert(
@@ -1680,6 +1713,7 @@ where
                 agg_column,
                 where_program,
                 dependency_columns,
+                database_reads_per_consumer,
             ),
         );
         self.index_reread(subscription_id, &[table_id], session);
@@ -2728,7 +2762,7 @@ where
         let mut deferred_dup_copies: Vec<(usize, usize)> = Vec::new();
 
         for spec in specs {
-            match self.compile_spec(spec) {
+            match self.compile_spec(spec, false) {
                 Ok(compiled_spec) => {
                     // Check dedup index for idempotent re-registration.
                     let natural_key = (
