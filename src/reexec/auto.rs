@@ -461,6 +461,127 @@ where
     ) -> Result<Vec<crate::term::TermDescription>, RegisterError> {
         self.inner.describe_terms(spec)
     }
+
+    /// Unregister a session and drop every stored auth context that
+    /// belonged to it.
+    pub fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
+        let engine = self.inner.unregister_session(session_id);
+        self.contexts
+            .retain(|_, ctx| ctx.session != Some(session_id));
+        engine
+    }
+
+    /// Unregister a subscription by id, resolving whichever registry holds
+    /// it. Returns false if no such subscription existed.
+    ///
+    /// One id counter serves both registries (`next_subscription_id` lives
+    /// only on the inner engine), so an id cannot be claimed by both and the
+    /// order below is a resolution, not a precedence. The read registry is
+    /// tried first, and when it claims the id the stored resolve context is
+    /// dropped with it.
+    pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
+        if self.inner.unregister_reread(subscription_id) {
+            self.contexts.remove(&subscription_id);
+            return true;
+        }
+        let removed = self.inner.unregister_subscription(subscription_id);
+        if removed {
+            // Drop an in-process aggregate's stored context (auth for a possible
+            // demotion); a plain row subscription has none and this is a no-op.
+            self.contexts.remove(&subscription_id);
+        }
+        removed
+    }
+
+    /// Unregister an in-process subscription by `(consumer_id, sql)`.
+    pub fn unregister_query(
+        &mut self,
+        consumer_id: I::ConsumerId,
+        sql: &str,
+    ) -> Result<UnregisterReport, RegisterError> {
+        self.inner.unregister_query(consumer_id, sql)
+    }
+
+    /// Advance the resume cursor for `(session_id, sub_id)`. Passthrough to
+    /// [`SubscriptionEngine::advance_cursor`](crate::SubscriptionEngine::advance_cursor).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::AdvanceCursorError::NonMonotonic`] when `checkpoint` rewinds.
+    pub fn advance_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+        checkpoint: crate::OpaqueCheckpoint,
+    ) -> Result<Option<crate::OpaqueCheckpoint>, crate::AdvanceCursorError> {
+        self.inner.advance_cursor(session_id, sub_id, checkpoint)
+    }
+
+    /// Set the resume cursor for `(session_id, sub_id)` unconditionally.
+    /// Passthrough to
+    /// [`SubscriptionEngine::force_set_cursor`](crate::SubscriptionEngine::force_set_cursor).
+    pub fn force_set_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+        checkpoint: crate::OpaqueCheckpoint,
+    ) -> Option<crate::OpaqueCheckpoint> {
+        self.inner.force_set_cursor(session_id, sub_id, checkpoint)
+    }
+
+    /// Read the resume cursor for `(session_id, sub_id)`. Passthrough to
+    /// [`SubscriptionEngine::cursor_for`](crate::SubscriptionEngine::cursor_for).
+    #[must_use]
+    pub fn cursor_for(
+        &self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+    ) -> Option<&crate::OpaqueCheckpoint> {
+        self.inner.cursor_for(session_id, sub_id)
+    }
+
+    /// Iterate `(subscription_id, cursor)` for every cursor stored against
+    /// `session_id`. Passthrough to
+    /// [`SubscriptionEngine::cursors_for_session`](crate::SubscriptionEngine::cursors_for_session).
+    pub fn cursors_for_session(
+        &self,
+        session_id: I::SessionId,
+    ) -> impl Iterator<Item = (SubscriptionId, &crate::OpaqueCheckpoint)> + '_ {
+        self.inner.cursors_for_session(session_id)
+    }
+
+    /// Remove the resume cursor for `(session_id, sub_id)`. Passthrough to
+    /// [`SubscriptionEngine::drop_cursor`](crate::SubscriptionEngine::drop_cursor).
+    pub fn drop_cursor(
+        &mut self,
+        session_id: I::SessionId,
+        sub_id: SubscriptionId,
+    ) -> Option<crate::OpaqueCheckpoint> {
+        self.inner.drop_cursor(session_id, sub_id)
+    }
+
+    /// Match `event` against the registered subscriptions without reading or
+    /// folding, for catchup replay of an event the caller already dispatched.
+    ///
+    /// Delegates straight to
+    /// [`SubscriptionEngine::consumers`](crate::SubscriptionEngine::consumers),
+    /// so no connector call is made and no aggregate fold advances. The return
+    /// carries more than its name suggests: alongside the row verdicts it
+    /// reports term-membership narrowings, which a replay announces a second
+    /// time. Re-applying them is a set union or difference that does not move
+    /// the stored state, but a caller acting on the announcement itself must
+    /// treat a replay's narrowings as possibly-stale repeats.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::DispatchError`] when the event cannot be matched.
+    pub fn match_rows(
+        &mut self,
+        event: &E,
+    ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, crate::DispatchError>
+    {
+        self.inner.consumers(event)
+    }
 }
 
 /// Walks a key set in bounded batches.
@@ -1300,126 +1421,46 @@ where
             transitions,
         })
     }
+}
 
-    /// Unregister a session and drop every stored auth context that
-    /// belonged to it.
-    pub fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
-        let engine = self.inner.unregister_session(session_id);
-        self.contexts
-            .retain(|_, ctx| ctx.session != Some(session_id));
-        engine
+/// Exposes the tier transitions an install produced, so the facade can apply
+/// them to its own per-subscription context. Most install shapes carry none.
+/// A grouped-aggregate seed that overflows the group budget demotes at install
+/// time and carries the demotion here, which the facade must apply or a later
+/// snapshot mistakes the demoted subscription for a still-folding aggregate.
+pub(super) trait InstallOutputTransitions {
+    fn transitions(&self) -> &[crate::MaintenanceTransition];
+}
+
+impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions
+    for crate::AggregateMaintenanceOutput<I, B, C>
+{
+    fn transitions(&self) -> &[crate::MaintenanceTransition] {
+        &self.transitions
     }
+}
 
-    /// Unregister a subscription by id, resolving whichever registry holds
-    /// it. Returns false if no such subscription existed.
-    ///
-    /// One id counter serves both registries (`next_subscription_id` lives
-    /// only on the inner engine), so an id cannot be claimed by both and the
-    /// order below is a resolution, not a precedence. The read registry is
-    /// tried first, and when it claims the id the stored resolve context is
-    /// dropped with it.
-    pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
-        if self.inner.unregister_reread(subscription_id) {
-            self.contexts.remove(&subscription_id);
-            return true;
-        }
-        let removed = self.inner.unregister_subscription(subscription_id);
-        if removed {
-            // Drop an in-process aggregate's stored context (auth for a possible
-            // demotion); a plain row subscription has none and this is a no-op.
-            self.contexts.remove(&subscription_id);
-        }
-        removed
+impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions
+    for crate::reexec::ScalarUpdate<I, B, C>
+{
+    fn transitions(&self) -> &[crate::MaintenanceTransition] {
+        &[]
     }
+}
 
-    /// Unregister an in-process subscription by `(consumer_id, sql)`.
-    pub fn unregister_query(
-        &mut self,
-        consumer_id: I::ConsumerId,
-        sql: &str,
-    ) -> Result<UnregisterReport, RegisterError> {
-        self.inner.unregister_query(consumer_id, sql)
+impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions
+    for alloc::vec::Vec<crate::reexec::RowsUpdate<I, B, C>>
+{
+    fn transitions(&self) -> &[crate::MaintenanceTransition] {
+        &[]
     }
+}
 
-    /// Advance the resume cursor for `(session_id, sub_id)`. Passthrough to
-    /// [`SubscriptionEngine::advance_cursor`](crate::SubscriptionEngine::advance_cursor).
-    ///
-    /// # Errors
-    ///
-    /// [`crate::AdvanceCursorError::NonMonotonic`] when `checkpoint` rewinds.
-    pub fn advance_cursor(
-        &mut self,
-        session_id: I::SessionId,
-        sub_id: SubscriptionId,
-        checkpoint: crate::OpaqueCheckpoint,
-    ) -> Result<Option<crate::OpaqueCheckpoint>, crate::AdvanceCursorError> {
-        self.inner.advance_cursor(session_id, sub_id, checkpoint)
-    }
-
-    /// Set the resume cursor for `(session_id, sub_id)` unconditionally.
-    /// Passthrough to
-    /// [`SubscriptionEngine::force_set_cursor`](crate::SubscriptionEngine::force_set_cursor).
-    pub fn force_set_cursor(
-        &mut self,
-        session_id: I::SessionId,
-        sub_id: SubscriptionId,
-        checkpoint: crate::OpaqueCheckpoint,
-    ) -> Option<crate::OpaqueCheckpoint> {
-        self.inner.force_set_cursor(session_id, sub_id, checkpoint)
-    }
-
-    /// Read the resume cursor for `(session_id, sub_id)`. Passthrough to
-    /// [`SubscriptionEngine::cursor_for`](crate::SubscriptionEngine::cursor_for).
-    #[must_use]
-    pub fn cursor_for(
-        &self,
-        session_id: I::SessionId,
-        sub_id: SubscriptionId,
-    ) -> Option<&crate::OpaqueCheckpoint> {
-        self.inner.cursor_for(session_id, sub_id)
-    }
-
-    /// Iterate `(subscription_id, cursor)` for every cursor stored against
-    /// `session_id`. Passthrough to
-    /// [`SubscriptionEngine::cursors_for_session`](crate::SubscriptionEngine::cursors_for_session).
-    pub fn cursors_for_session(
-        &self,
-        session_id: I::SessionId,
-    ) -> impl Iterator<Item = (SubscriptionId, &crate::OpaqueCheckpoint)> + '_ {
-        self.inner.cursors_for_session(session_id)
-    }
-
-    /// Remove the resume cursor for `(session_id, sub_id)`. Passthrough to
-    /// [`SubscriptionEngine::drop_cursor`](crate::SubscriptionEngine::drop_cursor).
-    pub fn drop_cursor(
-        &mut self,
-        session_id: I::SessionId,
-        sub_id: SubscriptionId,
-    ) -> Option<crate::OpaqueCheckpoint> {
-        self.inner.drop_cursor(session_id, sub_id)
-    }
-
-    /// Match `event` against the registered subscriptions without reading or
-    /// folding, for catchup replay of an event the caller already dispatched.
-    ///
-    /// Delegates straight to
-    /// [`SubscriptionEngine::consumers`](crate::SubscriptionEngine::consumers),
-    /// so no connector call is made and no aggregate fold advances. The return
-    /// carries more than its name suggests: alongside the row verdicts it
-    /// reports term-membership narrowings, which a replay announces a second
-    /// time. Re-applying them is a set union or difference that does not move
-    /// the stored state, but a caller acting on the announcement itself must
-    /// treat a replay's narrowings as possibly-stale repeats.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::DispatchError`] when the event cannot be matched.
-    pub fn match_rows(
-        &mut self,
-        event: &E,
-    ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, crate::DispatchError>
-    {
-        self.inner.consumers(event)
+impl<I: IdTypes, B: crate::backend::Backend, C: crate::Checkpoint> InstallOutputTransitions
+    for alloc::vec::Vec<crate::reexec::RowDelta<I, B, C>>
+{
+    fn transitions(&self) -> &[crate::MaintenanceTransition] {
+        &[]
     }
 }
 
@@ -1431,6 +1472,7 @@ where
     DB: DatabaseLike + 'static,
     M: ResolverMode<E::Backend>,
     crate::SubscriptionEngine<E, I, DB>: crate::Install<T>,
+    <crate::SubscriptionEngine<E, I, DB> as crate::Install<T>>::Output: InstallOutputTransitions,
 {
     type Output = <crate::SubscriptionEngine<E, I, DB> as crate::Install<T>>::Output;
     type Error = <crate::SubscriptionEngine<E, I, DB> as crate::Install<T>>::Error;
@@ -1440,7 +1482,9 @@ where
         subscription_id: SubscriptionId,
         input: T,
     ) -> Result<Self::Output, Self::Error> {
-        crate::Install::install(&mut self.inner, subscription_id, input)
+        let output = crate::Install::install(&mut self.inner, subscription_id, input)?;
+        self.apply_transitions(output.transitions());
+        Ok(output)
     }
 }
 
@@ -2610,6 +2654,69 @@ mod tests {
             0,
             "snapshot reads nothing for a fold"
         );
+    }
+
+    #[test]
+    fn a_seed_that_demotes_at_install_serves_the_whole_read() {
+        // A grouped fold whose seed already exceeds the group budget demotes
+        // at install time. The demotion rides the install output as a
+        // transition, so the facade must apply it to its own context.
+        // Otherwise the context stays a still-folding aggregate and snapshot
+        // answers None instead of serving the whole read the demotion asked
+        // for.
+        let inner = SubscriptionEngine::<TestEvent<Postgres>, DefaultIds, ParserDB>::new(
+            catalog(),
+            PostgreSqlDialect {},
+        )
+        .with_max_groups_per_aggregate(1);
+        let mut e = AutoResolvingEngine::new(inner, SyncMode(MockConnector::new(alloc::vec![])));
+        let grouped = match e
+            .register(
+                SubscriptionRequest::new(
+                    1u64,
+                    "SELECT status, COUNT(*) FROM orders GROUP BY status",
+                ),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::InProcess(_),
+                ..
+            } => subscription_id,
+            other => panic!("expected InProcess, got {other:?}"),
+        };
+        // Two groups against a budget of one: the install demotes.
+        let seeded = crate::Install::install(
+            &mut e,
+            grouped,
+            crate::AggregateSeedInstall {
+                rows: alloc::vec![
+                    alloc::vec![Value::String("open".into()), Value::Int(2), Value::Int(2)],
+                    alloc::vec![Value::String("done".into()), Value::Int(1), Value::Int(1)],
+                ],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        assert!(
+            !seeded.transitions.is_empty(),
+            "the install-time demotion carries a transition"
+        );
+        // The mock connector holds no cursor, so a served whole read surfaces
+        // as a Cursor error naming the subscription. The bug returns Ok(None)
+        // instead, never reaching the connector.
+        match e.snapshot(grouped) {
+            Err(ReExecError::Cursor { subscription, .. }) => {
+                assert_eq!(
+                    subscription, grouped,
+                    "the demoted subscription attempts its whole read"
+                );
+            }
+            Ok(answer) => panic!("expected the whole read to be attempted, got {answer:?}"),
+            Err(other) => panic!("expected a Cursor error naming the subscription, got {other:?}"),
+        }
     }
 
     #[test]
