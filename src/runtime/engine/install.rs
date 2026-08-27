@@ -189,10 +189,10 @@ where
         };
         Ok(crate::AggregateMaintenanceOutput {
             updates: change
-                .map(|change| crate::AggregateValueUpdate {
+                .map(|(group, change)| crate::AggregateValueUpdate {
                     subscription: subscription_id,
                     consumer,
-                    group: Some(input.group),
+                    group: Some(group),
                     change,
                 })
                 .into_iter()

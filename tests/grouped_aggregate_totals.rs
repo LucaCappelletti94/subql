@@ -99,10 +99,12 @@ fn a_group_that_empties_is_removed_and_comes_back_under_the_same_key() {
         ]],
         None,
     );
-    let north = one(&opening)
+    let north_group = one(&opening)
         .group
-        .clone()
-        .expect("grouped update carries a key");
+        .as_ref()
+        .expect("grouped update carries identity");
+    assert_eq!(north_group.values, vec![Value::String("north".into())]);
+    let north = north_group.key.clone();
     assert_eq!(
         one(&opening).change,
         AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(1)))
@@ -111,13 +113,33 @@ fn a_group_that_empties_is_removed_and_comes_back_under_the_same_key() {
     let removed = engine
         .aggregate_updates(&delete(orders, 1, "north", 10))
         .expect("delete folds");
-    assert_eq!(one(&removed).group.as_deref(), Some(north.as_slice()));
+    assert_eq!(
+        one(&removed).group.as_ref().map(|group| &group.key),
+        Some(&north)
+    );
     assert_eq!(one(&removed).change, AggregateValueChange::Remove);
+    assert_eq!(
+        one(&removed)
+            .group
+            .as_ref()
+            .map(|group| group.values.as_slice()),
+        Some([Value::String("north".into())].as_slice())
+    );
 
     let returned = engine
         .aggregate_updates(&insert(orders, 2, "north", 20))
         .expect("insert folds");
-    assert_eq!(one(&returned).group.as_deref(), Some(north.as_slice()));
+    assert_eq!(
+        one(&returned).group.as_ref().map(|group| &group.key),
+        Some(&north)
+    );
+    assert_eq!(
+        one(&returned)
+            .group
+            .as_ref()
+            .map(|group| group.values.as_slice()),
+        Some([Value::String("north".into())].as_slice())
+    );
     assert_eq!(
         one(&returned).change,
         AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(1)))
@@ -163,11 +185,10 @@ fn moving_a_row_between_groups_emits_remove_and_set() {
         .expect("update folds both row images");
     assert_eq!(moved.len(), 2, "one group loses the row and one gains it");
     assert!(moved.iter().any(|update| {
-        update.group.as_deref() == Some(north.as_slice())
-            && update.change == AggregateValueChange::Remove
+        update.group.as_ref() == Some(&north) && update.change == AggregateValueChange::Remove
     }));
     assert!(moved.iter().any(|update| {
-        update.group.as_deref() == Some(south.as_slice())
+        update.group.as_ref() == Some(&south)
             && update.change
                 == AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(
                     3,
@@ -263,4 +284,88 @@ fn an_all_null_group_uses_source_row_count_not_aggregate_value() {
     .with_checkpoint(PgLsn(10));
     let updates = engine.aggregate_updates(&removed).expect("delete folds");
     assert_eq!(one(&updates).change, AggregateValueChange::Remove);
+}
+
+#[test]
+fn a_new_multi_column_group_reports_values_in_statement_order() {
+    let (mut engine, orders) = engine();
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            9u64,
+            "SELECT region, status, COUNT(*) FROM orders GROUP BY region, status",
+        ))
+        .expect("grouped count registers")
+        .subscription_id;
+    assert!(seed(&mut engine, subscription, Vec::new(), None).is_empty());
+
+    let updates = engine
+        .aggregate_updates(&insert(orders, 1, "north", 10))
+        .expect("insert folds");
+    assert_eq!(
+        one(&updates)
+            .group
+            .as_ref()
+            .expect("grouped update carries identity")
+            .values,
+        vec![Value::String("north".into()), Value::String("paid".into())]
+    );
+}
+
+#[test]
+fn a_replayed_multi_column_group_keeps_its_identity() {
+    let (mut engine, orders) = engine();
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            10u64,
+            "SELECT region, status, COUNT(*) FROM orders GROUP BY region, status",
+        ))
+        .expect("grouped count registers")
+        .subscription_id;
+
+    assert!(engine
+        .aggregate_updates(&insert(orders, 1, "north", 10))
+        .expect("insert queues")
+        .is_empty());
+    let opening = seed(
+        &mut engine,
+        subscription,
+        vec![vec![
+            Value::String("south".into()),
+            Value::String("shipped".into()),
+            Value::Int(1),
+            Value::Int(1),
+        ]],
+        Some(PgLsn(5)),
+    );
+
+    assert_eq!(opening.len(), 2);
+    let replayed = opening
+        .iter()
+        .find(|update| {
+            update.group.as_ref().is_some_and(|group| {
+                group.values == vec![Value::String("north".into()), Value::String("paid".into())]
+            })
+        })
+        .expect("replayed group opens");
+    let identity = replayed
+        .group
+        .as_ref()
+        .expect("grouped update carries identity");
+    assert_eq!(
+        subql::backend::encode_value_key(&identity.values).as_ref(),
+        Some(&identity.key)
+    );
+    assert_eq!(
+        replayed.change,
+        AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(1)))
+    );
+    assert!(opening.iter().any(|update| {
+        update.group.as_ref().is_some_and(|group| {
+            group.values
+                == vec![
+                    Value::String("south".into()),
+                    Value::String("shipped".into()),
+                ]
+        })
+    }));
 }

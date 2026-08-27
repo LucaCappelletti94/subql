@@ -749,18 +749,18 @@ fn weighted_rows_for_agg<E: CdcEvent>(event: &E) -> Vec<(i64, RowKind)> {
     }
 }
 
-/// Net aggregate change per subscription and encoded group this event touched.
+/// Net aggregate change per subscription and group.
 #[derive(Debug)]
-pub(crate) struct AggregateDelta {
+pub(crate) struct AggregateDelta<B: crate::backend::Backend> {
     pub subscription: SubscriptionId,
-    pub group: Option<Vec<u8>>,
+    pub group: Option<crate::GroupIdentity<B>>,
     pub delta: Option<AggDelta>,
     /// Source-row change, independent of NULL aggregate cells.
     pub rows: i64,
 }
 
-pub(crate) struct AggregateComputation {
-    pub deltas: Vec<AggregateDelta>,
+pub(crate) struct AggregateComputation<B: crate::backend::Backend> {
+    pub deltas: Vec<AggregateDelta<B>>,
     pub missing_old: Vec<SubscriptionId>,
 }
 
@@ -812,6 +812,27 @@ where
     missing
 }
 
+fn aggregate_group<E, DB>(
+    event: &E,
+    row: RowKind,
+    columns: &[crate::ColumnId],
+    db: &DB,
+) -> Result<Option<crate::GroupIdentity<E::Backend>>, DispatchError>
+where
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let values = columns
+        .iter()
+        .map(|column| event.value_at(db, row, *column))
+        .collect::<Result<Vec<_>, _>>()?;
+    let key = crate::backend::encode_value_key(&values).ok_or(DispatchError::GroupKeyEncoding)?;
+    Ok(Some(crate::GroupIdentity { key, values }))
+}
+
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn compute_agg_deltas<I, E, DB>(
     event: &E,
@@ -819,15 +840,21 @@ pub(crate) fn compute_agg_deltas<I, E, DB>(
     vm: &mut Vm<E::Backend>,
     arity: usize,
     db: &DB,
-) -> Result<AggregateComputation, DispatchError>
+) -> Result<AggregateComputation<E::Backend>, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
     DB: DatabaseLike,
 {
     let weighted_rows = weighted_rows_for_agg(event);
-    let mut net: HashMap<(SubscriptionId, Option<Vec<u8>>), (Option<AggDelta>, i64)> =
-        HashMap::new();
+    let mut net: HashMap<
+        (SubscriptionId, Option<Vec<u8>>),
+        (
+            Option<AggDelta>,
+            i64,
+            Option<crate::GroupIdentity<E::Backend>>,
+        ),
+    > = HashMap::new();
     let snapshot = partition.load_snapshot();
 
     // For UPDATE, use dependency-aware candidate selection; for INSERT /
@@ -866,18 +893,7 @@ where
                 if let Some(error) = decode_err {
                     return Err(DispatchError::Value(error));
                 }
-                let group = if groups.is_empty() {
-                    None
-                } else {
-                    let values: Vec<_> = groups
-                        .iter()
-                        .map(|column| event.value_at(db, row, *column))
-                        .collect::<Result<_, _>>()?;
-                    Some(
-                        crate::backend::encode_value_key(&values)
-                            .ok_or(DispatchError::GroupKeyEncoding)?,
-                    )
-                };
+                let group = aggregate_group(event, row, groups, db)?;
 
                 for ord_u32 in consumers {
                     let ord = ConsumerOrdinal::new(ord_u32);
@@ -891,8 +907,11 @@ where
                             continue;
                         }
                         let held = net
-                            .entry((subscription, group.clone()))
-                            .or_insert((None, 0));
+                            .entry((
+                                subscription,
+                                group.as_ref().map(|identity| identity.key.clone()),
+                            ))
+                            .or_insert_with(|| (None, 0, group.clone()));
                         held.1 += weight;
                         if let Some(delta) = maybe_delta {
                             match &mut held.0 {
@@ -910,7 +929,7 @@ where
 
     let deltas = net
         .into_iter()
-        .filter_map(|((subscription, group), (delta, rows))| {
+        .filter_map(|((subscription, _), (delta, rows, group))| {
             (rows != 0 || delta.as_ref().is_some_and(|delta| !delta.is_zero())).then_some(
                 AggregateDelta {
                     subscription,

@@ -197,7 +197,7 @@ where
                     continue;
                 };
                 match total.fold(
-                    group.clone(),
+                    group,
                     delta.delta,
                     delta.rows,
                     at.as_ref(),
@@ -205,11 +205,11 @@ where
                     self.max_groups_per_aggregate,
                 ) {
                     crate::runtime::aggregate::GroupedFoldOutcome::Unchanged => {}
-                    crate::runtime::aggregate::GroupedFoldOutcome::Change(change) => {
+                    crate::runtime::aggregate::GroupedFoldOutcome::Change(identity, change) => {
                         output.updates.push(crate::AggregateValueUpdate {
                             subscription: delta.subscription,
                             consumer: total.consumer(),
-                            group: Some(group),
+                            group: Some(identity),
                             change,
                         });
                     }

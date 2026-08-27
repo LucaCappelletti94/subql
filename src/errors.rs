@@ -82,33 +82,21 @@ pub enum RegisterError {
         cap: usize,
     },
 
-    /// Aggregator subscription on a table with row-level security enabled.
-    ///
-    /// Under RLS, different viewers observe different result rows, so a
-    /// single in-process IVM state cannot be shared across consumers. The
-    /// reexec wrapper rejects such registrations until per-consumer total
-    /// re-execution lands.
+    /// Aggregate subscription on an RLS table without the per-consumer marker.
     #[error(
-        "Aggregator subscription on RLS-protected table {table_id} requires total re-execution (not yet supported)"
+        "Aggregate subscription on RLS-protected table {table_id} requires per-consumer database reads"
     )]
     AggregatorOnRlsTable {
-        /// Table whose RLS made the aggregator unsafe to capture.
+        /// Table whose RLS made shared aggregate state unsafe.
         table_id: TableId,
     },
 
-    /// A row-returning subscription over an RLS-protected table was captured
-    /// for re-execution, which cannot be shared.
-    ///
-    /// Same cause as [`Self::AggregatorOnRlsTable`] and a different query: this
-    /// one delivers rows rather than an aggregate, so the message must not call
-    /// it an aggregator. Row-level security means each consumer sees a
-    /// different set of rows, while a captured query holds one answer per
-    /// query, so per-consumer re-execution is the planned follow-on.
+    /// Captured row subscription on an RLS table without the per-consumer marker.
     #[error(
-        "Row subscription on RLS-protected table {table_id} requires per-consumer re-execution (not yet supported)"
+        "Row subscription on RLS-protected table {table_id} requires per-consumer database reads"
     )]
     RowCaptureOnRlsTable {
-        /// Table whose RLS made the captured rows unsafe to share.
+        /// Table whose RLS made shared row capture unsafe.
         table_id: TableId,
     },
 

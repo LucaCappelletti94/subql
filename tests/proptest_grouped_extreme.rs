@@ -10,7 +10,7 @@ use subql::backend::{Postgres, Value};
 use subql::reexec::ReExecutionRead;
 use subql::testing::TestEvent;
 use subql::{
-    AggregateResultValue, AggregateValueChange, DefaultIds, GroupedScalarInstall,
+    AggregateResultValue, AggregateValueChange, DefaultIds, GroupIdentity, GroupedScalarInstall,
     GroupedScalarSeedInstall, Install, NoCheckpoint, SubscriptionEngine, SubscriptionRequest,
 };
 
@@ -22,18 +22,36 @@ fn row(id: i64, group: &str, amount: i64) -> Vec<Value<Postgres>> {
     ]
 }
 
+fn identity_group_name(identity: &GroupIdentity<Postgres>) -> &str {
+    let [Value::String(name)] = identity.values.as_slice() else {
+        panic!("group identity must carry one string value")
+    };
+    name
+}
+
 fn apply_updates(
     observed: &mut BTreeMap<Vec<u8>, i64>,
+    group_keys: &HashMap<String, Vec<u8>>,
     updates: &[subql::AggregateValueUpdate<DefaultIds, Postgres>],
 ) {
     for update in updates {
-        let key = update.group.clone().expect("group key");
+        let identity = update.group.as_ref().expect("group identity");
+        assert_eq!(
+            subql::backend::encode_value_key(&identity.values).as_ref(),
+            Some(&identity.key)
+        );
+        let name = identity_group_name(identity);
+        assert_eq!(
+            group_keys.get(name),
+            Some(&identity.key),
+            "identity values must name the updated reference group"
+        );
         match &update.change {
             AggregateValueChange::Set(AggregateResultValue::Scalar(Value::Int(value))) => {
-                observed.insert(key, *value);
+                observed.insert(identity.key.clone(), *value);
             }
             AggregateValueChange::Remove => {
-                observed.remove(&key);
+                observed.remove(&identity.key);
             }
             other @ AggregateValueChange::Set(_) => {
                 panic!("unexpected grouped extreme update {other:?}")
@@ -118,14 +136,15 @@ proptest! {
                     .aggregate_updates()
                     .iter()
                     .find_map(|update| {
-                        matches!(update.change, AggregateValueChange::Set(_))
-                            .then(|| update.group.clone())
-                            .flatten()
+                        let identity = update.group.as_ref()?;
+                        (matches!(update.change, AggregateValueChange::Set(_))
+                            && identity_group_name(identity) == group)
+                            .then(|| identity.key.clone())
                     })
-                    .expect("a new group emits its key");
+                    .expect("a new group emits its identity");
                 group_keys.insert(group, key);
             }
-            apply_updates(&mut observed, output.aggregate_updates());
+            apply_updates(&mut observed, &group_keys, output.aggregate_updates());
 
             let reference = rows.values().fold(
                 BTreeMap::<String, Vec<i64>>::new(),
@@ -161,7 +180,7 @@ proptest! {
                     },
                 )
                 .expect("group read installs");
-                apply_updates(&mut observed, &installed.updates);
+                apply_updates(&mut observed, &group_keys, &installed.updates);
             }
 
             let expected: BTreeMap<Vec<u8>, i64> = reference
@@ -253,7 +272,7 @@ proptest! {
             };
             let output = engine.dispatch(&event).expect("event dispatches");
             prop_assert!(output.transitions().is_empty());
-            apply_updates(&mut observed, output.aggregate_updates());
+            apply_updates(&mut observed, &group_keys, output.aggregate_updates());
 
             let reference = rows.values().fold(
                 BTreeMap::<String, Vec<i64>>::new(),
@@ -289,7 +308,7 @@ proptest! {
                     },
                 )
                 .expect("group read installs");
-                apply_updates(&mut observed, &installed.updates);
+                apply_updates(&mut observed, &group_keys, &installed.updates);
             }
 
             // The announced result is the reference filtered by the condition.

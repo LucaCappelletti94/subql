@@ -1563,6 +1563,38 @@ impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> core::fmt::Debug
     }
 }
 
+/// Identity of one grouped SQL result row.
+pub struct GroupIdentity<B: crate::backend::Backend = crate::backend::Postgres> {
+    /// Opaque encoded key used to scope group reads.
+    pub key: Vec<u8>,
+    /// Typed `GROUP BY` values in statement order.
+    pub values: Vec<crate::backend::Value<B>>,
+}
+
+impl<B: crate::backend::Backend> Clone for GroupIdentity<B> {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            values: self.values.clone(),
+        }
+    }
+}
+
+impl<B: crate::backend::Backend> core::fmt::Debug for GroupIdentity<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GroupIdentity")
+            .field("key", &self.key)
+            .field("values", &self.values)
+            .finish()
+    }
+}
+
+impl<B: crate::backend::Backend> PartialEq for GroupIdentity<B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.values == other.values
+    }
+}
+
 /// One aggregate subscription's grouped SQL result changed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregateValueUpdate<I: IdTypes, B: crate::backend::Backend = crate::backend::Postgres> {
@@ -1570,8 +1602,8 @@ pub struct AggregateValueUpdate<I: IdTypes, B: crate::backend::Backend = crate::
     pub subscription: SubscriptionId,
     /// The consumer that registration belongs to.
     pub consumer: I::ConsumerId,
-    /// Opaque encoded group key, or `None` for an ungrouped aggregate.
-    pub group: Option<Vec<u8>>,
+    /// Group identity, or `None` for an ungrouped aggregate.
+    pub group: Option<GroupIdentity<B>>,
     /// Write or remove the grouped SQL result row.
     pub change: AggregateValueChange<B>,
 }
