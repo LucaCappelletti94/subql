@@ -125,6 +125,50 @@ pub type BuiltinKind = ScalarKind<NoCustom>;
 /// Spelling this alias is how a site says "a column type of this backend",
 /// as against [`BuiltinKind`], which says "a builtin shape".
 pub type ScalarKindOf<B> = ScalarKind<<<B as Backend>::Custom as CustomScalars>::Kind>;
+/// Owned SQL name for a group-key column's declared collation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GroupKeyCollationName {
+    /// Identifier without surrounding quotes.
+    pub name: alloc::string::String,
+    /// Whether the identifier was quoted.
+    pub name_is_quoted: bool,
+    /// Optional schema identifier without surrounding quotes.
+    pub schema: Option<alloc::string::String>,
+    /// Whether the schema identifier was quoted.
+    pub schema_is_quoted: bool,
+}
+
+/// Comparison metadata for a group-key column.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GroupKeyCollation {
+    /// The database default applies.
+    DatabaseDefault,
+    /// The column declares a named collation.
+    Named {
+        /// Declared collation name.
+        name: GroupKeyCollationName,
+        /// PostgreSQL determinism when known.
+        postgres_deterministic: Option<bool>,
+        /// MySQL padding behavior when known.
+        mysql_padding: Option<sql_traits::traits::MySqlCollationPadding>,
+    },
+    /// Comparison rules changed without a resolved collation name.
+    Unknown,
+}
+
+/// Catalog facts needed to decide whether a column can form a group key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GroupKeyColumn<C> {
+    /// Scalar kind used by subql.
+    pub kind: ScalarKind<C>,
+    /// Canonical declared SQL type.
+    pub declared_type: alloc::string::String,
+    /// Column comparison metadata.
+    pub collation: GroupKeyCollation,
+}
+
+/// Group-key catalog facts under backend `B`.
+pub type GroupKeyColumnOf<B> = GroupKeyColumn<<<B as Backend>::Custom as CustomScalars>::Kind>;
 
 /// The custom scalar set of a backend that has none. Uninhabited, so
 /// [`ScalarKind::Custom`] cannot be constructed for such a backend.

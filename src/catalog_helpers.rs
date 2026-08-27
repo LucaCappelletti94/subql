@@ -10,7 +10,7 @@
 //!
 //! Functions: [`table_id`], [`table_name`], [`column_id`], [`resolve_table`],
 //! [`table_arity`], [`schema_fingerprint`], [`primary_key_columns`],
-//! [`column_scalar_kind`], [`table_has_rls`].
+//! [`column_scalar_kind`], [`group_key_column`], [`table_has_rls`].
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -24,7 +24,10 @@ use sql_traits::{
 };
 use sqlite_diff_rs::SimpleTable;
 
-use crate::backend::{ScalarKind, ScalarKindOf};
+use crate::backend::{
+    GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, GroupKeyColumnOf, ScalarKind,
+    ScalarKindOf,
+};
 use crate::types::{ColumnId, TableId};
 
 /// Resolve a table name (unquoted or quoted form) to subql's compact
@@ -269,16 +272,59 @@ pub fn column_scalar_kind<B: crate::backend::Backend, DB: DatabaseLike>(
     table_id: TableId,
     column_id: ColumnId,
 ) -> Option<ScalarKindOf<B>> {
-    let table = database.table_by_id(table_id as usize)?;
-    let column = table.column_by_id(column_id as usize, database).ok()??;
-    let declared = column.data_type(database);
-    // A builtin name wins, so an embedder cannot shadow a type subql
-    // already understands. Only an unrecognised name reaches the backend's
-    // own classifier, which is the single rule the write side consults too.
-    if let Some(builtin) = scalar_kind_from_raw(&declared) {
+    let table_index = usize::try_from(table_id).ok()?;
+    let table = database.table_by_id(table_index)?;
+    let column = table
+        .column_by_id(usize::from(column_id), database)
+        .ok()??;
+    classify_scalar_kind::<B>(&column.data_type(database))
+}
+
+/// Returns the scalar and comparison facts for one group-key column.
+#[must_use]
+pub fn group_key_column<B: crate::backend::Backend, DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Option<GroupKeyColumnOf<B>> {
+    let table_index = usize::try_from(table_id).ok()?;
+    let table = database.table_by_id(table_index)?;
+    let column = table
+        .column_by_id(usize::from(column_id), database)
+        .ok()??;
+    let declared_type = column.data_type(database).into_owned();
+    let kind = classify_scalar_kind::<B>(&declared_type)?;
+    let collation = match column.collation(database).ok()? {
+        sql_traits::traits::ColumnCollation::DatabaseDefault => GroupKeyCollation::DatabaseDefault,
+        sql_traits::traits::ColumnCollation::Named(collation) => {
+            let target = collation.name();
+            GroupKeyCollation::Named {
+                name: GroupKeyCollationName {
+                    name: target.name().to_string(),
+                    name_is_quoted: target.name_is_quoted(),
+                    schema: target.schema().map(ToString::to_string),
+                    schema_is_quoted: target.schema_is_quoted(),
+                },
+                postgres_deterministic: collation.postgres_deterministic(),
+                mysql_padding: collation.mysql_padding(),
+            }
+        }
+        sql_traits::traits::ColumnCollation::Unknown => GroupKeyCollation::Unknown,
+    };
+    Some(GroupKeyColumn {
+        kind,
+        declared_type,
+        collation,
+    })
+}
+
+fn classify_scalar_kind<B: crate::backend::Backend>(
+    declared_type: &str,
+) -> Option<ScalarKindOf<B>> {
+    if let Some(builtin) = scalar_kind_from_raw(declared_type) {
         return Some(ScalarKind::from_builtin(builtin));
     }
-    <B::Custom as crate::backend::CustomScalars>::classify(&declared).map(ScalarKind::Custom)
+    <B::Custom as crate::backend::CustomScalars>::classify(declared_type).map(ScalarKind::Custom)
 }
 
 /// The builtin kind a column declares, or `None` when it declares none.
@@ -538,5 +584,56 @@ mod tests {
             column_scalar_kind::<Postgres, _>(&my, tid, 5),
             Some(ScalarKind::Int)
         );
+        let _ = tid;
+    }
+
+    #[test]
+    fn group_key_column_preserves_postgres_collation_facts() {
+        use crate::backend::{GroupKeyCollation, GroupKeyColumnOf};
+
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+             CREATE TABLE labels (name TEXT COLLATE ci);",
+        )
+        .unwrap();
+        let table = table_id(&db, "labels").unwrap();
+
+        let column: GroupKeyColumnOf<Postgres> =
+            group_key_column::<Postgres, _>(&db, table, 0).unwrap();
+        assert_eq!(column.kind, ScalarKind::String);
+        assert_eq!(column.declared_type, "TEXT");
+        let GroupKeyCollation::Named {
+            name,
+            postgres_deterministic,
+            ..
+        } = column.collation
+        else {
+            panic!("expected named collation")
+        };
+        assert_eq!(name.name, "ci");
+        assert_eq!(postgres_deterministic, Some(false));
+    }
+
+    #[test]
+    fn group_key_column_distinguishes_default_and_unknown_collations() {
+        use crate::backend::{GroupKeyCollation, GroupKeyColumnOf};
+
+        let default_db = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
+            "CREATE TABLE labels (name TEXT);",
+        )
+        .unwrap();
+        let table = table_id(&default_db, "labels").unwrap();
+        let column: GroupKeyColumnOf<crate::backend::SQLite> =
+            group_key_column::<crate::backend::SQLite, _>(&default_db, table, 0).unwrap();
+        assert_eq!(column.collation, GroupKeyCollation::DatabaseDefault);
+
+        let unknown_db = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
+            "CREATE TABLE labels (name TEXT CHARACTER SET utf8mb4);",
+        )
+        .unwrap();
+        let table = table_id(&unknown_db, "labels").unwrap();
+        let column: GroupKeyColumnOf<crate::backend::MySql> =
+            group_key_column::<crate::backend::MySql, _>(&unknown_db, table, 0).unwrap();
+        assert_eq!(column.collation, GroupKeyCollation::Unknown);
     }
 }
