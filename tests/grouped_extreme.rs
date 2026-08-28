@@ -203,7 +203,7 @@ fn null_group_values_use_is_null_in_the_scoped_read() {
         query.sql().contains("\"region\" IS NULL"),
         "scoped query was {query:?}"
     );
-    assert!(query.binds().is_empty());
+    assert_eq!(query.binds(), []);
 }
 
 #[test]

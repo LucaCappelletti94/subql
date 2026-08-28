@@ -5193,6 +5193,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlparser-canonicalize"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#7b7b5c72a35ef3932f1401e2529df632aac26de6"
+dependencies = [
+ "seahash",
+ "sqlparser",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
 source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#75a1040597fd6233f24a6b41641b360e30fb01b9"
@@ -5301,13 +5311,13 @@ dependencies = [
  "r2d2",
  "rls2fga",
  "roaring",
- "seahash",
  "serde",
  "serde_json",
  "slab",
  "sql-traits",
  "sqlite-diff-rs",
  "sqlparser",
+ "sqlparser-canonicalize",
  "tempfile",
  "testcontainers",
  "thiserror 2.0.20",

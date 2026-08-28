@@ -767,7 +767,12 @@ fn canonicalize_term_slots<B: Backend>(
 
     let mut keyed: Vec<(String, CompiledTerm)> = terms
         .into_iter()
-        .map(|term| Ok((canonicalize::normalize_expr(&term.expr)?, term)))
+        .map(|term| {
+            Ok((
+                canonicalize::normalize_where_clause(Some(&term.expr))?,
+                term,
+            ))
+        })
         .collect::<Result<_, RegisterError>>()?;
     keyed.sort_by(|left, right| left.0.cmp(&right.0));
 

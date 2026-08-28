@@ -313,6 +313,8 @@ required-features = [
 # table a statement reads, and a table it missed would be a table whose changes
 # never trigger the query, so totality by derivation beats a hand-rolled walk.
 sqlparser = { version = "0.62", default-features = false, features = ["visitor"] }
+# Canonical SQL predicates and stable hashes.
+sqlparser-canonicalize = { git = "https://github.com/LucaCappelletti94/sqlparser-canonicalize", branch = "main", default-features = false }
 
 # Generic SQL schema traits + canonical SchemaFingerprint (FINGERPRINT_SPEC).
 # `default-features = false` follows sql-traits' own gating. The `std`
@@ -333,7 +335,6 @@ arc-swap = "1.7"
 # hasher (foldhash) via the `default-hasher` feature — no direct ahash dep
 # required.
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "serde", "inline-more", "allocator-api2"] }
-seahash = "4.1"        # Deterministic hashing for canonicalization
 
 # Serialization. All no_std + alloc capable. Std features propagated below.
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "alloc"] }
