@@ -11,7 +11,7 @@
 //! a future `executor-sqlx` or `executor-diesel-async` feature can land
 //! additively without a trait-shape change.
 
-use super::connector::{ScalarRowError, Snapshot};
+use super::connector::{ReadQuery, ScalarRowError, Snapshot};
 use crate::backend::{Backend, BuiltinKind, Value};
 use crate::Checkpoint;
 
@@ -60,7 +60,7 @@ pub trait AsyncConnector: Send + Sync {
     /// returning a future.
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kind: BuiltinKind,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
@@ -72,7 +72,7 @@ pub trait AsyncConnector: Send + Sync {
     /// stateless.
     fn read_page(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         max_bytes: usize,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
@@ -83,11 +83,11 @@ pub trait AsyncConnector: Send + Sync {
     /// [`Connector::open_cursor`](super::Connector::open_cursor).
     fn open_cursor(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<Output = Result<super::CursorId, super::CursorError<Self::Error>>>
            + Send {
-        let _ = (sql, auth);
+        let _ = (query, auth);
         core::future::ready(Err(super::CursorError::Unsupported))
     }
 
@@ -141,7 +141,7 @@ pub trait AsyncConnector: Send + Sync {
     /// external impls keep compiling.
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kinds: &[BuiltinKind],
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
@@ -153,7 +153,7 @@ pub trait AsyncConnector: Send + Sync {
             ScalarRowError<Self::Error>,
         >,
     > + Send {
-        let _ = (sql, kinds, auth);
+        let _ = (query, kinds, auth);
         async { Err(ScalarRowError::Unsupported) }
     }
 }

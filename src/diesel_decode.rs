@@ -729,8 +729,8 @@ impl SpellCanonical for crate::backend::SQLite {
             Canonical::Date(d) => Value::Date(d),
             Canonical::Time(t) => Value::Time(t),
             Canonical::Decimal(d) => Value::Decimal(d),
-            Canonical::Json(j) => Value::Json(j),
-            Canonical::Jsonb(j) => Value::Jsonb(j),
+            Canonical::Json(j) => Value::Json(j.into()),
+            Canonical::Jsonb(j) => Value::Jsonb(j.into()),
         }
     }
 }

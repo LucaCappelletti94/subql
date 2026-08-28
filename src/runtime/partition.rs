@@ -515,6 +515,7 @@ mod tests {
             index_atoms: Arc::from([IndexableAtom::Fallback]),
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             projection: QueryProjection::Rows,
+            group_key_encoder: None,
             refcount: 1,
             updated_at_unix_ms: 0,
         }

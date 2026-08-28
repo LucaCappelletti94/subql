@@ -100,6 +100,8 @@ pub struct GroupedMinMaxPlan<B: Backend> {
     pub read_projection: Vec<SelectItem>,
     pub bootstrap: crate::AggregateBootstrap,
     pub having: Option<GroupedHavingCheck<B>>,
+    pub bind_placeholder: crate::compiler::BindPlaceholder,
+    pub group_key_encoder: crate::backend::GroupKeyEncoder<B>,
 }
 
 /// A grouped extreme's `HAVING` comparison, its threshold parsed at plan
@@ -277,6 +279,21 @@ where
             )
         })?;
     let having = planned_having::<B>(projection.having.as_ref(), agg_kind)?;
+    let group_key_columns = projection
+        .groups
+        .iter()
+        .map(|column| {
+            crate::catalog_helpers::group_key_column::<B, _>(database, parsed.table_id, *column)
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            RegisterError::UnsupportedSql(
+                "a grouped extreme column has incomplete key metadata".to_string(),
+            )
+        })?;
+    let group_key_encoder = B::group_key_encoder(group_key_columns).ok_or_else(|| {
+        RegisterError::UnsupportedSql("a grouped extreme column has no canonical key".to_string())
+    })?;
     let mut group_kinds = Vec::with_capacity(projection.groups.len());
     let mut group_idents = Vec::with_capacity(projection.groups.len());
     for column in &projection.groups {
@@ -341,6 +358,8 @@ where
             statement: parsed.statement,
             bootstrap,
             having,
+            bind_placeholder: crate::compiler::bind_placeholder(dialect),
+            group_key_encoder,
         },
     )))
 }
@@ -453,11 +472,11 @@ fn grouped_scalar_read_projection<B: Backend>(
 }
 
 /// Render the extreme and source-row count for one group.
-pub fn render_grouped_scalar_read<B: Backend + SqlLiteralParse>(
+pub fn render_grouped_scalar_read<B: Backend>(
     plan: &GroupedMinMaxPlan<B>,
     group_values: &[Value<B>],
-) -> Result<String, RegisterError> {
-    use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr};
+) -> Result<crate::reexec::ReadQuery<'static, B>, RegisterError> {
+    use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, Value as SqlValue};
 
     if group_values.len() != plan.group_idents.len() {
         return Err(RegisterError::UnsupportedSql(
@@ -465,14 +484,24 @@ pub fn render_grouped_scalar_read<B: Backend + SqlLiteralParse>(
         ));
     }
     let mut scoped = None;
+    let mut binds = Vec::with_capacity(group_values.len());
     for (ident, value) in plan.group_idents.iter().zip(group_values) {
         let predicate = if value.is_null() {
             Expr::IsNull(alloc::boxed::Box::new(Expr::Identifier(ident.clone())))
         } else {
+            let placeholder = match plan.bind_placeholder {
+                crate::compiler::BindPlaceholder::Numbered => {
+                    alloc::format!("${}", binds.len() + 1)
+                }
+                crate::compiler::BindPlaceholder::Positional => "?".to_string(),
+            };
+            binds.push(value.clone());
             Expr::BinaryOp {
                 left: alloc::boxed::Box::new(Expr::Identifier(ident.clone())),
                 op: BinaryOperator::Eq,
-                right: alloc::boxed::Box::new(B::render_group_literal(value)?),
+                right: alloc::boxed::Box::new(Expr::Value(
+                    SqlValue::Placeholder(placeholder).with_empty_span(),
+                )),
             }
         };
         scoped = Some(match scoped {
@@ -490,8 +519,7 @@ pub fn render_grouped_scalar_read<B: Backend + SqlLiteralParse>(
     };
     select.projection.clone_from(&plan.read_projection);
     select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
-    // The scoped read replaces a group's whole state, hidden groups
-    // included, so the original condition must not filter it.
+    // The scoped read replaces the whole group, so HAVING must not filter it.
     select.having = None;
     let scoped = scoped.expect("a grouped plan has at least one group column");
     select.selection = Some(match select.selection.take() {
@@ -502,7 +530,10 @@ pub fn render_grouped_scalar_read<B: Backend + SqlLiteralParse>(
         },
         None => scoped,
     });
-    Ok(statement.to_string())
+    Ok(crate::reexec::ReadQuery::owned(
+        statement.to_string(),
+        binds,
+    ))
 }
 
 fn scalar_plan<B, DB>(

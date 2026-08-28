@@ -170,6 +170,416 @@ pub struct GroupKeyColumn<C> {
 /// Group-key catalog facts under backend `B`.
 pub type GroupKeyColumnOf<B> = GroupKeyColumn<<<B as Backend>::Custom as CustomScalars>::Kind>;
 
+type GroupKeyComponentEncoder<B> =
+    fn(&GroupKeyColumnOf<B>, &Value<B>, &mut alloc::vec::Vec<u8>) -> bool;
+
+/// Canonical identity encoder selected for one grouped projection.
+pub struct GroupKeyEncoder<B: Backend> {
+    columns: alloc::sync::Arc<[GroupKeyColumnOf<B>]>,
+    encode_component: GroupKeyComponentEncoder<B>,
+}
+
+impl<B: Backend> GroupKeyEncoder<B> {
+    /// Creates an encoder from resolved columns and one backend component writer.
+    #[must_use]
+    pub fn new(
+        columns: alloc::vec::Vec<GroupKeyColumnOf<B>>,
+        encode_component: GroupKeyComponentEncoder<B>,
+    ) -> Self {
+        Self {
+            columns: columns.into(),
+            encode_component,
+        }
+    }
+
+    /// Encodes one tuple, or refuses values outside the selected column domain.
+    #[must_use]
+    pub fn encode(&self, values: &[Value<B>]) -> Option<alloc::vec::Vec<u8>> {
+        let count = u16::try_from(self.columns.len()).ok()?;
+        if values.len() != self.columns.len() {
+            return None;
+        }
+        let mut key = alloc::vec::Vec::new();
+        key.extend_from_slice(b"SQGK");
+        key.push(1);
+        key.extend_from_slice(&count.to_be_bytes());
+        for (column, value) in self.columns.iter().zip(values) {
+            let length_at = key.len();
+            key.extend_from_slice(&[0; 4]);
+            let component_at = key.len();
+            if !(self.encode_component)(column, value, &mut key) {
+                return None;
+            }
+            let length = u32::try_from(key.len() - component_at).ok()?;
+            key[length_at..component_at].copy_from_slice(&length.to_be_bytes());
+        }
+        Some(key)
+    }
+
+    /// Columns whose comparison contract selected this encoder.
+    #[must_use]
+    pub fn columns(&self) -> &[GroupKeyColumnOf<B>] {
+        &self.columns
+    }
+}
+
+impl<B: Backend> Clone for GroupKeyEncoder<B> {
+    fn clone(&self) -> Self {
+        Self {
+            columns: alloc::sync::Arc::clone(&self.columns),
+            encode_component: self.encode_component,
+        }
+    }
+}
+
+impl<B: Backend> core::fmt::Debug for GroupKeyEncoder<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GroupKeyEncoder")
+            .field("columns", &self.columns)
+            .finish_non_exhaustive()
+    }
+}
+
+struct AppendPostcard<'a>(&'a mut alloc::vec::Vec<u8>);
+
+impl postcard::ser_flavors::Flavor for AppendPostcard<'_> {
+    type Output = ();
+
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn try_push(&mut self, data: u8) -> postcard::Result<()> {
+        self.0.push(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<Self::Output> {
+        Ok(())
+    }
+}
+
+fn append_postcard<T: serde::Serialize + ?Sized>(
+    output: &mut alloc::vec::Vec<u8>,
+    value: &T,
+) -> bool {
+    postcard::serialize_with_flavor::<T, AppendPostcard<'_>, ()>(value, AppendPostcard(output))
+        .is_ok()
+}
+
+fn encode_exact_component<B: Backend>(
+    column: &GroupKeyColumnOf<B>,
+    value: &Value<B>,
+    output: &mut alloc::vec::Vec<u8>,
+) -> bool {
+    macro_rules! tagged {
+        ($tag:literal, $value:expr) => {{
+            output.push($tag);
+            append_postcard(output, $value)
+        }};
+    }
+    match (column.kind, value) {
+        (_, Value::Null) => {
+            output.push(0);
+            true
+        }
+        (ScalarKind::Bool, Value::Bool(value)) => tagged!(1, value),
+        (ScalarKind::Int, Value::Int(value)) => tagged!(2, value),
+        (ScalarKind::Float, Value::Float(value)) => tagged!(3, value),
+        (ScalarKind::String, Value::String(value)) => tagged!(4, value),
+        (ScalarKind::Bytes, Value::Bytes(value)) => tagged!(5, value),
+        (ScalarKind::Uuid, Value::Uuid(value)) => tagged!(6, value),
+        (ScalarKind::Timestamp, Value::Timestamp(value)) => tagged!(7, value),
+        (ScalarKind::TimestampTz, Value::TimestampTz(value)) => tagged!(8, value),
+        (ScalarKind::Date, Value::Date(value)) => tagged!(9, value),
+        (ScalarKind::Time, Value::Time(value)) => tagged!(10, value),
+        (ScalarKind::Decimal, Value::Decimal(value)) => tagged!(11, value),
+        (ScalarKind::Json, Value::Json(value)) => tagged!(12, value),
+        (ScalarKind::Jsonb, Value::Jsonb(value)) => tagged!(13, value),
+        (ScalarKind::Custom(kind), Value::Custom(value))
+            if kind == <B::Custom as CustomScalars>::kind_of(value) =>
+        {
+            tagged!(14, value)
+        }
+        _ => false,
+    }
+}
+
+fn default_group_key_encoder<B: Backend>(
+    columns: alloc::vec::Vec<GroupKeyColumnOf<B>>,
+) -> Option<GroupKeyEncoder<B>> {
+    let supported = columns.iter().all(|column| {
+        matches!(
+            column.kind,
+            ScalarKind::Int
+                | ScalarKind::Bool
+                | ScalarKind::Bytes
+                | ScalarKind::Timestamp
+                | ScalarKind::TimestampTz
+                | ScalarKind::Date
+                | ScalarKind::Time
+        )
+    });
+    supported.then(|| GroupKeyEncoder::new(columns, encode_exact_component::<B>))
+}
+
+fn decode_exact_group_value<B: Backend>(
+    kind: ScalarKindOf<B>,
+    value: Value<B>,
+) -> Option<Value<B>> {
+    if value.is_null() || value.scalar_kind() == Some(kind) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TextKey {
+    Exact,
+    AsciiNoCase,
+    TrimTrailingSpace,
+}
+
+fn canonical_f64(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else if value.is_nan() {
+        f64::from_bits(0x7ff8_0000_0000_0000)
+    } else {
+        value
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+const fn widen_i64_to_f64(value: i64) -> f64 {
+    value as f64 // Deliberate SQL double-precision rounding.
+}
+
+fn append_tagged<T: serde::Serialize + ?Sized>(
+    output: &mut alloc::vec::Vec<u8>,
+    tag: u8,
+    value: &T,
+) -> bool {
+    output.push(tag);
+    append_postcard(output, value)
+}
+
+fn append_text(output: &mut alloc::vec::Vec<u8>, tag: u8, value: &str, mode: TextKey) -> bool {
+    match mode {
+        TextKey::Exact => append_tagged(output, tag, value),
+        TextKey::TrimTrailingSpace => append_tagged(output, tag, value.trim_end_matches(' ')),
+        TextKey::AsciiNoCase => {
+            let mut canonical = value.as_bytes().to_vec();
+            canonical.make_ascii_lowercase();
+            output.push(tag);
+            append_postcard(output, canonical.as_slice())
+        }
+    }
+}
+
+const fn postgres_text_key(column: &GroupKeyColumnOf<Postgres>) -> Option<TextKey> {
+    match &column.collation {
+        // PostgreSQL CREATE DATABASE cannot select nondeterministic comparisons.
+        GroupKeyCollation::DatabaseDefault => Some(TextKey::Exact),
+        GroupKeyCollation::Named {
+            postgres_deterministic: Some(true),
+            ..
+        } => Some(TextKey::Exact),
+        GroupKeyCollation::Named { .. } | GroupKeyCollation::Unknown => None,
+    }
+}
+
+fn sqlite_text_key(column: &GroupKeyColumnOf<SQLite>) -> Option<TextKey> {
+    match &column.collation {
+        GroupKeyCollation::DatabaseDefault => Some(TextKey::Exact),
+        GroupKeyCollation::Named { name, .. } if name.name.eq_ignore_ascii_case("binary") => {
+            Some(TextKey::Exact)
+        }
+        GroupKeyCollation::Named { name, .. } if name.name.eq_ignore_ascii_case("nocase") => {
+            Some(TextKey::AsciiNoCase)
+        }
+        GroupKeyCollation::Named { name, .. } if name.name.eq_ignore_ascii_case("rtrim") => {
+            Some(TextKey::TrimTrailingSpace)
+        }
+        GroupKeyCollation::Named { .. } | GroupKeyCollation::Unknown => None,
+    }
+}
+
+fn mysql_text_key(column: &GroupKeyColumnOf<MySql>) -> Option<TextKey> {
+    let GroupKeyCollation::Named {
+        name,
+        mysql_padding,
+        ..
+    } = &column.collation
+    else {
+        return None;
+    };
+    if !name.name.to_ascii_lowercase().ends_with("_bin") {
+        return None;
+    }
+    match mysql_padding {
+        Some(sql_traits::traits::MySqlCollationPadding::PadSpace) => {
+            Some(TextKey::TrimTrailingSpace)
+        }
+        Some(sql_traits::traits::MySqlCollationPadding::NoPad) => Some(TextKey::Exact),
+        None if name.name.eq_ignore_ascii_case("utf8mb4_bin") => Some(TextKey::TrimTrailingSpace),
+        None if name.name.eq_ignore_ascii_case("utf8mb4_0900_bin") => Some(TextKey::Exact),
+        None => None,
+    }
+}
+
+fn append_json(value: &serde_json::Value, output: &mut alloc::vec::Vec<u8>) -> bool {
+    match value {
+        serde_json::Value::Null => {
+            output.push(0);
+            true
+        }
+        serde_json::Value::Bool(value) => append_tagged(output, 1, value),
+        serde_json::Value::Number(value) => {
+            let Ok(number) = value.to_string().parse::<bigdecimal::BigDecimal>() else {
+                return false;
+            };
+            append_tagged(output, 2, &number.normalized().to_string())
+        }
+        serde_json::Value::String(value) => append_tagged(output, 3, value),
+        serde_json::Value::Array(values) => {
+            let Ok(length) = u32::try_from(values.len()) else {
+                return false;
+            };
+            output.push(4);
+            output.extend_from_slice(&length.to_be_bytes());
+            values.iter().all(|value| append_json(value, output))
+        }
+        serde_json::Value::Object(values) => {
+            let Ok(length) = u32::try_from(values.len()) else {
+                return false;
+            };
+            output.push(5);
+            output.extend_from_slice(&length.to_be_bytes());
+            let mut fields: alloc::vec::Vec<_> = values.iter().collect();
+            fields.sort_unstable_by(|left, right| {
+                left.0
+                    .len()
+                    .cmp(&right.0.len())
+                    .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+            });
+            fields
+                .into_iter()
+                .all(|(name, value)| append_postcard(output, name) && append_json(value, output))
+        }
+    }
+}
+
+pub(crate) fn jsonb_values_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    let mut left_key = alloc::vec::Vec::new();
+    let mut right_key = alloc::vec::Vec::new();
+    append_json(left, &mut left_key) && append_json(right, &mut right_key) && left_key == right_key
+}
+
+pub(crate) fn jsonb_payloads_equal<B: Backend>(left: &B::Jsonb, right: &B::Jsonb) -> bool {
+    let left_json = (left as &dyn core::any::Any).downcast_ref::<serde_json::Value>();
+    let right_json = (right as &dyn core::any::Any).downcast_ref::<serde_json::Value>();
+    match (left_json, right_json) {
+        (Some(left), Some(right)) => jsonb_values_equal(left, right),
+        _ => left == right,
+    }
+}
+
+fn encode_postgres_component(
+    column: &GroupKeyColumnOf<Postgres>,
+    value: &Value<Postgres>,
+    output: &mut alloc::vec::Vec<u8>,
+) -> bool {
+    match (column.kind, value) {
+        (ScalarKind::Float, Value::Float(value)) => {
+            append_tagged(output, 3, &canonical_f64(*value))
+        }
+        (ScalarKind::String, Value::String(value)) => {
+            postgres_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
+        }
+        (ScalarKind::Jsonb, Value::Jsonb(value)) => {
+            output.push(13);
+            append_json(value, output)
+        }
+        _ => encode_exact_component(column, value, output),
+    }
+}
+
+fn encode_mysql_component(
+    column: &GroupKeyColumnOf<MySql>,
+    value: &Value<MySql>,
+    output: &mut alloc::vec::Vec<u8>,
+) -> bool {
+    match (column.kind, value) {
+        (ScalarKind::Float, Value::Float(value)) => {
+            append_tagged(output, 3, &canonical_f64(*value))
+        }
+        (ScalarKind::String, Value::String(value)) => {
+            mysql_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
+        }
+        (ScalarKind::Uuid, Value::Uuid(value)) => {
+            mysql_text_key(column).is_some_and(|mode| append_text(output, 6, value, mode))
+        }
+        (ScalarKind::Decimal, Value::Decimal(value)) => {
+            append_tagged(output, 11, &value.normalized())
+        }
+        _ => encode_exact_component(column, value, output),
+    }
+}
+
+fn append_sqlite_json(
+    column: &GroupKeyColumnOf<SQLite>,
+    value: &SqliteJson,
+    output: &mut alloc::vec::Vec<u8>,
+) -> bool {
+    match value.storage() {
+        SqliteJsonStorage::Text(value) => {
+            sqlite_text_key(column).is_some_and(|mode| append_text(output, 0, value, mode))
+        }
+        SqliteJsonStorage::Integer(value) => append_tagged(output, 1, value),
+        SqliteJsonStorage::Real(value) => {
+            let canonical = canonical_f64(*value);
+            if canonical.fract() == 0.0 {
+                if let Ok(integer) = canonical.to_string().parse::<i64>() {
+                    return append_tagged(output, 1, &integer);
+                }
+            }
+            append_tagged(output, 2, &canonical)
+        }
+        SqliteJsonStorage::Blob(value) => append_tagged(output, 3, value),
+    }
+}
+
+fn encode_sqlite_component(
+    column: &GroupKeyColumnOf<SQLite>,
+    value: &Value<SQLite>,
+    output: &mut alloc::vec::Vec<u8>,
+) -> bool {
+    match (column.kind, value) {
+        // SQLite stores NaN as SQL NULL, so only synthetic values reach this arm.
+        (ScalarKind::Float, Value::Float(value)) => {
+            append_tagged(output, 3, &canonical_f64(*value))
+        }
+        (ScalarKind::String, Value::String(value)) => {
+            sqlite_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
+        }
+        (ScalarKind::Uuid, Value::Uuid(value)) => {
+            sqlite_text_key(column).is_some_and(|mode| append_text(output, 6, value, mode))
+        }
+        (ScalarKind::Json, Value::Json(value)) => {
+            output.push(12);
+            append_sqlite_json(column, value, output)
+        }
+        (ScalarKind::Jsonb, Value::Jsonb(value)) => {
+            output.push(13);
+            append_sqlite_json(column, value, output)
+        }
+        _ => encode_exact_component(column, value, output),
+    }
+}
+
 /// The custom scalar set of a backend that has none. Uninhabited, so
 /// [`ScalarKind::Custom`] cannot be constructed for such a backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -573,7 +983,7 @@ impl<B: Backend> PartialEq for Value<B> {
             (Self::Time(a), Self::Time(b)) => a == b,
             (Self::Decimal(a), Self::Decimal(b)) => a == b,
             (Self::Json(a), Self::Json(b)) => a == b,
-            (Self::Jsonb(a), Self::Jsonb(b)) => a == b,
+            (Self::Jsonb(a), Self::Jsonb(b)) => jsonb_payloads_equal::<B>(a, b),
             // Without this arm the wildcard below answers `false` for two
             // equal custom values, which is the silent wrong answer the
             // wildcard hides from the compiler.
@@ -709,15 +1119,96 @@ impl ScalarTruth for i64 {
     }
 }
 
-/// Payload that stores a JSON document.
+/// SQLite storage classes carried by a column declared as JSON-like.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SqliteJsonStorage {
+    /// Stored text, preserved byte-for-byte.
+    Text(alloc::string::String),
+    /// Stored integer.
+    Integer(i64),
+    /// Stored real.
+    Real(f64),
+    /// Stored blob, including SQLite JSONB.
+    Blob(alloc::vec::Vec<u8>),
+}
+
+/// Lossless SQLite JSON-like value with an optional parsed document.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SqliteJson {
+    storage: SqliteJsonStorage,
+    document: Option<serde_json::Value>,
+}
+
+impl SqliteJson {
+    /// Preserves a text value and parses it when valid JSON.
+    #[must_use]
+    pub fn text(raw: alloc::string::String) -> Self {
+        let document = serde_json::from_str(&raw).ok();
+        Self {
+            storage: SqliteJsonStorage::Text(raw),
+            document,
+        }
+    }
+
+    /// Preserves an integer storage value.
+    #[must_use]
+    pub fn integer(value: i64) -> Self {
+        Self {
+            storage: SqliteJsonStorage::Integer(value),
+            document: Some(serde_json::Value::Number(value.into())),
+        }
+    }
+
+    /// Preserves a real storage value.
+    #[must_use]
+    pub fn real(value: f64) -> Self {
+        Self {
+            storage: SqliteJsonStorage::Real(value),
+            document: serde_json::Number::from_f64(value).map(serde_json::Value::Number),
+        }
+    }
+
+    /// Preserves a blob storage value.
+    #[must_use]
+    pub const fn blob(value: alloc::vec::Vec<u8>) -> Self {
+        Self {
+            storage: SqliteJsonStorage::Blob(value),
+            document: None,
+        }
+    }
+
+    /// Returns the original SQLite storage value.
+    #[must_use]
+    pub const fn storage(&self) -> &SqliteJsonStorage {
+        &self.storage
+    }
+}
+
+impl From<serde_json::Value> for SqliteJson {
+    fn from(document: serde_json::Value) -> Self {
+        let raw = document.to_string();
+        Self {
+            storage: SqliteJsonStorage::Text(raw),
+            document: Some(document),
+        }
+    }
+}
+
+/// Payload that may expose a parsed JSON document.
 pub trait JsonDocument: ScalarCore {
-    /// Borrow the stored document.
-    fn json_document(&self) -> &serde_json::Value;
+    /// Borrows the parsed document when the stored value has one.
+    fn json_document(&self) -> Option<&serde_json::Value>;
 }
 
 impl JsonDocument for serde_json::Value {
-    fn json_document(&self) -> &serde_json::Value {
-        self
+    fn json_document(&self) -> Option<&serde_json::Value> {
+        Some(self)
+    }
+}
+
+impl JsonDocument for SqliteJson {
+    fn json_document(&self) -> Option<&serde_json::Value> {
+        self.document.as_ref()
     }
 }
 
@@ -741,32 +1232,29 @@ impl JsonDocument for serde_json::Value {
 ///   UUIDs as text.
 /// * `Bool` diverges per backend: Postgres carries `bool`; SQLite carries
 ///   `i64` because SQLite has no native BOOL.
-/// * `Json` and `Jsonb` are distinct (Diesel treats them as distinct
-///   `sql_types`; Postgres assigns them different OIDs). Both use
-///   [`serde_json::Value`] for the Rust representation.
+/// * Postgres and MySQL JSON use [`serde_json::Value`]. SQLite uses
+///   [`SqliteJson`] to preserve the storage class and original text.
 pub trait Backend: 'static {
-    /// Whether two text values that differ in bytes are two different values
-    /// to this database.
-    ///
-    /// Grouping needs it. A grouped fold decides a row's group by encoding the
-    /// group columns, while the database decides it by its own equality, and
-    /// the two must agree or a seed row and a later change land in different
-    /// groups and both totals go wrong with nothing failing.
-    ///
-    /// Measured rather than assumed. Postgres text collations are deterministic
-    /// unless a column declares otherwise, and SQLite's default is `BINARY`, so
-    /// `'a'` and `'A'` are two groups on both. MySQL 8.0 ships
-    /// `utf8mb4_0900_ai_ci` as the server default, so they are one group there
-    /// out of the box, and because that collation comes from server and table
-    /// defaults rather than the column's DDL it is not even visible in the
-    /// schema text, so it cannot be detected per column.
-    ///
-    /// [`ScalarKind::Uuid`] rides this too, since MySQL and SQLite carry a uuid
-    /// as text while Postgres carries a parsed one.
-    const TEXT_GROUPS_BY_BYTES: bool;
+    /// Selects a canonical encoder for resolved group columns.
+    #[must_use]
+    fn group_key_encoder(
+        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+    ) -> Option<GroupKeyEncoder<Self>>
+    where
+        Self: Sized,
+    {
+        default_group_key_encoder(columns)
+    }
 
-    /// sqlparser dialect for parsing subscription text and DDL under this
-    /// backend.
+    /// Reinterprets a database row field using the planned group-column kind.
+    #[must_use]
+    fn decode_group_value(_kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>>
+    where
+        Self: Sized,
+    {
+        (!value.is_missing()).then_some(value)
+    }
+    /// SQL parser dialect for this backend.
     type Dialect: sqlparser::dialect::Dialect;
 
     /// SQL `BOOL` representation. Only equality-shaped operations are
@@ -843,8 +1331,38 @@ pub trait Backend: 'static {
 pub struct Postgres;
 
 impl Backend for Postgres {
-    const TEXT_GROUPS_BY_BYTES: bool = true;
     type Custom = NoCustomScalars<Self>;
+
+    fn group_key_encoder(
+        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+    ) -> Option<GroupKeyEncoder<Self>> {
+        let supported = columns.iter().all(|column| match column.kind {
+            ScalarKind::Int
+            | ScalarKind::Bool
+            | ScalarKind::Bytes
+            | ScalarKind::Uuid
+            | ScalarKind::Timestamp
+            | ScalarKind::TimestampTz
+            | ScalarKind::Date
+            | ScalarKind::Time
+            | ScalarKind::Float
+            | ScalarKind::Jsonb => true,
+            ScalarKind::String => postgres_text_key(column).is_some(),
+            // PostgreSQL numeric waits on Diesel #5168 for infinity support.
+            ScalarKind::Decimal | ScalarKind::Json | ScalarKind::Custom(_) => false,
+        });
+        supported.then(|| GroupKeyEncoder::new(columns, encode_postgres_component))
+    }
+
+    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
+        match (kind, value) {
+            (ScalarKind::Float, Value::Int(value)) => Some(Value::Float(widen_i64_to_f64(value))),
+            (ScalarKind::Float, Value::Decimal(value)) => {
+                value.to_string().parse().ok().map(Value::Float)
+            }
+            (_, value) => (!value.is_missing()).then_some(value),
+        }
+    }
     type Dialect = sqlparser::dialect::PostgreSqlDialect;
     type Bool = bool;
     type Int = i64;
@@ -866,8 +1384,38 @@ impl Backend for Postgres {
 pub struct MySql;
 
 impl Backend for MySql {
-    const TEXT_GROUPS_BY_BYTES: bool = false;
     type Custom = NoCustomScalars<Self>;
+
+    fn group_key_encoder(
+        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+    ) -> Option<GroupKeyEncoder<Self>> {
+        let supported = columns.iter().all(|column| match column.kind {
+            ScalarKind::Int
+            | ScalarKind::Bool
+            | ScalarKind::Bytes
+            | ScalarKind::Timestamp
+            | ScalarKind::TimestampTz
+            | ScalarKind::Date
+            | ScalarKind::Time
+            | ScalarKind::Decimal => true,
+            ScalarKind::String | ScalarKind::Uuid => mysql_text_key(column).is_some(),
+            // MySQL 8.0 groups persisted signed zero into two groups.
+            ScalarKind::Float | ScalarKind::Json | ScalarKind::Jsonb | ScalarKind::Custom(_) => {
+                false
+            }
+        });
+        supported.then(|| GroupKeyEncoder::new(columns, encode_mysql_component))
+    }
+
+    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
+        match (kind, value) {
+            (ScalarKind::Float, Value::Int(value)) => Some(Value::Float(widen_i64_to_f64(value))),
+            (ScalarKind::Float, Value::Decimal(value)) => {
+                value.to_string().parse().ok().map(Value::Float)
+            }
+            (_, value) => (!value.is_missing()).then_some(value),
+        }
+    }
     type Dialect = sqlparser::dialect::MySqlDialect;
     type Bool = bool;
     type Int = i64;
@@ -893,8 +1441,27 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
-    const TEXT_GROUPS_BY_BYTES: bool = true;
     type Custom = NoCustomScalars<Self>;
+
+    fn group_key_encoder(
+        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+    ) -> Option<GroupKeyEncoder<Self>> {
+        let supported = columns.iter().all(|column| match column.kind {
+            ScalarKind::Int
+            | ScalarKind::Bool
+            | ScalarKind::Bytes
+            | ScalarKind::Timestamp
+            | ScalarKind::TimestampTz
+            | ScalarKind::Date
+            | ScalarKind::Time
+            | ScalarKind::Float
+            | ScalarKind::Json
+            | ScalarKind::Jsonb => true,
+            ScalarKind::String | ScalarKind::Uuid => sqlite_text_key(column).is_some(),
+            ScalarKind::Decimal | ScalarKind::Custom(_) => false,
+        });
+        supported.then(|| GroupKeyEncoder::new(columns, encode_sqlite_component))
+    }
     type Dialect = sqlparser::dialect::SQLiteDialect;
     // SQLite has no native BOOL; the column-type contract stores 0 / 1
     // as INTEGER. The backend surfaces the wire type honestly rather than
@@ -914,8 +1481,48 @@ impl Backend for SQLite {
     type Date = chrono::NaiveDate;
     type Time = chrono::NaiveTime;
     type Decimal = bigdecimal::BigDecimal;
-    type Json = serde_json::Value;
-    type Jsonb = serde_json::Value;
+    type Json = SqliteJson;
+
+    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
+        match (kind, value) {
+            (ScalarKind::Bool, Value::Int(value)) => Some(Value::Bool(value)),
+            (ScalarKind::Uuid, Value::String(value)) => Some(Value::Uuid(value)),
+            (ScalarKind::Timestamp, Value::String(value)) => {
+                crate::temporal::parse_timestamp(&value).map(Value::Timestamp)
+            }
+            (ScalarKind::TimestampTz, Value::String(value)) => {
+                crate::temporal::parse_timestamp_tz(&value).map(Value::TimestampTz)
+            }
+            (ScalarKind::Date, Value::String(value)) => {
+                crate::temporal::parse_date(&value).map(Value::Date)
+            }
+            (ScalarKind::Time, Value::String(value)) => {
+                crate::temporal::parse_time(&value).map(Value::Time)
+            }
+            (ScalarKind::Decimal, Value::String(value)) => value.parse().ok().map(Value::Decimal),
+            (ScalarKind::Float, Value::Int(value)) => Some(Value::Float(widen_i64_to_f64(value))),
+            (ScalarKind::Decimal, Value::Int(value)) => {
+                Some(Value::Decimal(bigdecimal::BigDecimal::from(value)))
+            }
+            (ScalarKind::Decimal, Value::Float(value)) => {
+                value.to_string().parse().ok().map(Value::Decimal)
+            }
+            (ScalarKind::Json, Value::String(value)) => Some(Value::Json(SqliteJson::text(value))),
+            (ScalarKind::Json, Value::Int(value)) => Some(Value::Json(SqliteJson::integer(value))),
+            (ScalarKind::Json, Value::Float(value)) => Some(Value::Json(SqliteJson::real(value))),
+            (ScalarKind::Json, Value::Bytes(value)) => Some(Value::Json(SqliteJson::blob(value))),
+            (ScalarKind::Jsonb, Value::String(value)) => {
+                Some(Value::Jsonb(SqliteJson::text(value)))
+            }
+            (ScalarKind::Jsonb, Value::Int(value)) => {
+                Some(Value::Jsonb(SqliteJson::integer(value)))
+            }
+            (ScalarKind::Jsonb, Value::Float(value)) => Some(Value::Jsonb(SqliteJson::real(value))),
+            (ScalarKind::Jsonb, Value::Bytes(value)) => Some(Value::Jsonb(SqliteJson::blob(value))),
+            (kind, value) => decode_exact_group_value(kind, value),
+        }
+    }
+    type Jsonb = SqliteJson;
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,64 +1686,12 @@ where
 /// length-prefixed per element, so `["a", "b"]` and `["ab", ""]` differ, which
 /// a naive concatenation would not.
 ///
-/// Public because it is the encoding behind the opaque group key on
-/// [`AggregateValueUpdate`](crate::AggregateValueUpdate), pinned byte for
-/// byte, so a consumer may compute a group's key from its values.
+/// This is the transport identity used by keyed row matching. Grouped results
+/// use [`GroupKeyEncoder`], whose backend policy follows database equality.
 ///
-/// Returns `None` when the tuple cannot be encoded. Callers must not treat
-/// that as "no match": a keyed read falls back to comparing values, and a
-/// grouped fold refuses the column kinds that could produce it before any row
-/// is read.
+/// Returns `None` when postcard cannot encode the tuple.
 pub fn encode_value_key<B: Backend>(values: &[Value<B>]) -> Option<alloc::vec::Vec<u8>> {
     postcard::to_allocvec(values).ok()
-}
-
-/// Can a column of this kind identify a group?
-///
-/// A grouped fold decides a row's group by encoding the group columns with
-/// [`encode_value_key`], while the database decides it with its own equality.
-/// A kind qualifies only when the two agree, so that two rows the database
-/// puts in one group always encode alike and two rows it separates never do.
-/// Where they disagree the fold would seed one group and then open a second
-/// from zero on the next change, leaving both totals wrong and nothing failing,
-/// so such a query is refused here and served by re-reading it instead.
-///
-/// Exhaustive rather than a wildcard, so a new kind has to be classified
-/// instead of silently joining whichever side is the default.
-///
-/// Measured, not reasoned. Postgres and SQLite both put `0.0` and `-0.0` in one
-/// group and two `NaN`s in one group while their bit patterns differ, and
-/// Postgres puts `1.0::numeric` and `1.00::numeric` in one group while subql
-/// carries decimals as text to keep precision. Text and uuid vary by backend
-/// and ride [`Backend::TEXT_GROUPS_BY_BYTES`].
-pub(crate) const fn kind_groups_one_to_one<B: Backend>(kind: Option<BuiltinKind>) -> bool {
-    match kind {
-        // Exact values with a canonical representation. `Timestamp`, `Date` and
-        // `Time` are parsed `chrono` types and `TimestampTz` normalises to UTC
-        // before subql sees it, so two spellings of one instant are one value.
-        Some(
-            ScalarKind::Int
-            | ScalarKind::Bool
-            | ScalarKind::Bytes
-            | ScalarKind::Timestamp
-            | ScalarKind::TimestampTz
-            | ScalarKind::Date
-            | ScalarKind::Time,
-        ) => true,
-        Some(ScalarKind::String | ScalarKind::Uuid) => B::TEXT_GROUPS_BY_BYTES,
-        // Float: the database groups `-0.0` with `0.0` and `NaN` with `NaN`.
-        // Decimal: it groups `1.0` with `1.00`, which differ as text.
-        // Json: whitespace and key order vary without changing the document.
-        // Custom and unknown: subql cannot know how the database compares them.
-        Some(
-            ScalarKind::Float
-            | ScalarKind::Decimal
-            | ScalarKind::Json
-            | ScalarKind::Jsonb
-            | ScalarKind::Custom(_),
-        )
-        | None => false,
-    }
 }
 
 #[cfg(test)]
@@ -1145,16 +1700,7 @@ mod value_key_tests {
     use super::{encode_value_key, Postgres, Value};
     use alloc::vec;
 
-    /// The encoding is frozen, byte for byte.
-    ///
-    /// These bytes leave the process. A consumer stores them as the key of a
-    /// row it keeps across restarts and across subql versions, so changing how
-    /// a value encodes does not produce a migration, it produces a second row
-    /// for a group that already had one, with the old row never updated again.
-    /// Injectivity is deliberately not pinned here: postcard gives it
-    /// structurally, and both wrong implementations tried against an
-    /// injectivity test kept it, so such a test asserts nothing. Stability is
-    /// what nothing else defends.
+    /// The transport encoding remains byte-for-byte stable.
     #[test]
     fn the_encoding_is_frozen() {
         let cases: vec::Vec<(vec::Vec<Value<Postgres>>, &[u8])> = vec![
@@ -1233,73 +1779,238 @@ mod value_key_tests {
 }
 
 #[cfg(test)]
-mod grouping_kind_tests {
-    use super::{kind_groups_one_to_one, MySql, Postgres, SQLite, ScalarKind};
+#[allow(clippy::unwrap_used)]
+mod canonical_group_key_tests {
+    use super::{
+        Backend, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, MySql, Postgres, SQLite,
+        ScalarKind, SqliteJson, Value,
+    };
+    use alloc::{string::String, vec};
+    use sql_traits::traits::MySqlCollationPadding;
 
-    /// Every kind, classified, on every backend.
-    ///
-    /// Exhaustive by construction rather than by sampling: a new [`ScalarKind`]
-    /// makes this fail to compile until it is classified, which is the point.
-    /// Getting one wrong is silent, since the fold and the database would
-    /// simply disagree about how many groups there are.
-    fn expect<B: super::Backend>(text_safe: bool) {
-        for kind in [
-            ScalarKind::Int,
-            ScalarKind::Bool,
-            ScalarKind::Bytes,
-            ScalarKind::Timestamp,
-            ScalarKind::TimestampTz,
-            ScalarKind::Date,
-            ScalarKind::Time,
-        ] {
-            assert!(
-                kind_groups_one_to_one::<B>(Some(kind)),
-                "{kind:?} encodes one-to-one on every backend"
+    fn column(kind: super::BuiltinKind) -> GroupKeyColumn<super::NoCustom> {
+        column_with_collation(kind, GroupKeyCollation::DatabaseDefault)
+    }
+
+    fn column_with_collation(
+        kind: super::BuiltinKind,
+        collation: GroupKeyCollation,
+    ) -> GroupKeyColumn<super::NoCustom> {
+        GroupKeyColumn {
+            kind,
+            declared_type: String::from("test"),
+            collation,
+        }
+    }
+
+    fn named_collation(
+        name: &str,
+        postgres_deterministic: Option<bool>,
+        mysql_padding: Option<MySqlCollationPadding>,
+    ) -> GroupKeyCollation {
+        GroupKeyCollation::Named {
+            name: GroupKeyCollationName {
+                name: String::from(name),
+                name_is_quoted: false,
+                schema: None,
+                schema_is_quoted: false,
+            },
+            postgres_deterministic,
+            mysql_padding,
+        }
+    }
+
+    #[test]
+    fn canonical_key_has_one_versioned_tuple_format() {
+        let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Int)])
+            .expect("integer groups have a canonical encoder");
+        let key = encoder
+            .encode(&[Value::Int(42)])
+            .expect("integer value matches the plan");
+
+        assert_eq!(
+            key,
+            vec![b'S', b'Q', b'G', b'K', 1, 0, 1, 0, 0, 0, 2, 2, 84]
+        );
+    }
+
+    #[test]
+    fn canonical_key_rejects_values_outside_the_selected_domain() {
+        let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Int)])
+            .expect("integer groups have a canonical encoder");
+
+        assert!(encoder.encode(&[]).is_none());
+        assert!(encoder.encode(&[Value::Missing]).is_none());
+        assert!(encoder.encode(&[Value::Null]).is_some());
+        assert_ne!(
+            encoder.encode(&[Value::Null]),
+            encoder.encode(&[Value::Int(0)])
+        );
+        assert!(encoder
+            .encode(&[Value::String(String::from("42"))])
+            .is_none());
+    }
+
+    #[test]
+    fn postgres_float_keys_follow_grouping_equality() {
+        let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Float)])
+            .expect("Postgres float grouping is canonical");
+
+        let zero = encoder.encode(&[Value::Float(0.0)]).unwrap();
+        let negative_zero = encoder.encode(&[Value::Float(-0.0)]).unwrap();
+        assert_eq!(zero, negative_zero);
+
+        let nan = encoder.encode(&[Value::Float(f64::NAN)]).unwrap();
+        let other_nan = encoder
+            .encode(&[Value::Float(f64::from_bits(0x7ff0_0000_0000_0001))])
+            .unwrap();
+        assert_eq!(nan, other_nan);
+        assert_ne!(zero, nan);
+    }
+
+    #[test]
+    fn postgres_text_requires_deterministic_comparison() {
+        assert!(
+            Postgres::group_key_encoder(vec![column(ScalarKind::String)]).is_some(),
+            "the database default is deterministic"
+        );
+        assert!(Postgres::group_key_encoder(vec![column_with_collation(
+            ScalarKind::String,
+            named_collation("unicode", Some(true), None),
+        )])
+        .is_some());
+        assert!(Postgres::group_key_encoder(vec![column_with_collation(
+            ScalarKind::String,
+            named_collation("ci", Some(false), None),
+        )])
+        .is_none());
+        assert!(Postgres::group_key_encoder(vec![column_with_collation(
+            ScalarKind::String,
+            GroupKeyCollation::Unknown,
+        )])
+        .is_none());
+    }
+
+    #[test]
+    fn sqlite_builtin_collations_have_exact_canonical_forms() {
+        let nocase = SQLite::group_key_encoder(vec![column_with_collation(
+            ScalarKind::String,
+            named_collation("NOCASE", None, None),
+        )])
+        .unwrap();
+        assert_eq!(
+            nocase.encode(&[Value::String(String::from("A\0IGNORED"))]),
+            nocase.encode(&[Value::String(String::from("a\0ignored"))])
+        );
+        assert_ne!(
+            nocase.encode(&[Value::String(String::from("A\0ignored"))]),
+            nocase.encode(&[Value::String(String::from("a\0different"))])
+        );
+        assert_ne!(
+            nocase.encode(&[Value::String(String::from("Æ"))]),
+            nocase.encode(&[Value::String(String::from("æ"))])
+        );
+
+        let rtrim = SQLite::group_key_encoder(vec![column_with_collation(
+            ScalarKind::String,
+            named_collation("RTRIM", None, None),
+        )])
+        .unwrap();
+        assert_eq!(
+            rtrim.encode(&[Value::String(String::from("value"))]),
+            rtrim.encode(&[Value::String(String::from("value  "))])
+        );
+    }
+
+    #[test]
+    fn mysql_binary_collations_apply_their_padding_rule() {
+        assert!(MySql::group_key_encoder(vec![column(ScalarKind::String)]).is_none());
+
+        let pad = MySql::group_key_encoder(vec![column_with_collation(
+            ScalarKind::String,
+            named_collation("utf8mb4_bin", None, Some(MySqlCollationPadding::PadSpace)),
+        )])
+        .unwrap();
+        assert_eq!(
+            pad.encode(&[Value::String(String::from("value"))]),
+            pad.encode(&[Value::String(String::from("value  "))])
+        );
+
+        let no_pad = MySql::group_key_encoder(vec![column_with_collation(
+            ScalarKind::String,
+            named_collation("utf8mb4_0900_bin", None, Some(MySqlCollationPadding::NoPad)),
+        )])
+        .unwrap();
+        assert_ne!(
+            no_pad.encode(&[Value::String(String::from("value"))]),
+            no_pad.encode(&[Value::String(String::from("value  "))])
+        );
+    }
+
+    #[test]
+    fn mysql_decimal_keys_ignore_scale_spelling() {
+        let encoder = MySql::group_key_encoder(vec![column(ScalarKind::Decimal)]).unwrap();
+        assert_eq!(
+            encoder.encode(&[Value::Decimal("1.0".parse().unwrap())]),
+            encoder.encode(&[Value::Decimal("1.00".parse().unwrap())])
+        );
+    }
+
+    #[test]
+    fn postgres_jsonb_keys_follow_structural_equality() {
+        let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Jsonb)]).unwrap();
+        let left: serde_json::Value =
+            serde_json::from_str(r#"{"a": 1.0, "b": [true, null]}"#).unwrap();
+        let right: serde_json::Value =
+            serde_json::from_str(r#"{"b": [true, null], "a": 1.00}"#).unwrap();
+        assert_eq!(
+            encoder.encode(&[Value::Jsonb(left.clone())]),
+            encoder.encode(&[Value::Jsonb(right.clone())])
+        );
+        assert_eq!(Value::<Postgres>::Jsonb(left), Value::Jsonb(right));
+    }
+
+    #[test]
+    fn sqlite_json_keys_preserve_storage_equality() {
+        let encoder = SQLite::group_key_encoder(vec![column(ScalarKind::Json)]).unwrap();
+        assert_eq!(
+            encoder.encode(&[Value::Json(SqliteJson::integer(1))]),
+            encoder.encode(&[Value::Json(SqliteJson::real(1.0))])
+        );
+        assert_ne!(
+            encoder.encode(&[Value::Json(SqliteJson::text(String::from("{\"a\":1}")))]),
+            encoder.encode(&[Value::Json(SqliteJson::text(String::from("{ \"a\": 1 }")))])
+        );
+        assert_ne!(
+            encoder.encode(&[Value::Json(SqliteJson::blob(vec![1]))]),
+            encoder.encode(&[Value::Json(SqliteJson::text(String::from("1")))])
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn sqlite_nocase_folds_every_ascii_case_pair(value in "[A-Za-z0-9]{0,64}") {
+            let encoder = SQLite::group_key_encoder(vec![column_with_collation(
+                ScalarKind::String,
+                named_collation("NOCASE", None, None),
+            )])
+            .unwrap();
+            proptest::prop_assert_eq!(
+                encoder.encode(&[Value::String(value.to_ascii_lowercase())]),
+                encoder.encode(&[Value::String(value.to_ascii_uppercase())])
             );
         }
-        for kind in [
-            ScalarKind::Float,
-            ScalarKind::Decimal,
-            ScalarKind::Json,
-            ScalarKind::Jsonb,
-        ] {
-            assert!(
-                !kind_groups_one_to_one::<B>(Some(kind)),
-                "{kind:?} has values the database groups together and the encoding separates"
-            );
+
+        #[test]
+        fn postgres_float_collapses_every_nan_payload(bits in proptest::prelude::any::<u64>()) {
+            let value = f64::from_bits(bits);
+            if value.is_nan() {
+                let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Float)]).unwrap();
+                proptest::prop_assert_eq!(
+                    encoder.encode(&[Value::Float(value)]),
+                    encoder.encode(&[Value::Float(f64::NAN)])
+                );
+            }
         }
-        // Text, and uuid where the backend carries it as text.
-        assert_eq!(
-            kind_groups_one_to_one::<B>(Some(ScalarKind::String)),
-            text_safe
-        );
-        assert_eq!(
-            kind_groups_one_to_one::<B>(Some(ScalarKind::Uuid)),
-            text_safe
-        );
-        // An unknown column type is not a licence to guess.
-        assert!(!kind_groups_one_to_one::<B>(None));
-    }
-
-    /// Postgres text collations are deterministic unless one is declared
-    /// otherwise per column, measured as two groups for 'a' and 'A'.
-    #[test]
-    fn postgres_groups_text_by_bytes() {
-        expect::<Postgres>(true);
-    }
-
-    /// SQLite's default collation is BINARY, measured as two groups.
-    #[test]
-    fn sqlite_groups_text_by_bytes() {
-        expect::<SQLite>(true);
-    }
-
-    /// MySQL's server default is `utf8mb4_0900_ai_ci`, so 'a' and 'A' are one
-    /// group, measured on the image this repo's tests use. The collation comes
-    /// from server and table defaults rather than the column's DDL, so it is
-    /// absent from the schema text and cannot be detected per column either.
-    #[test]
-    fn mysql_does_not_group_text_by_bytes() {
-        expect::<MySql>(false);
     }
 }

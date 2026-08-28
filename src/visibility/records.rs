@@ -425,8 +425,12 @@ where
         match self.value(column) {
             Ok(Value::Missing) | Err(CellRead::Absent) => RowCell::Absent,
             Ok(Value::Null) => RowCell::Null,
-            Ok(Value::Json(json)) => json_at(json.json_document(), path),
-            Ok(Value::Jsonb(jsonb)) => json_at(jsonb.json_document(), path),
+            Ok(Value::Json(json)) => json
+                .json_document()
+                .map_or(RowCell::Undecodable, |document| json_at(document, path)),
+            Ok(Value::Jsonb(jsonb)) => jsonb
+                .json_document()
+                .map_or(RowCell::Undecodable, |document| json_at(document, path)),
             Ok(_) | Err(CellRead::Undecodable) => RowCell::Undecodable,
         }
     }

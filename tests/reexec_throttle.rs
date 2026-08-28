@@ -93,7 +93,7 @@ impl AsyncConnector for ConcurrencyProbingConnector {
 
     fn execute_scalar(
         &self,
-        _sql: &str,
+        _query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         _auth: &(),
     ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
@@ -121,7 +121,7 @@ impl AsyncConnector for ConcurrencyProbingConnector {
 
     fn read_page(
         &self,
-        _sql: &str,
+        _query: &subql::reexec::ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         _auth: &(),
     ) -> impl Future<Output = Result<Snapshot<RowPage<Postgres>, Self::Checkpoint>, Self::Error>> + Send

@@ -313,7 +313,7 @@ where
     pub(super) fn debounce_skip(
         &self,
         subscription_id: SubscriptionId,
-        read: &super::ReExecutionRead,
+        read: &super::ReExecutionRead<E::Backend>,
     ) -> bool {
         let (Some(clock), Some(window)) = (self.clock.as_ref(), self.debounce) else {
             return false;
@@ -328,7 +328,7 @@ where
     pub(super) fn stamp_reexec(
         &mut self,
         subscription_id: SubscriptionId,
-        read: &super::ReExecutionRead,
+        read: &super::ReExecutionRead<E::Backend>,
     ) {
         if let Some(clock) = self.clock.as_ref() {
             self.last_reexec_at.insert(
@@ -690,7 +690,8 @@ where
         };
         let grouped_bootstrap = context.grouped_bootstrap.clone();
         if let Some(bootstrap) = grouped_bootstrap {
-            let (_, rows, checkpoint) = self.read_whole(&bootstrap.sql, subscription_id)?;
+            let (_, mut rows, checkpoint) = self.read_whole(&bootstrap.sql, subscription_id)?;
+            decode_grouped_seed_rows::<E::Backend>(&mut rows, &bootstrap.kinds);
             let mut installed = crate::Install::install(
                 &mut self.inner,
                 subscription_id,
@@ -704,13 +705,13 @@ where
                 match &trigger.read {
                     super::ReExecutionRead::GroupedScalar {
                         group,
-                        sql,
+                        query,
                         column_kinds,
                     } => {
                         let resolved = self.resolve_grouped_scalar(
                             subscription_id,
                             group,
-                            sql,
+                            query,
                             *column_kinds,
                             trigger.checkpoint.clone(),
                         )?;
@@ -758,7 +759,11 @@ where
         let (value, checkpoint) = self
             .mode
             .0
-            .execute_scalar(&context.sql, context.column_kind, &context.auth)
+            .execute_scalar(
+                &super::ReadQuery::without_binds(&context.sql),
+                context.column_kind,
+                &context.auth,
+            )
             .map_err(|error| ReExecError::Connector {
                 subscription: subscription_id,
                 error,
@@ -801,7 +806,7 @@ where
         let cursor = self
             .mode
             .0
-            .open_cursor(sql, auth)
+            .open_cursor(&super::ReadQuery::without_binds(sql), auth)
             .map_err(|error| ReExecError::Cursor {
                 subscription: subscription_id,
                 error,
@@ -893,14 +898,14 @@ where
             }
             if let super::ReExecutionRead::GroupedScalar {
                 group,
-                sql,
+                query,
                 column_kinds,
             } = &trigger.read
             {
                 let installed = self.resolve_grouped_scalar(
                     trigger.subscription_id,
                     group,
-                    sql,
+                    query,
                     *column_kinds,
                     trigger.checkpoint.clone(),
                 )?;
@@ -938,7 +943,11 @@ where
             let (value, _db_checkpoint) = self
                 .mode
                 .0
-                .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
+                .execute_scalar(
+                    &super::ReadQuery::without_binds(&ctx.sql),
+                    ctx.column_kind,
+                    &ctx.auth,
+                )
                 .map_err(|error| ReExecError::Connector {
                     subscription: trigger.subscription_id,
                     error,
@@ -970,7 +979,7 @@ where
         &mut self,
         subscription_id: SubscriptionId,
         group: &[u8],
-        sql: &str,
+        query: &super::ReadQuery<'_, E::Backend>,
         _column_kinds: [BuiltinKind; 2],
         checkpoint: Option<E::Checkpoint>,
     ) -> Result<
@@ -984,7 +993,7 @@ where
         let snapshot = self
             .mode
             .0
-            .read_page(sql, self.max_page_bytes, &context.auth)
+            .read_page(query, self.max_page_bytes, &context.auth)
             .map_err(|error| ReExecError::Connector {
                 subscription: subscription_id,
                 error,
@@ -1110,7 +1119,11 @@ where
             let page = self
                 .mode
                 .0
-                .read_page(&page_sql, self.max_page_bytes, auth)
+                .read_page(
+                    &super::ReadQuery::without_binds(&page_sql),
+                    self.max_page_bytes,
+                    auth,
+                )
                 .map_err(|error| ReExecError::Connector {
                     subscription: subscription_id,
                     error,
@@ -1170,6 +1183,19 @@ where
             present,
             columns,
         )
+    }
+}
+
+pub(super) fn decode_grouped_seed_rows<B: Backend>(
+    rows: &mut [Vec<Value<B>>],
+    kinds: &[BuiltinKind],
+) {
+    for row in rows {
+        for (value, kind) in row.iter_mut().zip(kinds) {
+            let raw = core::mem::replace(value, Value::Missing);
+            *value = B::decode_group_value(crate::backend::ScalarKind::from_builtin(*kind), raw)
+                .unwrap_or(Value::Missing);
+        }
     }
 }
 
@@ -1263,7 +1289,10 @@ where
         let cursor = self
             .mode
             .0
-            .open_cursor(&sql, &self.contexts[&subscription_id].auth)
+            .open_cursor(
+                &super::ReadQuery::without_binds(&sql),
+                &self.contexts[&subscription_id].auth,
+            )
             .map_err(|error| ReExecError::Cursor {
                 subscription: subscription_id,
                 error,
@@ -1349,14 +1378,14 @@ where
             }
             if let super::ReExecutionRead::GroupedScalar {
                 group,
-                sql,
+                query,
                 column_kinds,
             } = &trigger.read
             {
                 let installed = self.resolve_grouped_scalar(
                     trigger.subscription_id,
                     group,
-                    sql,
+                    query,
                     *column_kinds,
                     trigger.checkpoint.clone(),
                 )?;
@@ -1394,7 +1423,11 @@ where
             let (value, _db_checkpoint) = self
                 .mode
                 .0
-                .execute_scalar(&ctx.sql, ctx.column_kind, &ctx.auth)
+                .execute_scalar(
+                    &super::ReadQuery::without_binds(&ctx.sql),
+                    ctx.column_kind,
+                    &ctx.auth,
+                )
                 .map_err(|error| ReExecError::Connector {
                     subscription: trigger.subscription_id,
                     error,
@@ -1562,13 +1595,13 @@ mod tests {
 
         fn execute_scalar(
             &self,
-            sql: &str,
+            query: &super::super::ReadQuery<'_, Postgres>,
             column_kind: BuiltinKind,
             _auth: &(),
         ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
             self.calls
                 .borrow_mut()
-                .push((String::from(sql), column_kind));
+                .push((String::from(query.sql()), column_kind));
             let value = self
                 .values
                 .borrow_mut()
@@ -1579,7 +1612,7 @@ mod tests {
 
         fn read_page(
             &self,
-            _sql: &str,
+            _query: &super::super::ReadQuery<'_, Postgres>,
             _max_bytes: usize,
             _auth: &(),
         ) -> Result<
@@ -2206,12 +2239,12 @@ mod tests {
             .with_debounce_per_query(core::time::Duration::from_secs(1));
         let first = super::super::ReExecutionRead::GroupedScalar {
             group: vec![1],
-            sql: String::new(),
+            query: super::super::ReadQuery::owned(String::new(), Vec::new()),
             column_kinds: [ScalarKind::Int, ScalarKind::Int],
         };
         let second = super::super::ReExecutionRead::GroupedScalar {
             group: vec![2],
-            sql: String::new(),
+            query: super::super::ReadQuery::owned(String::new(), Vec::new()),
             column_kinds: [ScalarKind::Int, ScalarKind::Int],
         };
         engine.stamp_reexec(7, &first);

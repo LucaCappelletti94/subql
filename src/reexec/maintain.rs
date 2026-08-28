@@ -326,9 +326,9 @@ enum ObservedRow<B: Backend> {
     MissingGroup,
 }
 
-pub struct GroupedRead<C: Checkpoint> {
+pub struct GroupedRead<B: Backend, C: Checkpoint> {
     pub group: Vec<u8>,
-    pub sql: alloc::string::String,
+    pub query: crate::reexec::ReadQuery<'static, B>,
     pub column_kinds: [crate::backend::BuiltinKind; 2],
     pub checkpoint: Option<C>,
 }
@@ -337,7 +337,7 @@ type GroupedValueChange<B> = (crate::GroupIdentity<B>, crate::AggregateValueChan
 
 pub struct GroupedMaintenance<B: Backend, C: Checkpoint> {
     pub changes: Vec<GroupedValueChange<B>>,
-    pub reads: Vec<GroupedRead<C>>,
+    pub reads: Vec<GroupedRead<B, C>>,
     pub group_limit: bool,
     pub missing_group: bool,
 }
@@ -399,7 +399,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         if values.iter().any(Value::is_missing) {
             return Ok(ObservedRow::MissingGroup);
         }
-        let Some(key) = crate::backend::encode_value_key(&values) else {
+        let Some(key) = self.plan.group_key_encoder.encode(&values) else {
             return Ok(ObservedRow::MissingGroup);
         };
         if self.plan.where_dependency_columns.iter().any(|column| {
@@ -608,10 +608,10 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 .get(&key)
                 .map_or(values, |group| group.values.clone());
             self.pending_reads.insert(key.clone(), values.clone());
-            let sql = crate::reexec::plan::render_grouped_scalar_read(&self.plan, &values)?;
+            let query = crate::reexec::plan::render_grouped_scalar_read(&self.plan, &values)?;
             output.reads.push(GroupedRead {
                 group: key,
-                sql,
+                query,
                 column_kinds: [self.plan.agg_kind, crate::backend::ScalarKind::Int],
                 checkpoint: checkpoint.cloned(),
             });
@@ -737,7 +737,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 });
             }
             let values = row[..group_columns].to_vec();
-            let Some(key) = crate::backend::encode_value_key(&values) else {
+            let Some(key) = self.plan.group_key_encoder.encode(&values) else {
                 self.pending = Some(pending);
                 return Err(crate::AggregateInstallError::GroupKeyUnencodable(
                     subscription,

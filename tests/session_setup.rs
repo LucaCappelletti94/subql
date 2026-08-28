@@ -81,7 +81,11 @@ fn setup_statements_run_inside_the_read_transaction() {
         DieselConnector::with_session_setup(conn);
     let setup = Setup(vec![SETUP_SQL.to_string()]);
     connector
-        .execute_scalar(SCALAR_SQL, BuiltinKind::Int, &setup)
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(SCALAR_SQL),
+            BuiltinKind::Int,
+            &setup,
+        )
         .unwrap();
 
     let events = log.lock().clone();
@@ -110,7 +114,11 @@ fn an_empty_setup_changes_nothing() {
     let (conn, log) = conn_with_recorder();
     let connector: DieselConnector<SqliteConnection, Postgres> = DieselConnector::new(conn);
     connector
-        .execute_scalar(SCALAR_SQL, BuiltinKind::Int, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(SCALAR_SQL),
+            BuiltinKind::Int,
+            &(),
+        )
         .unwrap();
     let events = log.lock().clone();
     assert!(
@@ -138,11 +146,20 @@ fn a_transaction_free_path_with_setup_opens_a_transaction() {
         fn(&DieselConnector<SqliteConnection, Postgres, Setup>, &Setup),
     )] = &[
         ("execute_scalar", |c, setup| {
-            c.execute_scalar(SCALAR_SQL, BuiltinKind::Int, setup)
-                .unwrap();
+            c.execute_scalar(
+                &subql::reexec::ReadQuery::without_binds(SCALAR_SQL),
+                BuiltinKind::Int,
+                setup,
+            )
+            .unwrap();
         }),
         ("read_page", |c, setup| {
-            c.read_page(SCALAR_SQL, 4096, setup).unwrap();
+            c.read_page(
+                &subql::reexec::ReadQuery::without_binds(SCALAR_SQL),
+                4096,
+                setup,
+            )
+            .unwrap();
         }),
     ];
     for (name, run) in paths {

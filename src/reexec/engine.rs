@@ -105,22 +105,22 @@ pub struct RowDelta<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoChec
 }
 
 /// Database read named by one re-execution trigger.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReExecutionRead {
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReExecutionRead<B: Backend = crate::backend::Postgres> {
     /// Use the fixed read declared by the registration tier.
     Subscription,
     /// Re-read one displaced grouped extreme.
     GroupedScalar {
         /// Opaque group key used for installation and coalescing.
         group: Vec<u8>,
-        /// Runnable two-column SQL constrained to this group.
-        sql: String,
+        /// Runnable two-column query constrained to this group.
+        query: crate::reexec::ReadQuery<'static, B>,
         /// Decode hints for the extreme and source-row count.
         column_kinds: [crate::backend::BuiltinKind; 2],
     },
 }
 
-impl ReExecutionRead {
+impl<B: Backend> ReExecutionRead<B> {
     pub(crate) fn group_key(&self) -> Option<&[u8]> {
         match self {
             Self::Subscription => None,
@@ -139,14 +139,18 @@ impl ReExecutionRead {
 /// the same trigger twice is safe (a single re-execution serves any
 /// number of pending triggers), and `install` unconditionally overwrites
 /// the stored value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReExecutionTrigger<I: IdTypes, C: crate::Checkpoint = crate::NoCheckpoint> {
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReExecutionTrigger<
+    I: IdTypes,
+    C: crate::Checkpoint = crate::NoCheckpoint,
+    B: Backend = crate::backend::Postgres,
+> {
     /// The captured query needing re-execution.
     pub subscription_id: SubscriptionId,
     /// Consumer that registered the query.
     pub consumer_id: I::ConsumerId,
     /// Fixed subscription read or one group-scoped read.
-    pub read: ReExecutionRead,
+    pub read: ReExecutionRead<B>,
     /// Position of the event that triggered this re-execution, when known.
     pub checkpoint: Option<C>,
 }
@@ -176,7 +180,7 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
     pub row_deltas: Vec<RowDelta<I, B, C>>,
     /// Queries whose maintenance could not resolve in-process. The
     /// materializer must re-execute and call [`Install::install`](crate::Install::install).
-    pub triggers: Vec<ReExecutionTrigger<I, C>>,
+    pub triggers: Vec<ReExecutionTrigger<I, C, B>>,
     /// Subscriptions that changed maintenance tier.
     pub transitions: Vec<crate::MaintenanceTransition>,
 }
@@ -202,7 +206,7 @@ pub struct BatchOutcome<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::No
     /// Per-row changes from keyed captures produced during the batch.
     pub row_deltas: Vec<RowDelta<I, B, C>>,
     /// Re-execution triggers, deduplicated by subscription and group scope.
-    pub triggers: Vec<ReExecutionTrigger<I, C>>,
+    pub triggers: Vec<ReExecutionTrigger<I, C, B>>,
     /// Tier changes produced during the batch.
     pub transitions: Vec<crate::MaintenanceTransition>,
 }

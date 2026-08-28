@@ -131,7 +131,11 @@ fn a_budget_stops_the_page_and_says_the_result_went_on() {
     let connector: DieselConnector<SqliteConnection, Postgres> = DieselConnector::new(setup);
 
     let first = connector
-        .read_page("SELECT id, label FROM readings ORDER BY id", 64, &())
+        .read_page(
+            &subql::reexec::ReadQuery::without_binds("SELECT id, label FROM readings ORDER BY id"),
+            64,
+            &(),
+        )
         .expect("first page");
     assert!(first.value.more, "a 33-row result does not fit 64 bytes");
     assert!(
@@ -149,7 +153,9 @@ fn a_budget_stops_the_page_and_says_the_result_went_on() {
     };
     let second = connector
         .read_page(
-            &format!("SELECT id, label FROM readings WHERE id > {last} ORDER BY id"),
+            &subql::reexec::ReadQuery::without_binds(&format!(
+                "SELECT id, label FROM readings WHERE id > {last} ORDER BY id"
+            )),
             64,
             &(),
         )
@@ -158,6 +164,20 @@ fn a_budget_stops_the_page_and_says_the_result_went_on() {
         matches!(second.value.rows.first().map(|r| &r[0]), Some(Value::Int(id)) if *id > last),
         "the second page starts after the first"
     );
+}
+
+#[test]
+fn a_page_read_binds_values_natively() {
+    let connector: DieselConnector<SqliteConnection, subql::backend::Postgres> =
+        DieselConnector::new(conn());
+    let query = subql::reexec::ReadQuery::owned(
+        "SELECT id, label FROM readings WHERE id = ?".to_string(),
+        vec![Value::Int(7)],
+    );
+    let page =
+        subql::reexec::Connector::read_page(&connector, &query, 4096, &()).expect("bound page");
+    assert_eq!(page.value.rows.len(), 1);
+    assert_eq!(page.value.rows[0][0], Value::Int(7));
 }
 
 /// A budget too small for even one row still returns that row, because a page
@@ -174,7 +194,7 @@ fn a_row_larger_than_the_budget_still_makes_progress() {
 
     let page = subql::reexec::Connector::read_page(
         &connector,
-        "SELECT * FROM readings ORDER BY id",
+        &subql::reexec::ReadQuery::without_binds("SELECT * FROM readings ORDER BY id"),
         1,
         &(),
     )
@@ -189,9 +209,13 @@ fn a_row_larger_than_the_budget_still_makes_progress() {
 fn a_result_inside_the_budget_reports_no_more() {
     let connector: DieselConnector<SqliteConnection, subql::backend::Postgres> =
         DieselConnector::new(conn());
-    let page =
-        subql::reexec::Connector::read_page(&connector, "SELECT id FROM readings", 4096, &())
-            .expect("page");
+    let page = subql::reexec::Connector::read_page(
+        &connector,
+        &subql::reexec::ReadQuery::without_binds("SELECT id FROM readings"),
+        4096,
+        &(),
+    )
+    .expect("page");
     assert_eq!(page.value.rows.len(), 1);
     assert!(!page.value.more);
 }
@@ -205,7 +229,10 @@ fn a_connector_without_cursors_refuses_them_by_name() {
     let connector: DieselConnector<SqliteConnection, subql::backend::Postgres> =
         DieselConnector::new(conn());
     assert!(matches!(
-        connector.open_cursor("SELECT DISTINCT label FROM readings", &()),
+        connector.open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT DISTINCT label FROM readings"),
+            &(),
+        ),
         Err(CursorError::Unsupported)
     ));
     assert!(matches!(

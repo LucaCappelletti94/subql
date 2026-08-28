@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashMap};
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
+use subql::backend::{
+    Backend, GroupKeyCollation, GroupKeyColumn, NoCustom, Postgres, ScalarKind, Value,
+};
 use subql::reexec::ReExecutionRead;
 use subql::testing::TestEvent;
 use subql::{
@@ -29,6 +31,18 @@ fn identity_group_name(identity: &GroupIdentity<Postgres>) -> &str {
     name
 }
 
+fn text_group_key(name: &str) -> Vec<u8> {
+    let encoder = Postgres::group_key_encoder(vec![GroupKeyColumn::<NoCustom> {
+        kind: ScalarKind::String,
+        declared_type: String::from("TEXT"),
+        collation: GroupKeyCollation::DatabaseDefault,
+    }])
+    .expect("Postgres default text has a canonical key");
+    encoder
+        .encode(&[Value::String(name.into())])
+        .expect("text matches the encoder")
+}
+
 fn apply_updates(
     observed: &mut BTreeMap<Vec<u8>, i64>,
     group_keys: &HashMap<String, Vec<u8>>,
@@ -36,10 +50,6 @@ fn apply_updates(
 ) {
     for update in updates {
         let identity = update.group.as_ref().expect("group identity");
-        assert_eq!(
-            subql::backend::encode_value_key(&identity.values).as_ref(),
-            Some(&identity.key)
-        );
         let name = identity_group_name(identity);
         assert_eq!(
             group_keys.get(name),
@@ -235,10 +245,9 @@ proptest! {
         let group_keys: HashMap<String, Vec<u8>> = ["north", "south"]
             .into_iter()
             .map(|name| {
-                let values = [Value::<Postgres>::String(name.into())];
                 (
                     name.to_owned(),
-                    subql::backend::encode_value_key(&values).expect("text encodes"),
+                    text_group_key(name),
                 )
             })
             .collect();

@@ -584,7 +584,6 @@ mod tests {
             column_scalar_kind::<Postgres, _>(&my, tid, 5),
             Some(ScalarKind::Int)
         );
-        let _ = tid;
     }
 
     #[test]

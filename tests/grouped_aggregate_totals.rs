@@ -351,10 +351,7 @@ fn a_replayed_multi_column_group_keeps_its_identity() {
         .group
         .as_ref()
         .expect("grouped update carries identity");
-    assert_eq!(
-        subql::backend::encode_value_key(&identity.values).as_ref(),
-        Some(&identity.key)
-    );
+    assert_eq!(&identity.key[..5], b"SQGK\x01");
     assert_eq!(
         replayed.change,
         AggregateValueChange::Set(subql::AggregateResultValue::Folded(AggValue::Count(1)))
@@ -368,4 +365,46 @@ fn a_replayed_multi_column_group_keeps_its_identity() {
                 ]
         })
     }));
+}
+
+#[test]
+fn an_unencodable_runtime_group_demotes_without_folding() {
+    let catalog = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE readings (id INT PRIMARY KEY, region DOUBLE PRECISION, amount INT);",
+    )
+    .unwrap();
+    let table = catalog_helpers::table_id(&catalog, "readings").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(catalog, PostgreSqlDialect {});
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            7u64,
+            "SELECT region, COUNT(*) FROM readings GROUP BY region",
+        ))
+        .unwrap()
+        .subscription_id;
+    let event = TestEvent::insert(
+        table,
+        vec![
+            Value::Int(1),
+            Value::String("not a float".into()),
+            Value::Int(1),
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(PgLsn(10));
+
+    let output = engine.aggregate_updates(&event).unwrap();
+    assert!(output.updates.is_empty());
+    assert!(matches!(
+        output.transitions.as_slice(),
+        [subql::MaintenanceTransition {
+            subscription_id,
+            reason: subql::MaintenanceStopReason::GroupKeyUnencodable { table_id },
+            ..
+        }] if *subscription_id == subscription && *table_id == table
+    ));
+    assert!(matches!(
+        output.triggers[0].read,
+        subql::reexec::ReExecutionRead::Subscription
+    ));
 }

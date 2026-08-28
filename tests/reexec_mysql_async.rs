@@ -272,7 +272,11 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
         let pool = mysql_async_pool(port).await;
         let connector = MysqlAsyncDieselConnector::new(pool);
         let (row, _checkpoint) = connector
-            .execute_scalar_row(&bundle.sql, &bundle.kinds, &())
+            .execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds(&bundle.sql),
+                &bundle.kinds,
+                &(),
+            )
             .await
             .expect("execute_scalar_row");
         assert_eq!(
@@ -313,8 +317,15 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let sql = "SELECT count(*) AS v FROM orders WHERE GET_LOCK(CONCAT('park_scalar_', id), 60) = 1";
     let ((value, position), after_commit) =
         common::park_a_mysql_read(port, "park_scalar_1", &insert(2), move || {
-            on.block_on(async move { held.execute_scalar(sql, ScalarKind::Int, &()).await })
-                .expect("scalar read")
+            on.block_on(async move {
+                held.execute_scalar(
+                    &subql::reexec::ReadQuery::without_binds(sql),
+                    ScalarKind::Int,
+                    &(),
+                )
+                .await
+            })
+            .expect("scalar read")
         });
     assert_eq!(
         value,
@@ -331,8 +342,15 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let sql = "SELECT count(*) AS c0 FROM orders WHERE GET_LOCK(CONCAT('park_seed_', id), 60) = 1";
     let ((values, position), after_commit) =
         common::park_a_mysql_read(port, "park_seed_1", &insert(3), move || {
-            on.block_on(async move { held.execute_scalar_row(sql, &[ScalarKind::Int], &()).await })
-                .expect("seed read")
+            on.block_on(async move {
+                held.execute_scalar_row(
+                    &subql::reexec::ReadQuery::without_binds(sql),
+                    &[ScalarKind::Int],
+                    &(),
+                )
+                .await
+            })
+            .expect("seed read")
         });
     assert_eq!(
         values,
@@ -374,7 +392,11 @@ fn session_setup_runs_on_the_transaction_free_read_page() {
         let setup = MarkerSetup(vec!["SET SESSION max_sort_length = 1234".to_string()]);
         let with = MysqlAsyncDieselConnector::with_session_setup(mysql_async_pool(port).await);
         let page = with
-            .read_page(read_marker, 4096, &setup)
+            .read_page(
+                &subql::reexec::ReadQuery::without_binds(read_marker),
+                4096,
+                &setup,
+            )
             .await
             .expect("read with setup");
         assert_eq!(
@@ -387,7 +409,11 @@ fn session_setup_runs_on_the_transaction_free_read_page() {
         // which is not the value the setup would have installed.
         let plain = MysqlAsyncDieselConnector::new(mysql_async_pool(port).await);
         let page = plain
-            .read_page(read_marker, 4096, &())
+            .read_page(
+                &subql::reexec::ReadQuery::without_binds(read_marker),
+                4096,
+                &(),
+            )
             .await
             .expect("read with empty setup");
         assert_ne!(

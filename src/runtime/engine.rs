@@ -916,6 +916,7 @@ where
     }
 
     fn make_predicate_from_compiled(
+        database: &DB,
         compiled: &CompiledSpec<I, E::Backend>,
     ) -> (Predicate<E::Backend>, Vec<IndexableAtom>) {
         let atoms = Self::index_atoms_from_plan(&compiled.prefilter_plan);
@@ -946,6 +947,20 @@ where
             }
             Arc::from(dep_cols.as_slice())
         };
+        let group_key_encoder = match &compiled.projection {
+            QueryProjection::GroupedAggregate { groups, .. } => groups
+                .iter()
+                .map(|column| {
+                    catalog_helpers::group_key_column::<E::Backend, _>(
+                        database,
+                        compiled.table_id,
+                        *column,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()
+                .and_then(E::Backend::group_key_encoder),
+            QueryProjection::Rows | QueryProjection::Aggregate(_) => None,
+        };
 
         let pred = Predicate {
             // Placeholder. Store allocates the authoritative ID.
@@ -957,6 +972,7 @@ where
             index_atoms: Arc::from(atoms.as_slice()),
             prefilter_plan: Arc::new(compiled.prefilter_plan.clone()),
             projection: compiled.projection.clone(),
+            group_key_encoder,
             refcount: 0, // Will be incremented via binding
             updated_at_unix_ms: compiled.spec.updated_at_unix_ms,
         };
@@ -1431,7 +1447,8 @@ where
             .find_by_hash_and_sql(hash, &compiled.normalized)
             .map_or_else(
                 || {
-                    let (pred, atoms) = Self::make_predicate_from_compiled(&compiled);
+                    let (pred, atoms) =
+                        Self::make_predicate_from_compiled(&self.database, &compiled);
                     let pred_id = partition.add_predicate(pred, atoms);
                     (pred_id, true)
                 },
@@ -1452,10 +1469,10 @@ where
         self.open_aggregate_total(
             subscription_id,
             &compiled.spec,
+            compiled.table_id,
             &compiled.projection,
             database_reads_per_consumer,
         );
-
         // 9. Enforce durability policy for this table.
         #[cfg(feature = "std")]
         if let DurabilityCheckOutcome::RequiredFailure {
@@ -1835,7 +1852,7 @@ where
     ) -> Result<
         (
             crate::MaintenanceTransition,
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         ),
         DispatchError,
     > {
@@ -1896,7 +1913,7 @@ where
     ) -> Result<
         (
             crate::MaintenanceTransition,
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         ),
         DispatchError,
     > {
@@ -1916,7 +1933,7 @@ where
     ) -> Result<
         (
             crate::MaintenanceTransition,
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         ),
         DispatchError,
     > {
@@ -1936,7 +1953,7 @@ where
         transitioned: Result<
             (
                 crate::MaintenanceTransition,
-                crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+                crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
             ),
             DispatchError,
         >,
@@ -1972,7 +1989,7 @@ where
         (
             Vec<crate::AggregateValueUpdate<I, E::Backend>>,
             Vec<crate::reexec::ScalarUpdate<I, E::Backend, E::Checkpoint>>,
-            Vec<crate::reexec::ReExecutionTrigger<I, E::Checkpoint>>,
+            Vec<crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>>,
             Vec<crate::MaintenanceTransition>,
         ),
         DispatchError,
@@ -2053,7 +2070,7 @@ where
                         consumer_id,
                         read: crate::reexec::ReExecutionRead::GroupedScalar {
                             group: read.group,
-                            sql: read.sql,
+                            query: read.query,
                             column_kinds: read.column_kinds,
                         },
                         checkpoint: read.checkpoint,
@@ -2163,7 +2180,7 @@ where
         let mut transitions = Vec::new();
         let mut triggers: HashMap<
             (SubscriptionId, Option<Vec<u8>>),
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         > = HashMap::new();
         for event in events {
             let output = self.reread_notifications(event)?;
@@ -2961,7 +2978,7 @@ where
                 pending_uncommitted += 1;
                 created_new = false;
             } else {
-                let (pred, atoms) = Self::make_predicate_from_compiled(&c);
+                let (pred, atoms) = Self::make_predicate_from_compiled(&self.database, &c);
                 let binding = Self::make_binding(
                     &c.spec,
                     subscription_id,
@@ -2981,7 +2998,7 @@ where
             self.binding_dedup.insert(natural_key, subscription_id);
             // Batch registration takes plain `SubscriptionRequest`, which
             // states shared database reads.
-            self.open_aggregate_total(subscription_id, &c.spec, &c.projection, false);
+            self.open_aggregate_total(subscription_id, &c.spec, c.table_id, &c.projection, false);
 
             // Fill in the result, including any evictions credited to
             // this spec by the cap branch above.
@@ -4274,8 +4291,6 @@ where
                 .unwrap_or_default()
                 .as_millis() as u64,
         };
-
-        // Serialize shard
         let bytes = serialize_shard::<I, DB>(table_id, &payload, &self.database)?;
 
         // Write to disk atomically (temp file + fsync + rename + parent-dir fsync).
@@ -4291,6 +4306,8 @@ where
 
     #[cfg(feature = "std")]
     fn rebuild_entries_from_payload(
+        &self,
+        table_id: TableId,
         payload: &ShardPayload<I>,
     ) -> Result<(ConsumerDictionary<I>, BatchEntries<I, E::Backend>), RebuildPayloadError> {
         let mut consumer_dict = ConsumerDictionary::<I>::new();
@@ -4350,6 +4367,20 @@ where
             let Some(bindings) = bindings_by_hash.remove(&pred_data.hash) else {
                 continue;
             };
+            let group_key_encoder = match &pred_data.projection {
+                QueryProjection::GroupedAggregate { groups, .. } => groups
+                    .iter()
+                    .map(|column| {
+                        catalog_helpers::group_key_column::<E::Backend, _>(
+                            &self.database,
+                            table_id,
+                            *column,
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(E::Backend::group_key_encoder),
+                QueryProjection::Rows | QueryProjection::Aggregate(_) => None,
+            };
 
             let bytecode: BytecodeProgram<E::Backend> =
                 codec::deserialize(&pred_data.bytecode_instructions).map_err(|e| {
@@ -4370,6 +4401,7 @@ where
                 index_atoms: Arc::from(atoms.as_slice()),
                 prefilter_plan: Arc::new(prefilter_plan),
                 projection: pred_data.projection,
+                group_key_encoder,
                 refcount: 0, // incremented via bindings in add_batch
                 updated_at_unix_ms: pred_data.updated_at_unix_ms,
             };
@@ -4422,7 +4454,7 @@ where
         table_id: TableId,
         payload: &ShardPayload<I>,
     ) -> Result<(), RebuildPayloadError> {
-        let (consumer_dict, entries) = Self::rebuild_entries_from_payload(payload)?;
+        let (consumer_dict, entries) = self.rebuild_entries_from_payload(table_id, payload)?;
         let mut partition = TablePartition::new(table_id);
         partition.add_batch(&entries);
         self.replace_table_state(table_id, partition, consumer_dict, &entries);

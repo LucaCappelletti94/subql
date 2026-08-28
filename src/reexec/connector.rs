@@ -40,6 +40,93 @@ use crate::backend::ScalarKind;
 use crate::{Checkpoint, DispatchError};
 use thiserror::Error;
 
+/// SQL and typed binds passed to every connector read.
+pub struct ReadQuery<'a, B: Backend> {
+    sql: alloc::borrow::Cow<'a, str>,
+    binds: alloc::borrow::Cow<'a, [Value<B>]>,
+}
+
+impl<'a, B: Backend> ReadQuery<'a, B> {
+    /// Creates an owned query.
+    #[must_use]
+    pub const fn owned(sql: alloc::string::String, binds: alloc::vec::Vec<Value<B>>) -> Self {
+        Self {
+            sql: alloc::borrow::Cow::Owned(sql),
+            binds: alloc::borrow::Cow::Owned(binds),
+        }
+    }
+
+    /// Creates a borrowed query.
+    #[must_use]
+    pub const fn borrowed(sql: &'a str, binds: &'a [Value<B>]) -> Self {
+        Self {
+            sql: alloc::borrow::Cow::Borrowed(sql),
+            binds: alloc::borrow::Cow::Borrowed(binds),
+        }
+    }
+
+    /// Creates a borrowed query without binds.
+    #[must_use]
+    pub const fn without_binds(sql: &'a str) -> Self {
+        Self::borrowed(sql, &[])
+    }
+
+    /// Returns the SQL text.
+    #[must_use]
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// Returns binds in placeholder order.
+    #[must_use]
+    pub fn binds(&self) -> &[Value<B>] {
+        &self.binds
+    }
+
+    /// Converts borrowed fields to owned storage.
+    #[must_use]
+    pub fn into_owned(self) -> ReadQuery<'static, B> {
+        ReadQuery::owned(self.sql.into_owned(), self.binds.into_owned())
+    }
+}
+
+impl<B: Backend> Clone for ReadQuery<'_, B> {
+    fn clone(&self) -> Self {
+        Self {
+            sql: self.sql.clone(),
+            binds: self.binds.clone(),
+        }
+    }
+}
+
+impl<B: Backend> core::fmt::Debug for ReadQuery<'_, B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReadQuery")
+            .field("sql", &self.sql)
+            .field("binds", &self.binds)
+            .finish()
+    }
+}
+
+impl<B: Backend> PartialEq for ReadQuery<'_, B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.sql == other.sql && self.binds == other.binds
+    }
+}
+
+#[cfg(feature = "executor-diesel")]
+#[derive(Debug, Error)]
+#[error("this diesel connector does not support typed read binds")]
+struct UnsupportedReadBinds;
+
+#[cfg(feature = "executor-diesel")]
+#[derive(Debug, Error)]
+#[error("read returned {got} columns, expected {expected}")]
+struct ReadShapeError {
+    expected: usize,
+    got: usize,
+}
+
 /// A captured-state snapshot of a query's value, together with the
 /// [`Checkpoint`] at which it was read.
 ///
@@ -142,10 +229,12 @@ use alloc::string::String;
 use core::cell::RefCell;
 #[cfg(feature = "executor-diesel")]
 use diesel::{
-    query_builder::SqlQuery,
+    query_builder::{BoxedSqlQuery, SqlQuery},
     query_dsl::LoadQuery,
     sql_query,
-    sql_types::{BigInt, Double, Nullable, Text},
+    sql_types::{
+        BigInt, Binary, Bool, Date, Double, Json, Nullable, Numeric, Text, Time, Timestamp,
+    },
     Connection, QueryResult, RunQueryDsl,
 };
 
@@ -211,7 +300,7 @@ pub trait Connector {
     /// semantics of MIN/MAX).
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kind: BuiltinKind,
         auth: &Self::AuthContext,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>;
@@ -238,7 +327,7 @@ pub trait Connector {
     /// no progress and the caller would ask again forever.
     fn read_page(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         max_bytes: usize,
         auth: &Self::AuthContext,
     ) -> Result<Snapshot<RowPage<Self::Backend>, Self::Checkpoint>, Self::Error>;
@@ -259,10 +348,10 @@ pub trait Connector {
     /// honest to say so, and the refusal names what the caller loses.
     fn open_cursor(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         auth: &Self::AuthContext,
     ) -> Result<CursorId, CursorError<Self::Error>> {
-        let _ = (sql, auth);
+        let _ = (query, auth);
         Err(CursorError::Unsupported)
     }
 
@@ -318,7 +407,7 @@ pub trait Connector {
     /// override it for the full aggregate family.
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kinds: &[BuiltinKind],
         auth: &Self::AuthContext,
     ) -> Result<
@@ -328,7 +417,7 @@ pub trait Connector {
         ),
         ScalarRowError<Self::Error>,
     > {
-        let _ = (sql, kinds, auth);
+        let _ = (query, kinds, auth);
         Err(ScalarRowError::Unsupported)
     }
 }
@@ -454,6 +543,8 @@ pub trait DieselBackend: crate::backend::Backend + Sized {
     fn value_from_f64(x: f64) -> Value<Self>;
     /// Wrap a `String` decoded via `Nullable<Text>` as [`Value::String`].
     fn value_from_string(s: String) -> Value<Self>;
+    /// Converts a subql value to the shared diesel bind vocabulary.
+    fn read_bind(value: &Value<Self>) -> Option<DieselReadBind<'_>>;
     /// SQL type name to cast a `SUM` component to double precision in this
     /// backend's dialect, so `SUM`'s promoted integer type decodes as `f64`
     /// for the accumulator. Defaults to `DOUBLE PRECISION` (PostgreSQL, and
@@ -473,6 +564,21 @@ pub trait DieselBackend: crate::backend::Backend + Sized {
 }
 
 #[cfg(feature = "executor-diesel")]
+#[doc(hidden)]
+pub enum DieselReadBind<'a> {
+    Bool(&'a bool),
+    Int(&'a i64),
+    Float(&'a f64),
+    Text(&'a str),
+    Bytes(&'a [u8]),
+    Timestamp(&'a chrono::NaiveDateTime),
+    Date(&'a chrono::NaiveDate),
+    Time(&'a chrono::NaiveTime),
+    Decimal(&'a bigdecimal::BigDecimal),
+    Json(&'a serde_json::Value),
+}
+
+#[cfg(feature = "executor-diesel")]
 impl DieselBackend for crate::backend::Postgres {
     fn value_from_i64(x: i64) -> Value<Self> {
         Value::Int(x)
@@ -482,6 +588,26 @@ impl DieselBackend for crate::backend::Postgres {
     }
     fn value_from_string(s: String) -> Value<Self> {
         Value::String(s)
+    }
+    fn read_bind(value: &Value<Self>) -> Option<DieselReadBind<'_>> {
+        Some(match value {
+            Value::Bool(value) => DieselReadBind::Bool(value),
+            Value::Int(value) => DieselReadBind::Int(value),
+            Value::Float(value) => DieselReadBind::Float(value),
+            Value::String(value) => DieselReadBind::Text(value),
+            Value::Bytes(value) => DieselReadBind::Bytes(value),
+            Value::Timestamp(value) => DieselReadBind::Timestamp(value),
+            Value::Date(value) => DieselReadBind::Date(value),
+            Value::Time(value) => DieselReadBind::Time(value),
+            Value::Decimal(value) => DieselReadBind::Decimal(value),
+            Value::Json(value) => DieselReadBind::Json(value),
+            Value::Missing
+            | Value::Null
+            | Value::Uuid(_)
+            | Value::TimestampTz(_)
+            | Value::Jsonb(_)
+            | Value::Custom(_) => return None,
+        })
     }
 }
 
@@ -495,6 +621,21 @@ impl DieselBackend for crate::backend::MySql {
     }
     fn value_from_string(s: String) -> Value<Self> {
         Value::String(s)
+    }
+    fn read_bind(value: &Value<Self>) -> Option<DieselReadBind<'_>> {
+        Some(match value {
+            Value::Bool(value) => DieselReadBind::Bool(value),
+            Value::Int(value) => DieselReadBind::Int(value),
+            Value::Float(value) => DieselReadBind::Float(value),
+            Value::String(value) | Value::Uuid(value) => DieselReadBind::Text(value),
+            Value::Bytes(value) => DieselReadBind::Bytes(value),
+            Value::Timestamp(value) => DieselReadBind::Timestamp(value),
+            Value::Date(value) => DieselReadBind::Date(value),
+            Value::Time(value) => DieselReadBind::Time(value),
+            Value::Decimal(value) => DieselReadBind::Decimal(value),
+            Value::Json(value) | Value::Jsonb(value) => DieselReadBind::Json(value),
+            Value::Missing | Value::Null | Value::TimestampTz(_) | Value::Custom(_) => return None,
+        })
     }
     fn double_cast_type() -> &'static str {
         "DOUBLE"
@@ -515,6 +656,167 @@ impl DieselBackend for crate::backend::SQLite {
     fn value_from_string(s: String) -> Value<Self> {
         Value::String(s)
     }
+    fn read_bind(value: &Value<Self>) -> Option<DieselReadBind<'_>> {
+        Some(match value {
+            Value::Bool(value) | Value::Int(value) => DieselReadBind::Int(value),
+            Value::Float(value) => DieselReadBind::Float(value),
+            Value::String(value) | Value::Uuid(value) => DieselReadBind::Text(value),
+            Value::Bytes(value) => DieselReadBind::Bytes(value),
+            Value::Timestamp(value) => DieselReadBind::Timestamp(value),
+            Value::Date(value) => DieselReadBind::Date(value),
+            Value::Time(value) => DieselReadBind::Time(value),
+            Value::Decimal(value) => DieselReadBind::Decimal(value),
+            Value::Json(value) | Value::Jsonb(value) => match value.storage() {
+                crate::backend::SqliteJsonStorage::Text(value) => DieselReadBind::Text(value),
+                crate::backend::SqliteJsonStorage::Integer(value) => DieselReadBind::Int(value),
+                crate::backend::SqliteJsonStorage::Real(value) => DieselReadBind::Float(value),
+                crate::backend::SqliteJsonStorage::Blob(value) => DieselReadBind::Bytes(value),
+            },
+            Value::Missing | Value::Null | Value::TimestampTz(_) | Value::Custom(_) => return None,
+        })
+    }
+}
+
+#[cfg(feature = "executor-diesel")]
+pub(super) fn boxed_read_query<'a, DB, B>(
+    query: &'a ReadQuery<'_, B>,
+) -> QueryResult<BoxedSqlQuery<'a, DB, SqlQuery>>
+where
+    DB: diesel::backend::Backend
+        + diesel::backend::DieselReserveSpecialization
+        + diesel::sql_types::HasSqlType<Bool>
+        + diesel::sql_types::HasSqlType<BigInt>
+        + diesel::sql_types::HasSqlType<Double>
+        + diesel::sql_types::HasSqlType<Text>
+        + diesel::sql_types::HasSqlType<Binary>
+        + diesel::sql_types::HasSqlType<Timestamp>
+        + diesel::sql_types::HasSqlType<Date>
+        + diesel::sql_types::HasSqlType<Time>
+        + diesel::sql_types::HasSqlType<Numeric>
+        + diesel::sql_types::HasSqlType<Json>,
+    B: DieselBackend,
+    bool: diesel::serialize::ToSql<Bool, DB>,
+    i64: diesel::serialize::ToSql<BigInt, DB>,
+    f64: diesel::serialize::ToSql<Double, DB>,
+    for<'b> &'b str: diesel::serialize::ToSql<Text, DB>,
+    for<'b> &'b [u8]: diesel::serialize::ToSql<Binary, DB>,
+    for<'b> &'b chrono::NaiveDateTime: diesel::serialize::ToSql<Timestamp, DB>,
+    for<'b> &'b chrono::NaiveDate: diesel::serialize::ToSql<Date, DB>,
+    for<'b> &'b chrono::NaiveTime: diesel::serialize::ToSql<Time, DB>,
+    for<'b> &'b bigdecimal::BigDecimal: diesel::serialize::ToSql<Numeric, DB>,
+    for<'b> &'b serde_json::Value: diesel::serialize::ToSql<Json, DB>,
+{
+    let mut boxed = sql_query(query.sql()).into_boxed::<DB>();
+    for value in query.binds() {
+        boxed = match B::read_bind(value) {
+            Some(DieselReadBind::Bool(value)) => boxed.bind::<Bool, _>(*value),
+            Some(DieselReadBind::Int(value)) => boxed.bind::<BigInt, _>(*value),
+            Some(DieselReadBind::Float(value)) => boxed.bind::<Double, _>(*value),
+            Some(DieselReadBind::Text(value)) => boxed.bind::<Text, _>(value),
+            Some(DieselReadBind::Bytes(value)) => boxed.bind::<Binary, _>(value),
+            Some(DieselReadBind::Timestamp(value)) => boxed.bind::<Timestamp, _>(value),
+            Some(DieselReadBind::Date(value)) => boxed.bind::<Date, _>(value),
+            Some(DieselReadBind::Time(value)) => boxed.bind::<Time, _>(value),
+            Some(DieselReadBind::Decimal(value)) => boxed.bind::<Numeric, _>(value),
+            Some(DieselReadBind::Json(value)) => boxed.bind::<Json, _>(value),
+            None => {
+                return Err(diesel::result::Error::QueryBuilderError(Box::new(
+                    UnsupportedReadBinds,
+                )));
+            }
+        };
+    }
+    Ok(boxed)
+}
+
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
+pub(super) fn boxed_postgres_read_query<'a>(
+    query: &'a ReadQuery<'_, crate::backend::Postgres>,
+) -> QueryResult<BoxedSqlQuery<'a, diesel::pg::Pg, SqlQuery>> {
+    let mut boxed = sql_query(query.sql()).into_boxed::<diesel::pg::Pg>();
+    for value in query.binds() {
+        boxed = match value {
+            Value::Bool(value) => boxed.bind::<Bool, _>(*value),
+            Value::Int(value) => boxed.bind::<BigInt, _>(*value),
+            Value::Float(value) => boxed.bind::<Double, _>(*value),
+            Value::String(value) => boxed.bind::<Text, _>(value.as_str()),
+            Value::Bytes(value) => boxed.bind::<Binary, _>(value.as_slice()),
+            Value::Uuid(value) => boxed.bind::<diesel::sql_types::Uuid, _>(value),
+            Value::Timestamp(value) => boxed.bind::<Timestamp, _>(value),
+            Value::TimestampTz(value) => boxed.bind::<diesel::sql_types::Timestamptz, _>(value),
+            Value::Date(value) => boxed.bind::<Date, _>(value),
+            Value::Time(value) => boxed.bind::<Time, _>(value),
+            Value::Decimal(value) => boxed.bind::<Numeric, _>(value),
+            Value::Json(value) => boxed.bind::<Json, _>(value),
+            Value::Jsonb(value) => boxed.bind::<diesel::sql_types::Jsonb, _>(value),
+            Value::Missing | Value::Null | Value::Custom(_) => {
+                return Err(diesel::result::Error::QueryBuilderError(Box::new(
+                    UnsupportedReadBinds,
+                )));
+            }
+        };
+    }
+    Ok(boxed)
+}
+
+#[cfg(feature = "executor-diesel-async-postgres")]
+pub(super) fn boxed_postgres_read_query_owned(
+    query: &ReadQuery<'_, crate::backend::Postgres>,
+) -> QueryResult<BoxedSqlQuery<'static, diesel::pg::Pg, SqlQuery>> {
+    let mut boxed = sql_query(query.sql()).into_boxed::<diesel::pg::Pg>();
+    for value in query.binds() {
+        boxed = match value {
+            Value::Bool(value) => boxed.bind::<Bool, _>(*value),
+            Value::Int(value) => boxed.bind::<BigInt, _>(*value),
+            Value::Float(value) => boxed.bind::<Double, _>(*value),
+            Value::String(value) => boxed.bind::<Text, _>(value.clone()),
+            Value::Bytes(value) => boxed.bind::<Binary, _>(value.clone()),
+            Value::Uuid(value) => boxed.bind::<diesel::sql_types::Uuid, _>(*value),
+            Value::Timestamp(value) => boxed.bind::<Timestamp, _>(*value),
+            Value::TimestampTz(value) => boxed.bind::<diesel::sql_types::Timestamptz, _>(*value),
+            Value::Date(value) => boxed.bind::<Date, _>(*value),
+            Value::Time(value) => boxed.bind::<Time, _>(*value),
+            Value::Decimal(value) => boxed.bind::<Numeric, _>(value.clone()),
+            Value::Json(value) => boxed.bind::<Json, _>(value.clone()),
+            Value::Jsonb(value) => boxed.bind::<diesel::sql_types::Jsonb, _>(value.clone()),
+            Value::Missing | Value::Null | Value::Custom(_) => {
+                return Err(diesel::result::Error::QueryBuilderError(Box::new(
+                    UnsupportedReadBinds,
+                )));
+            }
+        };
+    }
+    Ok(boxed)
+}
+
+#[cfg(feature = "executor-diesel-async-mysql")]
+pub(super) fn boxed_mysql_read_query_owned(
+    query: &ReadQuery<'_, crate::backend::MySql>,
+) -> QueryResult<BoxedSqlQuery<'static, diesel::mysql::Mysql, SqlQuery>> {
+    let mut boxed = sql_query(query.sql()).into_boxed::<diesel::mysql::Mysql>();
+    for value in query.binds() {
+        boxed = match value {
+            Value::Bool(value) => boxed.bind::<Bool, _>(*value),
+            Value::Int(value) => boxed.bind::<BigInt, _>(*value),
+            Value::Float(value) => boxed.bind::<Double, _>(*value),
+            Value::String(value) | Value::Uuid(value) => boxed.bind::<Text, _>(value.clone()),
+            Value::Bytes(value) => boxed.bind::<Binary, _>(value.clone()),
+            Value::Timestamp(value) => boxed.bind::<Timestamp, _>(*value),
+            Value::Date(value) => boxed.bind::<Date, _>(*value),
+            Value::Time(value) => boxed.bind::<Time, _>(*value),
+            Value::Decimal(value) => boxed.bind::<Numeric, _>(value.clone()),
+            Value::Json(value) | Value::Jsonb(value) => boxed.bind::<Json, _>(value.clone()),
+            Value::Missing | Value::Null | Value::TimestampTz(_) | Value::Custom(_) => {
+                return Err(diesel::result::Error::QueryBuilderError(Box::new(
+                    UnsupportedReadBinds,
+                )));
+            }
+        };
+    }
+    Ok(boxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -609,28 +911,53 @@ pub struct TextRow {
 /// row. Decimals are carried as text through this path so precision is
 /// not lost through `f64`.
 #[cfg(feature = "executor-diesel")]
-fn load_scalar<C, B>(conn: &mut C, sql: &str, kind: BuiltinKind) -> QueryResult<Value<B>>
+fn load_scalar<C, B>(
+    conn: &mut C,
+    query: &ReadQuery<'_, B>,
+    kind: BuiltinKind,
+) -> QueryResult<Value<B>>
 where
+    C: Connection,
+    C::Backend: diesel::backend::DieselReserveSpecialization
+        + diesel::sql_types::HasSqlType<Bool>
+        + diesel::sql_types::HasSqlType<BigInt>
+        + diesel::sql_types::HasSqlType<Double>
+        + diesel::sql_types::HasSqlType<Text>
+        + diesel::sql_types::HasSqlType<Binary>
+        + diesel::sql_types::HasSqlType<Timestamp>
+        + diesel::sql_types::HasSqlType<Date>
+        + diesel::sql_types::HasSqlType<Time>
+        + diesel::sql_types::HasSqlType<Numeric>
+        + diesel::sql_types::HasSqlType<Json>,
     B: DieselBackend,
-    for<'q> SqlQuery:
+    bool: diesel::serialize::ToSql<Bool, C::Backend>,
+    i64: diesel::serialize::ToSql<BigInt, C::Backend>,
+    f64: diesel::serialize::ToSql<Double, C::Backend>,
+    for<'b> &'b str: diesel::serialize::ToSql<Text, C::Backend>,
+    for<'b> &'b [u8]: diesel::serialize::ToSql<Binary, C::Backend>,
+    for<'b> &'b chrono::NaiveDateTime: diesel::serialize::ToSql<Timestamp, C::Backend>,
+    for<'b> &'b chrono::NaiveDate: diesel::serialize::ToSql<Date, C::Backend>,
+    for<'b> &'b chrono::NaiveTime: diesel::serialize::ToSql<Time, C::Backend>,
+    for<'b> &'b bigdecimal::BigDecimal: diesel::serialize::ToSql<Numeric, C::Backend>,
+    for<'b> &'b serde_json::Value: diesel::serialize::ToSql<Json, C::Backend>,
+    for<'q> BoxedSqlQuery<'q, C::Backend, SqlQuery>:
         LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
 {
     let value = match kind {
-        // Raw SQL of necessity: the statement is the subscription's own text,
-        // so no `table!` exists to type it. Wrapped as a scalar subquery so
-        // the read produces what the row decodes: eight bytes, under the
-        // alias `v`, whatever width and name the inner projection has.
         ScalarKind::Int => {
             let widened = alloc::format!(
-                "SELECT CAST(({sql}) AS {cast}) AS v",
+                "SELECT CAST(({}) AS {cast}) AS v",
+                query.sql(),
                 cast = B::int_cast_type()
             );
-            sql_query(widened)
+            let widened = ReadQuery::borrowed(&widened, query.binds());
+            let value = boxed_read_query::<C::Backend, B>(&widened)?
                 .get_result::<IntRow>(conn)?
                 .v
-                .map_or(Value::Null, B::value_from_i64)
+                .map_or(Value::Null, B::value_from_i64);
+            value
         }
-        ScalarKind::Float => sql_query(sql)
+        ScalarKind::Float => boxed_read_query::<C::Backend, B>(query)?
             .get_result::<FloatRow>(conn)?
             .v
             .map_or(Value::Null, B::value_from_f64),
@@ -644,45 +971,67 @@ where
         | ScalarKind::Time
         | ScalarKind::Decimal
         | ScalarKind::Json
-        | ScalarKind::Jsonb => sql_query(sql)
+        | ScalarKind::Jsonb => boxed_read_query::<C::Backend, B>(query)?
             .get_result::<TextRow>(conn)?
             .v
             .map_or(Value::Null, B::value_from_string),
     };
-    Ok(value)
+    Ok(B::decode_group_value(ScalarKind::from_builtin(kind), value).unwrap_or(Value::Missing))
 }
 
-/// Decode a single-row, multi-column aggregate seed by running one aliased
-/// subquery per component through [`load_scalar`], reusing its per-kind
-/// decode. `Float` components (`SUM` / `SUM(x*x)`) are cast to the backend's
-/// double type because `SUM` promotes the source integer type; `Int`
-/// components (counts) are read as-is. Column `i` is projected as `ci` by the
-/// bootstrap SQL. Callers run this inside their own transaction so the
-/// components share one snapshot.
+/// Decodes one aggregate seed row using its runtime database types.
 #[cfg(feature = "executor-diesel")]
 fn load_scalar_row<C, B>(
     conn: &mut C,
-    sql: &str,
+    query: &ReadQuery<'_, B>,
     kinds: &[BuiltinKind],
 ) -> QueryResult<alloc::vec::Vec<Value<B>>>
 where
-    B: DieselBackend,
-    for<'q> SqlQuery:
-        LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
+    C: Connection,
+    C::Backend: crate::diesel_decode::RowFieldDecode
+        + diesel::backend::DieselReserveSpecialization
+        + diesel::sql_types::HasSqlType<Bool>
+        + diesel::sql_types::HasSqlType<BigInt>
+        + diesel::sql_types::HasSqlType<Double>
+        + diesel::sql_types::HasSqlType<Text>
+        + diesel::sql_types::HasSqlType<Binary>
+        + diesel::sql_types::HasSqlType<Timestamp>
+        + diesel::sql_types::HasSqlType<Date>
+        + diesel::sql_types::HasSqlType<Time>
+        + diesel::sql_types::HasSqlType<Numeric>
+        + diesel::sql_types::HasSqlType<Json>,
+    B: DieselBackend + crate::diesel_decode::SpellCanonical,
+    bool: diesel::serialize::ToSql<Bool, C::Backend>,
+    i64: diesel::serialize::ToSql<BigInt, C::Backend>,
+    f64: diesel::serialize::ToSql<Double, C::Backend>,
+    for<'b> &'b str: diesel::serialize::ToSql<Text, C::Backend>,
+    for<'b> &'b [u8]: diesel::serialize::ToSql<Binary, C::Backend>,
+    for<'b> &'b chrono::NaiveDateTime: diesel::serialize::ToSql<Timestamp, C::Backend>,
+    for<'b> &'b chrono::NaiveDate: diesel::serialize::ToSql<Date, C::Backend>,
+    for<'b> &'b chrono::NaiveTime: diesel::serialize::ToSql<Time, C::Backend>,
+    for<'b> &'b bigdecimal::BigDecimal: diesel::serialize::ToSql<Numeric, C::Backend>,
+    for<'b> &'b serde_json::Value: diesel::serialize::ToSql<Json, C::Backend>,
+    for<'q> BoxedSqlQuery<'q, C::Backend, SqlQuery>:
+        LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>,
 {
-    let mut out = alloc::vec::Vec::with_capacity(kinds.len());
-    for (i, kind) in kinds.iter().enumerate() {
-        let wrapped = if matches!(kind, ScalarKind::Float) {
-            alloc::format!(
-                "SELECT CAST(c{i} AS {cast}) AS v FROM ({sql}) AS agg_seed",
-                cast = B::double_cast_type()
-            )
-        } else {
-            alloc::format!("SELECT c{i} AS v FROM ({sql}) AS agg_seed")
-        };
-        out.push(load_scalar::<C, B>(conn, &wrapped, *kind)?);
+    let row = boxed_read_query::<C::Backend, B>(query)?
+        .get_result::<crate::diesel_decode::DynamicRow<B>>(conn)?;
+    if row.values.len() != kinds.len() {
+        return Err(diesel::result::Error::DeserializationError(Box::new(
+            ReadShapeError {
+                expected: kinds.len(),
+                got: row.values.len(),
+            },
+        )));
     }
-    Ok(out)
+    Ok(row
+        .values
+        .into_iter()
+        .zip(kinds)
+        .map(|(value, kind)| {
+            B::decode_group_value(ScalarKind::from_builtin(*kind), value).unwrap_or(Value::Missing)
+        })
+        .collect())
 }
 
 #[cfg(feature = "executor-diesel")]
@@ -694,14 +1043,38 @@ where
 impl<C, B, S> Connector for DieselConnector<C, B, S>
 where
     C: Connection + diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
-    C::Backend: crate::diesel_decode::RowFieldDecode + diesel::backend::DieselReserveSpecialization,
+    C::Backend: crate::diesel_decode::RowFieldDecode
+        + diesel::backend::DieselReserveSpecialization
+        + diesel::sql_types::HasSqlType<Bool>
+        + diesel::sql_types::HasSqlType<BigInt>
+        + diesel::sql_types::HasSqlType<Double>
+        + diesel::sql_types::HasSqlType<Text>
+        + diesel::sql_types::HasSqlType<Binary>
+        + diesel::sql_types::HasSqlType<Timestamp>
+        + diesel::sql_types::HasSqlType<Date>
+        + diesel::sql_types::HasSqlType<Time>
+        + diesel::sql_types::HasSqlType<Numeric>
+        + diesel::sql_types::HasSqlType<Json>,
     B: DieselBackend + crate::diesel_decode::SpellCanonical,
     S: SessionSetup,
+    bool: diesel::serialize::ToSql<Bool, C::Backend>,
+    i64: diesel::serialize::ToSql<BigInt, C::Backend>,
+    f64: diesel::serialize::ToSql<Double, C::Backend>,
+    for<'b> &'b str: diesel::serialize::ToSql<Text, C::Backend>,
+    for<'b> &'b [u8]: diesel::serialize::ToSql<Binary, C::Backend>,
+    for<'b> &'b chrono::NaiveDateTime: diesel::serialize::ToSql<Timestamp, C::Backend>,
+    for<'b> &'b chrono::NaiveDate: diesel::serialize::ToSql<Date, C::Backend>,
+    for<'b> &'b chrono::NaiveTime: diesel::serialize::ToSql<Time, C::Backend>,
+    for<'b> &'b bigdecimal::BigDecimal: diesel::serialize::ToSql<Numeric, C::Backend>,
+    for<'b> &'b serde_json::Value: diesel::serialize::ToSql<Json, C::Backend>,
     for<'q> SqlQuery: LoadQuery<'q, C, IntRow>
         + LoadQuery<'q, C, FloatRow>
         + LoadQuery<'q, C, TextRow>
-        + LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>
         + diesel::query_dsl::methods::ExecuteDsl<C, C::Backend>,
+    for<'q> BoxedSqlQuery<'q, C::Backend, SqlQuery>: LoadQuery<'q, C, IntRow>
+        + LoadQuery<'q, C, FloatRow>
+        + LoadQuery<'q, C, TextRow>
+        + LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>,
 {
     type AuthContext = S;
     type Error = diesel::result::Error;
@@ -714,7 +1087,7 @@ where
 
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, B>,
         kind: BuiltinKind,
         auth: &S,
     ) -> Result<(Value<B>, Option<Self::Checkpoint>), Self::Error> {
@@ -724,11 +1097,11 @@ where
         // supplying nothing gets that behaviour byte for byte, and one
         // supplying statements gets a real transaction so the setup takes hold.
         let value = if setup.is_empty() {
-            load_scalar::<_, B>(&mut *conn, sql, kind)?
+            load_scalar::<_, B>(&mut *conn, query, kind)?
         } else {
             diesel::connection::Connection::transaction(&mut *conn, |conn| {
                 run_setup_statements(conn, setup)?;
-                load_scalar::<_, B>(conn, sql, kind)
+                load_scalar::<_, B>(conn, query, kind)
             })?
         };
         Ok((value, None))
@@ -736,7 +1109,7 @@ where
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, B>,
         max_bytes: usize,
         auth: &S,
     ) -> Result<Snapshot<RowPage<B>, Self::Checkpoint>, Self::Error> {
@@ -745,11 +1118,11 @@ where
         // Decision 5, as in `execute_scalar`: a transaction only when the
         // caller supplied statements.
         let value = if setup.is_empty() {
-            load_page::<_, B>(&mut *conn, sql, max_bytes)?
+            load_page::<_, B>(&mut *conn, query, max_bytes)?
         } else {
             diesel::connection::Connection::transaction(&mut *conn, |conn| {
                 run_setup_statements(conn, setup)?;
-                load_page::<_, B>(conn, sql, max_bytes)
+                load_page::<_, B>(conn, query, max_bytes)
             })?
         };
         Ok(Snapshot {
@@ -760,7 +1133,7 @@ where
 
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, B>,
         kinds: &[BuiltinKind],
         auth: &S,
     ) -> Result<(alloc::vec::Vec<Value<B>>, Option<Self::Checkpoint>), ScalarRowError<Self::Error>>
@@ -772,7 +1145,7 @@ where
         // `PgDieselConnector` additionally pins REPEATABLE READ.
         let values = diesel::connection::Connection::transaction(&mut *conn, |conn| {
             run_setup_statements(conn, auth.setup_statements())?;
-            load_scalar_row::<_, B>(conn, sql, kinds)
+            load_scalar_row::<_, B>(conn, query, kinds)
         })
         .map_err(ScalarRowError::Connector)?;
         Ok((values, None))
@@ -866,7 +1239,7 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
 
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kind: BuiltinKind,
         auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
@@ -883,14 +1256,14 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
             run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
+            let value = load_scalar::<_, Self::Backend>(conn, query, kind)?;
             Ok((value, lsn))
         })
     }
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         max_bytes: usize,
         auth: &S,
     ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
@@ -910,7 +1283,7 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(conn)?;
             run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_page::<_, crate::backend::Postgres>(conn, sql, max_bytes)?;
+            let value = load_page_postgres(conn, query, max_bytes)?;
             Ok(Snapshot {
                 value,
                 checkpoint: lsn,
@@ -920,7 +1293,7 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
 
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kinds: &[BuiltinKind],
         auth: &S,
     ) -> Result<
@@ -943,7 +1316,7 @@ impl<S: SessionSetup> Connector for PgDieselConnector<S> {
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
             run_setup_statements(conn, auth.setup_statements())?;
-            let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
+            let values = load_scalar_row::<_, Self::Backend>(conn, query, kinds)?;
             Ok((values, lsn))
         })
         .map_err(ScalarRowError::Connector)
@@ -1078,7 +1451,7 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
 
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kind: BuiltinKind,
         auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
@@ -1089,14 +1462,14 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
         let pos = read_binlog_pos(&mut conn);
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
+            let value = load_scalar::<_, Self::Backend>(conn, query, kind)?;
             Ok((value, pos))
         })
     }
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         max_bytes: usize,
         auth: &S,
     ) -> Result<Snapshot<RowPage<crate::backend::MySql>, Self::Checkpoint>, Self::Error> {
@@ -1105,7 +1478,7 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
         let pos = read_binlog_pos(&mut conn);
         conn.transaction(|conn| {
             run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_page::<_, crate::backend::MySql>(conn, sql, max_bytes)?;
+            let value = load_page::<_, crate::backend::MySql>(conn, query, max_bytes)?;
             Ok(Snapshot {
                 value,
                 checkpoint: pos,
@@ -1115,7 +1488,7 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
 
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kinds: &[BuiltinKind],
         auth: &S,
     ) -> Result<
@@ -1126,11 +1499,10 @@ impl<S: SessionSetup> Connector for MysqlDieselConnector<S> {
         ScalarRowError<Self::Error>,
     > {
         let mut conn = self.conn.borrow_mut();
-        // Position before snapshot, per `Connector::Checkpoint`.
         let pos = read_binlog_pos(&mut conn);
         diesel::connection::Connection::transaction(&mut *conn, |conn| {
             run_setup_statements(conn, auth.setup_statements())?;
-            let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
+            let values = load_scalar_row::<_, Self::Backend>(conn, query, kinds)?;
             Ok((values, pos))
         })
         .map_err(ScalarRowError::Connector)
@@ -1305,7 +1677,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
 
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kind: BuiltinKind,
         auth: &S,
     ) -> Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error> {
@@ -1324,7 +1696,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
                 sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                     .execute(conn)?;
                 run_setup_statements(conn, auth.setup_statements())?;
-                let value = load_scalar::<_, Self::Backend>(conn, sql, kind)?;
+                let value = load_scalar::<_, Self::Backend>(conn, query, kind)?;
                 Ok((value, lsn))
             });
         Ok(result?)
@@ -1332,7 +1704,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         max_bytes: usize,
         auth: &S,
     ) -> Result<Snapshot<RowPage<crate::backend::Postgres>, Self::Checkpoint>, Self::Error> {
@@ -1350,7 +1722,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(conn)?;
             run_setup_statements(conn, auth.setup_statements())?;
-            let value = load_page::<_, crate::backend::Postgres>(conn, sql, max_bytes)?;
+            let value = load_page_postgres(conn, query, max_bytes)?;
             Ok(Snapshot {
                 value,
                 checkpoint: lsn,
@@ -1361,7 +1733,7 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
 
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kinds: &[BuiltinKind],
         auth: &S,
     ) -> Result<
@@ -1391,13 +1763,17 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
         > = diesel::connection::Connection::transaction(&mut *conn, |conn| {
             sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ").execute(conn)?;
             run_setup_statements(conn, auth.setup_statements())?;
-            let values = load_scalar_row::<_, Self::Backend>(conn, sql, kinds)?;
+            let values = load_scalar_row::<_, Self::Backend>(conn, query, kinds)?;
             Ok((values, lsn))
         });
         result.map_err(|e| ScalarRowError::Connector(e.into()))
     }
 
-    fn open_cursor(&self, sql: &str, auth: &S) -> Result<CursorId, CursorError<Self::Error>> {
+    fn open_cursor(
+        &self,
+        query: &ReadQuery<'_, Self::Backend>,
+        auth: &S,
+    ) -> Result<CursorId, CursorError<Self::Error>> {
         let mut conn = self
             .pool
             .get()
@@ -1433,8 +1809,11 @@ impl<S: SessionSetup> Connector for PgR2D2DieselConnector<S> {
             diesel::sql_query("SET TRANSACTION READ ONLY, ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut *conn)?;
             run_setup_statements(&mut *conn, auth.setup_statements())?;
-            diesel::sql_query(alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {sql}"))
-                .execute(&mut *conn)?;
+            let declaration = ReadQuery::owned(
+                alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {}", query.sql()),
+                query.binds().to_vec(),
+            );
+            boxed_postgres_read_query(&declaration)?.execute(&mut *conn)?;
             Ok(lsn)
         })();
 
@@ -1575,9 +1954,9 @@ fn fetch_page_from(
                 checkpoint: held.checkpoint,
             });
         }
-        let page = load_page::<_, crate::backend::Postgres>(
+        let page = load_page_postgres(
             &mut held.conn,
-            &alloc::format!("FETCH FORWARD {batch} FROM {}", held.name),
+            &ReadQuery::without_binds(&alloc::format!("FETCH FORWARD {batch} FROM {}", held.name)),
             usize::MAX,
         )?;
         if held.columns.is_empty() {
@@ -1602,41 +1981,68 @@ fn fetch_page_from(
     }
 }
 
-/// Read one page of `sql` off a diesel connection, decoding each row without a
-/// compile-time schema and stopping at `max_bytes`.
-///
-/// The shared body behind every diesel-backed connector's
-/// [`Connector::read_page`]. `conn.load` hands back an iterator, so the budget
-/// stops the decode rather than trimming an already-materialized vector, and
-/// one extra row is pulled to answer [`RowPage::more`] without guessing.
+/// Read one bounded page through a typed query.
 #[cfg(feature = "executor-diesel")]
-fn load_page<C, B>(conn: &mut C, sql: &str, max_bytes: usize) -> QueryResult<RowPage<B>>
+fn load_page<C, B>(
+    conn: &mut C,
+    query: &ReadQuery<'_, B>,
+    max_bytes: usize,
+) -> QueryResult<RowPage<B>>
 where
     C: diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
-    C::Backend: crate::diesel_decode::RowFieldDecode + diesel::backend::DieselReserveSpecialization,
+    C::Backend: crate::diesel_decode::RowFieldDecode
+        + diesel::backend::DieselReserveSpecialization
+        + diesel::sql_types::HasSqlType<Bool>
+        + diesel::sql_types::HasSqlType<BigInt>
+        + diesel::sql_types::HasSqlType<Double>
+        + diesel::sql_types::HasSqlType<Text>
+        + diesel::sql_types::HasSqlType<Binary>
+        + diesel::sql_types::HasSqlType<Timestamp>
+        + diesel::sql_types::HasSqlType<Date>
+        + diesel::sql_types::HasSqlType<Time>
+        + diesel::sql_types::HasSqlType<Numeric>
+        + diesel::sql_types::HasSqlType<Json>,
+    B: crate::diesel_decode::SpellCanonical + DieselBackend,
+    bool: diesel::serialize::ToSql<Bool, C::Backend>,
+    i64: diesel::serialize::ToSql<BigInt, C::Backend>,
+    f64: diesel::serialize::ToSql<Double, C::Backend>,
+    for<'b> &'b str: diesel::serialize::ToSql<Text, C::Backend>,
+    for<'b> &'b [u8]: diesel::serialize::ToSql<Binary, C::Backend>,
+    for<'b> &'b chrono::NaiveDateTime: diesel::serialize::ToSql<Timestamp, C::Backend>,
+    for<'b> &'b chrono::NaiveDate: diesel::serialize::ToSql<Date, C::Backend>,
+    for<'b> &'b chrono::NaiveTime: diesel::serialize::ToSql<Time, C::Backend>,
+    for<'b> &'b bigdecimal::BigDecimal: diesel::serialize::ToSql<Numeric, C::Backend>,
+    for<'b> &'b serde_json::Value: diesel::serialize::ToSql<Json, C::Backend>,
+    for<'q> BoxedSqlQuery<'q, C::Backend, SqlQuery>:
+        LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>,
+{
+    collect_page(conn, boxed_read_query::<C::Backend, B>(query)?, max_bytes)
+}
+
+#[cfg(feature = "executor-diesel")]
+fn collect_page<'conn, C, B, Q>(
+    conn: &'conn mut C,
+    query: Q,
+    max_bytes: usize,
+) -> QueryResult<RowPage<B>>
+where
+    C: diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
     B: crate::diesel_decode::SpellCanonical,
-    for<'q> SqlQuery: LoadQuery<'q, C, crate::diesel_decode::DynamicRow<B>>,
+    Q: LoadQuery<'conn, C, crate::diesel_decode::DynamicRow<B>>,
 {
     let mut columns = alloc::vec::Vec::new();
     let mut rows: alloc::vec::Vec<alloc::vec::Vec<Value<B>>> = alloc::vec::Vec::new();
     let mut spent = 0_usize;
     let mut more = false;
-
-    // Lazy on purpose: the iterator lets the budget stop the decode rather
-    // than trim a vector that was already built in full.
-    let iter =
-        diesel::query_dsl::LoadQuery::<'_, C, crate::diesel_decode::DynamicRow<B>>::internal_load(
-            diesel::sql_query(sql),
-            conn,
-        )?;
+    let iter = diesel::query_dsl::LoadQuery::<'conn, C, crate::diesel_decode::DynamicRow<B>>::internal_load(
+        query,
+        conn,
+    )?;
     for row in iter {
         let row = row?;
         if columns.is_empty() {
             columns = row.columns;
         }
-        // A page always makes progress: the budget stops the row after the
-        // first, never the first itself, or an oversized row would stall the
-        // read forever.
         let cost = RowPage::<B>::row_bytes_of(&row.values);
         if !rows.is_empty() && spent + cost > max_bytes {
             more = true;
@@ -1645,10 +2051,23 @@ where
         spent += cost;
         rows.push(row.values);
     }
-
     Ok(RowPage {
         columns,
         rows,
         more,
     })
+}
+#[cfg(feature = "executor-diesel-postgres")]
+fn load_page_postgres<C>(
+    conn: &mut C,
+    query: &ReadQuery<'_, crate::backend::Postgres>,
+    max_bytes: usize,
+) -> QueryResult<RowPage<crate::backend::Postgres>>
+where
+    C: Connection<Backend = diesel::pg::Pg>
+        + diesel::connection::LoadConnection<diesel::connection::DefaultLoadingMode>,
+    for<'q> BoxedSqlQuery<'q, diesel::pg::Pg, SqlQuery>:
+        LoadQuery<'q, C, crate::diesel_decode::DynamicRow<crate::backend::Postgres>>,
+{
+    collect_page(conn, boxed_postgres_read_query(query)?, max_bytes)
 }

@@ -5,7 +5,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{Postgres, Value};
+use subql::backend::{Postgres, ScalarKind, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, AggValue, AggregateSeedInstall, AggregateValueChange, DefaultIds, Install,
@@ -157,10 +157,10 @@ fn a_count_star_having_needs_no_widening() {
         "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING COUNT(*) > 2",
     );
     assert!(!bootstrap.sql.to_uppercase().contains("HAVING"));
-    assert!(
-        !bootstrap.sql.contains("AS c2"),
-        "COUNT(*) reads the row count every grouped fold already seeds: {}",
-        bootstrap.sql
+    assert_eq!(
+        bootstrap.kinds,
+        vec![ScalarKind::String, ScalarKind::Float, ScalarKind::Int],
+        "COUNT(*) uses the grouped row count without widening the component set"
     );
 }
 

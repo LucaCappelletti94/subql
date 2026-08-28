@@ -100,7 +100,7 @@ enum ResolveJob<B: Backend> {
     /// One grouped extreme and its source-row count.
     GroupedScalar {
         group: Vec<u8>,
-        sql: alloc::string::String,
+        query: super::ReadQuery<'static, B>,
     },
     /// Rows for the keys that changed, read scoped to those keys. Boxed: this
     /// variant carries a parsed statement, and the others carry a string.
@@ -146,7 +146,7 @@ struct ResolveOutputs<'a, I: IdTypes, B: Backend, C: crate::Checkpoint> {
     scalar_updates: &'a mut Vec<ScalarUpdate<I, B, C>>,
     rows_updates: &'a mut Vec<super::engine::RowsUpdate<I, B, C>>,
     row_deltas: &'a mut Vec<super::engine::RowDelta<I, B, C>>,
-    followup: &'a mut Vec<super::ReExecutionTrigger<I, C>>,
+    followup: &'a mut Vec<super::ReExecutionTrigger<I, C, B>>,
     transitions: &'a mut Vec<crate::MaintenanceTransition>,
 }
 
@@ -268,7 +268,8 @@ where
                 &context.auth,
             )
             .await?;
-            let rows = pages.into_iter().flat_map(|page| page.rows).collect();
+            let mut rows: Vec<_> = pages.into_iter().flat_map(|page| page.rows).collect();
+            super::auto::decode_grouped_seed_rows::<E::Backend>(&mut rows, &bootstrap.kinds);
             let mut installed = crate::Install::install(
                 &mut self.inner,
                 subscription_id,
@@ -281,7 +282,7 @@ where
             let mut pending = core::mem::take(&mut installed.triggers);
             while let Some(trigger) = pending.pop() {
                 match &trigger.read {
-                    super::ReExecutionRead::GroupedScalar { group, sql, .. } => {
+                    super::ReExecutionRead::GroupedScalar { group, query, .. } => {
                         let context = self
                             .contexts
                             .get(&subscription_id)
@@ -289,7 +290,7 @@ where
                         let page = self
                             .mode
                             .connector
-                            .read_page(sql, self.max_page_bytes, &context.auth)
+                            .read_page(query, self.max_page_bytes, &context.auth)
                             .await
                             .map_err(|error| ReExecError::Connector {
                                 subscription: subscription_id,
@@ -388,7 +389,11 @@ where
         let (value, checkpoint) = self
             .mode
             .connector
-            .execute_scalar(&context.sql, context.column_kind, &context.auth)
+            .execute_scalar(
+                &super::ReadQuery::without_binds(&context.sql),
+                context.column_kind,
+                &context.auth,
+            )
             .await
             .map_err(|error| ReExecError::Connector {
                 subscription: subscription_id,
@@ -485,7 +490,7 @@ where
         let resolved: Vec<
             Result<
                 (
-                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
                     Resolved<E::Backend>,
                 ),
                 ReExecError<X::Error>,
@@ -574,10 +579,10 @@ where
     #[allow(clippy::type_complexity)]
     fn plan_jobs(
         &mut self,
-        actionable: Vec<super::ReExecutionTrigger<I, E::Checkpoint>>,
+        actionable: Vec<super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>>,
     ) -> (
         Vec<(
-            super::ReExecutionTrigger<I, E::Checkpoint>,
+            super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
             ResolveJob<E::Backend>,
         )>,
         BorrowedKeys<E::Backend>,
@@ -613,7 +618,7 @@ where
         resolved: Vec<
             Result<
                 (
-                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
                     Resolved<E::Backend>,
                 ),
                 ReExecError<X::Error>,
@@ -621,7 +626,7 @@ where
         >,
     ) -> Result<
         Vec<(
-            super::ReExecutionTrigger<I, E::Checkpoint>,
+            super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
             Resolved<E::Backend>,
         )>,
         ReExecError<X::Error>,
@@ -646,7 +651,7 @@ where
     /// what a tier delivers.
     fn apply_resolved(
         &mut self,
-        trigger: &super::ReExecutionTrigger<I, E::Checkpoint>,
+        trigger: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         answer: Resolved<E::Backend>,
         outputs: &mut ResolveOutputs<'_, I, E::Backend, E::Checkpoint>,
     ) -> Result<(), ReExecError<X::Error>> {
@@ -714,7 +719,7 @@ where
     /// diverging copies of this loop.
     async fn drain_followup(
         &mut self,
-        followup: &mut Vec<super::ReExecutionTrigger<I, E::Checkpoint>>,
+        followup: &mut Vec<super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>>,
         aggregate_updates: &mut Vec<crate::AggregateValueUpdate<I, E::Backend>>,
         scalar_updates: &mut Vec<ScalarUpdate<I, E::Backend, E::Checkpoint>>,
         rows_updates: &mut Vec<super::engine::RowsUpdate<I, E::Backend, E::Checkpoint>>,
@@ -769,13 +774,13 @@ where
     /// what lets the reads themselves run concurrently.
     fn plan_job(
         &mut self,
-        trigger: &super::ReExecutionTrigger<I, E::Checkpoint>,
+        trigger: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
     ) -> Option<ResolveJob<E::Backend>> {
         let subscription_id = trigger.subscription_id;
-        if let super::ReExecutionRead::GroupedScalar { group, sql, .. } = &trigger.read {
+        if let super::ReExecutionRead::GroupedScalar { group, query, .. } = &trigger.read {
             return Some(ResolveJob::GroupedScalar {
                 group: group.clone(),
-                sql: sql.clone(),
+                query: query.clone(),
             });
         }
         let ctx = self.contexts.get(&subscription_id).expect(
@@ -834,7 +839,7 @@ where
         match job {
             ResolveJob::Scalar { sql, column_kind } => {
                 let (value, _db_checkpoint) = connector
-                    .execute_scalar(&sql, column_kind, auth)
+                    .execute_scalar(&super::ReadQuery::without_binds(&sql), column_kind, auth)
                     .await
                     .map_err(|error| ReExecError::Connector {
                         subscription,
@@ -842,9 +847,9 @@ where
                     })?;
                 Ok(Resolved::Scalar(value))
             }
-            ResolveJob::GroupedScalar { group, sql } => {
+            ResolveJob::GroupedScalar { group, query } => {
                 let page = connector
-                    .read_page(&sql, max_page_bytes, auth)
+                    .read_page(&query, max_page_bytes, auth)
                     .await
                     .map_err(|error| ReExecError::Connector {
                         subscription,
@@ -898,7 +903,11 @@ where
                     let mut seen_in_batch: Vec<Vec<Value<E::Backend>>> = Vec::new();
                     loop {
                         let page = connector
-                            .read_page(&page_sql, max_page_bytes, auth)
+                            .read_page(
+                                &super::ReadQuery::without_binds(&page_sql),
+                                max_page_bytes,
+                                auth,
+                            )
                             .await
                             .map_err(|error| ReExecError::Connector {
                                 subscription,
@@ -985,14 +994,13 @@ where
         max_page_bytes: usize,
         auth: &X::AuthContext,
     ) -> Result<(Vec<ReadPage<E::Backend>>, Option<X::Checkpoint>), ReExecError<X::Error>> {
-        let cursor =
-            connector
-                .open_cursor(sql, auth)
-                .await
-                .map_err(|error| ReExecError::Cursor {
-                    subscription,
-                    error,
-                })?;
+        let cursor = connector
+            .open_cursor(&super::ReadQuery::without_binds(sql), auth)
+            .await
+            .map_err(|error| ReExecError::Cursor {
+                subscription,
+                error,
+            })?;
 
         let mut pages = Vec::new();
         let mut checkpoint = None;
@@ -1117,7 +1125,7 @@ where
         let resolved: alloc::vec::Vec<
             Result<
                 (
-                    super::ReExecutionTrigger<I, E::Checkpoint>,
+                    super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
                     Resolved<E::Backend>,
                 ),
                 ReExecError<X::Error>,
@@ -1315,7 +1323,7 @@ mod tests {
 
         fn execute_scalar(
             &self,
-            _sql: &str,
+            _query: &super::super::ReadQuery<'_, Postgres>,
             _kind: BuiltinKind,
             _auth: &(),
         ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
@@ -1329,7 +1337,7 @@ mod tests {
 
         fn read_page(
             &self,
-            _sql: &str,
+            _query: &super::super::ReadQuery<'_, Postgres>,
             _max_bytes: usize,
             _auth: &(),
         ) -> impl Future<
@@ -1885,12 +1893,12 @@ mod tests {
             .with_debounce_per_query(core::time::Duration::from_secs(1));
         let first = super::super::ReExecutionRead::GroupedScalar {
             group: vec![1],
-            sql: String::new(),
+            query: super::super::ReadQuery::owned(String::new(), Vec::new()),
             column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
         };
         let second = super::super::ReExecutionRead::GroupedScalar {
             group: vec![2],
-            sql: String::new(),
+            query: super::super::ReadQuery::owned(String::new(), Vec::new()),
             column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
         };
         engine.stamp_reexec(7, &first);

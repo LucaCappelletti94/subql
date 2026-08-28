@@ -100,8 +100,6 @@ impl CustomScalars for MyScalars {
 struct Custom;
 
 impl Backend for Custom {
-    // Postgres' shapes, so Postgres' text comparison too.
-    const TEXT_GROUPS_BY_BYTES: bool = true;
     type Dialect = PostgreSqlDialect;
     type Custom = MyScalars;
     type Bool = bool;

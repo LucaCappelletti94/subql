@@ -42,11 +42,9 @@ pub enum QueryProjection {
     /// `SELECT g1, ..., gn, <aggregate> FROM t WHERE p GROUP BY g1, ..., gn`:
     /// deliver one maintained value per group.
     ///
-    /// Every group column is a bare column, so a changed row names its own
-    /// group without evaluating anything, and every one is of a kind whose
-    /// values encode one-to-one with how the database groups them
-    /// (`backend::kind_groups_one_to_one`). `groups` is in the order
-    /// the `GROUP BY` names them, which is the order a group's key encodes in.
+    /// Every group column is bare, so a changed row names its own group. The
+    /// backend selects a canonical encoder from each column's scalar and
+    /// comparison metadata. `groups` preserves `GROUP BY` order.
     ///
     /// The enum-level `non_exhaustive` does NOT cover this variant's fields:
     /// match it with `..` or a future field addition breaks the match, as
@@ -700,20 +698,19 @@ fn grouped_projection<B: crate::backend::Backend, DB: DatabaseLike>(
     table_id: crate::TableId,
     database: &DB,
 ) -> Result<QueryProjection, RegisterError> {
-    // A group column whose values the database groups together while their
-    // encoding separates them would seed one group and then open a second from
-    // zero, leaving both totals wrong with nothing failing.
-    for column in groups {
-        let kind = catalog_helpers::column_builtin_kind(database, table_id, *column);
-        if !crate::backend::kind_groups_one_to_one::<B>(kind) {
-            let name = catalog_helpers::column_name(database, table_id, *column)
-                .unwrap_or_else(|| alloc::format!("column {column}"));
-            return Err(RegisterError::UnsupportedSql(alloc::format!(
-                "{name} cannot identify a group: this database treats values of {kind:?} as \
-                 equal that subql would encode apart, so the seeded group and a later change \
-                 would land in different groups and both totals would be wrong"
-            )));
-        }
+    let columns: Vec<_> = groups
+        .iter()
+        .map(|column| catalog_helpers::group_key_column::<B, _>(database, table_id, *column))
+        .collect::<Option<_>>()
+        .ok_or_else(|| {
+            RegisterError::UnsupportedSql(
+                "a GROUP BY column has no complete scalar or comparison metadata".to_string(),
+            )
+        })?;
+    if B::group_key_encoder(columns).is_none() {
+        return Err(RegisterError::UnsupportedSql(
+            "a GROUP BY column has no canonical key for this database comparison".to_string(),
+        ));
     }
 
     let mut projected_groups = Vec::with_capacity(groups.len());
@@ -1021,11 +1018,15 @@ pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLi
     let Some(groups) = group_columns(select, table_id, database)? else {
         return Ok(None);
     };
-    for column in &groups {
-        let kind = catalog_helpers::column_builtin_kind(database, table_id, *column);
-        if !crate::backend::kind_groups_one_to_one::<B>(kind) {
-            return Ok(None);
-        }
+    let Some(columns) = groups
+        .iter()
+        .map(|column| catalog_helpers::group_key_column::<B, _>(database, table_id, *column))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    if B::group_key_encoder(columns).is_none() {
+        return Ok(None);
     }
 
     let mut projected_groups = Vec::with_capacity(groups.len());
@@ -1252,11 +1253,12 @@ pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
     // is escaped by the same renderer that parsed it.
     let mut items = Vec::with_capacity(groups.len() + 4);
     let mut group_kinds = Vec::with_capacity(groups.len());
-    for column in groups {
+    for (slot, column) in groups.iter().enumerate() {
         let name = catalog_helpers::column_name(database, table_id, *column)?;
-        items.push(SelectItem::UnnamedExpr(Expr::Identifier(
-            super::quoted_ident(dialect, &name),
-        )));
+        items.push(component(
+            Expr::Identifier(super::quoted_ident(dialect, &name)),
+            slot,
+        ));
         group_kinds.push(catalog_helpers::column_builtin_kind(
             database, table_id, *column,
         )?);
@@ -1277,14 +1279,14 @@ pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
         components
             .into_iter()
             .enumerate()
-            .map(|(slot, expr)| component(expr, slot)),
+            .map(|(slot, expr)| component(expr, groups.len() + slot)),
     );
     if !groups.is_empty() {
         // A grouped seed also reports how many source rows each group holds,
         // which is what lets a later change know whether it emptied one.
         items.push(component(
             agg_call("COUNT", FunctionArgExpr::Wildcard),
-            component_count,
+            groups.len() + component_count,
         ));
     }
     *select_projection_mut(&mut stmt)? = items;

@@ -762,6 +762,53 @@ pub(crate) struct AggregateDelta<B: crate::backend::Backend> {
 pub(crate) struct AggregateComputation<B: crate::backend::Backend> {
     pub deltas: Vec<AggregateDelta<B>>,
     pub missing_old: Vec<SubscriptionId>,
+    pub group_key_failed: Vec<SubscriptionId>,
+}
+
+type AggregateNet<B> = HashMap<
+    (SubscriptionId, Option<Vec<u8>>),
+    (Option<AggDelta>, i64, Option<crate::GroupIdentity<B>>),
+>;
+
+struct AggregateDeltaState<'a, I: IdTypes, B: crate::backend::Backend> {
+    store: &'a PredicateStore<I, B>,
+    missing_old: &'a HashSet<SubscriptionId>,
+    net: &'a mut AggregateNet<B>,
+}
+
+fn accumulate_aggregate_deltas<I, B>(
+    state: &mut AggregateDeltaState<'_, I, B>,
+    consumers: &RoaringBitmap,
+    predicate: PredicateId,
+    group: Option<&crate::GroupIdentity<B>>,
+    delta: Option<AggDelta>,
+    rows: i64,
+) where
+    I: IdTypes,
+    B: crate::backend::Backend,
+{
+    for ordinal in consumers {
+        let ordinal = ConsumerOrdinal::new(ordinal);
+        let Some(subscriptions) = state.store.binding_lookup.get(&(predicate, ordinal)) else {
+            continue;
+        };
+        for &subscription in subscriptions {
+            if state.missing_old.contains(&subscription) {
+                continue;
+            }
+            let held = state
+                .net
+                .entry((subscription, group.map(|identity| identity.key.clone())))
+                .or_insert_with(|| (None, 0, group.cloned()));
+            held.1 += rows;
+            if let Some(delta) = delta {
+                match &mut held.0 {
+                    Some(existing) => existing.merge(&delta),
+                    slot @ None => *slot = Some(delta),
+                }
+            }
+        }
+    }
 }
 
 fn subscriptions_missing_old<I, E, DB>(
@@ -812,25 +859,51 @@ where
     missing
 }
 
+fn extend_bound_subscriptions<I, B>(
+    consumers: &RoaringBitmap,
+    predicate: PredicateId,
+    store: &PredicateStore<I, B>,
+    subscriptions: &mut HashSet<SubscriptionId>,
+) where
+    I: IdTypes,
+    B: crate::backend::Backend,
+{
+    for ordinal in consumers {
+        let ordinal = ConsumerOrdinal::new(ordinal);
+        if let Some(bound) = store.binding_lookup.get(&(predicate, ordinal)) {
+            subscriptions.extend(bound.iter().copied());
+        }
+    }
+}
+
+enum AggregateGroup<B: crate::backend::Backend> {
+    Ungrouped,
+    Group(crate::GroupIdentity<B>),
+    Unencodable,
+}
+
 fn aggregate_group<E, DB>(
     event: &E,
     row: RowKind,
     columns: &[crate::ColumnId],
+    encoder: Option<&crate::backend::GroupKeyEncoder<E::Backend>>,
     db: &DB,
-) -> Result<Option<crate::GroupIdentity<E::Backend>>, DispatchError>
+) -> Result<AggregateGroup<E::Backend>, DispatchError>
 where
     E: CdcEvent,
     DB: DatabaseLike,
 {
     if columns.is_empty() {
-        return Ok(None);
+        return Ok(AggregateGroup::Ungrouped);
     }
     let values = columns
         .iter()
         .map(|column| event.value_at(db, row, *column))
         .collect::<Result<Vec<_>, _>>()?;
-    let key = crate::backend::encode_value_key(&values).ok_or(DispatchError::GroupKeyEncoding)?;
-    Ok(Some(crate::GroupIdentity { key, values }))
+    let Some(key) = encoder.and_then(|encoder| encoder.encode(&values)) else {
+        return Ok(AggregateGroup::Unencodable);
+    };
+    Ok(AggregateGroup::Group(crate::GroupIdentity { key, values }))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -847,14 +920,7 @@ where
     DB: DatabaseLike,
 {
     let weighted_rows = weighted_rows_for_agg(event);
-    let mut net: HashMap<
-        (SubscriptionId, Option<Vec<u8>>),
-        (
-            Option<AggDelta>,
-            i64,
-            Option<crate::GroupIdentity<E::Backend>>,
-        ),
-    > = HashMap::new();
+    let mut net: AggregateNet<E::Backend> = HashMap::new();
     let snapshot = partition.load_snapshot();
 
     // For UPDATE, use dependency-aware candidate selection; for INSERT /
@@ -866,6 +932,7 @@ where
     };
     let candidates = partition.select_agg_candidates(event.kind(), &changed_cols);
     let missing_old = subscriptions_missing_old(event, &candidates, &snapshot.predicates, db);
+    let mut group_key_failed = HashSet::new();
 
     for (weight, row) in weighted_rows {
         for_each_matching_predicate(
@@ -893,34 +960,34 @@ where
                 if let Some(error) = decode_err {
                     return Err(DispatchError::Value(error));
                 }
-                let group = aggregate_group(event, row, groups, db)?;
-
-                for ord_u32 in consumers {
-                    let ord = ConsumerOrdinal::new(ord_u32);
-                    let Some(subscriptions) =
-                        snapshot.predicates.binding_lookup.get(&(pred.id, ord))
-                    else {
-                        continue;
+                let group =
+                    match aggregate_group(event, row, groups, pred.group_key_encoder.as_ref(), db)?
+                    {
+                        AggregateGroup::Ungrouped => None,
+                        AggregateGroup::Group(group) => Some(group),
+                        AggregateGroup::Unencodable => {
+                            extend_bound_subscriptions(
+                                consumers,
+                                pred.id,
+                                &snapshot.predicates,
+                                &mut group_key_failed,
+                            );
+                            return Ok(());
+                        }
                     };
-                    for &subscription in subscriptions {
-                        if missing_old.contains(&subscription) {
-                            continue;
-                        }
-                        let held = net
-                            .entry((
-                                subscription,
-                                group.as_ref().map(|identity| identity.key.clone()),
-                            ))
-                            .or_insert_with(|| (None, 0, group.clone()));
-                        held.1 += weight;
-                        if let Some(delta) = maybe_delta {
-                            match &mut held.0 {
-                                Some(existing) => existing.merge(&delta),
-                                slot @ None => *slot = Some(delta),
-                            }
-                        }
-                    }
-                }
+
+                accumulate_aggregate_deltas(
+                    &mut AggregateDeltaState {
+                        store: &snapshot.predicates,
+                        missing_old: &missing_old,
+                        net: &mut net,
+                    },
+                    consumers,
+                    pred.id,
+                    group.as_ref(),
+                    maybe_delta,
+                    weight,
+                );
 
                 Ok(())
             },
@@ -942,9 +1009,12 @@ where
         .collect();
     let mut missing_old: Vec<_> = missing_old.into_iter().collect();
     missing_old.sort_unstable();
+    let mut group_key_failed: Vec<_> = group_key_failed.into_iter().collect();
+    group_key_failed.sort_unstable();
     Ok(AggregateComputation {
         deltas,
         missing_old,
+        group_key_failed,
     })
 }
 

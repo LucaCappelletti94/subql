@@ -69,7 +69,8 @@ pub use connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
 pub use connector::PgDieselConnector;
 pub use connector::{
-    Connector, CursorError, CursorId, ReExecError, RowPage, ScalarRowError, SessionSetup, Snapshot,
+    Connector, CursorError, CursorId, ReExecError, ReadQuery, RowPage, ScalarRowError,
+    SessionSetup, Snapshot,
 };
 #[cfg(feature = "executor-diesel")]
 pub use connector::{DieselBackend, DieselConnector};

@@ -618,6 +618,7 @@ pub struct GroupedAggregateTotal<I: IdTypes, B: Backend, C: Checkpoint> {
     consumer: I::ConsumerId,
     spec: AggSpec,
     group_columns: usize,
+    group_key_encoder: crate::backend::GroupKeyEncoder<B>,
     groups: HashMap<Vec<u8>, GroupValue<B>>,
     pending: Option<PendingGroups<B, C>>,
     having: Option<GroupHaving>,
@@ -631,6 +632,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         spec: AggSpec,
         group_columns: usize,
         having: Option<&crate::AggHaving>,
+        group_key_encoder: crate::backend::GroupKeyEncoder<B>,
     ) -> Self {
         let widened = having.is_some_and(|having| having.widens(&spec));
         debug_assert!(
@@ -648,6 +650,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             consumer,
             spec,
             group_columns,
+            group_key_encoder,
             groups: HashMap::new(),
             pending: Some(PendingGroups::new()),
             having,
@@ -789,7 +792,9 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             });
         }
         let values = row[..group_columns].to_vec();
-        let key = crate::backend::encode_value_key(&values)
+        let key = self
+            .group_key_encoder
+            .encode(&values)
             .ok_or(AggregateInstallError::GroupKeyUnencodable(subscription))?;
         let rows = row
             .last()

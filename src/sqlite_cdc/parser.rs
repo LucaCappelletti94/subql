@@ -28,7 +28,7 @@ use sqlite_diff_rs::{
 
 use super::event::SqliteChangesetEvent;
 use crate::backend::{
-    Backend, BuiltinKind, CustomScalars, SQLite, ScalarKind, ScalarKindOf, Value,
+    Backend, BuiltinKind, CustomScalars, SQLite, ScalarKind, ScalarKindOf, SqliteJson, Value,
 };
 use crate::wal::{resolve_table, WalParseError, WalParser};
 use crate::{catalog_helpers, ColumnId, EventKind, TableId};
@@ -296,10 +296,14 @@ fn decode_wire_value(
         WireValue::Integer(i) => match kind {
             Some(ScalarKind::Bool) => Value::Bool(i),
             Some(ScalarKind::Int) | None => Value::Int(i),
+            Some(ScalarKind::Json) => Value::Json(SqliteJson::integer(i)),
+            Some(ScalarKind::Jsonb) => Value::Jsonb(SqliteJson::integer(i)),
             _ => Value::Missing,
         },
         WireValue::Real(f) => match kind {
             Some(ScalarKind::Float) | None => Value::Float(f),
+            Some(ScalarKind::Json) => Value::Json(SqliteJson::real(f)),
+            Some(ScalarKind::Jsonb) => Value::Jsonb(SqliteJson::real(f)),
             _ => Value::Missing,
         },
         WireValue::Text(s) => match kind {
@@ -322,16 +326,14 @@ fn decode_wire_value(
                     .ok()
                     .map_or(Value::Missing, Value::Decimal)
             }
-            Some(ScalarKind::Json) => serde_json::from_str(&s)
-                .ok()
-                .map_or(Value::Missing, Value::Json),
-            Some(ScalarKind::Jsonb) => serde_json::from_str(&s)
-                .ok()
-                .map_or(Value::Missing, Value::Jsonb),
+            Some(ScalarKind::Json) => Value::Json(SqliteJson::text(s)),
+            Some(ScalarKind::Jsonb) => Value::Jsonb(SqliteJson::text(s)),
             _ => Value::Missing,
         },
         WireValue::Blob(b) => match kind {
             Some(ScalarKind::Bytes) | None => Value::Bytes(b),
+            Some(ScalarKind::Json) => Value::Json(SqliteJson::blob(b)),
+            Some(ScalarKind::Jsonb) => Value::Jsonb(SqliteJson::blob(b)),
             _ => Value::Missing,
         },
     }
@@ -549,6 +551,39 @@ mod tests {
                 Value::Missing,
                 "sqlite text {text:?} must not decode as {kind:?}"
             );
+        }
+    }
+
+    #[test]
+    fn json_like_columns_preserve_every_sqlite_storage_class() {
+        use crate::backend::SqliteJsonStorage;
+
+        let values = [
+            (
+                decode_wire_value(
+                    WireValue::Text(String::from("{ \"a\": 1 }")),
+                    Some(ScalarKind::Json),
+                ),
+                SqliteJsonStorage::Text(String::from("{ \"a\": 1 }")),
+            ),
+            (
+                decode_wire_value(WireValue::Integer(1), Some(ScalarKind::Json)),
+                SqliteJsonStorage::Integer(1),
+            ),
+            (
+                decode_wire_value(WireValue::Real(1.5), Some(ScalarKind::Json)),
+                SqliteJsonStorage::Real(1.5),
+            ),
+            (
+                decode_wire_value(WireValue::Blob(vec![1, 2]), Some(ScalarKind::Json)),
+                SqliteJsonStorage::Blob(vec![1, 2]),
+            ),
+        ];
+        for (value, expected) in values {
+            let Value::Json(value) = value else {
+                panic!("JSON columns keep their storage class")
+            };
+            assert_eq!(value.storage(), &expected);
         }
     }
 }

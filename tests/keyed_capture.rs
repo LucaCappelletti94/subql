@@ -78,23 +78,23 @@ impl subql::reexec::Connector for Counting {
 
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, SQLite>,
         kind: subql::backend::BuiltinKind,
         auth: &(),
     ) -> Result<(Value<SQLite>, Option<Self::Checkpoint>), Self::Error> {
-        self.inner.execute_scalar(sql, kind, auth)
+        self.inner.execute_scalar(query, kind, auth)
     }
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, SQLite>,
         max_bytes: usize,
         auth: &(),
     ) -> Result<
         subql::reexec::Snapshot<subql::reexec::RowPage<SQLite>, Self::Checkpoint>,
         Self::Error,
     > {
-        self.statements.lock().push(sql.to_string());
+        self.statements.lock().push(query.sql().to_string());
         {
             let mut allow = self.allow.lock();
             if *allow == 0 {
@@ -102,19 +102,19 @@ impl subql::reexec::Connector for Counting {
             }
             *allow = allow.saturating_sub(1);
         }
-        self.inner.read_page(sql, max_bytes, auth)
+        self.inner.read_page(query, max_bytes, auth)
     }
 
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, SQLite>,
         kinds: &[subql::backend::BuiltinKind],
         auth: &(),
     ) -> Result<
         (Vec<Value<SQLite>>, Option<Self::Checkpoint>),
         subql::reexec::ScalarRowError<Self::Error>,
     > {
-        self.inner.execute_scalar_row(sql, kinds, auth)
+        self.inner.execute_scalar_row(query, kinds, auth)
     }
 }
 

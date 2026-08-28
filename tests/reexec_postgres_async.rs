@@ -352,7 +352,11 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
         let pool = pg_async_pool(port).await;
         let connector = PgAsyncDieselConnector::new(pool);
         let (row, checkpoint) = connector
-            .execute_scalar_row(&bundle.sql, &bundle.kinds, &())
+            .execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds(&bundle.sql),
+                &bundle.kinds,
+                &(),
+            )
             .await
             .expect("execute_scalar_row");
         assert_eq!(
@@ -397,7 +401,12 @@ fn a_cancelled_read_does_not_hand_its_transaction_to_the_next_caller() {
         // what an elapsed deadline or a lost `select!` race does.
         let cancelled = async {
             let cursor = connector
-                .open_cursor("SELECT id, price FROM orders ORDER BY id", &())
+                .open_cursor(
+                    &subql::reexec::ReadQuery::without_binds(
+                        "SELECT id, price FROM orders ORDER BY id",
+                    ),
+                    &(),
+                )
                 .await
                 .expect("open cursor");
             let page = connector
@@ -475,7 +484,12 @@ fn a_busy_cursor_and_a_broken_one_report_differently() {
         let connector = std::sync::Arc::new(PgAsyncDieselConnector::new(pool));
 
         let cursor = connector
-            .open_cursor("SELECT id, price FROM orders ORDER BY id", &())
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds(
+                    "SELECT id, price FROM orders ORDER BY id",
+                ),
+                &(),
+            )
             .await
             .expect("open cursor");
 
@@ -567,7 +581,12 @@ fn closing_a_cursor_during_a_read_does_not_orphan_it() {
         let connector = PgAsyncDieselConnector::new(pool);
 
         let cursor = connector
-            .open_cursor("SELECT id, price FROM orders ORDER BY id", &())
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds(
+                    "SELECT id, price FROM orders ORDER BY id",
+                ),
+                &(),
+            )
             .await
             .expect("open cursor");
 
@@ -627,7 +646,12 @@ fn a_cancelled_read_does_not_poison_its_cursor_id() {
         let connector = PgAsyncDieselConnector::new(pool);
 
         let cursor = connector
-            .open_cursor("SELECT id, price FROM orders ORDER BY id", &())
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds(
+                    "SELECT id, price FROM orders ORDER BY id",
+                ),
+                &(),
+            )
             .await
             .expect("open cursor");
 
@@ -1092,8 +1116,15 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let on = rt.handle().clone();
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
     let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
-        on.block_on(async move { held.execute_scalar(&sql, ScalarKind::Int, &()).await })
-            .expect("scalar read")
+        on.block_on(async move {
+            held.execute_scalar(
+                &subql::reexec::ReadQuery::without_binds(&sql),
+                ScalarKind::Int,
+                &(),
+            )
+            .await
+        })
+        .expect("scalar read")
     });
     assert_eq!(
         value,
@@ -1109,8 +1140,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let on = rt.handle().clone();
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
     let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
-        on.block_on(async move { held.read_page(&sql, 1 << 20, &()).await })
-            .expect("page read")
+        on.block_on(async move {
+            held.read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
+                .await
+        })
+        .expect("page read")
     });
     assert_eq!(
         page.value.rows.len(),
@@ -1126,8 +1160,15 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let on = rt.handle().clone();
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
     let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
-        on.block_on(async move { held.execute_scalar_row(&sql, &[ScalarKind::Int], &()).await })
-            .expect("seed read")
+        on.block_on(async move {
+            held.execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds(&sql),
+                &[ScalarKind::Int],
+                &(),
+            )
+            .await
+        })
+        .expect("seed read")
     });
     assert_eq!(
         values,
@@ -1243,18 +1284,26 @@ fn a_scalar_over_a_narrow_integer_column_decodes_async() {
     let connector = PgAsyncDieselConnector::new(rt.block_on(pg_async_pool(port)));
     let (value, _) = rt
         .block_on(connector.execute_scalar(
-            "SELECT MIN(quantity) FROM orders",
+            &subql::reexec::ReadQuery::without_binds("SELECT MIN(quantity) FROM orders"),
             ScalarKind::Int,
             &(),
         ))
         .expect("INT column decodes");
     assert_eq!(value, Value::Int(1));
     let (value, _) = rt
-        .block_on(connector.execute_scalar("SELECT MIN(small) FROM probe", ScalarKind::Int, &()))
+        .block_on(connector.execute_scalar(
+            &subql::reexec::ReadQuery::without_binds("SELECT MIN(small) FROM probe"),
+            ScalarKind::Int,
+            &(),
+        ))
         .expect("INT column decodes");
     assert_eq!(value, Value::Int(7));
     let (value, _) = rt
-        .block_on(connector.execute_scalar("SELECT MAX(tiny) FROM probe", ScalarKind::Int, &()))
+        .block_on(connector.execute_scalar(
+            &subql::reexec::ReadQuery::without_binds("SELECT MAX(tiny) FROM probe"),
+            ScalarKind::Int,
+            &(),
+        ))
         .expect("SMALLINT column decodes");
     assert_eq!(value, Value::Int(4));
 }
@@ -1287,7 +1336,11 @@ fn session_setup_runs_inside_each_read_transaction_async_pg() {
             PgAsyncDieselConnector::with_session_setup(pg_async_pool(port).await);
 
         let (value, _) = connector
-            .execute_scalar(read_marker, ScalarKind::String, &setup)
+            .execute_scalar(
+                &subql::reexec::ReadQuery::without_binds(read_marker),
+                ScalarKind::String,
+                &setup,
+            )
             .await
             .expect("scalar read");
         assert_eq!(
@@ -1297,7 +1350,11 @@ fn session_setup_runs_inside_each_read_transaction_async_pg() {
         );
 
         let page = connector
-            .read_page(read_marker, 4096, &setup)
+            .read_page(
+                &subql::reexec::ReadQuery::without_binds(read_marker),
+                4096,
+                &setup,
+            )
             .await
             .expect("page read");
         assert_eq!(
@@ -1309,7 +1366,10 @@ fn session_setup_runs_inside_each_read_transaction_async_pg() {
         // The cursor's held transaction: setup runs at open, before the
         // DECLARE, so the cursor's snapshot carries the value.
         let cursor = connector
-            .open_cursor(read_marker, &setup)
+            .open_cursor(
+                &subql::reexec::ReadQuery::without_binds(read_marker),
+                &setup,
+            )
             .await
             .expect("open cursor");
         let page = connector.fetch_cursor(cursor, 4096).await.expect("fetch");
@@ -1322,9 +1382,33 @@ fn session_setup_runs_inside_each_read_transaction_async_pg() {
 
         let plain = PgAsyncDieselConnector::new(pg_async_pool(port).await);
         let (value, _) = plain
-            .execute_scalar(read_marker, ScalarKind::String, &())
+            .execute_scalar(
+                &subql::reexec::ReadQuery::without_binds(read_marker),
+                ScalarKind::String,
+                &(),
+            )
             .await
             .expect("scalar read");
         assert_eq!(value, Value::Null, "an empty setup leaves the marker unset");
+    });
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn async_page_reads_apply_typed_binds() {
+    let container = common::pg_with_wal2json();
+    let port = common::pg_port(&container);
+    let mut connection = common::pg_connect(port);
+    setup_pg(&mut connection, &[(7, 1.0)]);
+    let runtime = common::multi_thread_rt();
+    runtime.block_on(async {
+        let connector = PgAsyncDieselConnector::new(pg_async_pool(port).await);
+        let query = subql::reexec::ReadQuery::owned(
+            "SELECT id, status FROM orders WHERE id = $1".to_string(),
+            vec![Value::Int(7)],
+        );
+        let page = connector.read_page(&query, 4096, &()).await.unwrap();
+        assert_eq!(page.value.rows.len(), 1);
+        assert_eq!(page.value.rows[0][0], Value::Int(7));
     });
 }

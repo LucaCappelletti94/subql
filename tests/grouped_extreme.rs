@@ -123,7 +123,7 @@ fn insert_folds_delete_requeries_only_the_displaced_group() {
     assert_eq!(output.triggers().len(), 1);
     let ReExecutionRead::GroupedScalar {
         group,
-        sql,
+        query,
         column_kinds,
     } = &output.triggers()[0].read
     else {
@@ -131,8 +131,12 @@ fn insert_folds_delete_requeries_only_the_displaced_group() {
     };
     assert_eq!(group, &north.key);
     assert_eq!(*column_kinds, [ScalarKind::Int, ScalarKind::Int]);
-    assert!(sql.contains("\"region\" = 'north'"), "scoped SQL was {sql}");
-    assert!(!sql.contains("south"));
+    assert!(
+        query.sql().contains("\"region\" = $1"),
+        "scoped SQL was {query:?}"
+    );
+    assert_eq!(query.binds(), &[Value::String("north".into())]);
+    assert!(!query.sql().contains("south"));
 
     let installed = Install::install(
         &mut engine,
@@ -191,11 +195,15 @@ fn null_group_values_use_is_null_in_the_scoped_read() {
         .with_pk_columns([0u16])
         .with_checkpoint(PgLsn(10));
     let output = engine.dispatch(&removed).expect("delete dispatches");
-    let ReExecutionRead::GroupedScalar { group, sql, .. } = &output.triggers()[0].read else {
+    let ReExecutionRead::GroupedScalar { group, query, .. } = &output.triggers()[0].read else {
         panic!("expected grouped scalar read")
     };
     assert_eq!(group, &null_group.key);
-    assert!(sql.contains("\"region\" IS NULL"), "scoped SQL was {sql}");
+    assert!(
+        query.sql().contains("\"region\" IS NULL"),
+        "scoped query was {query:?}"
+    );
+    assert!(query.binds().is_empty());
 }
 
 #[test]
@@ -606,15 +614,17 @@ fn every_postgres_group_kind_renders_into_a_scoped_read() {
         clock TIME,
         label TEXT,
         token UUID,
+        metric DOUBLE PRECISION,
+        doc JSONB,
         amount INT
     );";
     let catalog = ParserDB::parse::<PostgreSqlDialect>(ddl).expect("parse DDL");
     let table = catalog_helpers::table_id(&catalog, "samples").expect("samples resolves");
     let mut engine =
         SubscriptionEngine::<Event, DefaultIds, ParserDB>::new(catalog, PostgreSqlDialect {});
-    let sql = "SELECT enabled, payload, created, zoned, day, clock, label, token, MIN(amount) \
+    let sql = "SELECT enabled, payload, created, zoned, day, clock, label, token, metric, doc, MIN(amount) \
                FROM samples \
-               GROUP BY enabled, payload, created, zoned, day, clock, label, token";
+               GROUP BY enabled, payload, created, zoned, day, clock, label, token, metric, doc";
     let registered = engine
         .register(SubscriptionRequest::new(10u64, sql))
         .expect("all exact group kinds register");
@@ -633,6 +643,8 @@ fn every_postgres_group_kind_renders_into_a_scoped_read() {
         Value::Time(clock),
         Value::String("north".into()),
         Value::Uuid(token),
+        Value::Float(-0.0),
+        Value::Jsonb(serde_json::from_str(r#"{"a":1.00,"b":true}"#).unwrap()),
     ];
     let mut seed_row = groups.clone();
     seed_row.extend([Value::Int(2), Value::Int(2)]);
@@ -648,23 +660,18 @@ fn every_postgres_group_kind_renders_into_a_scoped_read() {
     );
 
     let mut old = vec![Value::Int(1)];
-    old.extend(groups);
+    old.extend(groups.clone());
     old.push(Value::Int(2));
     let event = Event::delete(table, old)
         .with_pk_columns([0u16])
         .with_checkpoint(PgLsn(10));
     let output = engine.dispatch(&event).expect("delete dispatches");
-    let ReExecutionRead::GroupedScalar { sql, .. } = &output.triggers()[0].read else {
+    let ReExecutionRead::GroupedScalar { query, .. } = &output.triggers()[0].read else {
         panic!("expected grouped scalar read")
     };
-    assert!(sql.contains("\"enabled\" = true"), "{sql}");
-    assert!(sql.contains("\"payload\" = '\\x0102'"), "{sql}");
-    assert!(
-        sql.contains("550e8400-e29b-41d4-a716-446655440000"),
-        "{sql}"
-    );
-    assert!(sql.contains("2026-01-02"), "{sql}");
-    assert!(sql.contains("03:04:05"), "{sql}");
+    assert_eq!(query.binds(), groups);
+    assert!(!query.sql().contains("true"));
+    assert!(!query.sql().contains("550e8400-e29b-41d4-a716-446655440000"));
 }
 
 // ---- HAVING on the grouped extreme tier ----
@@ -764,12 +771,12 @@ fn an_extreme_crossing_out_on_a_scoped_read_install_emits_remove() {
         .with_pk_columns([0u16])
         .with_checkpoint(PgLsn(20));
     let output = engine.dispatch(&displaced).expect("delete dispatches");
-    let ReExecutionRead::GroupedScalar { group, sql, .. } = &output.triggers()[0].read else {
+    let ReExecutionRead::GroupedScalar { group, query, .. } = &output.triggers()[0].read else {
         panic!("expected grouped scalar read")
     };
     assert!(
-        !sql.to_uppercase().contains("HAVING"),
-        "the scoped read replaces the group's whole state, so the condition must not filter it: {sql}"
+        !query.sql().to_uppercase().contains("HAVING"),
+        "the scoped read replaces the group's whole state, so the condition must not filter it: {query:?}"
     );
     let installed = Install::install(
         &mut engine,
@@ -886,10 +893,7 @@ fn a_group_inserted_during_the_seed_window_is_announced_once() {
         .as_ref()
         .expect("grouped update carries identity");
     assert_eq!(identity.values, vec![Value::String("south".into())]);
-    assert_eq!(
-        subql::backend::encode_value_key(&identity.values).as_ref(),
-        Some(&identity.key)
-    );
+    assert_eq!(&identity.key[..5], b"SQGK\x01");
 }
 
 /// A scoped read that confirms the held extreme announces nothing: the

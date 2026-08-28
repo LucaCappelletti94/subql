@@ -1078,9 +1078,9 @@ pub struct GroupedScalarSeedInstall<B: crate::backend::Backend, C: Checkpoint = 
 /// Result of re-reading one displaced extreme.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupedScalarInstall<B: crate::backend::Backend, C: Checkpoint = NoCheckpoint> {
-    /// Opaque key of the group the SQL constrained.
+    /// Opaque canonical identity of the constrained group.
     pub group: Vec<u8>,
-    /// Current extreme and source-row count returned by the scoped SQL.
+    /// Current extreme and source-row count returned by the scoped query.
     pub row: Vec<crate::backend::Value<B>>,
     /// Position of the change that caused the read.
     pub checkpoint: Option<C>,
@@ -1153,8 +1153,8 @@ pub enum AggregateInstallError {
         /// Cells the row carried.
         got: usize,
     },
-    /// A grouped row's group values do not encode into a group key.
-    #[error("subscription {0} received group values that do not encode to a key")]
+    /// A grouped row cannot produce the canonical identity selected at registration.
+    #[error("subscription {0} received values outside its canonical group-key domain")]
     GroupKeyUnencodable(SubscriptionId),
     /// A grouped row's source-row count is missing, non-integer, or not
     /// positive.
@@ -1565,7 +1565,7 @@ impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> core::fmt::Debug
 
 /// Identity of one grouped SQL result row.
 pub struct GroupIdentity<B: crate::backend::Backend = crate::backend::Postgres> {
-    /// Opaque encoded key used to scope group reads.
+    /// Opaque canonical identity used by maintenance, reads, and downstream storage.
     pub key: Vec<u8>,
     /// Typed `GROUP BY` values in statement order.
     pub values: Vec<crate::backend::Value<B>>,
@@ -1690,6 +1690,11 @@ pub enum MaintenanceStopReason {
         /// Source table whose event was incomplete.
         table_id: TableId,
     },
+    /// A runtime value fell outside the selected canonical key domain.
+    GroupKeyUnencodable {
+        /// Source table carrying the value.
+        table_id: TableId,
+    },
     /// A keyed row read received a CDC change with no readable primary key.
     KeyedChangeWithoutKey {
         /// Source table whose event lacked the key.
@@ -1720,7 +1725,7 @@ pub struct AggregateMaintenanceOutput<
     /// Aggregate result rows written or removed.
     pub updates: Vec<AggregateValueUpdate<I, B>>,
     /// Database reads required after a tier transition.
-    pub triggers: Vec<crate::reexec::ReExecutionTrigger<I, C>>,
+    pub triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
     /// Tier changes caused by this operation.
     pub transitions: Vec<MaintenanceTransition>,
 }
@@ -1777,7 +1782,7 @@ pub struct DispatchOutput<
     notifications: ConsumerNotifications<I, C, B>,
     aggregate_updates: Vec<AggregateValueUpdate<I, B>>,
     scalar_updates: Vec<crate::reexec::ScalarUpdate<I, B, C>>,
-    triggers: Vec<crate::reexec::ReExecutionTrigger<I, C>>,
+    triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
     transitions: Vec<MaintenanceTransition>,
 }
 
@@ -1786,7 +1791,7 @@ impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> DispatchOutput<I, C,
         notifications: ConsumerNotifications<I, C, B>,
         aggregate_updates: Vec<AggregateValueUpdate<I, B>>,
         scalar_updates: Vec<crate::reexec::ScalarUpdate<I, B, C>>,
-        triggers: Vec<crate::reexec::ReExecutionTrigger<I, C>>,
+        triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
         transitions: Vec<MaintenanceTransition>,
     ) -> Self {
         Self {
@@ -1821,7 +1826,7 @@ impl<I: IdTypes, C: Checkpoint, B: crate::backend::Backend> DispatchOutput<I, C,
 
     /// Database reads required by this event.
     #[must_use]
-    pub fn triggers(&self) -> &[crate::reexec::ReExecutionTrigger<I, C>] {
+    pub fn triggers(&self) -> &[crate::reexec::ReExecutionTrigger<I, C, B>] {
         &self.triggers
     }
 

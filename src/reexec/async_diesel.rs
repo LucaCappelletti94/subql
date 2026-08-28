@@ -28,14 +28,17 @@
 
 use super::async_connector::AsyncConnector;
 #[cfg(feature = "executor-diesel-async-mysql")]
+use super::connector::boxed_mysql_read_query_owned;
+#[cfg(feature = "executor-diesel-async-postgres")]
+use super::connector::boxed_postgres_read_query_owned;
+#[cfg(feature = "executor-diesel-async-mysql")]
 use super::connector::LogStatusRow;
 #[cfg(feature = "executor-diesel-async-postgres")]
 use super::connector::PgLsnRow;
 use super::connector::{
-    DieselBackend, FloatRow, IntRow, ScalarRowError, SessionSetup, Snapshot, TextRow,
+    FloatRow, IntRow, ReadQuery, ScalarRowError, SessionSetup, Snapshot, TextRow,
 };
-use crate::backend::{BuiltinKind, ScalarKind, Value};
-use alloc::string::ToString;
+use crate::backend::{Backend, BuiltinKind, ScalarKind, Value};
 use alloc::vec::Vec;
 use core::future::Future;
 use diesel::query_builder::SqlQuery;
@@ -89,86 +92,114 @@ pub enum DieselAsyncError {
 /// projected column through the `Nullable<BigInt|Double|Text>` row shape
 /// that matches `kind`, then lift into [`Value<B>`]. Decimals travel as text
 /// so precision is not lost through `f64`.
-async fn load_scalar_async<C, B>(
-    conn: &mut C,
-    sql: &str,
+#[cfg(feature = "executor-diesel-async-postgres")]
+async fn load_scalar_postgres_async(
+    conn: &mut diesel_async::AsyncPgConnection,
+    query: &ReadQuery<'_, crate::backend::Postgres>,
     kind: BuiltinKind,
-) -> diesel::QueryResult<Value<B>>
-where
-    B: DieselBackend,
-    C: AsyncConnection,
-    for<'q> SqlQuery: diesel_async::methods::LoadQuery<'q, C, IntRow>
-        + diesel_async::methods::LoadQuery<'q, C, FloatRow>
-        + diesel_async::methods::LoadQuery<'q, C, TextRow>,
-{
+) -> diesel::QueryResult<Value<crate::backend::Postgres>> {
     let value = match kind {
-        // Raw SQL of necessity, wrapped exactly as the sync twin: the
-        // statement is the subscription's own text, and the cast makes the
-        // read produce the eight bytes the row decodes under the alias `v`.
         ScalarKind::Int => {
-            let widened = alloc::format!(
-                "SELECT CAST(({sql}) AS {cast}) AS v",
-                cast = B::int_cast_type()
-            );
-            sql_query(widened)
+            let sql = alloc::format!("SELECT CAST(({}) AS BIGINT) AS v", query.sql());
+            let query = ReadQuery::borrowed(&sql, query.binds());
+            boxed_postgres_read_query_owned(&query)?
                 .get_result::<IntRow>(conn)
                 .await?
                 .v
-                .map_or(Value::Null, B::value_from_i64)
+                .map_or(Value::Null, Value::Int)
         }
-        ScalarKind::Float => sql_query(sql)
+        ScalarKind::Float => boxed_postgres_read_query_owned(query)?
             .get_result::<FloatRow>(conn)
             .await?
             .v
-            .map_or(Value::Null, B::value_from_f64),
-        ScalarKind::Bool
-        | ScalarKind::String
-        | ScalarKind::Bytes
-        | ScalarKind::Uuid
-        | ScalarKind::Timestamp
-        | ScalarKind::TimestampTz
-        | ScalarKind::Date
-        | ScalarKind::Time
-        | ScalarKind::Decimal
-        | ScalarKind::Json
-        | ScalarKind::Jsonb => sql_query(sql)
+            .map_or(Value::Null, Value::Float),
+        _ => boxed_postgres_read_query_owned(query)?
             .get_result::<TextRow>(conn)
             .await?
             .v
-            .map_or(Value::Null, B::value_from_string),
+            .map_or(Value::Null, Value::String),
     };
     Ok(value)
 }
 
-/// Async peer of `load_scalar_row`: run one aliased subquery per component
-/// through [`load_scalar_async`], casting `Float` (`SUM`) components to the
-/// backend's double type. Callers wrap this in a transaction so the
-/// components share one snapshot. Column `i` is projected as `ci`.
-async fn load_scalar_row_async<C, B>(
-    conn: &mut C,
-    sql: &str,
+#[cfg(feature = "executor-diesel-async-mysql")]
+async fn load_scalar_mysql_async(
+    conn: &mut diesel_async::AsyncMysqlConnection,
+    query: &ReadQuery<'_, crate::backend::MySql>,
+    kind: BuiltinKind,
+) -> diesel::QueryResult<Value<crate::backend::MySql>> {
+    let value = match kind {
+        ScalarKind::Int => {
+            let sql = alloc::format!("SELECT CAST(({}) AS SIGNED) AS v", query.sql());
+            let query = ReadQuery::borrowed(&sql, query.binds());
+            boxed_mysql_read_query_owned(&query)?
+                .get_result::<IntRow>(conn)
+                .await?
+                .v
+                .map_or(Value::Null, Value::Int)
+        }
+        ScalarKind::Float => boxed_mysql_read_query_owned(query)?
+            .get_result::<FloatRow>(conn)
+            .await?
+            .v
+            .map_or(Value::Null, Value::Float),
+        _ => boxed_mysql_read_query_owned(query)?
+            .get_result::<TextRow>(conn)
+            .await?
+            .v
+            .map_or(Value::Null, Value::String),
+    };
+    Ok(value)
+}
+
+#[cfg(feature = "executor-diesel-async-postgres")]
+async fn load_scalar_row_postgres_async(
+    conn: &mut diesel_async::AsyncPgConnection,
+    query: &ReadQuery<'_, crate::backend::Postgres>,
     kinds: &[BuiltinKind],
-) -> diesel::QueryResult<Vec<Value<B>>>
-where
-    B: DieselBackend,
-    C: AsyncConnection,
-    for<'q> SqlQuery: diesel_async::methods::LoadQuery<'q, C, IntRow>
-        + diesel_async::methods::LoadQuery<'q, C, FloatRow>
-        + diesel_async::methods::LoadQuery<'q, C, TextRow>,
-{
-    let mut out = Vec::with_capacity(kinds.len());
-    for (i, kind) in kinds.iter().enumerate() {
-        let wrapped = if matches!(kind, ScalarKind::Float) {
-            alloc::format!(
-                "SELECT CAST(c{i} AS {cast}) AS v FROM ({sql}) AS agg_seed",
-                cast = B::double_cast_type()
-            )
-        } else {
-            alloc::format!("SELECT c{i} AS v FROM ({sql}) AS agg_seed")
-        };
-        out.push(load_scalar_async::<C, B>(conn, &wrapped, *kind).await?);
+) -> diesel::QueryResult<Vec<Value<crate::backend::Postgres>>> {
+    let row = boxed_postgres_read_query_owned(query)?
+        .get_result::<crate::diesel_decode::DynamicRow<crate::backend::Postgres>>(conn)
+        .await?;
+    if row.values.len() != kinds.len() {
+        return Err(diesel::result::Error::DeserializationError(
+            "aggregate seed row has the wrong arity".into(),
+        ));
     }
-    Ok(out)
+    Ok(row
+        .values
+        .into_iter()
+        .zip(kinds)
+        .map(|(value, kind)| {
+            crate::backend::Postgres::decode_group_value(ScalarKind::from_builtin(*kind), value)
+                .unwrap_or(Value::Missing)
+        })
+        .collect())
+}
+
+#[cfg(feature = "executor-diesel-async-mysql")]
+async fn load_scalar_row_mysql_async(
+    conn: &mut diesel_async::AsyncMysqlConnection,
+    query: &ReadQuery<'_, crate::backend::MySql>,
+    kinds: &[BuiltinKind],
+) -> diesel::QueryResult<Vec<Value<crate::backend::MySql>>> {
+    let row = boxed_mysql_read_query_owned(query)?
+        .get_result::<crate::diesel_decode::DynamicRow<crate::backend::MySql>>(conn)
+        .await?;
+    if row.values.len() != kinds.len() {
+        return Err(diesel::result::Error::DeserializationError(
+            "aggregate seed row has the wrong arity".into(),
+        ));
+    }
+    Ok(row
+        .values
+        .into_iter()
+        .zip(kinds)
+        .map(|(value, kind)| {
+            crate::backend::MySql::decode_group_value(ScalarKind::from_builtin(*kind), value)
+                .unwrap_or(Value::Missing)
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -367,9 +398,12 @@ impl<S> PgAsyncDieselConnector<S> {
                     checkpoint: held.checkpoint,
                 });
             }
-            let page = load_page_async::<_, diesel::pg::Pg, crate::backend::Postgres>(
+            let page = load_page_postgres_async(
                 &mut held.conn,
-                &alloc::format!("FETCH FORWARD {batch} FROM {}", held.name),
+                &ReadQuery::without_binds(&alloc::format!(
+                    "FETCH FORWARD {batch} FROM {}",
+                    held.name
+                )),
                 usize::MAX,
             )
             .await?;
@@ -415,12 +449,12 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
 
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kind: BuiltinKind,
         auth: &S,
     ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
     {
-        let sql = sql.to_string();
+        let query = query.clone().into_owned();
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
@@ -439,7 +473,8 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                             .execute(c)
                             .await?;
                         run_setup_statements_async(c, auth.setup_statements()).await?;
-                        let value = load_scalar_async::<_, Self::Backend>(c, &sql, kind).await?;
+                        let value =
+                            load_scalar_postgres_async(c, &query, kind).await?;
                         Ok((value, lsn))
                     }
                     .scope_boxed()
@@ -452,7 +487,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         max_bytes: usize,
         auth: &S,
     ) -> impl Future<
@@ -461,7 +496,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
             Self::Error,
         >,
     > + Send {
-        let sql = sql.to_string();
+        let query = query.clone().into_owned();
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncPgConnection = &mut pooled;
@@ -480,7 +515,8 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                             .execute(c)
                             .await?;
                         run_setup_statements_async(c, auth.setup_statements()).await?;
-                        let value = load_page_async::<_, diesel::pg::Pg, crate::backend::Postgres>(c, &sql, max_bytes).await?;
+                        let value =
+                            load_page_postgres_async(c, &query, max_bytes).await?;
                         Ok(Snapshot {
                             value,
                             checkpoint: lsn,
@@ -496,10 +532,10 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
 
     fn open_cursor(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         auth: &S,
     ) -> impl Future<Output = Result<super::CursorId, super::CursorError<Self::Error>>> + Send {
-        let sql = sql.to_string();
+        let query = query.clone().into_owned();
         async move {
             // Owned, so the connection can be held in the cursor map across
             // calls rather than borrowed from the pool for one await.
@@ -534,7 +570,11 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                     .execute(&mut *conn)
                     .await?;
                 run_setup_statements_async(&mut *conn, auth.setup_statements()).await?;
-                sql_query(alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {sql}"))
+                let declaration = ReadQuery::owned(
+                    alloc::format!("DECLARE {name} NO SCROLL CURSOR FOR {}", query.sql()),
+                    query.binds().to_vec(),
+                );
+                boxed_postgres_read_query_owned(&declaration)?
                     .execute(&mut *conn)
                     .await?;
                 Ok::<_, diesel::result::Error>(lsn)
@@ -676,7 +716,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
 
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kinds: &[BuiltinKind],
         auth: &S,
     ) -> impl Future<
@@ -685,7 +725,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
             ScalarRowError<Self::Error>,
         >,
     > + Send {
-        let sql = sql.to_string();
+        let query = query.clone().into_owned();
         let kinds = kinds.to_vec();
         async move {
             let mut pooled = self
@@ -708,7 +748,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for PgAsyncDieselConnector<S>
                             .await?;
                         run_setup_statements_async(c, auth.setup_statements()).await?;
                         let values =
-                            load_scalar_row_async::<_, Self::Backend>(c, &sql, &kinds).await?;
+                            load_scalar_row_postgres_async(c, &query, &kinds).await?;
                         Ok((values, lsn))
                     }
                     .scope_boxed()
@@ -815,12 +855,12 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
 
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kind: BuiltinKind,
         auth: &S,
     ) -> impl Future<Output = Result<(Value<Self::Backend>, Option<Self::Checkpoint>), Self::Error>> + Send
     {
-        let sql = sql.to_string();
+        let query = query.clone().into_owned();
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
@@ -833,7 +873,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
                 |c| {
                     async move {
                         run_setup_statements_async(c, auth.setup_statements()).await?;
-                        let value = load_scalar_async::<_, Self::Backend>(c, &sql, kind).await?;
+                        let value = load_scalar_mysql_async(c, &query, kind).await?;
                         Ok((value, pos))
                     }
                     .scope_boxed()
@@ -846,7 +886,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         max_bytes: usize,
         auth: &S,
     ) -> impl Future<
@@ -855,7 +895,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
             Self::Error,
         >,
     > + Send {
-        let sql = sql.to_string();
+        let query = query.clone().into_owned();
         async move {
             let mut pooled = self.pool.get().await.map_err(DieselAsyncError::Pool)?;
             let conn: &mut diesel_async::AsyncMysqlConnection = &mut pooled;
@@ -864,20 +904,15 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
             // setup keeps that byte for byte, and a non-empty setup gets a real
             // transaction so the statements take hold for this read.
             let value = if setup.is_empty() {
-                load_page_async::<_, diesel::mysql::Mysql, crate::backend::MySql>(
-                    conn, &sql, max_bytes,
-                )
-                .await
-                .map_err(DieselAsyncError::Diesel)?
+                load_page_mysql_async(conn, &query, max_bytes)
+                    .await
+                    .map_err(DieselAsyncError::Diesel)?
             } else {
                 conn.transaction::<crate::reexec::RowPage<Self::Backend>, diesel::result::Error, _>(
                     |c| {
                         async move {
                             run_setup_statements_async(c, setup).await?;
-                            load_page_async::<_, diesel::mysql::Mysql, crate::backend::MySql>(
-                                c, &sql, max_bytes,
-                            )
-                            .await
+                            load_page_mysql_async(c, &query, max_bytes).await
                         }
                         .scope_boxed()
                     },
@@ -894,7 +929,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
 
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &ReadQuery<'_, Self::Backend>,
         kinds: &[BuiltinKind],
         auth: &S,
     ) -> impl Future<
@@ -903,7 +938,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
             ScalarRowError<Self::Error>,
         >,
     > + Send {
-        let sql = sql.to_string();
+        let query = query.clone().into_owned();
         let kinds = kinds.to_vec();
         async move {
             let mut pooled = self
@@ -919,7 +954,7 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
                     async move {
                         run_setup_statements_async(c, auth.setup_statements()).await?;
                         let values =
-                            load_scalar_row_async::<_, Self::Backend>(c, &sql, &kinds).await?;
+                            load_scalar_row_mysql_async(c, &query, &kinds).await?;
                         Ok((values, pos))
                     }
                     .scope_boxed()
@@ -937,24 +972,36 @@ impl<S: SessionSetup + Send + Sync> AsyncConnector for MysqlAsyncDieselConnector
 /// The async peer of the sync `load_page`. `diesel_async`'s `load` yields a
 /// stream, so the budget stops the decode rather than trimming a materialized
 /// vector, and the row after the budget answers `more` without guessing.
-async fn load_page_async<C, DB, B>(
-    conn: &mut C,
-    sql: &str,
+#[cfg(feature = "executor-diesel-async-postgres")]
+async fn load_page_postgres_async(
+    conn: &mut diesel_async::AsyncPgConnection,
+    query: &ReadQuery<'_, crate::backend::Postgres>,
     max_bytes: usize,
-) -> diesel::QueryResult<crate::reexec::RowPage<B>>
-where
-    C: diesel_async::AsyncConnection<Backend = DB>,
-    DB: crate::diesel_decode::RowFieldDecode
-        + diesel::backend::DieselReserveSpecialization
-        + 'static,
-    B: crate::diesel_decode::SpellCanonical,
-    crate::diesel_decode::DynamicRow<B>:
-        diesel::deserialize::FromSqlRow<diesel::sql_types::Untyped, DB> + Send + 'static,
-{
+) -> diesel::QueryResult<crate::reexec::RowPage<crate::backend::Postgres>> {
     use diesel_async::RunQueryDsl;
 
-    let decoded: Vec<crate::diesel_decode::DynamicRow<B>> = sql_query(sql).load(conn).await?;
+    let decoded: Vec<crate::diesel_decode::DynamicRow<crate::backend::Postgres>> =
+        boxed_postgres_read_query_owned(query)?.load(conn).await?;
+    Ok(finish_page(decoded, max_bytes))
+}
 
+#[cfg(feature = "executor-diesel-async-mysql")]
+async fn load_page_mysql_async(
+    conn: &mut diesel_async::AsyncMysqlConnection,
+    query: &ReadQuery<'_, crate::backend::MySql>,
+    max_bytes: usize,
+) -> diesel::QueryResult<crate::reexec::RowPage<crate::backend::MySql>> {
+    use diesel_async::RunQueryDsl;
+
+    let decoded: Vec<crate::diesel_decode::DynamicRow<crate::backend::MySql>> =
+        boxed_mysql_read_query_owned(query)?.load(conn).await?;
+    Ok(finish_page(decoded, max_bytes))
+}
+
+fn finish_page<B: crate::backend::Backend>(
+    decoded: Vec<crate::diesel_decode::DynamicRow<B>>,
+    max_bytes: usize,
+) -> crate::reexec::RowPage<B> {
     let mut columns = Vec::new();
     let mut rows = Vec::new();
     let mut spent = 0_usize;
@@ -964,8 +1011,6 @@ where
             columns = row.columns;
         }
         let cost = crate::reexec::RowPage::<B>::row_bytes_of(&row.values);
-        // A page always makes progress: the budget stops the row after the
-        // first, never the first itself.
         if !rows.is_empty() && spent + cost > max_bytes {
             more = true;
             break;
@@ -973,9 +1018,9 @@ where
         spent += cost;
         rows.push(row.values);
     }
-    Ok(crate::reexec::RowPage {
+    crate::reexec::RowPage {
         columns,
         rows,
         more,
-    })
+    }
 }

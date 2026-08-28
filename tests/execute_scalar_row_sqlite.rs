@@ -27,6 +27,13 @@ use subql::{
     SubscriptionRequest,
 };
 
+diesel::table! {
+    json_t (id) {
+        id -> Integer,
+        payload -> Text,
+    }
+}
+
 const CATALOG: &str = "CREATE TABLE t (id INT PRIMARY KEY, amount INT);";
 
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
@@ -145,19 +152,43 @@ fn execute_scalar_row_decodes_components() {
     let connector = sqlite_with(&[Some(2), Some(4), Some(6)]);
     // COUNT(*): single Int component.
     let b = bootstrap("SELECT COUNT(*) FROM t");
-    let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
+    let (row, _) = connector
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&b.sql),
+            &b.kinds,
+            &(),
+        )
+        .unwrap();
     assert_eq!(row, vec![Value::Int(3)]);
     // SUM: single Float component (cast to double).
     let b = bootstrap("SELECT SUM(amount) FROM t");
-    let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
+    let (row, _) = connector
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&b.sql),
+            &b.kinds,
+            &(),
+        )
+        .unwrap();
     assert_eq!(row, vec![Value::Float(12.0)]);
     // AVG: (sum, count).
     let b = bootstrap("SELECT AVG(amount) FROM t");
-    let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
+    let (row, _) = connector
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&b.sql),
+            &b.kinds,
+            &(),
+        )
+        .unwrap();
     assert_eq!(row, vec![Value::Float(12.0), Value::Int(3)]);
     // VAR_POP: (sum, sum_sq, count) = (12, 56, 3).
     let b = bootstrap("SELECT VAR_POP(amount) FROM t");
-    let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
+    let (row, _) = connector
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&b.sql),
+            &b.kinds,
+            &(),
+        )
+        .unwrap();
     assert_eq!(
         row,
         vec![Value::Float(12.0), Value::Float(56.0), Value::Int(3)]
@@ -169,11 +200,23 @@ fn execute_scalar_row_empty_table_is_empty_state() {
     let connector = sqlite_with(&[]);
     // COUNT over empty is 0.
     let b = bootstrap("SELECT COUNT(*) FROM t");
-    let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
+    let (row, _) = connector
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&b.sql),
+            &b.kinds,
+            &(),
+        )
+        .unwrap();
     assert_eq!(row, vec![Value::Int(0)]);
     // SUM over empty is NULL, COUNT(amount) is 0.
     let (mut engine, subscription, b) = registered("SELECT AVG(amount) FROM t");
-    let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
+    let (row, _) = connector
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&b.sql),
+            &b.kinds,
+            &(),
+        )
+        .unwrap();
     assert_eq!(row, vec![Value::Null, Value::Int(0)]);
     // The empty row seeds the empty aggregate.
     assert_eq!(
@@ -189,7 +232,13 @@ fn seed_through_connector_matches_recompute() {
     let connector = sqlite_with(&amounts);
     for (sql, spec) in all_specs() {
         let (mut engine, subscription, b) = registered(sql);
-        let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
+        let (row, _) = connector
+            .execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds(&b.sql),
+                &b.kinds,
+                &(),
+            )
+            .unwrap();
         assert_eq!(
             install_seed(&mut engine, subscription, row),
             Ok(oracle(&spec, &amounts)),
@@ -215,7 +264,13 @@ proptest! {
         let connector = sqlite_with(&amounts);
         for (sql, spec) in all_specs() {
             let (mut engine, subscription, b) = registered(sql);
-            let (row, _) = connector.execute_scalar_row(&b.sql, &b.kinds, &()).unwrap();
+            let (row, _) = connector
+                .execute_scalar_row(
+                    &subql::reexec::ReadQuery::without_binds(&b.sql),
+                    &b.kinds,
+                    &(),
+                )
+                .unwrap();
             prop_assert_eq!(
                 install_seed(&mut engine, subscription, row),
                 Ok(oracle(&spec, &amounts)),
@@ -223,4 +278,49 @@ proptest! {
             );
         }
     }
+}
+
+#[test]
+fn grouped_sqlite_json_seed_preserves_original_text() {
+    use diesel::connection::SimpleConnection;
+    use diesel::prelude::*;
+    use sqlparser::dialect::SQLiteDialect;
+    use subql::backend::{SQLite, SqliteJsonStorage};
+
+    let ddl = "CREATE TABLE json_t (id INTEGER PRIMARY KEY, payload JSON);";
+    let database = ParserDB::parse::<SQLiteDialect>(ddl).unwrap();
+    let mut engine: SubscriptionEngine<TestEvent<SQLite>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(database, SQLiteDialect {});
+    let registered = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT payload, COUNT(*) FROM json_t GROUP BY payload",
+        ))
+        .unwrap();
+    let bootstrap = registered
+        .served()
+        .unwrap()
+        .aggregate_bootstrap
+        .as_ref()
+        .unwrap();
+
+    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    connection.batch_execute(ddl).unwrap();
+    let raw = String::from("{ \"a\": 1 }");
+    diesel::insert_into(json_t::table)
+        .values((json_t::id.eq(1), json_t::payload.eq(&raw)))
+        .execute(&mut connection)
+        .unwrap();
+    let connector: DieselConnector<SqliteConnection, SQLite> = DieselConnector::new(connection);
+    let (seed_values, _) = connector
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&bootstrap.sql),
+            &bootstrap.kinds,
+            &(),
+        )
+        .unwrap();
+    let Value::Json(value) = &seed_values[0] else {
+        panic!("the JSON group keeps its backend value")
+    };
+    assert_eq!(value.storage(), &SqliteJsonStorage::Text(raw));
 }

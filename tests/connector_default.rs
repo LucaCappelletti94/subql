@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used)]
 
 use subql::backend::{BuiltinKind, Postgres, ScalarKind, Value};
-use subql::reexec::{Connector, RowPage, ScalarRowError, Snapshot};
+use subql::reexec::{Connector, ReadQuery, RowPage, ScalarRowError, Snapshot};
 use subql::NoCheckpoint;
 
 /// A connector implementing only the required trait methods, leaving
@@ -22,7 +22,7 @@ impl Connector for MinimalConnector {
 
     fn execute_scalar(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         _auth: &(),
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), String> {
@@ -31,7 +31,7 @@ impl Connector for MinimalConnector {
 
     fn read_page(
         &self,
-        _sql: &str,
+        _query: &ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         _auth: &(),
     ) -> Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, String> {
@@ -40,10 +40,26 @@ impl Connector for MinimalConnector {
 }
 
 #[test]
+fn read_query_carries_sql_and_typed_binds() {
+    let query = ReadQuery::<Postgres>::owned(
+        "SELECT value FROM t WHERE id = $1".to_string(),
+        vec![Value::Int(7)],
+    );
+    assert_eq!(query.sql(), "SELECT value FROM t WHERE id = $1");
+    assert_eq!(query.binds(), &[Value::Int(7)]);
+
+    let borrowed = ReadQuery::borrowed(query.sql(), query.binds());
+    assert_eq!(borrowed.sql(), query.sql());
+    assert_eq!(borrowed.binds(), query.binds());
+}
+
+#[test]
 fn default_execute_scalar_row_is_unsupported() {
     let connector = MinimalConnector;
     let result = connector.execute_scalar_row(
-        "SELECT SUM(amount) AS c0, COUNT(amount) AS c1 FROM t",
+        &subql::reexec::ReadQuery::without_binds(
+            "SELECT SUM(amount) AS c0, COUNT(amount) AS c1 FROM t",
+        ),
         &[ScalarKind::Float, ScalarKind::Int],
         &(),
     );
@@ -55,7 +71,11 @@ fn execute_scalar_still_works_without_overriding_the_row_method() {
     // The required scalar path is unaffected by the added default method.
     let connector = MinimalConnector;
     let (value, checkpoint) = connector
-        .execute_scalar("SELECT COUNT(*) AS v FROM t", ScalarKind::Int, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds("SELECT COUNT(*) AS v FROM t"),
+            ScalarKind::Int,
+            &(),
+        )
         .unwrap();
     assert_eq!(value, Value::Int(0));
     assert!(checkpoint.is_none());

@@ -164,7 +164,7 @@ fn scaffold_registers_both_subscription_kinds() {
     let _ = engine
         .connector()
         .execute_scalar(
-            "SELECT MIN(price) AS v FROM orders",
+            &subql::reexec::ReadQuery::without_binds("SELECT MIN(price) AS v FROM orders"),
             subql::backend::ScalarKind::Float,
             &(),
         )
@@ -473,7 +473,11 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     // double cast into (Float, Float, Int).
     let connector = PgDieselConnector::new(common::pg_connect(port));
     let (row, checkpoint) = connector
-        .execute_scalar_row(&bundle.sql, &bundle.kinds, &())
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&bundle.sql),
+            &bundle.kinds,
+            &(),
+        )
         .expect("execute_scalar_row");
     assert_eq!(
         row,
@@ -571,7 +575,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
     let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
         PgDieselConnector::new(common::pg_connect(port))
-            .execute_scalar(&sql, ScalarKind::Int, &())
+            .execute_scalar(
+                &subql::reexec::ReadQuery::without_binds(&sql),
+                ScalarKind::Int,
+                &(),
+            )
             .expect("scalar read")
     });
     assert_eq!(
@@ -587,7 +595,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
     let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
         PgDieselConnector::new(common::pg_connect(port))
-            .read_page(&sql, 1 << 20, &())
+            .read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
             .expect("page read")
     });
     assert_eq!(
@@ -603,7 +611,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
     let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
         PgDieselConnector::new(common::pg_connect(port))
-            .execute_scalar_row(&sql, &[ScalarKind::Int], &())
+            .execute_scalar_row(
+                &subql::reexec::ReadQuery::without_binds(&sql),
+                &[ScalarKind::Int],
+                &(),
+            )
             .expect("seed read")
     });
     assert_eq!(
@@ -643,7 +655,11 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
         PgDieselConnector::with_session_setup(common::pg_connect(port));
 
     let (value, _) = connector
-        .execute_scalar(read_marker, ScalarKind::String, &setup)
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            ScalarKind::String,
+            &setup,
+        )
         .expect("scalar read");
     assert_eq!(
         value,
@@ -652,7 +668,11 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
     );
 
     let page = connector
-        .read_page(read_marker, 4096, &setup)
+        .read_page(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            4096,
+            &setup,
+        )
         .expect("page read");
     assert_eq!(
         page.value.rows[0][0],
@@ -662,7 +682,11 @@ fn session_setup_runs_inside_each_read_transaction_sync_pg() {
 
     let plain = PgDieselConnector::new(common::pg_connect(port));
     let (value, _) = plain
-        .execute_scalar(read_marker, ScalarKind::String, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            ScalarKind::String,
+            &(),
+        )
         .expect("scalar read");
     assert_eq!(value, Value::Null, "an empty setup leaves the marker unset");
 }

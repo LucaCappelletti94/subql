@@ -43,7 +43,6 @@ const FILTERS: &[(u64, &str)] = &[
     (9, "at_tz = '2026-01-01T00:00:00Z'"),
     (10, "on_date = '2026-01-01'"),
     (11, "at_time = '12:34:56'"),
-    (12, "doc = '{\"k\":1}'"),
     (13, "meta = '{\"k\":1}'"),
 ];
 
@@ -59,7 +58,7 @@ fn cells_row(table_id: TableId, id: i64, shift: bool) -> TestEvent<Postgres> {
     let doc = if shift {
         serde_json::json!({"k": 2})
     } else {
-        serde_json::json!({"k": 1})
+        serde_json::from_str(r#"{"k":1.00}"#).unwrap()
     };
     TestEvent::<Postgres>::insert(
         table_id,
@@ -154,6 +153,33 @@ fn an_equality_filter_stays_silent_on_a_row_it_does_not_name() {
     assert!(
         matched(&mut engine, &cells_row(table_id, 2, true)).is_empty(),
         "no filter names this row's values"
+    );
+}
+
+#[test]
+fn postgres_json_equality_is_refused() {
+    let (mut engine, _) = pg_engine();
+    let error = engine
+        .register(SubscriptionRequest::new(
+            20u64,
+            "SELECT * FROM cells WHERE doc = '{\"k\":1}'",
+        ))
+        .expect_err("PostgreSQL json has no equality operator");
+    assert!(error.to_string().contains("PostgreSQL json"));
+}
+
+#[test]
+fn postgres_jsonb_equality_normalizes_numbers() {
+    let (mut engine, table_id) = pg_engine();
+    engine
+        .register(SubscriptionRequest::new(
+            21u64,
+            "SELECT * FROM cells WHERE meta = '{\"k\":1.0}'",
+        ))
+        .unwrap();
+    assert_eq!(
+        matched(&mut engine, &cells_row(table_id, 1, false)),
+        vec![21]
     );
 }
 

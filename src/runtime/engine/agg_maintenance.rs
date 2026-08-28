@@ -8,6 +8,7 @@ use super::{
     IdTypes, SqlLiteralParse, SubscriptionEngine, SubscriptionId, SubscriptionRequest,
     SubscriptionScope, TableId, ToString, Value, Vec,
 };
+use crate::backend::Backend;
 
 impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<E, I, DB>
 where
@@ -23,7 +24,7 @@ where
     ) -> Result<
         (
             crate::MaintenanceTransition,
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint>,
+            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         ),
         DispatchError,
     > {
@@ -70,6 +71,60 @@ where
             checkpoint: checkpoint.cloned(),
         };
         Ok((transition, trigger))
+    }
+
+    fn push_aggregate_stop(
+        &mut self,
+        subscription: SubscriptionId,
+        reason: crate::MaintenanceStopReason,
+        checkpoint: Option<&E::Checkpoint>,
+        output: &mut crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
+    ) -> Result<(), DispatchError> {
+        let (transition, trigger) =
+            self.transition_aggregate_to_whole(subscription, reason, checkpoint)?;
+        output.transitions.push(transition);
+        output.triggers.push(trigger);
+        Ok(())
+    }
+
+    fn push_aggregate_stops(
+        &mut self,
+        table_id: TableId,
+        missing_old: Vec<SubscriptionId>,
+        group_key_failed: Vec<SubscriptionId>,
+        mut group_limit: Vec<SubscriptionId>,
+        checkpoint: Option<&E::Checkpoint>,
+        output: &mut crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
+    ) -> Result<(), DispatchError> {
+        for subscription in missing_old {
+            self.push_aggregate_stop(
+                subscription,
+                crate::MaintenanceStopReason::MissingOldRow { table_id },
+                checkpoint,
+                output,
+            )?;
+        }
+        for subscription in group_key_failed {
+            self.push_aggregate_stop(
+                subscription,
+                crate::MaintenanceStopReason::GroupKeyUnencodable { table_id },
+                checkpoint,
+                output,
+            )?;
+        }
+        group_limit.sort_unstable();
+        group_limit.dedup();
+        for subscription in group_limit {
+            self.push_aggregate_stop(
+                subscription,
+                crate::MaintenanceStopReason::GroupLimit {
+                    limit: self.max_groups_per_aggregate,
+                },
+                checkpoint,
+                output,
+            )?;
+        }
+        Ok(())
     }
     /// Report every aggregate subscription whose value moved on this event.
     ///
@@ -236,28 +291,14 @@ where
             }
         }
 
-        for subscription_id in computation.missing_old {
-            let (transition, trigger) = self.transition_aggregate_to_whole(
-                subscription_id,
-                crate::MaintenanceStopReason::MissingOldRow { table_id },
-                at.as_ref(),
-            )?;
-            output.transitions.push(transition);
-            output.triggers.push(trigger);
-        }
-        group_limit.sort_unstable();
-        group_limit.dedup();
-        for subscription_id in group_limit {
-            let (transition, trigger) = self.transition_aggregate_to_whole(
-                subscription_id,
-                crate::MaintenanceStopReason::GroupLimit {
-                    limit: self.max_groups_per_aggregate,
-                },
-                at.as_ref(),
-            )?;
-            output.transitions.push(transition);
-            output.triggers.push(trigger);
-        }
+        self.push_aggregate_stops(
+            table_id,
+            computation.missing_old,
+            computation.group_key_failed,
+            group_limit,
+            at.as_ref(),
+            &mut output,
+        )?;
         Ok(output)
     }
 
@@ -295,6 +336,7 @@ where
         &mut self,
         subscription: SubscriptionId,
         request: &SubscriptionRequest<I, E::Backend>,
+        table_id: crate::TableId,
         projection: &crate::compiler::sql_shape::QueryProjection,
         database_reads_per_consumer: bool,
     ) {
@@ -312,6 +354,19 @@ where
                 agg,
                 having,
             } => {
+                let columns = groups
+                    .iter()
+                    .map(|column| {
+                        crate::catalog_helpers::group_key_column::<E::Backend, _>(
+                            &self.database,
+                            table_id,
+                            *column,
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .expect("the grouped planner resolved every key column");
+                let group_key_encoder = E::Backend::group_key_encoder(columns)
+                    .expect("the grouped planner selected a canonical key encoder");
                 self.grouped_aggregates.insert(
                     subscription,
                     crate::runtime::aggregate::GroupedAggregateTotal::new(
@@ -319,6 +374,7 @@ where
                         agg.clone(),
                         groups.len(),
                         having.as_ref(),
+                        group_key_encoder,
                     ),
                 );
                 true
@@ -391,7 +447,7 @@ where
     pub(super) fn unseeded_aggregate_triggers(
         &self,
         event: &E,
-    ) -> Vec<crate::reexec::ReExecutionTrigger<I, E::Checkpoint>> {
+    ) -> Vec<crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>> {
         let table_id = event.table_id(&self.database);
         let mut triggers: Vec<_> = self
             .aggregates

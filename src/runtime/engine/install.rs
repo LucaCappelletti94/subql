@@ -93,6 +93,16 @@ where
                     ),
                 );
             }
+            Err(crate::AggregateInstallError::GroupKeyUnencodable(_)) => {
+                return Self::stopped_output(
+                    subscription_id,
+                    self.transition_grouped_scalar_to_whole(
+                        subscription_id,
+                        crate::MaintenanceStopReason::GroupKeyUnencodable { table_id },
+                        input.read_at.as_ref(),
+                    ),
+                );
+            }
             Err(error) => return Err(error),
         };
         let reason = if grouped.missing_group {
@@ -131,7 +141,7 @@ where
                     consumer_id: consumer,
                     read: crate::reexec::ReExecutionRead::GroupedScalar {
                         group: read.group,
-                        sql: read.sql,
+                        query: read.query,
                         column_kinds: read.column_kinds,
                     },
                     checkpoint: read.checkpoint,
@@ -334,6 +344,21 @@ where
                         self.transition_aggregate_to_whole(
                             subscription_id,
                             crate::MaintenanceStopReason::GroupLimit { limit },
+                            read_at.as_ref(),
+                        ),
+                    );
+                }
+                (_, Err(crate::AggregateInstallError::GroupKeyUnencodable(_))) => {
+                    let table_id = self
+                        .subscription_to_table
+                        .get(&subscription_id)
+                        .copied()
+                        .expect("a grouped aggregate keeps its source table");
+                    return Self::stopped_output(
+                        subscription_id,
+                        self.transition_aggregate_to_whole(
+                            subscription_id,
+                            crate::MaintenanceStopReason::GroupKeyUnencodable { table_id },
                             read_at.as_ref(),
                         ),
                     );

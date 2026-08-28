@@ -309,8 +309,14 @@ fn first_projected_ident(dialect: &dyn sqlparser::dialect::Dialect, sql: &str) -
         panic!("the seed query is a plain SELECT");
     };
     match select.projection.first() {
-        Some(SelectItem::UnnamedExpr(Expr::Identifier(ident))) => ident.value.clone(),
-        other => panic!("expected a bare identifier first, got {other:?}"),
+        Some(
+            SelectItem::UnnamedExpr(Expr::Identifier(ident))
+            | SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(ident),
+                ..
+            },
+        ) => ident.value.clone(),
+        other => panic!("expected an identifier first, got {other:?}"),
     }
 }
 

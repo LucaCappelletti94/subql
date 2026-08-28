@@ -242,7 +242,13 @@ fn a_cursor_pages_one_snapshot_of_a_keyless_result() {
     let connector = PgR2D2DieselConnector::new(build_pool(port));
     // DISTINCT has no key to resume from, which is what cursors exist for.
     let cursor = connector
-        .open_cursor("SELECT DISTINCT id, status FROM orders ORDER BY id", &())
+        .open_cursor(
+            &subql::reexec::ReadQuery::owned(
+                "SELECT DISTINCT id, status FROM orders WHERE id > $1 ORDER BY id".to_string(),
+                vec![Value::Int(0)],
+            ),
+            &(),
+        )
         .expect("open cursor");
 
     // A write committed after the cursor opened must not appear in its pages.
@@ -625,8 +631,12 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let sql = format!("SELECT count(*)::bigint AS v FROM orders {}", common::PARK);
     let ((value, position), after_commit) = common::park_a_read(port, &insert(2), move || {
-        held.execute_scalar(&sql, ScalarKind::Int, &())
-            .expect("scalar read")
+        held.execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(&sql),
+            ScalarKind::Int,
+            &(),
+        )
+        .expect("scalar read")
     });
     assert_eq!(
         value,
@@ -641,7 +651,8 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let sql = format!("SELECT id FROM orders {} ORDER BY id", common::PARK);
     let (page, after_commit) = common::park_a_read(port, &insert(3), move || {
-        held.read_page(&sql, 1 << 20, &()).expect("page read")
+        held.read_page(&subql::reexec::ReadQuery::without_binds(&sql), 1 << 20, &())
+            .expect("page read")
     });
     assert_eq!(
         page.value.rows.len(),
@@ -656,8 +667,12 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let held = Arc::clone(&connector);
     let sql = format!("SELECT count(*)::bigint AS c0 FROM orders {}", common::PARK);
     let ((values, position), after_commit) = common::park_a_read(port, &insert(4), move || {
-        held.execute_scalar_row(&sql, &[ScalarKind::Int], &())
-            .expect("seed read")
+        held.execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&sql),
+            &[ScalarKind::Int],
+            &(),
+        )
+        .expect("seed read")
     });
     assert_eq!(
         values,
@@ -707,7 +722,10 @@ fn an_abandoned_cursor_ends_its_transaction_and_keeps_its_connection() {
     };
     let connector = PgR2D2DieselConnector::new(pool.clone());
     let cursor = connector
-        .open_cursor("SELECT id, price FROM orders ORDER BY id", &())
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id, price FROM orders ORDER BY id"),
+            &(),
+        )
         .expect("open cursor");
     let page = connector
         .fetch_cursor(cursor, 1)
@@ -766,7 +784,10 @@ fn a_cursor_whose_read_failed_reports_as_unknown() {
 
     let connector = PgR2D2DieselConnector::new(build_pool(port));
     let cursor = connector
-        .open_cursor("SELECT id, price FROM orders ORDER BY id", &())
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds("SELECT id, price FROM orders ORDER BY id"),
+            &(),
+        )
         .expect("open cursor");
 
     // Drain the buffered rows so the next fetch reaches the server, otherwise
@@ -812,43 +833,43 @@ impl Connector for PanicMidRead {
 
     fn execute_scalar(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         kind: subql::backend::BuiltinKind,
         auth: &(),
     ) -> Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error> {
-        self.inner.execute_scalar(sql, kind, auth)
+        self.inner.execute_scalar(query, kind, auth)
     }
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         max_bytes: usize,
         auth: &(),
     ) -> Result<
         subql::reexec::Snapshot<subql::reexec::RowPage<Postgres>, Self::Checkpoint>,
         Self::Error,
     > {
-        self.inner.read_page(sql, max_bytes, auth)
+        self.inner.read_page(query, max_bytes, auth)
     }
 
     fn execute_scalar_row(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         kinds: &[subql::backend::BuiltinKind],
         auth: &(),
     ) -> Result<
         (Vec<Value<Postgres>>, Option<Self::Checkpoint>),
         subql::reexec::ScalarRowError<Self::Error>,
     > {
-        self.inner.execute_scalar_row(sql, kinds, auth)
+        self.inner.execute_scalar_row(query, kinds, auth)
     }
 
     fn open_cursor(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         auth: &(),
     ) -> Result<subql::reexec::CursorId, subql::reexec::CursorError<Self::Error>> {
-        self.inner.open_cursor(sql, auth)
+        self.inner.open_cursor(query, auth)
     }
 
     fn fetch_cursor(
@@ -1193,15 +1214,27 @@ fn a_scalar_over_a_narrow_integer_column_decodes() {
 
     let connector = PgR2D2DieselConnector::new(build_pool(port));
     let (value, _) = connector
-        .execute_scalar("SELECT MIN(quantity) FROM orders", ScalarKind::Int, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds("SELECT MIN(quantity) FROM orders"),
+            ScalarKind::Int,
+            &(),
+        )
         .expect("INT column decodes");
     assert_eq!(value, Value::Int(1));
     let (value, _) = connector
-        .execute_scalar("SELECT MIN(small) FROM probe", ScalarKind::Int, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds("SELECT MIN(small) FROM probe"),
+            ScalarKind::Int,
+            &(),
+        )
         .expect("INT column decodes");
     assert_eq!(value, Value::Int(7));
     let (value, _) = connector
-        .execute_scalar("SELECT MAX(tiny) FROM probe", ScalarKind::Int, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds("SELECT MAX(tiny) FROM probe"),
+            ScalarKind::Int,
+            &(),
+        )
         .expect("SMALLINT column decodes");
     assert_eq!(value, Value::Int(4));
 }
@@ -1235,7 +1268,11 @@ fn session_setup_runs_inside_each_read_transaction() {
         PgR2D2DieselConnector::with_session_setup(build_pool(port));
 
     let (value, _) = connector
-        .execute_scalar(read_marker, ScalarKind::String, &setup)
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            ScalarKind::String,
+            &setup,
+        )
         .expect("scalar read");
     assert_eq!(
         value,
@@ -1244,7 +1281,11 @@ fn session_setup_runs_inside_each_read_transaction() {
     );
 
     let page = connector
-        .read_page(read_marker, 4096, &setup)
+        .read_page(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            4096,
+            &setup,
+        )
         .expect("page read");
     assert_eq!(
         page.value.rows[0][0],
@@ -1255,7 +1296,10 @@ fn session_setup_runs_inside_each_read_transaction() {
     // The cursor's held transaction: setup runs at open, before the DECLARE, so
     // the cursor's snapshot carries the value.
     let cursor = connector
-        .open_cursor(read_marker, &setup)
+        .open_cursor(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            &setup,
+        )
         .expect("open cursor");
     let page = connector.fetch_cursor(cursor, 4096).expect("fetch");
     assert_eq!(
@@ -1268,7 +1312,11 @@ fn session_setup_runs_inside_each_read_transaction() {
     // No setup: the marker is never set, so current_setting is NULL.
     let plain = PgR2D2DieselConnector::new(build_pool(port));
     let (value, _) = plain
-        .execute_scalar(read_marker, ScalarKind::String, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            ScalarKind::String,
+            &(),
+        )
         .expect("scalar read");
     assert_eq!(value, Value::Null, "an empty setup leaves the marker unset");
 }

@@ -37,7 +37,7 @@ impl Connector for Recording {
 
     fn execute_scalar(
         &self,
-        _sql: &str,
+        _query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         _auth: &Self::AuthContext,
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
@@ -46,7 +46,7 @@ impl Connector for Recording {
 
     fn read_page(
         &self,
-        _sql: &str,
+        _query: &subql::reexec::ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         auth: &Self::AuthContext,
     ) -> Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, Self::Error> {
@@ -189,7 +189,7 @@ impl Connector for AggregateRecording {
 
     fn execute_scalar(
         &self,
-        _sql: &str,
+        _query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         auth: &Self::AuthContext,
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
@@ -198,22 +198,22 @@ impl Connector for AggregateRecording {
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         auth: &Self::AuthContext,
     ) -> Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, Self::Error> {
         Ok(Snapshot {
-            value: self.state.lock().page_answer(sql, auth),
+            value: self.state.lock().page_answer(query.sql(), auth),
             checkpoint: None,
         })
     }
 
     fn open_cursor(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         auth: &Self::AuthContext,
     ) -> Result<CursorId, CursorError<Self::Error>> {
-        Ok(self.state.lock().open_cursor(sql, auth))
+        Ok(self.state.lock().open_cursor(query.sql(), auth))
     }
 
     fn fetch_cursor(
@@ -256,7 +256,7 @@ impl AsyncConnector for AsyncAggregateRecording {
 
     fn execute_scalar(
         &self,
-        _sql: &str,
+        _query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
@@ -268,14 +268,14 @@ impl AsyncConnector for AsyncAggregateRecording {
 
     fn read_page(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
         Output = Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, Self::Error>,
     > + Send {
         let answer = Snapshot {
-            value: self.state.lock().page_answer(sql, auth),
+            value: self.state.lock().page_answer(query.sql(), auth),
             checkpoint: None,
         };
         core::future::ready(Ok(answer))
@@ -283,10 +283,10 @@ impl AsyncConnector for AsyncAggregateRecording {
 
     fn open_cursor(
         &self,
-        sql: &str,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<Output = Result<CursorId, CursorError<Self::Error>>> + Send {
-        let cursor = self.state.lock().open_cursor(sql, auth);
+        let cursor = self.state.lock().open_cursor(query.sql(), auth);
         core::future::ready(Ok(cursor))
     }
 
@@ -816,13 +816,14 @@ fn per_consumer_grouped_extreme_insert_asks_before_opening_group() {
     let output = registry.dispatch(&event).expect("insert dispatches");
     assert!(output.aggregate_updates().is_empty());
     assert_eq!(output.triggers().len(), 1);
-    let ReExecutionRead::GroupedScalar { group, sql, .. } = &output.triggers()[0].read else {
+    let ReExecutionRead::GroupedScalar { group, query, .. } = &output.triggers()[0].read else {
         panic!("expected grouped scalar read")
     };
     assert!(
-        sql.contains("\"status\" = 'secret'"),
-        "scoped SQL was {sql}"
+        query.sql().contains("\"status\" = $1"),
+        "scoped query was {query:?}"
     );
+    assert_eq!(query.binds(), &[Value::String("secret".into())]);
 
     let installed = Install::install(
         &mut registry,

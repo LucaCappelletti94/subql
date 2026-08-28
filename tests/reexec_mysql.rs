@@ -145,7 +145,11 @@ fn scaffold_registers_both_and_executes_scalar() {
 
     let (value, _checkpoint) = engine
         .connector()
-        .execute_scalar("SELECT MIN(price) AS v FROM orders", ScalarKind::Float, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds("SELECT MIN(price) AS v FROM orders"),
+            ScalarKind::Float,
+            &(),
+        )
         .expect("connector executes");
     assert_eq!(value, Value::Float(5.0), "live MIN(price) decode");
 }
@@ -305,7 +309,11 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     // MySQL SUM(int) -> DECIMAL, cast to DOUBLE; sum=12, sum_sq=56, count=3.
     let connector = MysqlDieselConnector::new(common::mysql_connect(port));
     let (row, _checkpoint) = connector
-        .execute_scalar_row(&bundle.sql, &bundle.kinds, &())
+        .execute_scalar_row(
+            &subql::reexec::ReadQuery::without_binds(&bundle.sql),
+            &bundle.kinds,
+            &(),
+        )
         .expect("execute_scalar_row");
     assert_eq!(
         row,
@@ -342,7 +350,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let ((value, position), after_commit) =
         common::park_a_mysql_read(port, "park_scalar_1", &insert(2), move || {
             MysqlDieselConnector::new(common::mysql_connect(port))
-                .execute_scalar(sql, ScalarKind::Int, &())
+                .execute_scalar(
+                    &subql::reexec::ReadQuery::without_binds(sql),
+                    ScalarKind::Int,
+                    &(),
+                )
                 .expect("scalar read")
         });
     assert_eq!(
@@ -359,7 +371,7 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let (page, after_commit) =
         common::park_a_mysql_read(port, "park_page_1", &insert(3), move || {
             MysqlDieselConnector::new(common::mysql_connect(port))
-                .read_page(sql, 1 << 20, &())
+                .read_page(&subql::reexec::ReadQuery::without_binds(sql), 1 << 20, &())
                 .expect("page read")
         });
     assert_eq!(
@@ -378,7 +390,11 @@ fn every_read_reports_a_position_taken_before_its_snapshot() {
     let ((values, position), after_commit) =
         common::park_a_mysql_read(port, "park_seed_1", &insert(4), move || {
             MysqlDieselConnector::new(common::mysql_connect(port))
-                .execute_scalar_row(sql, &[ScalarKind::Int], &())
+                .execute_scalar_row(
+                    &subql::reexec::ReadQuery::without_binds(sql),
+                    &[ScalarKind::Int],
+                    &(),
+                )
                 .expect("seed read")
         });
     assert_eq!(
@@ -418,7 +434,11 @@ fn session_setup_runs_on_each_read_sync_mysql() {
         MysqlDieselConnector::with_session_setup(common::mysql_connect(port));
 
     let (value, _) = connector
-        .execute_scalar(read_marker, ScalarKind::Int, &setup)
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            ScalarKind::Int,
+            &setup,
+        )
         .expect("scalar read");
     assert_eq!(
         value,
@@ -427,7 +447,11 @@ fn session_setup_runs_on_each_read_sync_mysql() {
     );
 
     let page = connector
-        .read_page(read_marker, 4096, &setup)
+        .read_page(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            4096,
+            &setup,
+        )
         .expect("page read");
     assert_eq!(
         page.value.rows[0][0],
@@ -437,7 +461,11 @@ fn session_setup_runs_on_each_read_sync_mysql() {
 
     let plain = MysqlDieselConnector::new(common::mysql_connect(port));
     let (value, _) = plain
-        .execute_scalar(read_marker, ScalarKind::Int, &())
+        .execute_scalar(
+            &subql::reexec::ReadQuery::without_binds(read_marker),
+            ScalarKind::Int,
+            &(),
+        )
         .expect("scalar read");
     assert_ne!(value, Value::Int(1234), "an empty setup runs nothing");
 }

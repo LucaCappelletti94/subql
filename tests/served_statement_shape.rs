@@ -96,26 +96,26 @@ fn having_outside_the_fast_path_is_refused() {
     );
 }
 
-/// A group column whose values the database groups together while their
-/// encoding separates them cannot identify a group.
-///
-/// Measured: Postgres puts `0.0` with `-0.0` and `1.0::numeric` with
-/// `1.00::numeric` in one group, and json documents differing only in
-/// whitespace or key order are one value. The fold decides a group by encoding
-/// the value, so it would seed one group and then open a second from zero,
-/// leaving both totals wrong with nothing failing. Refused, so the query is
-/// served by re-reading it instead.
+/// PostgreSQL float groups now have canonical signed-zero and NaN identities.
+/// Decimal and JSON remain refused until their full domains are representable.
 #[test]
-fn a_group_column_that_cannot_identify_a_group_is_refused() {
+fn only_group_columns_without_a_canonical_identity_are_refused() {
+    let report = engine()
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT price, COUNT(*) FROM g GROUP BY price",
+        ))
+        .expect("PostgreSQL float grouping has a canonical key");
+    assert!(matches!(report.tier, Tier::InProcess(_)));
+
     for sql in [
-        "SELECT price, COUNT(*) FROM g GROUP BY price",
         "SELECT paid, COUNT(*) FROM g GROUP BY paid",
         "SELECT doc, COUNT(*) FROM g GROUP BY doc",
     ] {
         let message = refusal(sql);
         assert!(
-            message.contains("group"),
-            "the refusal of {sql} should say the column cannot identify a group, got {message:?}"
+            message.contains("group") || message.contains("GROUP BY"),
+            "the refusal of {sql} should name group identity, got {message:?}"
         );
     }
 }
@@ -293,7 +293,7 @@ fn a_grouped_aggregate_seeds_one_row_per_group() {
         .expect("a grouped aggregate seeds");
     assert_eq!(
         bootstrap.sql,
-        "SELECT \"status\", COUNT(*) AS c0, COUNT(*) AS c1 FROM g WHERE amount > 3 GROUP BY status"
+        "SELECT \"status\" AS c0, COUNT(*) AS c1, COUNT(*) AS c2 FROM g WHERE amount > 3 GROUP BY status"
     );
     assert_eq!(bootstrap.group_columns, 1);
     assert_eq!(
@@ -318,7 +318,7 @@ fn a_grouped_aggregate_seeds_one_row_per_group() {
         .expect("a grouped aggregate seeds");
     assert_eq!(
         bootstrap.sql,
-        "SELECT \"status\", \"id\", SUM(amount) AS c0, COUNT(*) AS c1 FROM g GROUP BY status, id"
+        "SELECT \"status\" AS c0, \"id\" AS c1, SUM(amount) AS c2, COUNT(*) AS c3 FROM g GROUP BY status, id"
     );
     assert_eq!(bootstrap.group_columns, 2);
 }
@@ -494,7 +494,7 @@ fn text_grouping_is_served_on_postgres_and_refused_on_mysql() {
                 .not_served_because
                 .expect("a tier that needs a read says why");
             assert!(
-                reason.contains("group"),
+                reason.contains("group") || reason.contains("GROUP BY"),
                 "the reason should name the group column, got {reason:?}"
             );
         }

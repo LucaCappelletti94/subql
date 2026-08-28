@@ -38,6 +38,8 @@ pub struct Predicate<B: Backend> {
     pub prefilter_plan: Arc<PrefilterPlan>,
     /// Projection kind: row events or aggregate deltas.
     pub projection: QueryProjection,
+    /// Canonical group identity selected during planning.
+    pub group_key_encoder: Option<crate::backend::GroupKeyEncoder<B>>,
     /// Reference count (number of subscriptions using this predicate).
     pub refcount: u32,
     /// Timestamp for conflict resolution in merge (milliseconds since Unix epoch).
@@ -61,6 +63,7 @@ impl<B: Backend> Clone for Predicate<B> {
             index_atoms: Arc::clone(&self.index_atoms),
             prefilter_plan: Arc::clone(&self.prefilter_plan),
             projection: self.projection.clone(),
+            group_key_encoder: self.group_key_encoder.clone(),
             refcount: self.refcount,
             updated_at_unix_ms: self.updated_at_unix_ms,
         }
@@ -78,6 +81,7 @@ impl<B: Backend> core::fmt::Debug for Predicate<B> {
             .field("index_atoms", &self.index_atoms)
             .field("prefilter_plan", &self.prefilter_plan)
             .field("projection", &self.projection)
+            .field("group_key_encoder", &self.group_key_encoder)
             .field("refcount", &self.refcount)
             .field("updated_at_unix_ms", &self.updated_at_unix_ms)
             .finish()
@@ -544,6 +548,7 @@ mod tests {
             index_atoms: Arc::from([IndexableAtom::Fallback]),
             prefilter_plan: Arc::new(PrefilterPlan::default()),
             projection: QueryProjection::Rows,
+            group_key_encoder: None,
             refcount,
             updated_at_unix_ms: 0,
         }
