@@ -18,8 +18,8 @@ use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{FingerprintError, SchemaFingerprint},
     utils::{
-        fingerprint_type_token::canonical_type_token,
         identifier_resolution::stored_identifier_matches_lookup,
+        scalar_family::{scalar_family, ScalarFamily},
     },
 };
 use sqlite_diff_rs::SimpleTable;
@@ -257,11 +257,8 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
 /// Resolve a column's declared SQL type into a backend-neutral
 /// [`ScalarKind`].
 ///
-/// Distinguishes every scalar subql cares about (`JSONB` vs `JSON`,
-/// `TIMESTAMPTZ` vs `TIMESTAMP`, and so on) via
-/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token).
-/// The compiler coerces comparison literals to the column's kind with it,
-/// and the WAL decoders route each wire cell to its typed value against it.
+/// The exhaustive [`ScalarFamily`] mapping distinguishes every scalar subql
+/// serves and makes an upstream family addition break this build.
 ///
 /// Returns `None` when the table / column id is unknown or when the
 /// declared type doesn't match any supported scalar (compiler surfaces
@@ -345,25 +342,23 @@ pub fn column_builtin_kind<DB: DatabaseLike>(
     scalar_kind_from_raw(&column.data_type(database))
 }
 
-/// Map a raw SQL declared type string to its [`ScalarKind`] via
-/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token).
+/// Map a declared SQL type from sql-traits' exhaustive [`ScalarFamily`].
 fn scalar_kind_from_raw(raw: &str) -> Option<crate::backend::BuiltinKind> {
-    match canonical_type_token(raw).as_str() {
-        "INT" => Some(ScalarKind::Int),
-        "FLOAT" => Some(ScalarKind::Float),
-        "DECIMAL" => Some(ScalarKind::Decimal),
-        "BOOL" => Some(ScalarKind::Bool),
-        "STRING" => Some(ScalarKind::String),
-        "BYTES" => Some(ScalarKind::Bytes),
-        "UUID" => Some(ScalarKind::Uuid),
-        "DATE" => Some(ScalarKind::Date),
-        "TIME" => Some(ScalarKind::Time),
-        "TIMESTAMP" => Some(ScalarKind::Timestamp),
-        "TIMESTAMPTZ" => Some(ScalarKind::TimestampTz),
-        "JSON" => Some(ScalarKind::Json),
-        "JSONB" => Some(ScalarKind::Jsonb),
-        _ => None,
-    }
+    Some(match scalar_family(raw)? {
+        ScalarFamily::Bool => ScalarKind::Bool,
+        ScalarFamily::Int => ScalarKind::Int,
+        ScalarFamily::Float => ScalarKind::Float,
+        ScalarFamily::Decimal => ScalarKind::Decimal,
+        ScalarFamily::String => ScalarKind::String,
+        ScalarFamily::Bytes => ScalarKind::Bytes,
+        ScalarFamily::Uuid => ScalarKind::Uuid,
+        ScalarFamily::Date => ScalarKind::Date,
+        ScalarFamily::Time => ScalarKind::Time,
+        ScalarFamily::Timestamp => ScalarKind::Timestamp,
+        ScalarFamily::TimestampTz => ScalarKind::TimestampTz,
+        ScalarFamily::Json => ScalarKind::Json,
+        ScalarFamily::Jsonb => ScalarKind::Jsonb,
+    })
 }
 
 /// Whether the table has row-level security enabled (per
