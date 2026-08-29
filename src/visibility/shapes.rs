@@ -133,9 +133,12 @@ pub(crate) struct TableShapes {
 ///     .with_min_confidence(ConfidenceLevel::B)
 ///     .build();
 /// let translation = translator.translate(&db)?;
-/// let relations = translation.relations();
+/// // `relations` borrows the translation, which borrows `db`, so take an owned
+/// // copy and end the borrow before `Shapes::new` takes the catalog.
+/// let relations = translation.relations().to_vec();
 /// let naming = translation.row_naming();
 /// let answers = translation.action_relations();
+/// drop(translation);
 ///
 /// let shapes = Arc::new(
 ///     Shapes::new::<Postgres>(db, &relations)
@@ -329,10 +332,13 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// let translation = translator
     ///     .translate(&db)
     ///     .expect("the schema translates");
-    /// let relations = translation.relations();
+    /// // `relations` borrows the translation, which borrows `db`, so take an
+    /// // owned copy and end the borrow before `Shapes::new` takes the catalog.
+    /// let relations = translation.relations().to_vec();
     /// let naming = translation.row_naming();
     /// let answers = translation.action_relations();
     /// let open = translation.unrestricted_tables();
+    /// drop(translation);
     ///
     /// let shapes = Shapes::new::<Postgres>(db, &relations)
     ///     .with_row_naming(&naming)

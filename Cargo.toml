@@ -173,10 +173,15 @@ r2d2 = { version = "0.8", optional = true }
 # the fork.
 diesel-async = { version = "0.7", optional = true, default-features = false }
 
-# SQLite patchsets, Maxwell events, and wal2json digest conversion.
-sqlite-diff-rs = { version = "0.9.0", path = "../sqlite-diff-rs", default-features = false, features = ["wal2json", "maxwell"] }
+# SQLite patchsets and digest conversion for both CDC wire formats.
+sqlite-diff-rs = { version = "0.10", default-features = false, features = ["wal2json", "maxwell"] }
 # PostgreSQL wal2json parser and model.
 wal2json-events = { version = "0.1.0", default-features = false }
+# MySQL Maxwell parser and model. Direct, like `wal2json-events` and for the
+# same reason: `sqlite-diff-rs` re-exports the model and `parse` but not
+# `ParseError`, and subql needs that error to tell a message type it does not
+# model (skip it) from malformed JSON (report it).
+maxwell-cdc = { version = "0.1.0", default-features = false }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables

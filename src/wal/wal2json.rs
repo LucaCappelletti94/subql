@@ -37,7 +37,7 @@ const fn v2_row_kind(action: Action) -> Option<EventKind> {
     }
 }
 
-fn v1_row_kind(change: &ChangeV1) -> Option<EventKind> {
+const fn v1_row_kind(change: &ChangeV1) -> Option<EventKind> {
     match change {
         ChangeV1::Insert { .. } => Some(EventKind::Insert),
         ChangeV1::Update { .. } => Some(EventKind::Update),
@@ -130,7 +130,7 @@ fn column_value<'a>(columns: &'a [Column], name: &str) -> Option<&'a serde_json:
 // ---------------------------------------------------------------------------
 
 /// The row payload, for the row actions that carry one.
-fn v2_row(msg: &MessageV2) -> Option<&RowV2> {
+const fn v2_row(msg: &MessageV2) -> Option<&RowV2> {
     match msg {
         MessageV2::Insert(row) | MessageV2::Update(row) | MessageV2::Delete(row) => Some(row),
         MessageV2::Begin(_)
@@ -175,11 +175,9 @@ impl CdcEvent for MessageV2 {
 
     fn checkpoint(&self) -> Option<Self::Checkpoint> {
         let lsn = match self {
-            MessageV2::Insert(row) | MessageV2::Update(row) | MessageV2::Delete(row) => {
-                row.lsn.as_deref()
-            }
-            MessageV2::Truncate(truncate) => truncate.lsn.as_deref(),
-            MessageV2::Begin(_) | MessageV2::Commit(_) | MessageV2::Message(_) => None,
+            Self::Insert(row) | Self::Update(row) | Self::Delete(row) => row.lsn.as_deref(),
+            Self::Truncate(truncate) => truncate.lsn.as_deref(),
+            Self::Begin(_) | Self::Commit(_) | Self::Message(_) => None,
         };
         lsn.and_then(crate::PgLsn::parse)
     }
@@ -249,7 +247,7 @@ impl CdcEvent for MessageV2 {
 
 /// The `(names, values)` parallel arrays `row` selects for `change`, or
 /// `None` when the change does not carry that image.
-fn v1_image(
+const fn v1_image(
     change: &ChangeV1,
     row: RowKind,
 ) -> Option<(&[alloc::string::String], &[serde_json::Value])> {
@@ -312,7 +310,7 @@ impl CdcEvent for ChangeV1 {
     }
 
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        let ChangeV1::Update {
+        let Self::Update {
             columns, oldkeys, ..
         } = self
         else {

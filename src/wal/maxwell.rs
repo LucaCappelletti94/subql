@@ -1,22 +1,23 @@
-//! [`CdcEvent`] for the `sqlite-diff-rs` Maxwell message type.
+//! [`CdcEvent`] for the `maxwell-cdc` message type.
 //!
-//! subql parses Maxwell JSON with `sqlite_diff_rs::maxwell::parse` and views
-//! the resulting [`Message`] as a [`CdcEvent`], resolving table and column
-//! names to catalog ordinals and decoding each cell against the catalog on
-//! demand. This replaces the former bespoke `MaxwellParser` and `MaxwellEvent`.
+//! subql parses Maxwell JSON with `maxwell_cdc::parse` and views the resulting
+//! [`Message`] as a [`CdcEvent`], resolving table and column names to catalog
+//! ordinals and decoding each cell against the catalog on demand. The same
+//! type is what `sqlite_diff_rs::maxwell` digests into a patchset, so a parsed
+//! message serves both paths.
 //!
-//! [`parse_messages`] adapts the two Maxwell shapes `sqlite-diff-rs` does not
-//! model: control messages (`ddl`, `bootstrap-start`, and friends) carry no
-//! row `data` and are dropped, and `bootstrap-insert` is normalized to a
-//! plain insert.
+//! [`parse_messages`] keeps only the messages that carry a row. Control
+//! messages (bootstrap boundaries, table and database DDL) are dropped, and so
+//! is a message whose `type` the model does not know, which is how a tag added
+//! by a newer Maxwell skips instead of ending the stream. `bootstrap-insert`
+//! reads as a plain insert.
 
-use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use serde::Deserialize;
+use maxwell_cdc::{Message, OpType, ParseError, RowChange};
+use serde_json::{Map, Value as JsonValue};
 use sql_traits::prelude::DatabaseLike;
-use sqlite_diff_rs::maxwell::{Message, OpType};
 
 use super::pg_type::json_value_to_mysql_value_by_kind;
 use super::{resolve_table, WalParseError};
@@ -24,20 +25,12 @@ use crate::backend::{CdcEvent, MySql, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
 
-/// Minimal peek at a Maxwell message's `type`, so control and bootstrap
-/// messages can be classified before the full row parse.
-#[derive(Deserialize)]
-struct MaxwellType {
-    #[serde(rename = "type")]
-    type_name: String,
-}
-
 /// Parse one Maxwell JSON message into the row events subql dispatches.
 ///
-/// Returns an empty vector for control messages (`ddl`, `table-create`,
-/// `bootstrap-start`, and friends) that carry no row data. `bootstrap-insert`
-/// is normalized to an insert. Insert, update, and delete each yield a single
-/// [`Message`].
+/// Returns an empty vector for a message that carries no row: a control
+/// message (`bootstrap-start`, `table-create`, and friends) or one whose
+/// `type` the model does not know. Insert, update, delete, and
+/// bootstrap-insert each yield a single [`Message`].
 ///
 /// # Errors
 ///
@@ -46,51 +39,59 @@ struct MaxwellType {
 pub fn parse_messages(bytes: &[u8]) -> Result<Vec<Message>, WalParseError> {
     let text =
         core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-    let peek: MaxwellType =
-        serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
-    match peek.type_name.as_str() {
-        "insert" | "update" | "delete" => {
-            let msg = sqlite_diff_rs::maxwell::parse(text)
-                .map_err(|e| WalParseError::JsonError(e.to_string()))?;
-            Ok(alloc::vec![msg])
-        }
-        // `sqlite-diff-rs`'s `OpType` has no bootstrap variant, so rewrite the
-        // type to a plain insert before the row parse.
-        "bootstrap-insert" => {
-            let mut value: serde_json::Value =
-                serde_json::from_str(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("type".to_string(), serde_json::Value::from("insert"));
-            }
-            let msg: Message = serde_json::from_value(value)
-                .map_err(|e| WalParseError::JsonError(e.to_string()))?;
-            Ok(alloc::vec![msg])
-        }
-        // ddl, table-*, database-*, bootstrap-start, bootstrap-complete, ...
-        _ => Ok(Vec::new()),
+    match maxwell_cdc::parse(text) {
+        Ok(msg) if row(&msg).is_some() => Ok(alloc::vec![msg]),
+        Ok(_) | Err(ParseError::UnknownMessageType(_)) => Ok(Vec::new()),
+        Err(e @ ParseError::Json(_)) => Err(WalParseError::JsonError(e.to_string())),
     }
 }
 
-const fn op_kind(op: OpType) -> EventKind {
-    match op {
-        OpType::Insert => EventKind::Insert,
-        OpType::Update => EventKind::Update,
-        OpType::Delete => EventKind::Delete,
+/// The row payload, for the message types that carry one.
+const fn row(msg: &Message) -> Option<&RowChange> {
+    match msg {
+        Message::Insert(row)
+        | Message::Update(row)
+        | Message::Delete(row)
+        | Message::BootstrapInsert(row) => Some(row),
+        // Control messages and DDL carry no row. `Message` is non-exhaustive,
+        // so a type a newer model adds reads as one of those until subql says
+        // otherwise.
+        _ => None,
     }
 }
 
-/// The row map `row` selects for `msg`, or `None` when the message does not
+/// The event kind `msg` dispatches as, or `None` when it carries no row.
+/// A bootstrap insert is an insert: the snapshot row is new to every consumer.
+const fn kind_of(msg: &Message) -> Option<EventKind> {
+    match msg.op_type() {
+        Some(OpType::Insert | OpType::BootstrapInsert) => Some(EventKind::Insert),
+        Some(OpType::Update) => Some(EventKind::Update),
+        Some(OpType::Delete) => Some(EventKind::Delete),
+        // No op type at all is a control message, and an op type the model
+        // gained later carries a row shape subql has not been taught.
+        Some(_) | None => None,
+    }
+}
+
+/// The row map `image` selects for `msg`, or `None` when the message does not
 /// carry that image. Insert exposes `data` as New and Pk, Delete exposes
 /// `data` (Maxwell puts the deleted row there) as Old and Pk, and Update
 /// exposes `data` as New and `old` as Old and Pk.
-const fn image_for(msg: &Message, row: RowKind) -> Option<&BTreeMap<String, serde_json::Value>> {
-    match (msg.op_type, row) {
-        (OpType::Insert, RowKind::New | RowKind::Pk)
-        | (OpType::Delete, RowKind::Old | RowKind::Pk)
-        | (OpType::Update, RowKind::New) => Some(&msg.data),
-        (OpType::Update, RowKind::Old | RowKind::Pk) => msg.old.as_ref(),
+fn image_for(msg: &Message, image: RowKind) -> Option<&Map<String, JsonValue>> {
+    let payload = row(msg)?;
+    match (kind_of(msg)?, image) {
+        (EventKind::Insert, RowKind::New | RowKind::Pk)
+        | (EventKind::Delete, RowKind::Old | RowKind::Pk)
+        | (EventKind::Update, RowKind::New) => Some(&payload.data),
+        (EventKind::Update, RowKind::Old | RowKind::Pk) => payload.old.as_ref(),
         _ => None,
     }
+}
+
+/// The catalog table `msg` names, when it carries a row that resolves.
+fn table_of<DB: DatabaseLike>(msg: &Message, db: &DB) -> Option<TableId> {
+    let payload = row(msg)?;
+    resolve_table(&payload.database, &payload.table, db).ok()
 }
 
 impl CdcEvent for Message {
@@ -98,13 +99,15 @@ impl CdcEvent for Message {
     type Checkpoint = crate::NoCheckpoint;
 
     fn kind(&self) -> EventKind {
-        op_kind(self.op_type)
+        kind_of(self).expect(
+            "CdcEvent::kind called on a Maxwell message with no row. Filter with parse_messages first",
+        )
     }
 
     fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         // Infallible in the trait, so an unresolved name yields the `u32`
         // sentinel, which the engine reports as an unknown table.
-        resolve_table(&self.database, &self.table, db).unwrap_or(TableId::MAX)
+        table_of(self, db).unwrap_or(TableId::MAX)
     }
 
     fn checkpoint(&self) -> Option<Self::Checkpoint> {
@@ -114,20 +117,19 @@ impl CdcEvent for Message {
     fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
         // The primary key is the row identity subql matches follows and PK
         // projections against, so it comes from the catalog.
-        resolve_table(&self.database, &self.table, db)
-            .ok()
+        table_of(self, db)
             .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id))
             .unwrap_or_default()
     }
 
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        if self.op_type != OpType::Update {
-            return Vec::new();
-        }
-        let Some(old) = self.old.as_ref() else {
+        let Self::Update(payload) = self else {
             return Vec::new();
         };
-        let Ok(table_id) = resolve_table(&self.database, &self.table, db) else {
+        let Some(old) = payload.old.as_ref() else {
+            return Vec::new();
+        };
+        let Some(table_id) = table_of(self, db) else {
             return Vec::new();
         };
         // Maxwell's `old` carries exactly the columns whose value changed, so
@@ -143,7 +145,7 @@ impl CdcEvent for Message {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<MySql>, crate::ValueError> {
-        let Ok(table_id) = resolve_table(&self.database, &self.table, db) else {
+        let Some(table_id) = table_of(self, db) else {
             return Ok(Value::Missing);
         };
         if row == RowKind::Pk
@@ -241,13 +243,15 @@ mod tests {
 
     #[test]
     fn control_messages_drop_and_bootstrap_insert_is_an_insert() {
+        // A `type` the model does not know skips, so a tag a newer Maxwell
+        // adds does not end the stream.
         assert!(
             parse_messages(br#"{"database":"test","table":"orders","type":"ddl"}"#)
-                .expect("ddl parses")
+                .expect("an unknown type is not an error")
                 .is_empty()
         );
         assert!(parse_messages(
-            br#"{"type":"bootstrap-start","database":"test","table":"orders"}"#
+            br#"{"type":"bootstrap-start","database":"test","table":"orders","data":{}}"#
         )
         .expect("bootstrap-start parses")
         .is_empty());
@@ -258,6 +262,25 @@ mod tests {
         );
         assert_eq!(ev.kind(), EventKind::Insert);
         assert_eq!(ev.value_at(&db, RowKind::New, 0).unwrap(), Value::Int(42));
+    }
+
+    #[test]
+    fn malformed_input_is_an_error_not_a_silent_drop() {
+        // Skipping is reserved for a type the model does not know. A message
+        // of a type it does know that will not parse is a real failure, and
+        // so is input that is not JSON at all.
+        assert!(matches!(
+            parse_messages(br#"{"type":"insert","database":"test","table":"orders"}"#),
+            Err(WalParseError::JsonError(_))
+        ));
+        assert!(matches!(
+            parse_messages(b"{not json"),
+            Err(WalParseError::JsonError(_))
+        ));
+        assert!(matches!(
+            parse_messages(&[0xff, 0xfe]),
+            Err(WalParseError::InvalidUtf8(_))
+        ));
     }
 
     #[test]

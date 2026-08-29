@@ -82,6 +82,9 @@ pub type ScalarKindOf<B> = ScalarKind<<<B as Backend>::Custom as CustomScalars>:
 mod scalar_family_serde {
     use super::BuiltinKind;
 
+    // serde's `serialize_with` fixes the signature, so the one-byte family
+    // arrives by reference whatever clippy would prefer.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn serialize<S>(family: &BuiltinKind, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -130,6 +133,7 @@ mod scalar_family_serde {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod scalar_kind_serde_tests {
     use super::{BuiltinKind, ScalarKind};
 

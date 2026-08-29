@@ -22,10 +22,10 @@
 //!
 //! Three vehicles are wired over one source-agnostic schema side
 //! ([`WireCatalog`], [`WireTable`]): [`wal2json_patchset`] digests
-//! subql-owned `sqlite_diff_rs::wal2json` events, [`maxwell_patchset`]
-//! digests `sqlite_diff_rs::maxwell` events, and (behind the
-//! `pgoutput-emit` feature) [`pgoutput_patchset`] digests pg_walstream
-//! `ChangeEvent`s. Each differs only in its decoder registry.
+//! `wal2json_events` messages, [`maxwell_patchset`] digests `maxwell_cdc`
+//! messages, and (behind the `pgoutput-emit` feature) [`pgoutput_patchset`]
+//! digests pg_walstream `ChangeEvent`s. Each differs only in its decoder
+//! registry.
 //!
 //! Each vehicle also has a `*_changeset` variant (for example
 //! [`wal2json_changeset`]) that emits the changeset format, which records
@@ -36,10 +36,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use hashbrown::HashMap;
+use maxwell_cdc::Message as MaxwellMessage;
 use sql_traits::prelude::DatabaseLike;
-use sqlite_diff_rs::maxwell::{
-    ConversionError as MaxwellConversionError, Maxwell, Message as MaxwellMessage,
-};
+use sqlite_diff_rs::maxwell::{ConversionError as MaxwellConversionError, Maxwell};
 #[cfg(feature = "pgoutput-emit")]
 use sqlite_diff_rs::pg_walstream::{
     ChangeEvent as PgChangeEvent, ConversionError as PgConversionError, PgWalstream,

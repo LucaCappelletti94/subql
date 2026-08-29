@@ -34,6 +34,7 @@
 
 #![allow(dead_code)]
 #![allow(clippy::unreadable_literal)]
+#![allow(clippy::unwrap_used)]
 
 use core::str::FromStr;
 use std::io::Write;

@@ -3,9 +3,8 @@
 //!
 //! The pgoutput, wal2json, and Maxwell paths implement `CdcEvent` directly on
 //! the ecosystem message types (`pg_walstream::ChangeEvent`,
-//! `wal2json_events::{MessageV2, ChangeV1}`, and
-//! `sqlite_diff_rs::maxwell::Message`). The [`WalParser`] trait remains for the
-//! SQLite changeset path.
+//! `wal2json_events::{MessageV2, ChangeV1}`, and `maxwell_cdc::Message`). The
+//! [`WalParser`] trait remains for the SQLite changeset path.
 
 mod change_event;
 mod maxwell;
@@ -19,10 +18,10 @@ mod wal2json;
 #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
 pub(crate) use change_event::into_engine_events;
 pub use maxwell::parse_messages as parse_maxwell;
+pub use maxwell_cdc::Message as MaxwellMessage;
 #[cfg(feature = "pg-streaming")]
 pub use pg_streaming::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
 pub use pg_walstream::ChangeEvent;
-pub use sqlite_diff_rs::maxwell::Message as MaxwellMessage;
 #[cfg(feature = "std")]
 pub use streaming::CdcSource;
 pub use wal2json::{parse_wal2json_v1, parse_wal2json_v2};

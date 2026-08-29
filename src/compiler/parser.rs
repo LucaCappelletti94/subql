@@ -906,7 +906,7 @@ where
                     // uses its ScalarKind for the other side's literal.
                     let child_target = column_scalar_of::<B, DB>(left, table_id, database)
                         .or_else(|| column_scalar_of::<B, DB>(right, table_id, database))
-                        .unwrap_or(BuiltinKind::String.into());
+                        .unwrap_or_else(|| BuiltinKind::String.into());
                     compile_expr_recursive::<B, DB>(
                         left,
                         table_id,
@@ -1001,7 +1001,7 @@ where
             // Derive target from the tested expression if it's a column
             // reference; fall back to String otherwise (best-effort).
             let list_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or(BuiltinKind::String.into());
+                .unwrap_or_else(|| BuiltinKind::String.into());
 
             compile_expr_recursive::<B, DB>(expr, table_id, database, out, depth + 1, list_target)?;
 
@@ -1099,7 +1099,7 @@ where
             negated,
         } => {
             let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
-                .unwrap_or(BuiltinKind::String.into());
+                .unwrap_or_else(|| BuiltinKind::String.into());
 
             // Stack order: value, lower, upper.
             compile_expr_recursive::<B, DB>(
