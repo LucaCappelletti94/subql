@@ -1,6 +1,6 @@
 //! Which authorization records one changed row implies.
 //!
-//! [`rls2fga`] describes a relation's records as structure: a template
+//! `rls2fga-types` describes a relation's records as structure: a template
 //! naming where the object key and the subject key come from, plus guards
 //! the row must satisfy. Given a row's column values it evaluates that
 //! description with no database. This module is the adapter that lets a
@@ -8,7 +8,7 @@
 //!
 //! # Refusing is part of the contract
 //!
-//! [`rls2fga::generator::records::RowValues`] answers `None` for anything
+//! [`rls2fga_types::RowValues`] answers `None` for anything
 //! it cannot read, and `records_from_row` turns a `None` object key into
 //! an empty record set. That is correct when the row genuinely says
 //! nothing, and wrong when this adapter simply cannot read the shape,
@@ -24,15 +24,15 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-use rls2fga::classifier::patterns::{AttributeLiteral, AttributeOperator, AttributePredicate};
-use rls2fga::generator::records::{
+use rls2fga_types::{
     records_from_row, ColumnKind, ColumnRead, Guard, Record, RecordDerivation, RecordDescription,
     RecordError, RowCell, RowList, RowValues, ValueSource,
 };
+use rls2fga_types::{AttributeLiteral, AttributeOperator, AttributePredicate};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::backend::{
-    Backend, JsonDocument, ScalarKind, ScalarKindOf, ScalarText, ScalarTruth, Value,
+    Backend, BuiltinKind, JsonDocument, ScalarKindOf, ScalarText, ScalarTruth, Value,
 };
 use crate::catalog_helpers;
 use crate::visibility::RowView;
@@ -49,7 +49,7 @@ use crate::{TableId, ValueError};
 /// withdrawal of access.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RowRecordError {
-    /// [`rls2fga`] refused to produce records for this row.
+    /// `rls2fga-types` refused to produce records for this row.
     ///
     /// Wrapped whole rather than mapped arm by arm, because
     /// [`RecordError`] is `#[non_exhaustive]` and every arm of it is a
@@ -149,7 +149,7 @@ fn unsupported_description<B: crate::backend::Backend, DB: DatabaseLike>(
     else {
         return None;
     };
-    let Some(table) = catalog_helpers::table_id(db, table) else {
+    let Some(table) = catalog_helpers::contract_table_id(db, table) else {
         return Some(RowRecordError::UnreadableColumn(alloc::format!(
             "any column of {table:?}, a table the catalog does not know"
         )));
@@ -336,19 +336,18 @@ fn column_kind_from_scalar<B: crate::backend::Backend>(
     // mean asserting a text form subql cannot prove matches the loading SQL
     // (R1), so a shape that renders such a column is reported uncovered.
     Some(match kind.as_builtin()? {
-        ScalarKind::Bool => ColumnKind::Bool,
-        ScalarKind::Int => ColumnKind::Integer,
-        ScalarKind::Float => ColumnKind::Unsupported,
-        ScalarKind::String => ColumnKind::Text,
-        ScalarKind::Bytes => ColumnKind::Bytea,
-        ScalarKind::Uuid => ColumnKind::Uuid,
-        ScalarKind::Timestamp => ColumnKind::Timestamp,
-        ScalarKind::TimestampTz => ColumnKind::TimestampTz,
-        ScalarKind::Date => ColumnKind::Date,
-        ScalarKind::Time => ColumnKind::Time,
-        ScalarKind::Decimal => ColumnKind::Decimal,
-        ScalarKind::Json | ScalarKind::Jsonb => ColumnKind::Json,
-        ScalarKind::Custom(none) => match none {},
+        BuiltinKind::Bool => ColumnKind::Bool,
+        BuiltinKind::Int => ColumnKind::Integer,
+        BuiltinKind::Float => ColumnKind::Unsupported,
+        BuiltinKind::String => ColumnKind::Text,
+        BuiltinKind::Bytes => ColumnKind::Bytea,
+        BuiltinKind::Uuid => ColumnKind::Uuid,
+        BuiltinKind::Timestamp => ColumnKind::Timestamp,
+        BuiltinKind::TimestampTz => ColumnKind::TimestampTz,
+        BuiltinKind::Date => ColumnKind::Date,
+        BuiltinKind::Time => ColumnKind::Time,
+        BuiltinKind::Decimal => ColumnKind::Decimal,
+        BuiltinKind::Json | BuiltinKind::Jsonb => ColumnKind::Json,
     })
 }
 
@@ -550,18 +549,19 @@ fn bytea_sql_text(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use crate::backend::BuiltinKind;
+    use crate::backend::{BuiltinKind, ScalarKind};
     use alloc::vec;
 
-    use rls2fga::classifier::patterns::ConfidenceLevel;
-    use rls2fga::generator::records::{ColumnRead, ContextRendering, RowValues, SubjectKey};
-    use rls2fga::parser::identifiers::{ColumnName, RelationName};
     use rls2fga::translator::TranslatorBuilder;
+    use rls2fga_types::ConfidenceLevel;
+    use rls2fga_types::{ColumnName, RelationName};
+    use rls2fga_types::{ColumnRead, ContextRendering, RowValues, SubjectKey};
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::*;
     use crate::backend::Postgres;
     use crate::testing::TestEvent;
+    use crate::visibility::test_names;
     use crate::visibility::EventRow;
     use crate::{catalog_helpers, ParserDB};
 
@@ -599,8 +599,8 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
             .translate(&db)
             .unwrap()
             .relations()
-            .into_iter()
-            .flat_map(|entry| entry.shapes)
+            .iter()
+            .flat_map(|entry| entry.shapes.clone())
             .find(|shape| {
                 matches!(&shape.derivation, RecordDerivation::FromRow { template, .. }
                     if template.subject_type == "user")
@@ -814,7 +814,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
 
     #[test]
     fn a_timestamp_comparison_is_refused_and_presence_is_not() {
-        use rls2fga::classifier::patterns::{AttributeOperator, AttributePredicate};
+        use rls2fga_types::{AttributeOperator, AttributePredicate};
 
         let db = catalog();
         let compared = description(
@@ -839,7 +839,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
 
     #[test]
     fn a_timestamp_context_keeps_serving() {
-        use rls2fga::generator::records::{RecordContext, RecordContextEntry};
+        use rls2fga_types::{RecordContext, RecordContextEntry};
 
         let db = catalog();
         let mut d = description(ValueSource::column("owner"), vec![]);
@@ -871,7 +871,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
 
     #[test]
     fn a_guard_over_the_wrong_kind_is_refused() {
-        use rls2fga::classifier::patterns::{AttributeOperator, AttributePredicate};
+        use rls2fga_types::{AttributeOperator, AttributePredicate};
 
         let subject = || ValueSource::column("owner");
         let cases: [(Guard, &str); 3] = [
@@ -930,27 +930,27 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
     fn the_setup_gate_matches_what_render_text_spells() {
         let epoch = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant");
         let cases: [(BuiltinKind, Value<Postgres>); 13] = [
-            (ScalarKind::Bool, Value::Bool(true)),
-            (ScalarKind::Int, Value::Int(1)),
-            (ScalarKind::Float, Value::Float(1.0)),
-            (ScalarKind::String, Value::String("x".into())),
-            (ScalarKind::Bytes, Value::Bytes(vec![1])),
-            (ScalarKind::Uuid, Value::Uuid(uuid::Uuid::nil())),
-            (ScalarKind::Timestamp, Value::Timestamp(epoch.naive_utc())),
-            (ScalarKind::TimestampTz, Value::TimestampTz(epoch)),
-            (ScalarKind::Date, Value::Date(epoch.date_naive())),
-            (ScalarKind::Time, Value::Time(epoch.time())),
+            (BuiltinKind::Bool, Value::Bool(true)),
+            (BuiltinKind::Int, Value::Int(1)),
+            (BuiltinKind::Float, Value::Float(1.0)),
+            (BuiltinKind::String, Value::String("x".into())),
+            (BuiltinKind::Bytes, Value::Bytes(vec![1])),
+            (BuiltinKind::Uuid, Value::Uuid(uuid::Uuid::nil())),
+            (BuiltinKind::Timestamp, Value::Timestamp(epoch.naive_utc())),
+            (BuiltinKind::TimestampTz, Value::TimestampTz(epoch)),
+            (BuiltinKind::Date, Value::Date(epoch.date_naive())),
+            (BuiltinKind::Time, Value::Time(epoch.time())),
             (
-                ScalarKind::Decimal,
+                BuiltinKind::Decimal,
                 Value::Decimal(bigdecimal::BigDecimal::from(1)),
             ),
-            (ScalarKind::Json, Value::Json(serde_json::Value::Null)),
-            (ScalarKind::Jsonb, Value::Jsonb(serde_json::Value::Null)),
+            (BuiltinKind::Json, Value::Json(serde_json::Value::Null)),
+            (BuiltinKind::Jsonb, Value::Jsonb(serde_json::Value::Null)),
         ];
         for (kind, value) in cases {
             assert_eq!(
                 direct_kind(
-                    column_kind_from_scalar::<Postgres>(ScalarKind::from_builtin(kind))
+                    column_kind_from_scalar::<Postgres>(ScalarKind::from(kind))
                         .expect("every builtin kind has a column kind"),
                 ),
                 render_text(&value).is_some(),
@@ -1001,7 +1001,7 @@ CREATE POLICY docs_owner ON docs USING (owner = current_user);";
     #[test]
     fn a_joining_shape_is_refused_with_its_reason() {
         let d = RecordDescription {
-            tables: vec!["docs".into(), "grants".into()],
+            tables: vec![test_names::table("docs"), test_names::table("grants")],
             derivation: RecordDerivation::Joined {
                 queries: vec![],
                 reason: "reads the grants table".into(),

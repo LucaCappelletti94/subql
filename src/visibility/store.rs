@@ -21,7 +21,7 @@
 //! A shape the row settles yields records directly, and the difference
 //! between the two images is what moved. A shape whose records span two
 //! tables cannot be differenced from one of them, so the query
-//! [`rls2fga`] already bound to one row is handed over with the key read
+//! `rls2fga` already bound to one row is handed over with the key read
 //! off the row, and the caller runs it: the result is the whole truth for
 //! the slice the query declares, so reconciling it both writes what is new
 //! and takes out what the result stopped returning. A shape that can be
@@ -78,8 +78,10 @@ use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use rls2fga::generator::records::{BoundQuery, Record, RecordDerivation, RecordDescription};
-use rls2fga::generator::relations::RelationShapes;
+use rls2fga_types::{
+    BoundQuery, Record, RecordDerivation, RecordDescription, RelationShapes,
+    TableId as ContractTableId,
+};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::backend::{Backend, CdcEvent, Value};
@@ -134,18 +136,18 @@ pub struct Uncovered {
 /// due before the event is delivered. See the module's own section on when a
 /// replayed query has to have finished, which says what a caller accepts by
 /// deferring it. The result is the whole truth for the slice
-/// [`BoundQuery::scope`](rls2fga::generator::records::BoundQuery::scope)
+/// [`BoundQuery::scope`](rls2fga_types::BoundQuery::scope)
 /// declares, which is what makes the reconciliation able to remove.
 ///
 /// The key is a typed [`Value`] rather than text, so the caller binds it
 /// through its own type system and no cast is needed anywhere.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Requery<'a, B: Backend> {
-    /// The query [`rls2fga`] bound to one row of this table. Its SQL takes
+    /// The query `rls2fga` bound to one row of this table. Its SQL takes
     /// the key as `$1` through `$n`.
     pub query: &'a BoundQuery,
     /// The values to bind, one per column of
-    /// [`BoundQuery::key_columns`](rls2fga::generator::records::BoundQuery::key_columns)
+    /// [`BoundQuery::key_columns`](rls2fga_types::BoundQuery::key_columns)
     /// and in that order. Several of them where the key spans several columns,
     /// which is one key rather than several.
     pub key: Vec<Value<B>>,
@@ -353,7 +355,7 @@ where
 pub(crate) fn name_gap(
     entry: &RelationShapes,
     shape: &RecordDescription,
-    table: &str,
+    table: &ContractTableId,
     reason: UncoveredReason,
 ) -> Uncovered {
     // A settled shape names its own type and relation, which is what a
@@ -396,17 +398,15 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use rls2fga::classifier::patterns::ConfidenceLevel;
-    use rls2fga::generator::records::RecordError;
-    use rls2fga::generator::records::{
-        BoundQuery, Record, RecordDerivation, RecordDescription, ReplayScope,
-    };
-    use rls2fga::generator::relations::RelationShapes;
     use rls2fga::generator::well_known::{
         can_delete_relation, can_select_relation, member_relation,
     };
-    use rls2fga::parser::identifiers::RelationName;
     use rls2fga::translator::TranslatorBuilder;
+    use rls2fga_types::ConfidenceLevel;
+    use rls2fga_types::RecordError;
+    use rls2fga_types::RelationName;
+    use rls2fga_types::RelationShapes;
+    use rls2fga_types::{BoundQuery, Record, RecordDerivation, RecordDescription, ReplayScope};
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{StoreDiffError, UncoveredReason};
@@ -461,10 +461,10 @@ CREATE POLICY p ON docs FOR SELECT USING (
     /// evaluate, so `teams#member` joins and reaches `team_members` through a
     /// bound query instead.
     const EXPIRING: &str = "
-CREATE TABLE teams(id INTEGER PRIMARY KEY);
-CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
+CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT,
     expires_at TIMESTAMPTZ);
-CREATE TABLE docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+CREATE TABLE public.docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON docs FOR SELECT USING (
   EXISTS (SELECT 1 FROM team_members
@@ -476,11 +476,11 @@ CREATE POLICY p ON docs FOR SELECT USING (
     /// one only a replay reaches. The replay's slice is also stated by the
     /// settled shape, so reconciling it would delete that shape's facts.
     const SHARED_SLICE: &str = "
-CREATE TABLE teams(id INTEGER PRIMARY KEY);
-CREATE TABLE team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
-CREATE TABLE team_guests(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
+CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+CREATE TABLE public.team_guests(team_id INTEGER REFERENCES teams(id), user_id TEXT,
     expires_at TIMESTAMPTZ);
-CREATE TABLE docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+CREATE TABLE public.docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON docs FOR SELECT USING (
   EXISTS (SELECT 1 FROM team_members
@@ -512,7 +512,8 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             .build()
             .translate(&db)
             .unwrap()
-            .relations();
+            .relations()
+            .to_vec();
         Shapes::new::<Postgres>(db, &relations)
     }
 
@@ -783,7 +784,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         );
         assert_eq!(diff.requeries.len(), 1);
         let requery = &diff.requeries[0];
-        assert_eq!(requery.query.table, "team_members");
+        assert_eq!(requery.query.table.name(), "team_members");
         assert_eq!(requery.query.key_columns, ["team_id"]);
         assert!(requery.query.sql.contains("$1"));
         assert_eq!(requery.key, [Value::Int(3)]);
@@ -993,10 +994,8 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
 
         let uncovered = store.uncovered();
         assert!(
-            uncovered
-                .iter()
-                .any(|gap| gap.table == "team_guests"
-                    && gap.reason == UncoveredReason::SharedSlice),
+            uncovered.iter().any(|gap| gap.table == "public.team_guests"
+                && gap.reason == UncoveredReason::SharedSlice),
             "the guest shape's slice is also stated by the member shape: {uncovered:?}"
         );
 
@@ -1077,7 +1076,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 }
                 Err(ValueError::Builtin {
                     column: col,
-                    kind: crate::backend::ScalarKind::String,
+                    kind: crate::backend::BuiltinKind::String,
                 })
             }
         }
@@ -1132,7 +1131,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             ) -> Result<Value<Postgres>, ValueError> {
                 Err(ValueError::Builtin {
                     column: col,
-                    kind: crate::backend::ScalarKind::Int,
+                    kind: crate::backend::BuiltinKind::Int,
                 })
             }
         }
@@ -1383,10 +1382,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             relation,
             from_one_row: false,
             shapes: vec![RecordDescription {
-                tables: vec!["docs".to_string()],
+                tables: vec![test_names::table("docs")],
                 derivation: RecordDerivation::Joined {
                     queries: vec![BoundQuery {
-                        table: "docs".to_string(),
+                        table: test_names::table("docs"),
                         key_columns: vec![test_names::column("id")],
                         sql: sql.to_string(),
                         condition: None,
@@ -1413,7 +1412,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             .collect::<Vec<String>>()
             .join(" AND ");
         BoundQuery {
-            table: table.to_string(),
+            table: test_names::table(table),
             key_columns: key_columns
                 .iter()
                 .copied()
@@ -1443,7 +1442,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             relation: can_select_relation(),
             from_one_row: false,
             shapes: vec![RecordDescription {
-                tables: vec!["readings".to_string()],
+                tables: vec![test_names::table("readings")],
                 derivation: RecordDerivation::Joined {
                     queries: vec![bound("readings", &["tenant_id", "reading_id"])],
                     reason: "the guard is settled by the request".to_string(),
@@ -1463,7 +1462,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             relation: can_select_relation(),
             from_one_row: false,
             shapes: vec![RecordDescription {
-                tables: tables.iter().copied().map(String::from).collect(),
+                tables: tables.iter().copied().map(test_names::table).collect(),
                 derivation: RecordDerivation::Joined {
                     queries,
                     reason: "a grant row and the resource row it names are separate".to_string(),

@@ -3,7 +3,7 @@
 //!
 //! The pgoutput, wal2json, and Maxwell paths implement `CdcEvent` directly on
 //! the ecosystem message types (`pg_walstream::ChangeEvent`,
-//! `sqlite_diff_rs::wal2json::{MessageV2, ChangeV1}`, and
+//! `wal2json_events::{MessageV2, ChangeV1}`, and
 //! `sqlite_diff_rs::maxwell::Message`). The [`WalParser`] trait remains for the
 //! SQLite changeset path.
 
@@ -23,10 +23,10 @@ pub use maxwell::parse_messages as parse_maxwell;
 pub use pg_streaming::{PgStreamingCdcSource, PgStreamingConfig, PgStreamingError};
 pub use pg_walstream::ChangeEvent;
 pub use sqlite_diff_rs::maxwell::Message as MaxwellMessage;
-pub use sqlite_diff_rs::wal2json::{ChangeV1, MessageV2};
 #[cfg(feature = "std")]
 pub use streaming::CdcSource;
 pub use wal2json::{parse_wal2json_v1, parse_wal2json_v2};
+pub use wal2json_events::{ChangeV1, MessageV2};
 
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::{catalog_helpers, Checkpoint, ColumnId, TableId};

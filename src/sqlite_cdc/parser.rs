@@ -196,7 +196,7 @@ fn op_to_event<DB: DatabaseLike>(
 /// corresponding side.
 fn decode_update_pair(
     pair: &ChangesetUpdatePair<alloc::string::String, Vec<u8>>,
-    kind: Option<BuiltinKind>,
+    kind: Option<ScalarKindOf<SQLite>>,
 ) -> (Value<SQLite>, Value<SQLite>) {
     let old = pair
         .0
@@ -294,46 +294,46 @@ fn decode_wire_value(
     match wire {
         WireValue::Null => Value::Null,
         WireValue::Integer(i) => match kind {
-            Some(ScalarKind::Bool) => Value::Bool(i),
-            Some(ScalarKind::Int) | None => Value::Int(i),
-            Some(ScalarKind::Json) => Value::Json(SqliteJson::integer(i)),
-            Some(ScalarKind::Jsonb) => Value::Jsonb(SqliteJson::integer(i)),
+            Some(BuiltinKind::Bool) => Value::Bool(i),
+            Some(BuiltinKind::Int) | None => Value::Int(i),
+            Some(BuiltinKind::Json) => Value::Json(SqliteJson::integer(i)),
+            Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::integer(i)),
             _ => Value::Missing,
         },
         WireValue::Real(f) => match kind {
-            Some(ScalarKind::Float) | None => Value::Float(f),
-            Some(ScalarKind::Json) => Value::Json(SqliteJson::real(f)),
-            Some(ScalarKind::Jsonb) => Value::Jsonb(SqliteJson::real(f)),
+            Some(BuiltinKind::Float) | None => Value::Float(f),
+            Some(BuiltinKind::Json) => Value::Json(SqliteJson::real(f)),
+            Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::real(f)),
             _ => Value::Missing,
         },
         WireValue::Text(s) => match kind {
-            Some(ScalarKind::String) | None => Value::String(s),
-            Some(ScalarKind::Uuid) => Value::Uuid(s),
-            Some(ScalarKind::Timestamp) => {
+            Some(BuiltinKind::String) | None => Value::String(s),
+            Some(BuiltinKind::Uuid) => Value::Uuid(s),
+            Some(BuiltinKind::Timestamp) => {
                 crate::temporal::parse_timestamp(&s).map_or(Value::Missing, Value::Timestamp)
             }
-            Some(ScalarKind::TimestampTz) => {
+            Some(BuiltinKind::TimestampTz) => {
                 crate::temporal::parse_timestamp_tz(&s).map_or(Value::Missing, Value::TimestampTz)
             }
-            Some(ScalarKind::Date) => {
+            Some(BuiltinKind::Date) => {
                 crate::temporal::parse_date(&s).map_or(Value::Missing, Value::Date)
             }
-            Some(ScalarKind::Time) => {
+            Some(BuiltinKind::Time) => {
                 crate::temporal::parse_time(&s).map_or(Value::Missing, Value::Time)
             }
-            Some(ScalarKind::Decimal) => {
+            Some(BuiltinKind::Decimal) => {
                 <bigdecimal::BigDecimal as core::str::FromStr>::from_str(&s)
                     .ok()
                     .map_or(Value::Missing, Value::Decimal)
             }
-            Some(ScalarKind::Json) => Value::Json(SqliteJson::text(s)),
-            Some(ScalarKind::Jsonb) => Value::Jsonb(SqliteJson::text(s)),
+            Some(BuiltinKind::Json) => Value::Json(SqliteJson::text(s)),
+            Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::text(s)),
             _ => Value::Missing,
         },
         WireValue::Blob(b) => match kind {
-            Some(ScalarKind::Bytes) | None => Value::Bytes(b),
-            Some(ScalarKind::Json) => Value::Json(SqliteJson::blob(b)),
-            Some(ScalarKind::Jsonb) => Value::Jsonb(SqliteJson::blob(b)),
+            Some(BuiltinKind::Bytes) | None => Value::Bytes(b),
+            Some(BuiltinKind::Json) => Value::Json(SqliteJson::blob(b)),
+            Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::blob(b)),
             _ => Value::Missing,
         },
     }
@@ -562,20 +562,20 @@ mod tests {
             (
                 decode_wire_value(
                     WireValue::Text(String::from("{ \"a\": 1 }")),
-                    Some(ScalarKind::Json),
+                    Some(BuiltinKind::Json),
                 ),
                 SqliteJsonStorage::Text(String::from("{ \"a\": 1 }")),
             ),
             (
-                decode_wire_value(WireValue::Integer(1), Some(ScalarKind::Json)),
+                decode_wire_value(WireValue::Integer(1), Some(BuiltinKind::Json)),
                 SqliteJsonStorage::Integer(1),
             ),
             (
-                decode_wire_value(WireValue::Real(1.5), Some(ScalarKind::Json)),
+                decode_wire_value(WireValue::Real(1.5), Some(BuiltinKind::Json)),
                 SqliteJsonStorage::Real(1.5),
             ),
             (
-                decode_wire_value(WireValue::Blob(vec![1, 2]), Some(ScalarKind::Json)),
+                decode_wire_value(WireValue::Blob(vec![1, 2]), Some(BuiltinKind::Json)),
                 SqliteJsonStorage::Blob(vec![1, 2]),
             ),
         ];

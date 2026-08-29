@@ -19,21 +19,21 @@
 //! * `NUMERIC` / `DECIMAL` gets a native `Numeric` bind when the wire
 //!   carries a `Value::Text` holding the verbatim decimal digits, parsed
 //!   through [`bigdecimal::BigDecimal`]. The target column is classified
-//!   through the catalog's [`ScalarKind`], since Postgres has no implicit
+//!   through the catalog's [`crate::backend::ScalarKind`], since Postgres has no implicit
 //!   assignment cast from text to `numeric`. Any other wire shape on a
 //!   decimal column is rejected.
 //! * `TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, and `TIME` get native temporal
 //!   binds when the wire carries a `Value::Text` holding the verbatim
 //!   Postgres text form, parsed through the shared `chrono` parsers in
 //!   `crate::temporal`. `TIMESTAMPTZ` normalizes to a UTC instant.
-//!   Each column is classified through the catalog's [`ScalarKind`],
+//!   Each column is classified through the catalog's [`crate::backend::ScalarKind`],
 //!   since Postgres has no implicit assignment cast from text to these
 //!   types. Any other wire shape on such a column is rejected.
 //! * `JSON` and `JSONB` get native binds when the wire carries a
 //!   `Value::Text` holding JSON text, parsed through `serde_json`. A
 //!   `JSONB` column normalizes key order and whitespace on store, so a
 //!   round trip preserves the value, not the exact input bytes. Each is
-//!   classified through the catalog's [`ScalarKind`]. Any other wire
+//!   classified through the catalog's [`crate::backend::ScalarKind`]. Any other wire
 //!   shape on such a column is rejected.
 //!
 //! Every other column falls through to [`sqlite_diff_rs::DefaultBinder`]
@@ -68,7 +68,7 @@ use diesel::sql_types::{
 use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TableLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
-use crate::backend::{ScalarKind, ScalarKindOf};
+use crate::backend::{BuiltinKind, ScalarKindOf};
 use crate::catalog_helpers;
 use crate::temporal::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 use crate::types::ColumnId;
@@ -97,7 +97,7 @@ impl<'db, DB: DatabaseLike> PgAdapter<'db, DB> {
         table.columns(self.catalog).ok()?.nth(index)
     }
 
-    /// Classify the target column through the catalog's [`ScalarKind`],
+    /// Classify the target column through the catalog's [`crate::backend::ScalarKind`],
     /// the dispatch key for families Postgres will not assignment-cast
     /// from a text bind. Returns `None` for an unknown table or column,
     /// or a declared type that maps to no supported scalar.
@@ -198,36 +198,45 @@ where
         // bind: decimal and the temporals. Each parses the verbatim wire
         // text into its diesel type and binds it natively. Bool and UUID
         // are handled above, and everything else falls to DefaultBinder.
-        match self.scalar_kind_at(table_name, column_index) {
-            Some(ScalarKind::Decimal) => {
+        match self
+            .scalar_kind_at(table_name, column_index)
+            .and_then(|kind| kind.as_builtin())
+        {
+            Some(BuiltinKind::Decimal) => {
                 text_scalar_bind(col_name, value, "decimal TEXT or NULL", |s| {
                     Some(Box::new(DecimalBinder(BigDecimal::from_str(s).ok()?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(ScalarKind::Timestamp) => {
+            Some(BuiltinKind::Timestamp) => {
                 text_scalar_bind(col_name, value, "timestamp TEXT or NULL", |s| {
                     Some(Box::new(TimestampBinder(parse_timestamp(s)?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(ScalarKind::TimestampTz) => {
+            Some(BuiltinKind::TimestampTz) => {
                 text_scalar_bind(col_name, value, "timestamptz TEXT or NULL", |s| {
                     Some(Box::new(TimestampTzBinder(parse_timestamp_tz(s)?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }
-            Some(ScalarKind::Date) => text_scalar_bind(col_name, value, "date TEXT or NULL", |s| {
-                Some(Box::new(DateBinder(parse_date(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
-            }),
-            Some(ScalarKind::Time) => text_scalar_bind(col_name, value, "time TEXT or NULL", |s| {
-                Some(Box::new(TimeBinder(parse_time(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
-            }),
-            Some(ScalarKind::Json) => text_scalar_bind(col_name, value, "json TEXT or NULL", |s| {
-                Some(Box::new(JsonBinder(serde_json::from_str(s).ok()?))
-                    as Box<dyn Binder<Pg> + Send + 'a>)
-            }),
-            Some(ScalarKind::Jsonb) => {
+            Some(BuiltinKind::Date) => {
+                text_scalar_bind(col_name, value, "date TEXT or NULL", |s| {
+                    Some(Box::new(DateBinder(parse_date(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
+                })
+            }
+            Some(BuiltinKind::Time) => {
+                text_scalar_bind(col_name, value, "time TEXT or NULL", |s| {
+                    Some(Box::new(TimeBinder(parse_time(s)?)) as Box<dyn Binder<Pg> + Send + 'a>)
+                })
+            }
+            Some(BuiltinKind::Json) => {
+                text_scalar_bind(col_name, value, "json TEXT or NULL", |s| {
+                    Some(Box::new(JsonBinder(serde_json::from_str(s).ok()?))
+                        as Box<dyn Binder<Pg> + Send + 'a>)
+                })
+            }
+            Some(BuiltinKind::Jsonb) => {
                 text_scalar_bind(col_name, value, "jsonb TEXT or NULL", |s| {
                     Some(Box::new(JsonbBinder(serde_json::from_str(s).ok()?))
                         as Box<dyn Binder<Pg> + Send + 'a>)

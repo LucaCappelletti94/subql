@@ -14,7 +14,7 @@
 //!   connection (edge environments, TCP-hostile networks, libpq-only
 //!   downstreams that can't speak `START_REPLICATION`).
 //! - **Equivalence ground truth**: the differential equivalence test
-//!   in `tests/cdc_equivalence.rs` drains both transports against the
+//!   in `tests/it/cdc_equivalence.rs` drains both transports against the
 //!   same WAL stream and asserts they observe identical events.
 //! - **Benchmark subject**: the workload-matrix examples measure both
 //!   transports across regimes.

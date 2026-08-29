@@ -84,8 +84,8 @@ use openfga_client::tonic::body::Body;
 use openfga_client::tonic::client::GrpcService;
 use openfga_client::tonic::codegen::{Bytes, StdError};
 use openfga_client::tonic::Code;
-use rls2fga::generator::records::{Record, RecordContextValue, ReplayScope};
-use rls2fga::parser::identifiers::RelationName;
+use rls2fga_types::RelationName;
+use rls2fga_types::{Record, RecordContextValue, ReplayScope};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::backend::Backend;
@@ -93,7 +93,7 @@ use crate::visibility::policy::{image_of, statement_of, table_of, RequestValues,
 use crate::TableId;
 use core::ops::Not;
 
-use rls2fga::generator::action_relations::{ActionAnswer, ActionStatement, RowVersion};
+use rls2fga_types::{ActionAnswer, ActionStatement, RowVersion};
 
 use crate::visibility::records::render_text;
 use crate::visibility::shapes::{RequiredParameter, Shapes, SharedShapes};
@@ -1258,8 +1258,8 @@ mod tests {
     use alloc::vec;
 
     use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
-    use rls2fga::classifier::patterns::ConfidenceLevel;
     use rls2fga::translator::TranslatorBuilder;
+    use rls2fga_types::ConfidenceLevel;
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{
@@ -1639,8 +1639,9 @@ CREATE POLICY notes_p ON notes USING (
             .build()
             .translate(&db)
             .unwrap();
-        let relations = translation.relations();
+        let relations = translation.relations().to_vec();
         let notes = translation.notes().to_vec();
+        drop(translation);
 
         let bare = Shapes::new::<crate::backend::Postgres>(db, &relations);
         assert!(
@@ -1701,10 +1702,11 @@ CREATE POLICY notes_p ON notes USING (
             .translate(&db)
             .unwrap();
         let (relations, naming, answers) = (
-            translation.relations(),
+            translation.relations().to_vec(),
             translation.row_naming(),
             translation.action_relations(),
         );
+        drop(translation);
         let shapes = Arc::new(
             Shapes::new::<crate::backend::Postgres>(db, &relations)
                 .with_row_naming(&naming)

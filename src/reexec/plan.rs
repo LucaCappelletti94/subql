@@ -5,7 +5,7 @@
 //! only runs for rejected queries and produces a [`QueryPlan`] describing how
 //! the re-execution layer should maintain it.
 
-use crate::backend::{Backend, Value};
+use crate::backend::{Backend, BuiltinKind, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::parser;
 use crate::compiler::sql_shape::{
@@ -378,7 +378,7 @@ fn planned_having<B: Backend + SqlLiteralParse>(
             op: having.op,
             threshold: B::parse_literal(
                 &having.literal,
-                crate::backend::ScalarKind::from_builtin(agg_kind),
+                crate::backend::ScalarKind::from(agg_kind),
             )?,
         },
         crate::compiler::sql_shape::ExtremeHavingSubject::RowCount => {
@@ -441,7 +441,7 @@ fn render_grouped_scalar_bootstrap<B: Backend>(
     // moment it crosses into the result.
     select.having = None;
     let mut kinds = group_kinds.to_vec();
-    kinds.extend([agg_kind, crate::backend::ScalarKind::Int]);
+    kinds.extend([agg_kind, crate::backend::BuiltinKind::Int]);
     Ok(crate::AggregateBootstrap {
         sql: statement.to_string(),
         kinds,
@@ -765,9 +765,8 @@ where
 /// be classified here instead of silently joining whichever side is the
 /// default.
 const fn key_kind_has_literal_spelling(kind: Option<crate::backend::BuiltinKind>) -> bool {
-    use crate::backend::ScalarKind;
     match kind {
-        Some(ScalarKind::Int | ScalarKind::String | ScalarKind::Bytes) => true,
+        Some(BuiltinKind::Int | BuiltinKind::String | BuiltinKind::Bytes) => true,
         // Float is refused despite being spellable, because it cannot identify
         // a row: Infinity and negative infinity have no literal spelling, and
         // `{f:?}` renders them as bare tokens no backend parses as numerics,
@@ -777,17 +776,16 @@ const fn key_kind_has_literal_spelling(kind: Option<crate::backend::BuiltinKind>
         // render through typed constructors rather than literals. An unknown
         // column type is not a licence to guess, so `None` joins them.
         Some(
-            ScalarKind::Float
-            | ScalarKind::Bool
-            | ScalarKind::Uuid
-            | ScalarKind::Timestamp
-            | ScalarKind::TimestampTz
-            | ScalarKind::Date
-            | ScalarKind::Time
-            | ScalarKind::Decimal
-            | ScalarKind::Json
-            | ScalarKind::Jsonb
-            | ScalarKind::Custom(_),
+            BuiltinKind::Float
+            | BuiltinKind::Bool
+            | BuiltinKind::Uuid
+            | BuiltinKind::Timestamp
+            | BuiltinKind::TimestampTz
+            | BuiltinKind::Date
+            | BuiltinKind::Time
+            | BuiltinKind::Decimal
+            | BuiltinKind::Json
+            | BuiltinKind::Jsonb,
         )
         | None => false,
     }

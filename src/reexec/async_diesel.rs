@@ -99,7 +99,7 @@ async fn load_scalar_postgres_async(
     kind: BuiltinKind,
 ) -> diesel::QueryResult<Value<crate::backend::Postgres>> {
     let value = match kind {
-        ScalarKind::Int => {
+        BuiltinKind::Int => {
             let sql = alloc::format!("SELECT CAST(({}) AS BIGINT) AS v", query.sql());
             let query = ReadQuery::borrowed(&sql, query.binds());
             boxed_postgres_read_query_owned(&query)?
@@ -108,7 +108,7 @@ async fn load_scalar_postgres_async(
                 .v
                 .map_or(Value::Null, Value::Int)
         }
-        ScalarKind::Float => boxed_postgres_read_query_owned(query)?
+        BuiltinKind::Float => boxed_postgres_read_query_owned(query)?
             .get_result::<FloatRow>(conn)
             .await?
             .v
@@ -129,7 +129,7 @@ async fn load_scalar_mysql_async(
     kind: BuiltinKind,
 ) -> diesel::QueryResult<Value<crate::backend::MySql>> {
     let value = match kind {
-        ScalarKind::Int => {
+        BuiltinKind::Int => {
             let sql = alloc::format!("SELECT CAST(({}) AS SIGNED) AS v", query.sql());
             let query = ReadQuery::borrowed(&sql, query.binds());
             boxed_mysql_read_query_owned(&query)?
@@ -138,7 +138,7 @@ async fn load_scalar_mysql_async(
                 .v
                 .map_or(Value::Null, Value::Int)
         }
-        ScalarKind::Float => boxed_mysql_read_query_owned(query)?
+        BuiltinKind::Float => boxed_mysql_read_query_owned(query)?
             .get_result::<FloatRow>(conn)
             .await?
             .v
@@ -171,7 +171,7 @@ async fn load_scalar_row_postgres_async(
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            crate::backend::Postgres::decode_group_value(ScalarKind::from_builtin(*kind), value)
+            crate::backend::Postgres::decode_group_value(ScalarKind::from(*kind), value)
                 .unwrap_or(Value::Missing)
         })
         .collect())
@@ -196,7 +196,7 @@ async fn load_scalar_row_mysql_async(
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            crate::backend::MySql::decode_group_value(ScalarKind::from_builtin(*kind), value)
+            crate::backend::MySql::decode_group_value(ScalarKind::from(*kind), value)
                 .unwrap_or(Value::Missing)
         })
         .collect())

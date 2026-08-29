@@ -33,14 +33,14 @@ use alloc::vec::Vec;
 
 use core::ops::Not;
 use hashbrown::{HashMap, HashSet};
-use rls2fga::generator::action_relations::{ActionAnswer, ActionRelations, ActionStatement};
-use rls2fga::generator::notes::TranslationNote;
-use rls2fga::generator::records::{BoundQuery, RecordDerivation, RecordDescription, ReplayScope};
-use rls2fga::generator::relations::{RelationShapes, RowDecision};
-use rls2fga::generator::row_naming::RowNaming;
-use rls2fga::generator::unrestricted::UnrestrictedTable;
+use rls2fga_types::RowNaming;
+use rls2fga_types::TranslationNote;
+use rls2fga_types::UnrestrictedTable;
+use rls2fga_types::{ActionAnswer, ActionRelations, ActionStatement};
+use rls2fga_types::{BoundQuery, RecordDerivation, RecordDescription, ReplayScope};
+use rls2fga_types::{RelationShapes, RowDecision};
 
-use rls2fga::parser::identifiers::{ColumnName, RelationName};
+use rls2fga_types::{ColumnName, RelationName, TableId as ContractTableId};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::visibility::records::is_evaluable;
@@ -115,10 +115,10 @@ pub(crate) struct TableShapes {
 /// ```
 /// use std::sync::Arc;
 /// use subql::backend::Postgres;
-/// use rls2fga::classifier::patterns::ConfidenceLevel;
+/// use rls2fga_types::ConfidenceLevel;
 /// use rls2fga::translator::TranslatorBuilder;
 /// use sqlparser::dialect::PostgreSqlDialect;
-/// use rls2fga::generator::action_relations::ActionStatement;
+/// use rls2fga_types::ActionStatement;
 /// use subql::visibility::shapes::Shapes;
 /// use subql::{catalog_helpers, ParserDB};
 ///
@@ -233,7 +233,8 @@ impl<DB: DatabaseLike> Shapes<DB> {
         self.naming = naming
             .iter()
             .filter_map(|entry| {
-                catalog_helpers::table_id(&self.db, &entry.table).map(|id| (id, entry.clone()))
+                catalog_helpers::contract_table_id(&self.db, &entry.table)
+                    .map(|id| (id, entry.clone()))
             })
             .collect();
         self
@@ -308,8 +309,8 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// # Examples
     ///
     /// ```
-    /// use rls2fga::classifier::patterns::ConfidenceLevel;
-    /// use rls2fga::generator::action_relations::ActionStatement;
+    /// use rls2fga_types::ConfidenceLevel;
+    /// use rls2fga_types::ActionStatement;
     /// use rls2fga::translator::TranslatorBuilder;
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::backend::Postgres;
@@ -345,7 +346,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
     pub fn with_unrestricted_tables(mut self, tables: &[UnrestrictedTable]) -> Self {
         self.unrestricted = tables
             .iter()
-            .filter_map(|entry| catalog_helpers::table_id(&self.db, &entry.table))
+            .filter_map(|entry| catalog_helpers::contract_table_id(&self.db, &entry.table))
             .collect();
         self
     }
@@ -485,8 +486,8 @@ fn index_recipe<B: crate::backend::Backend, DB: DatabaseLike>(
     let Some(decision) = entry.decision.as_ref() else {
         return;
     };
-    let Some(table) =
-        usable_table::<B, DB>(decision, db).and_then(|name| catalog_helpers::table_id(db, name))
+    let Some(table) = usable_table::<B, DB>(decision, db)
+        .and_then(|name| catalog_helpers::contract_table_id(db, name))
     else {
         return;
     };
@@ -514,7 +515,7 @@ fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
                 ));
                 return;
             }
-            if let Some(id) = catalog_helpers::table_id(db, table) {
+            if let Some(id) = catalog_helpers::contract_table_id(db, table) {
                 by_table.entry(id).or_default().settled.push(shape.clone());
             }
         }
@@ -536,15 +537,15 @@ fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
             );
         }
         RecordDerivation::Joined { queries, .. } => {
-            let mut bound: Vec<&str> = Vec::with_capacity(queries.len());
+            let mut bound: Vec<&ContractTableId> = Vec::with_capacity(queries.len());
             for query in queries {
-                let Some(id) = catalog_helpers::table_id(db, &query.table) else {
+                let Some(id) = catalog_helpers::contract_table_id(db, &query.table) else {
                     continue;
                 };
                 let Some(key) = resolve_key(db, id, &query.key_columns) else {
                     continue;
                 };
-                bound.push(query.table.as_str());
+                bound.push(&query.table);
                 by_table
                     .entry(id)
                     .or_default()
@@ -557,7 +558,7 @@ fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
             // query dropped for a column this catalog does not have is a named
             // gap instead of a silent one.
             for table in &shape.tables {
-                if !bound.contains(&table.as_str()) {
+                if !bound.contains(&table) {
                     uncovered.push(name_gap(entry, shape, table, UncoveredReason::NoBoundQuery));
                 }
             }
@@ -664,8 +665,8 @@ fn resolve_key<DB: DatabaseLike>(
 fn usable_table<'a, B: crate::backend::Backend, DB: DatabaseLike>(
     decision: &'a RowDecision,
     db: &DB,
-) -> Option<&'a str> {
-    let mut table: Option<&str> = None;
+) -> Option<&'a ContractTableId> {
+    let mut table: Option<&ContractTableId> = None;
     match decision {
         RowDecision::Leaf { shapes, .. } | RowDecision::RequestGated { shapes, .. } => {
             for shape in shapes {
@@ -675,7 +676,7 @@ fn usable_table<'a, B: crate::backend::Backend, DB: DatabaseLike>(
                 let RecordDerivation::FromRow { table: name, .. } = &shape.derivation else {
                     return None;
                 };
-                if *table.get_or_insert(name) != name.as_str() {
+                if *table.get_or_insert(name) != name {
                     return None;
                 }
             }
@@ -706,9 +707,9 @@ mod tests {
 
     use core::ops::Not;
 
-    use rls2fga::classifier::patterns::ConfidenceLevel;
-    use rls2fga::generator::action_relations::{ActionAnswer, ActionStatement};
     use rls2fga::translator::TranslatorBuilder;
+    use rls2fga_types::ConfidenceLevel;
+    use rls2fga_types::{ActionAnswer, ActionStatement};
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::Shapes;
@@ -736,11 +737,12 @@ mod tests {
             .translate(&db)
             .unwrap();
         let (relations, naming, answers, unrestricted) = (
-            translation.relations(),
+            translation.relations().to_vec(),
             translation.row_naming(),
             translation.action_relations(),
             translation.unrestricted_tables(),
         );
+        drop(translation);
         Shapes::new::<Postgres>(db, &relations)
             .with_row_naming(&naming)
             .with_action_relations(&answers)

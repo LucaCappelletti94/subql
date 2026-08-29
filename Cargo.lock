@@ -1895,7 +1895,7 @@ checksum = "ad5208a115eaba24916f7456929832e310a81518c641f93fee4f89aa93aa3675"
 dependencies = [
  "cfg-if",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2021,7 +2021,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2638,7 +2638,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -4094,7 +4094,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -4113,7 +4113,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4259,7 +4259,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4297,9 +4297,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4569,13 +4569,23 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#a028e3a97c1cc890e86488128fa93482f738432b"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#47f41782ae23d4d82fd5dc1b6b8c6ddc4e31782c"
 dependencies = [
  "openfga-client",
+ "rls2fga-types",
  "serde",
  "serde_json",
  "sql-traits",
  "sqlparser",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rls2fga-types"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#47f41782ae23d4d82fd5dc1b6b8c6ddc4e31782c"
+dependencies = [
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -4642,7 +4652,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5135,7 +5145,7 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#c6372e4e6e711f38a61c11ba461bf2da19860b63"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e6b2a8da40f2af2ad44e8c119320dfb3604137dc"
 dependencies = [
  "geometric-traits",
  "sha2 0.10.9",
@@ -5156,8 +5166,6 @@ dependencies = [
 [[package]]
 name = "sqlite-diff-rs"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ead425795e9bfe99bf22505c2d22d3f1595aa5a930a71847092b2f51d45e8210"
 dependencies = [
  "diesel",
  "diesel-async",
@@ -5167,6 +5175,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -5300,6 +5309,7 @@ dependencies = [
  "proptest",
  "r2d2",
  "rls2fga",
+ "rls2fga-types",
  "roaring",
  "seahash",
  "serde",
@@ -5316,6 +5326,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -5429,10 +5440,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6123,6 +6134,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wal2json-events"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e07472d540f81a13c811ca9132d9839326a2be5f61823bc6f9c94a6c67886269"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6328,7 +6350,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

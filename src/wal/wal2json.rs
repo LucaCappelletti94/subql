@@ -1,6 +1,6 @@
-//! [`CdcEvent`] for the `sqlite-diff-rs` wal2json message types.
+//! [`CdcEvent`] for the `wal2json-events` message types.
 //!
-//! subql parses wal2json JSON with `sqlite_diff_rs::wal2json::{parse_v2,
+//! subql parses wal2json JSON with `wal2json_events::{parse_v2,
 //! parse_v1}` and views the resulting [`MessageV2`] and [`ChangeV1`] as
 //! [`CdcEvent`]s, resolving table and column names to catalog ordinals and
 //! decoding each cell against the catalog on demand. This replaces the former
@@ -14,7 +14,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use sql_traits::prelude::DatabaseLike;
-use sqlite_diff_rs::wal2json::{Action, ChangeV1, Column, MessageV2};
+use wal2json_events::{Action, ChangeV1, Column, MessageV2, RowV2};
 
 use super::pg_type::json_value_to_pg_value_by_kind;
 use super::{changed_columns_by_name, resolve_table, WalParseError};
@@ -28,22 +28,22 @@ use crate::types::{ColumnId, EventKind, TableId};
 
 const fn v2_row_kind(action: Action) -> Option<EventKind> {
     match action {
-        Action::I => Some(EventKind::Insert),
-        Action::U => Some(EventKind::Update),
-        Action::D => Some(EventKind::Delete),
-        Action::T => Some(EventKind::Truncate),
+        Action::Insert => Some(EventKind::Insert),
+        Action::Update => Some(EventKind::Update),
+        Action::Delete => Some(EventKind::Delete),
+        Action::Truncate => Some(EventKind::Truncate),
         // Begin, Commit, and Message are transaction boundaries, not rows.
-        Action::B | Action::C | Action::M => None,
+        Action::Begin | Action::Commit | Action::Message => None,
     }
 }
 
-fn v1_row_kind(kind: &str) -> Option<EventKind> {
-    match kind {
-        "insert" => Some(EventKind::Insert),
-        "update" => Some(EventKind::Update),
-        "delete" => Some(EventKind::Delete),
-        "truncate" => Some(EventKind::Truncate),
-        _ => None,
+fn v1_row_kind(change: &ChangeV1) -> Option<EventKind> {
+    match change {
+        ChangeV1::Insert { .. } => Some(EventKind::Insert),
+        ChangeV1::Update { .. } => Some(EventKind::Update),
+        ChangeV1::Delete { .. } => Some(EventKind::Delete),
+        // Not a row change.
+        ChangeV1::Message { .. } => None,
     }
 }
 
@@ -59,9 +59,9 @@ fn v1_row_kind(kind: &str) -> Option<EventKind> {
 pub fn parse_wal2json_v2(bytes: &[u8]) -> Result<Vec<MessageV2>, WalParseError> {
     let text =
         core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-    let msg = sqlite_diff_rs::wal2json::parse_v2(text)
-        .map_err(|e| WalParseError::JsonError(e.to_string()))?;
-    Ok(if v2_row_kind(msg.action).is_some() {
+    let msg =
+        wal2json_events::parse_v2(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
+    Ok(if v2_row_kind(msg.action()).is_some() {
         alloc::vec![msg]
     } else {
         Vec::new()
@@ -79,12 +79,12 @@ pub fn parse_wal2json_v2(bytes: &[u8]) -> Result<Vec<MessageV2>, WalParseError> 
 pub fn parse_wal2json_v1(bytes: &[u8]) -> Result<Vec<ChangeV1>, WalParseError> {
     let text =
         core::str::from_utf8(bytes).map_err(|e| WalParseError::InvalidUtf8(e.to_string()))?;
-    let txn = sqlite_diff_rs::wal2json::parse_v1(text)
-        .map_err(|e| WalParseError::JsonError(e.to_string()))?;
+    let txn =
+        wal2json_events::parse_v1(text).map_err(|e| WalParseError::JsonError(e.to_string()))?;
     Ok(txn
         .change
         .into_iter()
-        .filter(|c| v1_row_kind(&c.kind).is_some())
+        .filter(|c| v1_row_kind(c).is_some())
         .collect())
 }
 
@@ -116,27 +116,46 @@ fn decode_cell<DB: DatabaseLike>(
     }
 }
 
+/// The cell `name` carries in `columns`, if any. An entry without a value
+/// (as in the `pk` listing) reads as an absent cell.
 fn column_value<'a>(columns: &'a [Column], name: &str) -> Option<&'a serde_json::Value> {
-    columns.iter().find(|c| c.name == name).map(|c| &c.value)
+    columns
+        .iter()
+        .find(|c| c.name == name)
+        .and_then(|c| c.value.as_ref())
 }
 
 // ---------------------------------------------------------------------------
 // wal2json v2
 // ---------------------------------------------------------------------------
 
+/// The row payload, for the row actions that carry one.
+fn v2_row(msg: &MessageV2) -> Option<&RowV2> {
+    match msg {
+        MessageV2::Insert(row) | MessageV2::Update(row) | MessageV2::Delete(row) => Some(row),
+        MessageV2::Begin(_)
+        | MessageV2::Commit(_)
+        | MessageV2::Truncate(_)
+        | MessageV2::Message(_) => None,
+    }
+}
+
 fn v2_image(msg: &MessageV2, row: RowKind) -> Option<&[Column]> {
-    match (msg.action, row) {
-        (Action::I, RowKind::New | RowKind::Pk) | (Action::U, RowKind::New) => {
-            msg.columns.as_deref()
+    let payload = v2_row(msg)?;
+    match (msg.action(), row) {
+        (Action::Insert, RowKind::New | RowKind::Pk) | (Action::Update, RowKind::New) => {
+            payload.columns.as_deref()
         }
-        (Action::D | Action::U, RowKind::Old | RowKind::Pk) => msg.identity.as_deref(),
+        (Action::Delete | Action::Update, RowKind::Old | RowKind::Pk) => {
+            payload.identity.as_deref()
+        }
         _ => None,
     }
 }
 
 fn v2_table_id<DB: DatabaseLike>(msg: &MessageV2, db: &DB) -> Option<TableId> {
-    let schema = msg.schema.as_deref().unwrap_or("");
-    let table = msg.table.as_deref()?;
+    let schema = msg.schema().unwrap_or("");
+    let table = msg.table()?;
     resolve_table(schema, table, db).ok()
 }
 
@@ -145,7 +164,7 @@ impl CdcEvent for MessageV2 {
     type Checkpoint = crate::PgLsn;
 
     fn kind(&self) -> EventKind {
-        v2_row_kind(self.action).expect(
+        v2_row_kind(self.action()).expect(
             "CdcEvent::kind called on a non-row wal2json v2 message. Filter with parse_wal2json_v2 first",
         )
     }
@@ -155,11 +174,18 @@ impl CdcEvent for MessageV2 {
     }
 
     fn checkpoint(&self) -> Option<Self::Checkpoint> {
-        self.lsn.as_deref().and_then(crate::PgLsn::parse)
+        let lsn = match self {
+            MessageV2::Insert(row) | MessageV2::Update(row) | MessageV2::Delete(row) => {
+                row.lsn.as_deref()
+            }
+            MessageV2::Truncate(truncate) => truncate.lsn.as_deref(),
+            MessageV2::Begin(_) | MessageV2::Commit(_) | MessageV2::Message(_) => None,
+        };
+        lsn.and_then(crate::PgLsn::parse)
     }
 
     fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        if self.action == Action::T {
+        if self.action() == Action::Truncate {
             return Vec::new();
         }
         v2_table_id(self, db)
@@ -168,10 +194,14 @@ impl CdcEvent for MessageV2 {
     }
 
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        if self.action != Action::U {
+        if self.action() != Action::Update {
             return Vec::new();
         }
-        let (Some(new_cols), Some(old_cols)) = (self.columns.as_deref(), self.identity.as_deref())
+        let Some(payload) = v2_row(self) else {
+            return Vec::new();
+        };
+        let (Some(new_cols), Some(old_cols)) =
+            (payload.columns.as_deref(), payload.identity.as_deref())
         else {
             return Vec::new();
         };
@@ -223,17 +253,24 @@ fn v1_image(
     change: &ChangeV1,
     row: RowKind,
 ) -> Option<(&[alloc::string::String], &[serde_json::Value])> {
-    let kind = v1_row_kind(&change.kind)?;
-    match (kind, row) {
-        (EventKind::Insert, RowKind::New | RowKind::Pk) | (EventKind::Update, RowKind::New) => {
-            Some((&change.columnnames, &change.columnvalues))
-        }
-        (EventKind::Delete | EventKind::Update, RowKind::Old | RowKind::Pk) => change
-            .oldkeys
-            .as_ref()
-            .map(|ok| (ok.keynames.as_slice(), ok.keyvalues.as_slice())),
+    match (change, row) {
+        (ChangeV1::Insert { columns, .. }, RowKind::New | RowKind::Pk)
+        | (ChangeV1::Update { columns, .. }, RowKind::New) => Some((
+            columns.columnnames.as_slice(),
+            columns.columnvalues.as_slice(),
+        )),
+        (
+            ChangeV1::Update { oldkeys, .. } | ChangeV1::Delete { oldkeys, .. },
+            RowKind::Old | RowKind::Pk,
+        ) => Some((oldkeys.keynames.as_slice(), oldkeys.keyvalues.as_slice())),
         _ => None,
     }
+}
+
+/// The `(schema, table)` naming of a v1 row change, for catalog resolution.
+/// The schema is empty when `include-schemas=false` left it off the wire.
+fn v1_naming(change: &ChangeV1) -> Option<(&str, &str)> {
+    Some((change.schema().unwrap_or(""), change.table()?))
 }
 
 fn v1_value<'a>(
@@ -252,13 +289,15 @@ impl CdcEvent for ChangeV1 {
     type Checkpoint = crate::NoCheckpoint;
 
     fn kind(&self) -> EventKind {
-        v1_row_kind(&self.kind).expect(
+        v1_row_kind(self).expect(
             "CdcEvent::kind called on a non-row wal2json v1 change. Filter with parse_wal2json_v1 first",
         )
     }
 
     fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
-        resolve_table(&self.schema, &self.table, db).unwrap_or(TableId::MAX)
+        v1_naming(self)
+            .and_then(|(schema, table)| resolve_table(schema, table, db).ok())
+            .unwrap_or(TableId::MAX)
     }
 
     fn checkpoint(&self) -> Option<Self::Checkpoint> {
@@ -266,35 +305,34 @@ impl CdcEvent for ChangeV1 {
     }
 
     fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        if v1_row_kind(&self.kind) == Some(EventKind::Truncate) {
-            return Vec::new();
-        }
-        resolve_table(&self.schema, &self.table, db)
-            .ok()
+        v1_naming(self)
+            .and_then(|(schema, table)| resolve_table(schema, table, db).ok())
             .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id))
             .unwrap_or_default()
     }
 
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        if v1_row_kind(&self.kind) != Some(EventKind::Update) {
-            return Vec::new();
-        }
-        let Some(oldkeys) = self.oldkeys.as_ref() else {
+        let ChangeV1::Update {
+            columns, oldkeys, ..
+        } = self
+        else {
             return Vec::new();
         };
-        let Ok(table_id) = resolve_table(&self.schema, &self.table, db) else {
+        let Some(table_id) =
+            v1_naming(self).and_then(|(schema, table)| resolve_table(schema, table, db).ok())
+        else {
             return Vec::new();
         };
         let Some(arity) = catalog_helpers::table_arity(db, table_id) else {
             return Vec::new();
         };
-        if self.columnnames.len() != arity || oldkeys.keynames.len() != arity {
+        if columns.columnnames.len() != arity || oldkeys.keynames.len() != arity {
             return Vec::new();
         }
         changed_columns_by_name(db, table_id, arity, |name| {
             (
                 v1_value(&oldkeys.keynames, &oldkeys.keyvalues, name),
-                v1_value(&self.columnnames, &self.columnvalues, name),
+                v1_value(&columns.columnnames, &columns.columnvalues, name),
             )
         })
     }
@@ -305,7 +343,9 @@ impl CdcEvent for ChangeV1 {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Postgres>, crate::ValueError> {
-        let Ok(table_id) = resolve_table(&self.schema, &self.table, db) else {
+        let Some(table_id) =
+            v1_naming(self).and_then(|(schema, table)| resolve_table(schema, table, db).ok())
+        else {
             return Ok(Value::Missing);
         };
         if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
@@ -387,8 +427,8 @@ mod tests {
 
     #[test]
     fn v2_boundary_messages_drop() {
-        assert!(parse_wal2json_v2(br#"{"action":"B"}"#).unwrap().is_empty());
-        assert!(parse_wal2json_v2(br#"{"action":"C"}"#).unwrap().is_empty());
+        assert_eq!(parse_wal2json_v2(br#"{"action":"B"}"#).unwrap(), []);
+        assert_eq!(parse_wal2json_v2(br#"{"action":"C"}"#).unwrap(), []);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! A [`VisibilityPolicy`] that answers from the changed row where the
 //! schema allows, and delegates the rest.
 //!
-//! [`rls2fga`] reports, per relation of the model it emits, whether one row
+//! `rls2fga` reports, per relation of the model it emits, whether one row
 //! decides who the relation grants to and how those subjects compose. Where
 //! it does, this answers with no round trip: evaluate the recipe against the
 //! row image and test the resulting subjects against the watcher list.
@@ -34,11 +34,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use rls2fga::generator::action_relations::{
-    ActionAnswer, ActionJudgement, ActionStatement, RowVersion,
-};
-use rls2fga::generator::records::RecordDescription;
-use rls2fga::generator::relations::{RequestComparison, RowDecision};
+use rls2fga_types::RecordDescription;
+use rls2fga_types::{ActionAnswer, ActionJudgement, ActionStatement, RowVersion};
+use rls2fga_types::{RequestComparison, RowDecision};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::visibility::records::records_from_row_view;
@@ -280,13 +278,13 @@ where
 /// ```
 /// # use core::convert::Infallible;
 /// # use core::future::Future;
-/// use rls2fga::classifier::patterns::ConfidenceLevel;
+/// use rls2fga_types::ConfidenceLevel;
 /// use rls2fga::translator::TranslatorBuilder;
 /// use sqlparser::dialect::PostgreSqlDialect;
 /// use subql::backend::{Postgres, Value};
 /// use subql::testing::TestEvent;
 /// use std::sync::Arc;
-/// use rls2fga::generator::action_relations::ActionStatement;
+/// use rls2fga_types::ActionStatement;
 /// use subql::visibility::policy::RowPolicy;
 /// use subql::visibility::shapes::Shapes;
 /// use subql::visibility::{EventRow, RowView, RowWrite, Verdict, VisibilityPolicy};
@@ -803,14 +801,14 @@ mod tests {
     use core::task::{Context, Poll, Waker};
 
     use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
-    use rls2fga::classifier::patterns::ConfidenceLevel;
-    use rls2fga::generator::records::{
+    use rls2fga::generator::well_known::can_select_relation;
+    use rls2fga::translator::TranslatorBuilder;
+    use rls2fga_types::ConfidenceLevel;
+    use rls2fga_types::{
         ColumnKind, ContextRendering, ObjectKey, RecordContext, RecordContextEntry,
         RecordDerivation, RecordDescription, RecordTemplate, SubjectKey, ValueSource,
     };
-    use rls2fga::generator::relations::{RelationShapes, RowDecision};
-    use rls2fga::generator::well_known::can_select_relation;
-    use rls2fga::translator::TranslatorBuilder;
+    use rls2fga_types::{RelationShapes, RowDecision};
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{image_of, RequestValues, RowPolicy, Subject};
@@ -819,8 +817,8 @@ mod tests {
     use crate::visibility::shapes::{Shapes, SharedShapes};
     use crate::visibility::{EventRow, RowView, RowWrite, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ColumnId, ParserDB, TableId, ValueError};
-    use rls2fga::generator::action_relations::{ActionStatement, RowVersion};
-    use rls2fga::generator::relations::RequestComparison;
+    use rls2fga_types::RequestComparison;
+    use rls2fga_types::{ActionStatement, RowVersion};
 
     // -----------------------------------------------------------------
     // Harness
@@ -1094,7 +1092,8 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
             .build()
             .translate(&db)
             .unwrap()
-            .relations();
+            .relations()
+            .to_vec();
         (db, relations)
     }
 
@@ -1510,9 +1509,9 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
             decision: Some(RowDecision::Leaf {
                 relation: test_names::relation("owner"),
                 shapes: vec![RecordDescription {
-                    tables: vec!["docs".to_string()],
+                    tables: vec![test_names::table("docs")],
                     derivation: RecordDerivation::FromRow {
-                        table: "docs".to_string(),
+                        table: test_names::table("docs"),
                         template: Box::new(RecordTemplate {
                             object_type: "docs".to_string(),
                             object_key: id_key(),
@@ -1555,7 +1554,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
                 }
                 Err(ValueError::Builtin {
                     column: col,
-                    kind: crate::backend::ScalarKind::String,
+                    kind: crate::backend::BuiltinKind::String,
                 })
             }
         }
@@ -2344,7 +2343,8 @@ CREATE POLICY notes_p ON notes USING (
             .build()
             .translate(&db)
             .unwrap()
-            .relations();
+            .relations()
+            .to_vec();
         (db, relations)
     }
 
@@ -2501,14 +2501,16 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
         let db = ParserDB::parse::<PostgreSqlDialect>(SCALAR_GATE).unwrap();
         let department =
             SessionAttribute::setting("app.department", SessionAttributeKind::ScalarAttribute)
-                .with_parameter("app_subjects");
+                .with_parameter("app_subjects")
+                .expect("a valid CEL parameter name");
         let relations = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .with_session_attributes([department.clone()])
             .build()
             .translate(&db)
             .unwrap()
-            .relations();
+            .relations()
+            .to_vec();
         let notes = notes_id(&db);
         let event = insert(notes, notes_row("physics"));
         let policy = RowPolicy::new(
@@ -2872,9 +2874,9 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
     /// so nothing but the context can decide it.
     fn gated_shape_on(table: &str, key: &str, column: &str) -> RecordDescription {
         RecordDescription {
-            tables: vec![table.to_string()],
+            tables: vec![test_names::table(table)],
             derivation: RecordDerivation::FromRow {
-                table: table.to_string(),
+                table: test_names::table(table),
                 template: Box::new(RecordTemplate {
                     object_type: table.to_string(),
                     object_key: id_key(),
@@ -2899,9 +2901,9 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
     /// column.
     fn shape_on(table: &str, subject: &str) -> RecordDescription {
         RecordDescription {
-            tables: vec![table.to_string()],
+            tables: vec![test_names::table(table)],
             derivation: RecordDerivation::FromRow {
-                table: table.to_string(),
+                table: test_names::table(table),
                 template: Box::new(RecordTemplate {
                     object_type: table.to_string(),
                     object_key: id_key(),
@@ -2939,7 +2941,7 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
     #[test]
     fn a_recipe_no_single_table_keys_is_delegated() {
         let joined = RecordDescription {
-            tables: vec!["docs".to_string()],
+            tables: vec![test_names::table("docs")],
             derivation: RecordDerivation::Joined {
                 queries: Vec::new(),
                 reason: "two rows".to_string(),

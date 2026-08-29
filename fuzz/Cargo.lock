@@ -1182,8 +1182,6 @@ dependencies = [
 [[package]]
 name = "sqlite-diff-rs"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ead425795e9bfe99bf22505c2d22d3f1595aa5a930a71847092b2f51d45e8210"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
@@ -1191,6 +1189,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -1282,6 +1281,7 @@ dependencies = [
  "thiserror",
  "toml",
  "uuid",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -1484,6 +1484,14 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wal2json-events"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "wasm-bindgen"

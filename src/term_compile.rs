@@ -11,11 +11,12 @@
 
 use alloc::format;
 use alloc::string::ToString;
+use alloc::vec::Vec;
 
-use rls2fga::generator::records::{Guard, RecordDerivation, ValueSource};
-use rls2fga::generator::relations::RelationShapes;
 use rls2fga::term::{describe_membership_term, TermChain, TermShapes};
 use rls2fga::translator::Translator;
+use rls2fga::types::RelationShapes;
+use rls2fga::types::{Guard, RecordDerivation, ValueSource};
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::Expr;
 
@@ -153,7 +154,7 @@ fn caller_plan<DB: DatabaseLike>(
             "are guarded on more than the compared value being present",
         ));
     }
-    if catalog_helpers::table_id(database, row_table) != Some(table) {
+    if catalog_helpers::contract_table_id(database, row_table) != Some(table) {
         return Err(refuse("read a table other than the subscribed one"));
     }
     if column_of(template.subject_key.part(), database, table) != Some(term.columns[0]) {
@@ -292,7 +293,7 @@ fn read_from_one_row<DB: DatabaseLike>(
         return Err(refuse("need more than one row"));
     };
 
-    let table_id = catalog_helpers::table_id(database, table)
+    let table_id = catalog_helpers::contract_table_id(database, table)
         .ok_or_else(|| refuse("read a table the catalog does not know"))?;
     let member_keys = template
         .object_key

@@ -14,7 +14,7 @@
 //! [`WireSchema`] and decoding each column payload through a
 //! [`WireAdapter`]. The schema declares one
 //! [`WireType`] per column, a source-independent semantic type that
-//! selects the decoder. subql's catalog is [`ScalarKind`]-based, and
+//! selects the decoder. subql's catalog is [`BuiltinKind`]-based, and
 //! [`scalar_kind_to_wire_type`] maps one to the other, so a single
 //! [`WireCatalog`] over any [`DatabaseLike`] drives every wire source.
 //!
@@ -52,31 +52,31 @@ use sqlite_diff_rs::{
     WireSchema, WireType,
 };
 
-use crate::backend::{BuiltinKind, ScalarKind};
+use crate::backend::BuiltinKind;
 use crate::catalog_helpers;
 use crate::types::{ColumnId, TableId};
 
-/// Map a subql catalog [`ScalarKind`] to the source-independent
+/// Map a subql catalog [`BuiltinKind`] to the source-independent
 /// [`WireType`] that selects a decoder in `sqlite-diff-rs`'s `digest`.
 ///
-/// The mapping is total: every `ScalarKind` has a `WireType`. subql has
+/// The mapping is total: every `BuiltinKind` has a `WireType`. subql has
 /// no interval scalar, so [`WireType::Interval`] is never produced here.
 #[must_use]
 pub const fn scalar_kind_to_wire_type(kind: BuiltinKind) -> WireType {
     match kind {
-        ScalarKind::Bool => WireType::Bool,
-        ScalarKind::Int => WireType::Int,
-        ScalarKind::Float => WireType::Real,
-        ScalarKind::String => WireType::Text,
-        ScalarKind::Bytes => WireType::Bytes,
-        ScalarKind::Uuid => WireType::Uuid,
-        ScalarKind::Timestamp => WireType::Timestamp,
-        ScalarKind::TimestampTz => WireType::TimestampTz,
-        ScalarKind::Date => WireType::Date,
-        ScalarKind::Time => WireType::Time,
-        ScalarKind::Decimal => WireType::Decimal,
-        ScalarKind::Json => WireType::Json,
-        ScalarKind::Jsonb => WireType::Jsonb,
+        BuiltinKind::Bool => WireType::Bool,
+        BuiltinKind::Int => WireType::Int,
+        BuiltinKind::Float => WireType::Real,
+        BuiltinKind::String => WireType::Text,
+        BuiltinKind::Bytes => WireType::Bytes,
+        BuiltinKind::Uuid => WireType::Uuid,
+        BuiltinKind::Timestamp => WireType::Timestamp,
+        BuiltinKind::TimestampTz => WireType::TimestampTz,
+        BuiltinKind::Date => WireType::Date,
+        BuiltinKind::Time => WireType::Time,
+        BuiltinKind::Decimal => WireType::Decimal,
+        BuiltinKind::Json => WireType::Json,
+        BuiltinKind::Jsonb => WireType::Jsonb,
     }
 }
 
@@ -163,7 +163,7 @@ pub struct WireCatalog {
 impl WireCatalog {
     /// Build a catalog over every table in `database`.
     ///
-    /// Columns whose declared SQL type does not map to a [`ScalarKind`]
+    /// Columns whose declared SQL type does not map to a [`BuiltinKind`]
     /// fall back to [`WireType::Text`], the lossless affinity for an
     /// unmodeled type on the SQLite side.
     #[must_use]
@@ -452,7 +452,7 @@ pub fn pgoutput_changeset<DB: DatabaseLike>(
 /// The Maxwell decoder registry subql feeds to `digest`.
 ///
 /// MySQL has no native UUID type, so a UUID stored as `BINARY(16)`
-/// classifies as [`ScalarKind::Bytes`] and rides [`WireType::Bytes`],
+/// classifies as [`BuiltinKind::Bytes`] and rides [`WireType::Bytes`],
 /// which the default `MySqlBinaryDecoder` base64-decodes to a compact
 /// 16-byte `Value::Blob`. That matches the SQLite client's blob storage
 /// and the way subql's `MysqlAdapter` rebinds the blob as MySQL binary,
@@ -568,7 +568,7 @@ pub fn pgbinary_adapter() -> TypeMap<PgBinary, String, Vec<u8>> {
 ///
 /// [`ConversionError::TableNotFound`] when `table` is not in the catalog,
 /// [`ConversionError::UnsupportedType`] when a catalog column's declared
-/// type has no [`ScalarKind`], [`ConversionError::MissingColumns`] when a
+/// type has no [`BuiltinKind`], [`ConversionError::MissingColumns`] when a
 /// row's width does not match `column_names`, and
 /// [`ConversionError::Decode`] when a column's bytes do not decode for its
 /// type.
@@ -657,9 +657,9 @@ pub fn pgbinary_patchset<DB: DatabaseLike>(
 mod tests {
     use super::*;
     use sql_traits::structs::ParserDB;
-    use sqlite_diff_rs::wal2json::parse_v2;
     use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, PatchsetOp};
     use sqlparser::dialect::PostgreSqlDialect;
+    use wal2json_events::parse_v2;
 
     fn orders_db() -> ParserDB {
         ParserDB::parse::<PostgreSqlDialect>(
@@ -676,12 +676,15 @@ mod tests {
 
     #[test]
     fn scalar_kind_maps_cover_every_kind() {
-        // A change to `ScalarKind` must be reflected here. The match in
+        // A change to `BuiltinKind` must be reflected here. The match in
         // `scalar_kind_to_wire_type` is exhaustive, so this only pins the
         // representative mappings the wal2json decoders depend on.
-        assert_eq!(scalar_kind_to_wire_type(ScalarKind::Uuid), WireType::Uuid);
-        assert_eq!(scalar_kind_to_wire_type(ScalarKind::Float), WireType::Real);
-        assert_eq!(scalar_kind_to_wire_type(ScalarKind::Jsonb), WireType::Jsonb);
+        assert_eq!(scalar_kind_to_wire_type(BuiltinKind::Uuid), WireType::Uuid);
+        assert_eq!(scalar_kind_to_wire_type(BuiltinKind::Float), WireType::Real);
+        assert_eq!(
+            scalar_kind_to_wire_type(BuiltinKind::Jsonb),
+            WireType::Jsonb
+        );
     }
 
     #[test]

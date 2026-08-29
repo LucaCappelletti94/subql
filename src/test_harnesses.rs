@@ -487,7 +487,7 @@ pub fn harness_wal_json_postparse(data: &[u8]) {
 /// Mutation operation against the virtual `orders` table used by
 /// [`harness_aggregate_consistency`]. `Truncate` is absent because the engine
 /// answers it from the held totals rather than from row images, which the unit
-/// tests in `tests/aggregate_totals.rs` cover directly.
+/// tests in `tests/it/aggregate_totals.rs` cover directly.
 ///
 /// `amount` is bounded to `i16` (not `i32`) so that squared values stay
 /// well inside f64's exact-integer range (2^53). Streaming variance over

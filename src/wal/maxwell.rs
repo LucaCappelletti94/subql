@@ -286,7 +286,7 @@ mod tests {
             err,
             crate::ValueError::Builtin {
                 column: 1,
-                kind: crate::backend::ScalarKind::Int
+                kind: crate::backend::BuiltinKind::Int
             }
         );
     }
