@@ -5154,6 +5154,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
+name = "sql-scalar-text"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c8a68d907abe87d261288a6753ba0ce1451ecef845ad13dba2be60b652605c"
+dependencies = [
+ "bigdecimal",
+ "chrono",
+]
+
+[[package]]
 name = "sql-traits"
 version = "0.1.0"
 source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e6b2a8da40f2af2ad44e8c119320dfb3604137dc"
@@ -5329,6 +5339,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slab",
+ "sql-scalar-text",
  "sql-traits",
  "sqlite-diff-rs",
  "sqlparser",

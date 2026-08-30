@@ -96,6 +96,8 @@ sqlparser = { version = "0.62", default-features = false, features = ["visitor"]
 # feature is propagated below.
 sql-traits = { git = "https://github.com/earth-metabolome-initiative/sql-traits", branch = "main", default-features = false }
 
+sql-scalar-text = { version = "0.1.0", features = ["decimal"] }
+
 # Compressed bitmaps for predicate/user sets. Pinned below 0.11.4 because
 # that release bumped its MSRV to 1.90. Subql's MSRV gate is 1.88.
 roaring = ">=0.11, <0.11.4"

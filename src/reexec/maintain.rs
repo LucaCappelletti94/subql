@@ -747,10 +747,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 self.pending = Some(pending);
                 return Err(crate::AggregateInstallError::GroupedRowCount(subscription));
             };
-            let count = count
-                .scalar_text()
-                .parse::<i64>()
-                .ok()
+            let count = sql_scalar_text::parse_i64(&count.scalar_text())
                 .filter(|count| *count > 0)
                 .ok_or(crate::AggregateInstallError::GroupedRowCount(subscription))?;
             if !groups.contains_key(&key) && groups.len() >= group_limit {
@@ -841,10 +838,8 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
         let Value::Int(count) = &row[1] else {
             return Err(crate::AggregateInstallError::GroupedRowCount(subscription));
         };
-        let count = count
-            .scalar_text()
-            .parse::<i64>()
-            .map_err(|_| crate::AggregateInstallError::GroupedRowCount(subscription))?;
+        let count = sql_scalar_text::parse_i64(&count.scalar_text())
+            .ok_or(crate::AggregateInstallError::GroupedRowCount(subscription))?;
         if count <= 0 {
             self.pending_reads.remove(key);
             let change = self.groups.remove(key).and_then(|group| {

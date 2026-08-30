@@ -24,8 +24,7 @@
 //!   decimal column is rejected.
 //! * `TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, and `TIME` get native temporal
 //!   binds when the wire carries a `Value::Text` holding the verbatim
-//!   Postgres text form, parsed through the shared `chrono` parsers in
-//!   `crate::temporal`. `TIMESTAMPTZ` normalizes to a UTC instant.
+//!   Postgres text form, parsed through `sql_scalar_text`. `TIMESTAMPTZ` normalizes to a UTC instant.
 //!   Each column is classified through the catalog's [`crate::backend::ScalarKind`],
 //!   since Postgres has no implicit assignment cast from text to these
 //!   types. Any other wire shape on such a column is rejected.
@@ -54,7 +53,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::marker::PhantomData;
-use core::str::FromStr;
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -70,8 +68,8 @@ use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
 use crate::backend::{BuiltinKind, ScalarKindOf};
 use crate::catalog_helpers;
-use crate::temporal::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 use crate::types::ColumnId;
+use sql_scalar_text::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 
 /// Adapter that resolves column names and native diesel binders for a
 /// Postgres target from a subql catalog.
@@ -204,7 +202,7 @@ where
         {
             Some(BuiltinKind::Decimal) => {
                 text_scalar_bind(col_name, value, "decimal TEXT or NULL", |s| {
-                    Some(Box::new(DecimalBinder(BigDecimal::from_str(s).ok()?))
+                    Some(Box::new(DecimalBinder(sql_scalar_text::parse_decimal(s)?))
                         as Box<dyn Binder<Pg> + Send + 'a>)
                 })
             }

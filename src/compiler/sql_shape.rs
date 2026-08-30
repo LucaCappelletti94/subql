@@ -837,7 +837,7 @@ fn having_from_expr<DB: DatabaseLike>(
                 ))
             }
         };
-    if threshold.parse::<f64>().is_err() {
+    if sql_scalar_text::parse_f64(&threshold).is_none() {
         return Err(RegisterError::UnsupportedSql(alloc::format!(
             "HAVING threshold {threshold} is not a numeric constant"
         )));
