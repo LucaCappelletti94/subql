@@ -3968,7 +3968,8 @@ dependencies = [
 [[package]]
 name = "postgres-jsonb-canonical"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/postgres-jsonb-canonical?rev=3aa51e4#3aa51e4b6471d660d8bf0d0f908b4d4fe7f37fcd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cefe35610bb56653dd85d53b2c00504c05415ab9b4581de1a2c2cc83e86bbb5"
 dependencies = [
  "serde_json",
  "thiserror 2.0.20",
