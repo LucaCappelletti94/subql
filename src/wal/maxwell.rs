@@ -245,16 +245,18 @@ mod tests {
     fn control_messages_drop_and_bootstrap_insert_is_an_insert() {
         // A `type` the model does not know skips, so a tag a newer Maxwell
         // adds does not end the stream.
-        assert!(
+        assert_eq!(
             parse_messages(br#"{"database":"test","table":"orders","type":"ddl"}"#)
-                .expect("an unknown type is not an error")
-                .is_empty()
+                .expect("an unknown type is not an error"),
+            []
         );
-        assert!(parse_messages(
-            br#"{"type":"bootstrap-start","database":"test","table":"orders","data":{}}"#
-        )
-        .expect("bootstrap-start parses")
-        .is_empty());
+        assert_eq!(
+            parse_messages(
+                br#"{"type":"bootstrap-start","database":"test","table":"orders","data":{}}"#
+            )
+            .expect("bootstrap-start parses"),
+            []
+        );
         let db = orders();
         let ev = one(
             br#"{"database":"test","table":"orders","type":"bootstrap-insert",

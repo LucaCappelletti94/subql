@@ -46,7 +46,6 @@ pub use sql_traits::{
 // Internal modules
 mod errors;
 mod table_resolution;
-mod temporal;
 mod types;
 
 pub mod backend;

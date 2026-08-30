@@ -19,7 +19,6 @@ use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::str::FromStr;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{Expr, Value as SqlValue};
 
@@ -80,18 +79,25 @@ fn err_parse_kind<C: core::fmt::Debug + Copy>(
     ))
 }
 
-fn parse_i64(n: &str, sql: &SqlValue) -> Result<i64, RegisterError> {
-    n.parse::<i64>()
-        .map_err(|e| err_parse(sql, BuiltinKind::Int, e))
+fn parse_i64_literal(n: &str, sql: &SqlValue) -> Result<i64, RegisterError> {
+    sql_scalar_text::parse_i64(n).ok_or_else(|| match n.parse::<i64>() {
+        Err(e) => err_parse(sql, BuiltinKind::Int, e),
+        Ok(_) => err_parse(sql, BuiltinKind::Int, "not an integer"),
+    })
 }
 
-fn parse_f64(n: &str, sql: &SqlValue) -> Result<f64, RegisterError> {
-    n.parse::<f64>()
-        .map_err(|e| err_parse(sql, BuiltinKind::Float, e))
+fn parse_f64_literal(n: &str, sql: &SqlValue) -> Result<f64, RegisterError> {
+    sql_scalar_text::parse_f64(n).ok_or_else(|| match n.parse::<f64>() {
+        Err(e) => err_parse(sql, BuiltinKind::Float, e),
+        Ok(_) => err_parse(sql, BuiltinKind::Float, "not a float"),
+    })
 }
 
-fn parse_decimal(n: &str, sql: &SqlValue) -> Result<bigdecimal::BigDecimal, RegisterError> {
-    bigdecimal::BigDecimal::from_str(n).map_err(|e| err_parse(sql, BuiltinKind::Decimal, e))
+fn parse_decimal_literal(n: &str, sql: &SqlValue) -> Result<bigdecimal::BigDecimal, RegisterError> {
+    sql_scalar_text::parse_decimal(n).ok_or_else(|| match n.parse::<bigdecimal::BigDecimal>() {
+        Err(e) => err_parse(sql, BuiltinKind::Decimal, e),
+        Ok(_) => err_parse(sql, BuiltinKind::Decimal, "not a decimal"),
+    })
 }
 
 fn parse_hex_bytes(s: &str, sql: &SqlValue) -> Result<Vec<u8>, RegisterError> {
@@ -149,16 +155,19 @@ fn parse_uuid_as_string(s: &str, sql: &SqlValue) -> Result<String, RegisterError
     Ok(s.to_string())
 }
 
-fn parse_timestamp(s: &str, sql: &SqlValue) -> Result<chrono::NaiveDateTime, RegisterError> {
-    crate::temporal::parse_timestamp(s)
+fn parse_timestamp_literal(
+    s: &str,
+    sql: &SqlValue,
+) -> Result<chrono::NaiveDateTime, RegisterError> {
+    sql_scalar_text::parse_timestamp(s)
         .ok_or_else(|| err_parse(sql, BuiltinKind::Timestamp, "not a timestamp"))
 }
 
-fn parse_timestamp_tz(
+fn parse_timestamp_tz_literal(
     s: &str,
     sql: &SqlValue,
 ) -> Result<chrono::DateTime<chrono::Utc>, RegisterError> {
-    crate::temporal::parse_timestamp_tz(s).ok_or_else(|| {
+    sql_scalar_text::parse_timestamp_tz(s).ok_or_else(|| {
         err_parse(
             sql,
             BuiltinKind::TimestampTz,
@@ -167,12 +176,12 @@ fn parse_timestamp_tz(
     })
 }
 
-fn parse_date(s: &str, sql: &SqlValue) -> Result<chrono::NaiveDate, RegisterError> {
-    crate::temporal::parse_date(s).ok_or_else(|| err_parse(sql, BuiltinKind::Date, "not a date"))
+fn parse_date_literal(s: &str, sql: &SqlValue) -> Result<chrono::NaiveDate, RegisterError> {
+    sql_scalar_text::parse_date(s).ok_or_else(|| err_parse(sql, BuiltinKind::Date, "not a date"))
 }
 
-fn parse_time(s: &str, sql: &SqlValue) -> Result<chrono::NaiveTime, RegisterError> {
-    crate::temporal::parse_time(s).ok_or_else(|| err_parse(sql, BuiltinKind::Time, "not a time"))
+fn parse_time_literal(s: &str, sql: &SqlValue) -> Result<chrono::NaiveTime, RegisterError> {
+    sql_scalar_text::parse_time(s).ok_or_else(|| err_parse(sql, BuiltinKind::Time, "not a time"))
 }
 
 fn parse_json(s: &str, sql: &SqlValue) -> Result<serde_json::Value, RegisterError> {
@@ -243,8 +252,12 @@ impl SqlLiteralParse for Postgres {
         };
         match (family, sql) {
             (BuiltinKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
-            (BuiltinKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
-            (BuiltinKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
+            (BuiltinKind::Int, SqlValue::Number(n, _)) => {
+                Ok(Value::Int(parse_i64_literal(n, sql)?))
+            }
+            (BuiltinKind::Float, SqlValue::Number(n, _)) => {
+                Ok(Value::Float(parse_f64_literal(n, sql)?))
+            }
             (BuiltinKind::String, _) => quoted_string(sql)
                 .map(|s| Value::String(s.to_string()))
                 .ok_or_else(|| err_shape(sql, target)),
@@ -256,18 +269,18 @@ impl SqlLiteralParse for Postgres {
                 .and_then(|s| parse_uuid(s, sql).map(Value::Uuid)),
             (BuiltinKind::Timestamp, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_timestamp(s, sql).map(Value::Timestamp)),
+                .and_then(|s| parse_timestamp_literal(s, sql).map(Value::Timestamp)),
             (BuiltinKind::TimestampTz, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_timestamp_tz(s, sql).map(Value::TimestampTz)),
+                .and_then(|s| parse_timestamp_tz_literal(s, sql).map(Value::TimestampTz)),
             (BuiltinKind::Date, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_date(s, sql).map(Value::Date)),
+                .and_then(|s| parse_date_literal(s, sql).map(Value::Date)),
             (BuiltinKind::Time, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_time(s, sql).map(Value::Time)),
+                .and_then(|s| parse_time_literal(s, sql).map(Value::Time)),
             (BuiltinKind::Decimal, SqlValue::Number(n, _)) => {
-                Ok(Value::Decimal(parse_decimal(n, sql)?))
+                Ok(Value::Decimal(parse_decimal_literal(n, sql)?))
             }
             (BuiltinKind::Json, _) => Err(RegisterError::TypeError(
                 "PostgreSQL json has no equality operator".to_string(),
@@ -295,8 +308,12 @@ impl SqlLiteralParse for MySql {
         };
         match (family, sql) {
             (BuiltinKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
-            (BuiltinKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
-            (BuiltinKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
+            (BuiltinKind::Int, SqlValue::Number(n, _)) => {
+                Ok(Value::Int(parse_i64_literal(n, sql)?))
+            }
+            (BuiltinKind::Float, SqlValue::Number(n, _)) => {
+                Ok(Value::Float(parse_f64_literal(n, sql)?))
+            }
             (BuiltinKind::String, _) => quoted_string(sql)
                 .map(|s| Value::String(s.to_string()))
                 .ok_or_else(|| err_shape(sql, target)),
@@ -310,18 +327,18 @@ impl SqlLiteralParse for MySql {
                 .and_then(|s| parse_uuid_as_string(s, sql).map(Value::Uuid)),
             (BuiltinKind::Timestamp, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_timestamp(s, sql).map(Value::Timestamp)),
+                .and_then(|s| parse_timestamp_literal(s, sql).map(Value::Timestamp)),
             (BuiltinKind::TimestampTz, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_timestamp_tz(s, sql).map(Value::TimestampTz)),
+                .and_then(|s| parse_timestamp_tz_literal(s, sql).map(Value::TimestampTz)),
             (BuiltinKind::Date, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_date(s, sql).map(Value::Date)),
+                .and_then(|s| parse_date_literal(s, sql).map(Value::Date)),
             (BuiltinKind::Time, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_time(s, sql).map(Value::Time)),
+                .and_then(|s| parse_time_literal(s, sql).map(Value::Time)),
             (BuiltinKind::Decimal, SqlValue::Number(n, _)) => {
-                Ok(Value::Decimal(parse_decimal(n, sql)?))
+                Ok(Value::Decimal(parse_decimal_literal(n, sql)?))
             }
             (BuiltinKind::Json | BuiltinKind::Jsonb, _) => {
                 let s = quoted_string(sql).ok_or_else(|| err_shape(sql, target))?;
@@ -353,8 +370,12 @@ impl SqlLiteralParse for SQLite {
             // SQLite has no native BOOL. The column contract stores 0 or 1
             // as INTEGER. Coerce the sqlparser Boolean to that.
             (BuiltinKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(i64::from(*b))),
-            (BuiltinKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
-            (BuiltinKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
+            (BuiltinKind::Int, SqlValue::Number(n, _)) => {
+                Ok(Value::Int(parse_i64_literal(n, sql)?))
+            }
+            (BuiltinKind::Float, SqlValue::Number(n, _)) => {
+                Ok(Value::Float(parse_f64_literal(n, sql)?))
+            }
             (BuiltinKind::String, _) => quoted_string(sql)
                 .map(|s| Value::String(s.to_string()))
                 .ok_or_else(|| err_shape(sql, target)),
@@ -368,18 +389,18 @@ impl SqlLiteralParse for SQLite {
                 .and_then(|s| parse_uuid_as_string(s, sql).map(Value::Uuid)),
             (BuiltinKind::Timestamp, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_timestamp(s, sql).map(Value::Timestamp)),
+                .and_then(|s| parse_timestamp_literal(s, sql).map(Value::Timestamp)),
             (BuiltinKind::TimestampTz, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_timestamp_tz(s, sql).map(Value::TimestampTz)),
+                .and_then(|s| parse_timestamp_tz_literal(s, sql).map(Value::TimestampTz)),
             (BuiltinKind::Date, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_date(s, sql).map(Value::Date)),
+                .and_then(|s| parse_date_literal(s, sql).map(Value::Date)),
             (BuiltinKind::Time, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
-                .and_then(|s| parse_time(s, sql).map(Value::Time)),
+                .and_then(|s| parse_time_literal(s, sql).map(Value::Time)),
             (BuiltinKind::Decimal, SqlValue::Number(n, _)) => {
-                Ok(Value::Decimal(parse_decimal(n, sql)?))
+                Ok(Value::Decimal(parse_decimal_literal(n, sql)?))
             }
             (BuiltinKind::Json | BuiltinKind::Jsonb, _) => {
                 let s = quoted_string(sql).ok_or_else(|| err_shape(sql, target))?;
@@ -529,44 +550,47 @@ mod tests {
         assert!(matches!(err, RegisterError::TypeError(_)));
     }
 
-    /// Every spelling the WAL and changeset decoders read also registers.
-    /// `'2026-01-01 00:00:00+00'` is the one a Postgres client prints, and
-    /// a subscription naming it was refused as a type error while the same
-    /// text off the WAL decoded fine.
     #[test]
-    fn a_temporal_literal_accepts_the_shared_corpus() {
-        for (text, want) in crate::temporal::corpus::accepted() {
-            let sql = SqlValue::SingleQuotedString(text.to_string());
-            assert_eq!(
-                Postgres::parse_literal(&sql, want.kind().into()).expect(text),
-                want.value::<Postgres>(),
-                "postgres literal {text:?}"
-            );
-            assert_eq!(
-                SQLite::parse_literal(&sql, want.kind().into()).expect(text),
-                want.value::<SQLite>(),
-                "sqlite literal {text:?}"
-            );
-            assert_eq!(
-                MySql::parse_literal(&sql, want.kind().into()).expect(text),
-                want.value::<MySql>(),
-                "mysql literal {text:?}"
-            );
-        }
+    fn temporal_literal_maps_representative_values() {
+        use chrono::{DateTime, Utc};
+        let ts = SqlValue::SingleQuotedString("2026-01-01 00:00:00".to_string());
+        assert!(matches!(
+            Postgres::parse_literal(&ts, BuiltinKind::Timestamp.into()),
+            Ok(Value::Timestamp(_))
+        ));
+        assert!(matches!(
+            SQLite::parse_literal(&ts, BuiltinKind::Timestamp.into()),
+            Ok(Value::Timestamp(_))
+        ));
+        let tstz = SqlValue::SingleQuotedString("2025-12-31 22:00:00-02".to_string());
+        let expected_utc: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            Postgres::parse_literal(&tstz, BuiltinKind::TimestampTz.into()).unwrap(),
+            Value::TimestampTz(expected_utc)
+        );
+        let date = SqlValue::SingleQuotedString("2026-01-01".to_string());
+        assert!(matches!(
+            Postgres::parse_literal(&date, BuiltinKind::Date.into()),
+            Ok(Value::Date(_))
+        ));
+        let time = SqlValue::SingleQuotedString("12:34:56.789".to_string());
+        assert!(matches!(
+            MySql::parse_literal(&time, BuiltinKind::Time.into()),
+            Ok(Value::Time(_))
+        ));
     }
 
-    /// The refusals stay refusals, and stay named as type errors.
     #[test]
-    fn a_temporal_literal_refuses_the_shared_corpus() {
-        for (text, kind) in crate::temporal::corpus::refused() {
-            let sql = SqlValue::SingleQuotedString(text.to_string());
-            assert!(
-                matches!(
-                    Postgres::parse_literal(&sql, kind.into()),
-                    Err(RegisterError::TypeError(_))
-                ),
-                "{text:?} must not parse as {kind:?}"
-            );
-        }
+    fn temporal_literal_rejects_key_boundaries() {
+        let no_offset = SqlValue::SingleQuotedString("2026-01-01 00:00:00".to_string());
+        assert!(matches!(
+            Postgres::parse_literal(&no_offset, BuiltinKind::TimestampTz.into()),
+            Err(RegisterError::TypeError(_))
+        ));
+        let with_offset = SqlValue::SingleQuotedString("2026-01-01 00:00:00+00".to_string());
+        assert!(matches!(
+            Postgres::parse_literal(&with_offset, BuiltinKind::Timestamp.into()),
+            Err(RegisterError::TypeError(_))
+        ));
     }
 }

@@ -514,7 +514,7 @@ fn literal_index_key<B: SqlLiteralParse, DB: DatabaseLike>(
 fn literal_int_from_expr(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::Value(value) => match &value.value {
-            SqlValue::Number(n, _) => n.parse::<i64>().ok(),
+            SqlValue::Number(n, _) => sql_scalar_text::parse_i64(n),
             _ => None,
         },
         _ => None,

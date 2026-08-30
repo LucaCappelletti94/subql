@@ -206,7 +206,7 @@ impl AggAccumulator {
             // num-traits import.
             Value::Decimal(d) => (d as &dyn Any)
                 .downcast_ref::<bigdecimal::BigDecimal>()
-                .and_then(|x| x.to_string().parse::<f64>().ok()),
+                .and_then(|x| sql_scalar_text::parse_f64(&x.to_string())),
             _ => None,
         }
     }
@@ -636,7 +636,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
     ) -> Self {
         let widened = having.is_some_and(|having| having.widens(&spec));
         debug_assert!(
-            having.is_none_or(|having| having.threshold.parse::<f64>().is_ok()),
+            having.is_none_or(|having| sql_scalar_text::parse_f64(&having.threshold).is_some()),
             "a HAVING threshold parses at registration, so this one is corrupt"
         );
         let having = having.map(|having| GroupHaving {
@@ -644,7 +644,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
             op: having.op,
             // Validated at registration. An unparseable threshold would
             // compare as NaN and never pass, failing closed.
-            threshold: having.threshold.parse().unwrap_or(f64::NAN),
+            threshold: sql_scalar_text::parse_f64(&having.threshold).unwrap_or(f64::NAN),
         });
         Self {
             consumer,

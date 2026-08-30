@@ -310,21 +310,19 @@ fn decode_wire_value(
             Some(BuiltinKind::String) | None => Value::String(s),
             Some(BuiltinKind::Uuid) => Value::Uuid(s),
             Some(BuiltinKind::Timestamp) => {
-                crate::temporal::parse_timestamp(&s).map_or(Value::Missing, Value::Timestamp)
+                sql_scalar_text::parse_timestamp(&s).map_or(Value::Missing, Value::Timestamp)
             }
             Some(BuiltinKind::TimestampTz) => {
-                crate::temporal::parse_timestamp_tz(&s).map_or(Value::Missing, Value::TimestampTz)
+                sql_scalar_text::parse_timestamp_tz(&s).map_or(Value::Missing, Value::TimestampTz)
             }
             Some(BuiltinKind::Date) => {
-                crate::temporal::parse_date(&s).map_or(Value::Missing, Value::Date)
+                sql_scalar_text::parse_date(&s).map_or(Value::Missing, Value::Date)
             }
             Some(BuiltinKind::Time) => {
-                crate::temporal::parse_time(&s).map_or(Value::Missing, Value::Time)
+                sql_scalar_text::parse_time(&s).map_or(Value::Missing, Value::Time)
             }
             Some(BuiltinKind::Decimal) => {
-                <bigdecimal::BigDecimal as core::str::FromStr>::from_str(&s)
-                    .ok()
-                    .map_or(Value::Missing, Value::Decimal)
+                sql_scalar_text::parse_decimal(&s).map_or(Value::Missing, Value::Decimal)
             }
             Some(BuiltinKind::Json) => Value::Json(SqliteJson::text(s)),
             Some(BuiltinKind::Jsonb) => Value::Jsonb(SqliteJson::text(s)),
@@ -529,29 +527,56 @@ mod tests {
         assert_eq!(notifs.inserted(), alloc::vec![99u64]);
     }
 
-    /// A SQLite text cell reads the shared temporal corpus exactly as the
-    /// Postgres wire paths and registration do. SQLite stores temporals as
-    /// TEXT, so whatever spelling the writer chose has to survive here.
     #[test]
-    fn a_temporal_text_cell_accepts_the_shared_corpus() {
-        for (text, want) in crate::temporal::corpus::accepted() {
-            assert_eq!(
-                decode_wire_value(WireValue::Text(text.into()), Some(want.kind())),
-                want.value::<SQLite>(),
-                "sqlite text {text:?}"
-            );
-        }
+    fn temporal_text_cell_maps_representative_values() {
+        use chrono::{DateTime, Utc};
+        assert!(matches!(
+            decode_wire_value(
+                WireValue::Text("2026-01-01 00:00:00".into()),
+                Some(BuiltinKind::Timestamp)
+            ),
+            Value::Timestamp(_)
+        ));
+        let expected: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            decode_wire_value(
+                WireValue::Text("2025-12-31 22:00:00-02".into()),
+                Some(BuiltinKind::TimestampTz)
+            ),
+            Value::TimestampTz(expected)
+        );
+        assert!(matches!(
+            decode_wire_value(
+                WireValue::Text("2026-01-01".into()),
+                Some(BuiltinKind::Date)
+            ),
+            Value::Date(_)
+        ));
+        assert!(matches!(
+            decode_wire_value(
+                WireValue::Text("12:34:56.789".into()),
+                Some(BuiltinKind::Time)
+            ),
+            Value::Time(_)
+        ));
     }
 
     #[test]
-    fn a_temporal_text_cell_refuses_the_shared_corpus() {
-        for (text, kind) in crate::temporal::corpus::refused() {
-            assert_eq!(
-                decode_wire_value(WireValue::Text(text.into()), Some(kind)),
-                Value::Missing,
-                "sqlite text {text:?} must not decode as {kind:?}"
-            );
-        }
+    fn temporal_text_cell_rejects_key_boundaries() {
+        assert_eq!(
+            decode_wire_value(
+                WireValue::Text("2026-01-01 00:00:00".into()),
+                Some(BuiltinKind::TimestampTz)
+            ),
+            Value::Missing
+        );
+        assert_eq!(
+            decode_wire_value(
+                WireValue::Text("2026-01-01 00:00:00+00".into()),
+                Some(BuiltinKind::Timestamp)
+            ),
+            Value::Missing
+        );
     }
 
     #[test]

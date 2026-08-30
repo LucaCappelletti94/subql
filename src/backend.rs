@@ -502,7 +502,7 @@ fn append_json(value: &serde_json::Value, output: &mut alloc::vec::Vec<u8>) -> b
         }
         serde_json::Value::Bool(value) => append_tagged(output, 1, value),
         serde_json::Value::Number(value) => {
-            let Ok(number) = value.to_string().parse::<bigdecimal::BigDecimal>() else {
+            let Some(number) = sql_scalar_text::parse_decimal(&value.to_string()) else {
                 return false;
             };
             append_tagged(output, 2, &number.normalized().to_string())
@@ -606,7 +606,7 @@ fn append_sqlite_json(
         SqliteJsonStorage::Real(value) => {
             let canonical = canonical_f64(*value);
             if canonical.fract() == 0.0 {
-                if let Ok(integer) = canonical.to_string().parse::<i64>() {
+                if let Some(integer) = sql_scalar_text::parse_i64(&canonical.to_string()) {
                     return append_tagged(output, 1, &integer);
                 }
             }
@@ -1526,19 +1526,19 @@ impl Backend for SQLite {
             (Some(BuiltinKind::Bool), Value::Int(value)) => Some(Value::Bool(value)),
             (Some(BuiltinKind::Uuid), Value::String(value)) => Some(Value::Uuid(value)),
             (Some(BuiltinKind::Timestamp), Value::String(value)) => {
-                crate::temporal::parse_timestamp(&value).map(Value::Timestamp)
+                sql_scalar_text::parse_timestamp(&value).map(Value::Timestamp)
             }
             (Some(BuiltinKind::TimestampTz), Value::String(value)) => {
-                crate::temporal::parse_timestamp_tz(&value).map(Value::TimestampTz)
+                sql_scalar_text::parse_timestamp_tz(&value).map(Value::TimestampTz)
             }
             (Some(BuiltinKind::Date), Value::String(value)) => {
-                crate::temporal::parse_date(&value).map(Value::Date)
+                sql_scalar_text::parse_date(&value).map(Value::Date)
             }
             (Some(BuiltinKind::Time), Value::String(value)) => {
-                crate::temporal::parse_time(&value).map(Value::Time)
+                sql_scalar_text::parse_time(&value).map(Value::Time)
             }
             (Some(BuiltinKind::Decimal), Value::String(value)) => {
-                value.parse().ok().map(Value::Decimal)
+                sql_scalar_text::parse_decimal(&value).map(Value::Decimal)
             }
             (Some(BuiltinKind::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
