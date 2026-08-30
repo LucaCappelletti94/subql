@@ -1670,9 +1670,7 @@ mod tests {
         assert_eq!(e.contexts.len(), 0);
     }
 
-    // ----------------------------------------------------------------
     // Re-execution concurrency throttle
-    // ----------------------------------------------------------------
     //
     // The `MockAsyncConnector` futures complete in one poll, so the
     // tests here cannot observe the *peak* inflight count during a

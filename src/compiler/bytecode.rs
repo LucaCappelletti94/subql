@@ -29,9 +29,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub enum Instruction<B: Backend> {
-    // ========================================================================
     // Stack Operations
-    // ========================================================================
     /// Push a literal [`Value`] onto the stack.
     ///
     /// Stack: `[...] -> [..., Value]`.
@@ -46,9 +44,7 @@ pub enum Instruction<B: Backend> {
     /// Stack: `[...] -> [..., Value]`.
     LoadColumn(ColumnId),
 
-    // ========================================================================
     // Comparison Operators (pop 2 values, push Tri)
-    // ========================================================================
     /// Equal: `a = b`.
     ///
     /// NULL-safe: any `Missing` / `Null` operand yields `Tri::Unknown`. Same
@@ -84,9 +80,7 @@ pub enum Instruction<B: Backend> {
     /// Stack: `[..., a, b] -> [..., Tri]`.
     GreaterThanOrEqual,
 
-    // ========================================================================
     // NULL Checks (pop 1 value, push Tri)
-    // ========================================================================
     /// IS NULL check. `Missing` and `Null` both satisfy `IS NULL`.
     ///
     /// Stack: `[..., value] -> [..., Tri]`.
@@ -97,9 +91,7 @@ pub enum Instruction<B: Backend> {
     /// Stack: `[..., value] -> [..., Tri]`.
     IsNotNull,
 
-    // ========================================================================
     // Logical Operators (pop 2 Tri, push Tri)
-    // ========================================================================
     /// AND with tri-state semantics.
     ///
     /// Stack: `[..., a, b] -> [..., Tri]`.
@@ -110,17 +102,13 @@ pub enum Instruction<B: Backend> {
     /// Stack: `[..., a, b] -> [..., Tri]`.
     Or,
 
-    // ========================================================================
     // Unary Operators (pop 1 Tri, push Tri)
-    // ========================================================================
     /// NOT with tri-state semantics.
     ///
     /// Stack: `[..., tri] -> [..., Tri]`.
     Not,
 
-    // ========================================================================
     // Arithmetic Operators (pop 2 values, push value)
-    // ========================================================================
     /// Add: `a + b`.
     ///
     /// Same-scalar only: `Int + Int -> Int`, `Float + Float -> Float`,
@@ -163,9 +151,7 @@ pub enum Instruction<B: Backend> {
     /// Stack: `[..., a] -> [..., Value]`.
     Negate,
 
-    // ========================================================================
     // Special Operations
-    // ========================================================================
     /// `IN (...)`: membership test against a literal set.
     ///
     /// `Missing` / `Null` on the stack yields `Tri::Unknown`. A `Null` in
@@ -196,9 +182,7 @@ pub enum Instruction<B: Backend> {
         case_sensitive: bool,
     },
 
-    // ========================================================================
     // Control Flow (short-circuit evaluation)
-    // ========================================================================
     /// Jump forward `offset` instructions if top-of-stack is `Tri::False`.
     /// Used for `AND` short-circuiting.
     ///
@@ -215,9 +199,7 @@ pub enum Instruction<B: Backend> {
     /// Symmetric to [`JumpIfFalse`](Self::JumpIfFalse).
     JumpIfTrue(usize),
 
-    // ========================================================================
     // Membership terms
-    // ========================================================================
     /// Push the truth supplied for membership term slot `slot`.
     ///
     /// A membership term is not a row test: it answers which subscribers the

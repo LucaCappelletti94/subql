@@ -266,9 +266,7 @@ mod tests {
     use crate::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB, TableId};
 
-    // -----------------------------------------------------------------
     // Harness
-    // -----------------------------------------------------------------
 
     fn block_on<F: Future>(fut: F) -> F::Output {
         let mut ctx = Context::from_waker(Waker::noop());
@@ -395,9 +393,7 @@ mod tests {
         Ok(buffers.get().to_vec())
     }
 
-    // -----------------------------------------------------------------
     // The four cases
-    // -----------------------------------------------------------------
 
     /// A watcher who can see the row as it is now receives it, and the
     /// previous version is never consulted, which is the whole cost
@@ -471,9 +467,7 @@ mod tests {
         assert_eq!(policy.calls(), 1, "there is no previous image to ask about");
     }
 
-    // -----------------------------------------------------------------
     // Cost
-    // -----------------------------------------------------------------
 
     /// One call covers every watcher who can see the current row. The
     /// second call happens once, not once per denied watcher.
@@ -507,9 +501,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // Refusals and failure
-    // -----------------------------------------------------------------
 
     /// A truncate names no row, so there is nothing to judge. Answering
     /// `Nothing` would read as "no watcher is affected", which is the
@@ -598,9 +590,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // An old image that cannot be judged
-    // -----------------------------------------------------------------
 
     /// Under Postgres `REPLICA IDENTITY DEFAULT` an update's old image
     /// carries the key and nothing else, so whether the watcher could see

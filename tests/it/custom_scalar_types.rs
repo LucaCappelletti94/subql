@@ -11,6 +11,7 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::Value as SqlValue;
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::Pg18;
 use subql::backend::Postgres;
 use subql::backend::{
     Backend, BuiltinKind, Carried, CustomScalars, ScalarKind, ScalarKindOf, Value,
@@ -115,6 +116,7 @@ impl Backend for Custom {
     type Decimal = bigdecimal::BigDecimal;
     type Json = serde_json::Value;
     type Jsonb = serde_json::Value;
+    type JsonbVersion = Pg18;
 }
 
 impl SqlLiteralParse for Custom {
@@ -129,7 +131,7 @@ impl SqlLiteralParse for Custom {
             return subql::compiler::parse_custom_literal::<Self>(sql, custom);
         }
         let builtin = target.as_builtin().expect("not custom, so builtin");
-        Ok(widen(Postgres::parse_literal(
+        Ok(widen(Postgres::<Pg18>::parse_literal(
             sql,
             ScalarKind::from(builtin),
         )?))

@@ -119,6 +119,10 @@ serde = { version = "1.0", default-features = false, features = ["derive", "rc",
 serde_json = { version = "1", default-features = false, features = ["alloc", "arbitrary_precision"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 
+# PostgreSQL `jsonb` canonical equality and group-key bytes. A git revision rather than a
+# release: the crate is unpublished until this integration proves its API.
+postgres-jsonb-canonical = "0.1.0"
+
 # Backend scalar type dependencies. `chrono` covers Timestamp / TimestampTz /
 # Date / Time; `bigdecimal` covers arbitrary-precision NUMERIC / DECIMAL. Both
 # are pinned no-default-features to keep subql's `no_std + alloc` posture.

@@ -1,10 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
+use crate::common;
 #[cfg(any(
     feature = "executor-diesel-postgres",
     feature = "executor-diesel-mysql"
 ))]
-use crate::common;
+use subql::backend::Pg18;
 
 use bigdecimal::BigDecimal;
 use diesel::connection::SimpleConnection;
@@ -100,7 +101,7 @@ struct NewPgGroup {
     jsonb_value: serde_json::Value,
 }
 
-fn pg_rows() -> [NewPgGroup; 8] {
+fn pg_rows() -> [NewPgGroup; 12] {
     [
         NewPgGroup {
             id: 1,
@@ -160,6 +161,38 @@ fn pg_rows() -> [NewPgGroup; 8] {
             exact_text: String::from("d"),
             jsonb_value: serde_json::from_str(r#"{"duplicate":2}"#).unwrap(),
         },
+        // Exponent spellings of one value. `1e-3` and `0.001` group together, and both
+        // differ from the neighbouring pair below.
+        NewPgGroup {
+            id: 9,
+            float_value: 0.0,
+            text_value: String::from("E"),
+            exact_text: String::from("E"),
+            jsonb_value: serde_json::from_str(r#"{"e":1e-3,"f":1E2}"#).unwrap(),
+        },
+        NewPgGroup {
+            id: 10,
+            float_value: -0.0,
+            text_value: String::from("e"),
+            exact_text: String::from("e"),
+            jsonb_value: serde_json::from_str(r#"{"f":100.000,"e":0.001}"#).unwrap(),
+        },
+        // Differ in the twenty-fifth significant digit, which an f64 cannot hold, so a
+        // lossy path would group these together and PostgreSQL does not.
+        NewPgGroup {
+            id: 11,
+            float_value: 0.0,
+            text_value: String::from("F"),
+            exact_text: String::from("F"),
+            jsonb_value: serde_json::from_str(r#"{"n":1234567890123456789012345}"#).unwrap(),
+        },
+        NewPgGroup {
+            id: 12,
+            float_value: -0.0,
+            text_value: String::from("f"),
+            exact_text: String::from("f"),
+            jsonb_value: serde_json::from_str(r#"{"n":1234567890123456789012346}"#).unwrap(),
+        },
     ]
 }
 
@@ -196,7 +229,7 @@ fn postgres_keys_match_group_by_equality() {
         .load::<(f64, i64)>(&mut connection)
         .unwrap();
     assert_eq!(float_groups.len(), 2);
-    let float_encoder = Postgres::group_key_encoder(vec![column(
+    let float_encoder = Postgres::<Pg18>::group_key_encoder(vec![column(
         BuiltinKind::Float,
         GroupKeyCollation::DatabaseDefault,
     )])
@@ -215,8 +248,8 @@ fn postgres_keys_match_group_by_equality() {
         .select((groups::text_value, diesel::dsl::count_star()))
         .load::<(String, i64)>(&mut connection)
         .unwrap();
-    assert_eq!(text_groups.len(), 4);
-    assert!(Postgres::group_key_encoder(vec![column(
+    assert_eq!(text_groups.len(), 6);
+    assert!(Postgres::<Pg18>::group_key_encoder(vec![column(
         BuiltinKind::String,
         named("ci", Some(false), None),
     )])
@@ -227,8 +260,8 @@ fn postgres_keys_match_group_by_equality() {
         .select((groups::exact_text, diesel::dsl::count_star()))
         .load::<(String, i64)>(&mut connection)
         .unwrap();
-    assert_eq!(exact_groups.len(), 8);
-    assert!(Postgres::group_key_encoder(vec![column(
+    assert_eq!(exact_groups.len(), 12);
+    assert!(Postgres::<Pg18>::group_key_encoder(vec![column(
         BuiltinKind::String,
         named("C", Some(true), None),
     )])
@@ -239,8 +272,8 @@ fn postgres_keys_match_group_by_equality() {
         .select((groups::jsonb_value, diesel::dsl::count_star()))
         .load::<(serde_json::Value, i64)>(&mut connection)
         .unwrap();
-    assert_eq!(jsonb_groups.len(), 4);
-    let jsonb_encoder = Postgres::group_key_encoder(vec![column(
+    assert_eq!(jsonb_groups.len(), 7);
+    let jsonb_encoder = Postgres::<Pg18>::group_key_encoder(vec![column(
         BuiltinKind::Jsonb,
         GroupKeyCollation::DatabaseDefault,
     )])
@@ -256,6 +289,17 @@ fn postgres_keys_match_group_by_equality() {
     assert_eq!(
         jsonb_encoder.encode(&[Value::Jsonb(rows[6].jsonb_value.clone())]),
         jsonb_encoder.encode(&[Value::Jsonb(rows[7].jsonb_value.clone())])
+    );
+    // Exponent spellings of one value fold together.
+    assert_eq!(
+        jsonb_encoder.encode(&[Value::Jsonb(rows[8].jsonb_value.clone())]),
+        jsonb_encoder.encode(&[Value::Jsonb(rows[9].jsonb_value.clone())])
+    );
+    // Differing in the twenty-fifth significant digit, which an f64 cannot hold, so a
+    // lossy path would fold these and PostgreSQL does not.
+    assert_ne!(
+        jsonb_encoder.encode(&[Value::Jsonb(rows[10].jsonb_value.clone())]),
+        jsonb_encoder.encode(&[Value::Jsonb(rows[11].jsonb_value.clone())])
     );
 
     let connector = PgDieselConnector::new(common::pg_connect(port));

@@ -132,7 +132,7 @@ fn changeset_emit_propagates_pk_change_to_replica() {
         );
     let sqlite_adapter = SqliteAdapter::new(sqlite_engine.database());
 
-    // ---- Seed phase: source inserts emitted as a changeset ----
+    // Seed phase: source inserts emitted as a changeset
     for (id, label, qty) in SEED {
         sql_query(format!(
             "INSERT INTO items (id, label, qty) VALUES ({id}, '{label}', {qty})"
@@ -152,8 +152,8 @@ fn changeset_emit_propagates_pk_change_to_replica() {
         "replica after seed changeset"
     );
 
-    // ---- Mutate phase: a non-key update, a primary-key relocation, and a
-    // delete, all emitted as one changeset ----
+    // Mutate phase: a non-key update, a primary-key relocation, and a
+    // delete, all emitted as one changeset
     sql_query("UPDATE items SET qty = 99 WHERE id = 1")
         .execute(&mut pg)
         .unwrap();

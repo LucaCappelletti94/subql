@@ -948,9 +948,7 @@ mod tests {
     // catalog method that can sleep, so the timing-based proof of bounded
     // worker concurrency is no longer reachable through this fixture.
 
-    // =========================================================================
     // D3 merge determinism: equal-timestamp tie-breaking
-    // =========================================================================
 
     #[test]
     fn test_binding_tie_break_equal_timestamp() {
@@ -1036,9 +1034,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // D4 merge output ordering is deterministic
-    // =========================================================================
 
     #[test]
     fn test_merge_output_ordering_deterministic() {

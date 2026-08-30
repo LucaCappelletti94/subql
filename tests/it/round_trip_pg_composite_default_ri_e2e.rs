@@ -194,7 +194,7 @@ fn finish_loop(
     let source_net = load_pg(pg);
     assert_eq!(source_net, final_pg_rows(), "source net state");
 
-    // ---- Outgoing: seed then mutate the SQLite replica ----
+    // Outgoing: seed then mutate the SQLite replica
     let mut sqlite = SqliteConnection::establish(":memory:").unwrap();
     sql_query(SQLITE_DDL).execute(&mut sqlite).unwrap();
     let sqlite_catalog = ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).unwrap();
@@ -223,7 +223,7 @@ fn finish_loop(
         "SQLite replica after mutate (composite update and delete applied)"
     );
 
-    // ---- Incoming: capture the session patchset and re-apply to PG ----
+    // Incoming: capture the session patchset and re-apply to PG
     let session_patchset = session.patchset().unwrap();
     assert!(!session_patchset.is_empty(), "session recorded no changes");
 

@@ -36,16 +36,20 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
 use pg_walstream::error::ReplicationError;
-use pg_walstream::{parse_lsn, ChangeEvent, Lsn, PgOutputDecoder, PgReplicationConnection};
+use pg_walstream::{ChangeEvent, PgReplicationConnection};
 use sql_traits::prelude::DatabaseLike;
 
-use crate::wal::into_engine_events;
 use crate::PgLsn;
+
+pub(crate) mod helpers;
+pub(crate) mod inner_polling_loop;
+
+use self::helpers::sql_string_literal;
+use self::inner_polling_loop::polling_loop;
 
 /// Configuration for a [`PollingPgCdcSource`].
 ///
@@ -305,129 +309,6 @@ impl Drop for PollingPgCdcSource {
     }
 }
 
-// ============================================================================
-// Inner polling loop (runs on the tokio blocking pool)
-// ============================================================================
-
-// All `Arc` arguments are consumed by the loop's `Drop`-on-exit guard
-// or held for the loop's lifetime, so `clippy::needless_pass_by_value`
-// would only push us toward `Arc::clone` at every call site without a
-// real readability win.
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
-fn polling_loop(
-    mut conn: PgReplicationConnection,
-    slot_name: String,
-    publication_name: String,
-    poll_interval: Duration,
-    event_tx: tokio::sync::mpsc::Sender<Result<ChangeEvent, PollingPgCdcError>>,
-    polls_issued: Arc<AtomicU64>,
-    events_received: Arc<AtomicU64>,
-    empty_polls_observed: Arc<AtomicU64>,
-    total_drained_events: Arc<AtomicU64>,
-    non_empty_drains: Arc<AtomicU64>,
-    shutdown: Arc<AtomicBool>,
-    task_exited: Arc<AtomicBool>,
-) {
-    struct ExitGuard(Arc<AtomicBool>);
-    impl Drop for ExitGuard {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-    let _exit_guard = ExitGuard(task_exited);
-
-    let mut decoder = PgOutputDecoder::with_protocol_version(1);
-
-    // pg_walstream's `exec` uses libpq's `PQexec` which returns all
-    // columns in text format, so we cannot fetch raw BYTEA bytes
-    // directly. Wrap the column in `encode(data, 'hex')` so the
-    // returned text is lowercase hex without a leading `\x` prefix,
-    // then hex-decode in Rust. A future `exec_with_params` upstream
-    // would let us request binary result format and drop this round
-    // trip entirely.
-    let query = format!(
-        "SELECT lsn::text, encode(data, 'hex') FROM pg_logical_slot_get_binary_changes(\
-            {slot}, NULL, NULL, \
-            'proto_version', '1', \
-            'publication_names', {pub_name}\
-        )",
-        slot = sql_string_literal(&slot_name),
-        pub_name = sql_string_literal(&publication_name),
-    );
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return;
-        }
-        std::thread::sleep(poll_interval);
-        if shutdown.load(Ordering::Relaxed) {
-            return;
-        }
-
-        polls_issued.fetch_add(1, Ordering::Relaxed);
-        let result = match conn.exec(&query) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = event_tx.blocking_send(Err(PollingPgCdcError::Postgres(e)));
-                return;
-            }
-        };
-
-        if result.ntuples() == 0 {
-            empty_polls_observed.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-
-        // Counted before the send, so a consumer that has the event has the
-        // counters that describe it. A drain is counted non-empty by its first
-        // event rather than at the end, which keeps the average at or above one
-        // for as long as any event has been delivered.
-        let mut drain_counted = false;
-
-        for row_idx in 0..result.ntuples() {
-            let Some(lsn_text) = result.get_value(row_idx, 0) else {
-                continue;
-            };
-            let Some(hex_text) = result.get_value(row_idx, 1) else {
-                continue;
-            };
-            let bytes = match hex_decode(hex_text.as_bytes()) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = event_tx.blocking_send(Err(PollingPgCdcError::Protocol(e)));
-                    return;
-                }
-            };
-            let lsn = match parse_lsn(&lsn_text) {
-                Ok(v) => Lsn::new(v),
-                Err(e) => {
-                    let _ = event_tx.blocking_send(Err(PollingPgCdcError::Postgres(e)));
-                    return;
-                }
-            };
-            let change = match decoder.decode_message(bytes, lsn) {
-                Ok(Some(c)) => c,
-                Ok(None) => continue,
-                Err(e) => {
-                    let _ = event_tx.blocking_send(Err(PollingPgCdcError::Postgres(e)));
-                    return;
-                }
-            };
-            for ev in into_engine_events(change) {
-                events_received.fetch_add(1, Ordering::Relaxed);
-                total_drained_events.fetch_add(1, Ordering::Relaxed);
-                if !drain_counted {
-                    drain_counted = true;
-                    non_empty_drains.fetch_add(1, Ordering::Relaxed);
-                }
-                if event_tx.blocking_send(Ok(ev)).is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
 impl crate::CdcSource for PollingPgCdcSource {
     type Event = ChangeEvent;
     type Error = PollingPgCdcError;
@@ -453,74 +334,5 @@ impl crate::CdcSource for PollingPgCdcSource {
         // No-op: `pg_logical_slot_get_binary_changes` auto-advances the
         // slot's `confirmed_flush_lsn` as a side effect of the drain.
         async move { Ok(()) }
-    }
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Escape a string for embedding as a single-quoted SQL literal.
-fn sql_string_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// Decode lowercase ASCII hex bytes into raw bytes. Rejects odd-length
-/// or non-hex inputs with a structured error message.
-fn hex_decode(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if !bytes.len().is_multiple_of(2) {
-        return Err(format!(
-            "encode(data, 'hex') returned odd-length output ({} chars)",
-            bytes.len()
-        ));
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for i in 0..bytes.len() / 2 {
-        let hi = hex_nibble(bytes[2 * i])?;
-        let lo = hex_nibble(bytes[2 * i + 1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Result<u8, String> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        other => Err(format!("invalid hex digit 0x{other:02X}")),
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hex_decode_round_trip() {
-        let bytes = [0x00, 0xFF, 0x42, 0xc0];
-        let mut hex = Vec::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            hex.push(b"0123456789abcdef"[usize::from(b >> 4)]);
-            hex.push(b"0123456789abcdef"[usize::from(b & 0x0F)]);
-        }
-        assert_eq!(hex_decode(&hex).unwrap(), bytes);
-    }
-
-    #[test]
-    fn hex_decode_rejects_odd_length() {
-        assert!(hex_decode(b"abc").is_err());
-    }
-
-    #[test]
-    fn hex_decode_rejects_non_hex() {
-        assert!(hex_decode(b"zz").is_err());
-    }
-
-    #[test]
-    fn sql_string_literal_escapes_quotes() {
-        assert_eq!(sql_string_literal("foo'bar"), "'foo''bar'");
-        assert_eq!(sql_string_literal("ok_slot"), "'ok_slot'");
     }
 }

@@ -674,299 +674,300 @@ fn every_postgres_group_kind_renders_into_a_scoped_read() {
     assert!(!query.sql().contains("550e8400-e29b-41d4-a716-446655440000"));
 }
 
-// ---- HAVING on the grouped extreme tier ----
+mod having_on_grouped_extreme {
+    use super::*;
+    /// Register a grouped extreme with a `HAVING`, expecting the hybrid tier.
+    fn register_having(engine: &mut Engine, sql: &str) -> (u64, subql::AggregateBootstrap) {
+        let registered = engine
+            .register(SubscriptionRequest::new(7u64, sql))
+            .unwrap_or_else(|e| panic!("`{sql}` should register, got {e:?}"));
+        let Tier::GroupedScalar { bootstrap } = registered.tier else {
+            panic!(
+                "`{sql}` should be a grouped extreme, got {:?}",
+                registered.tier
+            )
+        };
+        (registered.subscription_id, bootstrap)
+    }
 
-/// Register a grouped extreme with a `HAVING`, expecting the hybrid tier.
-fn register_having(engine: &mut Engine, sql: &str) -> (u64, subql::AggregateBootstrap) {
-    let registered = engine
-        .register(SubscriptionRequest::new(7u64, sql))
-        .unwrap_or_else(|e| panic!("`{sql}` should register, got {e:?}"));
-    let Tier::GroupedScalar { bootstrap } = registered.tier else {
-        panic!(
-            "`{sql}` should be a grouped extreme, got {:?}",
+    #[test]
+    fn a_having_extreme_registers_and_strips_the_clause() {
+        let (mut engine, _) = engine();
+        let (_, bootstrap) = register_having(
+            &mut engine,
+            "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
+        );
+        assert!(
+            !bootstrap.sql.to_uppercase().contains("HAVING"),
+            "the seed must fetch every group, hidden ones included: {}",
+            bootstrap.sql
+        );
+    }
+
+    #[test]
+    fn a_sibling_having_on_an_extreme_rides_the_capture() {
+        let (mut engine, _) = engine();
+        let registered = engine
+            .register(SubscriptionRequest::new(
+                7u64,
+                "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING SUM(amount) > 10",
+            ))
+            .expect("the capture still answers");
+        assert!(
+            matches!(registered.tier, Tier::WholeRows { .. }),
+            "extreme state holds no sum, so this rides the whole re-read, got {:?}",
             registered.tier
+        );
+    }
+
+    #[test]
+    fn an_extreme_crossing_on_a_fold_emits_entering() {
+        let (mut engine, orders) = engine();
+        let (subscription, _) = register_having(
+            &mut engine,
+            "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
+        );
+        let opening = seed(
+            &mut engine,
+            subscription,
+            vec![vec![
+                Value::String("north".into()),
+                Value::Int(7),
+                Value::Int(1),
+            ]],
+        );
+        assert!(opening.updates.is_empty(), "minimum 7 does not pass");
+
+        let entering = Event::insert(orders, text_row(2, "north", 3))
+            .with_pk_columns([0u16])
+            .with_checkpoint(PgLsn(10));
+        let output = engine.dispatch(&entering).expect("insert dispatches");
+        assert_eq!(output.aggregate_updates().len(), 1);
+        assert_eq!(output.aggregate_updates()[0].change, scalar(Value::Int(3)));
+    }
+
+    #[test]
+    fn an_extreme_crossing_out_on_a_scoped_read_install_emits_remove() {
+        let (mut engine, orders) = engine();
+        let (subscription, _) = register_having(
+            &mut engine,
+            "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
+        );
+        seed(
+            &mut engine,
+            subscription,
+            vec![vec![
+                Value::String("north".into()),
+                Value::Int(7),
+                Value::Int(1),
+            ]],
+        );
+        let entering = Event::insert(orders, text_row(2, "north", 3))
+            .with_pk_columns([0u16])
+            .with_checkpoint(PgLsn(10));
+        engine.dispatch(&entering).expect("insert dispatches");
+
+        let displaced = Event::delete(orders, text_row(2, "north", 3))
+            .with_pk_columns([0u16])
+            .with_checkpoint(PgLsn(20));
+        let output = engine.dispatch(&displaced).expect("delete dispatches");
+        let ReExecutionRead::GroupedScalar { group, query, .. } = &output.triggers()[0].read else {
+            panic!("expected grouped scalar read")
+        };
+        assert!(
+            !query.sql().to_uppercase().contains("HAVING"),
+            "the scoped read replaces the group's whole state, so the condition must not filter it: {query:?}"
+        );
+        let installed = Install::install(
+            &mut engine,
+            subscription,
+            GroupedScalarInstall {
+                group: group.clone(),
+                row: vec![Value::Int(7), Value::Int(1)],
+                checkpoint: Some(PgLsn(20)),
+            },
         )
-    };
-    (registered.subscription_id, bootstrap)
-}
+        .expect("scoped result installs");
+        assert_eq!(installed.updates.len(), 1);
+        assert_eq!(
+            installed.updates[0].change,
+            AggregateValueChange::Remove,
+            "the replacement minimum 7 leaves the result"
+        );
+    }
 
-#[test]
-fn a_having_extreme_registers_and_strips_the_clause() {
-    let (mut engine, _) = engine();
-    let (_, bootstrap) = register_having(
-        &mut engine,
-        "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
-    );
-    assert!(
-        !bootstrap.sql.to_uppercase().contains("HAVING"),
-        "the seed must fetch every group, hidden ones included: {}",
-        bootstrap.sql
-    );
-}
+    #[test]
+    fn a_row_count_having_announces_without_an_extreme_change() {
+        let (mut engine, orders) = engine();
+        let (subscription, _) = register_having(
+            &mut engine,
+            "SELECT region, MAX(amount) FROM orders GROUP BY region HAVING COUNT(*) > 1",
+        );
+        let opening = seed(
+            &mut engine,
+            subscription,
+            vec![vec![
+                Value::String("north".into()),
+                Value::Int(9),
+                Value::Int(1),
+            ]],
+        );
+        assert!(opening.updates.is_empty(), "one row does not pass");
 
-#[test]
-fn a_sibling_having_on_an_extreme_rides_the_capture() {
-    let (mut engine, _) = engine();
-    let registered = engine
-        .register(SubscriptionRequest::new(
-            7u64,
-            "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING SUM(amount) > 10",
-        ))
-        .expect("the capture still answers");
-    assert!(
-        matches!(registered.tier, Tier::WholeRows { .. }),
-        "extreme state holds no sum, so this rides the whole re-read, got {:?}",
-        registered.tier
-    );
-}
+        let second = Event::insert(orders, text_row(2, "north", 4))
+            .with_pk_columns([0u16])
+            .with_checkpoint(PgLsn(10));
+        let output = engine.dispatch(&second).expect("insert dispatches");
+        assert_eq!(output.aggregate_updates().len(), 1);
+        assert_eq!(
+            output.aggregate_updates()[0].change,
+            scalar(Value::Int(9)),
+            "the second row crosses the row-count threshold without moving the maximum"
+        );
+    }
 
-#[test]
-fn an_extreme_crossing_on_a_fold_emits_entering() {
-    let (mut engine, orders) = engine();
-    let (subscription, _) = register_having(
-        &mut engine,
-        "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
-    );
-    let opening = seed(
-        &mut engine,
-        subscription,
-        vec![vec![
-            Value::String("north".into()),
-            Value::Int(7),
-            Value::Int(1),
-        ]],
-    );
-    assert!(opening.updates.is_empty(), "minimum 7 does not pass");
+    #[test]
+    fn a_hidden_extreme_group_that_empties_stays_silent() {
+        let (mut engine, orders) = engine();
+        let (subscription, _) = register_having(
+            &mut engine,
+            "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
+        );
+        seed(
+            &mut engine,
+            subscription,
+            vec![vec![
+                Value::String("north".into()),
+                Value::Int(7),
+                Value::Int(1),
+            ]],
+        );
+        let removed = Event::delete(orders, text_row(1, "north", 7))
+            .with_pk_columns([0u16])
+            .with_checkpoint(PgLsn(10));
+        let output = engine.dispatch(&removed).expect("delete dispatches");
+        assert!(
+            output.aggregate_updates().is_empty(),
+            "a group never announced must not announce its removal"
+        );
+        assert!(output.triggers().is_empty());
+    }
 
-    let entering = Event::insert(orders, text_row(2, "north", 3))
-        .with_pk_columns([0u16])
-        .with_checkpoint(PgLsn(10));
-    let output = engine.dispatch(&entering).expect("insert dispatches");
-    assert_eq!(output.aggregate_updates().len(), 1);
-    assert_eq!(output.aggregate_updates()[0].change, scalar(Value::Int(3)));
-}
+    /// A group born during the seed window is announced exactly once: the
+    /// opening pass speaks for the final state, never on top of the replay.
+    #[test]
+    fn a_group_inserted_during_the_seed_window_is_announced_once() {
+        let (mut engine, orders) = engine();
+        let (subscription, _) = register(&mut engine, "MIN");
+        let event = Event::insert(orders, text_row(1, "south", 4))
+            .with_pk_columns([0u16])
+            .with_checkpoint(PgLsn(10));
+        engine.dispatch(&event).expect("insert queues");
 
-#[test]
-fn an_extreme_crossing_out_on_a_scoped_read_install_emits_remove() {
-    let (mut engine, orders) = engine();
-    let (subscription, _) = register_having(
-        &mut engine,
-        "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
-    );
-    seed(
-        &mut engine,
-        subscription,
-        vec![vec![
-            Value::String("north".into()),
-            Value::Int(7),
-            Value::Int(1),
-        ]],
-    );
-    let entering = Event::insert(orders, text_row(2, "north", 3))
-        .with_pk_columns([0u16])
-        .with_checkpoint(PgLsn(10));
-    engine.dispatch(&entering).expect("insert dispatches");
+        let installed = seed(
+            &mut engine,
+            subscription,
+            vec![vec![
+                Value::String("north".into()),
+                Value::Int(2),
+                Value::Int(1),
+            ]],
+        );
+        assert_eq!(
+            installed.updates.len(),
+            2,
+            "north and south once each, got {:?}",
+            installed.updates
+        );
+        let mut south_sets = installed
+            .updates
+            .iter()
+            .filter(|update| update.change == scalar(Value::Int(4)));
+        let south = south_sets.next().expect("replayed group opens");
+        assert!(
+            south_sets.next().is_none(),
+            "the replayed insert must not double-announce"
+        );
+        let identity = south
+            .group
+            .as_ref()
+            .expect("grouped update carries identity");
+        assert_eq!(identity.values, vec![Value::String("south".into())]);
+        assert_eq!(&identity.key[..5], b"SQGK\x01");
+    }
 
-    let displaced = Event::delete(orders, text_row(2, "north", 3))
-        .with_pk_columns([0u16])
-        .with_checkpoint(PgLsn(20));
-    let output = engine.dispatch(&displaced).expect("delete dispatches");
-    let ReExecutionRead::GroupedScalar { group, query, .. } = &output.triggers()[0].read else {
-        panic!("expected grouped scalar read")
-    };
-    assert!(
-        !query.sql().to_uppercase().contains("HAVING"),
-        "the scoped read replaces the group's whole state, so the condition must not filter it: {query:?}"
-    );
-    let installed = Install::install(
-        &mut engine,
-        subscription,
-        GroupedScalarInstall {
-            group: group.clone(),
-            row: vec![Value::Int(7), Value::Int(1)],
-            checkpoint: Some(PgLsn(20)),
-        },
-    )
-    .expect("scoped result installs");
-    assert_eq!(installed.updates.len(), 1);
-    assert_eq!(
-        installed.updates[0].change,
-        AggregateValueChange::Remove,
-        "the replacement minimum 7 leaves the result"
-    );
-}
+    /// A scoped read that confirms the held extreme announces nothing: the
+    /// consumer already holds this value, and the read only corrected the
+    /// engine's private row count.
+    #[test]
+    fn a_confirming_reread_stays_silent() {
+        let (mut engine, orders) = engine();
+        let (subscription, _) = register(&mut engine, "MIN");
+        seed(
+            &mut engine,
+            subscription,
+            vec![vec![
+                Value::String("north".into()),
+                Value::Int(2),
+                Value::Int(3),
+            ]],
+        );
+        let tied = Event::delete(orders, text_row(1, "north", 2))
+            .with_pk_columns([0u16])
+            .with_checkpoint(PgLsn(10));
+        let output = engine.dispatch(&tied).expect("delete dispatches");
+        let ReExecutionRead::GroupedScalar { group, .. } = &output.triggers()[0].read else {
+            panic!("expected grouped scalar read")
+        };
+        let installed = Install::install(
+            &mut engine,
+            subscription,
+            GroupedScalarInstall {
+                group: group.clone(),
+                row: vec![Value::Int(2), Value::Int(2)],
+                checkpoint: Some(PgLsn(10)),
+            },
+        )
+        .expect("confirming result installs");
+        assert!(
+            installed.updates.is_empty(),
+            "the extreme did not change, got {:?}",
+            installed.updates
+        );
+    }
 
-#[test]
-fn a_row_count_having_announces_without_an_extreme_change() {
-    let (mut engine, orders) = engine();
-    let (subscription, _) = register_having(
-        &mut engine,
-        "SELECT region, MAX(amount) FROM orders GROUP BY region HAVING COUNT(*) > 1",
-    );
-    let opening = seed(
-        &mut engine,
-        subscription,
-        vec![vec![
-            Value::String("north".into()),
-            Value::Int(9),
-            Value::Int(1),
-        ]],
-    );
-    assert!(opening.updates.is_empty(), "one row does not pass");
+    /// `TRUNCATE` says goodbye only to announced groups: one hidden behind the
+    /// `HAVING` was never delivered, so its disappearance announces nothing.
+    #[test]
+    fn truncate_removes_only_announced_groups() {
+        let (mut engine, orders) = engine();
+        let (subscription, _) = register_having(
+            &mut engine,
+            "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
+        );
+        let opening = seed(
+            &mut engine,
+            subscription,
+            vec![
+                vec![Value::String("north".into()), Value::Int(7), Value::Int(1)],
+                vec![Value::String("south".into()), Value::Int(2), Value::Int(1)],
+            ],
+        );
+        assert_eq!(opening.updates.len(), 1, "north stays hidden");
+        let south = opening.updates[0].group.clone().expect("south key");
 
-    let second = Event::insert(orders, text_row(2, "north", 4))
-        .with_pk_columns([0u16])
-        .with_checkpoint(PgLsn(10));
-    let output = engine.dispatch(&second).expect("insert dispatches");
-    assert_eq!(output.aggregate_updates().len(), 1);
-    assert_eq!(
-        output.aggregate_updates()[0].change,
-        scalar(Value::Int(9)),
-        "the second row crosses the row-count threshold without moving the maximum"
-    );
-}
-
-#[test]
-fn a_hidden_extreme_group_that_empties_stays_silent() {
-    let (mut engine, orders) = engine();
-    let (subscription, _) = register_having(
-        &mut engine,
-        "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
-    );
-    seed(
-        &mut engine,
-        subscription,
-        vec![vec![
-            Value::String("north".into()),
-            Value::Int(7),
-            Value::Int(1),
-        ]],
-    );
-    let removed = Event::delete(orders, text_row(1, "north", 7))
-        .with_pk_columns([0u16])
-        .with_checkpoint(PgLsn(10));
-    let output = engine.dispatch(&removed).expect("delete dispatches");
-    assert!(
-        output.aggregate_updates().is_empty(),
-        "a group never announced must not announce its removal"
-    );
-    assert!(output.triggers().is_empty());
-}
-
-/// A group born during the seed window is announced exactly once: the
-/// opening pass speaks for the final state, never on top of the replay.
-#[test]
-fn a_group_inserted_during_the_seed_window_is_announced_once() {
-    let (mut engine, orders) = engine();
-    let (subscription, _) = register(&mut engine, "MIN");
-    let event = Event::insert(orders, text_row(1, "south", 4))
-        .with_pk_columns([0u16])
-        .with_checkpoint(PgLsn(10));
-    engine.dispatch(&event).expect("insert queues");
-
-    let installed = seed(
-        &mut engine,
-        subscription,
-        vec![vec![
-            Value::String("north".into()),
-            Value::Int(2),
-            Value::Int(1),
-        ]],
-    );
-    assert_eq!(
-        installed.updates.len(),
-        2,
-        "north and south once each, got {:?}",
-        installed.updates
-    );
-    let mut south_sets = installed
-        .updates
-        .iter()
-        .filter(|update| update.change == scalar(Value::Int(4)));
-    let south = south_sets.next().expect("replayed group opens");
-    assert!(
-        south_sets.next().is_none(),
-        "the replayed insert must not double-announce"
-    );
-    let identity = south
-        .group
-        .as_ref()
-        .expect("grouped update carries identity");
-    assert_eq!(identity.values, vec![Value::String("south".into())]);
-    assert_eq!(&identity.key[..5], b"SQGK\x01");
-}
-
-/// A scoped read that confirms the held extreme announces nothing: the
-/// consumer already holds this value, and the read only corrected the
-/// engine's private row count.
-#[test]
-fn a_confirming_reread_stays_silent() {
-    let (mut engine, orders) = engine();
-    let (subscription, _) = register(&mut engine, "MIN");
-    seed(
-        &mut engine,
-        subscription,
-        vec![vec![
-            Value::String("north".into()),
-            Value::Int(2),
-            Value::Int(3),
-        ]],
-    );
-    let tied = Event::delete(orders, text_row(1, "north", 2))
-        .with_pk_columns([0u16])
-        .with_checkpoint(PgLsn(10));
-    let output = engine.dispatch(&tied).expect("delete dispatches");
-    let ReExecutionRead::GroupedScalar { group, .. } = &output.triggers()[0].read else {
-        panic!("expected grouped scalar read")
-    };
-    let installed = Install::install(
-        &mut engine,
-        subscription,
-        GroupedScalarInstall {
-            group: group.clone(),
-            row: vec![Value::Int(2), Value::Int(2)],
-            checkpoint: Some(PgLsn(10)),
-        },
-    )
-    .expect("confirming result installs");
-    assert!(
-        installed.updates.is_empty(),
-        "the extreme did not change, got {:?}",
-        installed.updates
-    );
-}
-
-/// `TRUNCATE` says goodbye only to announced groups: one hidden behind the
-/// `HAVING` was never delivered, so its disappearance announces nothing.
-#[test]
-fn truncate_removes_only_announced_groups() {
-    let (mut engine, orders) = engine();
-    let (subscription, _) = register_having(
-        &mut engine,
-        "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
-    );
-    let opening = seed(
-        &mut engine,
-        subscription,
-        vec![
-            vec![Value::String("north".into()), Value::Int(7), Value::Int(1)],
-            vec![Value::String("south".into()), Value::Int(2), Value::Int(1)],
-        ],
-    );
-    assert_eq!(opening.updates.len(), 1, "north stays hidden");
-    let south = opening.updates[0].group.clone().expect("south key");
-
-    let truncated = Event::truncate(orders).with_checkpoint(PgLsn(10));
-    let output = engine.dispatch(&truncated).expect("truncate dispatches");
-    assert_eq!(
-        output.aggregate_updates().len(),
-        1,
-        "north was never announced"
-    );
-    assert_eq!(output.aggregate_updates()[0].group.as_ref(), Some(&south));
-    assert_eq!(
-        output.aggregate_updates()[0].change,
-        AggregateValueChange::Remove
-    );
-    assert!(output.triggers().is_empty());
+        let truncated = Event::truncate(orders).with_checkpoint(PgLsn(10));
+        let output = engine.dispatch(&truncated).expect("truncate dispatches");
+        assert_eq!(
+            output.aggregate_updates().len(),
+            1,
+            "north was never announced"
+        );
+        assert_eq!(output.aggregate_updates()[0].group.as_ref(), Some(&south));
+        assert_eq!(
+            output.aggregate_updates()[0].change,
+            AggregateValueChange::Remove
+        );
+        assert!(output.triggers().is_empty());
+    }
 }

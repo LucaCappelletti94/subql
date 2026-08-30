@@ -68,9 +68,7 @@ fn apply_patchset_uuid_roundtrip_blob_and_text_clients() {
     let uuid_blob_client = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
     let uuid_text_client = Uuid::from_u128(0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111);
 
-    // -------------------------------------------------------------------
     // Round 1: INSERT one row with BLOB PK, one row with TEXT PK.
-    // -------------------------------------------------------------------
     let inserts = PatchSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(
             Insert::from(things.clone())
@@ -109,10 +107,8 @@ fn apply_patchset_uuid_roundtrip_blob_and_text_clients() {
         ]
     );
 
-    // -------------------------------------------------------------------
     // Round 2: UPDATE the BLOB-client row's tag via a TEXT PK reference
     // (proving the adapter accepts both flavors even for the same row).
-    // -------------------------------------------------------------------
     let updates = PatchSet::<SimpleTable, String, Vec<u8>>::new().update(
         Update::<_, PatchsetFormat, String, Vec<u8>>::from(things.clone())
             .set(0, uuid_blob_client.hyphenated().to_string())
@@ -131,10 +127,8 @@ fn apply_patchset_uuid_roundtrip_blob_and_text_clients() {
         .expect("load");
     assert_eq!(row.tag, "relabeled");
 
-    // -------------------------------------------------------------------
     // Round 3: DELETE the TEXT-client row via a BLOB PK reference (same
     // adapter accepts either flavor for identifying the same row).
-    // -------------------------------------------------------------------
     let deletes = PatchSet::<SimpleTable, String, Vec<u8>>::new().delete(PatchDelete::<
         SimpleTable,
         String,
@@ -154,11 +148,9 @@ fn apply_patchset_uuid_roundtrip_blob_and_text_clients() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, uuid_blob_client);
 
-    // -------------------------------------------------------------------
     // Round 4 (strict-error path): INTEGER wire value on a UUID column is
     // refused at bind time with `Error::QueryBuilderError`, transaction
     // rolls back.
-    // -------------------------------------------------------------------
     let bad = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(
         Insert::from(things)
             .set(0, 42_i64)

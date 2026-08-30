@@ -11,206 +11,216 @@ use sqlparser::dialect::PostgreSqlDialect;
 use std::collections::{HashMap, HashSet};
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
-use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest, TableId};
+use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
-// ============================================================================
-// Test Schema
-// ============================================================================
+mod test_schema {
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use subql::{catalog_helpers, TableId};
 
-/// Build the proptest fixture: a single 3-column `items` table.
-fn proptest_catalog() -> ParserDB {
-    ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE _items_pad (id INT);\n\
+    /// Build the proptest fixture: a single 3-column `items` table.
+    pub(super) fn proptest_catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE _items_pad (id INT);\n\
          CREATE TABLE items (id INT PRIMARY KEY, amount INT, status TEXT);",
-    )
-    .expect("proptest items fixture parses")
+        )
+        .expect("proptest items fixture parses")
+    }
+
+    pub(super) fn items_id(database: &ParserDB) -> TableId {
+        catalog_helpers::table_id(database, "items").expect("items table exists")
+    }
+
+    pub(super) fn pad_id(database: &ParserDB) -> TableId {
+        catalog_helpers::table_id(database, "_items_pad").expect("_items_pad table exists")
+    }
 }
 
-fn items_id(database: &ParserDB) -> TableId {
-    catalog_helpers::table_id(database, "items").expect("items table exists")
-}
+mod strategies {
+    use proptest::prelude::*;
+    use subql::backend::{Postgres, Value};
+    use subql::testing::TestEvent;
+    use subql::TableId;
 
-fn pad_id(database: &ParserDB) -> TableId {
-    catalog_helpers::table_id(database, "_items_pad").expect("_items_pad table exists")
-}
+    /// A predicate we can generate SQL for and also evaluate directly in Rust.
+    #[derive(Debug, Clone)]
+    pub(super) enum TestPredicate {
+        AmountGt(i64),
+        AmountLt(i64),
+        AmountEq(i64),
+        AmountBetween(i64, i64),
+        StatusEq(String),
+        IdEq(i64),
+        IsNull,
+        And(Box<Self>, Box<Self>),
+        Or(Box<Self>, Box<Self>),
+    }
 
-// ============================================================================
-// Strategies
-// ============================================================================
+    impl TestPredicate {
+        /// Convert to SQL WHERE clause.
+        pub(super) fn to_sql(&self) -> String {
+            match self {
+                Self::AmountGt(v) => format!("amount > {v}"),
+                Self::AmountLt(v) => format!("amount < {v}"),
+                Self::AmountEq(v) => format!("amount = {v}"),
+                Self::AmountBetween(lo, hi) => format!("amount BETWEEN {lo} AND {hi}"),
+                Self::StatusEq(s) => format!("status = '{s}'"),
+                Self::IdEq(v) => format!("id = {v}"),
+                Self::IsNull => "amount IS NULL".to_string(),
+                Self::And(a, b) => format!("({}) AND ({})", a.to_sql(), b.to_sql()),
+                Self::Or(a, b) => format!("({}) OR ({})", a.to_sql(), b.to_sql()),
+            }
+        }
 
-/// A predicate we can generate SQL for and also evaluate directly in Rust.
-#[derive(Debug, Clone)]
-enum TestPredicate {
-    AmountGt(i64),
-    AmountLt(i64),
-    AmountEq(i64),
-    AmountBetween(i64, i64),
-    StatusEq(String),
-    IdEq(i64),
-    IsNull,
-    And(Box<Self>, Box<Self>),
-    Or(Box<Self>, Box<Self>),
-}
-
-impl TestPredicate {
-    /// Convert to SQL WHERE clause.
-    fn to_sql(&self) -> String {
-        match self {
-            Self::AmountGt(v) => format!("amount > {v}"),
-            Self::AmountLt(v) => format!("amount < {v}"),
-            Self::AmountEq(v) => format!("amount = {v}"),
-            Self::AmountBetween(lo, hi) => format!("amount BETWEEN {lo} AND {hi}"),
-            Self::StatusEq(s) => format!("status = '{s}'"),
-            Self::IdEq(v) => format!("id = {v}"),
-            Self::IsNull => "amount IS NULL".to_string(),
-            Self::And(a, b) => format!("({}) AND ({})", a.to_sql(), b.to_sql()),
-            Self::Or(a, b) => format!("({}) OR ({})", a.to_sql(), b.to_sql()),
+        /// Evaluate predicate against a row (ground truth).
+        pub(super) fn eval(
+            &self,
+            id: &Value<Postgres>,
+            amount: &Value<Postgres>,
+            status: &Value<Postgres>,
+        ) -> Option<bool> {
+            match self {
+                Self::AmountGt(v) => match amount {
+                    Value::Int(a) => Some(*a > *v),
+                    _ => None,
+                },
+                Self::AmountLt(v) => match amount {
+                    Value::Int(a) => Some(*a < *v),
+                    _ => None,
+                },
+                Self::AmountEq(v) => match amount {
+                    Value::Int(a) => Some(*a == *v),
+                    _ => None,
+                },
+                Self::AmountBetween(lo, hi) => match amount {
+                    Value::Int(a) => Some(*a >= *lo && *a <= *hi),
+                    _ => None,
+                },
+                Self::StatusEq(s) => match status {
+                    Value::String(st) => Some(st.as_str() == s.as_str()),
+                    _ => None,
+                },
+                Self::IdEq(v) => match id {
+                    Value::Int(i) => Some(*i == *v),
+                    _ => None,
+                },
+                Self::IsNull => match amount {
+                    Value::Null => Some(true),
+                    _ => Some(false),
+                },
+                Self::And(a, b) => {
+                    let ra = a.eval(id, amount, status);
+                    let rb = b.eval(id, amount, status);
+                    match (ra, rb) {
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    }
+                }
+                Self::Or(a, b) => {
+                    let ra = a.eval(id, amount, status);
+                    let rb = b.eval(id, amount, status);
+                    match (ra, rb) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                }
+            }
         }
     }
 
-    /// Evaluate predicate against a row (ground truth).
-    fn eval(
-        &self,
+    /// Strategy for generating test predicates (limited depth).
+    pub(super) fn predicate_strategy() -> impl Strategy<Value = TestPredicate> {
+        let leaf = prop_oneof![
+            (-500i64..500).prop_map(TestPredicate::AmountGt),
+            (-500i64..500).prop_map(TestPredicate::AmountLt),
+            (-500i64..500).prop_map(TestPredicate::AmountEq),
+            (-500i64..500i64)
+                .prop_flat_map(|lo| (Just(lo), lo..lo + 1000))
+                .prop_map(|(lo, hi)| TestPredicate::AmountBetween(lo, hi)),
+            prop_oneof![
+                Just("active".to_string()),
+                Just("pending".to_string()),
+                Just("closed".to_string()),
+            ]
+            .prop_map(TestPredicate::StatusEq),
+            (0i64..100).prop_map(TestPredicate::IdEq),
+            Just(TestPredicate::IsNull),
+        ];
+
+        leaf.prop_recursive(2, 16, 4, |inner| {
+            prop_oneof![
+                (inner.clone(), inner.clone())
+                    .prop_map(|(a, b)| TestPredicate::And(Box::new(a), Box::new(b))),
+                (inner.clone(), inner)
+                    .prop_map(|(a, b)| TestPredicate::Or(Box::new(a), Box::new(b))),
+            ]
+        })
+    }
+
+    /// Strategy for generating row cells.
+    pub(super) fn row_strategy(
+    ) -> impl Strategy<Value = (Value<Postgres>, Value<Postgres>, Value<Postgres>)> {
+        let id_cell = (0i64..100).prop_map(Value::Int);
+        let amount_cell = prop_oneof![
+            9 => (-1000i64..1000).prop_map(Value::Int),
+            1 => Just(Value::Null),
+        ];
+        let status_cell = prop_oneof![
+            Just(Value::String("active".into())),
+            Just(Value::String("pending".into())),
+            Just(Value::String("closed".into())),
+            Just(Value::String("unknown".into())),
+            Just(Value::Null),
+        ];
+        (id_cell, amount_cell, status_cell)
+    }
+
+    pub(super) fn insert_event(
+        tid: TableId,
         id: &Value<Postgres>,
         amount: &Value<Postgres>,
         status: &Value<Postgres>,
-    ) -> Option<bool> {
-        match self {
-            Self::AmountGt(v) => match amount {
-                Value::Int(a) => Some(*a > *v),
-                _ => None,
-            },
-            Self::AmountLt(v) => match amount {
-                Value::Int(a) => Some(*a < *v),
-                _ => None,
-            },
-            Self::AmountEq(v) => match amount {
-                Value::Int(a) => Some(*a == *v),
-                _ => None,
-            },
-            Self::AmountBetween(lo, hi) => match amount {
-                Value::Int(a) => Some(*a >= *lo && *a <= *hi),
-                _ => None,
-            },
-            Self::StatusEq(s) => match status {
-                Value::String(st) => Some(st.as_str() == s.as_str()),
-                _ => None,
-            },
-            Self::IdEq(v) => match id {
-                Value::Int(i) => Some(*i == *v),
-                _ => None,
-            },
-            Self::IsNull => match amount {
-                Value::Null => Some(true),
-                _ => Some(false),
-            },
-            Self::And(a, b) => {
-                let ra = a.eval(id, amount, status);
-                let rb = b.eval(id, amount, status);
-                match (ra, rb) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                }
-            }
-            Self::Or(a, b) => {
-                let ra = a.eval(id, amount, status);
-                let rb = b.eval(id, amount, status);
-                match (ra, rb) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                }
-            }
-        }
+    ) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::insert(tid, vec![id.clone(), amount.clone(), status.clone()])
+            .with_pk_columns([0u16])
+    }
+
+    pub(super) fn delete_event(
+        tid: TableId,
+        id: &Value<Postgres>,
+        amount: &Value<Postgres>,
+        status: &Value<Postgres>,
+    ) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::delete(tid, vec![id.clone(), amount.clone(), status.clone()])
+            .with_pk_columns([0u16])
+    }
+
+    pub(super) fn update_event(
+        tid: TableId,
+        id: &Value<Postgres>,
+        old_amount: Value<Postgres>,
+        new_amount: &Value<Postgres>,
+        status: &Value<Postgres>,
+        changed: impl IntoIterator<Item = u16>,
+    ) -> TestEvent<Postgres> {
+        TestEvent::<Postgres>::update(
+            tid,
+            vec![id.clone(), old_amount, status.clone()],
+            vec![id.clone(), new_amount.clone(), status.clone()],
+        )
+        .with_pk_columns([0u16])
+        .with_changed_columns(changed)
     }
 }
 
-/// Strategy for generating test predicates (limited depth).
-fn predicate_strategy() -> impl Strategy<Value = TestPredicate> {
-    let leaf = prop_oneof![
-        (-500i64..500).prop_map(TestPredicate::AmountGt),
-        (-500i64..500).prop_map(TestPredicate::AmountLt),
-        (-500i64..500).prop_map(TestPredicate::AmountEq),
-        (-500i64..500i64)
-            .prop_flat_map(|lo| (Just(lo), lo..lo + 1000))
-            .prop_map(|(lo, hi)| TestPredicate::AmountBetween(lo, hi)),
-        prop_oneof![
-            Just("active".to_string()),
-            Just("pending".to_string()),
-            Just("closed".to_string()),
-        ]
-        .prop_map(TestPredicate::StatusEq),
-        (0i64..100).prop_map(TestPredicate::IdEq),
-        Just(TestPredicate::IsNull),
-    ];
+use strategies::{
+    delete_event, insert_event, predicate_strategy, row_strategy, update_event, TestPredicate,
+};
+use test_schema::{items_id, pad_id, proptest_catalog};
 
-    leaf.prop_recursive(2, 16, 4, |inner| {
-        prop_oneof![
-            (inner.clone(), inner.clone())
-                .prop_map(|(a, b)| TestPredicate::And(Box::new(a), Box::new(b))),
-            (inner.clone(), inner).prop_map(|(a, b)| TestPredicate::Or(Box::new(a), Box::new(b))),
-        ]
-    })
-}
-
-/// Strategy for generating row cells.
-fn row_strategy() -> impl Strategy<Value = (Value<Postgres>, Value<Postgres>, Value<Postgres>)> {
-    let id_cell = (0i64..100).prop_map(Value::Int);
-    let amount_cell = prop_oneof![
-        9 => (-1000i64..1000).prop_map(Value::Int),
-        1 => Just(Value::Null),
-    ];
-    let status_cell = prop_oneof![
-        Just(Value::String("active".into())),
-        Just(Value::String("pending".into())),
-        Just(Value::String("closed".into())),
-        Just(Value::String("unknown".into())),
-        Just(Value::Null),
-    ];
-    (id_cell, amount_cell, status_cell)
-}
-
-fn insert_event(
-    tid: TableId,
-    id: &Value<Postgres>,
-    amount: &Value<Postgres>,
-    status: &Value<Postgres>,
-) -> TestEvent<Postgres> {
-    TestEvent::<Postgres>::insert(tid, vec![id.clone(), amount.clone(), status.clone()])
-        .with_pk_columns([0u16])
-}
-
-fn delete_event(
-    tid: TableId,
-    id: &Value<Postgres>,
-    amount: &Value<Postgres>,
-    status: &Value<Postgres>,
-) -> TestEvent<Postgres> {
-    TestEvent::<Postgres>::delete(tid, vec![id.clone(), amount.clone(), status.clone()])
-        .with_pk_columns([0u16])
-}
-
-fn update_event(
-    tid: TableId,
-    id: &Value<Postgres>,
-    old_amount: Value<Postgres>,
-    new_amount: &Value<Postgres>,
-    status: &Value<Postgres>,
-    changed: impl IntoIterator<Item = u16>,
-) -> TestEvent<Postgres> {
-    TestEvent::<Postgres>::update(
-        tid,
-        vec![id.clone(), old_amount, status.clone()],
-        vec![id.clone(), new_amount.clone(), status.clone()],
-    )
-    .with_pk_columns([0u16])
-    .with_changed_columns(changed)
-}
-
-// ============================================================================
 // Property Tests
-// ============================================================================
 
 proptest! {
     /// The core invariant: dispatch returns exactly the consumers whose predicates match.

@@ -14,10 +14,6 @@ use uuid::Uuid;
 
 use crate::backend::{BuiltinKind, MySql, Postgres, Value};
 
-// ============================================================================
-// Typed decoders producing `Value<Postgres>` (Phase 7)
-// ============================================================================
-
 /// Decode a pgoutput text-format value into a typed [`Value<Postgres>`],
 /// routed by the column's catalog [`BuiltinKind`] (the schema-driven path).
 ///
@@ -471,12 +467,10 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // Sub-block F: json_value_to_{pg,mysql}_value_by_kind. Catalog-driven
     // decode for the JSON wire parsers (wal2json = Postgres, Maxwell =
     // MySQL). Decode is infallible: a shape the kind cannot accept
     // collapses to Value::Missing, matching the value_at re-exec contract.
-    // ------------------------------------------------------------------
 
     #[test]
     fn json_kind_null_is_sql_null_not_missing() {
