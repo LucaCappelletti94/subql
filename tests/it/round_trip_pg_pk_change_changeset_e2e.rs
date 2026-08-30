@@ -88,7 +88,7 @@ fn round_trip_pk_change_via_changeset() {
     let port = common::pg_port(&container);
     let mut pg = common::pg_connect(port);
 
-    // ---- Server state: create and seed the Postgres table ----
+    // Server state: create and seed the Postgres table
     sql_query(PG_DDL).execute(&mut pg).unwrap();
     for (id, label, qty) in SEED {
         sql_query(format!(
@@ -98,7 +98,7 @@ fn round_trip_pk_change_via_changeset() {
         .unwrap();
     }
 
-    // ---- Client replica: same rows in SQLite ----
+    // Client replica: same rows in SQLite
     let mut sqlite = SqliteConnection::establish(":memory:").unwrap();
     sql_query(SQLITE_DDL).execute(&mut sqlite).unwrap();
     for (id, label, qty) in SEED {
@@ -109,7 +109,7 @@ fn round_trip_pk_change_via_changeset() {
         .unwrap();
     }
 
-    // ---- Client mutation: relocate a primary key, recorded in a session ----
+    // Client mutation: relocate a primary key, recorded in a session
     let mut session = sqlite.create_session().unwrap();
     session.attach_all().unwrap();
     sql_query("UPDATE items SET id = 20, label = 'moved' WHERE id = 2")
@@ -118,7 +118,7 @@ fn round_trip_pk_change_via_changeset() {
     let changeset = session.changeset().unwrap();
     assert!(!changeset.is_empty(), "session recorded no changes");
 
-    // ---- Apply the client changeset to the server ----
+    // Apply the client changeset to the server
     let pg_engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> = SubscriptionEngine::new(
         ParserDB::parse::<PostgreSqlDialect>(SUBQL_PG_DDL).unwrap(),
         PostgreSqlDialect {},

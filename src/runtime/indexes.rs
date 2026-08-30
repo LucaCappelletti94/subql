@@ -154,11 +154,9 @@ pub struct HybridIndexes {
     /// [`select_update_candidates`](Self::select_update_candidates).
     pub full_row: RoaringBitmap,
 
-    // -----------------------------------------------------------------------
     // Aggregate (COUNT/SUM/...) predicate indexes, parallel to row indexes.
     // Kept separate so `select_candidates` never returns agg predicates and
     // `select_agg_candidates` never returns row predicates.
-    // -----------------------------------------------------------------------
     /// Aggregate predicates (all of them, for INSERT/DELETE dispatch)
     pub agg_fallback: RoaringBitmap,
 
@@ -812,9 +810,7 @@ mod tests {
         assert!(bitmap.unwrap().contains(pred_id.as_u32()));
     }
 
-    // ========================================================================
     // Push Coverage: Extract Indexable Atoms - All Patterns
-    // ========================================================================
 
     #[test]
     fn test_finalize_ranges_sort_order() {

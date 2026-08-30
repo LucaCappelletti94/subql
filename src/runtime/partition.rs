@@ -936,9 +936,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // C3: UPDATE candidate set
-    // =========================================================================
 
     /// An UPDATE selects every row predicate, whatever its index atom. No row
     /// image enters the selection: dispatch evaluates both of them, so a

@@ -180,9 +180,7 @@ mod tests {
         assert!(matches!(err, StorageError::Corrupt(message) if message.contains("exceeds limit")));
     }
 
-    // =========================================================================
     // D1: Trailing bytes must be rejected
-    // =========================================================================
 
     #[test]
     fn test_trailing_bytes_rejected() {
@@ -220,9 +218,7 @@ mod tests {
         assert_eq!(data, decoded);
     }
 
-    // =========================================================================
     // D2: decode applies decompression-bomb cap
-    // =========================================================================
 
     #[test]
     fn test_decode_applies_decompression_limit() {

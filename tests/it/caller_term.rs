@@ -14,11 +14,10 @@ use rls2fga::translator::{Translator, TranslatorBuilder};
 use rls2fga::types::ConfidenceLevel;
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, RegisterError, SubscriptionEngine, SubscriptionRequest, TableId,
-    Tier,
 };
 
 /// One-wide value rows, the shape the tuple-stating API takes for the
@@ -321,241 +320,249 @@ fn the_batch_path_seeds_the_identity_as_the_single_path_does() {
     assert_eq!(notifs.inserted(), &[2], "the batch-registered term filters");
 }
 
-// ---------------------------------------------------------------------------
-// Refusals
-// ---------------------------------------------------------------------------
+mod refusals {
+    use super::{engine, refusal, rows_of, subscribe, Engine, CALLER, DDL};
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use subql::backend::{Postgres, Value};
+    use subql::{DefaultIds, SubscriptionEngine, SubscriptionRequest, Tier};
 
-/// The refusal the finding asked for by name: without a subscriber the
-/// registration is refused with a message naming the missing subscriber,
-/// rather than as unsupported SQL.
-#[test]
-fn without_a_subscriber_the_refusal_names_the_subscriber() {
-    let (mut engine, _) = engine();
-    let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, CALLER));
-    assert!(
-        reason.contains("subscriber"),
-        "the refusal names what is missing: {reason}"
-    );
-}
+    /// The refusal the finding asked for by name: without a subscriber the
+    /// registration is refused with a message naming the missing subscriber,
+    /// rather than as unsupported SQL.
+    #[test]
+    fn without_a_subscriber_the_refusal_names_the_subscriber() {
+        let (mut engine, _) = engine();
+        let reason = refusal(&mut engine, SubscriptionRequest::new(1u64, CALLER));
+        assert!(
+            reason.contains("subscriber"),
+            "the refusal names what is missing: {reason}"
+        );
+    }
 
-/// A setting key nothing declares as the caller is refused rather than read as
-/// the subscriber. `app.user_id` answers through the registry's defaults, and
-/// `app.tenant_id` is exactly the key those defaults do not name.
-#[test]
-fn an_undeclared_setting_key_is_refused() {
-    let (mut engine, _) = engine();
-    let reason = refusal(
-        &mut engine,
-        SubscriptionRequest::new(
+    /// A setting key nothing declares as the caller is refused rather than read as
+    /// the subscriber. `app.user_id` answers through the registry's defaults, and
+    /// `app.tenant_id` is exactly the key those defaults do not name.
+    #[test]
+    fn an_undeclared_setting_key_is_refused() {
+        let (mut engine, _) = engine();
+        let reason = refusal(
+            &mut engine,
+            SubscriptionRequest::new(
+                1u64,
+                "SELECT * FROM notes WHERE owner = current_setting('app.tenant_id', true)",
+            )
+            .subscriber(Value::String("alice".into())),
+        );
+        assert!(!reason.is_empty(), "the refusal carries rls2fga's reason");
+    }
+
+    /// A subscriber of another kind than the compared column would match no row,
+    /// ever, so it is refused at registration rather than served in silence.
+    #[test]
+    fn a_subscriber_of_the_wrong_kind_is_refused() {
+        let (mut engine, _) = engine();
+        let reason = refusal(
+            &mut engine,
+            SubscriptionRequest::new(1u64, CALLER).subscriber(Value::Int(7)),
+        );
+        assert!(
+            reason.contains("Int") && reason.contains("String"),
+            "the refusal names both kinds: {reason}"
+        );
+    }
+
+    /// Values stated for the compared column would admit rows the filter's text
+    /// never names, so they are refused: the comparison seeds itself.
+    #[test]
+    fn values_stated_for_the_caller_comparison_are_refused() {
+        let (mut engine, _) = engine();
+        let reason = refusal(
+            &mut engine,
+            subscribe(1, "alice")
+                .term_values(vec!["owner"], rows_of(vec![Value::String("bob".into())])),
+        );
+        assert!(
+            reason.contains("owner"),
+            "the refusal names the column: {reason}"
+        );
+    }
+
+    /// `NOT` over a caller comparison admits everybody but the caller, including
+    /// rows the caller cannot see, so it is not served in process and the reason
+    /// says so rather than the engine quietly serving different semantics.
+    #[test]
+    fn a_negated_caller_comparison_is_not_served_in_process() {
+        let (mut engine, _) = engine();
+        let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
             1u64,
-            "SELECT * FROM notes WHERE owner = current_setting('app.tenant_id', true)",
+            "SELECT * FROM notes WHERE NOT (owner = current_setting('app.user_id', true))",
         )
-        .subscriber(Value::String("alice".into())),
-    );
-    assert!(!reason.is_empty(), "the refusal carries rls2fga's reason");
+        .subscriber(Value::String("alice".into()));
+        let registered = engine
+            .register(spec)
+            .expect("a shape the evaluator refuses is re-read, not turned away");
+        assert!(
+            !matches!(registered.tier, Tier::InProcess(_)),
+            "got {:?}",
+            registered.tier
+        );
+        let reason = registered
+            .not_served_because
+            .expect("a read tier says why it is one");
+        assert!(
+            reason.contains("caller"),
+            "the reason names the shape: {reason}"
+        );
+    }
+
+    /// A function reading a column is not a caller comparison, so it too lands on
+    /// a tier that re-reads rather than being maintained in process.
+    #[test]
+    fn a_function_of_a_column_is_not_served_in_process() {
+        let (mut engine, _) = engine();
+        let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
+            1u64,
+            "SELECT * FROM notes WHERE owner = lower(title)",
+        );
+        let registered = engine.register(spec).expect("re-read, not refused");
+        assert!(
+            !matches!(registered.tier, Tier::InProcess(_)),
+            "a column-reading function is outside the lifted shape, got {:?}",
+            registered.tier
+        );
+    }
+
+    /// Without translation settings the engine cannot tell whether the comparison
+    /// names the caller, and says so.
+    #[test]
+    fn a_caller_comparison_is_refused_without_a_translator() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
+        let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+        let reason = refusal(&mut engine, subscribe(1, "alice"));
+        assert!(
+            reason.contains("translator") || reason.contains("translation"),
+            "the refusal names what is missing: {reason}"
+        );
+    }
+
+    /// An aggregate cannot carry a caller comparison for the same reason it cannot
+    /// carry a membership subquery: one shared accumulator cannot answer per
+    /// subscriber.
+    #[test]
+    fn an_aggregate_with_a_caller_comparison_is_refused() {
+        let (mut engine, _) = engine();
+        let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
+            1u64,
+            "SELECT COUNT(*) FROM notes WHERE owner = current_setting('app.user_id', true)",
+        )
+        .subscriber(Value::String("alice".into()));
+        let reason = refusal(&mut engine, spec);
+        assert!(
+            reason.contains("aggregate"),
+            "the refusal names the aggregate: {reason}"
+        );
+    }
 }
 
-/// A subscriber of another kind than the compared column would match no row,
-/// ever, so it is refused at registration rather than served in silence.
-#[test]
-fn a_subscriber_of_the_wrong_kind_is_refused() {
-    let (mut engine, _) = engine();
-    let reason = refusal(
-        &mut engine,
-        SubscriptionRequest::new(1u64, CALLER).subscriber(Value::Int(7)),
-    );
-    assert!(
-        reason.contains("Int") && reason.contains("String"),
-        "the refusal names both kinds: {reason}"
-    );
-}
+mod describe_terms {
+    use super::{engine, refusal, subscribe, CALLER};
+    use subql::backend::{BuiltinKind, Postgres, Value};
+    use subql::{DefaultIds, SubscriptionRequest};
 
-/// Values stated for the compared column would admit rows the filter's text
-/// never names, so they are refused: the comparison seeds itself.
-#[test]
-fn values_stated_for_the_caller_comparison_are_refused() {
-    let (mut engine, _) = engine();
-    let reason = refusal(
-        &mut engine,
-        subscribe(1, "alice")
-            .term_values(vec!["owner"], rows_of(vec![Value::String("bob".into())])),
-    );
-    assert!(
-        reason.contains("owner"),
-        "the refusal names the column: {reason}"
-    );
-}
+    /// A caller comparison needs nothing seeded, but the subscriber has to be
+    /// built at the compared column's kind, so the description says which.
+    #[test]
+    fn describe_terms_names_the_kind_for_a_caller_comparison() {
+        let (describing, _) = engine();
+        let described = describing
+            .describe_terms(&SubscriptionRequest::new(1u64, CALLER))
+            .unwrap();
+        let [subql::term::TermDescription::Caller(caller)] = described.as_slice() else {
+            panic!("one caller comparison, got {described:?}");
+        };
+        assert_eq!(caller.column, "owner", "the compared column");
+        assert_eq!(
+            caller.kind,
+            BuiltinKind::String,
+            "owner is TEXT, the kind the subscriber must be built at"
+        );
+        assert_eq!(caller.custom, None);
 
-/// `NOT` over a caller comparison admits everybody but the caller, including
-/// rows the caller cannot see, so it is not served in process and the reason
-/// says so rather than the engine quietly serving different semantics.
-#[test]
-fn a_negated_caller_comparison_is_not_served_in_process() {
-    let (mut engine, _) = engine();
-    let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
-        1u64,
-        "SELECT * FROM notes WHERE NOT (owner = current_setting('app.user_id', true))",
-    )
-    .subscriber(Value::String("alice".into()));
-    let registered = engine
-        .register(spec)
-        .expect("a shape the evaluator refuses is re-read, not turned away");
-    assert!(
-        !matches!(registered.tier, Tier::InProcess(_)),
-        "got {:?}",
-        registered.tier
-    );
-    let reason = registered
-        .not_served_because
-        .expect("a read tier says why it is one");
-    assert!(
-        reason.contains("caller"),
-        "the reason names the shape: {reason}"
-    );
-}
+        // The description and registration agree: the named kind registers, and
+        // another kind is refused with the message that already exists.
+        let (mut registering, _) = engine();
+        registering
+            .register(subscribe(1, "alice"))
+            .expect("a subscriber built at the described kind registers");
+        let reason = refusal(
+            &mut registering,
+            SubscriptionRequest::new(2u64, CALLER).subscriber(Value::Int(7)),
+        );
+        assert!(
+            reason.contains("kind"),
+            "a subscriber built at another kind is refused: {reason}"
+        );
+    }
 
-/// A function reading a column is not a caller comparison, so it too lands on
-/// a tier that re-reads rather than being maintained in process.
-#[test]
-fn a_function_of_a_column_is_not_served_in_process() {
-    let (mut engine, _) = engine();
-    let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
-        1u64,
-        "SELECT * FROM notes WHERE owner = lower(title)",
-    );
-    let registered = engine.register(spec).expect("re-read, not refused");
-    assert!(
-        !matches!(registered.tier, Tier::InProcess(_)),
-        "a column-reading function is outside the lifted shape, got {:?}",
-        registered.tier
-    );
-}
-
-/// Without translation settings the engine cannot tell whether the comparison
-/// names the caller, and says so.
-#[test]
-fn a_caller_comparison_is_refused_without_a_translator() {
-    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
-    let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
-    let reason = refusal(&mut engine, subscribe(1, "alice"));
-    assert!(
-        reason.contains("translator") || reason.contains("translation"),
-        "the refusal names what is missing: {reason}"
-    );
-}
-
-/// An aggregate cannot carry a caller comparison for the same reason it cannot
-/// carry a membership subquery: one shared accumulator cannot answer per
-/// subscriber.
-#[test]
-fn an_aggregate_with_a_caller_comparison_is_refused() {
-    let (mut engine, _) = engine();
-    let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(
-        1u64,
-        "SELECT COUNT(*) FROM notes WHERE owner = current_setting('app.user_id', true)",
-    )
-    .subscriber(Value::String("alice".into()));
-    let reason = refusal(&mut engine, spec);
-    assert!(
-        reason.contains("aggregate"),
-        "the refusal names the aggregate: {reason}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// What a caller has to read before it can register
-// ---------------------------------------------------------------------------
-
-/// A caller comparison needs nothing seeded, but the subscriber has to be
-/// built at the compared column's kind, so the description says which.
-#[test]
-fn describe_terms_names_the_kind_for_a_caller_comparison() {
-    let (describing, _) = engine();
-    let described = describing
-        .describe_terms(&SubscriptionRequest::new(1u64, CALLER))
-        .unwrap();
-    let [subql::term::TermDescription::Caller(caller)] = described.as_slice() else {
-        panic!("one caller comparison, got {described:?}");
-    };
-    assert_eq!(caller.column, "owner", "the compared column");
-    assert_eq!(
-        caller.kind,
-        BuiltinKind::String,
-        "owner is TEXT, the kind the subscriber must be built at"
-    );
-    assert_eq!(caller.custom, None);
-
-    // The description and registration agree: the named kind registers, and
-    // another kind is refused with the message that already exists.
-    let (mut registering, _) = engine();
-    registering
-        .register(subscribe(1, "alice"))
-        .expect("a subscriber built at the described kind registers");
-    let reason = refusal(
-        &mut registering,
-        SubscriptionRequest::new(2u64, CALLER).subscriber(Value::Int(7)),
-    );
-    assert!(
-        reason.contains("kind"),
-        "a subscriber built at another kind is refused: {reason}"
-    );
-}
-
-/// A mixed filter describes both halves: the membership subquery with its
-/// seed read, and the caller comparison with the kind to build the
-/// subscriber at.
-#[test]
-fn describe_terms_names_both_halves_of_a_mixed_filter() {
-    let (engine, _) = engine();
-    let mixed = "SELECT * FROM notes WHERE owner = current_setting('app.user_id', true) \
+    /// A mixed filter describes both halves: the membership subquery with its
+    /// seed read, and the caller comparison with the kind to build the
+    /// subscriber at.
+    #[test]
+    fn describe_terms_names_both_halves_of_a_mixed_filter() {
+        let (engine, _) = engine();
+        let mixed = "SELECT * FROM notes WHERE owner = current_setting('app.user_id', true) \
          AND project_id IN (SELECT project_id FROM project_members \
          WHERE user_id = current_setting('app.user_id', true))";
-    let described = engine
-        .describe_terms(&SubscriptionRequest::new(1u64, mixed))
-        .unwrap();
-    assert_eq!(described.len(), 2, "one entry per term");
-    let membership = described
-        .iter()
-        .find_map(|term| match term {
-            subql::term::TermDescription::Membership(membership) => Some(membership),
-            subql::term::TermDescription::Caller(_) => None,
-        })
-        .expect("the subquery is described with its seed read");
-    assert_eq!(
-        membership.pairs[0].column, "project_id",
-        "the subquery's compared column"
-    );
-    let caller = described
-        .iter()
-        .find_map(|term| match term {
-            subql::term::TermDescription::Caller(caller) => Some(caller),
-            subql::term::TermDescription::Membership(_) => None,
-        })
-        .expect("the caller comparison is described with its kind");
-    assert_eq!(caller.column, "owner");
-    assert_eq!(caller.kind, BuiltinKind::String);
-}
+        let described = engine
+            .describe_terms(&SubscriptionRequest::new(1u64, mixed))
+            .unwrap();
+        assert_eq!(described.len(), 2, "one entry per term");
+        let membership = described
+            .iter()
+            .find_map(|term| match term {
+                subql::term::TermDescription::Membership(membership) => Some(membership),
+                subql::term::TermDescription::Caller(_) => None,
+            })
+            .expect("the subquery is described with its seed read");
+        assert_eq!(
+            membership.pairs[0].column, "project_id",
+            "the subquery's compared column"
+        );
+        let caller = described
+            .iter()
+            .find_map(|term| match term {
+                subql::term::TermDescription::Caller(caller) => Some(caller),
+                subql::term::TermDescription::Membership(_) => None,
+            })
+            .expect("the caller comparison is described with its kind");
+        assert_eq!(caller.column, "owner");
+        assert_eq!(caller.kind, BuiltinKind::String);
+    }
 
-/// Describing and registering the same request refuse alike for the caller
-/// shapes, mirroring the membership-subquery parity assertion.
-#[test]
-fn describe_terms_refuses_the_caller_shapes_register_refuses() {
-    for sql in [
-        "SELECT * FROM notes WHERE owner = current_setting('app.tenant_id', true)",
-        "SELECT COUNT(*) FROM notes WHERE owner = current_setting('app.user_id', true)",
-    ] {
-        let (mut engine, _) = engine();
-        let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql)
-            .subscriber(Value::String("alice".into()));
-        let described = engine.describe_terms(&spec);
-        let registered = engine.register(spec);
-        match (described, registered) {
-            (Err(d), Err(r)) => assert_eq!(
-                format!("{d:?}"),
-                format!("{r:?}"),
-                "the two entry points refuse for the same stated reason"
-            ),
-            (d, r) => panic!("expected both to refuse for {sql}: describe {d:?}, register {r:?}"),
+    /// Describing and registering the same request refuse alike for the caller
+    /// shapes, mirroring the membership-subquery parity assertion.
+    #[test]
+    fn describe_terms_refuses_the_caller_shapes_register_refuses() {
+        for sql in [
+            "SELECT * FROM notes WHERE owner = current_setting('app.tenant_id', true)",
+            "SELECT COUNT(*) FROM notes WHERE owner = current_setting('app.user_id', true)",
+        ] {
+            let (mut engine, _) = engine();
+            let spec = SubscriptionRequest::<DefaultIds, Postgres>::new(1u64, sql)
+                .subscriber(Value::String("alice".into()));
+            let described = engine.describe_terms(&spec);
+            let registered = engine.register(spec);
+            match (described, registered) {
+                (Err(d), Err(r)) => assert_eq!(
+                    format!("{d:?}"),
+                    format!("{r:?}"),
+                    "the two entry points refuse for the same stated reason"
+                ),
+                (d, r) => {
+                    panic!("expected both to refuse for {sql}: describe {d:?}, register {r:?}")
+                }
+            }
         }
     }
 }

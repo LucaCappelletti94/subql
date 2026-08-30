@@ -55,9 +55,7 @@ fn apply_patchset_sqlite_roundtrip_insert_update_delete() {
 
     let things = SimpleTable::new("things", &["id", "name", "active", "blob_col"], &[0]);
 
-    // -------------------------------------------------------------------
     // Round 1: INSERT two rows spanning all four SQLite affinities.
-    // -------------------------------------------------------------------
     let inserts = PatchSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(
             Insert::from(things.clone())
@@ -109,9 +107,7 @@ fn apply_patchset_sqlite_roundtrip_insert_update_delete() {
         ]
     );
 
-    // -------------------------------------------------------------------
     // Round 2: UPDATE id=2 name and active.
-    // -------------------------------------------------------------------
     let updates = PatchSet::<SimpleTable, String, Vec<u8>>::new().update(
         Update::<_, PatchsetFormat, String, Vec<u8>>::from(things.clone())
             .set(0, 2_i64)
@@ -141,9 +137,7 @@ fn apply_patchset_sqlite_roundtrip_insert_update_delete() {
         }
     );
 
-    // -------------------------------------------------------------------
     // Round 3: DELETE id=1.
-    // -------------------------------------------------------------------
     let deletes = PatchSet::<SimpleTable, String, Vec<u8>>::new().delete(PatchDelete::<
         SimpleTable,
         String,

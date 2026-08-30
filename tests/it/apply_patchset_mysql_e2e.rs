@@ -62,9 +62,7 @@ fn apply_patchset_bool_roundtrip_insert_update_delete_mysql() {
     // SQLite session table descriptor. Column 0 is the PK.
     let things = SimpleTable::new("things", &["id", "active"], &[0]);
 
-    // -------------------------------------------------------------------
     // Round 1: INSERT id=1 active=true, INSERT id=2 active=false.
-    // -------------------------------------------------------------------
     let inserts = PatchSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(
             Insert::from(things.clone())
@@ -104,9 +102,7 @@ fn apply_patchset_bool_roundtrip_insert_update_delete_mysql() {
         ]
     );
 
-    // -------------------------------------------------------------------
     // Round 2: UPDATE id=2 active=true.
-    // -------------------------------------------------------------------
     let updates = PatchSet::<SimpleTable, String, Vec<u8>>::new().update(
         Update::<_, PatchsetFormat, String, Vec<u8>>::from(things.clone())
             .set(0, 2_i64)
@@ -130,9 +126,7 @@ fn apply_patchset_bool_roundtrip_insert_update_delete_mysql() {
         }
     );
 
-    // -------------------------------------------------------------------
     // Round 3: DELETE id=1.
-    // -------------------------------------------------------------------
     let deletes = PatchSet::<SimpleTable, String, Vec<u8>>::new().delete(PatchDelete::<
         SimpleTable,
         String,

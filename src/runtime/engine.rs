@@ -3176,12 +3176,10 @@ where
         removed
     }
 
-    // ----------------------------------------------------------------
     // Per-`(session, subscription)` resume cursor API. The cursor is the
     // position the materializer last successfully dispatched to the
     // client. On reconnect the materializer compares it against its own
     // oplog watermark to decide catchup vs full re-sync.
-    // ----------------------------------------------------------------
 
     /// Advance the resume cursor for `(session_id, sub_id)` to
     /// `checkpoint`.
@@ -4103,9 +4101,7 @@ where
             .sum()
     }
 
-    // ========================================================================
     // Persistence Methods
-    // ========================================================================
 
     #[cfg(feature = "std")]
     fn sync_parent_dir(path: &Path) -> Result<(), StorageError> {
@@ -4602,9 +4598,7 @@ where
         self.durability_mode
     }
 
-    // ========================================================================
     // Merge Methods
-    // ========================================================================
 
     /// Start background merge of shard files for a table
     ///
