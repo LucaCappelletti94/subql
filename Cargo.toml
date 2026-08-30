@@ -112,7 +112,7 @@ arc-swap = "1.7"
 # hasher (foldhash) via the `default-hasher` feature — no direct ahash dep
 # required.
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "serde", "inline-more", "allocator-api2"] }
-sqlparser-canonicalize = { git = "https://github.com/LucaCappelletti94/sqlparser-canonicalize", branch = "improve-fuzz-harness", default-features = false }
+sqlparser-canonicalize = { git = "https://github.com/LucaCappelletti94/sqlparser-canonicalize", branch = "main", default-features = false }
 
 # Serialization. All no_std + alloc capable. Std features propagated below.
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "alloc"] }
