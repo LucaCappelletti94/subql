@@ -9,6 +9,7 @@ use super::{
     Backend, BuiltinKind, GroupKeyColumnOf, GroupKeyEncoder, NoCustomScalars, ScalarKindOf,
     SqliteJson, Value,
 };
+use alloc::string::ToString;
 
 /// Postgres backend marker, parameterised by the server major it targets.
 ///

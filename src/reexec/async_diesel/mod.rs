@@ -47,6 +47,7 @@ use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
 use thiserror::Error;
 
+#[cfg(feature = "executor-diesel-async-postgres")]
 mod pg_async_diesel_connector;
 
 #[cfg(feature = "executor-diesel-async-postgres")]

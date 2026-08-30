@@ -2,8 +2,10 @@
 
 use super::domain_id_types::{ColumnId, MergeJobId, TableId};
 use super::generic_id_types::{IdTypes, SubscriptionId};
+#[cfg(feature = "std")]
+use super::subscription_types::MergeReport;
 use super::subscription_types::{
-    MergeReport, Registered, SubscriptionRequest, Tier, TierKind, UnregisterReport,
+    Registered, SubscriptionRequest, Tier, TierKind, UnregisterReport,
 };
 use crate::backend::{Backend, CdcEvent, Value};
 use crate::checkpoint::{Checkpoint, NoCheckpoint};

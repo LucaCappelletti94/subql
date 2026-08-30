@@ -15,6 +15,7 @@ use crate::backend::{
     BuiltinKind, MySql, Postgres, SQLite, ScalarKind, ScalarKindOf, SqliteJson, Value,
 };
 use crate::RegisterError;
+use alloc::string::ToString;
 use sqlparser::ast::Value as SqlValue;
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> SqlLiteralParse for Postgres<V> {

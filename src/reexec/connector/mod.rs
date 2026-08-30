@@ -45,10 +45,21 @@ use diesel::query_builder::SqlQuery;
 #[cfg(feature = "executor-diesel")]
 use diesel::{sql_query, Connection, QueryResult, RunQueryDsl};
 
+#[cfg(feature = "executor-diesel")]
 mod diesel_backend;
+#[cfg(feature = "executor-diesel")]
 mod diesel_connector;
+#[cfg(any(
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql"
+))]
 mod mysql_diesel_connector;
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
 mod pg_diesel_connector;
+#[cfg(feature = "executor-diesel-postgres-r2d2")]
 mod pg_r2d2_diesel_connector;
 
 // Public types needed by reexec/mod.rs re-exports and by async_diesel.

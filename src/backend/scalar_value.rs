@@ -2,6 +2,7 @@
 //! rather than a banner comment.
 
 use super::{Backend, MySql, Postgres, SQLite, SqliteJson, SqliteJsonStorage};
+use alloc::string::ToString;
 
 /// Runtime tag naming either an upstream builtin family or one custom type.
 ///

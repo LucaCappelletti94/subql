@@ -1,6 +1,7 @@
 #![allow(clippy::type_complexity)]
 //! LSN-aware sync [`Connector`] for PostgreSQL.
 
+#[cfg(feature = "executor-diesel-postgres")]
 use super::diesel_connector::{load_page_postgres, load_scalar, load_scalar_row};
 use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,

@@ -3,6 +3,7 @@
 
 use super::scalar_value::default_group_key_encoder;
 use super::{Cow, CustomScalars, GroupKeyColumnOf, GroupKeyEncoder, ScalarKindOf, Value};
+use alloc::string::ToString;
 
 /// Trait bounds every [`Backend`] associated scalar type must satisfy.
 ///

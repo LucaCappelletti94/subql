@@ -5,6 +5,7 @@ use crate::backend::{
     Backend, BuiltinKind, Checkpoint, ColumnId, CustomScalars, DatabaseLike, EventKind, RowKind,
     ScalarKindOf, TableId, Value,
 };
+use alloc::vec::Vec;
 
 /// One CDC row event as seen by the engine.
 ///

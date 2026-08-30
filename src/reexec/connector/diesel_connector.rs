@@ -1,7 +1,12 @@
 #![allow(clippy::type_complexity)]
 //! Generic sync [`Connector`] backed by a single diesel connection.
 
-use super::diesel_backend::{boxed_postgres_read_query, boxed_read_query, DieselBackend};
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres"
+))]
+use super::diesel_backend::boxed_postgres_read_query;
+use super::diesel_backend::{boxed_read_query, DieselBackend};
 use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
