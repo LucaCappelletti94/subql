@@ -129,13 +129,20 @@ fn canonicalize<E: CdcEvent<Backend = subql::backend::Postgres>>(
     }
 }
 
+/// Guards against a hang, and deliberately does not budget latency. This test
+/// compares the two event streams for equality, and CI runs eight Docker-backed
+/// tests at once, where a five second budget failed on an event that takes
+/// under one and a half seconds locally. The latency claim belongs to
+/// `pg_streaming_e2e::next_event_delivers_insert_within_latency_budget`.
+const DRAIN_HANG_GUARD: Duration = Duration::from_secs(30);
+
 async fn drain_n<S>(source: &mut S, n: usize) -> Vec<S::Event>
 where
     S: CdcSource,
 {
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
-        let ev = tokio::time::timeout(Duration::from_secs(5), source.next_event())
+        let ev = tokio::time::timeout(DRAIN_HANG_GUARD, source.next_event())
             .await
             .expect("next_event timeout draining")
             .expect("next_event err")
