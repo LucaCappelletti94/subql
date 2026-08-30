@@ -45,7 +45,7 @@ use crate::backend::CdcEvent;
 ///
 /// The canonical consume-and-ack loop is exercised end to end by
 /// `tests/pgoutput_e2e.rs` (push, via [`crate::PgStreamingCdcSource`]) and
-/// `tests/polling_smoke.rs` (poll, via
+/// `tests/it/polling_smoke.rs` (poll, via
 /// [`crate::PollingPgCdcSource`]).
 pub trait CdcSource: Send {
     /// The typed CDC event this source surfaces.

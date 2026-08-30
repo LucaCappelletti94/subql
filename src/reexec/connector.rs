@@ -281,9 +281,7 @@ pub trait Connector {
     /// Subql backend whose [`Value`] shape this connector produces.
     type Backend: Backend;
 
-    /// Run the re-execution SQL and decode a single scalar value with the
-    /// expected [`ScalarKind`], optionally reporting the position at which
-    /// the read was taken.
+    /// Run the SQL and decode one scalar using the expected [`BuiltinKind`].
     ///
     /// `sql` is exactly the string the plan rendered for re-execution and
     /// returned via [`Tier::Scalar`](crate::Tier::Scalar) at
@@ -386,8 +384,8 @@ pub trait Connector {
         Err(CursorError::Unsupported)
     }
 
-    /// Run a single-row, multi-column scalar seed query and decode each
-    /// column by the matching [`ScalarKind`].
+    /// Run one multi-column scalar seed query and decode each column by its
+    /// [`BuiltinKind`].
     ///
     /// Bootstraps or re-seeds an in-process aggregate accumulator from
     /// [`Served::aggregate_bootstrap`](crate::Served::aggregate_bootstrap):
@@ -906,7 +904,7 @@ pub struct TextRow {
 /// Route the projected column through the `Nullable<BigInt|Double|Text>`
 /// row shape that matches `kind`, then lift into [`Value<B>`].
 ///
-/// Aggregate-only column kinds ([`ScalarKind::Int`] / [`ScalarKind::Float`])
+/// Aggregate-only column kinds ([`BuiltinKind::Int`] / [`BuiltinKind::Float`])
 /// map to the numeric rows; every other kind reads through the `Text`
 /// row. Decimals are carried as text through this path so precision is
 /// not lost through `f64`.
@@ -944,7 +942,7 @@ where
         LoadQuery<'q, C, IntRow> + LoadQuery<'q, C, FloatRow> + LoadQuery<'q, C, TextRow>,
 {
     let value = match kind {
-        ScalarKind::Int => {
+        BuiltinKind::Int => {
             let widened = alloc::format!(
                 "SELECT CAST(({}) AS {cast}) AS v",
                 query.sql(),
@@ -957,26 +955,26 @@ where
                 .map_or(Value::Null, B::value_from_i64);
             value
         }
-        ScalarKind::Float => boxed_read_query::<C::Backend, B>(query)?
+        BuiltinKind::Float => boxed_read_query::<C::Backend, B>(query)?
             .get_result::<FloatRow>(conn)?
             .v
             .map_or(Value::Null, B::value_from_f64),
-        ScalarKind::Bool
-        | ScalarKind::String
-        | ScalarKind::Bytes
-        | ScalarKind::Uuid
-        | ScalarKind::Timestamp
-        | ScalarKind::TimestampTz
-        | ScalarKind::Date
-        | ScalarKind::Time
-        | ScalarKind::Decimal
-        | ScalarKind::Json
-        | ScalarKind::Jsonb => boxed_read_query::<C::Backend, B>(query)?
+        BuiltinKind::Bool
+        | BuiltinKind::String
+        | BuiltinKind::Bytes
+        | BuiltinKind::Uuid
+        | BuiltinKind::Timestamp
+        | BuiltinKind::TimestampTz
+        | BuiltinKind::Date
+        | BuiltinKind::Time
+        | BuiltinKind::Decimal
+        | BuiltinKind::Json
+        | BuiltinKind::Jsonb => boxed_read_query::<C::Backend, B>(query)?
             .get_result::<TextRow>(conn)?
             .v
             .map_or(Value::Null, B::value_from_string),
     };
-    Ok(B::decode_group_value(ScalarKind::from_builtin(kind), value).unwrap_or(Value::Missing))
+    Ok(B::decode_group_value(ScalarKind::from(kind), value).unwrap_or(Value::Missing))
 }
 
 /// Decodes one aggregate seed row using its runtime database types.
@@ -1029,7 +1027,7 @@ where
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            B::decode_group_value(ScalarKind::from_builtin(*kind), value).unwrap_or(Value::Missing)
+            B::decode_group_value(ScalarKind::from(*kind), value).unwrap_or(Value::Missing)
         })
         .collect())
 }

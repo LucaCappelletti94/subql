@@ -14,7 +14,7 @@ use super::{
     prefilter::build_prefilter_plan,
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
-use crate::backend::{Backend, ScalarKind, ScalarKindOf, Value};
+use crate::backend::{Backend, BuiltinKind, ScalarKindOf, Value};
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::term::{term_columns, CompiledTerm};
@@ -260,7 +260,7 @@ where
             // so the VM sees a Tri-typed result at TOS.
             let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
                 &SqlValue::Boolean(true),
-                ScalarKind::Bool,
+                BuiltinKind::Bool.into(),
             )?)];
             wrap_bare_value_as_tri::<B>(&mut instructions)?;
             (BytecodeProgram::new(instructions), Vec::new())
@@ -338,7 +338,7 @@ where
         // so the VM sees a Tri-typed result at TOS.
         let mut instructions = alloc::vec![Instruction::PushLiteral(B::parse_literal(
             &SqlValue::Boolean(true),
-            ScalarKind::Bool,
+            BuiltinKind::Bool.into(),
         )?)];
         wrap_bare_value_as_tri::<B>(&mut instructions)?;
         BytecodeProgram::new(instructions)
@@ -647,7 +647,7 @@ pub fn derive_update_follow_select_with_set_binds<D: Dialect>(
 // Compilation helpers
 // ============================================================================
 
-/// If `expr` is a bare column reference, return the [`ScalarKind`] of that
+/// If `expr` is a bare column reference, return the [`crate::backend::ScalarKind`] of that
 /// column via the catalog. Otherwise `None`. Used to derive the target
 /// type for a paired literal in a comparison or an IN list.
 fn column_scalar_of<B: Backend, DB: DatabaseLike>(
@@ -699,7 +699,7 @@ where
         Some(_) => {
             instructions.push(Instruction::PushLiteral(B::parse_literal(
                 &SqlValue::Boolean(true),
-                ScalarKind::Bool,
+                BuiltinKind::Bool.into(),
             )?));
             instructions.push(Instruction::Equal);
             Ok(())
@@ -736,7 +736,7 @@ where
         database,
         &mut compiling,
         0,
-        ScalarKind::String,
+        BuiltinKind::String.into(),
     )?;
     wrap_bare_value_as_tri::<B>(&mut compiling)?;
     let terms = canonicalize_term_slots(&mut compiling)?;
@@ -791,7 +791,7 @@ fn canonicalize_term_slots<B: Backend>(
 /// Recursive helper for expression compilation.
 ///
 /// Compiles an expression to leave its result on top of stack. The
-/// `target_kind` argument names the [`ScalarKind`] a standalone literal
+/// `target_kind` argument names the [`crate::backend::ScalarKind`] a standalone literal
 /// leaf should coerce to; comparison / arithmetic / IN / BETWEEN /
 /// LIKE arms override this per-child by peeking at whichever sibling is
 /// a column reference.
@@ -830,7 +830,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        ScalarKind::String,
+                        BuiltinKind::String.into(),
                     )?;
 
                     let jump_idx = out.len();
@@ -843,7 +843,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        ScalarKind::String,
+                        BuiltinKind::String.into(),
                     )?;
                     out.push(Instruction::And);
 
@@ -857,7 +857,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        ScalarKind::String,
+                        BuiltinKind::String.into(),
                     )?;
 
                     let jump_idx = out.len();
@@ -870,7 +870,7 @@ where
                         database,
                         out,
                         depth + 1,
-                        ScalarKind::String,
+                        BuiltinKind::String.into(),
                     )?;
                     out.push(Instruction::Or);
 
@@ -906,7 +906,7 @@ where
                     // uses its ScalarKind for the other side's literal.
                     let child_target = column_scalar_of::<B, DB>(left, table_id, database)
                         .or_else(|| column_scalar_of::<B, DB>(right, table_id, database))
-                        .unwrap_or(ScalarKind::String);
+                        .unwrap_or_else(|| BuiltinKind::String.into());
                     compile_expr_recursive::<B, DB>(
                         left,
                         table_id,
@@ -1000,8 +1000,8 @@ where
         } => {
             // Derive target from the tested expression if it's a column
             // reference; fall back to String otherwise (best-effort).
-            let list_target =
-                column_scalar_of::<B, DB>(expr, table_id, database).unwrap_or(ScalarKind::String);
+            let list_target = column_scalar_of::<B, DB>(expr, table_id, database)
+                .unwrap_or_else(|| BuiltinKind::String.into());
 
             compile_expr_recursive::<B, DB>(expr, table_id, database, out, depth + 1, list_target)?;
 
@@ -1098,8 +1098,8 @@ where
             high,
             negated,
         } => {
-            let range_target =
-                column_scalar_of::<B, DB>(expr, table_id, database).unwrap_or(ScalarKind::String);
+            let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
+                .unwrap_or_else(|| BuiltinKind::String.into());
 
             // Stack order: value, lower, upper.
             compile_expr_recursive::<B, DB>(
@@ -1137,7 +1137,7 @@ where
                 database,
                 out,
                 depth + 1,
-                ScalarKind::String,
+                BuiltinKind::String.into(),
             )?;
             out.push(Instruction::IsNull);
         }
@@ -1149,7 +1149,7 @@ where
                 database,
                 out,
                 depth + 1,
-                ScalarKind::String,
+                BuiltinKind::String.into(),
             )?;
             out.push(Instruction::IsNotNull);
         }
@@ -1219,7 +1219,7 @@ where
                 database,
                 out,
                 depth + 1,
-                ScalarKind::String,
+                BuiltinKind::String.into(),
             )?;
             compile_expr_recursive::<B, DB>(
                 pattern,
@@ -1227,7 +1227,7 @@ where
                 database,
                 out,
                 depth + 1,
-                ScalarKind::String,
+                BuiltinKind::String.into(),
             )?;
 
             out.push(Instruction::Like {
@@ -1258,7 +1258,7 @@ where
                 database,
                 out,
                 depth + 1,
-                ScalarKind::String,
+                BuiltinKind::String.into(),
             )?;
             compile_expr_recursive::<B, DB>(
                 pattern,
@@ -1266,7 +1266,7 @@ where
                 database,
                 out,
                 depth + 1,
-                ScalarKind::String,
+                BuiltinKind::String.into(),
             )?;
 
             out.push(Instruction::Like {
@@ -1354,7 +1354,7 @@ mod tests {
         let value = Value::<B>::Bytes(B::Bytes::from(bytes.clone()));
         let sql = value_to_sql_value(&value).unwrap();
         assert!(matches!(sql, SqlValue::HexStringLiteral(_)));
-        let decoded = B::parse_literal(&sql, ScalarKind::Bytes).unwrap();
+        let decoded = B::parse_literal(&sql, BuiltinKind::Bytes.into()).unwrap();
         assert_eq!(decoded, Value::<B>::Bytes(B::Bytes::from(bytes)));
     }
 

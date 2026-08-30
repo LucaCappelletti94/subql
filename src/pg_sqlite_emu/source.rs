@@ -26,7 +26,7 @@ use sqlite_diff_rs::pg_walstream_reverse::{
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, TableSchema, Value as WireValue};
 
 use super::error::PgSqliteEmuError;
-use crate::backend::{BuiltinKind, ScalarKind};
+use crate::backend::BuiltinKind;
 use crate::wal::into_engine_events;
 use crate::{catalog_helpers, ColumnId, TableId};
 
@@ -623,25 +623,25 @@ const fn synth_oid(table_id: TableId) -> Oid {
     1_000 + table_id
 }
 
-/// Map subql's [`ScalarKind`] to a PostgreSQL type OID for the encoded
+/// Map subql's [`BuiltinKind`] to a PostgreSQL type OID for the encoded
 /// `pgoutput` relation message. The OID labels the column on the wire,
 /// while the engine decodes each cell against the catalog scalar kind.
 /// Unknown or composite columns fall back to `TEXT` (25).
 const fn pg_type_oid_for_kind(kind: Option<BuiltinKind>) -> Oid {
     match kind {
-        Some(ScalarKind::Bool) => 16,
-        Some(ScalarKind::Int) => 20,
-        Some(ScalarKind::Float) => 701,
-        Some(ScalarKind::Bytes) => 17,
-        Some(ScalarKind::Uuid) => 2950,
-        Some(ScalarKind::Timestamp) => 1114,
-        Some(ScalarKind::TimestampTz) => 1184,
-        Some(ScalarKind::Date) => 1082,
-        Some(ScalarKind::Time) => 1083,
-        Some(ScalarKind::Decimal) => 1700,
-        Some(ScalarKind::Json) => 114,
-        Some(ScalarKind::Jsonb) => 3802,
-        Some(ScalarKind::String) | None => 25,
+        Some(BuiltinKind::Bool) => 16,
+        Some(BuiltinKind::Int) => 20,
+        Some(BuiltinKind::Float) => 701,
+        Some(BuiltinKind::Bytes) => 17,
+        Some(BuiltinKind::Uuid) => 2950,
+        Some(BuiltinKind::Timestamp) => 1114,
+        Some(BuiltinKind::TimestampTz) => 1184,
+        Some(BuiltinKind::Date) => 1082,
+        Some(BuiltinKind::Time) => 1083,
+        Some(BuiltinKind::Decimal) => 1700,
+        Some(BuiltinKind::Json) => 114,
+        Some(BuiltinKind::Jsonb) => 3802,
+        Some(BuiltinKind::String) | None => 25,
     }
 }
 

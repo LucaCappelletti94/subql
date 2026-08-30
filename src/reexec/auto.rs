@@ -1193,7 +1193,7 @@ pub(super) fn decode_grouped_seed_rows<B: Backend>(
     for row in rows {
         for (value, kind) in row.iter_mut().zip(kinds) {
             let raw = core::mem::replace(value, Value::Missing);
-            *value = B::decode_group_value(crate::backend::ScalarKind::from_builtin(*kind), raw)
+            *value = B::decode_group_value(crate::backend::ScalarKind::from(*kind), raw)
                 .unwrap_or(Value::Missing);
         }
     }
@@ -1544,7 +1544,6 @@ where
 mod tests {
     use super::*;
     use crate::backend::Postgres;
-    use crate::backend::ScalarKind;
     use crate::testing::TestEvent;
     use crate::TableId;
     use crate::{DefaultIds, SubscriptionEngine};
@@ -1721,7 +1720,7 @@ mod tests {
         assert_eq!(e.connector().call_count(), 1);
         let (sql, kind) = e.connector().calls.borrow()[0].clone();
         assert!(sql.contains("MIN"));
-        assert_eq!(kind, ScalarKind::Float);
+        assert_eq!(kind, BuiltinKind::Float);
     }
 
     #[test]
@@ -2240,12 +2239,12 @@ mod tests {
         let first = super::super::ReExecutionRead::GroupedScalar {
             group: vec![1],
             query: super::super::ReadQuery::owned(String::new(), Vec::new()),
-            column_kinds: [ScalarKind::Int, ScalarKind::Int],
+            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
         };
         let second = super::super::ReExecutionRead::GroupedScalar {
             group: vec![2],
             query: super::super::ReadQuery::owned(String::new(), Vec::new()),
-            column_kinds: [ScalarKind::Int, ScalarKind::Int],
+            column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
         };
         engine.stamp_reexec(7, &first);
         assert!(engine.debounce_skip(7, &first));

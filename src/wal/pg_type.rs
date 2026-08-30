@@ -13,14 +13,14 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use uuid::Uuid;
 
-use crate::backend::{BuiltinKind, MySql, Postgres, ScalarKind, Value};
+use crate::backend::{BuiltinKind, MySql, Postgres, Value};
 
 // ============================================================================
 // Typed decoders producing `Value<Postgres>` (Phase 7)
 // ============================================================================
 
 /// Decode a pgoutput text-format value into a typed [`Value<Postgres>`],
-/// routed by the column's catalog [`ScalarKind`] (the schema-driven path).
+/// routed by the column's catalog [`BuiltinKind`] (the schema-driven path).
 ///
 /// pgoutput carries only positional text, so the type comes from the
 /// catalog at decode time rather than the wire OID. Parse failures and
@@ -28,27 +28,27 @@ use crate::backend::{BuiltinKind, MySql, Postgres, ScalarKind, Value};
 /// the `value_at` contract (a corrupt cell escalates to re-execution).
 pub(super) fn text_to_pg_value_by_kind(text: &str, kind: BuiltinKind) -> Value<Postgres> {
     match kind {
-        ScalarKind::Bool => match text {
+        BuiltinKind::Bool => match text {
             "t" => Value::Bool(true),
             "f" => Value::Bool(false),
             _ => Value::Missing,
         },
-        ScalarKind::Int => text.parse::<i64>().map_or(Value::Missing, Value::Int),
-        ScalarKind::Float => text.parse::<f64>().map_or(Value::Missing, Value::Float),
-        ScalarKind::Decimal => BigDecimal::from_str(text).map_or(Value::Missing, Value::Decimal),
-        ScalarKind::String => Value::String(text.to_string()),
-        ScalarKind::Bytes => decode_pg_bytea_hex(text).map_or(Value::Missing, Value::Bytes),
-        ScalarKind::Uuid => Uuid::parse_str(text).map_or(Value::Missing, Value::Uuid),
-        ScalarKind::Timestamp => {
+        BuiltinKind::Int => text.parse::<i64>().map_or(Value::Missing, Value::Int),
+        BuiltinKind::Float => text.parse::<f64>().map_or(Value::Missing, Value::Float),
+        BuiltinKind::Decimal => BigDecimal::from_str(text).map_or(Value::Missing, Value::Decimal),
+        BuiltinKind::String => Value::String(text.to_string()),
+        BuiltinKind::Bytes => decode_pg_bytea_hex(text).map_or(Value::Missing, Value::Bytes),
+        BuiltinKind::Uuid => Uuid::parse_str(text).map_or(Value::Missing, Value::Uuid),
+        BuiltinKind::Timestamp => {
             crate::temporal::parse_timestamp(text).map_or(Value::Missing, Value::Timestamp)
         }
-        ScalarKind::TimestampTz => {
+        BuiltinKind::TimestampTz => {
             crate::temporal::parse_timestamp_tz(text).map_or(Value::Missing, Value::TimestampTz)
         }
-        ScalarKind::Date => crate::temporal::parse_date(text).map_or(Value::Missing, Value::Date),
-        ScalarKind::Time => crate::temporal::parse_time(text).map_or(Value::Missing, Value::Time),
-        ScalarKind::Json => serde_json::from_str(text).map_or(Value::Missing, Value::Json),
-        ScalarKind::Jsonb => serde_json::from_str(text).map_or(Value::Missing, Value::Jsonb),
+        BuiltinKind::Date => crate::temporal::parse_date(text).map_or(Value::Missing, Value::Date),
+        BuiltinKind::Time => crate::temporal::parse_time(text).map_or(Value::Missing, Value::Time),
+        BuiltinKind::Json => serde_json::from_str(text).map_or(Value::Missing, Value::Json),
+        BuiltinKind::Jsonb => serde_json::from_str(text).map_or(Value::Missing, Value::Jsonb),
     }
 }
 
@@ -70,7 +70,7 @@ fn decode_hex_bytes(hex: &str) -> Option<alloc::vec::Vec<u8>> {
 }
 
 /// Decode a JSON wire value into a typed [`Value<Postgres>`] routed by the
-/// column's catalog [`ScalarKind`] (the schema-driven path for wal2json).
+/// column's catalog [`BuiltinKind`] (the schema-driven path for wal2json).
 ///
 /// A wire-carried JSON null becomes [`Value::Null`]. Any shape the kind
 /// cannot accept collapses to [`Value::Missing`], matching the `value_at`
@@ -83,32 +83,32 @@ pub(super) fn json_value_to_pg_value_by_kind(
         return Value::Null;
     }
     match kind {
-        ScalarKind::Bool => json_bool(value).map_or(Value::Missing, Value::Bool),
-        ScalarKind::Int => json_i64(value).map_or(Value::Missing, Value::Int),
-        ScalarKind::Float => json_f64(value).map_or(Value::Missing, Value::Float),
-        ScalarKind::Decimal => json_bigdecimal(value).map_or(Value::Missing, Value::Decimal),
-        ScalarKind::String => Value::String(json_string(value)),
-        ScalarKind::Bytes => json_pg_bytea(value).map_or(Value::Missing, Value::Bytes),
-        ScalarKind::Uuid => value
+        BuiltinKind::Bool => json_bool(value).map_or(Value::Missing, Value::Bool),
+        BuiltinKind::Int => json_i64(value).map_or(Value::Missing, Value::Int),
+        BuiltinKind::Float => json_f64(value).map_or(Value::Missing, Value::Float),
+        BuiltinKind::Decimal => json_bigdecimal(value).map_or(Value::Missing, Value::Decimal),
+        BuiltinKind::String => Value::String(json_string(value)),
+        BuiltinKind::Bytes => json_pg_bytea(value).map_or(Value::Missing, Value::Bytes),
+        BuiltinKind::Uuid => value
             .as_str()
             .and_then(|s| Uuid::parse_str(s).ok())
             .map_or(Value::Missing, Value::Uuid),
-        ScalarKind::Timestamp => json_timestamp(value).map_or(Value::Missing, Value::Timestamp),
-        ScalarKind::TimestampTz => {
+        BuiltinKind::Timestamp => json_timestamp(value).map_or(Value::Missing, Value::Timestamp),
+        BuiltinKind::TimestampTz => {
             json_timestamptz(value).map_or(Value::Missing, Value::TimestampTz)
         }
-        ScalarKind::Date => json_date(value).map_or(Value::Missing, Value::Date),
-        ScalarKind::Time => json_time(value).map_or(Value::Missing, Value::Time),
-        ScalarKind::Json => json_document(value).map_or(Value::Missing, Value::Json),
-        ScalarKind::Jsonb => json_document(value).map_or(Value::Missing, Value::Jsonb),
+        BuiltinKind::Date => json_date(value).map_or(Value::Missing, Value::Date),
+        BuiltinKind::Time => json_time(value).map_or(Value::Missing, Value::Time),
+        BuiltinKind::Json => json_document(value).map_or(Value::Missing, Value::Json),
+        BuiltinKind::Jsonb => json_document(value).map_or(Value::Missing, Value::Jsonb),
     }
 }
 
 /// Decode a JSON wire value into a typed [`Value<MySql>`] routed by the
-/// column's catalog [`ScalarKind`] (the schema-driven path for Maxwell).
+/// column's catalog [`BuiltinKind`] (the schema-driven path for Maxwell).
 ///
 /// Mirrors [`json_value_to_pg_value_by_kind`]. The two differ only on
-/// [`ScalarKind::Uuid`]: MySQL has no native UUID type and stores it as
+/// [`BuiltinKind::Uuid`]: MySQL has no native UUID type and stores it as
 /// text, so the wire string is taken verbatim rather than parsed into a
 /// [`uuid::Uuid`].
 pub(super) fn json_value_to_mysql_value_by_kind(
@@ -119,23 +119,23 @@ pub(super) fn json_value_to_mysql_value_by_kind(
         return Value::Null;
     }
     match kind {
-        ScalarKind::Bool => json_bool(value).map_or(Value::Missing, Value::Bool),
-        ScalarKind::Int => json_i64(value).map_or(Value::Missing, Value::Int),
-        ScalarKind::Float => json_f64(value).map_or(Value::Missing, Value::Float),
-        ScalarKind::Decimal => json_bigdecimal(value).map_or(Value::Missing, Value::Decimal),
-        ScalarKind::String => Value::String(json_string(value)),
-        ScalarKind::Bytes => json_bytea(value).map_or(Value::Missing, Value::Bytes),
-        ScalarKind::Uuid => value
+        BuiltinKind::Bool => json_bool(value).map_or(Value::Missing, Value::Bool),
+        BuiltinKind::Int => json_i64(value).map_or(Value::Missing, Value::Int),
+        BuiltinKind::Float => json_f64(value).map_or(Value::Missing, Value::Float),
+        BuiltinKind::Decimal => json_bigdecimal(value).map_or(Value::Missing, Value::Decimal),
+        BuiltinKind::String => Value::String(json_string(value)),
+        BuiltinKind::Bytes => json_bytea(value).map_or(Value::Missing, Value::Bytes),
+        BuiltinKind::Uuid => value
             .as_str()
             .map_or(Value::Missing, |s| Value::Uuid(s.to_string())),
-        ScalarKind::Timestamp => json_timestamp(value).map_or(Value::Missing, Value::Timestamp),
-        ScalarKind::TimestampTz => {
+        BuiltinKind::Timestamp => json_timestamp(value).map_or(Value::Missing, Value::Timestamp),
+        BuiltinKind::TimestampTz => {
             json_timestamptz(value).map_or(Value::Missing, Value::TimestampTz)
         }
-        ScalarKind::Date => json_date(value).map_or(Value::Missing, Value::Date),
-        ScalarKind::Time => json_time(value).map_or(Value::Missing, Value::Time),
-        ScalarKind::Json => json_document(value).map_or(Value::Missing, Value::Json),
-        ScalarKind::Jsonb => json_document(value).map_or(Value::Missing, Value::Jsonb),
+        BuiltinKind::Date => json_date(value).map_or(Value::Missing, Value::Date),
+        BuiltinKind::Time => json_time(value).map_or(Value::Missing, Value::Time),
+        BuiltinKind::Json => json_document(value).map_or(Value::Missing, Value::Json),
+        BuiltinKind::Jsonb => json_document(value).map_or(Value::Missing, Value::Jsonb),
     }
 }
 
@@ -254,24 +254,24 @@ mod tests {
     #[test]
     fn kind_bool_uses_pg_text_forms_only() {
         assert_eq!(
-            text_to_pg_value_by_kind("t", ScalarKind::Bool),
+            text_to_pg_value_by_kind("t", BuiltinKind::Bool),
             Value::Bool(true)
         );
         assert_eq!(
-            text_to_pg_value_by_kind("f", ScalarKind::Bool),
+            text_to_pg_value_by_kind("f", BuiltinKind::Bool),
             Value::Bool(false)
         );
         // pgoutput never emits these spellings; they must not decode.
         assert_eq!(
-            text_to_pg_value_by_kind("true", ScalarKind::Bool),
+            text_to_pg_value_by_kind("true", BuiltinKind::Bool),
             Value::Missing
         );
         assert_eq!(
-            text_to_pg_value_by_kind("1", ScalarKind::Bool),
+            text_to_pg_value_by_kind("1", BuiltinKind::Bool),
             Value::Missing
         );
         assert_eq!(
-            text_to_pg_value_by_kind("", ScalarKind::Bool),
+            text_to_pg_value_by_kind("", BuiltinKind::Bool),
             Value::Missing
         );
     }
@@ -279,32 +279,32 @@ mod tests {
     #[test]
     fn kind_int_extremes_and_garbage() {
         assert_eq!(
-            text_to_pg_value_by_kind("0", ScalarKind::Int),
+            text_to_pg_value_by_kind("0", BuiltinKind::Int),
             Value::Int(0)
         );
         assert_eq!(
-            text_to_pg_value_by_kind("-9223372036854775808", ScalarKind::Int),
+            text_to_pg_value_by_kind("-9223372036854775808", BuiltinKind::Int),
             Value::Int(i64::MIN)
         );
         assert_eq!(
-            text_to_pg_value_by_kind("9223372036854775807", ScalarKind::Int),
+            text_to_pg_value_by_kind("9223372036854775807", BuiltinKind::Int),
             Value::Int(i64::MAX)
         );
         // i64::MAX + 1 overflows: Missing, never a wrapped or clamped value.
         assert_eq!(
-            text_to_pg_value_by_kind("9223372036854775808", ScalarKind::Int),
+            text_to_pg_value_by_kind("9223372036854775808", BuiltinKind::Int),
             Value::Missing
         );
         assert_eq!(
-            text_to_pg_value_by_kind("3.5", ScalarKind::Int),
+            text_to_pg_value_by_kind("3.5", BuiltinKind::Int),
             Value::Missing
         );
         assert_eq!(
-            text_to_pg_value_by_kind("0x10", ScalarKind::Int),
+            text_to_pg_value_by_kind("0x10", BuiltinKind::Int),
             Value::Missing
         );
         assert_eq!(
-            text_to_pg_value_by_kind("", ScalarKind::Int),
+            text_to_pg_value_by_kind("", BuiltinKind::Int),
             Value::Missing
         );
     }
@@ -312,28 +312,28 @@ mod tests {
     #[test]
     fn kind_float_specials() {
         assert_eq!(
-            text_to_pg_value_by_kind("1.5", ScalarKind::Float),
+            text_to_pg_value_by_kind("1.5", BuiltinKind::Float),
             Value::Float(1.5)
         );
         assert_eq!(
-            text_to_pg_value_by_kind("1e10", ScalarKind::Float),
+            text_to_pg_value_by_kind("1e10", BuiltinKind::Float),
             Value::Float(1e10)
         );
         // pg emits Infinity / -Infinity / NaN for float specials.
         assert_eq!(
-            text_to_pg_value_by_kind("Infinity", ScalarKind::Float),
+            text_to_pg_value_by_kind("Infinity", BuiltinKind::Float),
             Value::Float(f64::INFINITY)
         );
         assert_eq!(
-            text_to_pg_value_by_kind("-Infinity", ScalarKind::Float),
+            text_to_pg_value_by_kind("-Infinity", BuiltinKind::Float),
             Value::Float(f64::NEG_INFINITY)
         );
-        match text_to_pg_value_by_kind("NaN", ScalarKind::Float) {
+        match text_to_pg_value_by_kind("NaN", BuiltinKind::Float) {
             Value::Float(f) => assert!(f.is_nan()),
             other => panic!("expected NaN float, got {other:?}"),
         }
         assert_eq!(
-            text_to_pg_value_by_kind("abc", ScalarKind::Float),
+            text_to_pg_value_by_kind("abc", BuiltinKind::Float),
             Value::Missing
         );
     }
@@ -342,16 +342,16 @@ mod tests {
     fn kind_decimal_high_precision_preserved() {
         let s = "12345678901234567890.12345678901234567890";
         assert_eq!(
-            text_to_pg_value_by_kind(s, ScalarKind::Decimal),
+            text_to_pg_value_by_kind(s, BuiltinKind::Decimal),
             Value::Decimal(BigDecimal::from_str(s).unwrap())
         );
         // f64 would lose these digits; BigDecimal must not.
         assert_ne!(
-            text_to_pg_value_by_kind(s, ScalarKind::Decimal),
+            text_to_pg_value_by_kind(s, BuiltinKind::Decimal),
             Value::Decimal(BigDecimal::from_str("12345678901234567890").unwrap())
         );
         assert_eq!(
-            text_to_pg_value_by_kind("nope", ScalarKind::Decimal),
+            text_to_pg_value_by_kind("nope", BuiltinKind::Decimal),
             Value::Missing
         );
     }
@@ -362,24 +362,24 @@ mod tests {
         // never handled this (it fell back to String); the catalog-driven
         // path decodes it to real bytes.
         assert_eq!(
-            text_to_pg_value_by_kind(r"\xdeadbeef", ScalarKind::Bytes),
+            text_to_pg_value_by_kind(r"\xdeadbeef", BuiltinKind::Bytes),
             Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
         );
         assert_eq!(
-            text_to_pg_value_by_kind(r"\x", ScalarKind::Bytes),
+            text_to_pg_value_by_kind(r"\x", BuiltinKind::Bytes),
             Value::Bytes(vec![])
         );
         // Missing prefix / bad hex / odd nibble count all fail closed.
         assert_eq!(
-            text_to_pg_value_by_kind("deadbeef", ScalarKind::Bytes),
+            text_to_pg_value_by_kind("deadbeef", BuiltinKind::Bytes),
             Value::Missing
         );
         assert_eq!(
-            text_to_pg_value_by_kind(r"\xzz", ScalarKind::Bytes),
+            text_to_pg_value_by_kind(r"\xzz", BuiltinKind::Bytes),
             Value::Missing
         );
         assert_eq!(
-            text_to_pg_value_by_kind(r"\xabc", ScalarKind::Bytes),
+            text_to_pg_value_by_kind(r"\xabc", BuiltinKind::Bytes),
             Value::Missing
         );
     }
@@ -388,11 +388,11 @@ mod tests {
     fn kind_uuid() {
         let u = "550e8400-e29b-41d4-a716-446655440000";
         assert_eq!(
-            text_to_pg_value_by_kind(u, ScalarKind::Uuid),
+            text_to_pg_value_by_kind(u, BuiltinKind::Uuid),
             Value::Uuid(Uuid::parse_str(u).unwrap())
         );
         assert_eq!(
-            text_to_pg_value_by_kind("not-a-uuid", ScalarKind::Uuid),
+            text_to_pg_value_by_kind("not-a-uuid", BuiltinKind::Uuid),
             Value::Missing
         );
     }
@@ -411,7 +411,7 @@ mod tests {
             "{\"k\":1}",
         ] {
             assert_eq!(
-                text_to_pg_value_by_kind(s, ScalarKind::String),
+                text_to_pg_value_by_kind(s, BuiltinKind::String),
                 Value::String(s.to_string())
             );
         }
@@ -419,22 +419,22 @@ mod tests {
 
     #[test]
     fn kind_json_vs_jsonb_same_text_distinct_variants() {
-        let j = text_to_pg_value_by_kind(r#"{"k":1}"#, ScalarKind::Json);
-        let jb = text_to_pg_value_by_kind(r#"{"k":1}"#, ScalarKind::Jsonb);
+        let j = text_to_pg_value_by_kind(r#"{"k":1}"#, BuiltinKind::Json);
+        let jb = text_to_pg_value_by_kind(r#"{"k":1}"#, BuiltinKind::Jsonb);
         assert_eq!(j, Value::Json(serde_json::json!({"k": 1})));
         assert_eq!(jb, Value::Jsonb(serde_json::json!({"k": 1})));
         // Identical payload, different SQL type: different Value variant.
         assert_ne!(j, jb);
         assert_eq!(
-            text_to_pg_value_by_kind("5", ScalarKind::Json),
+            text_to_pg_value_by_kind("5", BuiltinKind::Json),
             Value::Json(serde_json::json!(5))
         );
         assert_eq!(
-            text_to_pg_value_by_kind("[1,2]", ScalarKind::Jsonb),
+            text_to_pg_value_by_kind("[1,2]", BuiltinKind::Jsonb),
             Value::Jsonb(serde_json::json!([1, 2]))
         );
         assert_eq!(
-            text_to_pg_value_by_kind("{bad", ScalarKind::Json),
+            text_to_pg_value_by_kind("{bad", BuiltinKind::Json),
             Value::Missing
         );
     }
@@ -442,11 +442,11 @@ mod tests {
     #[test]
     fn kind_temporal_including_offset_normalization() {
         assert_eq!(
-            text_to_pg_value_by_kind("2021-02-03", ScalarKind::Date),
+            text_to_pg_value_by_kind("2021-02-03", BuiltinKind::Date),
             Value::Date(NaiveDate::from_ymd_opt(2021, 2, 3).unwrap())
         );
         assert_eq!(
-            text_to_pg_value_by_kind("2021-02-03 04:05:06", ScalarKind::Timestamp),
+            text_to_pg_value_by_kind("2021-02-03 04:05:06", BuiltinKind::Timestamp),
             Value::Timestamp(
                 NaiveDate::from_ymd_opt(2021, 2, 3)
                     .unwrap()
@@ -454,18 +454,18 @@ mod tests {
                     .unwrap()
             )
         );
-        match text_to_pg_value_by_kind("04:05:06", ScalarKind::Time) {
+        match text_to_pg_value_by_kind("04:05:06", BuiltinKind::Time) {
             Value::Time(_) => {}
             other => panic!("expected time, got {other:?}"),
         }
         // pg timestamptz text carries an offset; result normalizes to UTC.
         let expected: DateTime<Utc> = "2021-02-03T02:05:06Z".parse().unwrap();
         assert_eq!(
-            text_to_pg_value_by_kind("2021-02-03 04:05:06+02", ScalarKind::TimestampTz),
+            text_to_pg_value_by_kind("2021-02-03 04:05:06+02", BuiltinKind::TimestampTz),
             Value::TimestampTz(expected)
         );
         assert_eq!(
-            text_to_pg_value_by_kind("nope", ScalarKind::Date),
+            text_to_pg_value_by_kind("nope", BuiltinKind::Date),
             Value::Missing
         );
     }
@@ -481,10 +481,10 @@ mod tests {
     fn json_kind_null_is_sql_null_not_missing() {
         // A wire-carried JSON null is SQL NULL under any catalog kind.
         for kind in [
-            ScalarKind::Int,
-            ScalarKind::String,
-            ScalarKind::Uuid,
-            ScalarKind::Json,
+            BuiltinKind::Int,
+            BuiltinKind::String,
+            BuiltinKind::Uuid,
+            BuiltinKind::Json,
         ] {
             assert_eq!(
                 json_value_to_pg_value_by_kind(&serde_json::json!(null), kind),
@@ -500,16 +500,16 @@ mod tests {
     #[test]
     fn json_kind_int_accepts_number_and_string() {
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(250), ScalarKind::Int),
+            json_value_to_pg_value_by_kind(&serde_json::json!(250), BuiltinKind::Int),
             Value::Int(250)
         );
         // Postgres numeric-as-string still lands as Int.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("250"), ScalarKind::Int),
+            json_value_to_pg_value_by_kind(&serde_json::json!("250"), BuiltinKind::Int),
             Value::Int(250)
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(-7), ScalarKind::Int),
+            json_value_to_mysql_value_by_kind(&serde_json::json!(-7), BuiltinKind::Int),
             Value::Int(-7)
         );
     }
@@ -517,16 +517,16 @@ mod tests {
     #[test]
     fn json_kind_int_rejects_fractional_and_overflow() {
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(1.5), ScalarKind::Int),
+            json_value_to_pg_value_by_kind(&serde_json::json!(1.5), BuiltinKind::Int),
             Value::Missing
         );
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(u64::MAX), ScalarKind::Int),
+            json_value_to_pg_value_by_kind(&serde_json::json!(u64::MAX), BuiltinKind::Int),
             Value::Missing
         );
         // A whole-valued JSON float is accepted under an Int kind.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(42.0), ScalarKind::Int),
+            json_value_to_pg_value_by_kind(&serde_json::json!(42.0), BuiltinKind::Int),
             Value::Int(42)
         );
     }
@@ -534,16 +534,16 @@ mod tests {
     #[test]
     fn json_kind_float_accepts_number_and_string() {
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(1.25), ScalarKind::Float),
+            json_value_to_pg_value_by_kind(&serde_json::json!(1.25), BuiltinKind::Float),
             Value::Float(1.25)
         );
         // Integer-valued JSON number under a Float column widens to f64.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(250), ScalarKind::Float),
+            json_value_to_pg_value_by_kind(&serde_json::json!(250), BuiltinKind::Float),
             Value::Float(250.0)
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!("3.5"), ScalarKind::Float),
+            json_value_to_mysql_value_by_kind(&serde_json::json!("3.5"), BuiltinKind::Float),
             Value::Float(3.5)
         );
     }
@@ -552,14 +552,14 @@ mod tests {
     fn json_kind_decimal_preserves_precision() {
         let s = "12345678901234567890.0987654321";
         let Value::Decimal(d) =
-            json_value_to_pg_value_by_kind(&serde_json::json!(s), ScalarKind::Decimal)
+            json_value_to_pg_value_by_kind(&serde_json::json!(s), BuiltinKind::Decimal)
         else {
             panic!("decimal kind must decode a numeric string");
         };
         assert_eq!(d, BigDecimal::from_str(s).unwrap());
         // A bare JSON number also decodes through its lexical form.
         assert!(matches!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(1.5), ScalarKind::Decimal),
+            json_value_to_mysql_value_by_kind(&serde_json::json!(1.5), BuiltinKind::Decimal),
             Value::Decimal(_)
         ));
     }
@@ -567,25 +567,25 @@ mod tests {
     #[test]
     fn json_kind_bool_accepts_bool_number_and_string() {
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(true), ScalarKind::Bool),
+            json_value_to_pg_value_by_kind(&serde_json::json!(true), BuiltinKind::Bool),
             Value::Bool(true)
         );
         // MySQL tinyint(1) arrives as a bare 0 / 1 number.
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(1), ScalarKind::Bool),
+            json_value_to_mysql_value_by_kind(&serde_json::json!(1), BuiltinKind::Bool),
             Value::Bool(true)
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(0), ScalarKind::Bool),
+            json_value_to_mysql_value_by_kind(&serde_json::json!(0), BuiltinKind::Bool),
             Value::Bool(false)
         );
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("t"), ScalarKind::Bool),
+            json_value_to_pg_value_by_kind(&serde_json::json!("t"), BuiltinKind::Bool),
             Value::Bool(true)
         );
         // 2 is neither true nor false.
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(2), ScalarKind::Bool),
+            json_value_to_mysql_value_by_kind(&serde_json::json!(2), BuiltinKind::Bool),
             Value::Missing
         );
     }
@@ -593,12 +593,12 @@ mod tests {
     #[test]
     fn json_kind_string_stringifies_nonstring() {
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("paid"), ScalarKind::String),
+            json_value_to_pg_value_by_kind(&serde_json::json!("paid"), BuiltinKind::String),
             Value::String("paid".to_string())
         );
         // A number under a String kind stringifies rather than dropping.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(42), ScalarKind::String),
+            json_value_to_pg_value_by_kind(&serde_json::json!(42), BuiltinKind::String),
             Value::String("42".to_string())
         );
     }
@@ -606,19 +606,19 @@ mod tests {
     #[test]
     fn json_kind_bytea_decodes_pg_hex_forms() {
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(r"\x0102ff"), ScalarKind::Bytes),
+            json_value_to_pg_value_by_kind(&serde_json::json!(r"\x0102ff"), BuiltinKind::Bytes),
             Value::Bytes(alloc::vec![0x01, 0x02, 0xff])
         );
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("0102ff"), ScalarKind::Bytes),
+            json_value_to_pg_value_by_kind(&serde_json::json!("0102ff"), BuiltinKind::Bytes),
             Value::Bytes(alloc::vec![0x01, 0x02, 0xff])
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!("0102ff"), ScalarKind::Bytes),
+            json_value_to_mysql_value_by_kind(&serde_json::json!("0102ff"), BuiltinKind::Bytes),
             Value::Missing
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(r"\x00"), ScalarKind::Bytes),
+            json_value_to_mysql_value_by_kind(&serde_json::json!(r"\x00"), BuiltinKind::Bytes),
             Value::Bytes(alloc::vec![0])
         );
     }
@@ -627,23 +627,23 @@ mod tests {
     fn json_kind_uuid_diverges_by_backend() {
         let u = "550e8400-e29b-41d4-a716-446655440000";
         let Value::Uuid(parsed) =
-            json_value_to_pg_value_by_kind(&serde_json::json!(u), ScalarKind::Uuid)
+            json_value_to_pg_value_by_kind(&serde_json::json!(u), BuiltinKind::Uuid)
         else {
             panic!("pg uuid kind must parse a native uuid");
         };
         assert_eq!(parsed.to_string(), u);
         // MySQL keeps the textual form verbatim.
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!(u), ScalarKind::Uuid),
+            json_value_to_mysql_value_by_kind(&serde_json::json!(u), BuiltinKind::Uuid),
             Value::Uuid(u.to_string())
         );
         // Malformed uuid: Postgres -> Missing; MySQL takes the raw text.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("not-a-uuid"), ScalarKind::Uuid),
+            json_value_to_pg_value_by_kind(&serde_json::json!("not-a-uuid"), BuiltinKind::Uuid),
             Value::Missing
         );
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!("not-a-uuid"), ScalarKind::Uuid),
+            json_value_to_mysql_value_by_kind(&serde_json::json!("not-a-uuid"), BuiltinKind::Uuid),
             Value::Uuid("not-a-uuid".to_string())
         );
     }
@@ -653,7 +653,7 @@ mod tests {
         assert!(matches!(
             json_value_to_pg_value_by_kind(
                 &serde_json::json!("2024-01-15 10:30:00"),
-                ScalarKind::Timestamp
+                BuiltinKind::Timestamp
             ),
             Value::Timestamp(_)
         ));
@@ -661,21 +661,21 @@ mod tests {
         assert!(matches!(
             json_value_to_pg_value_by_kind(
                 &serde_json::json!("2024-01-15 10:30:00+02"),
-                ScalarKind::TimestampTz
+                BuiltinKind::TimestampTz
             ),
             Value::TimestampTz(_)
         ));
         assert!(matches!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("2024-01-15"), ScalarKind::Date),
+            json_value_to_pg_value_by_kind(&serde_json::json!("2024-01-15"), BuiltinKind::Date),
             Value::Date(_)
         ));
         assert!(matches!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("10:30:00"), ScalarKind::Time),
+            json_value_to_pg_value_by_kind(&serde_json::json!("10:30:00"), BuiltinKind::Time),
             Value::Time(_)
         ));
         // Garbage temporal -> Missing.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("nope"), ScalarKind::Date),
+            json_value_to_pg_value_by_kind(&serde_json::json!("nope"), BuiltinKind::Date),
             Value::Missing
         );
     }
@@ -684,21 +684,21 @@ mod tests {
     fn json_kind_json_vs_jsonb_and_nested_vs_string() {
         let nested = serde_json::json!({"a": 1});
         assert_eq!(
-            json_value_to_pg_value_by_kind(&nested, ScalarKind::Json),
+            json_value_to_pg_value_by_kind(&nested, BuiltinKind::Json),
             Value::Json(serde_json::json!({"a": 1}))
         );
         assert_eq!(
-            json_value_to_pg_value_by_kind(&nested, ScalarKind::Jsonb),
+            json_value_to_pg_value_by_kind(&nested, BuiltinKind::Jsonb),
             Value::Jsonb(serde_json::json!({"a": 1}))
         );
         // A stringified JSON payload is parsed.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("{\"b\":2}"), ScalarKind::Json),
+            json_value_to_pg_value_by_kind(&serde_json::json!("{\"b\":2}"), BuiltinKind::Json),
             Value::Json(serde_json::json!({"b": 2}))
         );
         // Invalid JSON string -> Missing.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!("{not json"), ScalarKind::Jsonb),
+            json_value_to_pg_value_by_kind(&serde_json::json!("{not json"), BuiltinKind::Jsonb),
             Value::Missing
         );
     }
@@ -707,17 +707,17 @@ mod tests {
     fn json_kind_shape_mismatch_collapses_to_missing() {
         // Int kind but a JSON bool -> Missing (escalates to re-exec).
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(true), ScalarKind::Int),
+            json_value_to_pg_value_by_kind(&serde_json::json!(true), BuiltinKind::Int),
             Value::Missing
         );
         // Float kind but a JSON object -> Missing.
         assert_eq!(
-            json_value_to_mysql_value_by_kind(&serde_json::json!({"x": 1}), ScalarKind::Float),
+            json_value_to_mysql_value_by_kind(&serde_json::json!({"x": 1}), BuiltinKind::Float),
             Value::Missing
         );
         // Timestamp kind but a JSON number (not a string) -> Missing.
         assert_eq!(
-            json_value_to_pg_value_by_kind(&serde_json::json!(123), ScalarKind::Timestamp),
+            json_value_to_pg_value_by_kind(&serde_json::json!(123), BuiltinKind::Timestamp),
             Value::Missing
         );
     }

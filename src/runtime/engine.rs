@@ -5091,7 +5091,7 @@ mod tests {
     /// it and succeeds, so a batch never shields its own members. Guards
     /// against reintroducing a "no self-eviction" divergence, which would break
     /// the parity contract fixed in commit 95b435d and enforced by
-    /// `tests/proptest_register_batch_parity.rs`.
+    /// `tests/it/proptest_register_batch_parity.rs`.
     #[test]
     fn register_batch_evict_oldest_churns_like_sequential() {
         let mut engine = cap1_evict_oldest();

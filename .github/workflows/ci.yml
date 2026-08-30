@@ -174,15 +174,20 @@ jobs:
       matrix:
         # The three filters partition the ignored set rather than enumerating it:
         # the last one is the complement of the other two, so a Docker-backed
-        # target added tomorrow lands in a group by construction and cannot go
-        # unrun.
+        # test added tomorrow lands in a group by construction and cannot go
+        # unrun. Filters match the test path (module plus function name), since
+        # the merged `it` target replaced the per-file binaries these groups
+        # used to select on.
         group:
           - name: mysql
-            filter: binary(~mysql)
+            filter: test(~mysql)
+            threads: 1
           - name: openfga
-            filter: binary(~openfga)
+            filter: test(~openfga)
+            threads: 8
           - name: postgres and the rest
-            filter: not (binary(~mysql) or binary(~openfga))
+            filter: not (test(~mysql) or test(~openfga))
+            threads: 8
     steps:
       - uses: actions/checkout@v5
       # The tests read the fixture Dockerfile from the working tree and link
@@ -194,16 +199,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: nextest-archive
-      # Every Docker-backed test is `#[ignore]`d and nothing else is, so
-      # `--run-ignored ignored-only` covers exactly this set. nextest schedules
-      # across test binaries rather than finishing one before starting the next,
-      # which is where the rest of the time went: each of two dozen binaries paid
-      # its own container startup end to end. Every test builds its own container
-      # and shares no state, so a process per test is what these already assume.
-      # Eight at a time rather than one per core, because the work is waiting on
-      # containers rather than computing, and eight MySQL servers is the most this
-      # runner's memory should be asked to hold.
-      - run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --run-ignored ignored-only --no-fail-fast --test-threads 8 -E '${{ matrix.group.filter }}'
+      # MySQL runs one thread because concurrent container startups time out.
+      # Other groups use eight.
+      - run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --run-ignored ignored-only --no-fail-fast --test-threads ${{ matrix.group.threads }} -E '${{ matrix.group.filter }}'
 
   docs:
     name: docs + doctests

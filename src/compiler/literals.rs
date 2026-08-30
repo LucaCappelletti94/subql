@@ -12,8 +12,8 @@
 //! SQL and don't need the sqlparser dependency in their bounds.
 
 use crate::backend::{
-    Backend, BuiltinKind, CustomScalars, MySql, Postgres, SQLite, ScalarKind, ScalarKindOf,
-    SqliteJson, Value,
+    Backend, BuiltinKind, CustomScalars, MySql, NoCustom, Postgres, SQLite, ScalarKind,
+    ScalarKindOf, SqliteJson, Value,
 };
 use crate::{catalog_helpers, ColumnId, RegisterError, TableId};
 use alloc::format;
@@ -35,11 +35,11 @@ use sqlparser::ast::{Expr, Value as SqlValue};
 /// * `sqlparser::ast::Value::Null` maps to [`Value::Null`] regardless of
 ///   `target`.
 /// * When the sqlparser value's shape does not fit `target` (e.g.
-///   `Boolean(true)` targeting [`ScalarKind::Timestamp`]) the result is
+///   `Boolean(true)` targeting [`BuiltinKind::Timestamp`]) the result is
 ///   [`RegisterError::TypeError`] naming the mismatch.
 /// * When the shape fits but the payload cannot be parsed
 ///   (e.g. `SingleQuotedString("not-a-uuid")` targeting
-///   [`ScalarKind::Uuid`]) the result is [`RegisterError::TypeError`]
+///   [`BuiltinKind::Uuid`]) the result is [`RegisterError::TypeError`]
 ///   with a message naming the underlying parse failure.
 pub trait SqlLiteralParse: Backend + Sized {
     /// Coerce a sqlparser AST literal into a [`Value`] typed to `Self`,
@@ -66,7 +66,11 @@ fn err_shape<C: core::fmt::Debug + Copy>(sql: &SqlValue, target: ScalarKind<C>) 
     RegisterError::TypeError(format!("cannot use SQL literal {sql:?} as {target:?}"))
 }
 
-fn err_parse<C: core::fmt::Debug + Copy>(
+fn err_parse(sql: &SqlValue, family: BuiltinKind, msg: impl core::fmt::Display) -> RegisterError {
+    err_parse_kind(sql, ScalarKind::<NoCustom>::from(family), msg)
+}
+
+fn err_parse_kind<C: core::fmt::Debug + Copy>(
     sql: &SqlValue,
     target: ScalarKind<C>,
     msg: impl core::fmt::Display,
@@ -202,10 +206,10 @@ pub fn parse_custom_literal<B: SqlLiteralParse>(
     custom: <B::Custom as CustomScalars>::Kind,
 ) -> Result<Value<B>, RegisterError> {
     let carrier = <B::Custom as CustomScalars>::carrier(custom);
-    let raw = B::parse_literal(sql, ScalarKind::from_builtin(carrier))?;
+    let raw = B::parse_literal(sql, carrier.into())?;
     let view = raw
         .as_carried()
-        .ok_or_else(|| err_shape(sql, ScalarKind::<()>::from_builtin(carrier)))?;
+        .ok_or_else(|| err_shape(sql, ScalarKind::<()>::from(carrier)))?;
     <B::Custom as CustomScalars>::convert(custom, view)
         .map(Value::Custom)
         .ok_or_else(|| {
@@ -233,42 +237,45 @@ impl SqlLiteralParse for Postgres {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
-        match (target, sql) {
-            (ScalarKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
-            (ScalarKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
-            (ScalarKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
-            (ScalarKind::String, _) => quoted_string(sql)
+        let family = match target {
+            ScalarKind::Builtin(family) => family,
+            ScalarKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
+        };
+        match (family, sql) {
+            (BuiltinKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
+            (BuiltinKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
+            (BuiltinKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
+            (BuiltinKind::String, _) => quoted_string(sql)
                 .map(|s| Value::String(s.to_string()))
                 .ok_or_else(|| err_shape(sql, target)),
-            (ScalarKind::Bytes, SqlValue::HexStringLiteral(s)) => {
+            (BuiltinKind::Bytes, SqlValue::HexStringLiteral(s)) => {
                 Ok(Value::Bytes(parse_hex_bytes(s, sql)?))
             }
-            (ScalarKind::Uuid, _) => quoted_string(sql)
+            (BuiltinKind::Uuid, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_uuid(s, sql).map(Value::Uuid)),
-            (ScalarKind::Timestamp, _) => quoted_string(sql)
+            (BuiltinKind::Timestamp, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_timestamp(s, sql).map(Value::Timestamp)),
-            (ScalarKind::TimestampTz, _) => quoted_string(sql)
+            (BuiltinKind::TimestampTz, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_timestamp_tz(s, sql).map(Value::TimestampTz)),
-            (ScalarKind::Date, _) => quoted_string(sql)
+            (BuiltinKind::Date, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_date(s, sql).map(Value::Date)),
-            (ScalarKind::Time, _) => quoted_string(sql)
+            (BuiltinKind::Time, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_time(s, sql).map(Value::Time)),
-            (ScalarKind::Decimal, SqlValue::Number(n, _)) => {
+            (BuiltinKind::Decimal, SqlValue::Number(n, _)) => {
                 Ok(Value::Decimal(parse_decimal(n, sql)?))
             }
-            (ScalarKind::Json, _) => Err(RegisterError::TypeError(
+            (BuiltinKind::Json, _) => Err(RegisterError::TypeError(
                 "PostgreSQL json has no equality operator".to_string(),
             )),
-            (ScalarKind::Jsonb, _) => {
+            (BuiltinKind::Jsonb, _) => {
                 let s = quoted_string(sql).ok_or_else(|| err_shape(sql, target))?;
                 parse_json(s, sql).map(Value::Jsonb)
             }
-            (ScalarKind::Custom(custom), _) => parse_custom_literal::<Self>(sql, custom),
             _ => Err(err_shape(sql, target)),
         }
     }
@@ -282,46 +289,49 @@ impl SqlLiteralParse for MySql {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
-        match (target, sql) {
-            (ScalarKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
-            (ScalarKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
-            (ScalarKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
-            (ScalarKind::String, _) => quoted_string(sql)
+        let family = match target {
+            ScalarKind::Builtin(family) => family,
+            ScalarKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
+        };
+        match (family, sql) {
+            (BuiltinKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
+            (BuiltinKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
+            (BuiltinKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
+            (BuiltinKind::String, _) => quoted_string(sql)
                 .map(|s| Value::String(s.to_string()))
                 .ok_or_else(|| err_shape(sql, target)),
-            (ScalarKind::Bytes, SqlValue::HexStringLiteral(s)) => {
+            (BuiltinKind::Bytes, SqlValue::HexStringLiteral(s)) => {
                 Ok(Value::Bytes(parse_hex_bytes(s, sql)?))
             }
-            // MySQL stores UUIDs as CHAR(36) / BINARY(16); wire the
-            // validated string form through as `Backend::Uuid = String`.
-            (ScalarKind::Uuid, _) => quoted_string(sql)
+            // MySQL stores UUIDs as CHAR(36) or BINARY(16). The validated
+            // string form passes through as `Backend::Uuid = String`.
+            (BuiltinKind::Uuid, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_uuid_as_string(s, sql).map(Value::Uuid)),
-            (ScalarKind::Timestamp, _) => quoted_string(sql)
+            (BuiltinKind::Timestamp, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_timestamp(s, sql).map(Value::Timestamp)),
-            (ScalarKind::TimestampTz, _) => quoted_string(sql)
+            (BuiltinKind::TimestampTz, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_timestamp_tz(s, sql).map(Value::TimestampTz)),
-            (ScalarKind::Date, _) => quoted_string(sql)
+            (BuiltinKind::Date, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_date(s, sql).map(Value::Date)),
-            (ScalarKind::Time, _) => quoted_string(sql)
+            (BuiltinKind::Time, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_time(s, sql).map(Value::Time)),
-            (ScalarKind::Decimal, SqlValue::Number(n, _)) => {
+            (BuiltinKind::Decimal, SqlValue::Number(n, _)) => {
                 Ok(Value::Decimal(parse_decimal(n, sql)?))
             }
-            (ScalarKind::Json | ScalarKind::Jsonb, _) => {
+            (BuiltinKind::Json | BuiltinKind::Jsonb, _) => {
                 let s = quoted_string(sql).ok_or_else(|| err_shape(sql, target))?;
-                let v = parse_json(s, sql)?;
-                Ok(if matches!(target, ScalarKind::Json) {
-                    Value::Json(v)
+                let value = parse_json(s, sql)?;
+                Ok(if matches!(family, BuiltinKind::Json) {
+                    Value::Json(value)
                 } else {
-                    Value::Jsonb(v)
+                    Value::Jsonb(value)
                 })
             }
-            (ScalarKind::Custom(custom), _) => parse_custom_literal::<Self>(sql, custom),
             _ => Err(err_shape(sql, target)),
         }
     }
@@ -335,49 +345,52 @@ impl SqlLiteralParse for SQLite {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
-        match (target, sql) {
-            // SQLite has no native BOOL; the column contract stores 0 / 1
+        let family = match target {
+            ScalarKind::Builtin(family) => family,
+            ScalarKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
+        };
+        match (family, sql) {
+            // SQLite has no native BOOL. The column contract stores 0 or 1
             // as INTEGER. Coerce the sqlparser Boolean to that.
-            (ScalarKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(i64::from(*b))),
-            (ScalarKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
-            (ScalarKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
-            (ScalarKind::String, _) => quoted_string(sql)
+            (BuiltinKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(i64::from(*b))),
+            (BuiltinKind::Int, SqlValue::Number(n, _)) => Ok(Value::Int(parse_i64(n, sql)?)),
+            (BuiltinKind::Float, SqlValue::Number(n, _)) => Ok(Value::Float(parse_f64(n, sql)?)),
+            (BuiltinKind::String, _) => quoted_string(sql)
                 .map(|s| Value::String(s.to_string()))
                 .ok_or_else(|| err_shape(sql, target)),
-            (ScalarKind::Bytes, SqlValue::HexStringLiteral(s)) => {
+            (BuiltinKind::Bytes, SqlValue::HexStringLiteral(s)) => {
                 Ok(Value::Bytes(parse_hex_bytes(s, sql)?))
             }
-            // SQLite stores UUIDs as TEXT (36-byte hyphenated) by convention;
-            // wire the validated string form through as `Backend::Uuid = String`.
-            (ScalarKind::Uuid, _) => quoted_string(sql)
+            // SQLite stores UUIDs as TEXT (36-byte hyphenated) by convention.
+            // The validated string form passes through as `Backend::Uuid = String`.
+            (BuiltinKind::Uuid, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_uuid_as_string(s, sql).map(Value::Uuid)),
-            (ScalarKind::Timestamp, _) => quoted_string(sql)
+            (BuiltinKind::Timestamp, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_timestamp(s, sql).map(Value::Timestamp)),
-            (ScalarKind::TimestampTz, _) => quoted_string(sql)
+            (BuiltinKind::TimestampTz, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_timestamp_tz(s, sql).map(Value::TimestampTz)),
-            (ScalarKind::Date, _) => quoted_string(sql)
+            (BuiltinKind::Date, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_date(s, sql).map(Value::Date)),
-            (ScalarKind::Time, _) => quoted_string(sql)
+            (BuiltinKind::Time, _) => quoted_string(sql)
                 .ok_or_else(|| err_shape(sql, target))
                 .and_then(|s| parse_time(s, sql).map(Value::Time)),
-            (ScalarKind::Decimal, SqlValue::Number(n, _)) => {
+            (BuiltinKind::Decimal, SqlValue::Number(n, _)) => {
                 Ok(Value::Decimal(parse_decimal(n, sql)?))
             }
-            (ScalarKind::Json | ScalarKind::Jsonb, _) => {
+            (BuiltinKind::Json | BuiltinKind::Jsonb, _) => {
                 let s = quoted_string(sql).ok_or_else(|| err_shape(sql, target))?;
                 let _ = parse_json(s, sql)?;
                 let value = SqliteJson::text(s.to_string());
-                Ok(if matches!(target, ScalarKind::Json) {
+                Ok(if matches!(family, BuiltinKind::Json) {
                     Value::Json(value)
                 } else {
                     Value::Jsonb(value)
                 })
             }
-            (ScalarKind::Custom(custom), _) => parse_custom_literal::<Self>(sql, custom),
             _ => Err(err_shape(sql, target)),
         }
     }
@@ -414,11 +427,11 @@ mod tests {
     #[test]
     fn postgres_null_is_type_agnostic() {
         assert_eq!(
-            Postgres::parse_literal(&SqlValue::Null, ScalarKind::Int).unwrap(),
+            Postgres::parse_literal(&SqlValue::Null, BuiltinKind::Int.into()).unwrap(),
             Value::Null
         );
         assert_eq!(
-            Postgres::parse_literal(&SqlValue::Null, ScalarKind::String).unwrap(),
+            Postgres::parse_literal(&SqlValue::Null, BuiltinKind::String.into()).unwrap(),
             Value::Null
         );
     }
@@ -426,7 +439,7 @@ mod tests {
     #[test]
     fn postgres_bool_from_boolean() {
         assert_eq!(
-            Postgres::parse_literal(&SqlValue::Boolean(true), ScalarKind::Bool).unwrap(),
+            Postgres::parse_literal(&SqlValue::Boolean(true), BuiltinKind::Bool.into()).unwrap(),
             Value::Bool(true)
         );
     }
@@ -435,7 +448,7 @@ mod tests {
     fn postgres_int_from_number() {
         let sql = SqlValue::Number("42".to_string(), false);
         assert_eq!(
-            Postgres::parse_literal(&sql, ScalarKind::Int).unwrap(),
+            Postgres::parse_literal(&sql, BuiltinKind::Int.into()).unwrap(),
             Value::Int(42)
         );
     }
@@ -444,7 +457,7 @@ mod tests {
     fn postgres_float_from_number() {
         let sql = SqlValue::Number("3.5".to_string(), false);
         assert_eq!(
-            Postgres::parse_literal(&sql, ScalarKind::Float).unwrap(),
+            Postgres::parse_literal(&sql, BuiltinKind::Float.into()).unwrap(),
             Value::Float(3.5)
         );
     }
@@ -453,7 +466,7 @@ mod tests {
     fn postgres_string_from_quoted() {
         let sql = SqlValue::SingleQuotedString("hi".to_string());
         assert_eq!(
-            Postgres::parse_literal(&sql, ScalarKind::String).unwrap(),
+            Postgres::parse_literal(&sql, BuiltinKind::String.into()).unwrap(),
             Value::String("hi".to_string())
         );
     }
@@ -461,28 +474,28 @@ mod tests {
     #[test]
     fn postgres_uuid_from_quoted() {
         let sql = SqlValue::SingleQuotedString("550e8400-e29b-41d4-a716-446655440000".to_string());
-        let v = Postgres::parse_literal(&sql, ScalarKind::Uuid).unwrap();
+        let v = Postgres::parse_literal(&sql, BuiltinKind::Uuid.into()).unwrap();
         assert!(matches!(v, Value::Uuid(_)));
     }
 
     #[test]
     fn postgres_timestamp_from_iso8601() {
         let sql = SqlValue::SingleQuotedString("2024-01-02T03:04:05".to_string());
-        let v = Postgres::parse_literal(&sql, ScalarKind::Timestamp).unwrap();
+        let v = Postgres::parse_literal(&sql, BuiltinKind::Timestamp.into()).unwrap();
         assert!(matches!(v, Value::Timestamp(_)));
     }
 
     #[test]
     fn postgres_date_from_iso8601() {
         let sql = SqlValue::SingleQuotedString("2024-01-02".to_string());
-        let v = Postgres::parse_literal(&sql, ScalarKind::Date).unwrap();
+        let v = Postgres::parse_literal(&sql, BuiltinKind::Date.into()).unwrap();
         assert!(matches!(v, Value::Date(_)));
     }
 
     #[test]
     fn postgres_bytes_from_hex_literal() {
         let sql = SqlValue::HexStringLiteral("deadbeef".to_string());
-        let v = Postgres::parse_literal(&sql, ScalarKind::Bytes).unwrap();
+        let v = Postgres::parse_literal(&sql, BuiltinKind::Bytes.into()).unwrap();
         assert_eq!(v, Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
     }
 
@@ -490,7 +503,7 @@ mod tests {
     fn postgres_json_equality_is_refused() {
         let sql = SqlValue::SingleQuotedString("{\"k\":1}".to_string());
         assert!(matches!(
-            Postgres::parse_literal(&sql, ScalarKind::Json),
+            Postgres::parse_literal(&sql, BuiltinKind::Json.into()),
             Err(RegisterError::TypeError(_))
         ));
     }
@@ -498,21 +511,21 @@ mod tests {
     #[test]
     fn postgres_decimal_from_number() {
         let sql = SqlValue::Number("123.456".to_string(), false);
-        let v = Postgres::parse_literal(&sql, ScalarKind::Decimal).unwrap();
+        let v = Postgres::parse_literal(&sql, BuiltinKind::Decimal.into()).unwrap();
         assert!(matches!(v, Value::Decimal(_)));
     }
 
     #[test]
     fn postgres_type_mismatch_returns_type_error() {
         let sql = SqlValue::Boolean(true);
-        let err = Postgres::parse_literal(&sql, ScalarKind::Int).unwrap_err();
+        let err = Postgres::parse_literal(&sql, BuiltinKind::Int.into()).unwrap_err();
         assert!(matches!(err, RegisterError::TypeError(_)));
     }
 
     #[test]
     fn postgres_uuid_invalid_string_errors() {
         let sql = SqlValue::SingleQuotedString("not-a-uuid".to_string());
-        let err = Postgres::parse_literal(&sql, ScalarKind::Uuid).unwrap_err();
+        let err = Postgres::parse_literal(&sql, BuiltinKind::Uuid.into()).unwrap_err();
         assert!(matches!(err, RegisterError::TypeError(_)));
     }
 
@@ -525,17 +538,17 @@ mod tests {
         for (text, want) in crate::temporal::corpus::accepted() {
             let sql = SqlValue::SingleQuotedString(text.to_string());
             assert_eq!(
-                Postgres::parse_literal(&sql, want.kind()).expect(text),
+                Postgres::parse_literal(&sql, want.kind().into()).expect(text),
                 want.value::<Postgres>(),
                 "postgres literal {text:?}"
             );
             assert_eq!(
-                SQLite::parse_literal(&sql, want.kind()).expect(text),
+                SQLite::parse_literal(&sql, want.kind().into()).expect(text),
                 want.value::<SQLite>(),
                 "sqlite literal {text:?}"
             );
             assert_eq!(
-                MySql::parse_literal(&sql, want.kind()).expect(text),
+                MySql::parse_literal(&sql, want.kind().into()).expect(text),
                 want.value::<MySql>(),
                 "mysql literal {text:?}"
             );
@@ -549,7 +562,7 @@ mod tests {
             let sql = SqlValue::SingleQuotedString(text.to_string());
             assert!(
                 matches!(
-                    Postgres::parse_literal(&sql, kind),
+                    Postgres::parse_literal(&sql, kind.into()),
                     Err(RegisterError::TypeError(_))
                 ),
                 "{text:?} must not parse as {kind:?}"

@@ -770,8 +770,8 @@ impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
 /// consumes them, and
 /// [`kinds`](Self::kinds) gives the decode kind for every column in that same
 /// order. `COUNT` components are
-/// [`ScalarKind::Int`](crate::backend::ScalarKind::Int); `SUM` and `SUM(x*x)`
-/// components are [`ScalarKind::Float`](crate::backend::ScalarKind::Float),
+/// [`BuiltinKind::Int`](crate::backend::BuiltinKind::Int); `SUM` and `SUM(x*x)`
+/// components are [`BuiltinKind::Float`](crate::backend::BuiltinKind::Float),
 /// decoded as double to match the `f64` accumulator (since `SUM` promotes to
 /// `bigint`/`numeric`/`DECIMAL` depending on the backend).
 ///

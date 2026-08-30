@@ -84,229 +84,6 @@ name = "sqlparser_cursed"
 harness = false
 required-features = ["testing"]
 
-# Integration test for the DieselConnector. Uses in-memory SQLite. Gated
-# behind the `executor-diesel` feature so default `cargo test` does not try
-# to compile it.
-# Docker-free proof that a result of unknown shape decodes and that the byte
-# budget bounds a page. Needs the SQLite backend for a real connection plus the
-# connector seam under test.
-[[test]]
-name = "dynamic_row_decode"
-required-features = ["diesel-typed-sqlite", "executor-diesel"]
-
-[[test]]
-name = "reexec_diesel"
-required-features = ["executor-diesel", "diesel-typed-sqlite"]
-
-# Docker-free connector round-trip for the multi-column aggregate seed
-# (`execute_scalar_row`) over in-memory SQLite. Gated behind
-# `executor-diesel` like `reexec_diesel`.
-[[test]]
-name = "execute_scalar_row_sqlite"
-required-features = ["executor-diesel", "diesel-typed-sqlite"]
-
-# Docker-free coverage for the connector session-setup seam (U8) over in-memory
-# SQLite, plus Docker-gated cursor and async-MySQL coverage in the connector
-# test files. The SQLite target needs the same features as the other sqlite
-# connector tests.
-[[test]]
-name = "session_setup"
-required-features = ["executor-diesel", "diesel-typed-sqlite"]
-
-# Docker-backed integration test for AutoResolvingEngine + DieselConnector
-# against a real Postgres with logical replication. Tests are #[ignore]d;
-# run explicitly via:
-#   cargo test --test reexec_postgres --features executor-diesel-postgres -- --ignored --nocapture
-[[test]]
-name = "reexec_postgres"
-required-features = ["executor-diesel-postgres"]
-
-# Docker-backed check that `REPLICA_IDENTITY_AUDIT_SQL` names exactly the
-# tables whose change stream omits the previous row. Needs only a plain
-# Postgres connection, no replication slot. Run with:
-#   cargo test --test replica_identity_audit \
-#       --features executor-diesel-postgres -- --ignored --nocapture
-[[test]]
-name = "replica_identity_audit"
-required-features = ["executor-diesel-postgres"]
-
-# Docker-backed differential test: every record subql derives from a real
-# CDC row image must equal what the tuple SQL rls2fga emits for the same
-# rows returns from the same Postgres. This is what stops subql's own
-# value rendering drifting from the loader's. Run with:
-#   cargo test --test visibility_records_parity \
-#       --features "visibility-records executor-diesel-postgres" -- --ignored --nocapture
-[[test]]
-name = "visibility_records_parity"
-required-features = ["visibility-records", "executor-diesel-postgres"]
-
-# The delegated half against a real OpenFGA server, which is the one criterion
-# every other visibility test proves only against a counting stand-in. Run with:
-#   cargo test --test visibility_openfga_e2e \
-#       --features "visibility-openfga testing" -- --ignored --nocapture
-[[test]]
-name = "visibility_openfga_e2e"
-required-features = ["visibility-openfga", "testing"]
-
-[[test]]
-name = "follow_insert_postgres"
-required-features = ["diesel-typed"]
-
-[[test]]
-name = "follow_insert_sqlite"
-required-features = ["diesel-typed-sqlite"]
-
-# Smoke integration test for the fake-Postgres-over-SQLite CDC source.
-# Gated behind `pg-sqlite-emu` so default `cargo test` skips it.
-[[test]]
-name = "pg_sqlite_emu_smoke"
-required-features = ["pg-sqlite-emu"]
-
-# INSERT / UPDATE / DELETE coverage for the emulator on single-PK and
-# composite-PK tables. Composite PK is not exercised anywhere else.
-[[test]]
-name = "pg_sqlite_emu_dml"
-required-features = ["pg-sqlite-emu"]
-
-# End-to-end dispatch proptest for the emulator: arbitrary DML,
-# reference oracle, engine notifications must match per event.
-[[test]]
-name = "proptest_pg_sqlite_emu_dispatch"
-required-features = ["pg-sqlite-emu"]
-
-# `follow_row` + emulator integration: PK-scoped follows observe
-# INSERT / DELETE events routed through the pgoutput wire.
-[[test]]
-name = "follow_pg_sqlite_emu"
-required-features = ["pg-sqlite-emu"]
-
-# Structural CDC proptest: per-event shape assertions against a
-# reference model. Distinct from proptest_pg_sqlite_emu_dispatch,
-# which only checks oracle notifications.
-[[test]]
-name = "proptest_pg_sqlite_emu_cdc"
-required-features = ["pg-sqlite-emu"]
-
-# Docker-backed integration test for PgR2D2DieselConnector (pool-backed
-# PG connector). Run with:
-#   cargo test --test reexec_postgres_r2d2 \
-#       --features executor-diesel-postgres-r2d2 -- --ignored --nocapture
-[[test]]
-name = "reexec_postgres_r2d2"
-required-features = ["executor-diesel-postgres-r2d2"]
-
-# Docker-backed integration test for MysqlDieselConnector against a real MySQL
-# with binary logging. Tests are #[ignore]d; run via:
-#   cargo test --test reexec_mysql --features executor-diesel-mysql -- --ignored --nocapture
-[[test]]
-name = "reexec_mysql"
-required-features = ["executor-diesel-mysql"]
-
-# Docker-backed E2E for apply_patchset_async against Postgres over a
-# diesel-async connection. Run with:
-#   cargo test --test apply_patchset_pg_async_e2e \
-#       --features apply-patchset-postgres-async -- --ignored --nocapture
-[[test]]
-name = "apply_patchset_pg_async_e2e"
-required-features = ["apply-patchset-postgres-async"]
-
-# Docker-backed E2E for apply_diffset_bytes_async (patchset + changeset
-# arms) and apply_changeset_async against Postgres over a diesel-async
-# connection. Run with:
-#   cargo test --test apply_diffset_async_pg_e2e \
-#       --features apply-patchset-postgres-async -- --ignored --nocapture
-[[test]]
-name = "apply_diffset_async_pg_e2e"
-required-features = ["apply-patchset-postgres-async"]
-
-# Docker-backed E2E for apply_patchset_async against MySQL over a
-# diesel-async connection. Run with:
-#   cargo test --test apply_patchset_mysql_async_e2e \
-#       --features apply-patchset-mysql-async -- --ignored --nocapture
-[[test]]
-name = "apply_patchset_mysql_async_e2e"
-required-features = ["apply-patchset-mysql-async"]
-
-# Docker-backed integration test for AsyncAutoResolvingEngine +
-# PgAsyncDieselConnector against a real Postgres with logical replication.
-# Run with:
-#   cargo test --test reexec_postgres_async \
-#       --features executor-diesel-async-postgres -- --ignored --nocapture
-[[test]]
-name = "reexec_postgres_async"
-required-features = ["executor-diesel-async-postgres"]
-
-# Docker-backed integration test for AsyncAutoResolvingEngine +
-# MysqlAsyncDieselConnector against a real MySQL 8.0 with binary logging.
-# Run with:
-#   cargo test --test reexec_mysql_async \
-#       --features executor-diesel-async-mysql -- --ignored --nocapture
-[[test]]
-name = "reexec_mysql_async"
-required-features = ["executor-diesel-async-mysql"]
-
-# Docker-backed integration test for PgStreamingCdcSource (push-based PG
-# CDC source using START_REPLICATION via pg_walstream). Run with:
-#   cargo test --test pg_streaming_e2e \
-#       --features pg-streaming -- --ignored --nocapture
-[[test]]
-name = "pg_streaming_e2e"
-required-features = ["pg-streaming"]
-
-# Smoke test for the polling-based PG CDC source. Run with:
-#   cargo test --test polling_smoke --features pg-streaming -- --ignored --nocapture
-[[test]]
-name = "polling_smoke"
-required-features = ["pg-streaming"]
-
-# Differential equivalence test: drives a deterministic DML stream
-# against two slots concurrently, drains both push + poll, asserts
-# they observed identical events. Catches pgoutput parser bugs and
-# pg_walstream native-backend stream framing regressions. Run with:
-#   cargo test --test cdc_equivalence --features pg-streaming -- --ignored --nocapture
-[[test]]
-name = "cdc_equivalence"
-required-features = ["pg-streaming"]
-
-# One-shot empirical benchmark comparing the two shipped library
-# transports: the push-based `PgStreamingCdcSource` against the polling
-# `PollingPgCdcSource`. Verifies the architectural claim that push
-# delivers materially lower latency than polling at any poll cadence.
-# Run once, paste numbers into `BENCHMARKS.md`.
-[[test]]
-name = "polling_vs_push_benchmark"
-required-features = ["pg-streaming"]
-
-# Docker-backed full CDC round-trip test on the wal2json vehicle:
-# Postgres DML to wal2json CDC to emitted patchset, applied to a SQLite
-# replica via `SqliteAdapter`, session patchset captured and re-applied
-# to Postgres via `PgAdapter`, asserting row parity across the cycle.
-# Run with:
-#   cargo test --test round_trip_pg_wal2json_e2e \
-#       --features "apply-patchset-postgres apply-patchset-sqlite sqlite-cdc" -- --ignored --nocapture
-[[test]]
-name = "round_trip_pg_wal2json_e2e"
-required-features = [
-    "apply-patchset-postgres",
-    "apply-patchset-sqlite",
-    "sqlite-cdc",
-]
-
-# Docker-backed full CDC round-trip test on the pgoutput vehicle: the
-# same four-type loop as the wal2json test, but driven by real pgoutput
-# binary changes decoded to `ChangeEvent` and emitted via
-# `pgoutput_patchset_builder`. Run with:
-#   cargo test --test round_trip_pg_pgoutput_e2e \
-#       --features "pgoutput-emit apply-patchset-postgres apply-patchset-sqlite sqlite-cdc" -- --ignored --nocapture
-[[test]]
-name = "round_trip_pg_pgoutput_e2e"
-required-features = [
-    "pgoutput-emit",
-    "apply-patchset-postgres",
-    "apply-patchset-sqlite",
-    "sqlite-cdc",
-]
-
 [dependencies]
 # SQL parsing (supports multiple dialects).
 # `visitor` provides the derived AST walk. The capture classifier needs every
@@ -396,13 +173,15 @@ r2d2 = { version = "0.8", optional = true }
 # the fork.
 diesel-async = { version = "0.7", optional = true, default-features = false }
 
-# SQLite session-extension binary formats (changeset / patchset) plus the
-# wal2json and Maxwell parsers subql implements `CdcEvent` on. Backs the
-# `SqliteChangesetParser` and the Postgres/MySQL JSON CDC paths. `no_std +
-# alloc` posture, no C deps (the `wal2json` and `maxwell` features pull only
-# serde). `default-features = false` drops the `diesel` and `pg-walstream`
-# reverse adapters, which the feature gates below opt into when needed.
-sqlite-diff-rs = { version = "0.9.0", default-features = false, features = ["wal2json", "maxwell"] }
+# SQLite patchsets and digest conversion for both CDC wire formats.
+sqlite-diff-rs = { version = "0.10", default-features = false, features = ["wal2json", "maxwell"] }
+# PostgreSQL wal2json parser and model.
+wal2json-events = { version = "0.1.0", default-features = false }
+# MySQL Maxwell parser and model. Direct, like `wal2json-events` and for the
+# same reason: `sqlite-diff-rs` re-exports the model and `parse` but not
+# `ParseError`, and subql needs that error to tell a message type it does not
+# model (skip it) from malformed JSON (report it).
+maxwell-cdc = { version = "0.1.0", default-features = false }
 
 # Diesel wrapper around SQLite's session extension. Backs the Phase 8
 # `SqliteCdcSource`: owns a live `SqliteConnection`, attaches tables
@@ -433,13 +212,10 @@ diesel-dynamic-schema = { version = "0.2", default-features = false, optional = 
 # deps so the emulator stays a pure-Rust addition.
 pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
 
-# Per-row authorization records: given one changed row's column values,
-# which `(object, relation, subject)` facts it implies, and whether a
-# relation's records follow from that row alone. Backs the
-# `visibility-records` feature. `default-features = false` keeps the
-# `no_std + alloc` posture: its `std` feature forwards `std` to the parser
-# and serde, and its `client` feature pulls a gRPC stack subql does not want
-# in the library, only in the end-to-end test.
+# Output contracts and row evaluation for `visibility-records`.
+rls2fga-types = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
+
+# Full translation for `membership-term`.
 rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", default-features = false, optional = true }
 
 # OpenFGA gRPC client, behind `visibility-openfga`. The only maintained Rust
@@ -537,7 +313,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 # rule that bans `std::sync::Mutex/RwLock` where the guard is unwrapped.
 parking_lot = "0.12"
 
-
 [features]
 default = ["std"]
 # `std` enables the I/O subsystems: persistence (shard codec + background
@@ -555,6 +330,7 @@ std = [
     "pg_walstream/std",
     "dep:lz4",
     "dep:toml",
+    "rls2fga-types?/std",
     "rls2fga?/std",
 ]
 testing = ["dep:arbitrary"]
@@ -793,22 +569,11 @@ pg-sqlite-emu = [
 # unconditional in `sqlite-diff-rs`), only the pg path does.
 pgoutput-emit = ["sqlite-diff-rs/pg-walstream"]
 
-# Opt-in: answer which authorization records a changed row implies, and
-# which relations a single row decides, by feeding the row's own column
-# values to `rls2fga`. This is the half of row visibility that needs no
-# network: whatever it cannot decide locally becomes a question the
-# caller answers, in the `Connector` idiom. subql names no authorization
-# protocol, so the vendor client stays downstream.
-visibility-records = ["dep:rls2fga"]
+# Evaluate visibility records without the translator.
+visibility-records = ["dep:rls2fga-types"]
 
-# Opt-in: compile a membership subquery in a subscription's WHERE clause into
-# the relationships that answer it per changed row, through `rls2fga`. Only the
-# compiling half is switched. The bounded form itself is recognised in every
-# build, including both wasm targets under `--no-default-features`, because the
-# bound is enforced by subql's own statement-shape rule and names no `rls2fga`
-# type. With this off, a bounded term is refused at registration naming this
-# feature rather than claiming subql cannot run a nested SELECT.
-membership-term = ["visibility-records"]
+# Compile membership subqueries through the full translator.
+membership-term = ["visibility-records", "dep:rls2fga"]
 
 # Opt-in and off by default: answer the questions the row does not settle by
 # asking an OpenFGA server, which completes the composition
@@ -853,18 +618,19 @@ inherits = "release"
 lto = false
 codegen-units = 16
 
-# Iteration profile for local test runs. Under `cargo test --release` every
-# one of the ~78 integration test binaries pays release's fat-LTO,
-# single-codegen-unit link: 5m54s of rebuild after touching one source
-# file. Tests still want release-grade codegen, so only the link-time
-# knobs relax, plus incremental compilation, which brings the same rebuild
-# to 10s. Use via `cargo +1.88 nextest run --cargo-profile testfast`.
+# Iteration profile for local test runs. Relaxes release's fat-LTO,
+# single-codegen-unit link and adds incremental compilation. With the merged
+# `tests/it` target (2026-08-29): cold build 2m16s, touch rebuild ~6s.
+# Codegen stays at the inherited opt-level 3 on measurement: opt-level 1
+# saved 26% of the cold build but pushed the 1039-test run phase from 8s to
+# 12s (opt-level 0: 33s), all of it in the VM-eval harness test, and the
+# touch rebuild barely moved since the lib compile dominates it.
+# Use via `cargo +1.88 nextest run --cargo-profile testfast`.
 [profile.testfast]
 inherits = "release"
 lto = false
 codegen-units = 16
 incremental = true
-
 
 [lints]
 workspace = true

@@ -8,11 +8,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
-use rls2fga::classifier::patterns::ConfidenceLevel;
-use rls2fga::generator::records::{ColumnKind, ColumnRead, RecordDerivation};
-use rls2fga::generator::relations::RelationShapes;
-use rls2fga::parser::identifiers::{ColumnName, RelationName, TypeName};
 use rls2fga::translator::TranslatorBuilder;
+use rls2fga_types::ConfidenceLevel;
+use rls2fga_types::RelationShapes;
+use rls2fga_types::TableId;
+use rls2fga_types::{ColumnKind, ColumnRead, RecordDerivation};
+use rls2fga_types::{ColumnName, RelationName, TypeName};
 use sqlparser::dialect::PostgreSqlDialect;
 
 use crate::ParserDB;
@@ -30,6 +31,14 @@ fn translated(sql: &str) -> Vec<RelationShapes> {
         .translate(&db)
         .expect("the ownership fixture translates")
         .relations()
+        .to_vec()
+}
+
+/// A stored table identity, as [`crate::catalog_helpers::contract_table_id`]
+/// resolves it: no schema, the bare name.
+#[must_use]
+pub fn table(name: &str) -> TableId {
+    TableId::from_stored(None, String::from(name))
 }
 
 /// The type rls2fga names `docs`.
@@ -82,8 +91,8 @@ pub fn gated_relation() -> (RelationName, String) {
         .translate(&db)
         .expect("the held-keys fixture translates")
         .relations()
-        .into_iter()
-        .flat_map(|entry| entry.shapes)
+        .iter()
+        .flat_map(|entry| entry.shapes.clone())
         .find_map(|shape| match shape.derivation {
             RecordDerivation::FromRow { template, .. } => {
                 let template = *template;

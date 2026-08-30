@@ -612,7 +612,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             output.reads.push(GroupedRead {
                 group: key,
                 query,
-                column_kinds: [self.plan.agg_kind, crate::backend::ScalarKind::Int],
+                column_kinds: [self.plan.agg_kind, crate::backend::BuiltinKind::Int],
                 checkpoint: checkpoint.cloned(),
             });
         }

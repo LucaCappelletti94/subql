@@ -297,7 +297,7 @@ fn name<DB: DatabaseLike>(
 /// conversion into a custom value is subql's to run.
 fn carrier_of<B: Backend>(kind: ScalarKindOf<B>) -> BuiltinKind {
     kind.as_builtin().unwrap_or_else(|| {
-        kind.custom().map_or(ScalarKind::String, |custom| {
+        kind.custom().map_or(BuiltinKind::String, |custom| {
             <B::Custom as CustomScalars>::carrier(*custom)
         })
     })
@@ -443,17 +443,17 @@ impl<B: Backend> TermKey<B> {
     #[must_use]
     pub fn scalar_kind(&self) -> ScalarKindOf<B> {
         match self {
-            Self::Custom(v) => ScalarKind::Custom(<B::Custom as CustomScalars>::kind_of(v)),
-            Self::Bool(_) => ScalarKind::Bool,
-            Self::Int(_) => ScalarKind::Int,
-            Self::String(_) => ScalarKind::String,
-            Self::Bytes(_) => ScalarKind::Bytes,
-            Self::Uuid(_) => ScalarKind::Uuid,
-            Self::Timestamp(_) => ScalarKind::Timestamp,
-            Self::TimestampTz(_) => ScalarKind::TimestampTz,
-            Self::Date(_) => ScalarKind::Date,
-            Self::Time(_) => ScalarKind::Time,
-            Self::Decimal(_) => ScalarKind::Decimal,
+            Self::Custom(value) => ScalarKind::Custom(<B::Custom as CustomScalars>::kind_of(value)),
+            Self::Bool(_) => BuiltinKind::Bool.into(),
+            Self::Int(_) => BuiltinKind::Int.into(),
+            Self::String(_) => BuiltinKind::String.into(),
+            Self::Bytes(_) => BuiltinKind::Bytes.into(),
+            Self::Uuid(_) => BuiltinKind::Uuid.into(),
+            Self::Timestamp(_) => BuiltinKind::Timestamp.into(),
+            Self::TimestampTz(_) => BuiltinKind::TimestampTz.into(),
+            Self::Date(_) => BuiltinKind::Date.into(),
+            Self::Time(_) => BuiltinKind::Time.into(),
+            Self::Decimal(_) => BuiltinKind::Decimal.into(),
         }
     }
 }
@@ -553,27 +553,28 @@ impl<B: Backend> TermLookup<B> {
 pub fn kind_can_key<B: Backend>(kind: ScalarKindOf<B>) -> bool {
     match kind {
         // A custom type answers for itself. Its value is `Eq + Hash`, so the
-        // reflexivity the builtin rule demands is already promised, and this
-        // exists for a type that refuses keying for its own reasons.
+        // reflexivity the builtin rule demands is already promised.
         ScalarKind::Custom(custom) => <B::Custom as CustomScalars>::can_key(custom),
-        ScalarKind::Bool
-        | ScalarKind::Int
-        | ScalarKind::String
-        | ScalarKind::Bytes
-        | ScalarKind::Uuid
-        | ScalarKind::Timestamp
-        | ScalarKind::TimestampTz
-        | ScalarKind::Date
-        | ScalarKind::Time
-        | ScalarKind::Decimal => true,
-        ScalarKind::Float | ScalarKind::Json | ScalarKind::Jsonb => false,
+        ScalarKind::Builtin(family) => match family {
+            BuiltinKind::Bool
+            | BuiltinKind::Int
+            | BuiltinKind::String
+            | BuiltinKind::Bytes
+            | BuiltinKind::Uuid
+            | BuiltinKind::Timestamp
+            | BuiltinKind::TimestampTz
+            | BuiltinKind::Date
+            | BuiltinKind::Time
+            | BuiltinKind::Decimal => true,
+            BuiltinKind::Float | BuiltinKind::Json | BuiltinKind::Jsonb => false,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{kind_can_key, TermKey, TermLookup};
-    use crate::backend::{Backend, MySql, Postgres, ScalarKind, Value};
+    use crate::backend::{Backend, BuiltinKind, MySql, Postgres, Value};
     use hashbrown::HashMap;
 
     /// Both keys must go through the *same* hasher. `DefaultHashBuilder` is
@@ -663,36 +664,40 @@ mod tests {
     fn the_registration_gate_matches_what_the_conversion_accepts() {
         let epoch = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant");
         let cases = [
-            (ScalarKind::Bool, Value::<Postgres>::Bool(true)),
-            (ScalarKind::Int, Value::Int(1)),
-            (ScalarKind::Float, Value::Float(1.0)),
-            (ScalarKind::String, Value::String("x".to_string())),
-            (ScalarKind::Bytes, Value::Bytes(vec![1])),
-            (ScalarKind::Uuid, Value::Uuid(uuid::Uuid::nil())),
-            (ScalarKind::Timestamp, Value::Timestamp(epoch.naive_utc())),
-            (ScalarKind::TimestampTz, Value::TimestampTz(epoch)),
-            (ScalarKind::Date, Value::Date(epoch.date_naive())),
-            (ScalarKind::Time, Value::Time(epoch.time())),
+            (BuiltinKind::Bool, Value::<Postgres>::Bool(true)),
+            (BuiltinKind::Int, Value::Int(1)),
+            (BuiltinKind::Float, Value::Float(1.0)),
+            (BuiltinKind::String, Value::String("x".to_string())),
+            (BuiltinKind::Bytes, Value::Bytes(vec![1])),
+            (BuiltinKind::Uuid, Value::Uuid(uuid::Uuid::nil())),
+            (BuiltinKind::Timestamp, Value::Timestamp(epoch.naive_utc())),
+            (BuiltinKind::TimestampTz, Value::TimestampTz(epoch)),
+            (BuiltinKind::Date, Value::Date(epoch.date_naive())),
+            (BuiltinKind::Time, Value::Time(epoch.time())),
             (
-                ScalarKind::Decimal,
+                BuiltinKind::Decimal,
                 Value::Decimal(bigdecimal::BigDecimal::from(1)),
             ),
-            (ScalarKind::Json, Value::Json(serde_json::Value::Null)),
-            (ScalarKind::Jsonb, Value::Jsonb(serde_json::Value::Null)),
+            (BuiltinKind::Json, Value::Json(serde_json::Value::Null)),
+            (BuiltinKind::Jsonb, Value::Jsonb(serde_json::Value::Null)),
         ];
-        assert_eq!(cases.len(), 13, "every ScalarKind must appear here");
+        assert_eq!(cases.len(), 13, "every builtin kind must appear here");
         for (kind, value) in cases {
             let lookup = TermLookup::of(value);
             let keyed = matches!(lookup, TermLookup::Key(_));
             assert_eq!(
-                kind_can_key::<Postgres>(kind),
+                kind_can_key::<Postgres>(kind.into()),
                 keyed,
                 "{kind:?} disagrees between the gate and the conversion"
             );
             // The key's own kind is the kind the value was built at, which is
             // what the caller-comparison refusal compares against the column.
             if let TermLookup::Key(key) = lookup {
-                assert_eq!(key.scalar_kind(), kind, "the key changed kind in transit");
+                assert_eq!(
+                    key.scalar_kind(),
+                    kind.into(),
+                    "the key changed kind in transit"
+                );
             }
         }
     }

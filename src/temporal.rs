@@ -62,7 +62,7 @@ pub mod corpus {
     use alloc::vec::Vec;
     use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
-    use crate::backend::{Backend, BuiltinKind, ScalarKind, Value};
+    use crate::backend::{Backend, BuiltinKind, Value};
 
     /// The value a corpus entry means. All three shipped backends map the
     /// four temporal kinds to these same `chrono` types, so one shape
@@ -78,10 +78,10 @@ pub mod corpus {
     impl Temporal {
         pub const fn kind(self) -> BuiltinKind {
             match self {
-                Self::Timestamp(_) => ScalarKind::Timestamp,
-                Self::TimestampTz(_) => ScalarKind::TimestampTz,
-                Self::Date(_) => ScalarKind::Date,
-                Self::Time(_) => ScalarKind::Time,
+                Self::Timestamp(_) => BuiltinKind::Timestamp,
+                Self::TimestampTz(_) => BuiltinKind::TimestampTz,
+                Self::Date(_) => BuiltinKind::Date,
+                Self::Time(_) => BuiltinKind::Time,
             }
         }
 
@@ -159,17 +159,17 @@ pub mod corpus {
     /// that matter: each is the other kind's spelling.
     pub fn refused() -> Vec<(&'static str, BuiltinKind)> {
         vec![
-            ("2026-01-01 00:00:00", ScalarKind::TimestampTz),
-            ("2026-01-01", ScalarKind::TimestampTz),
-            ("nope", ScalarKind::TimestampTz),
-            ("", ScalarKind::TimestampTz),
-            ("2026-01-01 00:00:00+00", ScalarKind::Timestamp),
-            ("2026-01-01", ScalarKind::Timestamp),
-            ("nope", ScalarKind::Timestamp),
-            ("20260101", ScalarKind::Date),
-            ("nope", ScalarKind::Date),
-            ("12:34", ScalarKind::Time),
-            ("nope", ScalarKind::Time),
+            ("2026-01-01 00:00:00", BuiltinKind::TimestampTz),
+            ("2026-01-01", BuiltinKind::TimestampTz),
+            ("nope", BuiltinKind::TimestampTz),
+            ("", BuiltinKind::TimestampTz),
+            ("2026-01-01 00:00:00+00", BuiltinKind::Timestamp),
+            ("2026-01-01", BuiltinKind::Timestamp),
+            ("nope", BuiltinKind::Timestamp),
+            ("20260101", BuiltinKind::Date),
+            ("nope", BuiltinKind::Date),
+            ("12:34", BuiltinKind::Time),
+            ("nope", BuiltinKind::Time),
         ]
     }
 }

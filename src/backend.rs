@@ -61,70 +61,128 @@ pub enum RowKind {
 // ScalarKind, Value
 // ---------------------------------------------------------------------------
 
-/// Compile-time tag naming one scalar type on a [`Backend`].
+/// Runtime tag naming either an upstream builtin family or one custom type.
 ///
-/// Returned by
-/// [`column_scalar_kind`](crate::catalog_helpers::column_scalar_kind) and
-/// used in two places: the compiler coerces a comparison's literal to the
-/// paired column's kind, and the WAL decoders route a wire cell to its
-/// typed [`Value`] variant against the catalog at decode time. It is never
-/// carried in the bytecode nor consumed by the runtime VM, which reads
-/// cells through [`CdcEvent::value_at`] directly.
-///
-/// `C` names the embedder's own scalar types, one variant per type they
-/// taught the backend (see [`CustomScalars`]). It carries no default on
-/// purpose: a site that wrote the bare name would silently get the
-/// no-customs universe and skip deciding what a custom column means there,
-/// which is the whole point of threading it. A backend serving no custom
-/// types instantiates it at [`NoCustom`], which is uninhabited, so
-/// [`Self::Custom`] is unreachable and its arms discharge by matching the
-/// payload.
+/// `C` names the embedder's own scalar types. Builtin classification is owned
+/// by sql-traits and enters through [`From<BuiltinKind>`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ScalarKind<C> {
-    /// [`Backend::Bool`].
-    Bool,
-    /// [`Backend::Int`].
-    Int,
-    /// [`Backend::Float`].
-    Float,
-    /// [`Backend::String`].
-    String,
-    /// [`Backend::Bytes`].
-    Bytes,
-    /// [`Backend::Uuid`].
-    Uuid,
-    /// [`Backend::Timestamp`].
-    Timestamp,
-    /// [`Backend::TimestampTz`].
-    TimestampTz,
-    /// [`Backend::Date`].
-    Date,
-    /// [`Backend::Time`].
-    Time,
-    /// [`Backend::Decimal`].
-    Decimal,
-    /// [`Backend::Json`].
-    Json,
-    /// [`Backend::Jsonb`].
-    Jsonb,
-    /// One of the embedder's own types, named by its compile-time variant.
+    /// One builtin SQL scalar family.
+    Builtin(#[serde(with = "scalar_family_serde")] BuiltinKind),
+    /// One of the embedder's own types.
     Custom(C),
 }
 
-/// The kind of a column a custom type travels as on the wire, and of a
-/// column no embedder extended: [`ScalarKind`] with the custom position
-/// made unreachable.
-///
-/// This is the only place a kind may be spelled without a custom universe,
-/// and it is a distinct type from `ScalarKind<C>` for any real `C`, so it
-/// cannot stand in for a column type by accident.
-pub type BuiltinKind = ScalarKind<NoCustom>;
+/// Builtin scalar families are classified and owned by sql-traits.
+pub type BuiltinKind = sql_traits::utils::scalar_family::ScalarFamily;
 
 /// The kind of a column under backend `B`, custom position included.
-///
-/// Spelling this alias is how a site says "a column type of this backend",
-/// as against [`BuiltinKind`], which says "a builtin shape".
 pub type ScalarKindOf<B> = ScalarKind<<<B as Backend>::Custom as CustomScalars>::Kind>;
+
+mod scalar_family_serde {
+    use super::BuiltinKind;
+
+    // serde's `serialize_with` fixes the signature, so the one-byte family
+    // arrives by reference whatever clippy would prefer.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(family: &BuiltinKind, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8(match family {
+            BuiltinKind::Bool => 0,
+            BuiltinKind::Int => 1,
+            BuiltinKind::Float => 2,
+            BuiltinKind::Decimal => 3,
+            BuiltinKind::String => 4,
+            BuiltinKind::Bytes => 5,
+            BuiltinKind::Uuid => 6,
+            BuiltinKind::Date => 7,
+            BuiltinKind::Time => 8,
+            BuiltinKind::Timestamp => 9,
+            BuiltinKind::TimestampTz => 10,
+            BuiltinKind::Json => 11,
+            BuiltinKind::Jsonb => 12,
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BuiltinKind, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match <u8 as serde::Deserialize>::deserialize(deserializer)? {
+            0 => Ok(BuiltinKind::Bool),
+            1 => Ok(BuiltinKind::Int),
+            2 => Ok(BuiltinKind::Float),
+            3 => Ok(BuiltinKind::Decimal),
+            4 => Ok(BuiltinKind::String),
+            5 => Ok(BuiltinKind::Bytes),
+            6 => Ok(BuiltinKind::Uuid),
+            7 => Ok(BuiltinKind::Date),
+            8 => Ok(BuiltinKind::Time),
+            9 => Ok(BuiltinKind::Timestamp),
+            10 => Ok(BuiltinKind::TimestampTz),
+            11 => Ok(BuiltinKind::Json),
+            12 => Ok(BuiltinKind::Jsonb),
+            value => Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Unsigned(u64::from(value)),
+                &"a scalar family tag from 0 through 12",
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod scalar_kind_serde_tests {
+    use super::{BuiltinKind, ScalarKind};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    enum TestCustom {
+        Named,
+    }
+
+    #[test]
+    fn builtin_and_custom_kinds_round_trip_with_stable_tags() {
+        let families = [
+            BuiltinKind::Bool,
+            BuiltinKind::Int,
+            BuiltinKind::Float,
+            BuiltinKind::Decimal,
+            BuiltinKind::String,
+            BuiltinKind::Bytes,
+            BuiltinKind::Uuid,
+            BuiltinKind::Date,
+            BuiltinKind::Time,
+            BuiltinKind::Timestamp,
+            BuiltinKind::TimestampTz,
+            BuiltinKind::Json,
+            BuiltinKind::Jsonb,
+        ];
+        for (tag, family) in (0_u8..).zip(families) {
+            let kind = ScalarKind::<TestCustom>::from(family);
+            let encoded = postcard::to_allocvec(&kind).unwrap();
+            assert_eq!(encoded, [0, tag]);
+            assert_eq!(
+                postcard::from_bytes::<ScalarKind<TestCustom>>(&encoded),
+                Ok(kind)
+            );
+        }
+
+        let custom = ScalarKind::Custom(TestCustom::Named);
+        let encoded = postcard::to_allocvec(&custom).unwrap();
+        assert_eq!(encoded, [1, 0]);
+        assert_eq!(
+            postcard::from_bytes::<ScalarKind<TestCustom>>(&encoded),
+            Ok(custom)
+        );
+    }
+
+    #[test]
+    fn scalar_kind_rejects_an_unknown_builtin_tag() {
+        assert!(postcard::from_bytes::<ScalarKind<TestCustom>>(&[0, 13]).is_err());
+    }
+}
 /// Owned SQL name for a group-key column's declared collation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GroupKeyCollationName {
@@ -284,19 +342,23 @@ fn encode_exact_component<B: Backend>(
             output.push(0);
             true
         }
-        (ScalarKind::Bool, Value::Bool(value)) => tagged!(1, value),
-        (ScalarKind::Int, Value::Int(value)) => tagged!(2, value),
-        (ScalarKind::Float, Value::Float(value)) => tagged!(3, value),
-        (ScalarKind::String, Value::String(value)) => tagged!(4, value),
-        (ScalarKind::Bytes, Value::Bytes(value)) => tagged!(5, value),
-        (ScalarKind::Uuid, Value::Uuid(value)) => tagged!(6, value),
-        (ScalarKind::Timestamp, Value::Timestamp(value)) => tagged!(7, value),
-        (ScalarKind::TimestampTz, Value::TimestampTz(value)) => tagged!(8, value),
-        (ScalarKind::Date, Value::Date(value)) => tagged!(9, value),
-        (ScalarKind::Time, Value::Time(value)) => tagged!(10, value),
-        (ScalarKind::Decimal, Value::Decimal(value)) => tagged!(11, value),
-        (ScalarKind::Json, Value::Json(value)) => tagged!(12, value),
-        (ScalarKind::Jsonb, Value::Jsonb(value)) => tagged!(13, value),
+        (ScalarKind::Builtin(BuiltinKind::Bool), Value::Bool(value)) => tagged!(1, value),
+        (ScalarKind::Builtin(BuiltinKind::Int), Value::Int(value)) => tagged!(2, value),
+        (ScalarKind::Builtin(BuiltinKind::Float), Value::Float(value)) => tagged!(3, value),
+        (ScalarKind::Builtin(BuiltinKind::String), Value::String(value)) => tagged!(4, value),
+        (ScalarKind::Builtin(BuiltinKind::Bytes), Value::Bytes(value)) => tagged!(5, value),
+        (ScalarKind::Builtin(BuiltinKind::Uuid), Value::Uuid(value)) => tagged!(6, value),
+        (ScalarKind::Builtin(BuiltinKind::Timestamp), Value::Timestamp(value)) => {
+            tagged!(7, value)
+        }
+        (ScalarKind::Builtin(BuiltinKind::TimestampTz), Value::TimestampTz(value)) => {
+            tagged!(8, value)
+        }
+        (ScalarKind::Builtin(BuiltinKind::Date), Value::Date(value)) => tagged!(9, value),
+        (ScalarKind::Builtin(BuiltinKind::Time), Value::Time(value)) => tagged!(10, value),
+        (ScalarKind::Builtin(BuiltinKind::Decimal), Value::Decimal(value)) => tagged!(11, value),
+        (ScalarKind::Builtin(BuiltinKind::Json), Value::Json(value)) => tagged!(12, value),
+        (ScalarKind::Builtin(BuiltinKind::Jsonb), Value::Jsonb(value)) => tagged!(13, value),
         (ScalarKind::Custom(kind), Value::Custom(value))
             if kind == <B::Custom as CustomScalars>::kind_of(value) =>
         {
@@ -312,13 +374,15 @@ fn default_group_key_encoder<B: Backend>(
     let supported = columns.iter().all(|column| {
         matches!(
             column.kind,
-            ScalarKind::Int
-                | ScalarKind::Bool
-                | ScalarKind::Bytes
-                | ScalarKind::Timestamp
-                | ScalarKind::TimestampTz
-                | ScalarKind::Date
-                | ScalarKind::Time
+            ScalarKind::Builtin(
+                BuiltinKind::Int
+                    | BuiltinKind::Bool
+                    | BuiltinKind::Bytes
+                    | BuiltinKind::Timestamp
+                    | BuiltinKind::TimestampTz
+                    | BuiltinKind::Date
+                    | BuiltinKind::Time
+            )
         )
     });
     supported.then(|| GroupKeyEncoder::new(columns, encode_exact_component::<B>))
@@ -493,13 +557,13 @@ fn encode_postgres_component(
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
     match (column.kind, value) {
-        (ScalarKind::Float, Value::Float(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Float), Value::Float(value)) => {
             append_tagged(output, 3, &canonical_f64(*value))
         }
-        (ScalarKind::String, Value::String(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::String), Value::String(value)) => {
             postgres_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
         }
-        (ScalarKind::Jsonb, Value::Jsonb(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Jsonb), Value::Jsonb(value)) => {
             output.push(13);
             append_json(value, output)
         }
@@ -513,16 +577,16 @@ fn encode_mysql_component(
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
     match (column.kind, value) {
-        (ScalarKind::Float, Value::Float(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Float), Value::Float(value)) => {
             append_tagged(output, 3, &canonical_f64(*value))
         }
-        (ScalarKind::String, Value::String(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::String), Value::String(value)) => {
             mysql_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
         }
-        (ScalarKind::Uuid, Value::Uuid(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Uuid), Value::Uuid(value)) => {
             mysql_text_key(column).is_some_and(|mode| append_text(output, 6, value, mode))
         }
-        (ScalarKind::Decimal, Value::Decimal(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Decimal), Value::Decimal(value)) => {
             append_tagged(output, 11, &value.normalized())
         }
         _ => encode_exact_component(column, value, output),
@@ -559,20 +623,20 @@ fn encode_sqlite_component(
 ) -> bool {
     match (column.kind, value) {
         // SQLite stores NaN as SQL NULL, so only synthetic values reach this arm.
-        (ScalarKind::Float, Value::Float(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Float), Value::Float(value)) => {
             append_tagged(output, 3, &canonical_f64(*value))
         }
-        (ScalarKind::String, Value::String(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::String), Value::String(value)) => {
             sqlite_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
         }
-        (ScalarKind::Uuid, Value::Uuid(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Uuid), Value::Uuid(value)) => {
             sqlite_text_key(column).is_some_and(|mode| append_text(output, 6, value, mode))
         }
-        (ScalarKind::Json, Value::Json(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Json), Value::Json(value)) => {
             output.push(12);
             append_sqlite_json(column, value, output)
         }
-        (ScalarKind::Jsonb, Value::Jsonb(value)) => {
+        (ScalarKind::Builtin(BuiltinKind::Jsonb), Value::Jsonb(value)) => {
             output.push(13);
             append_sqlite_json(column, value, output)
         }
@@ -585,61 +649,27 @@ fn encode_sqlite_component(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NoCustom {}
 
-impl<C> ScalarKind<C> {
-    /// Re-tag a kind that names no custom type into any custom universe.
-    ///
-    /// The carrier a custom type declares is a [`BuiltinKind`], and the
-    /// decoders it feeds speak `ScalarKind<C>`, so one total mapping sits
-    /// between them rather than an ad-hoc match at each call.
-    #[must_use]
-    pub const fn from_builtin(kind: BuiltinKind) -> Self {
-        match kind {
-            ScalarKind::Bool => Self::Bool,
-            ScalarKind::Int => Self::Int,
-            ScalarKind::Float => Self::Float,
-            ScalarKind::String => Self::String,
-            ScalarKind::Bytes => Self::Bytes,
-            ScalarKind::Uuid => Self::Uuid,
-            ScalarKind::Timestamp => Self::Timestamp,
-            ScalarKind::TimestampTz => Self::TimestampTz,
-            ScalarKind::Date => Self::Date,
-            ScalarKind::Time => Self::Time,
-            ScalarKind::Decimal => Self::Decimal,
-            ScalarKind::Json => Self::Json,
-            ScalarKind::Jsonb => Self::Jsonb,
-            ScalarKind::Custom(none) => match none {},
-        }
+impl<C> From<BuiltinKind> for ScalarKind<C> {
+    fn from(family: BuiltinKind) -> Self {
+        Self::Builtin(family)
     }
+}
 
-    /// This kind as a builtin, or `None` when it names a custom type.
-    ///
-    /// The inverse of [`Self::from_builtin`], used where a builtin-only
-    /// decoder has to be handed a kind it can actually accept.
+impl<C> ScalarKind<C> {
+    /// This kind as a builtin family, or `None` for a custom type.
     #[must_use]
     pub const fn as_builtin(&self) -> Option<BuiltinKind> {
-        Some(match self {
-            Self::Bool => ScalarKind::Bool,
-            Self::Int => ScalarKind::Int,
-            Self::Float => ScalarKind::Float,
-            Self::String => ScalarKind::String,
-            Self::Bytes => ScalarKind::Bytes,
-            Self::Uuid => ScalarKind::Uuid,
-            Self::Timestamp => ScalarKind::Timestamp,
-            Self::TimestampTz => ScalarKind::TimestampTz,
-            Self::Date => ScalarKind::Date,
-            Self::Time => ScalarKind::Time,
-            Self::Decimal => ScalarKind::Decimal,
-            Self::Json => ScalarKind::Json,
-            Self::Jsonb => ScalarKind::Jsonb,
-            Self::Custom(_) => return None,
-        })
+        match self {
+            Self::Builtin(family) => Some(*family),
+            Self::Custom(_) => None,
+        }
     }
 
     /// The custom type this kind names, or `None` for a builtin.
     pub const fn custom(&self) -> Option<&C> {
         match self {
-            Self::Custom(c) => Some(c),
-            _ => None,
+            Self::Custom(custom) => Some(custom),
+            Self::Builtin(_) => None,
         }
     }
 }
@@ -850,23 +880,23 @@ impl<B: Backend> Value<B> {
     /// [`Value::Null`] (which do not correspond to a specific scalar type).
     #[inline]
     pub fn scalar_kind(&self) -> Option<ScalarKindOf<B>> {
-        match self {
-            Self::Missing | Self::Null => None,
-            Self::Bool(_) => Some(ScalarKind::Bool),
-            Self::Int(_) => Some(ScalarKind::Int),
-            Self::Float(_) => Some(ScalarKind::Float),
-            Self::String(_) => Some(ScalarKind::String),
-            Self::Bytes(_) => Some(ScalarKind::Bytes),
-            Self::Uuid(_) => Some(ScalarKind::Uuid),
-            Self::Timestamp(_) => Some(ScalarKind::Timestamp),
-            Self::TimestampTz(_) => Some(ScalarKind::TimestampTz),
-            Self::Date(_) => Some(ScalarKind::Date),
-            Self::Time(_) => Some(ScalarKind::Time),
-            Self::Decimal(_) => Some(ScalarKind::Decimal),
-            Self::Json(_) => Some(ScalarKind::Json),
-            Self::Jsonb(_) => Some(ScalarKind::Jsonb),
-            Self::Custom(x) => Some(ScalarKind::Custom(<B::Custom as CustomScalars>::kind_of(x))),
-        }
+        Some(match self {
+            Self::Missing | Self::Null => return None,
+            Self::Bool(_) => BuiltinKind::Bool.into(),
+            Self::Int(_) => BuiltinKind::Int.into(),
+            Self::Float(_) => BuiltinKind::Float.into(),
+            Self::String(_) => BuiltinKind::String.into(),
+            Self::Bytes(_) => BuiltinKind::Bytes.into(),
+            Self::Uuid(_) => BuiltinKind::Uuid.into(),
+            Self::Timestamp(_) => BuiltinKind::Timestamp.into(),
+            Self::TimestampTz(_) => BuiltinKind::TimestampTz.into(),
+            Self::Date(_) => BuiltinKind::Date.into(),
+            Self::Time(_) => BuiltinKind::Time.into(),
+            Self::Decimal(_) => BuiltinKind::Decimal.into(),
+            Self::Json(_) => BuiltinKind::Json.into(),
+            Self::Jsonb(_) => BuiltinKind::Jsonb.into(),
+            Self::Custom(value) => ScalarKind::Custom(<B::Custom as CustomScalars>::kind_of(value)),
+        })
     }
 
     /// This value as a borrowed builtin payload, or `None` when it is
@@ -1336,28 +1366,32 @@ impl Backend for Postgres {
     fn group_key_encoder(
         columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind {
-            ScalarKind::Int
-            | ScalarKind::Bool
-            | ScalarKind::Bytes
-            | ScalarKind::Uuid
-            | ScalarKind::Timestamp
-            | ScalarKind::TimestampTz
-            | ScalarKind::Date
-            | ScalarKind::Time
-            | ScalarKind::Float
-            | ScalarKind::Jsonb => true,
-            ScalarKind::String => postgres_text_key(column).is_some(),
+        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+            Some(
+                BuiltinKind::Int
+                | BuiltinKind::Bool
+                | BuiltinKind::Bytes
+                | BuiltinKind::Uuid
+                | BuiltinKind::Timestamp
+                | BuiltinKind::TimestampTz
+                | BuiltinKind::Date
+                | BuiltinKind::Time
+                | BuiltinKind::Float
+                | BuiltinKind::Jsonb,
+            ) => true,
+            Some(BuiltinKind::String) => postgres_text_key(column).is_some(),
             // PostgreSQL numeric waits on Diesel #5168 for infinity support.
-            ScalarKind::Decimal | ScalarKind::Json | ScalarKind::Custom(_) => false,
+            Some(BuiltinKind::Decimal | BuiltinKind::Json) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_postgres_component))
     }
 
     fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
-        match (kind, value) {
-            (ScalarKind::Float, Value::Int(value)) => Some(Value::Float(widen_i64_to_f64(value))),
-            (ScalarKind::Float, Value::Decimal(value)) => {
+        match (kind.as_builtin(), value) {
+            (Some(BuiltinKind::Float), Value::Int(value)) => {
+                Some(Value::Float(widen_i64_to_f64(value)))
+            }
+            (Some(BuiltinKind::Float), Value::Decimal(value)) => {
                 value.to_string().parse().ok().map(Value::Float)
             }
             (_, value) => (!value.is_missing()).then_some(value),
@@ -1389,28 +1423,30 @@ impl Backend for MySql {
     fn group_key_encoder(
         columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind {
-            ScalarKind::Int
-            | ScalarKind::Bool
-            | ScalarKind::Bytes
-            | ScalarKind::Timestamp
-            | ScalarKind::TimestampTz
-            | ScalarKind::Date
-            | ScalarKind::Time
-            | ScalarKind::Decimal => true,
-            ScalarKind::String | ScalarKind::Uuid => mysql_text_key(column).is_some(),
+        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+            Some(
+                BuiltinKind::Int
+                | BuiltinKind::Bool
+                | BuiltinKind::Bytes
+                | BuiltinKind::Timestamp
+                | BuiltinKind::TimestampTz
+                | BuiltinKind::Date
+                | BuiltinKind::Time
+                | BuiltinKind::Decimal,
+            ) => true,
+            Some(BuiltinKind::String | BuiltinKind::Uuid) => mysql_text_key(column).is_some(),
             // MySQL 8.0 groups persisted signed zero into two groups.
-            ScalarKind::Float | ScalarKind::Json | ScalarKind::Jsonb | ScalarKind::Custom(_) => {
-                false
-            }
+            Some(BuiltinKind::Float | BuiltinKind::Json | BuiltinKind::Jsonb) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_mysql_component))
     }
 
     fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
-        match (kind, value) {
-            (ScalarKind::Float, Value::Int(value)) => Some(Value::Float(widen_i64_to_f64(value))),
-            (ScalarKind::Float, Value::Decimal(value)) => {
+        match (kind.as_builtin(), value) {
+            (Some(BuiltinKind::Float), Value::Int(value)) => {
+                Some(Value::Float(widen_i64_to_f64(value)))
+            }
+            (Some(BuiltinKind::Float), Value::Decimal(value)) => {
                 value.to_string().parse().ok().map(Value::Float)
             }
             (_, value) => (!value.is_missing()).then_some(value),
@@ -1422,8 +1458,8 @@ impl Backend for MySql {
     type Float = f64;
     type String = alloc::string::String;
     type Bytes = alloc::vec::Vec<u8>;
-    // MySQL stores UUIDs as CHAR(36) or BINARY(16) with no native type;
-    // downstream code treats them as strings on the wire.
+    // MySQL stores UUIDs as CHAR(36) or BINARY(16) with no native type.
+    // Downstream code treats them as strings on the wire.
     type Uuid = alloc::string::String;
     type Timestamp = chrono::NaiveDateTime;
     type TimestampTz = chrono::DateTime<chrono::Utc>;
@@ -1431,7 +1467,7 @@ impl Backend for MySql {
     type Time = chrono::NaiveTime;
     type Decimal = bigdecimal::BigDecimal;
     type Json = serde_json::Value;
-    // MySQL does not distinguish JSON from JSONB; keep the type alias for
+    // MySQL does not distinguish JSON from JSONB. Keep the type alias for
     // symmetry with Postgres so the engine surface stays uniform.
     type Jsonb = serde_json::Value;
 }
@@ -1446,26 +1482,28 @@ impl Backend for SQLite {
     fn group_key_encoder(
         columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
-        let supported = columns.iter().all(|column| match column.kind {
-            ScalarKind::Int
-            | ScalarKind::Bool
-            | ScalarKind::Bytes
-            | ScalarKind::Timestamp
-            | ScalarKind::TimestampTz
-            | ScalarKind::Date
-            | ScalarKind::Time
-            | ScalarKind::Float
-            | ScalarKind::Json
-            | ScalarKind::Jsonb => true,
-            ScalarKind::String | ScalarKind::Uuid => sqlite_text_key(column).is_some(),
-            ScalarKind::Decimal | ScalarKind::Custom(_) => false,
+        let supported = columns.iter().all(|column| match column.kind.as_builtin() {
+            Some(
+                BuiltinKind::Int
+                | BuiltinKind::Bool
+                | BuiltinKind::Bytes
+                | BuiltinKind::Timestamp
+                | BuiltinKind::TimestampTz
+                | BuiltinKind::Date
+                | BuiltinKind::Time
+                | BuiltinKind::Float
+                | BuiltinKind::Json
+                | BuiltinKind::Jsonb,
+            ) => true,
+            Some(BuiltinKind::String | BuiltinKind::Uuid) => sqlite_text_key(column).is_some(),
+            Some(BuiltinKind::Decimal) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_sqlite_component))
     }
     type Dialect = sqlparser::dialect::SQLiteDialect;
-    // SQLite has no native BOOL; the column-type contract stores 0 / 1
-    // as INTEGER. The backend surfaces the wire type honestly rather than
-    // fabricating a `bool`.
+    // SQLite has no native BOOL. The column-type contract stores 0 or 1
+    // as INTEGER. The backend surfaces the wire type rather than inventing
+    // a `bool`.
     type Bool = i64;
     type Int = i64;
     type Float = f64;
@@ -1473,9 +1511,9 @@ impl Backend for SQLite {
     type Bytes = alloc::vec::Vec<u8>;
     // SQLite stores UUIDs as TEXT (36-byte hyphenated) by convention.
     type Uuid = alloc::string::String;
-    // SQLite has no native temporal types; downstream code stores dates and
-    // times as ISO-8601 TEXT. `Timestamp` and friends carry the parsed
-    // `chrono` type after decoding.
+    // SQLite has no native temporal types. Downstream code stores dates and
+    // times as ISO-8601 TEXT. `Timestamp` and related types carry parsed
+    // `chrono` values after decoding.
     type Timestamp = chrono::NaiveDateTime;
     type TimestampTz = chrono::DateTime<chrono::Utc>;
     type Date = chrono::NaiveDate;
@@ -1484,42 +1522,58 @@ impl Backend for SQLite {
     type Json = SqliteJson;
 
     fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
-        match (kind, value) {
-            (ScalarKind::Bool, Value::Int(value)) => Some(Value::Bool(value)),
-            (ScalarKind::Uuid, Value::String(value)) => Some(Value::Uuid(value)),
-            (ScalarKind::Timestamp, Value::String(value)) => {
+        match (kind.as_builtin(), value) {
+            (Some(BuiltinKind::Bool), Value::Int(value)) => Some(Value::Bool(value)),
+            (Some(BuiltinKind::Uuid), Value::String(value)) => Some(Value::Uuid(value)),
+            (Some(BuiltinKind::Timestamp), Value::String(value)) => {
                 crate::temporal::parse_timestamp(&value).map(Value::Timestamp)
             }
-            (ScalarKind::TimestampTz, Value::String(value)) => {
+            (Some(BuiltinKind::TimestampTz), Value::String(value)) => {
                 crate::temporal::parse_timestamp_tz(&value).map(Value::TimestampTz)
             }
-            (ScalarKind::Date, Value::String(value)) => {
+            (Some(BuiltinKind::Date), Value::String(value)) => {
                 crate::temporal::parse_date(&value).map(Value::Date)
             }
-            (ScalarKind::Time, Value::String(value)) => {
+            (Some(BuiltinKind::Time), Value::String(value)) => {
                 crate::temporal::parse_time(&value).map(Value::Time)
             }
-            (ScalarKind::Decimal, Value::String(value)) => value.parse().ok().map(Value::Decimal),
-            (ScalarKind::Float, Value::Int(value)) => Some(Value::Float(widen_i64_to_f64(value))),
-            (ScalarKind::Decimal, Value::Int(value)) => {
+            (Some(BuiltinKind::Decimal), Value::String(value)) => {
+                value.parse().ok().map(Value::Decimal)
+            }
+            (Some(BuiltinKind::Float), Value::Int(value)) => {
+                Some(Value::Float(widen_i64_to_f64(value)))
+            }
+            (Some(BuiltinKind::Decimal), Value::Int(value)) => {
                 Some(Value::Decimal(bigdecimal::BigDecimal::from(value)))
             }
-            (ScalarKind::Decimal, Value::Float(value)) => {
+            (Some(BuiltinKind::Decimal), Value::Float(value)) => {
                 value.to_string().parse().ok().map(Value::Decimal)
             }
-            (ScalarKind::Json, Value::String(value)) => Some(Value::Json(SqliteJson::text(value))),
-            (ScalarKind::Json, Value::Int(value)) => Some(Value::Json(SqliteJson::integer(value))),
-            (ScalarKind::Json, Value::Float(value)) => Some(Value::Json(SqliteJson::real(value))),
-            (ScalarKind::Json, Value::Bytes(value)) => Some(Value::Json(SqliteJson::blob(value))),
-            (ScalarKind::Jsonb, Value::String(value)) => {
+            (Some(BuiltinKind::Json), Value::String(value)) => {
+                Some(Value::Json(SqliteJson::text(value)))
+            }
+            (Some(BuiltinKind::Json), Value::Int(value)) => {
+                Some(Value::Json(SqliteJson::integer(value)))
+            }
+            (Some(BuiltinKind::Json), Value::Float(value)) => {
+                Some(Value::Json(SqliteJson::real(value)))
+            }
+            (Some(BuiltinKind::Json), Value::Bytes(value)) => {
+                Some(Value::Json(SqliteJson::blob(value)))
+            }
+            (Some(BuiltinKind::Jsonb), Value::String(value)) => {
                 Some(Value::Jsonb(SqliteJson::text(value)))
             }
-            (ScalarKind::Jsonb, Value::Int(value)) => {
+            (Some(BuiltinKind::Jsonb), Value::Int(value)) => {
                 Some(Value::Jsonb(SqliteJson::integer(value)))
             }
-            (ScalarKind::Jsonb, Value::Float(value)) => Some(Value::Jsonb(SqliteJson::real(value))),
-            (ScalarKind::Jsonb, Value::Bytes(value)) => Some(Value::Jsonb(SqliteJson::blob(value))),
-            (kind, value) => decode_exact_group_value(kind, value),
+            (Some(BuiltinKind::Jsonb), Value::Float(value)) => {
+                Some(Value::Jsonb(SqliteJson::real(value)))
+            }
+            (Some(BuiltinKind::Jsonb), Value::Bytes(value)) => {
+                Some(Value::Jsonb(SqliteJson::blob(value)))
+            }
+            (_, value) => decode_exact_group_value(kind, value),
         }
     }
     type Jsonb = SqliteJson;
@@ -1651,7 +1705,7 @@ where
 {
     let Some(custom) = kind.custom().copied() else {
         // Total: `custom()` answered `None`, so `as_builtin` answers `Some`.
-        let builtin = kind.as_builtin().unwrap_or(ScalarKind::String);
+        let builtin = kind.as_builtin().unwrap_or(BuiltinKind::String);
         let decoded = decode(builtin);
         return if decoded.is_missing() {
             Err(crate::ValueError::Builtin {
@@ -1782,8 +1836,8 @@ mod value_key_tests {
 #[allow(clippy::unwrap_used)]
 mod canonical_group_key_tests {
     use super::{
-        Backend, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, MySql, Postgres, SQLite,
-        ScalarKind, SqliteJson, Value,
+        Backend, BuiltinKind, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, MySql,
+        Postgres, SQLite, SqliteJson, Value,
     };
     use alloc::{string::String, vec};
     use sql_traits::traits::MySqlCollationPadding;
@@ -1797,7 +1851,7 @@ mod canonical_group_key_tests {
         collation: GroupKeyCollation,
     ) -> GroupKeyColumn<super::NoCustom> {
         GroupKeyColumn {
-            kind,
+            kind: kind.into(),
             declared_type: String::from("test"),
             collation,
         }
@@ -1822,7 +1876,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn canonical_key_has_one_versioned_tuple_format() {
-        let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Int)])
+        let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Int)])
             .expect("integer groups have a canonical encoder");
         let key = encoder
             .encode(&[Value::Int(42)])
@@ -1836,7 +1890,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn canonical_key_rejects_values_outside_the_selected_domain() {
-        let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Int)])
+        let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Int)])
             .expect("integer groups have a canonical encoder");
 
         assert!(encoder.encode(&[]).is_none());
@@ -1853,7 +1907,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn postgres_float_keys_follow_grouping_equality() {
-        let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Float)])
+        let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Float)])
             .expect("Postgres float grouping is canonical");
 
         let zero = encoder.encode(&[Value::Float(0.0)]).unwrap();
@@ -1871,21 +1925,21 @@ mod canonical_group_key_tests {
     #[test]
     fn postgres_text_requires_deterministic_comparison() {
         assert!(
-            Postgres::group_key_encoder(vec![column(ScalarKind::String)]).is_some(),
+            Postgres::group_key_encoder(vec![column(BuiltinKind::String)]).is_some(),
             "the database default is deterministic"
         );
         assert!(Postgres::group_key_encoder(vec![column_with_collation(
-            ScalarKind::String,
+            BuiltinKind::String,
             named_collation("unicode", Some(true), None),
         )])
         .is_some());
         assert!(Postgres::group_key_encoder(vec![column_with_collation(
-            ScalarKind::String,
+            BuiltinKind::String,
             named_collation("ci", Some(false), None),
         )])
         .is_none());
         assert!(Postgres::group_key_encoder(vec![column_with_collation(
-            ScalarKind::String,
+            BuiltinKind::String,
             GroupKeyCollation::Unknown,
         )])
         .is_none());
@@ -1894,7 +1948,7 @@ mod canonical_group_key_tests {
     #[test]
     fn sqlite_builtin_collations_have_exact_canonical_forms() {
         let nocase = SQLite::group_key_encoder(vec![column_with_collation(
-            ScalarKind::String,
+            BuiltinKind::String,
             named_collation("NOCASE", None, None),
         )])
         .unwrap();
@@ -1912,7 +1966,7 @@ mod canonical_group_key_tests {
         );
 
         let rtrim = SQLite::group_key_encoder(vec![column_with_collation(
-            ScalarKind::String,
+            BuiltinKind::String,
             named_collation("RTRIM", None, None),
         )])
         .unwrap();
@@ -1924,10 +1978,10 @@ mod canonical_group_key_tests {
 
     #[test]
     fn mysql_binary_collations_apply_their_padding_rule() {
-        assert!(MySql::group_key_encoder(vec![column(ScalarKind::String)]).is_none());
+        assert!(MySql::group_key_encoder(vec![column(BuiltinKind::String)]).is_none());
 
         let pad = MySql::group_key_encoder(vec![column_with_collation(
-            ScalarKind::String,
+            BuiltinKind::String,
             named_collation("utf8mb4_bin", None, Some(MySqlCollationPadding::PadSpace)),
         )])
         .unwrap();
@@ -1937,7 +1991,7 @@ mod canonical_group_key_tests {
         );
 
         let no_pad = MySql::group_key_encoder(vec![column_with_collation(
-            ScalarKind::String,
+            BuiltinKind::String,
             named_collation("utf8mb4_0900_bin", None, Some(MySqlCollationPadding::NoPad)),
         )])
         .unwrap();
@@ -1949,7 +2003,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn mysql_decimal_keys_ignore_scale_spelling() {
-        let encoder = MySql::group_key_encoder(vec![column(ScalarKind::Decimal)]).unwrap();
+        let encoder = MySql::group_key_encoder(vec![column(BuiltinKind::Decimal)]).unwrap();
         assert_eq!(
             encoder.encode(&[Value::Decimal("1.0".parse().unwrap())]),
             encoder.encode(&[Value::Decimal("1.00".parse().unwrap())])
@@ -1958,7 +2012,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn postgres_jsonb_keys_follow_structural_equality() {
-        let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Jsonb)]).unwrap();
+        let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Jsonb)]).unwrap();
         let left: serde_json::Value =
             serde_json::from_str(r#"{"a": 1.0, "b": [true, null]}"#).unwrap();
         let right: serde_json::Value =
@@ -1972,7 +2026,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn sqlite_json_keys_preserve_storage_equality() {
-        let encoder = SQLite::group_key_encoder(vec![column(ScalarKind::Json)]).unwrap();
+        let encoder = SQLite::group_key_encoder(vec![column(BuiltinKind::Json)]).unwrap();
         assert_eq!(
             encoder.encode(&[Value::Json(SqliteJson::integer(1))]),
             encoder.encode(&[Value::Json(SqliteJson::real(1.0))])
@@ -1991,7 +2045,7 @@ mod canonical_group_key_tests {
         #[test]
         fn sqlite_nocase_folds_every_ascii_case_pair(value in "[A-Za-z0-9]{0,64}") {
             let encoder = SQLite::group_key_encoder(vec![column_with_collation(
-                ScalarKind::String,
+                BuiltinKind::String,
                 named_collation("NOCASE", None, None),
             )])
             .unwrap();
@@ -2005,7 +2059,7 @@ mod canonical_group_key_tests {
         fn postgres_float_collapses_every_nan_payload(bits in proptest::prelude::any::<u64>()) {
             let value = f64::from_bits(bits);
             if value.is_nan() {
-                let encoder = Postgres::group_key_encoder(vec![column(ScalarKind::Float)]).unwrap();
+                let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Float)]).unwrap();
                 proptest::prop_assert_eq!(
                     encoder.encode(&[Value::Float(value)]),
                     encoder.encode(&[Value::Float(f64::NAN)])

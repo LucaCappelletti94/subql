@@ -18,8 +18,7 @@ use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
     structs::{FingerprintError, SchemaFingerprint},
     utils::{
-        fingerprint_type_token::canonical_type_token,
-        identifier_resolution::stored_identifier_matches_lookup,
+        identifier_resolution::stored_identifier_matches_lookup, scalar_family::scalar_family,
     },
 };
 use sqlite_diff_rs::SimpleTable;
@@ -62,6 +61,15 @@ pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<Tab
         (None, table_name)
     };
     let table = database.table(schema, bare)?;
+    let id = database.table_id(table)?;
+    u32::try_from(id).ok()
+}
+#[cfg(feature = "visibility-records")]
+pub(crate) fn contract_table_id<DB: DatabaseLike>(
+    database: &DB,
+    table: &rls2fga_types::TableId,
+) -> Option<TableId> {
+    let table = database.table(table.schema(), table.name())?;
     let id = database.table_id(table)?;
     u32::try_from(id).ok()
 }
@@ -254,14 +262,10 @@ pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
     })
 }
 
-/// Resolve a column's declared SQL type into a backend-neutral
-/// [`ScalarKind`].
+/// Resolve a column's declared SQL type into its runtime [`ScalarKind`].
 ///
-/// Distinguishes every scalar subql cares about (`JSONB` vs `JSON`,
-/// `TIMESTAMPTZ` vs `TIMESTAMP`, and so on) via
-/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token).
-/// The compiler coerces comparison literals to the column's kind with it,
-/// and the WAL decoders route each wire cell to its typed value against it.
+/// Builtin classification comes directly from sql-traits before the custom
+/// fallback runs.
 ///
 /// Returns `None` when the table / column id is unknown or when the
 /// declared type doesn't match any supported scalar (compiler surfaces
@@ -321,8 +325,8 @@ pub fn group_key_column<B: crate::backend::Backend, DB: DatabaseLike>(
 fn classify_scalar_kind<B: crate::backend::Backend>(
     declared_type: &str,
 ) -> Option<ScalarKindOf<B>> {
-    if let Some(builtin) = scalar_kind_from_raw(declared_type) {
-        return Some(ScalarKind::from_builtin(builtin));
+    if let Some(family) = scalar_family(declared_type) {
+        return Some(family.into());
     }
     <B::Custom as crate::backend::CustomScalars>::classify(declared_type).map(ScalarKind::Custom)
 }
@@ -342,28 +346,7 @@ pub fn column_builtin_kind<DB: DatabaseLike>(
 ) -> Option<crate::backend::BuiltinKind> {
     let table = database.table_by_id(table_id as usize)?;
     let column = table.column_by_id(column_id as usize, database).ok()??;
-    scalar_kind_from_raw(&column.data_type(database))
-}
-
-/// Map a raw SQL declared type string to its [`ScalarKind`] via
-/// [`canonical_type_token`](sql_traits::utils::fingerprint_type_token::canonical_type_token).
-fn scalar_kind_from_raw(raw: &str) -> Option<crate::backend::BuiltinKind> {
-    match canonical_type_token(raw).as_str() {
-        "INT" => Some(ScalarKind::Int),
-        "FLOAT" => Some(ScalarKind::Float),
-        "DECIMAL" => Some(ScalarKind::Decimal),
-        "BOOL" => Some(ScalarKind::Bool),
-        "STRING" => Some(ScalarKind::String),
-        "BYTES" => Some(ScalarKind::Bytes),
-        "UUID" => Some(ScalarKind::Uuid),
-        "DATE" => Some(ScalarKind::Date),
-        "TIME" => Some(ScalarKind::Time),
-        "TIMESTAMP" => Some(ScalarKind::Timestamp),
-        "TIMESTAMPTZ" => Some(ScalarKind::TimestampTz),
-        "JSON" => Some(ScalarKind::Json),
-        "JSONB" => Some(ScalarKind::Jsonb),
-        _ => None,
-    }
+    scalar_family(&column.data_type(database))
 }
 
 /// Whether the table has row-level security enabled (per
@@ -384,7 +367,7 @@ pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Opti
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::backend::Postgres;
+    use crate::backend::{BuiltinKind, Postgres};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::GenericDialect;
 
@@ -476,59 +459,6 @@ mod tests {
         let db = make_db();
         assert!(schema_fingerprint(&db, 9_999).unwrap().is_none());
     }
-    #[test]
-    fn scalar_kind_from_raw_distinguishes_timestamp_variants() {
-        assert_eq!(
-            scalar_kind_from_raw("TIMESTAMP"),
-            Some(ScalarKind::Timestamp)
-        );
-        assert_eq!(
-            scalar_kind_from_raw("TIMESTAMPTZ"),
-            Some(ScalarKind::TimestampTz)
-        );
-        assert_eq!(
-            scalar_kind_from_raw("TIMESTAMP WITH TIME ZONE"),
-            Some(ScalarKind::TimestampTz)
-        );
-        // Case-insensitive.
-        assert_eq!(
-            scalar_kind_from_raw("timestamptz"),
-            Some(ScalarKind::TimestampTz)
-        );
-    }
-
-    #[test]
-    fn scalar_kind_from_raw_distinguishes_json_variants() {
-        assert_eq!(scalar_kind_from_raw("JSON"), Some(ScalarKind::Json));
-        assert_eq!(scalar_kind_from_raw("JSONB"), Some(ScalarKind::Jsonb));
-        assert_eq!(scalar_kind_from_raw("jsonb"), Some(ScalarKind::Jsonb));
-    }
-
-    #[test]
-    fn scalar_kind_from_raw_maps_canonical_tokens() {
-        // Every string here mirrors what `normalize_sqlparser_type`
-        // hands back for the corresponding `sqlparser::ast::DataType`
-        // (parens already stripped). Values that are not one of the
-        // canonical spellings fall through to `OTHER:...` upstream and
-        // resolve to `None` here.
-        assert_eq!(scalar_kind_from_raw("BIGINT"), Some(ScalarKind::Int));
-        assert_eq!(
-            scalar_kind_from_raw("DOUBLE PRECISION"),
-            Some(ScalarKind::Float)
-        );
-        assert_eq!(scalar_kind_from_raw("NUMERIC"), Some(ScalarKind::Decimal));
-        assert_eq!(scalar_kind_from_raw("BOOLEAN"), Some(ScalarKind::Bool));
-        assert_eq!(scalar_kind_from_raw("VARCHAR"), Some(ScalarKind::String));
-        assert_eq!(scalar_kind_from_raw("BYTEA"), Some(ScalarKind::Bytes));
-        assert_eq!(scalar_kind_from_raw("UUID"), Some(ScalarKind::Uuid));
-        assert_eq!(scalar_kind_from_raw("DATE"), Some(ScalarKind::Date));
-        assert_eq!(scalar_kind_from_raw("TIME"), Some(ScalarKind::Time));
-    }
-
-    #[test]
-    fn scalar_kind_from_raw_returns_none_for_unknown() {
-        assert_eq!(scalar_kind_from_raw("SOME_UNKNOWN_TYPE"), None);
-    }
 
     #[test]
     fn column_scalar_kind_classifies_temporal_columns_through_ddl() {
@@ -541,19 +471,19 @@ mod tests {
         let tid = table_id(&pg, "e").unwrap();
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 1),
-            Some(ScalarKind::Timestamp)
+            Some(BuiltinKind::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 2),
-            Some(ScalarKind::TimestampTz)
+            Some(BuiltinKind::TimestampTz.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 3),
-            Some(ScalarKind::Date)
+            Some(BuiltinKind::Date.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&pg, tid, 4),
-            Some(ScalarKind::Time)
+            Some(BuiltinKind::Time.into())
         );
 
         // MySQL spellings, including `DATETIME` and `BIGINT UNSIGNED`.
@@ -566,23 +496,23 @@ mod tests {
         let tid = table_id(&my, "e").unwrap();
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 1),
-            Some(ScalarKind::Timestamp)
+            Some(BuiltinKind::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 2),
-            Some(ScalarKind::Timestamp)
+            Some(BuiltinKind::Timestamp.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 3),
-            Some(ScalarKind::Date)
+            Some(BuiltinKind::Date.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 4),
-            Some(ScalarKind::Time)
+            Some(BuiltinKind::Time.into())
         );
         assert_eq!(
             column_scalar_kind::<Postgres, _>(&my, tid, 5),
-            Some(ScalarKind::Int)
+            Some(BuiltinKind::Int.into())
         );
     }
 
@@ -599,7 +529,7 @@ mod tests {
 
         let column: GroupKeyColumnOf<Postgres> =
             group_key_column::<Postgres, _>(&db, table, 0).unwrap();
-        assert_eq!(column.kind, ScalarKind::String);
+        assert_eq!(column.kind, BuiltinKind::String.into());
         assert_eq!(column.declared_type, "TEXT");
         let GroupKeyCollation::Named {
             name,

@@ -748,6 +748,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxwell-cdc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae3f4a5b983efc9aa97039d4db23c211c0c55638a3b851dc9ccd9d73902685ee"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "maybe-dangling"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1016,12 +1027,23 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#95032d17f91a5d65602bd927fee7243adffcdf9a"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#98bda10681e5603aefa5382af990370bc1116f34"
 dependencies = [
+ "rls2fga-types",
  "serde",
  "serde_json",
  "sql-traits",
  "sqlparser",
+ "thiserror",
+]
+
+[[package]]
+name = "rls2fga-types"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#98bda10681e5603aefa5382af990370bc1116f34"
+dependencies = [
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -1161,7 +1183,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#eb1a6a998d030c2e66660db8fb6b5a23d9990ff5"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e6b2a8da40f2af2ad44e8c119320dfb3604137dc"
 dependencies = [
  "geometric-traits",
  "sha2",
@@ -1181,16 +1203,17 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ead425795e9bfe99bf22505c2d22d3f1595aa5a930a71847092b2f51d45e8210"
+checksum = "e000bff095eeb6527bca67810065049d73ced690901d9fdcfd9f8356fabe2b9a"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
+ "maxwell-cdc",
  "pg_walstream",
- "serde",
  "serde_json",
  "thiserror",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -1267,10 +1290,12 @@ dependencies = [
  "futures-util",
  "hashbrown 0.16.1",
  "lz4",
+ "maxwell-cdc",
  "pg2sqlite",
  "pg_walstream",
  "postcard",
  "rls2fga",
+ "rls2fga-types",
  "roaring",
  "seahash",
  "serde",
@@ -1282,6 +1307,7 @@ dependencies = [
  "thiserror",
  "toml",
  "uuid",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -1484,6 +1510,17 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wal2json-events"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e07472d540f81a13c811ca9132d9839326a2be5f61823bc6f9c94a6c67886269"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "wasm-bindgen"

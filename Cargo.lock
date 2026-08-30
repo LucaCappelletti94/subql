@@ -2638,7 +2638,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3289,6 +3289,17 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "maxwell-cdc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae3f4a5b983efc9aa97039d4db23c211c0c55638a3b851dc9ccd9d73902685ee"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "maybe-dangling"
@@ -4094,7 +4105,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -4113,7 +4124,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4259,7 +4270,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4297,7 +4308,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.52.0",
 ]
@@ -4569,13 +4580,23 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#a028e3a97c1cc890e86488128fa93482f738432b"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#98bda10681e5603aefa5382af990370bc1116f34"
 dependencies = [
  "openfga-client",
+ "rls2fga-types",
  "serde",
  "serde_json",
  "sql-traits",
  "sqlparser",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rls2fga-types"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#98bda10681e5603aefa5382af990370bc1116f34"
+dependencies = [
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -5135,7 +5156,7 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#eb1a6a998d030c2e66660db8fb6b5a23d9990ff5"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e6b2a8da40f2af2ad44e8c119320dfb3604137dc"
 dependencies = [
  "geometric-traits",
  "sha2 0.10.9",
@@ -5155,18 +5176,19 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ead425795e9bfe99bf22505c2d22d3f1595aa5a930a71847092b2f51d45e8210"
+checksum = "e000bff095eeb6527bca67810065049d73ced690901d9fdcfd9f8356fabe2b9a"
 dependencies = [
  "diesel",
  "diesel-async",
  "hashbrown 0.17.1",
  "indexmap 2.14.0",
+ "maxwell-cdc",
  "pg_walstream",
- "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -5292,6 +5314,7 @@ dependencies = [
  "futures-util",
  "hashbrown 0.16.1",
  "lz4",
+ "maxwell-cdc",
  "openfga-client",
  "parking_lot",
  "pg2sqlite",
@@ -5300,6 +5323,7 @@ dependencies = [
  "proptest",
  "r2d2",
  "rls2fga",
+ "rls2fga-types",
  "roaring",
  "seahash",
  "serde",
@@ -5316,6 +5340,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "wal2json-events",
 ]
 
 [[package]]
@@ -6120,6 +6145,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "wal2json-events"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e07472d540f81a13c811ca9132d9839326a2be5f61823bc6f9c94a6c67886269"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

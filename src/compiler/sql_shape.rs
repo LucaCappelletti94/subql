@@ -397,9 +397,9 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
     if let Some(kind) = catalog_helpers::column_builtin_kind(database, table_id, column) {
         match kind {
             // Numeric scalars: SUM/AVG/variance/stddev accept these.
-            crate::backend::ScalarKind::Int
-            | crate::backend::ScalarKind::Float
-            | crate::backend::ScalarKind::Decimal => {}
+            crate::backend::BuiltinKind::Int
+            | crate::backend::BuiltinKind::Float
+            | crate::backend::BuiltinKind::Decimal => {}
             // Everything else is rejected. Give the caller the concrete
             // kind in the error so the message matches the aggregate's
             // requirement.
@@ -1292,13 +1292,16 @@ pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
     *select_projection_mut(&mut stmt)? = items;
     let mut kinds = group_kinds;
     if widened {
-        use crate::backend::ScalarKind::{Float, Int};
-        kinds.extend([Float, Float, Int]);
+        kinds.extend([
+            crate::backend::BuiltinKind::Float,
+            crate::backend::BuiltinKind::Float,
+            crate::backend::BuiltinKind::Int,
+        ]);
     } else {
         kinds.extend(aggregate_bootstrap_kinds(spec));
     }
     if !groups.is_empty() {
-        kinds.push(crate::backend::ScalarKind::Int);
+        kinds.push(crate::backend::BuiltinKind::Int);
     }
     Some(crate::AggregateBootstrap {
         sql: stmt.to_string(),
@@ -1309,25 +1312,30 @@ pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
 
 /// Per-column decode kinds for an aggregate's seed components, in component
 /// order. `COUNT` components are exact integers
-/// ([`crate::backend::ScalarKind::Int`]); `SUM` and `SUM(x*x)` components are
-/// decoded as double ([`crate::backend::ScalarKind::Float`]) regardless of the
+/// ([`crate::backend::BuiltinKind::Int`]); `SUM` and `SUM(x*x)` components are
+/// decoded as double ([`crate::backend::BuiltinKind::Float`]) regardless of the
 /// source column type, matching the `f64` accumulator, since `SUM` promotes to
 /// `bigint`/`numeric`/`DECIMAL` depending on the backend.
 pub(crate) fn aggregate_bootstrap_kinds(spec: &AggSpec) -> Vec<crate::backend::BuiltinKind> {
-    use crate::backend::ScalarKind::{Float, Int};
     match spec {
-        AggSpec::CountStar | AggSpec::CountColumn { .. } => alloc::vec![Int],
-        AggSpec::Sum { .. } => alloc::vec![Float],
-        AggSpec::Avg { .. } => alloc::vec![Float, Int],
+        AggSpec::CountStar | AggSpec::CountColumn { .. } => {
+            alloc::vec![crate::backend::BuiltinKind::Int]
+        }
+        AggSpec::Sum { .. } => alloc::vec![crate::backend::BuiltinKind::Float],
+        AggSpec::Avg { .. } => alloc::vec![
+            crate::backend::BuiltinKind::Float,
+            crate::backend::BuiltinKind::Int,
+        ],
         AggSpec::VarPop { .. }
         | AggSpec::VarSamp { .. }
         | AggSpec::StddevPop { .. }
-        | AggSpec::StddevSamp { .. } => alloc::vec![Float, Float, Int],
+        | AggSpec::StddevSamp { .. } => alloc::vec![
+            crate::backend::BuiltinKind::Float,
+            crate::backend::BuiltinKind::Float,
+            crate::backend::BuiltinKind::Int,
+        ],
     }
 }
-
-/// The single argument of the statement's aggregate projection, as an AST node.
-///
 /// Returns [`FunctionArgExpr::Wildcard`] for `COUNT(*)`, and `None` when no
 /// projected item is a function call of exactly one unnamed argument.
 ///
