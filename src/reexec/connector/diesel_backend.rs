@@ -19,8 +19,10 @@ use diesel::QueryResult;
 struct UnsupportedReadBinds;
 
 /// Bridge trait: names the subql [`crate::backend::Backend`] a diesel-backed connector
-/// produces [`Value`]s for, and constructs those [`Value`]s from the
-/// scalar wire shapes diesel's `sql_query` hands back.
+/// produces [`Value`]s for.
+///
+/// Constructs those [`Value`]s from the scalar wire shapes diesel's `sql_query`
+/// hands back.
 ///
 /// Implemented for the three shipped backends ([`crate::backend::Postgres`],
 /// [`crate::backend::MySql`], [`crate::backend::SQLite`]), each of which
