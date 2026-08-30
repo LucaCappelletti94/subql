@@ -10,6 +10,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
+use sqlparser_canonicalize::Canonicalizer;
 
 /// If `expr` is a bare column reference, return the [`crate::backend::ScalarKind`] of that
 /// column via the catalog. Otherwise `None`. Used to derive the target
@@ -90,6 +91,7 @@ pub(super) fn compile_expression<B, DB>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
+    canonicalizer: &Canonicalizer<'_>,
 ) -> Result<(BytecodeProgram<B>, Vec<CompiledTerm>), RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -105,7 +107,7 @@ where
         BuiltinKind::String.into(),
     )?;
     wrap_bare_value_as_tri::<B>(&mut compiling)?;
-    let terms = canonicalize_term_slots(&mut compiling)?;
+    let terms = canonicalize_term_slots(&mut compiling, canonicalizer)?;
     let columns = term_columns(&terms);
     Ok((BytecodeProgram::with_terms(compiling.out, columns), terms))
 }
@@ -125,6 +127,7 @@ where
 /// order below never ties on filters SubQL serves.
 fn canonicalize_term_slots<B: Backend>(
     compiling: &mut Compiling<B>,
+    canonicalizer: &Canonicalizer<'_>,
 ) -> Result<Vec<CompiledTerm>, RegisterError> {
     let terms = core::mem::take(&mut compiling.terms);
     if terms.len() < 2 {
@@ -133,7 +136,10 @@ fn canonicalize_term_slots<B: Backend>(
 
     let mut keyed: Vec<(String, CompiledTerm)> = terms
         .into_iter()
-        .map(|term| Ok((canonicalize::normalize_expr(&term.expr)?, term)))
+        .map(|term| {
+            let text = canonicalize::normalize_where_clause(Some(&term.expr), canonicalizer)?;
+            Ok((text, term))
+        })
         .collect::<Result<_, RegisterError>>()?;
     keyed.sort_by(|left, right| left.0.cmp(&right.0));
 

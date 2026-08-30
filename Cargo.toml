@@ -112,7 +112,7 @@ arc-swap = "1.7"
 # hasher (foldhash) via the `default-hasher` feature — no direct ahash dep
 # required.
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "serde", "inline-more", "allocator-api2"] }
-seahash = "4.1"        # Deterministic hashing for canonicalization
+sqlparser-canonicalize = { git = "https://github.com/LucaCappelletti94/sqlparser-canonicalize", branch = "improve-fuzz-harness", default-features = false }
 
 # Serialization. All no_std + alloc capable. Std features propagated below.
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "alloc"] }
@@ -327,6 +327,7 @@ default = ["std"]
 # dispatch core under `no_std + alloc` — required for the wasm32 target.
 std = [
     "sqlparser/std",
+    "sqlparser-canonicalize/std",
     "sql-traits/std",
     "hashbrown/default",
     "serde/std",

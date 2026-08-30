@@ -28,6 +28,7 @@ use compilation_helpers::{compile_expression, wrap_bare_value_as_tri};
 use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{Expr, ObjectName, Statement, Value as SqlValue};
 use sqlparser::dialect::Dialect;
+use sqlparser_canonicalize::Canonicalizer;
 
 /// Where a filter's instructions accumulate, with the membership terms lifted
 /// out of it as they are met.
@@ -212,7 +213,8 @@ where
     let where_clause = resolve_where_placeholders::<B>(where_clause, binds)?;
     let table_id = resolve_table_id(&table_name, database)?;
     let projection = sql_shape::extract_projection::<B, DB>(&stmt, table_id, database)?;
-    let normalized = canonicalize::normalize_where_clause(where_clause.as_ref())?;
+    let canonicalizer = Canonicalizer::new(dialect as &dyn Dialect);
+    let normalized = canonicalize::normalize_where_clause(where_clause.as_ref(), &canonicalizer)?;
     Ok(ParsedQuery {
         table_id,
         where_clause,
@@ -256,7 +258,12 @@ where
     // Compile WHERE clause to bytecode.
     let (program, terms): (BytecodeProgram<B>, Vec<CompiledTerm>) =
         if let Some(expr) = pq.where_clause.as_ref() {
-            compile_expression::<B, DB>(expr, pq.table_id, database)?
+            compile_expression::<B, DB>(
+                expr,
+                pq.table_id,
+                database,
+                &Canonicalizer::new(dialect as &dyn Dialect),
+            )?
         } else {
             // No WHERE clause matches every row. Feed the bare `true` literal
             // through the same wrapper that trailing bare-value predicates use
@@ -320,7 +327,12 @@ where
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
     let table_id = resolve_table_id(&table_name, database)?;
     let where_program: BytecodeProgram<B> = if let Some(expr) = where_clause.as_ref() {
-        let (program, terms) = compile_expression::<B, DB>(expr, table_id, database)?;
+        let (program, terms) = compile_expression::<B, DB>(
+            expr,
+            table_id,
+            database,
+            &Canonicalizer::new(dialect as &dyn Dialect),
+        )?;
         // This path serves the queries the engine itself rejects, which are the
         // scalar aggregates. One in-process accumulator is shared by every
         // consumer of the aggregate, and a term makes their row sets differ, so
