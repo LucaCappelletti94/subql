@@ -238,7 +238,7 @@ pub fn parse_custom_literal<B: SqlLiteralParse>(
 // All other scalars are structurally identical across the three
 // backends.
 
-impl SqlLiteralParse for Postgres {
+impl<V: postgres_jsonb_canonical::PgVersion + 'static> SqlLiteralParse for Postgres<V> {
     fn parse_literal(
         sql: &SqlValue,
         target: ScalarKindOf<Self>,
@@ -287,7 +287,15 @@ impl SqlLiteralParse for Postgres {
             )),
             (BuiltinKind::Jsonb, _) => {
                 let s = quoted_string(sql).ok_or_else(|| err_shape(sql, target))?;
-                parse_json(s, sql).map(Value::Jsonb)
+                let value = parse_json(s, sql)?;
+                // The one path that can introduce a `jsonb` value the server could not
+                // store, so refusal belongs here, where it means the literal is invalid.
+                // Downstream every value came either from here or from a row, so equality
+                // never has to flatten a refusal into a boolean. One throwaway encoding
+                // per registration, not per row.
+                postgres_jsonb_canonical::encode::<V>(&value)
+                    .map_err(|error| err_parse(sql, family, error))?;
+                Ok(Value::Jsonb(value))
             }
             _ => Err(err_shape(sql, target)),
         }
@@ -444,15 +452,16 @@ pub(super) fn resolve_column_ref<DB: DatabaseLike>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::backend::Pg18;
 
     #[test]
     fn postgres_null_is_type_agnostic() {
         assert_eq!(
-            Postgres::parse_literal(&SqlValue::Null, BuiltinKind::Int.into()).unwrap(),
+            Postgres::<Pg18>::parse_literal(&SqlValue::Null, BuiltinKind::Int.into()).unwrap(),
             Value::Null
         );
         assert_eq!(
-            Postgres::parse_literal(&SqlValue::Null, BuiltinKind::String.into()).unwrap(),
+            Postgres::<Pg18>::parse_literal(&SqlValue::Null, BuiltinKind::String.into()).unwrap(),
             Value::Null
         );
     }
@@ -460,7 +469,8 @@ mod tests {
     #[test]
     fn postgres_bool_from_boolean() {
         assert_eq!(
-            Postgres::parse_literal(&SqlValue::Boolean(true), BuiltinKind::Bool.into()).unwrap(),
+            Postgres::<Pg18>::parse_literal(&SqlValue::Boolean(true), BuiltinKind::Bool.into())
+                .unwrap(),
             Value::Bool(true)
         );
     }
@@ -469,7 +479,7 @@ mod tests {
     fn postgres_int_from_number() {
         let sql = SqlValue::Number("42".to_string(), false);
         assert_eq!(
-            Postgres::parse_literal(&sql, BuiltinKind::Int.into()).unwrap(),
+            Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Int.into()).unwrap(),
             Value::Int(42)
         );
     }
@@ -478,7 +488,7 @@ mod tests {
     fn postgres_float_from_number() {
         let sql = SqlValue::Number("3.5".to_string(), false);
         assert_eq!(
-            Postgres::parse_literal(&sql, BuiltinKind::Float.into()).unwrap(),
+            Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Float.into()).unwrap(),
             Value::Float(3.5)
         );
     }
@@ -487,7 +497,7 @@ mod tests {
     fn postgres_string_from_quoted() {
         let sql = SqlValue::SingleQuotedString("hi".to_string());
         assert_eq!(
-            Postgres::parse_literal(&sql, BuiltinKind::String.into()).unwrap(),
+            Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::String.into()).unwrap(),
             Value::String("hi".to_string())
         );
     }
@@ -495,28 +505,28 @@ mod tests {
     #[test]
     fn postgres_uuid_from_quoted() {
         let sql = SqlValue::SingleQuotedString("550e8400-e29b-41d4-a716-446655440000".to_string());
-        let v = Postgres::parse_literal(&sql, BuiltinKind::Uuid.into()).unwrap();
+        let v = Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Uuid.into()).unwrap();
         assert!(matches!(v, Value::Uuid(_)));
     }
 
     #[test]
     fn postgres_timestamp_from_iso8601() {
         let sql = SqlValue::SingleQuotedString("2024-01-02T03:04:05".to_string());
-        let v = Postgres::parse_literal(&sql, BuiltinKind::Timestamp.into()).unwrap();
+        let v = Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Timestamp.into()).unwrap();
         assert!(matches!(v, Value::Timestamp(_)));
     }
 
     #[test]
     fn postgres_date_from_iso8601() {
         let sql = SqlValue::SingleQuotedString("2024-01-02".to_string());
-        let v = Postgres::parse_literal(&sql, BuiltinKind::Date.into()).unwrap();
+        let v = Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Date.into()).unwrap();
         assert!(matches!(v, Value::Date(_)));
     }
 
     #[test]
     fn postgres_bytes_from_hex_literal() {
         let sql = SqlValue::HexStringLiteral("deadbeef".to_string());
-        let v = Postgres::parse_literal(&sql, BuiltinKind::Bytes.into()).unwrap();
+        let v = Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Bytes.into()).unwrap();
         assert_eq!(v, Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
     }
 
@@ -524,7 +534,7 @@ mod tests {
     fn postgres_json_equality_is_refused() {
         let sql = SqlValue::SingleQuotedString("{\"k\":1}".to_string());
         assert!(matches!(
-            Postgres::parse_literal(&sql, BuiltinKind::Json.into()),
+            Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Json.into()),
             Err(RegisterError::TypeError(_))
         ));
     }
@@ -532,21 +542,21 @@ mod tests {
     #[test]
     fn postgres_decimal_from_number() {
         let sql = SqlValue::Number("123.456".to_string(), false);
-        let v = Postgres::parse_literal(&sql, BuiltinKind::Decimal.into()).unwrap();
+        let v = Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Decimal.into()).unwrap();
         assert!(matches!(v, Value::Decimal(_)));
     }
 
     #[test]
     fn postgres_type_mismatch_returns_type_error() {
         let sql = SqlValue::Boolean(true);
-        let err = Postgres::parse_literal(&sql, BuiltinKind::Int.into()).unwrap_err();
+        let err = Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Int.into()).unwrap_err();
         assert!(matches!(err, RegisterError::TypeError(_)));
     }
 
     #[test]
     fn postgres_uuid_invalid_string_errors() {
         let sql = SqlValue::SingleQuotedString("not-a-uuid".to_string());
-        let err = Postgres::parse_literal(&sql, BuiltinKind::Uuid.into()).unwrap_err();
+        let err = Postgres::<Pg18>::parse_literal(&sql, BuiltinKind::Uuid.into()).unwrap_err();
         assert!(matches!(err, RegisterError::TypeError(_)));
     }
 
@@ -555,7 +565,7 @@ mod tests {
         use chrono::{DateTime, Utc};
         let ts = SqlValue::SingleQuotedString("2026-01-01 00:00:00".to_string());
         assert!(matches!(
-            Postgres::parse_literal(&ts, BuiltinKind::Timestamp.into()),
+            Postgres::<Pg18>::parse_literal(&ts, BuiltinKind::Timestamp.into()),
             Ok(Value::Timestamp(_))
         ));
         assert!(matches!(
@@ -565,12 +575,12 @@ mod tests {
         let tstz = SqlValue::SingleQuotedString("2025-12-31 22:00:00-02".to_string());
         let expected_utc: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
         assert_eq!(
-            Postgres::parse_literal(&tstz, BuiltinKind::TimestampTz.into()).unwrap(),
+            Postgres::<Pg18>::parse_literal(&tstz, BuiltinKind::TimestampTz.into()).unwrap(),
             Value::TimestampTz(expected_utc)
         );
         let date = SqlValue::SingleQuotedString("2026-01-01".to_string());
         assert!(matches!(
-            Postgres::parse_literal(&date, BuiltinKind::Date.into()),
+            Postgres::<Pg18>::parse_literal(&date, BuiltinKind::Date.into()),
             Ok(Value::Date(_))
         ));
         let time = SqlValue::SingleQuotedString("12:34:56.789".to_string());
@@ -584,12 +594,12 @@ mod tests {
     fn temporal_literal_rejects_key_boundaries() {
         let no_offset = SqlValue::SingleQuotedString("2026-01-01 00:00:00".to_string());
         assert!(matches!(
-            Postgres::parse_literal(&no_offset, BuiltinKind::TimestampTz.into()),
+            Postgres::<Pg18>::parse_literal(&no_offset, BuiltinKind::TimestampTz.into()),
             Err(RegisterError::TypeError(_))
         ));
         let with_offset = SqlValue::SingleQuotedString("2026-01-01 00:00:00+00".to_string());
         assert!(matches!(
-            Postgres::parse_literal(&with_offset, BuiltinKind::Timestamp.into()),
+            Postgres::<Pg18>::parse_literal(&with_offset, BuiltinKind::Timestamp.into()),
             Err(RegisterError::TypeError(_))
         ));
     }

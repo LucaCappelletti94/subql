@@ -3966,6 +3966,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "postgres-jsonb-canonical"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/postgres-jsonb-canonical?rev=3aa51e4#3aa51e4b6471d660d8bf0d0f908b4d4fe7f37fcd"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "postgres-protocol"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5330,6 +5339,7 @@ dependencies = [
  "pg2sqlite",
  "pg_walstream",
  "postcard",
+ "postgres-jsonb-canonical",
  "proptest",
  "r2d2",
  "rls2fga",

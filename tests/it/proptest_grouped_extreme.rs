@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, HashMap};
+use subql::backend::Pg18;
 
 use proptest::prelude::*;
 use sql_traits::structs::ParserDB;
@@ -32,7 +33,7 @@ fn identity_group_name(identity: &GroupIdentity<Postgres>) -> &str {
 }
 
 fn text_group_key(name: &str) -> Vec<u8> {
-    let encoder = Postgres::group_key_encoder(vec![GroupKeyColumn::<NoCustom> {
+    let encoder = Postgres::<Pg18>::group_key_encoder(vec![GroupKeyColumn::<NoCustom> {
         kind: BuiltinKind::String.into(),
         declared_type: String::from("TEXT"),
         collation: GroupKeyCollation::DatabaseDefault,

@@ -494,66 +494,27 @@ fn mysql_text_key(column: &GroupKeyColumnOf<MySql>) -> Option<TextKey> {
     }
 }
 
-fn append_json(value: &serde_json::Value, output: &mut alloc::vec::Vec<u8>) -> bool {
-    match value {
-        serde_json::Value::Null => {
-            output.push(0);
-            true
-        }
-        serde_json::Value::Bool(value) => append_tagged(output, 1, value),
-        serde_json::Value::Number(value) => {
-            let Some(number) = sql_scalar_text::parse_decimal(&value.to_string()) else {
-                return false;
-            };
-            append_tagged(output, 2, &number.normalized().to_string())
-        }
-        serde_json::Value::String(value) => append_tagged(output, 3, value),
-        serde_json::Value::Array(values) => {
-            let Ok(length) = u32::try_from(values.len()) else {
-                return false;
-            };
-            output.push(4);
-            output.extend_from_slice(&length.to_be_bytes());
-            values.iter().all(|value| append_json(value, output))
-        }
-        serde_json::Value::Object(values) => {
-            let Ok(length) = u32::try_from(values.len()) else {
-                return false;
-            };
-            output.push(5);
-            output.extend_from_slice(&length.to_be_bytes());
-            let mut fields: alloc::vec::Vec<_> = values.iter().collect();
-            fields.sort_unstable_by(|left, right| {
-                left.0
-                    .len()
-                    .cmp(&right.0.len())
-                    .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
-            });
-            fields
-                .into_iter()
-                .all(|(name, value)| append_postcard(output, name) && append_json(value, output))
-        }
-    }
-}
-
-pub(crate) fn jsonb_values_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    let mut left_key = alloc::vec::Vec::new();
-    let mut right_key = alloc::vec::Vec::new();
-    append_json(left, &mut left_key) && append_json(right, &mut right_key) && left_key == right_key
-}
-
+/// PostgreSQL `jsonb` equality, for values already known to be storable.
+///
+/// A value refused by the canonical crate cannot have come from a server, and the one path
+/// that could introduce one, `SqlLiteralParse::parse_literal`, rejects it before it reaches
+/// here. Should one arrive anyway, comparing the payloads directly keeps the relation
+/// reflexive, which answering `false` would not.
 pub(crate) fn jsonb_payloads_equal<B: Backend>(left: &B::Jsonb, right: &B::Jsonb) -> bool {
     let left_json = (left as &dyn core::any::Any).downcast_ref::<serde_json::Value>();
     let right_json = (right as &dyn core::any::Any).downcast_ref::<serde_json::Value>();
     match (left_json, right_json) {
-        (Some(left), Some(right)) => jsonb_values_equal(left, right),
+        (Some(left), Some(right)) => {
+            postgres_jsonb_canonical::equivalent::<B::JsonbVersion>(left, right)
+                .unwrap_or_else(|_| left == right)
+        }
         _ => left == right,
     }
 }
 
-fn encode_postgres_component(
-    column: &GroupKeyColumnOf<Postgres>,
-    value: &Value<Postgres>,
+fn encode_postgres_component<V: postgres_jsonb_canonical::PgVersion + 'static>(
+    column: &GroupKeyColumnOf<Postgres<V>>,
+    value: &Value<Postgres<V>>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
     match (column.kind, value) {
@@ -565,7 +526,9 @@ fn encode_postgres_component(
         }
         (ScalarKind::Builtin(BuiltinKind::Jsonb), Value::Jsonb(value)) => {
             output.push(13);
-            append_json(value, output)
+            // Restores `output` itself on refusal, so a rejected value leaves no partial
+            // component behind in the group key.
+            postgres_jsonb_canonical::encode_into::<V>(value, output).is_ok()
         }
         _ => encode_exact_component(column, value, output),
     }
@@ -1350,17 +1313,30 @@ pub trait Backend: 'static {
     type Json: ScalarCore + JsonDocument;
     /// SQL `JSONB` (binary-shaped). No ordering bound (see `Json`).
     type Jsonb: ScalarCore + JsonDocument;
+    /// PostgreSQL major whose `jsonb` acceptance rules apply.
+    ///
+    /// The majors differ only in which numbers they accept, never in the canonical bytes,
+    /// and `Postgres<V>` forwards its own parameter here. Backends with their own JSON
+    /// semantics name one and never consult it.
+    type JsonbVersion: postgres_jsonb_canonical::PgVersion;
 }
 
 // ---------------------------------------------------------------------------
 // Shipped backends
 // ---------------------------------------------------------------------------
 
-/// Postgres backend marker.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Postgres;
+/// The Postgres server majors a [`Postgres`] backend can target, re-exported so
+/// callers need not depend on `postgres-jsonb-canonical` directly.
+pub use postgres_jsonb_canonical::{Pg14, Pg15, Pg16, Pg17, Pg18, PgVersion};
 
-impl Backend for Postgres {
+/// Postgres backend marker, parameterised by the server major it targets.
+///
+/// The default covers the newest supported server. Name another, as `Postgres<Pg14>`, to
+/// hold `jsonb` to what an older major accepts. Only acceptance changes, never the bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
+
+impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     type Custom = NoCustomScalars<Self>;
 
     fn group_key_encoder(
@@ -1411,6 +1387,7 @@ impl Backend for Postgres {
     type Decimal = bigdecimal::BigDecimal;
     type Json = serde_json::Value;
     type Jsonb = serde_json::Value;
+    type JsonbVersion = V;
 }
 
 /// MySQL backend marker.
@@ -1470,6 +1447,9 @@ impl Backend for MySql {
     // MySQL does not distinguish JSON from JSONB. Keep the type alias for
     // symmetry with Postgres so the engine surface stays uniform.
     type Jsonb = serde_json::Value;
+    // Named because associated type defaults are unstable; MySQL and SQLite JSON
+    // semantics never route through the PostgreSQL crate.
+    type JsonbVersion = postgres_jsonb_canonical::Pg18;
 }
 
 /// SQLite backend marker.
@@ -1577,6 +1557,9 @@ impl Backend for SQLite {
         }
     }
     type Jsonb = SqliteJson;
+    // Named because associated type defaults are unstable; MySQL and SQLite JSON
+    // semantics never route through the PostgreSQL crate.
+    type JsonbVersion = postgres_jsonb_canonical::Pg18;
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,8 +1596,6 @@ pub trait CdcEvent {
     type Backend: Backend;
     /// The checkpoint type this event carries (LSN, binlog position, ...).
     type Checkpoint: Checkpoint;
-
-    // ---------- Structural surface ----------
 
     /// Which flavour of event this is.
     fn kind(&self) -> EventKind;
@@ -1657,8 +1638,6 @@ pub trait CdcEvent {
     /// a hint for optimisation, not as an authoritative diff. `db`
     /// resolves wire names to subql column ordinals.
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId>;
-
-    // ---------- Cell accessor ----------
 
     /// Decode one cell to an owned [`Value<Self::Backend>`].
     ///
@@ -1751,7 +1730,9 @@ pub fn encode_value_key<B: Backend>(values: &[Value<B>]) -> Option<alloc::vec::V
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod value_key_tests {
-    use super::{encode_value_key, Postgres, Value};
+    use super::encode_value_key;
+    use super::Postgres;
+    use super::Value;
     use alloc::vec;
 
     /// The transport encoding remains byte-for-byte stable.
@@ -1837,19 +1818,19 @@ mod value_key_tests {
 mod canonical_group_key_tests {
     use super::{
         Backend, BuiltinKind, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, MySql,
-        Postgres, SQLite, SqliteJson, Value,
+        NoCustom, Pg18, Postgres, SQLite, SqliteJson, Value,
     };
     use alloc::{string::String, vec};
     use sql_traits::traits::MySqlCollationPadding;
 
-    fn column(kind: super::BuiltinKind) -> GroupKeyColumn<super::NoCustom> {
+    fn column(kind: BuiltinKind) -> GroupKeyColumn<NoCustom> {
         column_with_collation(kind, GroupKeyCollation::DatabaseDefault)
     }
 
     fn column_with_collation(
-        kind: super::BuiltinKind,
+        kind: BuiltinKind,
         collation: GroupKeyCollation,
-    ) -> GroupKeyColumn<super::NoCustom> {
+    ) -> GroupKeyColumn<NoCustom> {
         GroupKeyColumn {
             kind: kind.into(),
             declared_type: String::from("test"),
@@ -1876,7 +1857,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn canonical_key_has_one_versioned_tuple_format() {
-        let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Int)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Int)])
             .expect("integer groups have a canonical encoder");
         let key = encoder
             .encode(&[Value::Int(42)])
@@ -1890,7 +1871,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn canonical_key_rejects_values_outside_the_selected_domain() {
-        let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Int)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Int)])
             .expect("integer groups have a canonical encoder");
 
         assert!(encoder.encode(&[]).is_none());
@@ -1907,7 +1888,7 @@ mod canonical_group_key_tests {
 
     #[test]
     fn postgres_float_keys_follow_grouping_equality() {
-        let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Float)])
+        let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Float)])
             .expect("Postgres float grouping is canonical");
 
         let zero = encoder.encode(&[Value::Float(0.0)]).unwrap();
@@ -1925,24 +1906,30 @@ mod canonical_group_key_tests {
     #[test]
     fn postgres_text_requires_deterministic_comparison() {
         assert!(
-            Postgres::group_key_encoder(vec![column(BuiltinKind::String)]).is_some(),
+            Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::String)]).is_some(),
             "the database default is deterministic"
         );
-        assert!(Postgres::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
-            named_collation("unicode", Some(true), None),
-        )])
-        .is_some());
-        assert!(Postgres::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
-            named_collation("ci", Some(false), None),
-        )])
-        .is_none());
-        assert!(Postgres::group_key_encoder(vec![column_with_collation(
-            BuiltinKind::String,
-            GroupKeyCollation::Unknown,
-        )])
-        .is_none());
+        assert!(
+            Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
+                BuiltinKind::String,
+                named_collation("unicode", Some(true), None),
+            )])
+            .is_some()
+        );
+        assert!(
+            Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
+                BuiltinKind::String,
+                named_collation("ci", Some(false), None),
+            )])
+            .is_none()
+        );
+        assert!(
+            Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
+                BuiltinKind::String,
+                GroupKeyCollation::Unknown,
+            )])
+            .is_none()
+        );
     }
 
     #[test]
@@ -2012,7 +1999,8 @@ mod canonical_group_key_tests {
 
     #[test]
     fn postgres_jsonb_keys_follow_structural_equality() {
-        let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Jsonb)]).unwrap();
+        let encoder =
+            Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Jsonb)]).unwrap();
         let left: serde_json::Value =
             serde_json::from_str(r#"{"a": 1.0, "b": [true, null]}"#).unwrap();
         let right: serde_json::Value =
@@ -2059,7 +2047,7 @@ mod canonical_group_key_tests {
         fn postgres_float_collapses_every_nan_payload(bits in proptest::prelude::any::<u64>()) {
             let value = f64::from_bits(bits);
             if value.is_nan() {
-                let encoder = Postgres::group_key_encoder(vec![column(BuiltinKind::Float)]).unwrap();
+                let encoder = Postgres::<Pg18>::group_key_encoder(vec![column(BuiltinKind::Float)]).unwrap();
                 proptest::prop_assert_eq!(
                     encoder.encode(&[Value::Float(value)]),
                     encoder.encode(&[Value::Float(f64::NAN)])
