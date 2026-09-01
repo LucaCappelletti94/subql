@@ -70,7 +70,7 @@ use crate::TableId;
 /// // `relations` borrows the translation, which borrows `db`, so take an owned
 /// // copy and end the borrow before `Shapes::new` takes the catalog.
 /// let relations = translation.relations().to_vec();
-/// let naming = Vec::from(translation.row_naming());
+/// let naming = std::borrow::Cow::from(translation.row_naming()).into_owned();
 /// let answers = translation.action_relations();
 /// drop(translation);
 /// let shapes = Arc::new(

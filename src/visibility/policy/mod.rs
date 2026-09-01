@@ -385,7 +385,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
         let (naming, answers, notes) = {
             let translation = translator.translate(&db).unwrap();
             (
-                Vec::from(translation.row_naming()),
+                Cow::from(translation.row_naming()).into_owned(),
                 translation.action_relations(),
                 translation.notes().to_vec(),
             )
