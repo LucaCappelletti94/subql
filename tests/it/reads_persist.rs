@@ -252,7 +252,7 @@ fn restored_fixed_tiers_report_exact_executable_queries() {
             other => panic!("expected fixed read tier, got {other:?}"),
         };
         assert_eq!(query.sql(), sql);
-        assert_eq!(query.binds(), &[bind.clone()]);
+        assert_eq!(query.binds(), std::slice::from_ref(&bind));
     }
 }
 

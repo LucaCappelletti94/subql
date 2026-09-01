@@ -145,7 +145,7 @@ fn fixed_tiers_report_exact_executable_queries() {
         query.sql(),
         "SELECT MIN(price) AS v FROM orders WHERE status = $1"
     );
-    assert_eq!(query.binds(), &[bind.clone()]);
+    assert_eq!(query.binds(), std::slice::from_ref(&bind));
 
     let keyed_sql = "SELECT * FROM orders WHERE lower(status) = $1";
     let keyed = engine
@@ -155,7 +155,7 @@ fn fixed_tiers_report_exact_executable_queries() {
         panic!("expected keyed tier")
     };
     assert_eq!(query.sql(), keyed_sql);
-    assert_eq!(query.binds(), &[bind.clone()]);
+    assert_eq!(query.binds(), std::slice::from_ref(&bind));
 
     let whole_sql = "SELECT * FROM orders WHERE lower(status) = $1 \
                      AND id IN (SELECT id FROM managers)";
