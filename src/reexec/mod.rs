@@ -4,6 +4,7 @@
 //! query its in-process evaluator can handle returns [`Tier::InProcess`](crate::Tier::InProcess). A
 //! query needing SQL execution returns [`Tier::Scalar`](crate::Tier::Scalar), [`Tier::KeyedRows`](crate::Tier::KeyedRows) or
 //! [`Tier::WholeRows`](crate::Tier::WholeRows) and emits [`ReExecutionTrigger`] when a read is due.
+//! Each database-read payload owns a [`BoundQuery`] whose SQL and typed binds execute together.
 //! Downstream Rust code writes database results back through
 //! [`Install::install`](crate::Install::install).
 //!
@@ -69,7 +70,7 @@ pub use connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
 pub use connector::PgDieselConnector;
 pub use connector::{
-    Connector, CursorError, CursorId, ReExecError, ReadQuery, RowPage, ScalarRowError,
+    BoundQuery, Connector, CursorError, CursorId, ReExecError, ReadQuery, RowPage, ScalarRowError,
     SessionSetup, Snapshot,
 };
 #[cfg(feature = "executor-diesel")]

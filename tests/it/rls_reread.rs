@@ -72,6 +72,7 @@ enum RecordedOperation {
 #[derive(Default)]
 struct AggregateRecordingState {
     calls: Vec<(RecordedOperation, String)>,
+    bound_calls: Vec<(RecordedOperation, String, Vec<Value<Postgres>>)>,
     scalar_runs: HashMap<String, usize>,
     count_runs: HashMap<String, usize>,
     next_cursor: u64,
@@ -83,11 +84,20 @@ impl AggregateRecordingState {
         self.calls.clone()
     }
 
-    fn clear_calls(&mut self) {
-        self.calls.clear();
+    fn bound_calls(&self) -> Vec<(RecordedOperation, String, Vec<Value<Postgres>>)> {
+        self.bound_calls.clone()
     }
 
-    fn scalar_answer(&mut self, auth: &str) -> Value<Postgres> {
+    fn clear_calls(&mut self) {
+        self.calls.clear();
+        self.bound_calls.clear();
+    }
+
+    fn scalar_answer(
+        &mut self,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
+        auth: &str,
+    ) -> Value<Postgres> {
         let run = self.scalar_runs.entry(auth.to_string()).or_default();
         let value = match (auth, *run) {
             ("alice", 0) => 5,
@@ -99,12 +109,26 @@ impl AggregateRecordingState {
         *run += 1;
         self.calls
             .push((RecordedOperation::Scalar, auth.to_string()));
+        self.bound_calls.push((
+            RecordedOperation::Scalar,
+            auth.to_string(),
+            query.binds().to_vec(),
+        ));
         Value::Int(value)
     }
 
-    fn page_answer(&mut self, sql: &str, auth: &str) -> RowPage<Postgres> {
+    fn page_answer(
+        &mut self,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
+        auth: &str,
+    ) -> RowPage<Postgres> {
         self.calls.push((RecordedOperation::Page, auth.to_string()));
-        let rows = if sql.contains("MIN") {
+        self.bound_calls.push((
+            RecordedOperation::Page,
+            auth.to_string(),
+            query.binds().to_vec(),
+        ));
+        let rows = if query.sql().contains("MIN") {
             let value = if auth == "alice" { 3 } else { 4 };
             vec![vec![Value::Int(value), Value::Int(1)]]
         } else {
@@ -117,10 +141,19 @@ impl AggregateRecordingState {
         }
     }
 
-    fn open_cursor(&mut self, sql: &str, auth: &str) -> CursorId {
+    fn open_cursor(
+        &mut self,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
+        auth: &str,
+    ) -> CursorId {
         self.calls
             .push((RecordedOperation::Cursor, auth.to_string()));
-        let row = if sql.contains("GROUP BY") {
+        self.bound_calls.push((
+            RecordedOperation::Cursor,
+            auth.to_string(),
+            query.binds().to_vec(),
+        ));
+        let row = if query.sql().contains("GROUP BY") {
             let value = if auth == "alice" { 5 } else { 8 };
             vec![
                 Value::String("paid".into()),
@@ -176,6 +209,10 @@ impl AggregateRecording {
         self.state.lock().calls()
     }
 
+    fn bound_calls(&self) -> Vec<(RecordedOperation, String, Vec<Value<Postgres>>)> {
+        self.state.lock().bound_calls()
+    }
+
     fn clear_calls(&self) {
         self.state.lock().clear_calls();
     }
@@ -189,11 +226,11 @@ impl Connector for AggregateRecording {
 
     fn execute_scalar(
         &self,
-        _query: &subql::reexec::ReadQuery<'_, Postgres>,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         auth: &Self::AuthContext,
     ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
-        Ok((self.state.lock().scalar_answer(auth), None))
+        Ok((self.state.lock().scalar_answer(query, auth), None))
     }
 
     fn read_page(
@@ -203,7 +240,7 @@ impl Connector for AggregateRecording {
         auth: &Self::AuthContext,
     ) -> Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, Self::Error> {
         Ok(Snapshot {
-            value: self.state.lock().page_answer(query.sql(), auth),
+            value: self.state.lock().page_answer(query, auth),
             checkpoint: None,
         })
     }
@@ -213,7 +250,7 @@ impl Connector for AggregateRecording {
         query: &subql::reexec::ReadQuery<'_, Postgres>,
         auth: &Self::AuthContext,
     ) -> Result<CursorId, CursorError<Self::Error>> {
-        Ok(self.state.lock().open_cursor(query.sql(), auth))
+        Ok(self.state.lock().open_cursor(query, auth))
     }
 
     fn fetch_cursor(
@@ -243,6 +280,10 @@ impl AsyncAggregateRecording {
         self.state.lock().calls()
     }
 
+    fn bound_calls(&self) -> Vec<(RecordedOperation, String, Vec<Value<Postgres>>)> {
+        self.state.lock().bound_calls()
+    }
+
     fn clear_calls(&self) {
         self.state.lock().clear_calls();
     }
@@ -256,13 +297,13 @@ impl AsyncConnector for AsyncAggregateRecording {
 
     fn execute_scalar(
         &self,
-        _query: &subql::reexec::ReadQuery<'_, Postgres>,
+        query: &subql::reexec::ReadQuery<'_, Postgres>,
         _kind: BuiltinKind,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<
         Output = Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error>,
     > + Send {
-        let answer = (self.state.lock().scalar_answer(auth), None);
+        let answer = (self.state.lock().scalar_answer(query, auth), None);
         core::future::ready(Ok(answer))
     }
 
@@ -275,7 +316,7 @@ impl AsyncConnector for AsyncAggregateRecording {
         Output = Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, Self::Error>,
     > + Send {
         let answer = Snapshot {
-            value: self.state.lock().page_answer(query.sql(), auth),
+            value: self.state.lock().page_answer(query, auth),
             checkpoint: None,
         };
         core::future::ready(Ok(answer))
@@ -286,7 +327,7 @@ impl AsyncConnector for AsyncAggregateRecording {
         query: &subql::reexec::ReadQuery<'_, Postgres>,
         auth: &Self::AuthContext,
     ) -> impl core::future::Future<Output = Result<CursorId, CursorError<Self::Error>>> + Send {
-        let cursor = self.state.lock().open_cursor(query.sql(), auth);
+        let cursor = self.state.lock().open_cursor(query, auth);
         core::future::ready(Ok(cursor))
     }
 
@@ -700,11 +741,103 @@ fn sync_aggregate_reads_keep_authorization_per_subscription() {
     assert_sync_count_authorization();
 }
 
+#[test]
+fn per_consumer_sync_read_forwards_auth_and_registration_binds() {
+    let (mut engine, _) = sync_aggregate_engine();
+    let sql = "SELECT MIN(id) FROM notes WHERE id > $1";
+    let alice = engine
+        .register(
+            SubscriptionRequest::new(1u64, sql)
+                .binds(vec![Value::Int(0)])
+                .database_reads_per_consumer(),
+            String::from("alice"),
+        )
+        .expect("alice registers");
+    let bob = engine
+        .register(
+            SubscriptionRequest::new(2u64, sql)
+                .binds(vec![Value::Int(0)])
+                .database_reads_per_consumer(),
+            String::from("bob"),
+        )
+        .expect("bob registers");
+
+    engine
+        .snapshot(alice.subscription_id)
+        .expect("alice snapshot");
+    engine.snapshot(bob.subscription_id).expect("bob snapshot");
+    let mut calls = engine.connector().bound_calls();
+    calls.sort_by(|left, right| left.1.cmp(&right.1));
+    assert_eq!(
+        calls,
+        vec![
+            (
+                RecordedOperation::Scalar,
+                String::from("alice"),
+                vec![Value::Int(0)]
+            ),
+            (
+                RecordedOperation::Scalar,
+                String::from("bob"),
+                vec![Value::Int(0)]
+            )
+        ]
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn async_aggregate_reads_keep_authorization_per_subscription() {
     assert_async_scalar_authorization().await;
     assert_async_grouped_authorization().await;
     assert_async_count_authorization().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn per_consumer_async_read_forwards_auth_and_registration_binds() {
+    let (mut engine, _) = async_aggregate_engine();
+    let sql = "SELECT MIN(id) FROM notes WHERE id > $1";
+    let alice = engine
+        .register(
+            SubscriptionRequest::new(1u64, sql)
+                .binds(vec![Value::Int(0)])
+                .database_reads_per_consumer(),
+            String::from("alice"),
+        )
+        .expect("alice registers");
+    let bob = engine
+        .register(
+            SubscriptionRequest::new(2u64, sql)
+                .binds(vec![Value::Int(0)])
+                .database_reads_per_consumer(),
+            String::from("bob"),
+        )
+        .expect("bob registers");
+
+    engine
+        .snapshot(alice.subscription_id)
+        .await
+        .expect("alice snapshot");
+    engine
+        .snapshot(bob.subscription_id)
+        .await
+        .expect("bob snapshot");
+    let mut calls = engine.connector().bound_calls();
+    calls.sort_by(|left, right| left.1.cmp(&right.1));
+    assert_eq!(
+        calls,
+        vec![
+            (
+                RecordedOperation::Scalar,
+                String::from("alice"),
+                vec![Value::Int(0)]
+            ),
+            (
+                RecordedOperation::Scalar,
+                String::from("bob"),
+                vec![Value::Int(0)]
+            )
+        ]
+    );
 }
 
 #[test]

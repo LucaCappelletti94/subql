@@ -38,23 +38,21 @@ pub enum QueryPlan<B: Backend> {
     GroupedPartial(alloc::boxed::Box<GroupedMinMaxPlan<B>>),
     /// A query nothing in process can maintain, re-read in full whenever a
     /// table it reads changes.
-    Total(TotalPlan),
+    Total(TotalPlan<B>),
     /// A filter over one table, maintained by asking the database only about
     /// the rows that changed.
     Keyed(alloc::boxed::Box<KeyedPlan>),
 }
 
 /// Plan for a query served by re-reading it whole.
-pub struct TotalPlan {
+pub struct TotalPlan<B: Backend> {
     /// Tables whose changes mean the answer may have moved.
     pub tables: Vec<TableId>,
     /// Every column of every one of those tables: a computed projection can
     /// depend on any of them, so narrowing this would mean guessing.
     pub dependency_columns: Vec<ColumnId>,
-    /// The statement as written, which is what gets re-read. Unlike the scalar
-    /// plan nothing is rewritten, because the caller asked for these rows and
-    /// this tier promises exactly them.
-    pub reexec_sql: String,
+    /// The executable query re-read without rewriting.
+    pub read_query: crate::reexec::BoundQuery<B>,
 }
 
 /// Plan for an incrementally-maintained single-table scalar `MIN`/`MAX`.
@@ -82,7 +80,7 @@ pub struct MinMaxPlan<B: Backend> {
     /// projection aliased. Returned to the materializer at registration
     /// via [`Tier::Scalar`](crate::Tier::Scalar). Subql
     /// itself never executes it.
-    pub reexec_sql: String,
+    pub read_query: crate::reexec::BoundQuery<B>,
 }
 
 /// Plan for grouped `MIN` or `MAX`.
@@ -98,9 +96,11 @@ pub struct GroupedMinMaxPlan<B: Backend> {
     pub where_program: Arc<BytecodeProgram<B>>,
     pub statement: Statement,
     pub read_projection: Vec<SelectItem>,
-    pub bootstrap: crate::AggregateBootstrap,
+    pub bootstrap: crate::AggregateBootstrap<B>,
     pub having: Option<GroupedHavingCheck<B>>,
     pub bind_placeholder: crate::compiler::BindPlaceholder,
+    pub positional_scope_bind_index: usize,
+    pub source_query: crate::reexec::BoundQuery<B>,
     pub group_key_encoder: crate::backend::GroupKeyEncoder<B>,
 }
 
@@ -123,7 +123,7 @@ pub enum GroupedHavingCheck<B: Backend> {
 /// engine's original rejection message instead of this one). This is where the
 /// future `Total` plan will be built for JOIN/HAVING/multi-table queries.
 pub fn build_plan<B, DB>(
-    sql: &str,
+    query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
 ) -> Result<QueryPlan<B>, RegisterError>
@@ -136,19 +136,19 @@ where
     // re-read for everything else. An intermediate tier's error only means the
     // query belongs to the next tier, so it surfaces only when every tier
     // refused, where each tier's own reason is the whole diagnosis.
-    let grouped = match grouped_scalar_plan::<B, DB>(sql, dialect, database) {
+    let grouped = match grouped_scalar_plan::<B, DB>(query, dialect, database) {
         Ok(plan) => return Ok(plan),
         Err(error) => error,
     };
-    let scalar = match scalar_plan::<B, DB>(sql, dialect, database) {
+    let scalar = match scalar_plan::<B, DB>(query, dialect, database) {
         Ok(plan) => return Ok(plan),
         Err(error) => error,
     };
-    let keyed = match keyed_plan::<B, DB>(sql, dialect, database) {
+    let keyed = match keyed_plan::<B, DB>(query.sql(), dialect, database) {
         Ok(plan) => return Ok(plan),
         Err(error) => error,
     };
-    total_plan::<B, DB>(sql, dialect, database).map_err(|total| {
+    total_plan::<B, DB>(query, dialect, database).map_err(|total| {
         RegisterError::UnsupportedSql(alloc::format!(
             "no read tier serves this statement: grouped extreme said \
              \"{grouped}\", scalar said \"{scalar}\", keyed said \"{keyed}\", \
@@ -162,15 +162,15 @@ where
 /// Aggregate transitions call this instead of [`build_plan`], whose cheapest
 /// first ordering would select the in-process aggregate tier again.
 pub fn build_whole_rows_plan<B, DB>(
-    sql: &str,
+    query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
-) -> Result<TotalPlan, RegisterError>
+) -> Result<TotalPlan<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    match total_plan::<B, DB>(sql, dialect, database)? {
+    match total_plan::<B, DB>(query, dialect, database)? {
         QueryPlan::Total(plan) => Ok(plan),
         QueryPlan::Partial(_) | QueryPlan::GroupedPartial(_) | QueryPlan::Keyed(_) => {
             unreachable!("total_plan returns Total")
@@ -185,7 +185,7 @@ where
 /// clause nor constrains the statement's shape, because the shapes this serves
 /// are exactly the ones those checks refuse.
 fn total_plan<B, DB>(
-    sql: &str,
+    query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
 ) -> Result<QueryPlan<B>, RegisterError>
@@ -196,7 +196,7 @@ where
     use core::ops::ControlFlow;
 
     let statement =
-        crate::compiler::sql_shape::parse_single_statement(sql, dialect as &dyn Dialect)?;
+        crate::compiler::sql_shape::parse_single_statement(query.sql(), dialect as &dyn Dialect)?;
     if !matches!(statement, Statement::Query(_)) {
         return Err(RegisterError::UnsupportedSql(
             "only a SELECT can be captured for re-execution".to_string(),
@@ -250,12 +250,12 @@ where
     Ok(QueryPlan::Total(TotalPlan {
         tables,
         dependency_columns,
-        reexec_sql: sql.to_string(),
+        read_query: query.clone(),
     }))
 }
 
 fn grouped_scalar_plan<B, DB>(
-    sql: &str,
+    query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
 ) -> Result<QueryPlan<B>, RegisterError>
@@ -263,7 +263,8 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let parsed = parser::parse_table_and_where_deps::<B, DB>(sql, dialect, database)?;
+    let parsed =
+        parser::parse_table_and_where_deps::<B, DB>(query.sql(), dialect, database, query.binds())?;
     let projection =
         extract_grouped_extreme::<B, DB>(&parsed.statement, parsed.table_id, database)?
             .ok_or_else(|| {
@@ -294,26 +295,8 @@ where
     let group_key_encoder = B::group_key_encoder(group_key_columns).ok_or_else(|| {
         RegisterError::UnsupportedSql("a grouped extreme column has no canonical key".to_string())
     })?;
-    let mut group_kinds = Vec::with_capacity(projection.groups.len());
-    let mut group_idents = Vec::with_capacity(projection.groups.len());
-    for column in &projection.groups {
-        let kind = crate::catalog_helpers::column_builtin_kind(database, parsed.table_id, *column)
-            .ok_or_else(|| {
-                RegisterError::UnsupportedSql(
-                    "a grouped extreme column has no supported decode kind".to_string(),
-                )
-            })?;
-        let name = crate::catalog_helpers::column_name(database, parsed.table_id, *column)
-            .ok_or_else(|| RegisterError::UnknownColumn {
-                table_id: parsed.table_id,
-                column: alloc::format!("column {column}"),
-            })?;
-        group_kinds.push(kind);
-        group_idents.push(crate::compiler::quoted_ident(
-            dialect as &dyn Dialect,
-            &name,
-        ));
-    }
+    let (group_kinds, group_idents) =
+        grouped_column_metadata::<B, DB>(&projection.groups, parsed.table_id, dialect, database)?;
     let agg_name =
         crate::catalog_helpers::column_name(database, parsed.table_id, projection.column)
             .ok_or_else(|| RegisterError::UnknownColumn {
@@ -321,17 +304,26 @@ where
                 column: alloc::format!("column {}", projection.column),
             })?;
     let agg_ident = crate::compiler::quoted_ident(dialect as &dyn Dialect, &agg_name);
-    let bootstrap = render_grouped_scalar_bootstrap::<B>(
+    let bootstrap_query = render_grouped_scalar_bootstrap_query::<B>(
         &parsed.statement,
         &group_idents,
-        &group_kinds,
         &agg_ident,
-        agg_kind,
         projection.kind,
+        query.binds(),
         dialect,
     )?;
+    let mut bootstrap_kinds = group_kinds;
+    bootstrap_kinds.extend([agg_kind, crate::backend::BuiltinKind::Int]);
+    let bootstrap = crate::AggregateBootstrap {
+        query: bootstrap_query,
+        kinds: bootstrap_kinds,
+        group_columns: group_idents.len(),
+    };
     let read_projection =
         grouped_scalar_read_projection::<B>(projection.kind, &agg_ident, dialect)?;
+    let positional_scope_bind_index = crate::compiler::sql_shape::select_of(&parsed.statement)
+        .and_then(|select| select.selection.as_ref())
+        .map_or(0, crate::compiler::sql_shape::count_placeholders_in_expr);
     let mut dependency_columns = parsed.where_dependency_columns.clone();
     for column in projection
         .groups
@@ -359,9 +351,46 @@ where
             bootstrap,
             having,
             bind_placeholder: crate::compiler::bind_placeholder(dialect),
+            positional_scope_bind_index,
+            source_query: query.clone(),
             group_key_encoder,
         },
     )))
+}
+
+fn grouped_column_metadata<B, DB>(
+    columns: &[crate::ColumnId],
+    table_id: crate::TableId,
+    dialect: &B::Dialect,
+    database: &DB,
+) -> Result<(Vec<crate::backend::BuiltinKind>, Vec<Ident>), RegisterError>
+where
+    B: Backend,
+    DB: DatabaseLike,
+{
+    let mut kinds = Vec::with_capacity(columns.len());
+    let mut idents = Vec::with_capacity(columns.len());
+    for column in columns {
+        let kind = crate::catalog_helpers::column_builtin_kind(database, table_id, *column)
+            .ok_or_else(|| {
+                RegisterError::UnsupportedSql(
+                    "a grouped extreme column has no supported decode kind".to_string(),
+                )
+            })?;
+        let name =
+            crate::catalog_helpers::column_name(database, table_id, *column).ok_or_else(|| {
+                RegisterError::UnknownColumn {
+                    table_id,
+                    column: alloc::format!("column {column}"),
+                }
+            })?;
+        kinds.push(kind);
+        idents.push(crate::compiler::quoted_ident(
+            dialect as &dyn Dialect,
+            &name,
+        ));
+    }
+    Ok((kinds, idents))
 }
 
 /// Parse an extreme's `HAVING` threshold: to the extreme column's kind for a
@@ -399,15 +428,14 @@ fn planned_having<B: Backend + SqlLiteralParse>(
     }))
 }
 
-fn render_grouped_scalar_bootstrap<B: Backend>(
+fn render_grouped_scalar_bootstrap_query<B: Backend>(
     statement: &Statement,
     group_idents: &[Ident],
-    group_kinds: &[crate::backend::BuiltinKind],
     agg_ident: &Ident,
-    agg_kind: crate::backend::BuiltinKind,
     kind: ScalarAggKind,
+    binds: &[Value<B>],
     dialect: &B::Dialect,
-) -> Result<crate::AggregateBootstrap, RegisterError> {
+) -> Result<crate::reexec::BoundQuery<B>, RegisterError> {
     use core::fmt::Write as _;
     let function = match kind {
         ScalarAggKind::Min => "MIN",
@@ -440,13 +468,10 @@ fn render_grouped_scalar_bootstrap<B: Backend>(
     // The seed fetches every group. A hidden group's numbers are needed the
     // moment it crosses into the result.
     select.having = None;
-    let mut kinds = group_kinds.to_vec();
-    kinds.extend([agg_kind, crate::backend::BuiltinKind::Int]);
-    Ok(crate::AggregateBootstrap {
-        sql: statement.to_string(),
-        kinds,
-        group_columns: group_idents.len(),
-    })
+    Ok(crate::reexec::BoundQuery::new(
+        statement.to_string(),
+        binds.to_vec(),
+    ))
 }
 
 fn grouped_scalar_read_projection<B: Backend>(
@@ -475,7 +500,7 @@ fn grouped_scalar_read_projection<B: Backend>(
 pub fn render_grouped_scalar_read<B: Backend>(
     plan: &GroupedMinMaxPlan<B>,
     group_values: &[Value<B>],
-) -> Result<crate::reexec::ReadQuery<'static, B>, RegisterError> {
+) -> Result<crate::reexec::BoundQuery<B>, RegisterError> {
     use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, Value as SqlValue};
 
     if group_values.len() != plan.group_idents.len() {
@@ -483,19 +508,38 @@ pub fn render_grouped_scalar_read<B: Backend>(
             "a grouped read received the wrong number of group values".to_string(),
         ));
     }
+    let registration_binds = plan.source_query.binds();
+    let non_null_group_values = group_values.iter().filter(|value| !value.is_null()).count();
+    let mut binds = Vec::with_capacity(registration_binds.len() + non_null_group_values);
+    match plan.bind_placeholder {
+        crate::compiler::BindPlaceholder::Numbered => {
+            binds.extend(registration_binds.iter().cloned());
+        }
+        crate::compiler::BindPlaceholder::Positional => {
+            let (leading, trailing) = registration_binds.split_at(plan.positional_scope_bind_index);
+            binds.extend(leading.iter().cloned());
+            binds.extend(
+                group_values
+                    .iter()
+                    .filter(|value| !value.is_null())
+                    .cloned(),
+            );
+            binds.extend(trailing.iter().cloned());
+        }
+    }
     let mut scoped = None;
-    let mut binds = Vec::with_capacity(group_values.len());
     for (ident, value) in plan.group_idents.iter().zip(group_values) {
         let predicate = if value.is_null() {
             Expr::IsNull(alloc::boxed::Box::new(Expr::Identifier(ident.clone())))
         } else {
             let placeholder = match plan.bind_placeholder {
                 crate::compiler::BindPlaceholder::Numbered => {
-                    alloc::format!("${}", binds.len() + 1)
+                    let placeholder = alloc::format!("${}", binds.len() + 1);
+                    binds.push(value.clone());
+                    placeholder
                 }
                 crate::compiler::BindPlaceholder::Positional => "?".to_string(),
             };
-            binds.push(value.clone());
             Expr::BinaryOp {
                 left: alloc::boxed::Box::new(Expr::Identifier(ident.clone())),
                 op: BinaryOperator::Eq,
@@ -530,14 +574,11 @@ pub fn render_grouped_scalar_read<B: Backend>(
         },
         None => scoped,
     });
-    Ok(crate::reexec::ReadQuery::owned(
-        statement.to_string(),
-        binds,
-    ))
+    Ok(crate::reexec::BoundQuery::new(statement.to_string(), binds))
 }
 
 fn scalar_plan<B, DB>(
-    sql: &str,
+    query: &crate::reexec::BoundQuery<B>,
     dialect: &B::Dialect,
     database: &DB,
 ) -> Result<QueryPlan<B>, RegisterError>
@@ -545,7 +586,8 @@ where
     B: Backend + SqlLiteralParse,
     DB: DatabaseLike,
 {
-    let parsed = parser::parse_table_and_where_deps::<B, DB>(sql, dialect, database)?;
+    let parsed =
+        parser::parse_table_and_where_deps::<B, DB>(query.sql(), dialect, database, query.binds())?;
     // The shared parse admits `HAVING` because the grouped plan serves it.
     // A scalar read takes one value and cannot honour the clause, so a
     // statement carrying one falls through to the whole re-read, which
@@ -580,7 +622,7 @@ where
         dependency_columns.push(agg_column);
     }
 
-    let reexec_sql = render_aliased_scalar(&parsed.statement).ok_or_else(|| {
+    let read_sql = render_aliased_scalar(&parsed.statement).ok_or_else(|| {
         RegisterError::UnsupportedSql("unable to render re-execution query".to_string())
     })?;
 
@@ -591,7 +633,7 @@ where
         dependency_columns,
         agg_kind,
         where_program: Arc::new(parsed.where_program),
-        reexec_sql,
+        read_query: crate::reexec::BoundQuery::new(read_sql, query.binds().to_vec()),
     }))
 }
 

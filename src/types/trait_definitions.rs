@@ -27,7 +27,7 @@ pub trait SubscriptionRegistration<I: IdTypes, B: Backend>: Send {
     fn register(
         &mut self,
         spec: SubscriptionRequest<I, B>,
-    ) -> Result<Registered, crate::RegisterError>;
+    ) -> Result<Registered<B>, crate::RegisterError>;
 
     /// Unregister a subscription by ID.
     ///
@@ -431,14 +431,14 @@ pub enum MaintenanceStopReason {
 }
 
 /// One subscription changed maintenance tier without changing identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MaintenanceTransition {
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaintenanceTransition<B: Backend = crate::backend::Postgres> {
     /// Subscription that changed tier.
     pub subscription_id: SubscriptionId,
     /// Previous tier.
     pub from: TierKind,
-    /// Replacement tier, including the SQL downstream Rust code executes.
-    pub to: Tier,
+    /// Replacement tier, including the bound query downstream Rust code executes.
+    pub to: Tier<B>,
     /// Why the previous tier could not continue.
     pub reason: MaintenanceStopReason,
 }
@@ -455,7 +455,7 @@ pub struct AggregateMaintenanceOutput<
     /// Database reads required after a tier transition.
     pub triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
     /// Tier changes caused by this operation.
-    pub transitions: Vec<MaintenanceTransition>,
+    pub transitions: Vec<MaintenanceTransition<B>>,
 }
 
 impl<I: IdTypes, B: Backend, C: Checkpoint> AggregateMaintenanceOutput<I, B, C> {
@@ -509,7 +509,7 @@ pub struct DispatchOutput<
     aggregate_updates: Vec<AggregateValueUpdate<I, B>>,
     scalar_updates: Vec<crate::reexec::ScalarUpdate<I, B, C>>,
     triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
-    transitions: Vec<MaintenanceTransition>,
+    transitions: Vec<MaintenanceTransition<B>>,
 }
 
 impl<I: IdTypes, C: Checkpoint, B: Backend> DispatchOutput<I, C, B> {
@@ -518,7 +518,7 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> DispatchOutput<I, C, B> {
         aggregate_updates: Vec<AggregateValueUpdate<I, B>>,
         scalar_updates: Vec<crate::reexec::ScalarUpdate<I, B, C>>,
         triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
-        transitions: Vec<MaintenanceTransition>,
+        transitions: Vec<MaintenanceTransition<B>>,
     ) -> Self {
         Self {
             notifications,
@@ -558,7 +558,7 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> DispatchOutput<I, C, B> {
 
     /// Subscriptions that changed maintenance tier during this event.
     #[must_use]
-    pub fn transitions(&self) -> &[MaintenanceTransition] {
+    pub fn transitions(&self) -> &[MaintenanceTransition<B>] {
         &self.transitions
     }
 

@@ -7,6 +7,7 @@ use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
 use crate::backend::{BuiltinKind, Value};
+use alloc::string::String;
 use core::cell::RefCell;
 use diesel::sql_types::Text;
 use diesel::{sql_query, Connection, RunQueryDsl};

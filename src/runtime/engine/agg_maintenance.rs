@@ -5,8 +5,8 @@
 //! [`SubscriptionEngine`] and was moved verbatim.
 use super::{
     catalog_helpers, AggregateRegistration, CdcEvent, DatabaseLike, DispatchError, EventKind,
-    IdTypes, SqlLiteralParse, SubscriptionEngine, SubscriptionId, SubscriptionRequest,
-    SubscriptionScope, TableId, ToString, Value, Vec,
+    IdTypes, RereadRegistration, SqlLiteralParse, SubscriptionEngine, SubscriptionId,
+    SubscriptionRequest, SubscriptionScope, TableId, ToString, Value, Vec,
 };
 use crate::backend::Backend;
 
@@ -23,7 +23,7 @@ where
         checkpoint: Option<&E::Checkpoint>,
     ) -> Result<
         (
-            crate::MaintenanceTransition,
+            crate::MaintenanceTransition<E::Backend>,
             crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         ),
         DispatchError,
@@ -37,7 +37,7 @@ where
                 message: "aggregate registration metadata is missing".to_string(),
             })?;
         let plan = crate::reexec::plan::build_whole_rows_plan::<E::Backend, DB>(
-            &registration.sql,
+            &registration.source_query,
             &self.dialect,
             &self.database,
         )
@@ -50,14 +50,13 @@ where
             SubscriptionScope::Session(session) => Some(session),
         };
         let _ = self.unregister_subscription_internal(subscription_id);
-        let registered = self.capture_whole(
-            subscription_id,
-            plan,
-            registration.consumer,
+        let reread = RereadRegistration {
+            consumer: registration.consumer,
             session,
-            &registration.sql,
-            registration.database_reads_per_consumer,
-        );
+            source_query: &registration.source_query,
+            database_reads_per_consumer: registration.database_reads_per_consumer,
+        };
+        let registered = self.capture_whole(subscription_id, plan, &reread);
         let transition = crate::MaintenanceTransition {
             subscription_id,
             from: crate::TierKind::InProcess,
@@ -387,7 +386,10 @@ where
                 AggregateRegistration {
                     consumer,
                     scope: request.scope,
-                    sql: request.sql.clone(),
+                    source_query: crate::reexec::BoundQuery::new(
+                        request.sql.clone(),
+                        request.binds.clone(),
+                    ),
                     database_reads_per_consumer,
                 },
             );

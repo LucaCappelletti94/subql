@@ -94,13 +94,13 @@ type BorrowedKeys<B> = Vec<(SubscriptionId, Vec<Vec<Value<B>>>)>;
 enum ResolveJob<B: Backend> {
     /// A scalar the connector reads in one call.
     Scalar {
-        sql: alloc::string::String,
+        query: super::BoundQuery<B>,
         column_kind: crate::backend::BuiltinKind,
     },
     /// One grouped extreme and its source-row count.
     GroupedScalar {
         group: Vec<u8>,
-        query: super::ReadQuery<'static, B>,
+        query: super::BoundQuery<B>,
     },
     /// Rows for the keys that changed, read scoped to those keys. Boxed: this
     /// variant carries a parsed statement, and the others carry a string.
@@ -108,7 +108,7 @@ enum ResolveJob<B: Backend> {
     /// The whole result, paged. The generation is taken when the job is built,
     /// so a read that fails part way cannot let a later one reuse it.
     Whole {
-        sql: alloc::string::String,
+        query: super::BoundQuery<B>,
         generation: u64,
     },
 }
@@ -118,6 +118,7 @@ struct KeyedJob<B: Backend> {
     plan: super::plan::KeyedPlan,
     key_positions: Vec<usize>,
     keys: Vec<Vec<Value<B>>>,
+    query: super::BoundQuery<B>,
     /// Keys one statement may name, carried so the read needs nothing from the
     /// engine once it is planned.
     max_keys: usize,
@@ -147,7 +148,7 @@ struct ResolveOutputs<'a, I: IdTypes, B: Backend, C: crate::Checkpoint> {
     rows_updates: &'a mut Vec<super::engine::RowsUpdate<I, B, C>>,
     row_deltas: &'a mut Vec<super::engine::RowDelta<I, B, C>>,
     followup: &'a mut Vec<super::ReExecutionTrigger<I, C, B>>,
-    transitions: &'a mut Vec<crate::MaintenanceTransition>,
+    transitions: &'a mut Vec<crate::MaintenanceTransition<B>>,
 }
 
 /// One page of a whole re-read, as it will be delivered.
@@ -263,7 +264,7 @@ where
             let (pages, checkpoint) = Self::read_whole_with(
                 &self.mode.connector,
                 subscription_id,
-                &bootstrap.sql,
+                &context.query,
                 self.max_page_bytes,
                 &context.auth,
             )
@@ -290,7 +291,7 @@ where
                         let page = self
                             .mode
                             .connector
-                            .read_page(query, self.max_page_bytes, &context.auth)
+                            .read_page(&query.as_read_query(), self.max_page_bytes, &context.auth)
                             .await
                             .map_err(|error| ReExecError::Connector {
                                 subscription: subscription_id,
@@ -330,7 +331,7 @@ where
                         let (pages, checkpoint) = Self::read_whole_with(
                             &self.mode.connector,
                             subscription_id,
-                            &context.sql,
+                            &context.query,
                             self.max_page_bytes,
                             &context.auth,
                         )
@@ -357,11 +358,11 @@ where
             }));
         }
         if context.whole_result || context.keyed {
-            let sql = context.sql.clone();
+            let query = context.query.clone();
             let (pages, checkpoint) = Self::read_whole_with(
                 &self.mode.connector,
                 subscription_id,
-                &sql,
+                &query,
                 self.max_page_bytes,
                 &context.auth,
             )
@@ -390,7 +391,7 @@ where
             .mode
             .connector
             .execute_scalar(
-                &super::ReadQuery::without_binds(&context.sql),
+                &context.query.as_read_query(),
                 context.column_kind,
                 &context.auth,
             )
@@ -724,7 +725,7 @@ where
         scalar_updates: &mut Vec<ScalarUpdate<I, E::Backend, E::Checkpoint>>,
         rows_updates: &mut Vec<super::engine::RowsUpdate<I, E::Backend, E::Checkpoint>>,
         row_deltas: &mut Vec<super::engine::RowDelta<I, E::Backend, E::Checkpoint>>,
-        transitions: &mut Vec<crate::MaintenanceTransition>,
+        transitions: &mut Vec<crate::MaintenanceTransition<E::Backend>>,
     ) -> Result<(), ReExecError<X::Error>> {
         while let Some(trigger) = followup.pop() {
             if self.debounce_skip(trigger.subscription_id, &trigger.read) {
@@ -790,7 +791,7 @@ where
         if !ctx.keyed {
             if !ctx.whole_result {
                 return Some(ResolveJob::Scalar {
-                    sql: ctx.sql.clone(),
+                    query: ctx.query.clone(),
                     column_kind: ctx.column_kind,
                 });
             }
@@ -798,12 +799,12 @@ where
                 .contexts
                 .get_mut(&subscription_id)
                 .expect("just read above");
-            let sql = ctx.sql.clone();
+            let query = ctx.query.clone();
             // Bump first: a read that fails part way through must not let a
             // later one reuse the generation its partial pages carried.
             ctx.generation = ctx.generation.saturating_add(1);
             return Some(ResolveJob::Whole {
-                sql,
+                query,
                 generation: ctx.generation,
             });
         }
@@ -815,10 +816,12 @@ where
         let plan = self.inner.keyed_plan(subscription_id)?;
         let plan = plan.clone();
         let key_positions = plan.key_positions.clone();
+        let query = ctx.query.clone();
         Some(ResolveJob::Keyed(alloc::boxed::Box::new(KeyedJob {
             plan,
             key_positions,
             keys,
+            query,
             max_keys: self.max_keys_per_read,
         })))
     }
@@ -837,9 +840,9 @@ where
         auth: &X::AuthContext,
     ) -> Result<Resolved<E::Backend>, ReExecError<X::Error>> {
         match job {
-            ResolveJob::Scalar { sql, column_kind } => {
+            ResolveJob::Scalar { query, column_kind } => {
                 let (value, _db_checkpoint) = connector
-                    .execute_scalar(&super::ReadQuery::without_binds(&sql), column_kind, auth)
+                    .execute_scalar(&query.as_read_query(), column_kind, auth)
                     .await
                     .map_err(|error| ReExecError::Connector {
                         subscription,
@@ -849,7 +852,7 @@ where
             }
             ResolveJob::GroupedScalar { group, query } => {
                 let page = connector
-                    .read_page(&query, max_page_bytes, auth)
+                    .read_page(&query.as_read_query(), max_page_bytes, auth)
                     .await
                     .map_err(|error| ReExecError::Connector {
                         subscription,
@@ -877,6 +880,7 @@ where
                     plan,
                     key_positions,
                     keys,
+                    query,
                     max_keys,
                 } = *job;
                 let mut columns = Vec::new();
@@ -904,7 +908,7 @@ where
                     loop {
                         let page = connector
                             .read_page(
-                                &super::ReadQuery::without_binds(&page_sql),
+                                &super::ReadQuery::borrowed(&page_sql, query.binds()),
                                 max_page_bytes,
                                 auth,
                             )
@@ -964,12 +968,12 @@ where
                     present,
                 })
             }
-            ResolveJob::Whole { sql, generation } => {
+            ResolveJob::Whole { query, generation } => {
                 // The read's own position is discarded here on purpose: a
                 // re-read is delivered against the position of the event that
                 // triggered it, which is what a consumer reconciles by.
                 let (pages, _) =
-                    Self::read_whole_with(connector, subscription, &sql, max_page_bytes, auth)
+                    Self::read_whole_with(connector, subscription, &query, max_page_bytes, auth)
                         .await?;
                 Ok(Resolved::Whole { generation, pages })
             }
@@ -990,12 +994,12 @@ where
     async fn read_whole_with(
         connector: &X,
         subscription: SubscriptionId,
-        sql: &str,
+        query: &super::BoundQuery<E::Backend>,
         max_page_bytes: usize,
         auth: &X::AuthContext,
     ) -> Result<(Vec<ReadPage<E::Backend>>, Option<X::Checkpoint>), ReExecError<X::Error>> {
         let cursor = connector
-            .open_cursor(&super::ReadQuery::without_binds(sql), auth)
+            .open_cursor(&query.as_read_query(), auth)
             .await
             .map_err(|error| ReExecError::Cursor {
                 subscription,
@@ -1289,6 +1293,9 @@ mod tests {
     struct MockAsyncConnector {
         values: Mutex<Vec<Value<Postgres>>>,
         call_count: Mutex<usize>,
+        scalar_queries: Mutex<Vec<super::super::ReadQuery<'static, Postgres>>>,
+        page_queries: Mutex<Vec<super::super::ReadQuery<'static, Postgres>>>,
+        cursor_queries: Mutex<Vec<super::super::ReadQuery<'static, Postgres>>>,
     }
 
     impl MockAsyncConnector {
@@ -1296,6 +1303,9 @@ mod tests {
             Self {
                 values: Mutex::new(values),
                 call_count: Mutex::new(0),
+                scalar_queries: Mutex::new(Vec::new()),
+                page_queries: Mutex::new(Vec::new()),
+                cursor_queries: Mutex::new(Vec::new()),
             }
         }
         fn call_count(&self) -> usize {
@@ -1323,13 +1333,14 @@ mod tests {
 
         fn execute_scalar(
             &self,
-            _query: &super::super::ReadQuery<'_, Postgres>,
+            query: &super::super::ReadQuery<'_, Postgres>,
             _kind: BuiltinKind,
             _auth: &(),
         ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
         {
             async move {
                 *self.call_count.lock() += 1;
+                self.scalar_queries.lock().push(query.clone().into_owned());
                 let value = self.values.lock().pop().ok_or(MockError("queue empty"))?;
                 Ok((value, None))
             }
@@ -1337,7 +1348,7 @@ mod tests {
 
         fn read_page(
             &self,
-            _query: &super::super::ReadQuery<'_, Postgres>,
+            query: &super::super::ReadQuery<'_, Postgres>,
             _max_bytes: usize,
             _auth: &(),
         ) -> impl Future<
@@ -1346,7 +1357,21 @@ mod tests {
                 Self::Error,
             >,
         > + Send {
-            async move { Err(MockError("read_page is not exercised by the scalar tests")) }
+            async move {
+                self.page_queries.lock().push(query.clone().into_owned());
+                Err(MockError("read_page is not exercised by the scalar tests"))
+            }
+        }
+
+        fn open_cursor(
+            &self,
+            query: &super::super::ReadQuery<'_, Postgres>,
+            _auth: &(),
+        ) -> impl Future<
+            Output = Result<super::super::CursorId, super::super::CursorError<Self::Error>>,
+        > + Send {
+            self.cursor_queries.lock().push(query.clone().into_owned());
+            core::future::ready(Err(super::super::CursorError::Unsupported))
         }
     }
 
@@ -1445,6 +1470,208 @@ mod tests {
         assert_eq!(n.scalar_updates[0].value, Value::Float(9.0));
         assert!(n.triggers.is_empty(), "async engine drains triggers");
         assert_eq!(e.connector().call_count(), 2);
+    }
+
+    #[test]
+    fn async_scalar_initial_snapshot_forwards_registration_binds() {
+        let (mut engine, _) = engine_with_values(vec![Value::Float(5.0)]);
+        let subscription = engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders WHERE quantity > $1")
+                    .binds(vec![Value::Int(2)]),
+                (),
+            )
+            .expect("scalar registers")
+            .subscription_id;
+
+        block_on(engine.snapshot(subscription))
+            .expect("snapshot succeeds")
+            .expect("snapshot exists");
+        let queries = engine.connector().scalar_queries.lock();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].binds(), &[Value::Int(2)]);
+        drop(queries);
+    }
+
+    #[test]
+    fn async_scalar_event_forwards_registration_binds() {
+        let (mut engine, table) = engine_with_values(vec![Value::Float(9.0)]);
+        let subscription = engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders WHERE quantity > $1")
+                    .binds(vec![Value::Int(0)]),
+                (),
+            )
+            .expect("scalar registers")
+            .subscription_id;
+        crate::Install::install(
+            &mut engine,
+            subscription,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>,
+            },
+        )
+        .expect("scalar installs");
+
+        block_on(engine.consumers(&delete_event(table, 1, 5.0))).expect("delete resolves");
+        let queries = engine.connector().scalar_queries.lock();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].binds(), &[Value::Int(0)]);
+        drop(queries);
+    }
+
+    #[test]
+    fn async_keyed_initial_snapshot_forwards_registration_binds() {
+        let (mut engine, _) = engine_with_values(vec![]);
+        let registered = engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE lower(status) = $1")
+                    .binds(vec![Value::String("paid".into())]),
+                (),
+            )
+            .expect("keyed read registers");
+        let Tier::KeyedRows { ref query, .. } = registered.tier else {
+            panic!("expected keyed rows")
+        };
+
+        let _ = block_on(engine.snapshot(registered.subscription_id));
+        let queries = engine.connector().cursor_queries.lock();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].sql(), query.sql());
+        assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
+        drop(queries);
+    }
+
+    #[test]
+    fn async_keyed_event_scopes_registration_binds() {
+        let (mut engine, table) = engine_with_values(vec![]);
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE lower(status) = $1")
+                    .binds(vec![Value::String("paid".into())]),
+                (),
+            )
+            .expect("keyed read registers");
+
+        let _ = block_on(engine.consumers(&delete_event(table, 1, 5.0)));
+        let queries = engine.connector().page_queries.lock();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0].sql(),
+            "SELECT * FROM orders WHERE (lower(status) = $1) AND \"id\" IN (1)"
+        );
+        assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
+        drop(queries);
+    }
+
+    #[test]
+    fn async_grouped_bootstrap_forwards_registration_binds() {
+        let (mut engine, _) = engine_with_values(vec![]);
+        let registered = engine
+            .register(
+                SubscriptionRequest::new(
+                    1u64,
+                    "SELECT status, MIN(price) FROM orders WHERE quantity > $1 GROUP BY status",
+                )
+                .binds(vec![Value::Int(0)]),
+                (),
+            )
+            .expect("grouped read registers");
+        let Tier::GroupedScalar { ref bootstrap } = registered.tier else {
+            panic!("expected grouped scalar")
+        };
+
+        let _ = block_on(engine.snapshot(registered.subscription_id));
+        let queries = engine.connector().cursor_queries.lock();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].sql(), bootstrap.query.sql());
+        assert_eq!(queries[0].binds(), &[Value::Int(0)]);
+        drop(queries);
+    }
+
+    #[test]
+    fn async_grouped_scoped_read_orders_registration_binds() {
+        let (mut engine, table) = engine_with_values(vec![]);
+        let subscription = engine
+            .register(
+                SubscriptionRequest::new(
+                    1u64,
+                    "SELECT status, MIN(price) FROM orders WHERE quantity > $1 GROUP BY status",
+                )
+                .binds(vec![Value::Int(0)]),
+                (),
+            )
+            .expect("grouped read registers")
+            .subscription_id;
+        crate::Install::install(
+            &mut engine.inner,
+            subscription,
+            crate::GroupedScalarSeedInstall {
+                rows: vec![vec![
+                    Value::String("paid".into()),
+                    Value::Float(5.0),
+                    Value::Int(2),
+                ]],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .expect("grouped seed installs");
+
+        let _ = block_on(engine.consumers(&delete_event(table, 1, 5.0)));
+        let queries = engine.connector().page_queries.lock();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0].sql(),
+            "SELECT MIN(\"price\") AS v, COUNT(*) AS c1 FROM orders WHERE (quantity > $1) AND \"status\" = $2"
+        );
+        assert_eq!(
+            queries[0].binds(),
+            &[Value::Int(0), Value::String("paid".into())]
+        );
+        drop(queries);
+    }
+
+    #[test]
+    fn async_whole_snapshot_forwards_registration_binds() {
+        let (mut e, _tid) = engine_with_values(vec![]);
+        let qid = e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders ORDER BY id DESC LIMIT $1")
+                    .binds(vec![Value::Int(3)]),
+                (),
+            )
+            .unwrap()
+            .subscription_id;
+
+        let _ = block_on(e.snapshot(qid));
+
+        let queries = e.connector().cursor_queries.lock();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].binds(), &[Value::Int(3)]);
+        drop(queries);
+    }
+
+    #[test]
+    fn async_whole_event_forwards_registration_binds() {
+        let (mut engine, table) = engine_with_values(vec![]);
+        engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders ORDER BY id DESC LIMIT $1")
+                    .binds(vec![Value::Int(3)]),
+                (),
+            )
+            .expect("whole read registers");
+
+        let _ = block_on(engine.consumers(&insert_event(table, 2, 9.0)));
+        let queries = engine.connector().cursor_queries.lock();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0].sql(),
+            "SELECT * FROM orders ORDER BY id DESC LIMIT $1"
+        );
+        assert_eq!(queries[0].binds(), &[Value::Int(3)]);
+        drop(queries);
     }
 
     /// `unrelated-column` UPDATE skip optimization still works under
@@ -1891,12 +2118,12 @@ mod tests {
             .with_debounce_per_query(core::time::Duration::from_secs(1));
         let first = super::super::ReExecutionRead::GroupedScalar {
             group: vec![1],
-            query: super::super::ReadQuery::owned(String::new(), Vec::new()),
+            query: super::super::BoundQuery::new(String::new(), Vec::new()),
             column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
         };
         let second = super::super::ReExecutionRead::GroupedScalar {
             group: vec![2],
-            query: super::super::ReadQuery::owned(String::new(), Vec::new()),
+            query: super::super::BoundQuery::new(String::new(), Vec::new()),
             column_kinds: [BuiltinKind::Int, BuiltinKind::Int],
         };
         engine.stamp_reexec(7, &first);

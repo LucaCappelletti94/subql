@@ -49,7 +49,10 @@ fn a_bare_registry_plans_the_read_it_cannot_serve() {
     assert_eq!(
         keyed.tier,
         Tier::KeyedRows {
-            sql: "SELECT * FROM orders WHERE lower(status) = 'paid'".to_string(),
+            query: subql::reexec::BoundQuery::new(
+                "SELECT * FROM orders WHERE lower(status) = 'paid'".to_string(),
+                Vec::new(),
+            ),
             table_id: table,
         },
         "one table, so the read asks only about the rows that changed"

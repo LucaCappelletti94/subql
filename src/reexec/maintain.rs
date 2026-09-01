@@ -328,7 +328,7 @@ enum ObservedRow<B: Backend> {
 
 pub struct GroupedRead<B: Backend, C: Checkpoint> {
     pub group: Vec<u8>,
-    pub query: crate::reexec::ReadQuery<'static, B>,
+    pub query: crate::reexec::BoundQuery<B>,
     pub column_kinds: [crate::backend::BuiltinKind; 2],
     pub checkpoint: Option<C>,
 }

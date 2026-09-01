@@ -349,8 +349,11 @@ fn a_change_with_no_readable_key_transitions_to_whole_rows() {
         catalog,
         SQLiteDialect {},
     );
+    let bound_sql = "SELECT * FROM orders WHERE lower(status) = ?";
     let registered = registry
-        .register(SubscriptionRequest::new(1u64, SQL))
+        .register(
+            SubscriptionRequest::new(1u64, bound_sql).binds(vec![Value::String("paid".into())]),
+        )
         .expect("keyed read registers");
     assert!(matches!(registered.tier, Tier::KeyedRows { .. }));
 
@@ -365,7 +368,11 @@ fn a_change_with_no_readable_key_transitions_to_whole_rows() {
         transition.reason,
         MaintenanceStopReason::KeyedChangeWithoutKey { table_id: table }
     );
-    assert!(matches!(transition.to, Tier::WholeRows { .. }));
+    let Tier::WholeRows { query, .. } = &transition.to else {
+        panic!("expected whole-row transition")
+    };
+    assert_eq!(query.sql(), bound_sql);
+    assert_eq!(query.binds(), &[Value::String("paid".into())]);
     assert_eq!(
         output.triggers()[0].subscription_id,
         registered.subscription_id

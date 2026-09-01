@@ -204,9 +204,10 @@ proptest! {
 
         match registered {
             Registered {
-                tier: Tier::Scalar { column_kind, sql: reexec_sql },
+                tier: Tier::Scalar { column_kind, query },
                 ..
             } => {
+                let reexec_sql = query.sql();
                 prop_assert_eq!(
                     column_kind,
                     col.scalar_kind(),

@@ -152,41 +152,25 @@ fn execute_scalar_row_decodes_components() {
     // COUNT(*): single Int component.
     let b = bootstrap("SELECT COUNT(*) FROM t");
     let (row, _) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&b.sql),
-            &b.kinds,
-            &(),
-        )
+        .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Int(3)]);
     // SUM: single Float component (cast to double).
     let b = bootstrap("SELECT SUM(amount) FROM t");
     let (row, _) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&b.sql),
-            &b.kinds,
-            &(),
-        )
+        .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Float(12.0)]);
     // AVG: (sum, count).
     let b = bootstrap("SELECT AVG(amount) FROM t");
     let (row, _) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&b.sql),
-            &b.kinds,
-            &(),
-        )
+        .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Float(12.0), Value::Int(3)]);
     // VAR_POP: (sum, sum_sq, count) = (12, 56, 3).
     let b = bootstrap("SELECT VAR_POP(amount) FROM t");
     let (row, _) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&b.sql),
-            &b.kinds,
-            &(),
-        )
+        .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(
         row,
@@ -200,21 +184,13 @@ fn execute_scalar_row_empty_table_is_empty_state() {
     // COUNT over empty is 0.
     let b = bootstrap("SELECT COUNT(*) FROM t");
     let (row, _) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&b.sql),
-            &b.kinds,
-            &(),
-        )
+        .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Int(0)]);
     // SUM over empty is NULL, COUNT(amount) is 0.
     let (mut engine, subscription, b) = registered("SELECT AVG(amount) FROM t");
     let (row, _) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&b.sql),
-            &b.kinds,
-            &(),
-        )
+        .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
         .unwrap();
     assert_eq!(row, vec![Value::Null, Value::Int(0)]);
     // The empty row seeds the empty aggregate.
@@ -232,11 +208,7 @@ fn seed_through_connector_matches_recompute() {
     for (sql, spec) in all_specs() {
         let (mut engine, subscription, b) = registered(sql);
         let (row, _) = connector
-            .execute_scalar_row(
-                &subql::reexec::ReadQuery::without_binds(&b.sql),
-                &b.kinds,
-                &(),
-            )
+            .execute_scalar_row(&b.query.as_read_query(), &b.kinds, &())
             .unwrap();
         assert_eq!(
             install_seed(&mut engine, subscription, row),
@@ -265,7 +237,7 @@ proptest! {
             let (mut engine, subscription, b) = registered(sql);
             let (row, _) = connector
                 .execute_scalar_row(
-                    &subql::reexec::ReadQuery::without_binds(&b.sql),
+                    &b.query.as_read_query(),
                     &b.kinds,
                     &(),
                 )
@@ -312,11 +284,7 @@ fn grouped_sqlite_json_seed_preserves_original_text() {
         .unwrap();
     let connector: DieselConnector<SqliteConnection, SQLite> = DieselConnector::new(connection);
     let (seed_values, _) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&bootstrap.sql),
-            &bootstrap.kinds,
-            &(),
-        )
+        .execute_scalar_row(&bootstrap.query.as_read_query(), &bootstrap.kinds, &())
         .unwrap();
     let Value::Json(value) = &seed_values[0] else {
         panic!("the JSON group keeps its backend value")

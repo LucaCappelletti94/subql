@@ -15,6 +15,8 @@ use subql::{
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, region TEXT, amount INT, status TEXT);";
 const GROUPED_SQL: &str = "SELECT region, COUNT(*) FROM orders GROUP BY region";
 const FILTERED_SQL: &str = "SELECT COUNT(*) FROM orders WHERE status = 'paid'";
+const BOUND_GROUPED_SQL: &str =
+    "SELECT region, COUNT(*) FROM orders WHERE amount > $1 GROUP BY region";
 
 type Event = TestEvent<Postgres, PgLsn>;
 type Engine = SubscriptionEngine<Event, DefaultIds, ParserDB>;
@@ -76,9 +78,11 @@ fn assert_whole_transition(
     assert_eq!(transition.from, TierKind::InProcess);
     assert_eq!(&transition.reason, reason);
     match &transition.to {
-        Tier::WholeRows { sql, tables } => {
+        Tier::WholeRows { query, tables } => {
             assert!(
-                sql == GROUPED_SQL || sql == FILTERED_SQL,
+                query.sql() == GROUPED_SQL
+                    || query.sql() == BOUND_GROUPED_SQL
+                    || query.sql() == FILTERED_SQL,
                 "original SQL survives"
             );
             assert_eq!(tables.len(), 1);
@@ -91,7 +95,7 @@ fn assert_whole_transition(
 fn a_new_group_over_the_limit_changes_the_existing_subscription_to_whole_rows() {
     let (mut engine, orders) = engine(1);
     let registered = engine
-        .register(SubscriptionRequest::new(7u64, GROUPED_SQL))
+        .register(SubscriptionRequest::new(7u64, BOUND_GROUPED_SQL).binds(vec![Value::Int(0)]))
         .expect("grouped count registers");
     seed_group(&mut engine, registered.subscription_id, "north");
 
@@ -105,6 +109,11 @@ fn a_new_group_over_the_limit_changes_the_existing_subscription_to_whole_rows() 
         registered.subscription_id,
         &MaintenanceStopReason::GroupLimit { limit: 1 },
     );
+    let Tier::WholeRows { query, .. } = &output.transitions()[0].to else {
+        panic!("expected whole-row transition")
+    };
+    assert_eq!(query.sql(), BOUND_GROUPED_SQL);
+    assert_eq!(query.binds(), &[Value::Int(0)]);
     assert_eq!(output.triggers().len(), 1);
     assert_eq!(
         output.triggers()[0].subscription_id,

@@ -180,9 +180,6 @@ pub trait RegistrationRequest<I: IdTypes, B: Backend> {
 
     /// Recover the SQL request consumed by registration.
     fn into_request(self) -> SubscriptionRequest<I, B>;
-
-    /// Lifetime scope before registration consumes the request.
-    fn scope(&self) -> SubscriptionScope<I>;
 }
 
 impl<I: IdTypes, B: Backend> RegistrationRequest<I, B> for SubscriptionRequest<I, B> {
@@ -190,10 +187,6 @@ impl<I: IdTypes, B: Backend> RegistrationRequest<I, B> for SubscriptionRequest<I
 
     fn into_request(self) -> Self {
         self
-    }
-
-    fn scope(&self) -> SubscriptionScope<I> {
-        self.scope
     }
 }
 
@@ -208,10 +201,6 @@ impl<I: IdTypes, B: Backend> RegistrationRequest<I, B> for PerConsumerDatabaseRe
 
     fn into_request(self) -> SubscriptionRequest<I, B> {
         self.0
-    }
-
-    fn scope(&self) -> SubscriptionScope<I> {
-        self.0.scope
     }
 }
 
@@ -626,7 +615,7 @@ impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
 /// Runnable component-seed query for an aggregate registration, bundling
 /// the SQL with its per-column decode kinds so the two cannot drift apart.
 ///
-/// [`sql`](Self::sql) projects [`group_columns`](Self::group_columns) group
+/// [`query`](Self::query) projects [`group_columns`](Self::group_columns) group
 /// values first, then the seed components aliased positionally (`c0`, `c1`,
 /// ...) in the order
 /// [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall)
@@ -641,10 +630,10 @@ impl<'a, I: IdTypes> IntoIterator for &'a SubscriptionsView<'_, I> {
 /// An ungrouped seed returns exactly one row. A grouped one returns a row per
 /// group, and returns none at all over an empty table, where the ungrouped
 /// spelling still returns its empty-aggregate row.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AggregateBootstrap {
+#[derive(Debug, PartialEq)]
+pub struct AggregateBootstrap<B: Backend = crate::backend::Postgres> {
     /// Runnable seed query with positionally-aliased component columns.
-    pub sql: String,
+    pub query: crate::reexec::BoundQuery<B>,
     /// Per-column decode kinds, in column order, group columns included.
     pub kinds: Vec<BuiltinKind>,
     /// How many leading columns of each row are group values.
@@ -654,14 +643,24 @@ pub struct AggregateBootstrap {
     pub group_columns: usize,
 }
 
+impl<B: Backend> Clone for AggregateBootstrap<B> {
+    fn clone(&self) -> Self {
+        Self {
+            query: self.query.clone(),
+            kinds: self.kinds.clone(),
+            group_columns: self.group_columns,
+        }
+    }
+}
+
 /// What a registration produced: the identity, and the tier that maintains it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Registered {
+#[derive(Clone, Debug, PartialEq)]
+pub struct Registered<B: Backend = crate::backend::Postgres> {
     /// Engine-assigned identity, from the one counter every maintained answer
     /// draws from.
     pub subscription_id: SubscriptionId,
     /// How the answer is maintained, carrying whatever that tier needs.
-    pub tier: Tier,
+    pub tier: Tier<B>,
     /// Subscriptions evicted to make room for this registration.
     ///
     /// Empty under the default policy ([`EvictionPolicy::Reject`]) and when the
@@ -677,13 +676,13 @@ pub struct Registered {
     pub not_served_because: Option<String>,
 }
 
-impl Registered {
+impl<B: Backend> Registered<B> {
     /// The registry's own record, for an answer it maintains in process.
     ///
     /// `None` for every tier that needs a read, which have no predicate and no
     /// normalized statement to report.
     #[must_use]
-    pub const fn served(&self) -> Option<&Served> {
+    pub const fn served(&self) -> Option<&Served<B>> {
         match &self.tier {
             Tier::InProcess(served) => Some(served),
             Tier::Scalar { .. }
@@ -710,45 +709,44 @@ impl Registered {
 
 /// How a registered answer is maintained, and what its tier hands back.
 ///
-/// Every variant other than [`Self::InProcess`] needs a database read the
-/// engine cannot do itself, so it hands the caller the statement to run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Tier {
+/// Every variant other than [`Self::InProcess`] hands the caller an executable
+/// bound query because the engine cannot read the database itself.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tier<B: Backend = crate::backend::Postgres> {
     /// Maintained from the change stream alone, with no read at all.
     ///
     /// Rows or a fold: [`Served::projection`] says which, and a fold carries
     /// the query that seeds it.
-    InProcess(Served),
+    InProcess(Served<B>),
     /// A scalar extreme, re-read when the extreme itself leaves the answer.
     Scalar {
-        /// SQL to run for the initial value and for any later trigger.
-        sql: String,
+        /// Bound query for the initial value and later triggers.
+        query: crate::reexec::BoundQuery<B>,
         /// Decode hint for the scalar result.
         column_kind: BuiltinKind,
     },
     /// Grouped extrema seeded together and re-read one displaced group at a time.
     GroupedScalar {
-        /// SQL and decode kinds for the initial group map.
-        bootstrap: AggregateBootstrap,
+        /// Bound seed query and decode kinds for the initial group map.
+        bootstrap: AggregateBootstrap<B>,
     },
     /// One table's rows, re-read for the keys that changed.
     KeyedRows {
-        /// The statement, unchanged: this tier promises exactly the rows the
-        /// caller asked for.
-        sql: String,
+        /// Bound query, unchanged from the caller's request.
+        query: crate::reexec::BoundQuery<B>,
         /// The one table this tier reads, and the only one that triggers it.
         table_id: TableId,
     },
     /// The whole answer, re-read when any table it reads changes.
     WholeRows {
-        /// The statement, unchanged.
-        sql: String,
+        /// Bound query, unchanged from the caller's request.
+        query: crate::reexec::BoundQuery<B>,
         /// Tables whose changes trigger a read.
         tables: Vec<TableId>,
     },
 }
 
-impl Tier {
+impl<B: Backend> Tier<B> {
     /// This tier's bare name, for reporting and comparison.
     #[must_use]
     pub const fn kind(&self) -> TierKind {
@@ -764,9 +762,8 @@ impl Tier {
 
 /// Which read serves an answer, without the payload that goes with it.
 ///
-/// [`Tier`] carries a statement and the tables behind it, which a stored record
-/// does not need twice: it keeps the caller's SQL and this, and the statement is
-/// planned again on load.
+/// [`Tier`] carries a bound query and the tables behind it, while a stored
+/// record keeps the source SQL and plans the executable query again on load.
 ///
 /// One of three spellings of the same ladder: [`Tier`] is the registration
 /// answer with payloads, [`TierKind`] is the bare name a transition reports,
@@ -816,8 +813,8 @@ impl From<ReadTier> for TierKind {
 }
 
 /// What the registry recorded for an answer it maintains itself.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Served {
+#[derive(Clone, Debug, PartialEq)]
+pub struct Served<B: Backend = crate::backend::Postgres> {
     /// Table this subscription applies to
     pub table_id: TableId,
     /// Normalized/canonicalized SQL
@@ -829,14 +826,14 @@ pub struct Served {
     /// Projection kind for this subscription
     pub projection: crate::compiler::sql_shape::QueryProjection,
     /// Component-seed query for the aggregate, for bootstrap or reset.
-    /// `None` for a row subscription. Run [`AggregateBootstrap::sql`]
+    /// `None` for a row subscription. Run [`AggregateBootstrap::query`]
     /// (typing each column by [`AggregateBootstrap::kinds`]) and pass the
     /// decoded row to
     /// [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall).
-    pub aggregate_bootstrap: Option<AggregateBootstrap>,
+    pub aggregate_bootstrap: Option<AggregateBootstrap<B>>,
 }
 
-impl Served {
+impl<B: Backend> Served<B> {
     /// The aggregate spec when the registered query is an aggregate, grouped
     /// or not, else `None` for a row-set (`SELECT *`) query.
     ///
@@ -1078,21 +1075,30 @@ pub enum AggregateInstallError {
 /// Every restored answer comes back not knowing its value, so each one needs a
 /// read before it can report anything: this is that list as well as the record
 /// of what was dropped.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct RestoredReads {
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredReads<B: Backend = crate::backend::Postgres> {
     /// Answers that came back, each needing a read to fill it in.
-    pub restored: Vec<RestoredRead>,
+    pub restored: Vec<RestoredRead<B>>,
     /// Answers that could not come back, with the reason.
     pub dropped: Vec<DroppedRead>,
 }
 
+impl<B: Backend> Default for RestoredReads<B> {
+    fn default() -> Self {
+        Self {
+            restored: Vec::new(),
+            dropped: Vec::new(),
+        }
+    }
+}
+
 /// One answer that came back from the file.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RestoredRead {
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredRead<B: Backend = crate::backend::Postgres> {
     /// The identity it had before the restart, which it keeps.
     pub subscription_id: SubscriptionId,
     /// The tier planning its SQL chose this time.
-    pub tier: Tier,
+    pub tier: Tier<B>,
     /// Whether that tier differs from the one it was saved with.
     pub tier_changed: bool,
 }

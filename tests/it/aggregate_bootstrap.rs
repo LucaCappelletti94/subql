@@ -94,7 +94,9 @@ fn bootstrap_sql_per_aggspec() {
     ];
     for (sql, expected) in cases {
         assert_eq!(
-            bootstrap_of(sql).map(|b| b.sql).as_deref(),
+            bootstrap_of(sql)
+                .map(|b| b.query.sql().to_string())
+                .as_deref(),
             Some(expected),
             "bootstrap SQL mismatch for `{sql}`"
         );
@@ -105,16 +107,36 @@ fn bootstrap_sql_per_aggspec() {
 fn bootstrap_sql_preserves_where() {
     assert_eq!(
         bootstrap_of("SELECT SUM(amount) FROM t WHERE amount > 10")
-            .map(|b| b.sql)
+            .map(|b| b.query.sql().to_string())
             .as_deref(),
         Some("SELECT SUM(amount) AS c0 FROM t WHERE amount > 10"),
     );
     assert_eq!(
         bootstrap_of("SELECT COUNT(*) FROM t WHERE status = 'open'")
-            .map(|b| b.sql)
+            .map(|b| b.query.sql().to_string())
             .as_deref(),
         Some("SELECT COUNT(*) AS c0 FROM t WHERE status = 'open'"),
     );
+}
+
+#[test]
+fn aggregate_bootstrap_carries_registration_binds() {
+    let bootstrap = engine()
+        .register(
+            SubscriptionRequest::new(1u64, "SELECT SUM(amount) FROM t WHERE amount > $1")
+                .binds(vec![Value::Int(10)]),
+        )
+        .expect("aggregate registers")
+        .served()
+        .expect("aggregate is maintained in process")
+        .aggregate_bootstrap
+        .clone()
+        .expect("aggregate has a bootstrap");
+    assert_eq!(
+        bootstrap.query.sql(),
+        "SELECT SUM(amount) AS c0 FROM t WHERE amount > $1"
+    );
+    assert_eq!(bootstrap.query.binds(), &[Value::Int(10)]);
 }
 
 /// The per-column decode kinds are a pure function of the AggSpec and line
@@ -136,7 +158,7 @@ fn bootstrap_kinds_per_aggspec() {
     for (sql, expected) in cases {
         let bundle = bootstrap_of(sql).expect("aggregate registration has a bootstrap");
         assert_eq!(bundle.kinds, expected, "kinds mismatch for `{sql}`");
-        let column_count = bundle.sql.matches(" AS c").count();
+        let column_count = bundle.query.sql().matches(" AS c").count();
         assert_eq!(
             bundle.kinds.len(),
             column_count,
@@ -347,10 +369,10 @@ fn a_seeded_group_column_reparses() {
     let bootstrap =
         quoted_bootstrap(QUOTED_DDL, QUOTED_GROUPED_SQL).expect("a grouped aggregate seeds");
     assert_eq!(
-        first_projected_ident(&PostgreSqlDialect {}, &bootstrap.sql),
+        first_projected_ident(&PostgreSqlDialect {}, bootstrap.query.sql()),
         "a\"b",
         "seed SQL was `{}`",
-        bootstrap.sql
+        bootstrap.query.sql()
     );
 }
 
@@ -374,9 +396,9 @@ fn a_group_column_carrying_a_backtick_still_seeds_on_mysql() {
         .clone()
         .expect("a grouped aggregate seeds");
     assert_eq!(
-        first_projected_ident(&MySqlDialect {}, &bootstrap.sql),
+        first_projected_ident(&MySqlDialect {}, bootstrap.query.sql()),
         "a`b",
         "seed SQL was `{}`",
-        bootstrap.sql
+        bootstrap.query.sql()
     );
 }

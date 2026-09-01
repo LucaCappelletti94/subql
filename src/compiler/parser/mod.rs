@@ -318,6 +318,7 @@ pub(crate) fn parse_table_and_where_deps<B, DB>(
     sql: &str,
     dialect: &B::Dialect,
     database: &DB,
+    binds: &[Value<B>],
 ) -> Result<TableAndWhereDeps<B>, RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -325,6 +326,7 @@ where
 {
     let stmt = sql_shape::parse_single_statement(sql, dialect as &dyn Dialect)?;
     let (table_name, where_clause) = extract_table_and_where(&stmt)?;
+    let where_clause = resolve_where_placeholders::<B>(where_clause, binds)?;
     let table_id = resolve_table_id(&table_name, database)?;
     let where_program: BytecodeProgram<B> = if let Some(expr) = where_clause.as_ref() {
         let (program, terms) = compile_expression::<B, DB>(

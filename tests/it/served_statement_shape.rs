@@ -264,7 +264,7 @@ fn an_accepted_aggregate_seeds_from_the_statement_it_maintains() {
         .clone()
         .expect("an aggregate seeds");
     assert_eq!(
-        bootstrap.sql,
+        bootstrap.query.sql(),
         "SELECT COUNT(*) AS c0 FROM t WHERE status = 'a'"
     );
 }
@@ -292,7 +292,7 @@ fn a_grouped_aggregate_seeds_one_row_per_group() {
         .clone()
         .expect("a grouped aggregate seeds");
     assert_eq!(
-        bootstrap.sql,
+        bootstrap.query.sql(),
         "SELECT \"status\" AS c0, COUNT(*) AS c1, COUNT(*) AS c2 FROM g WHERE amount > 3 GROUP BY status"
     );
     assert_eq!(bootstrap.group_columns, 1);
@@ -317,7 +317,7 @@ fn a_grouped_aggregate_seeds_one_row_per_group() {
         .clone()
         .expect("a grouped aggregate seeds");
     assert_eq!(
-        bootstrap.sql,
+        bootstrap.query.sql(),
         "SELECT \"status\" AS c0, \"id\" AS c1, SUM(amount) AS c2, COUNT(*) AS c3 FROM g GROUP BY status, id"
     );
     assert_eq!(bootstrap.group_columns, 2);
@@ -346,10 +346,14 @@ fn a_dropped_clause_never_rides_a_scalar_reexecution() {
         let mut wrapper: Wrapper = SubscriptionEngine::new(db, PostgreSqlDialect {});
         match wrapper.register(SubscriptionRequest::new(1u64, sql)) {
             Ok(Registered {
-                tier: Tier::WholeRows { sql: captured, .. },
+                tier: Tier::WholeRows { query, .. },
                 ..
             }) => {
-                assert_eq!(captured, sql, "the tier re-reads the statement as written");
+                assert_eq!(
+                    query.sql(),
+                    sql,
+                    "the tier re-reads the statement as written"
+                );
             }
             other => panic!("{sql} should be captured for a whole re-read, got {other:?}"),
         }

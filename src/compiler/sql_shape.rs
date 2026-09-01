@@ -1219,13 +1219,14 @@ pub(crate) fn parse_single_statement(
 /// order [`crate::AggAccumulator::seed_from_row`] consumes them, paired with
 /// the per-column decode kinds. Returns `None` when `sql` is not the SELECT
 /// shape [`extract_projection`] already validated.
-pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
+pub(crate) fn render_aggregate_bootstrap<B: crate::backend::Backend, DB: DatabaseLike>(
     sql: &str,
+    binds: &[crate::backend::Value<B>],
     projection: &QueryProjection,
     dialect: &dyn sqlparser::dialect::Dialect,
     table_id: crate::TableId,
     database: &DB,
-) -> Option<crate::AggregateBootstrap> {
+) -> Option<crate::AggregateBootstrap<B>> {
     let (spec, groups, having) = match projection {
         QueryProjection::Rows => return None,
         QueryProjection::Aggregate(spec) => (spec, &[][..], None),
@@ -1304,7 +1305,7 @@ pub(crate) fn render_aggregate_bootstrap<DB: DatabaseLike>(
         kinds.push(crate::backend::BuiltinKind::Int);
     }
     Some(crate::AggregateBootstrap {
-        sql: stmt.to_string(),
+        query: crate::reexec::BoundQuery::new(stmt.to_string(), binds.to_vec()),
         kinds,
         group_columns: groups.len(),
     })
@@ -2255,7 +2256,7 @@ pub(super) fn derive_update_follow_sql_and_set_binds(
 /// Walk `expr` and count every `SqlValue::Placeholder` leaf (positional `?`
 /// and numbered `$N` alike). Recurses through the same expression shapes the
 /// compiler already supports.
-fn count_placeholders_in_expr(expr: &Expr) -> usize {
+pub(crate) fn count_placeholders_in_expr(expr: &Expr) -> usize {
     use sqlparser::ast::Value as SqlValue;
     match expr {
         Expr::Value(v) => usize::from(matches!(&v.value, SqlValue::Placeholder(_))),
