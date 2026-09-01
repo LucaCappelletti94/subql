@@ -271,11 +271,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed_async() {
         let pool = mysql_async_pool(port).await;
         let connector = MysqlAsyncDieselConnector::new(pool);
         let (row, _checkpoint) = connector
-            .execute_scalar_row(
-                &subql::reexec::ReadQuery::without_binds(&bundle.sql),
-                &bundle.kinds,
-                &(),
-            )
+            .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
             .await
             .expect("execute_scalar_row");
         assert_eq!(

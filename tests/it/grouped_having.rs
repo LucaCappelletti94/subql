@@ -98,15 +98,15 @@ mod registration {
             "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING SUM(amount) > 10",
         );
         assert!(
-            !bootstrap.sql.to_uppercase().contains("HAVING"),
+            !bootstrap.query.sql().to_uppercase().contains("HAVING"),
             "the seed must fetch every group, hidden ones included: {}",
-            bootstrap.sql
+            bootstrap.query.sql()
         );
         assert!(
-            bootstrap.sql.contains("AS c3"),
+            bootstrap.query.sql().contains("AS c3"),
             "a SUM subject widens: its running value alone cannot express the \
              NULL an all-null group sums to: {}",
-            bootstrap.sql
+            bootstrap.query.sql()
         );
     }
 
@@ -117,11 +117,11 @@ mod registration {
             &mut engine,
             "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING AVG(amount) > 3",
         );
-        assert!(!bootstrap.sql.to_uppercase().contains("HAVING"));
+        assert!(!bootstrap.query.sql().to_uppercase().contains("HAVING"));
         assert!(
-            bootstrap.sql.contains("AS c3"),
+            bootstrap.query.sql().contains("AS c3"),
             "a sibling HAVING seeds sum, sum of squares, count and the row count: {}",
-            bootstrap.sql
+            bootstrap.query.sql()
         );
     }
 
@@ -156,7 +156,7 @@ mod registration {
             &mut engine,
             "SELECT region, SUM(amount) FROM orders GROUP BY region HAVING COUNT(*) > 2",
         );
-        assert!(!bootstrap.sql.to_uppercase().contains("HAVING"));
+        assert!(!bootstrap.query.sql().to_uppercase().contains("HAVING"));
         assert_eq!(
             bootstrap.kinds,
             vec![BuiltinKind::String, BuiltinKind::Float, BuiltinKind::Int],

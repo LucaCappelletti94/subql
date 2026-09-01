@@ -11,6 +11,7 @@ use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
 use crate::backend::{BuiltinKind, ScalarKind, Value};
+use alloc::boxed::Box;
 use alloc::string::String;
 use core::cell::RefCell;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};

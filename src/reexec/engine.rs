@@ -24,9 +24,10 @@ pub struct ReExecEntry<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoC
     /// In-process maintenance state machine.
     pub runtime: super::maintain::QueryRuntime<B, C>,
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    /// The statement this answer re-reads, kept because a saved answer is
-    /// restored by planning its SQL again rather than by storing a plan.
-    pub sql: String,
+    /// Original query used for replanning and persistence.
+    pub source_query: crate::reexec::BoundQuery<B>,
+    /// Executable query for the current fixed read tier.
+    pub read_query: crate::reexec::BoundQuery<B>,
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
     /// Which read serves it, as saved.
     pub tier: crate::ReadTier,
@@ -113,8 +114,8 @@ pub enum ReExecutionRead<B: Backend = crate::backend::Postgres> {
     GroupedScalar {
         /// Opaque group key used for installation and coalescing.
         group: Vec<u8>,
-        /// Runnable two-column query constrained to this group.
-        query: crate::reexec::ReadQuery<'static, B>,
+        /// Bound two-column query constrained to this group.
+        query: crate::reexec::BoundQuery<B>,
         /// Decode hints for the extreme and source-row count.
         column_kinds: [crate::backend::BuiltinKind; 2],
     },
@@ -182,7 +183,7 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
     /// materializer must re-execute and call [`Install::install`](crate::Install::install).
     pub triggers: Vec<ReExecutionTrigger<I, C, B>>,
     /// Subscriptions that changed maintenance tier.
-    pub transitions: Vec<crate::MaintenanceTransition>,
+    pub transitions: Vec<crate::MaintenanceTransition<B>>,
 }
 
 /// Batch result returned by both connector modes.
@@ -208,5 +209,5 @@ pub struct BatchOutcome<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::No
     /// Re-execution triggers, deduplicated by subscription and group scope.
     pub triggers: Vec<ReExecutionTrigger<I, C, B>>,
     /// Tier changes produced during the batch.
-    pub transitions: Vec<crate::MaintenanceTransition>,
+    pub transitions: Vec<crate::MaintenanceTransition<B>>,
 }

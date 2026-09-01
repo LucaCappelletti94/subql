@@ -308,11 +308,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     // MySQL SUM(int) -> DECIMAL, cast to DOUBLE; sum=12, sum_sq=56, count=3.
     let connector = MysqlDieselConnector::new(common::mysql_connect(port));
     let (row, _checkpoint) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&bundle.sql),
-            &bundle.kinds,
-            &(),
-        )
+        .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
         .expect("execute_scalar_row");
     assert_eq!(
         row,

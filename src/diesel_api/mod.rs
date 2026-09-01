@@ -296,7 +296,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         query: &Q,
-    ) -> Result<Registered, RegisterError>
+    ) -> Result<Registered<E::Backend>, RegisterError>
     where
         D: BindDecode<SubqlBackend = E::Backend>,
         Q: QueryFragment<D>,
@@ -310,7 +310,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         update: &Q,
-    ) -> Result<Registered, RegisterError>
+    ) -> Result<Registered<E::Backend>, RegisterError>
     where
         D: BindDecode<SubqlBackend = E::Backend>,
         Q: QueryFragment<D>,
@@ -336,7 +336,7 @@ where
         consumer_id: I::ConsumerId,
         insert: InsertStatement<T, U, Op>,
         conn: &mut C,
-    ) -> Result<alloc::vec::Vec<Registered>, FollowInsertError>
+    ) -> Result<alloc::vec::Vec<Registered<E::Backend>>, FollowInsertError>
     where
         C: LoadConnection<DefaultLoadingMode>,
         E::Backend: SpellCanonical,

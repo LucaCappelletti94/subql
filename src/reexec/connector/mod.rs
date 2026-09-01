@@ -91,6 +91,72 @@ pub(super) use diesel_backend::boxed_mysql_read_query_owned;
 #[cfg(feature = "executor-diesel-async-postgres")]
 pub(super) use diesel_backend::boxed_postgres_read_query_owned;
 
+/// Owned SQL and typed binds shared across runtime state.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound = "", transparent)]
+pub struct BoundQuery<B: Backend> {
+    inner: alloc::sync::Arc<BoundQueryInner<B>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+struct BoundQueryInner<B: Backend> {
+    sql: alloc::string::String,
+    binds: alloc::vec::Vec<Value<B>>,
+}
+
+impl<B: Backend> BoundQuery<B> {
+    /// Creates an owned bound query.
+    #[must_use]
+    pub fn new(sql: alloc::string::String, binds: alloc::vec::Vec<Value<B>>) -> Self {
+        Self {
+            inner: alloc::sync::Arc::new(BoundQueryInner { sql, binds }),
+        }
+    }
+
+    /// Returns the SQL text.
+    #[must_use]
+    pub fn sql(&self) -> &str {
+        &self.inner.sql
+    }
+
+    /// Returns binds in placeholder order.
+    #[must_use]
+    pub fn binds(&self) -> &[Value<B>] {
+        &self.inner.binds
+    }
+
+    /// Borrows this query for a connector call.
+    #[must_use]
+    pub fn as_read_query(&self) -> ReadQuery<'_, B> {
+        ReadQuery::borrowed(self.sql(), self.binds())
+    }
+}
+
+impl<B: Backend> Clone for BoundQuery<B> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: alloc::sync::Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<B: Backend> core::fmt::Debug for BoundQuery<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BoundQuery")
+            .field("sql", &self.inner.sql)
+            .field("binds", &self.inner.binds)
+            .finish()
+    }
+}
+
+impl<B: Backend> PartialEq for BoundQuery<B> {
+    fn eq(&self, other: &Self) -> bool {
+        alloc::sync::Arc::ptr_eq(&self.inner, &other.inner)
+            || (self.inner.sql == other.inner.sql && self.inner.binds == other.inner.binds)
+    }
+}
+
 /// SQL and typed binds passed to every connector read.
 pub struct ReadQuery<'a, B: Backend> {
     sql: alloc::borrow::Cow<'a, str>,
@@ -407,16 +473,16 @@ pub trait Connector {
         Err(CursorError::Unsupported)
     }
 
-    /// Run one multi-column scalar seed query and decode each column by its
-    /// [`BuiltinKind`].
+    /// Run one bound multi-column scalar seed query and decode each column by
+    /// its [`BuiltinKind`].
     ///
     /// Bootstraps or re-seeds an in-process aggregate accumulator from
     /// [`Served::aggregate_bootstrap`](crate::Served::aggregate_bootstrap):
-    /// run [`AggregateBootstrap::sql`](crate::AggregateBootstrap::sql), typing
-    /// each column by [`AggregateBootstrap::kinds`](crate::AggregateBootstrap::kinds),
+    /// run [`AggregateBootstrap::query`](crate::AggregateBootstrap::query), typing each
+    /// column by [`AggregateBootstrap::kinds`](crate::AggregateBootstrap::kinds),
     /// then feed the returned row to
     /// [`Install::install`](crate::Install::install) with [`AggregateSeedInstall`](crate::AggregateSeedInstall).
-    /// `sql` returns exactly one row (aggregate queries always do, yielding
+    /// `query` returns exactly one row (aggregate queries always do, yielding
     /// the empty-aggregate row over an empty table). Run the components in
     /// the same read-only repeatable-read transaction
     /// [`execute_scalar`](Self::execute_scalar) uses so they share one
@@ -574,4 +640,36 @@ pub(super) fn drain_cursor_buffer<B: crate::backend::Backend>(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod bound_query_tests {
+    use super::BoundQuery;
+    use crate::backend::{Postgres, Value};
+    use alloc::sync::Arc;
+
+    #[test]
+    fn bound_query_exposes_owned_and_borrowed_views() {
+        let query = BoundQuery::<Postgres>::new(
+            "SELECT amount FROM orders WHERE id = $1".to_string(),
+            vec![Value::Int(7)],
+        );
+
+        assert_eq!(query.sql(), "SELECT amount FROM orders WHERE id = $1");
+        assert_eq!(query.binds(), &[Value::Int(7)]);
+        let read = query.as_read_query();
+        assert_eq!(read.sql(), query.sql());
+        assert_eq!(read.binds(), query.binds());
+    }
+
+    #[test]
+    fn bound_query_clone_shares_storage() {
+        let query = BoundQuery::<Postgres>::new(
+            "SELECT amount FROM orders WHERE id = $1".to_string(),
+            vec![Value::Int(7)],
+        );
+        let cloned = query.clone();
+
+        assert!(Arc::ptr_eq(&query.inner, &cloned.inner));
+    }
 }

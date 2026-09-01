@@ -2,12 +2,18 @@
 //! their value, and are dropped one at a time when their table moves.
 #![allow(clippy::unwrap_used)]
 
+use core::convert::Infallible;
+
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::Postgres;
+use subql::backend::{BuiltinKind, Postgres, Value};
+use subql::reexec::{
+    Connector, CursorError, CursorId, ReExecutionRead, ReadQuery, RowPage, Snapshot,
+};
 use subql::testing::TestEvent;
 use subql::{
-    catalog_helpers, DefaultIds, DropReason, SubscriptionEngine, SubscriptionRequest, Tier,
+    catalog_helpers, DefaultIds, DropReason, GroupedScalarSeedInstall, Install, NoCheckpoint,
+    SubscriptionEngine, SubscriptionRequest, Tier,
 };
 
 const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);\
@@ -20,6 +26,112 @@ const WIDER_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, s
                          CREATE TABLE managers (id INT PRIMARY KEY);";
 
 type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+
+#[derive(Default)]
+struct RecordingConnector {
+    queries: parking_lot::Mutex<Vec<ReadQuery<'static, Postgres>>>,
+}
+
+impl RecordingConnector {
+    fn queries(&self) -> Vec<ReadQuery<'static, Postgres>> {
+        self.queries.lock().clone()
+    }
+
+    fn record(&self, query: &ReadQuery<'_, Postgres>) {
+        self.queries.lock().push(query.clone().into_owned());
+    }
+}
+
+impl Connector for RecordingConnector {
+    type AuthContext = ();
+    type Error = Infallible;
+    type Checkpoint = NoCheckpoint;
+    type Backend = Postgres;
+
+    fn execute_scalar(
+        &self,
+        query: &ReadQuery<'_, Postgres>,
+        _kind: BuiltinKind,
+        _auth: &(),
+    ) -> Result<(Value<Postgres>, Option<NoCheckpoint>), Self::Error> {
+        self.record(query);
+        Ok((Value::Null, None))
+    }
+
+    fn read_page(
+        &self,
+        query: &ReadQuery<'_, Postgres>,
+        _max_bytes: usize,
+        _auth: &(),
+    ) -> Result<Snapshot<RowPage<Postgres>, NoCheckpoint>, Self::Error> {
+        self.record(query);
+        Ok(Snapshot {
+            value: RowPage {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                more: false,
+            },
+            checkpoint: None,
+        })
+    }
+
+    fn open_cursor(
+        &self,
+        query: &ReadQuery<'_, Postgres>,
+        _auth: &(),
+    ) -> Result<CursorId, CursorError<Self::Error>> {
+        self.record(query);
+        Err(CursorError::Unsupported)
+    }
+}
+
+fn restore_bound_reads() -> (subql::RestoredReads, [u64; 4]) {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().to_path_buf();
+    let (mut engine, _) =
+        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+    let scalar = engine
+        .register(
+            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders WHERE status = $1")
+                .binds(vec![Value::String("paid".into())]),
+        )
+        .expect("scalar registers");
+    let keyed = engine
+        .register(
+            SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE lower(status) = $1")
+                .binds(vec![Value::String("paid".into())]),
+        )
+        .expect("keyed read registers");
+    let grouped = engine
+        .register(
+            SubscriptionRequest::new(
+                3u64,
+                "SELECT status, MIN(price) FROM orders WHERE price > $1 GROUP BY status",
+            )
+            .binds(vec![Value::Float(1.0)]),
+        )
+        .expect("grouped read registers");
+    let whole = engine
+        .register(
+            SubscriptionRequest::new(
+                4u64,
+                "SELECT * FROM orders WHERE lower(status) = $1 AND id IN (SELECT id FROM managers)",
+            )
+            .binds(vec![Value::String("paid".into())]),
+        )
+        .expect("whole read registers");
+    let ids = [
+        scalar.subscription_id,
+        keyed.subscription_id,
+        grouped.subscription_id,
+        whole.subscription_id,
+    ];
+    drop(engine);
+
+    let (_engine, report) =
+        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
+    (report, ids)
+}
 
 fn catalog(ddl: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(ddl).expect("parse DDL")
@@ -86,6 +198,156 @@ fn saved_answers_come_back_with_their_identities() {
             && tiers.iter().any(|t| matches!(t, Tier::KeyedRows { .. })),
         "one of each, got {tiers:?}"
     );
+}
+
+#[test]
+fn restored_fixed_tiers_report_exact_executable_queries() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().to_path_buf();
+    let (mut engine, _) =
+        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+    let bind = Value::String("paid".into());
+    let scalar = engine
+        .register(
+            SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders WHERE status = $1")
+                .binds(vec![bind.clone()]),
+        )
+        .expect("scalar registers");
+    let keyed = engine
+        .register(
+            SubscriptionRequest::new(2u64, "SELECT * FROM orders WHERE lower(status) = $1")
+                .binds(vec![bind.clone()]),
+        )
+        .expect("keyed read registers");
+    let whole_sql = "SELECT * FROM orders WHERE lower(status) = $1 \
+                     AND id IN (SELECT id FROM managers)";
+    let whole = engine
+        .register(SubscriptionRequest::new(3u64, whole_sql).binds(vec![bind.clone()]))
+        .expect("whole read registers");
+    drop(engine);
+
+    let (_engine, report) =
+        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
+    let expected = [
+        (
+            scalar.subscription_id,
+            "SELECT MIN(price) AS v FROM orders WHERE status = $1",
+        ),
+        (
+            keyed.subscription_id,
+            "SELECT * FROM orders WHERE lower(status) = $1",
+        ),
+        (whole.subscription_id, whole_sql),
+    ];
+    for (subscription_id, sql) in expected {
+        let restored = report
+            .restored
+            .iter()
+            .find(|read| read.subscription_id == subscription_id)
+            .expect("registered read restores");
+        let query = match &restored.tier {
+            Tier::Scalar { query, .. }
+            | Tier::KeyedRows { query, .. }
+            | Tier::WholeRows { query, .. } => query,
+            other => panic!("expected fixed read tier, got {other:?}"),
+        };
+        assert_eq!(query.sql(), sql);
+        assert_eq!(query.binds(), std::slice::from_ref(&bind));
+    }
+}
+
+#[test]
+fn scalar_restores_and_executes_registration_binds() {
+    let (report, [scalar, _, _, _]) = restore_bound_reads();
+    let restored = report
+        .restored
+        .iter()
+        .find(|read| read.subscription_id == scalar)
+        .expect("scalar restores");
+    let Tier::Scalar { query, column_kind } = &restored.tier else {
+        panic!("expected scalar")
+    };
+    let connector = RecordingConnector::default();
+
+    connector
+        .execute_scalar(&query.as_read_query(), *column_kind, &())
+        .expect("connector is infallible");
+    let queries = connector.queries();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].sql(),
+        "SELECT MIN(price) AS v FROM orders WHERE status = $1"
+    );
+    assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
+}
+
+#[test]
+fn keyed_restores_and_executes_registration_binds() {
+    let (report, [_, keyed, _, _]) = restore_bound_reads();
+    let restored = report
+        .restored
+        .iter()
+        .find(|read| read.subscription_id == keyed)
+        .expect("keyed read restores");
+    let Tier::KeyedRows { query, .. } = &restored.tier else {
+        panic!("expected keyed rows")
+    };
+    let connector = RecordingConnector::default();
+
+    let _ = connector.open_cursor(&query.as_read_query(), &());
+    let queries = connector.queries();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].sql(),
+        "SELECT * FROM orders WHERE lower(status) = $1"
+    );
+    assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
+}
+
+#[test]
+fn grouped_restores_and_executes_registration_binds() {
+    let (report, [_, _, grouped, _]) = restore_bound_reads();
+    let restored = report
+        .restored
+        .iter()
+        .find(|read| read.subscription_id == grouped)
+        .expect("grouped read restores");
+    let Tier::GroupedScalar { bootstrap } = &restored.tier else {
+        panic!("expected grouped scalar")
+    };
+    let connector = RecordingConnector::default();
+
+    let _ = connector.open_cursor(&bootstrap.query.as_read_query(), &());
+    let queries = connector.queries();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].sql(),
+        "SELECT \"status\", MIN(\"price\") AS c0, COUNT(*) AS c1 FROM orders WHERE price > $1 GROUP BY status"
+    );
+    assert_eq!(queries[0].binds(), &[Value::Float(1.0)]);
+}
+
+#[test]
+fn whole_restores_and_executes_registration_binds() {
+    let (report, [_, _, _, whole]) = restore_bound_reads();
+    let restored = report
+        .restored
+        .iter()
+        .find(|read| read.subscription_id == whole)
+        .expect("whole read restores");
+    let Tier::WholeRows { query, .. } = &restored.tier else {
+        panic!("expected whole rows")
+    };
+    let connector = RecordingConnector::default();
+
+    let _ = connector.open_cursor(&query.as_read_query(), &());
+    let queries = connector.queries();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].sql(),
+        "SELECT * FROM orders WHERE lower(status) = $1 AND id IN (SELECT id FROM managers)"
+    );
+    assert_eq!(queries[0].binds(), &[Value::String("paid".into())]);
 }
 
 /// Restored identities remain taken: the next registration must not reuse one.
@@ -203,6 +465,62 @@ fn a_grouped_scalar_read_restores_under_the_same_identity() {
     ));
 }
 
+#[test]
+fn grouped_read_restores_registration_binds() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().to_path_buf();
+    let (mut engine, _) =
+        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path.clone()).expect("open store");
+    let registered = engine
+        .register(
+            SubscriptionRequest::new(
+                4u64,
+                "SELECT status, MIN(price) FROM orders WHERE price > $1 GROUP BY status",
+            )
+            .binds(vec![Value::Float(1.0)]),
+        )
+        .expect("grouped minimum registers");
+    drop(engine);
+
+    let (mut engine, report) =
+        Engine::with_storage(catalog(DDL), PostgreSqlDialect {}, path).expect("reopen store");
+    assert_eq!(report.restored.len(), 1);
+    Install::install(
+        &mut engine,
+        registered.subscription_id,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("paid".into()),
+                Value::Float(5.0),
+                Value::Int(2),
+            ]],
+            read_at: None::<subql::NoCheckpoint>,
+        },
+    )
+    .expect("seed installs");
+    let orders = catalog_helpers::table_id(&catalog(DDL), "orders").expect("orders resolves");
+    let event = TestEvent::<Postgres>::delete(
+        orders,
+        vec![
+            Value::Int(1),
+            Value::Float(5.0),
+            Value::String("paid".into()),
+        ],
+    )
+    .with_pk_columns([0u16]);
+
+    let output = engine.dispatch(&event).expect("delete dispatches");
+    let ReExecutionRead::GroupedScalar { query, .. } = &output.triggers()[0].read else {
+        panic!("expected grouped scalar read")
+    };
+    assert!(query.sql().contains("price > $1"), "{query:?}");
+    assert!(query.sql().contains("\"status\" = $2"));
+    assert_eq!(
+        query.binds(),
+        &[Value::Float(1.0), Value::String("paid".into())]
+    );
+}
+
 /// A grouped extreme's `HAVING` survives the restart: the restored plan
 /// still installs a failing group silently.
 #[test]
@@ -227,9 +545,9 @@ fn a_having_extreme_restores_with_its_condition() {
         panic!("expected grouped scalar tier, got {:?}", report.restored[0]);
     };
     assert!(
-        !bootstrap.sql.to_uppercase().contains("HAVING"),
+        !bootstrap.query.sql().to_uppercase().contains("HAVING"),
         "the restored seed still fetches every group: {}",
-        bootstrap.sql
+        bootstrap.query.sql()
     );
     let opening = subql::Install::install(
         &mut engine,

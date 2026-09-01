@@ -2,8 +2,8 @@
 #![allow(clippy::unwrap_used)]
 
 use sql_traits::structs::ParserDB;
-use sqlparser::dialect::PostgreSqlDialect;
-use subql::backend::{BuiltinKind, Postgres, Value};
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use subql::backend::{BuiltinKind, MySql, Postgres, SQLite, Value};
 use subql::reexec::ReExecutionRead;
 use subql::testing::TestEvent;
 use subql::{
@@ -77,8 +77,8 @@ fn registration_exposes_a_grouped_seed_with_extreme_and_row_count() {
         bootstrap.kinds,
         vec![BuiltinKind::String, BuiltinKind::Int, BuiltinKind::Int]
     );
-    assert!(bootstrap.sql.contains("MIN(\"amount\") AS c0"));
-    assert!(bootstrap.sql.contains("COUNT(*) AS c1"));
+    assert!(bootstrap.query.sql().contains("MIN(\"amount\") AS c0"));
+    assert!(bootstrap.query.sql().contains("COUNT(*) AS c1"));
 }
 
 #[test]
@@ -150,6 +150,271 @@ fn insert_folds_delete_requeries_only_the_displaced_group() {
     .expect("scoped result installs");
     assert_eq!(installed.updates[0].group.as_ref(), Some(&north));
     assert_eq!(installed.updates[0].change, scalar(Value::Int(5)));
+}
+
+#[test]
+fn registration_binds_precede_group_scope_binds() {
+    let (mut engine, orders) = engine();
+    let registered = engine
+        .register(
+            SubscriptionRequest::new(
+                7u64,
+                "SELECT region, MIN(amount) FROM orders WHERE status = $1 GROUP BY region",
+            )
+            .binds(vec![Value::String("paid".into())]),
+        )
+        .expect("grouped extreme registers");
+    let subscription = registered.subscription_id;
+    let opening = seed(
+        &mut engine,
+        subscription,
+        vec![vec![
+            Value::String("north".into()),
+            Value::Int(5),
+            Value::Int(2),
+        ]],
+    );
+    let north = opening.updates[0].group.clone().expect("north key");
+    let displaced = Event::delete(orders, text_row(1, "north", 5))
+        .with_pk_columns([0u16])
+        .with_checkpoint(PgLsn(10));
+
+    let output = engine.dispatch(&displaced).expect("delete dispatches");
+    let ReExecutionRead::GroupedScalar { query, group, .. } = &output.triggers()[0].read else {
+        panic!("expected grouped scalar read")
+    };
+
+    assert_eq!(group, &north.key);
+    assert!(query.sql().contains("status = $1"), "{query:?}");
+    assert!(query.sql().contains("\"region\" = $2"));
+    assert_eq!(
+        query.binds(),
+        &[Value::String("paid".into()), Value::String("north".into())]
+    );
+}
+
+#[test]
+fn positional_registration_binds_follow_rewritten_sql_order_mysql() {
+    let catalog = ParserDB::parse::<MySqlDialect>(
+        "CREATE TABLE orders (id INT PRIMARY KEY, region VARCHAR(32) COLLATE utf8mb4_bin, amount INT, status VARCHAR(32));",
+    )
+    .expect("parse DDL");
+    let orders = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let mut engine =
+        SubscriptionEngine::<TestEvent<MySql, PgLsn>, DefaultIds, _>::new(catalog, MySqlDialect {});
+    let registered = engine
+        .register(
+            SubscriptionRequest::<DefaultIds, MySql>::new(
+                7u64,
+                "SELECT region, MIN(amount) FROM orders WHERE status = ? GROUP BY region ORDER BY ?",
+            )
+            .binds(vec![
+                Value::String("paid".into()),
+                Value::String("order".into()),
+            ]),
+        )
+        .expect("grouped extreme registers");
+    assert!(
+        matches!(registered.tier, Tier::GroupedScalar { .. }),
+        "unexpected tier: {:?}",
+        registered.tier
+    );
+    let subscription = registered.subscription_id;
+    let opening = Install::install(
+        &mut engine,
+        subscription,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Int(5),
+                Value::Int(2),
+            ]],
+            read_at: Some(PgLsn(5)),
+        },
+    )
+    .expect("grouped extreme seed installs");
+    let north = opening.updates[0].group.clone().expect("north key");
+    let displaced = TestEvent::<MySql, PgLsn>::delete(
+        orders,
+        vec![
+            Value::Int(1),
+            Value::String("north".into()),
+            Value::Int(5),
+            Value::String("paid".into()),
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(PgLsn(10));
+
+    let output = engine.dispatch(&displaced).expect("delete dispatches");
+    let ReExecutionRead::GroupedScalar { query, group, .. } = &output.triggers()[0].read else {
+        panic!("expected grouped scalar read")
+    };
+
+    assert_eq!(group, &north.key);
+    assert_eq!(
+        query.sql(),
+        "SELECT MIN(`amount`) AS v, COUNT(*) AS c1 FROM orders WHERE (status = ?) AND `region` = ? ORDER BY ?"
+    );
+    assert_eq!(
+        query.binds(),
+        &[
+            Value::String("paid".into()),
+            Value::String("north".into()),
+            Value::String("order".into()),
+        ]
+    );
+}
+
+#[test]
+fn positional_registration_binds_follow_rewritten_sql_order_sqlite() {
+    let catalog = ParserDB::parse::<SQLiteDialect>(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT COLLATE BINARY, amount INTEGER, status TEXT);",
+    )
+    .expect("parse DDL");
+    let orders = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let mut engine = SubscriptionEngine::<TestEvent<SQLite, PgLsn>, DefaultIds, _>::new(
+        catalog,
+        SQLiteDialect {},
+    );
+    let registered = engine
+        .register(
+            SubscriptionRequest::<DefaultIds, SQLite>::new(
+                7u64,
+                "SELECT region, MIN(amount) FROM orders WHERE status = ? GROUP BY region ORDER BY ?",
+            )
+            .binds(vec![
+                Value::String("paid".into()),
+                Value::String("order".into()),
+            ]),
+        )
+        .expect("grouped extreme registers");
+    assert!(
+        matches!(registered.tier, Tier::GroupedScalar { .. }),
+        "unexpected tier: {:?}",
+        registered.tier
+    );
+    let subscription = registered.subscription_id;
+    let opening = Install::install(
+        &mut engine,
+        subscription,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Int(5),
+                Value::Int(2),
+            ]],
+            read_at: Some(PgLsn(5)),
+        },
+    )
+    .expect("grouped extreme seed installs");
+    let north = opening.updates[0].group.clone().expect("north key");
+    let displaced = TestEvent::<SQLite, PgLsn>::delete(
+        orders,
+        vec![
+            Value::Int(1),
+            Value::String("north".into()),
+            Value::Int(5),
+            Value::String("paid".into()),
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(PgLsn(10));
+
+    let output = engine.dispatch(&displaced).expect("delete dispatches");
+    let ReExecutionRead::GroupedScalar { query, group, .. } = &output.triggers()[0].read else {
+        panic!("expected grouped scalar read")
+    };
+
+    assert_eq!(group, &north.key);
+    assert_eq!(
+        query.sql(),
+        "SELECT MIN(`amount`) AS v, COUNT(*) AS c1 FROM orders WHERE (status = ?) AND `region` = ? ORDER BY ?"
+    );
+    assert_eq!(
+        query.binds(),
+        &[
+            Value::String("paid".into()),
+            Value::String("north".into()),
+            Value::String("order".into()),
+        ]
+    );
+}
+
+#[test]
+fn positional_registration_binds_skip_null_group_values_sqlite() {
+    let catalog = ParserDB::parse::<SQLiteDialect>(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, region TEXT COLLATE BINARY, category TEXT COLLATE BINARY, amount INTEGER, status TEXT);",
+    )
+    .expect("parse DDL");
+    let orders = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");
+    let mut engine = SubscriptionEngine::<TestEvent<SQLite, PgLsn>, DefaultIds, _>::new(
+        catalog,
+        SQLiteDialect {},
+    );
+    let registered = engine
+        .register(
+            SubscriptionRequest::<DefaultIds, SQLite>::new(
+                7u64,
+                "SELECT region, category, MIN(amount) FROM orders WHERE status = ? GROUP BY region, category ORDER BY ?",
+            )
+            .binds(vec![
+                Value::String("paid".into()),
+                Value::String("order".into()),
+            ]),
+        )
+        .expect("grouped extreme registers");
+    let subscription = registered.subscription_id;
+    let opening = Install::install(
+        &mut engine,
+        subscription,
+        GroupedScalarSeedInstall {
+            rows: vec![vec![
+                Value::String("north".into()),
+                Value::Null,
+                Value::Int(5),
+                Value::Int(2),
+            ]],
+            read_at: Some(PgLsn(5)),
+        },
+    )
+    .expect("grouped extreme seed installs");
+    let group = opening.updates[0].group.clone().expect("group key");
+    let displaced = TestEvent::<SQLite, PgLsn>::delete(
+        orders,
+        vec![
+            Value::Int(1),
+            Value::String("north".into()),
+            Value::Null,
+            Value::Int(5),
+            Value::String("paid".into()),
+        ],
+    )
+    .with_pk_columns([0u16])
+    .with_checkpoint(PgLsn(10));
+
+    let output = engine.dispatch(&displaced).expect("delete dispatches");
+    let ReExecutionRead::GroupedScalar {
+        query,
+        group: triggered,
+        ..
+    } = &output.triggers()[0].read
+    else {
+        panic!("expected grouped scalar read")
+    };
+
+    assert_eq!(triggered, &group.key);
+    assert!(query.sql().contains("`region` = ?"), "{query:?}");
+    assert!(query.sql().contains("`category` IS NULL"), "{query:?}");
+    assert_eq!(query.sql().matches('?').count(), 3);
+    assert_eq!(
+        query.binds(),
+        &[
+            Value::String("paid".into()),
+            Value::String("north".into()),
+            Value::String("order".into()),
+        ]
+    );
 }
 
 #[test]
@@ -698,9 +963,9 @@ mod having_on_grouped_extreme {
             "SELECT region, MIN(amount) FROM orders GROUP BY region HAVING MIN(amount) < 5",
         );
         assert!(
-            !bootstrap.sql.to_uppercase().contains("HAVING"),
+            !bootstrap.query.sql().to_uppercase().contains("HAVING"),
             "the seed must fetch every group, hidden ones included: {}",
-            bootstrap.sql
+            bootstrap.query.sql()
         );
     }
 

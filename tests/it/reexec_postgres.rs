@@ -472,11 +472,7 @@ fn execute_scalar_row_decodes_integer_aggregate_seed() {
     // double cast into (Float, Float, Int).
     let connector = PgDieselConnector::new(common::pg_connect(port));
     let (row, checkpoint) = connector
-        .execute_scalar_row(
-            &subql::reexec::ReadQuery::without_binds(&bundle.sql),
-            &bundle.kinds,
-            &(),
-        )
+        .execute_scalar_row(&bundle.query.as_read_query(), &bundle.kinds, &())
         .expect("execute_scalar_row");
     assert_eq!(
         row,

@@ -4,6 +4,7 @@
 
 use super::ReadQuery;
 use crate::backend::Value;
+use alloc::boxed::Box;
 use alloc::string::String;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_query;

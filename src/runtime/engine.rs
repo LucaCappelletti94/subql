@@ -129,7 +129,7 @@ struct CompiledSpec<I: IdTypes, B: Backend> {
     /// Runnable component-seed bundle (SQL plus per-column decode kinds)
     /// for an aggregate registration, `None` for row subscriptions.
     /// Rendered once at compile time.
-    bootstrap: Option<crate::AggregateBootstrap>,
+    bootstrap: Option<crate::AggregateBootstrap<B>>,
     /// What registration settled about each membership term the filter names,
     /// one per slot, empty for a filter naming none.
     term_plans: Vec<TermPlan>,
@@ -140,10 +140,10 @@ struct CompiledSpec<I: IdTypes, B: Backend> {
     term_seeds: Vec<Vec<crate::term::TermRow<B>>>,
 }
 
-struct AggregateRegistration<I: IdTypes> {
+struct AggregateRegistration<I: IdTypes, B: Backend> {
     consumer: I::ConsumerId,
     scope: SubscriptionScope<I>,
-    sql: String,
+    source_query: crate::reexec::BoundQuery<B>,
     /// Whether the registration declared per-consumer database reads, so a
     /// tier transition builds its replacement read under the same contract.
     /// Not persisted: a restored in-process aggregate starts shared, like
@@ -151,15 +151,22 @@ struct AggregateRegistration<I: IdTypes> {
     database_reads_per_consumer: bool,
 }
 
-impl<I: IdTypes> Clone for AggregateRegistration<I> {
+impl<I: IdTypes, B: Backend> Clone for AggregateRegistration<I, B> {
     fn clone(&self) -> Self {
         Self {
             consumer: self.consumer,
             scope: self.scope,
-            sql: self.sql.clone(),
+            source_query: self.source_query.clone(),
             database_reads_per_consumer: self.database_reads_per_consumer,
         }
     }
+}
+
+struct RereadRegistration<'a, I: IdTypes, B: Backend> {
+    consumer: I::ConsumerId,
+    session: Option<I::SessionId>,
+    source_query: &'a crate::reexec::BoundQuery<B>,
+    database_reads_per_consumer: bool,
 }
 
 #[cfg(feature = "std")]
@@ -316,7 +323,7 @@ where
     >,
     /// Original SQL and registration metadata retained for an in-place
     /// transition from aggregate maintenance to a complete row read.
-    aggregate_registrations: HashMap<SubscriptionId, AggregateRegistration<I>>,
+    aggregate_registrations: HashMap<SubscriptionId, AggregateRegistration<I, E::Backend>>,
     /// Maximum changes held while aggregate starting rows are read.
     max_changes_during_aggregate_read: usize,
     /// Maximum live groups for one grouped aggregate before it changes tier.
@@ -558,6 +565,7 @@ where
         // after a mandated reset. `None` for row subscriptions.
         let bootstrap = crate::compiler::sql_shape::render_aggregate_bootstrap(
             &spec.sql,
+            &spec.binds,
             &projection,
             &self.dialect,
             table_id,
@@ -1301,7 +1309,7 @@ where
         database: DB,
         dialect: <E::Backend as Backend>::Dialect,
         storage_path: PathBuf,
-    ) -> Result<(Self, RestoredReads), StorageError> {
+    ) -> Result<(Self, RestoredReads<E::Backend>), StorageError> {
         let mut engine = Self::new(database, dialect);
         engine.storage_path = Some(storage_path.clone());
 
@@ -1359,17 +1367,23 @@ where
     /// assert_eq!(engine.subscription_count(), 2);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-    pub fn register<R>(&mut self, spec: R) -> Result<Registered, RegisterError>
+    pub fn register<R>(&mut self, spec: R) -> Result<Registered<E::Backend>, RegisterError>
     where
         R: crate::RegistrationRequest<I, E::Backend>,
     {
-        let database_reads_per_consumer = R::DATABASE_READS_PER_CONSUMER;
-        let spec = spec.into_request();
+        self.register_request(spec.into_request(), R::DATABASE_READS_PER_CONSUMER)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn register_request(
+        &mut self,
+        spec: SubscriptionRequest<I, E::Backend>,
+        database_reads_per_consumer: bool,
+    ) -> Result<Registered<E::Backend>, RegisterError> {
+        let source_query = crate::reexec::BoundQuery::new(spec.sql.clone(), spec.binds.clone());
         // 1. Parse, compile, and canonicalize in one pass. A statement this
         // engine cannot serve is planned as a re-read rather than refused:
         // needing a database read is not grounds to turn a query away.
-        let sql = spec.sql.clone();
         let consumer_id = spec.consumer_id;
         let session = match &spec.scope {
             SubscriptionScope::Session(s) => Some(*s),
@@ -1379,7 +1393,7 @@ where
             Ok(compiled) => compiled,
             Err(RegisterError::UnsupportedSql(refusal)) => {
                 return self.plan_reread(
-                    &sql,
+                    &source_query,
                     refusal,
                     consumer_id,
                     session,
@@ -1517,17 +1531,26 @@ where
     /// the compiler's own message, returned when no tier can serve it either.
     fn plan_reread(
         &mut self,
-        sql: &str,
+        source_query: &crate::reexec::BoundQuery<E::Backend>,
         refusal: String,
         consumer_id: I::ConsumerId,
         session: Option<I::SessionId>,
         database_reads_per_consumer: bool,
-    ) -> Result<Registered, RegisterError> {
+    ) -> Result<Registered<E::Backend>, RegisterError> {
         if database_reads_per_consumer && refusal == RLS_AGGREGATE_NEEDS_DATABASE_READ {
-            return self.plan_whole_reread(sql, refusal, consumer_id, session);
+            return self.plan_whole_reread(source_query, refusal, consumer_id, session);
         }
-        let planned =
-            crate::reexec::plan::build_plan::<E::Backend, DB>(sql, self.dialect(), &self.database);
+        let planned = crate::reexec::plan::build_plan::<E::Backend, DB>(
+            source_query,
+            self.dialect(),
+            &self.database,
+        );
+        let registration = RereadRegistration {
+            consumer: consumer_id,
+            session,
+            source_query,
+            database_reads_per_consumer,
+        };
         match planned {
             Ok(crate::reexec::plan::QueryPlan::GroupedPartial(plan)) => {
                 if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
@@ -1539,14 +1562,8 @@ where
                     });
                 }
                 let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_grouped_scalar(
-                    subscription_id,
-                    *plan,
-                    consumer_id,
-                    session,
-                    sql,
-                    database_reads_per_consumer,
-                );
+                let mut registered =
+                    self.capture_grouped_scalar(subscription_id, *plan, &registration);
                 registered.not_served_because = Some(refusal);
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
@@ -1561,14 +1578,7 @@ where
                     });
                 }
                 let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_scalar(
-                    subscription_id,
-                    plan,
-                    consumer_id,
-                    session,
-                    sql,
-                    database_reads_per_consumer,
-                );
+                let mut registered = self.capture_scalar(subscription_id, plan, &registration);
                 registered.not_served_because = Some(refusal);
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
@@ -1583,14 +1593,7 @@ where
                     });
                 }
                 let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_keyed(
-                    subscription_id,
-                    *plan,
-                    consumer_id,
-                    session,
-                    sql,
-                    database_reads_per_consumer,
-                );
+                let mut registered = self.capture_keyed(subscription_id, *plan, &registration);
                 registered.not_served_because = Some(refusal);
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
@@ -1608,14 +1611,7 @@ where
                     return Err(RegisterError::RowCaptureOnRlsTable { table_id: table });
                 }
                 let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_whole(
-                    subscription_id,
-                    plan,
-                    consumer_id,
-                    session,
-                    sql,
-                    database_reads_per_consumer,
-                );
+                let mut registered = self.capture_whole(subscription_id, plan, &registration);
                 registered.not_served_because = Some(refusal);
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
@@ -1626,19 +1622,24 @@ where
     }
     fn plan_whole_reread(
         &mut self,
-        sql: &str,
+        source_query: &crate::reexec::BoundQuery<E::Backend>,
         refusal: String,
         consumer_id: I::ConsumerId,
         session: Option<I::SessionId>,
-    ) -> Result<Registered, RegisterError> {
+    ) -> Result<Registered<E::Backend>, RegisterError> {
         let plan = crate::reexec::plan::build_whole_rows_plan::<E::Backend, DB>(
-            sql,
+            source_query,
             self.dialect(),
             &self.database,
         )?;
         let subscription_id = self.allocate_subscription_id();
-        let mut registered =
-            self.capture_whole(subscription_id, plan, consumer_id, session, sql, true);
+        let registration = RereadRegistration {
+            consumer: consumer_id,
+            session,
+            source_query,
+            database_reads_per_consumer: true,
+        };
+        let mut registered = self.capture_whole(subscription_id, plan, &registration);
         registered.not_served_because = Some(refusal);
         self.persist_reads_after_change(subscription_id)?;
         Ok(registered)
@@ -1671,27 +1672,29 @@ where
         &mut self,
         subscription_id: SubscriptionId,
         plan: crate::reexec::plan::GroupedMinMaxPlan<E::Backend>,
-        consumer_id: I::ConsumerId,
-        session: Option<I::SessionId>,
-        source_sql: &str,
-        database_reads_per_consumer: bool,
-    ) -> Registered {
+        registration: &RereadRegistration<'_, I, E::Backend>,
+    ) -> Registered<E::Backend> {
         let table_id = plan.table_id;
         let bootstrap = plan.bootstrap.clone();
+        let read_query = bootstrap.query.clone();
         let runtime = crate::reexec::maintain::QueryRuntime::Grouped(alloc::boxed::Box::new(
-            crate::reexec::maintain::GroupedMinMaxQuery::new(plan, database_reads_per_consumer),
+            crate::reexec::maintain::GroupedMinMaxQuery::new(
+                plan,
+                registration.database_reads_per_consumer,
+            ),
         ));
-        self.index_reread(subscription_id, &[table_id], session);
+        self.index_reread(subscription_id, &[table_id], registration.session);
         self.reexec.insert(
             subscription_id,
             crate::reexec::ReExecEntry {
-                consumer_id,
-                session,
+                consumer_id: registration.consumer,
+                session: registration.session,
                 tables: alloc::vec![table_id],
                 runtime,
-                sql: String::from(source_sql),
+                source_query: registration.source_query.clone(),
+                read_query,
                 tier: crate::ReadTier::GroupedScalar,
-                database_reads_per_consumer,
+                database_reads_per_consumer: registration.database_reads_per_consumer,
             },
         );
         Registered {
@@ -1707,11 +1710,8 @@ where
         &mut self,
         subscription_id: SubscriptionId,
         plan: crate::reexec::plan::MinMaxPlan<E::Backend>,
-        consumer_id: I::ConsumerId,
-        session: Option<I::SessionId>,
-        source_sql: &str,
-        database_reads_per_consumer: bool,
-    ) -> Registered {
+        registration: &RereadRegistration<'_, I, E::Backend>,
+    ) -> Registered<E::Backend> {
         let crate::reexec::plan::MinMaxPlan {
             table_id,
             kind,
@@ -1719,8 +1719,9 @@ where
             agg_kind,
             dependency_columns,
             where_program,
-            reexec_sql,
+            read_query,
         } = plan;
+        let tier_query = read_query.clone();
 
         // The answer is unknown until someone reads it, which is not the same
         // as an empty one: an unknown extreme asks rather than guessing.
@@ -1730,27 +1731,28 @@ where
                 agg_column,
                 where_program,
                 dependency_columns,
-                database_reads_per_consumer,
+                registration.database_reads_per_consumer,
             ),
         );
-        self.index_reread(subscription_id, &[table_id], session);
+        self.index_reread(subscription_id, &[table_id], registration.session);
         self.reexec.insert(
             subscription_id,
             crate::reexec::ReExecEntry {
-                consumer_id,
-                session,
+                consumer_id: registration.consumer,
+                session: registration.session,
                 tables: alloc::vec![table_id],
                 runtime,
-                sql: String::from(source_sql),
+                source_query: registration.source_query.clone(),
+                read_query,
                 tier: crate::ReadTier::Scalar,
-                database_reads_per_consumer,
+                database_reads_per_consumer: registration.database_reads_per_consumer,
             },
         );
 
         Registered {
             subscription_id,
             tier: Tier::Scalar {
-                sql: reexec_sql,
+                query: tier_query,
                 column_kind: agg_kind,
             },
             evicted: Vec::new(),
@@ -1762,38 +1764,37 @@ where
     fn capture_whole(
         &mut self,
         subscription_id: SubscriptionId,
-        plan: crate::reexec::plan::TotalPlan,
-        consumer_id: I::ConsumerId,
-        session: Option<I::SessionId>,
-        source_sql: &str,
-        database_reads_per_consumer: bool,
-    ) -> Registered {
+        plan: crate::reexec::plan::TotalPlan<E::Backend>,
+        registration: &RereadRegistration<'_, I, E::Backend>,
+    ) -> Registered<E::Backend> {
         let crate::reexec::plan::TotalPlan {
             tables,
             dependency_columns,
-            reexec_sql,
+            read_query,
         } = plan;
+        let tier_query = read_query.clone();
 
-        self.index_reread(subscription_id, &tables, session);
+        self.index_reread(subscription_id, &tables, registration.session);
         self.reexec.insert(
             subscription_id,
             crate::reexec::ReExecEntry {
-                consumer_id,
-                session,
+                consumer_id: registration.consumer,
+                session: registration.session,
                 tables: tables.clone(),
                 runtime: crate::reexec::maintain::QueryRuntime::Total(
                     crate::reexec::maintain::TotalQuery::new(dependency_columns),
                 ),
-                sql: String::from(source_sql),
+                source_query: registration.source_query.clone(),
+                read_query,
                 tier: crate::ReadTier::WholeRows,
-                database_reads_per_consumer,
+                database_reads_per_consumer: registration.database_reads_per_consumer,
             },
         );
 
         Registered {
             subscription_id,
             tier: Tier::WholeRows {
-                sql: reexec_sql,
+                query: tier_query,
                 tables,
             },
             evicted: Vec::new(),
@@ -1807,35 +1808,37 @@ where
         &mut self,
         subscription_id: SubscriptionId,
         plan: crate::reexec::plan::KeyedPlan,
-        consumer_id: I::ConsumerId,
-        session: Option<I::SessionId>,
-        source_sql: &str,
-        database_reads_per_consumer: bool,
-    ) -> Registered {
+        registration: &RereadRegistration<'_, I, E::Backend>,
+    ) -> Registered<E::Backend> {
         let table = plan.table;
-        self.index_reread(subscription_id, &[table], session);
-        let sql = alloc::format!("{}", plan.statement);
+        self.index_reread(subscription_id, &[table], registration.session);
+        let read_query = crate::reexec::BoundQuery::new(
+            alloc::format!("{}", plan.statement),
+            registration.source_query.binds().to_vec(),
+        );
+        let tier_query = read_query.clone();
         let dependency_columns = plan.dependency_columns.clone();
         self.keyed_plans.insert(subscription_id, plan);
         self.reexec.insert(
             subscription_id,
             crate::reexec::ReExecEntry {
-                consumer_id,
-                session,
+                consumer_id: registration.consumer,
+                session: registration.session,
                 tables: alloc::vec![table],
                 runtime: crate::reexec::maintain::QueryRuntime::Keyed(
                     crate::reexec::maintain::KeyedQuery::new(dependency_columns),
                 ),
-                sql: String::from(source_sql),
+                source_query: registration.source_query.clone(),
+                read_query,
                 tier: crate::ReadTier::KeyedRows,
-                database_reads_per_consumer,
+                database_reads_per_consumer: registration.database_reads_per_consumer,
             },
         );
 
         Registered {
             subscription_id,
             tier: Tier::KeyedRows {
-                sql,
+                query: tier_query,
                 table_id: table,
             },
             evicted: Vec::new(),
@@ -1851,12 +1854,12 @@ where
         checkpoint: Option<&E::Checkpoint>,
     ) -> Result<
         (
-            crate::MaintenanceTransition,
+            crate::MaintenanceTransition<E::Backend>,
             crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         ),
         DispatchError,
     > {
-        let (consumer, session, sql, database_reads_per_consumer) = {
+        let (consumer, session, source_query, database_reads_per_consumer) = {
             let entry =
                 self.reexec
                     .get(&subscription_id)
@@ -1867,12 +1870,12 @@ where
             (
                 entry.consumer_id,
                 entry.session,
-                entry.sql.clone(),
+                entry.source_query.clone(),
                 entry.database_reads_per_consumer,
             )
         };
         let plan = crate::reexec::plan::build_whole_rows_plan::<E::Backend, DB>(
-            &sql,
+            &source_query,
             &self.dialect,
             &self.database,
         )
@@ -1881,14 +1884,13 @@ where
             message: error.to_string(),
         })?;
         self.unregister_reread(subscription_id);
-        let registered = self.capture_whole(
-            subscription_id,
-            plan,
+        let registration = RereadRegistration {
             consumer,
             session,
-            &sql,
+            source_query: &source_query,
             database_reads_per_consumer,
-        );
+        };
+        let registered = self.capture_whole(subscription_id, plan, &registration);
         Ok((
             crate::MaintenanceTransition {
                 subscription_id,
@@ -1912,7 +1914,7 @@ where
         checkpoint: Option<&E::Checkpoint>,
     ) -> Result<
         (
-            crate::MaintenanceTransition,
+            crate::MaintenanceTransition<E::Backend>,
             crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         ),
         DispatchError,
@@ -1932,7 +1934,7 @@ where
         checkpoint: Option<&E::Checkpoint>,
     ) -> Result<
         (
-            crate::MaintenanceTransition,
+            crate::MaintenanceTransition<E::Backend>,
             crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         ),
         DispatchError,
@@ -1952,7 +1954,7 @@ where
         subscription_id: SubscriptionId,
         transitioned: Result<
             (
-                crate::MaintenanceTransition,
+                crate::MaintenanceTransition<E::Backend>,
                 crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
             ),
             DispatchError,
@@ -1990,7 +1992,7 @@ where
             Vec<crate::AggregateValueUpdate<I, E::Backend>>,
             Vec<crate::reexec::ScalarUpdate<I, E::Backend, E::Checkpoint>>,
             Vec<crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>>,
-            Vec<crate::MaintenanceTransition>,
+            Vec<crate::MaintenanceTransition<E::Backend>>,
         ),
         DispatchError,
     > {
@@ -2257,6 +2259,20 @@ where
         self.keyed_plans.get(&subscription_id)
     }
 
+    /// Returns the executable query for a fixed read tier.
+    #[must_use]
+    pub fn read_query(
+        &self,
+        subscription_id: SubscriptionId,
+    ) -> Option<&crate::reexec::BoundQuery<E::Backend>> {
+        let entry = self.reexec.get(&subscription_id)?;
+        matches!(
+            entry.tier,
+            crate::ReadTier::Scalar | crate::ReadTier::KeyedRows | crate::ReadTier::WholeRows
+        )
+        .then_some(&entry.read_query)
+    }
+
     /// Drop a re-read answer by id, pruning its routing and session indexes.
     pub fn unregister_reread(&mut self, subscription_id: SubscriptionId) -> bool {
         let Some(entry) = self.reexec.remove(&subscription_id) else {
@@ -2338,13 +2354,13 @@ where
                     crate::persistence::shard::expected_envelope(&self.database, *table_id)?,
                 ));
             }
-            entries.push(crate::persistence::reads::ReadEntry::<I> {
+            entries.push(crate::persistence::reads::ReadEntry::<I, E::Backend> {
                 subscription_id: *subscription_id,
                 consumer_id: entry.consumer_id,
                 scope: entry.session.map_or(SubscriptionScope::Durable, |s| {
                     SubscriptionScope::Session(s)
                 }),
-                sql: entry.sql.clone(),
+                source_query: entry.source_query.clone(),
                 tables,
                 tier: entry.tier,
                 database_reads_per_consumer: entry.database_reads_per_consumer,
@@ -2359,7 +2375,7 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let payload = crate::persistence::reads::ReadsPayload::<I> {
+        let payload = crate::persistence::reads::ReadsPayload::<I, E::Backend> {
             entries,
             created_at_unix_ms,
         };
@@ -2381,7 +2397,7 @@ where
     /// alternative is a subscription answering against a schema it no longer
     /// matches. Every restored answer comes back not knowing its value.
     #[cfg(feature = "std")]
-    fn load_reads(&mut self) -> Result<RestoredReads, StorageError> {
+    fn load_reads(&mut self) -> Result<RestoredReads<E::Backend>, StorageError> {
         let Some(storage_path) = self.storage_path.as_ref() else {
             return Ok(RestoredReads::default());
         };
@@ -2391,7 +2407,7 @@ where
         }
         let bytes = std::fs::read(&path)
             .map_err(|e| StorageError::Io(format!("Failed to read the reads file: {e}")))?;
-        let payload: crate::persistence::reads::ReadsPayload<I> =
+        let payload: crate::persistence::reads::ReadsPayload<I, E::Backend> =
             crate::persistence::reads::deserialize(&bytes)?;
 
         let mut report = RestoredReads::default();
@@ -2400,7 +2416,7 @@ where
                 Ok(restored) => report.restored.push(restored),
                 Err(reason) => report.dropped.push(DroppedRead {
                     subscription_id: entry.subscription_id,
-                    sql: entry.sql,
+                    sql: entry.source_query.sql().to_string(),
                     reason,
                 }),
             }
@@ -2416,8 +2432,8 @@ where
     )]
     fn restore_one_read(
         &mut self,
-        entry: &crate::persistence::reads::ReadEntry<I>,
-    ) -> Result<RestoredRead, DropReason> {
+        entry: &crate::persistence::reads::ReadEntry<I, E::Backend>,
+    ) -> Result<RestoredRead<E::Backend>, DropReason> {
         for (table_id, saved) in &entry.tables {
             let live = crate::persistence::shard::expected_envelope(&self.database, *table_id)
                 .map_err(|_| DropReason::TableGone {
@@ -2438,7 +2454,7 @@ where
         // was, and a schema that still fingerprints the same can still plan
         // differently (a new unique index, say).
         let planned = crate::reexec::plan::build_plan::<E::Backend, DB>(
-            &entry.sql,
+            &entry.source_query,
             &self.dialect,
             &self.database,
         )
@@ -2479,39 +2495,25 @@ where
                 ),
             });
         }
+        let registration = RereadRegistration {
+            consumer: entry.consumer_id,
+            session,
+            source_query: &entry.source_query,
+            database_reads_per_consumer: entry.database_reads_per_consumer,
+        };
         let registered = match planned {
-            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => self.capture_grouped_scalar(
-                entry.subscription_id,
-                *plan,
-                entry.consumer_id,
-                session,
-                &entry.sql,
-                entry.database_reads_per_consumer,
-            ),
-            crate::reexec::plan::QueryPlan::Partial(plan) => self.capture_scalar(
-                entry.subscription_id,
-                plan,
-                entry.consumer_id,
-                session,
-                &entry.sql,
-                entry.database_reads_per_consumer,
-            ),
-            crate::reexec::plan::QueryPlan::Keyed(plan) => self.capture_keyed(
-                entry.subscription_id,
-                *plan,
-                entry.consumer_id,
-                session,
-                &entry.sql,
-                entry.database_reads_per_consumer,
-            ),
-            crate::reexec::plan::QueryPlan::Total(plan) => self.capture_whole(
-                entry.subscription_id,
-                plan,
-                entry.consumer_id,
-                session,
-                &entry.sql,
-                entry.database_reads_per_consumer,
-            ),
+            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
+                self.capture_grouped_scalar(entry.subscription_id, *plan, &registration)
+            }
+            crate::reexec::plan::QueryPlan::Partial(plan) => {
+                self.capture_scalar(entry.subscription_id, plan, &registration)
+            }
+            crate::reexec::plan::QueryPlan::Keyed(plan) => {
+                self.capture_keyed(entry.subscription_id, *plan, &registration)
+            }
+            crate::reexec::plan::QueryPlan::Total(plan) => {
+                self.capture_whole(entry.subscription_id, plan, &registration)
+            }
         };
         // A restored id is taken, so the counter must never hand it out again.
         if entry.subscription_id >= self.next_subscription_id {
@@ -2559,7 +2561,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         sql: impl Into<String>,
-    ) -> Result<Registered, RegisterError> {
+    ) -> Result<Registered<E::Backend>, RegisterError> {
         self.register(SubscriptionRequest::new(consumer_id, sql))
     }
 
@@ -2579,7 +2581,7 @@ where
         &mut self,
         consumer_id: I::ConsumerId,
         update_sql: impl Into<String>,
-    ) -> Result<Registered, RegisterError> {
+    ) -> Result<Registered<E::Backend>, RegisterError> {
         self.register_follow_update_with_binds(consumer_id, update_sql, Vec::new())
     }
 
@@ -2594,7 +2596,7 @@ where
         consumer_id: I::ConsumerId,
         update_sql: impl Into<String>,
         binds: Vec<crate::backend::Value<E::Backend>>,
-    ) -> Result<Registered, RegisterError> {
+    ) -> Result<Registered<E::Backend>, RegisterError> {
         let update_sql = update_sql.into();
         let select_sql = crate::compiler::derive_update_follow_select(&update_sql, &self.dialect)?;
         self.register(SubscriptionRequest::new(consumer_id, select_sql).binds(binds))
@@ -2619,7 +2621,7 @@ where
         consumer_id: I::ConsumerId,
         table: &str,
         pk: Vec<crate::backend::Value<E::Backend>>,
-    ) -> Result<Registered, RegisterError> {
+    ) -> Result<Registered<E::Backend>, RegisterError> {
         let table_id = catalog_helpers::table_id(&self.database, table)
             .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
         let pk_cols = catalog_helpers::primary_key_columns(&self.database, table_id)
@@ -2736,7 +2738,7 @@ where
     pub fn register_batch(
         &mut self,
         specs: Vec<SubscriptionRequest<I, E::Backend>>,
-    ) -> Vec<Result<Registered, RegisterError>> {
+    ) -> Vec<Result<Registered<E::Backend>, RegisterError>> {
         // Eviction-aware fallback: when an active-eviction policy is
         // configured, within-batch eviction would have to consider
         // pending-but-not-yet-committed sub_ids that
@@ -2761,7 +2763,8 @@ where
         // Idempotent duplicates are short-circuited before binding creation.
         let mut compiled: Vec<Option<CompiledSpec<I, E::Backend>>> =
             Vec::with_capacity(specs.len());
-        let mut results: Vec<Result<Registered, RegisterError>> = Vec::with_capacity(specs.len());
+        let mut results: Vec<Result<Registered<E::Backend>, RegisterError>> =
+            Vec::with_capacity(specs.len());
         // Within-batch natural-key dedup. Maps the natural key of a
         // freshly-compiled, not-yet-committed binding to the result
         // index that owns it. When a later spec in the same batch
@@ -4703,7 +4706,7 @@ where
     fn register(
         &mut self,
         spec: SubscriptionRequest<I, E::Backend>,
-    ) -> Result<Registered, RegisterError> {
+    ) -> Result<Registered<E::Backend>, RegisterError> {
         Self::register(self, spec)
     }
 
@@ -5251,5 +5254,65 @@ mod tests {
             ))
             .expect("aggregate on force-only (RLS-disabled) table must register");
         assert!(result.aggregate_spec().is_some());
+    }
+    #[test]
+    fn aggregate_demotion_preserves_registration_binds_and_mode() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+        let registered = engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT COUNT(*) FROM orders WHERE amount > $1")
+                    .binds(alloc::vec![Value::Int(0)])
+                    .database_reads_per_consumer(),
+            )
+            .expect("aggregate registers");
+        assert!(matches!(registered.tier, Tier::InProcess(_)));
+
+        let (transition, _) = engine
+            .transition_aggregate_to_whole(
+                registered.subscription_id,
+                crate::MaintenanceStopReason::GroupLimit { limit: 1 },
+                None,
+            )
+            .expect("aggregate demotes");
+        let Tier::WholeRows { query, .. } = transition.to else {
+            panic!("expected whole rows")
+        };
+        assert_eq!(query.binds(), &[Value::Int(0)]);
+        let entry = engine
+            .reexec
+            .get(&registered.subscription_id)
+            .expect("whole read is stored");
+        assert!(entry.database_reads_per_consumer);
+        assert_eq!(entry.source_query.binds(), &[Value::Int(0)]);
+    }
+
+    #[test]
+    fn keyed_transition_preserves_registration_binds_and_mode() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+        let table = catalog_helpers::table_id(engine.database(), "orders").expect("orders");
+        let registered = engine
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE lower(status) = $1")
+                    .binds(alloc::vec![Value::String("paid".into())])
+                    .database_reads_per_consumer(),
+            )
+            .expect("keyed read registers");
+        assert!(matches!(registered.tier, Tier::KeyedRows { .. }));
+
+        let (transition, _) = engine
+            .transition_keyed_to_whole(registered.subscription_id, table, None)
+            .expect("keyed read transitions");
+        let Tier::WholeRows { query, .. } = transition.to else {
+            panic!("expected whole rows")
+        };
+        assert_eq!(query.binds(), &[Value::String("paid".into())]);
+        let entry = engine
+            .reexec
+            .get(&registered.subscription_id)
+            .expect("whole read is stored");
+        assert!(entry.database_reads_per_consumer);
+        assert_eq!(entry.source_query.binds(), &[Value::String("paid".into())]);
     }
 }
