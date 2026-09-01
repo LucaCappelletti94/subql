@@ -1548,7 +1548,7 @@ CREATE POLICY notes_p ON notes USING (
             .unwrap();
         let (relations, naming, answers) = (
             translation.relations().to_vec(),
-            translation.row_naming(),
+            translation.row_naming().to_vec(),
             translation.action_relations(),
         );
         drop(translation);

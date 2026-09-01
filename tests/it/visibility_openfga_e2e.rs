@@ -75,7 +75,7 @@ fn wiring(sql: &str) -> Wiring {
             .expect("the visibility schema translates");
         (
             translation.relations().to_vec(),
-            translation.row_naming(),
+            translation.row_naming().to_vec(),
             translation.notes().to_vec(),
             translation.action_relations(),
         )
