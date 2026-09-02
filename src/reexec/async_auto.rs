@@ -1645,7 +1645,7 @@ mod tests {
         )
         .is_ok());
 
-        let events = vec![
+        let events = [
             delete_event(tid, 1, 5.0),
             delete_event(tid, 2, 5.0),
             delete_event(tid, 3, 5.0),
