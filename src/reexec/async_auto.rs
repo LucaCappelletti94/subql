@@ -498,7 +498,7 @@ where
     /// so a dropped future loses nothing. A read with nothing to ask is
     /// dequeued with its debounce stamp moved, as if it had been read.
     fn plan_pending_jobs(&mut self) -> Vec<PlannedJob<I, E::Checkpoint, E::Backend>> {
-        let snapshot = self.pending_reads.clone();
+        let snapshot = self.pending_reads.snapshot();
         let mut jobs = Vec::with_capacity(snapshot.len());
         for trigger in snapshot {
             if let Some(job) = self.plan_job(&trigger) {
