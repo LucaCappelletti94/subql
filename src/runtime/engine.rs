@@ -49,11 +49,7 @@ use std::sync::{Mutex, OnceLock};
 const RLS_AGGREGATE_NEEDS_DATABASE_READ: &str =
     "aggregate on RLS table requires database re-execution";
 
-type BatchEntries<I, B> = Vec<(
-    Predicate<B>,
-    Vec<IndexableAtom>,
-    Vec<SubscriptionBinding<I>>,
-)>;
+type BatchEntries<I, B> = Vec<(Predicate<B>, Vec<SubscriptionBinding<I>>)>;
 
 /// Per-subscription activity counters used by activity-aware eviction
 /// policies (e.g. `EvictLeastActive`, `EvictColdest`) to decide which
@@ -939,7 +935,7 @@ where
     fn make_predicate_from_compiled(
         database: &DB,
         compiled: &CompiledSpec<I, E::Backend>,
-    ) -> (Predicate<E::Backend>, Vec<IndexableAtom>) {
+    ) -> Predicate<E::Backend> {
         let atoms = Self::index_atoms_from_plan(&compiled.prefilter_plan);
 
         // For aggregate subscriptions that read a column (SUM/AVG/COUNT(col)/
@@ -983,7 +979,7 @@ where
             QueryProjection::Rows | QueryProjection::Aggregate(_) => None,
         };
 
-        let pred = Predicate {
+        Predicate {
             // Placeholder. Store allocates the authoritative ID.
             id: PredicateId::from_slab_index(0),
             hash: compiled.hash,
@@ -996,8 +992,7 @@ where
             group_key_encoder,
             refcount: 0, // Will be incremented via binding
             updated_at_unix_ms: compiled.spec.updated_at_unix_ms,
-        };
-        (pred, atoms)
+        }
     }
 
     const fn make_binding(
@@ -1473,9 +1468,8 @@ where
             let existing = txn.store().find_by_hash_and_sql(hash, &compiled.normalized);
             let (pred_id, created_new) = existing.map_or_else(
                 || {
-                    let (pred, atoms) =
-                        Self::make_predicate_from_compiled(&self.database, &compiled);
-                    (txn.add_predicate(pred, &atoms), true)
+                    let pred = Self::make_predicate_from_compiled(&self.database, &compiled);
+                    (txn.add_predicate(pred), true)
                 },
                 |existing| (existing, false),
             );
@@ -2976,12 +2970,12 @@ where
                     PredicateId::from_slab_index(0),
                     consumer_ord,
                 );
-                entries[batch_idx].2.push(binding);
+                entries[batch_idx].1.push(binding);
                 // Deferred to phase 3.
                 pending_uncommitted += 1;
                 created_new = false;
             } else {
-                let (pred, atoms) = Self::make_predicate_from_compiled(&self.database, &c);
+                let pred = Self::make_predicate_from_compiled(&self.database, &c);
                 let binding = Self::make_binding(
                     &c.spec,
                     subscription_id,
@@ -2991,7 +2985,7 @@ where
 
                 let entries = table_entries.entry(c.table_id).or_default();
                 let batch_idx = entries.len();
-                entries.push((pred, atoms, vec![binding]));
+                entries.push((pred, vec![binding]));
                 batch_hash_to_idx.insert(dedup_key, batch_idx);
                 // Deferred to phase 3.
                 pending_uncommitted += 1;
@@ -3042,8 +3036,8 @@ where
                 continue;
             };
             partition.mutate(|txn| {
-                for (predicate, atoms, bindings) in &entries {
-                    let pred_id = txn.add_predicate(Predicate::clone(predicate), atoms);
+                for (predicate, bindings) in &entries {
+                    let pred_id = txn.add_predicate(Predicate::clone(predicate));
                     for binding in bindings {
                         let mut bound = *binding;
                         bound.predicate_id = pred_id;
@@ -3051,7 +3045,7 @@ where
                     }
                 }
             });
-            for (_, _, bindings) in &entries {
+            for (_, bindings) in &entries {
                 for binding in bindings {
                     self.subscription_to_table
                         .insert(binding.subscription_id, table_id);
@@ -4467,7 +4461,7 @@ where
                 refcount: 0, // incremented via bindings in add_batch
                 updated_at_unix_ms: pred_data.updated_at_unix_ms,
             };
-            entries.push((pred, atoms, bindings));
+            entries.push((pred, bindings));
         }
 
         if !bindings_by_hash.is_empty() {
@@ -4495,7 +4489,7 @@ where
         self.binding_dedup
             .retain(|_, sub_id| self.subscription_to_table.contains_key(sub_id));
         // Rebuild from loaded entries.
-        for (pred, _, bindings) in entries {
+        for (pred, bindings) in entries {
             for binding in bindings {
                 self.subscription_to_table
                     .insert(binding.subscription_id, table_id);
@@ -4519,8 +4513,8 @@ where
         let (consumer_dict, entries) = self.rebuild_entries_from_payload(table_id, payload)?;
         let mut partition = TablePartition::new(table_id);
         partition.mutate(|txn| {
-            for (predicate, atoms, bindings) in &entries {
-                let pred_id = txn.add_predicate(Predicate::clone(predicate), atoms);
+            for (predicate, bindings) in &entries {
+                let pred_id = txn.add_predicate(Predicate::clone(predicate));
                 for binding in bindings {
                     let mut bound = *binding;
                     bound.predicate_id = pred_id;
