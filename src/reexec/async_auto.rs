@@ -90,9 +90,13 @@ type KeyedRows<B> = Vec<(Vec<Value<B>>, Vec<Value<B>>)>;
 /// One queued read paired with the job phase one planned for it.
 type PlannedJob<I, C, B> = (super::ReExecutionTrigger<I, C, B>, ResolveJob<B>);
 
-/// One concurrent read's outcome, entering phase three.
-type ReadOutcome<I, C, B, E> =
-    Result<(super::ReExecutionTrigger<I, C, B>, Resolved<B>), ReExecError<E>>;
+/// One concurrent read's outcome, entering phase three. The trigger travels
+/// with the failure too, so phase three can drop a read whose failure is
+/// not retryable.
+type ReadOutcome<I, C, B, E> = Result<
+    (super::ReExecutionTrigger<I, C, B>, Resolved<B>),
+    (super::ReExecutionTrigger<I, C, B>, ReExecError<E>),
+>;
 
 /// Every outcome of one concurrent drain iteration, in completion order.
 type ReadOutcomes<I, C, B, E> = Vec<ReadOutcome<I, C, B, E>>;
@@ -412,10 +416,13 @@ where
     ///
     /// The reads of one drain iteration run concurrently, at most
     /// [`with_max_concurrent_reexecutions`](Self::with_max_concurrent_reexecutions)
-    /// in flight (unbounded when not configured). A read that fails stays
-    /// queued and the next `resolve` retries it. Reads that succeeded in the
-    /// same iteration are still installed and delivered before the failure
-    /// is reported.
+    /// in flight (unbounded when not configured). A read whose database
+    /// call fails stays queued and the next `resolve` retries it. A read
+    /// whose answer fails to install is already dequeued when the install
+    /// runs, matching the sync engine: install failures are not retryable,
+    /// per [`ReExecError::is_retryable`](super::ReExecError::is_retryable).
+    /// Reads that succeeded in the same iteration are still installed and
+    /// delivered before the failure is reported.
     ///
     /// Dropping the returned future loses nothing: engine state moves only
     /// between awaits, keys are copied rather than taken, and a read is
@@ -522,7 +529,7 @@ where
         let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
         let answer = match job {
             ResolveJob::Whole { query, generation } => {
-                Self::stream_whole(
+                match Self::stream_whole(
                     connector,
                     shared_sink,
                     &trigger,
@@ -531,26 +538,33 @@ where
                     max_page_bytes,
                     auth,
                 )
-                .await?;
-                Resolved::WholeStreamed
+                .await
+                {
+                    Ok(()) => Resolved::WholeStreamed,
+                    Err(error) => return Err((trigger, error)),
+                }
             }
             other => {
-                Self::run_job(
+                match Self::run_job(
                     connector,
                     other,
                     trigger.subscription_id,
                     max_page_bytes,
                     auth,
                 )
-                .await?
+                .await
+                {
+                    Ok(answer) => answer,
+                    Err(error) => return Err((trigger, error)),
+                }
             }
         };
         Ok((trigger, answer))
     }
 
     /// Phase three, between awaits so it cannot be interrupted: install and
-    /// deliver the successes, keep the failures queued, and report the
-    /// first failure.
+    /// deliver the successes, keep the retryable failures queued, drop the
+    /// non-retryable ones, and report the first failure.
     fn apply_outcomes<S>(
         &mut self,
         resolved: ReadOutcomes<I, E::Checkpoint, E::Backend, X::Error>,
@@ -567,7 +581,13 @@ where
                     self.apply_answer(&trigger, answer, sink)?;
                     self.stamp_reexec(trigger.subscription_id, &trigger.read);
                 }
-                Err(error) => {
+                Err((trigger, error)) => {
+                    // The same read returns the same mismatched answer, so a
+                    // non-retryable failure is dropped exactly as the sync
+                    // engine drops it.
+                    if !error.is_retryable() {
+                        self.dequeue_read(&trigger);
+                    }
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -1105,6 +1125,9 @@ mod tests {
         /// Pages a whole re-read serves, front first. Empty means the mock
         /// holds no cursors and `open_cursor` refuses.
         cursor_pages: Mutex<Vec<crate::reexec::RowPage<Postgres>>>,
+        /// Pages `read_page` serves, popped from the back like `values`.
+        /// Empty keeps the historic refusal, which the scalar tests rely on.
+        pages: Mutex<Vec<crate::reexec::RowPage<Postgres>>>,
         /// Fetch index that suspends once before serving, so a test can drop
         /// a resolve future between pages.
         pend_fetch_at: Mutex<Option<usize>>,
@@ -1124,6 +1147,7 @@ mod tests {
                 cursor_queries: Mutex::new(Vec::new()),
                 pend_next_read: Mutex::new(false),
                 cursor_pages: Mutex::new(Vec::new()),
+                pages: Mutex::new(Vec::new()),
                 pend_fetch_at: Mutex::new(None),
                 fetch_count: Mutex::new(0),
                 log: Arc::new(Mutex::new(Vec::new())),
@@ -1131,6 +1155,9 @@ mod tests {
         }
         fn call_count(&self) -> usize {
             *self.call_count.lock()
+        }
+        fn push_page(&self, page: crate::reexec::RowPage<Postgres>) {
+            self.pages.lock().push(page);
         }
     }
 
@@ -1200,7 +1227,14 @@ mod tests {
         > + Send {
             async move {
                 self.page_queries.lock().push(query.clone().into_owned());
-                Err(MockError("read_page is not exercised by the scalar tests"))
+                let popped = self.pages.lock().pop();
+                let Some(page) = popped else {
+                    return Err(MockError("read_page is not exercised by the scalar tests"));
+                };
+                Ok(Snapshot {
+                    value: page,
+                    checkpoint: None,
+                })
             }
         }
 
@@ -1428,6 +1462,7 @@ mod tests {
     #[test]
     fn async_scalar_event_forwards_registration_binds() {
         let (mut engine, table) = engine_with_values(vec![Value::Float(9.0)]);
+
         let subscription = engine
             .register(
                 SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders WHERE quantity > $1")
@@ -1454,6 +1489,78 @@ mod tests {
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].binds(), &[Value::Int(0)]);
         drop(queries);
+    }
+
+    /// The async twin of the sync drop-on-install-failure contract: a
+    /// grouped re-read answering the wrong row count can never install, so
+    /// the failing read is dropped in phase three rather than staying queued
+    /// and repeating the same malformed read on every resolve.
+    #[test]
+    fn a_failed_install_drops_the_read_instead_of_requeueing_it() {
+        let (mut engine, table) = engine_with_values(Vec::new());
+        let subscription = engine
+            .register(
+                SubscriptionRequest::new(
+                    1u64,
+                    "SELECT status, MIN(price) FROM orders GROUP BY status",
+                ),
+                (),
+            )
+            .expect("grouped minimum registers")
+            .subscription_id;
+        crate::Install::install(
+            &mut engine.inner,
+            subscription,
+            crate::GroupedScalarSeedInstall {
+                rows: vec![vec![
+                    Value::String("paid".into()),
+                    Value::Float(5.0),
+                    Value::Int(2),
+                ]],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .expect("group map installs");
+        engine
+            .apply(
+                &TestEvent::<Postgres>::delete(
+                    table,
+                    vec![
+                        Value::Int(1),
+                        Value::Float(5.0),
+                        Value::Int(1),
+                        Value::String("paid".into()),
+                    ],
+                )
+                .with_pk_columns([0u16]),
+            )
+            .expect("the displacing delete dispatches");
+        assert_eq!(
+            engine.pending_read_count(),
+            1,
+            "the displacement queues one read"
+        );
+        // The re-read answers two rows for a one-group read, which can never
+        // install: retrying it would return the same malformed answer.
+        engine.connector().push_page(crate::reexec::RowPage {
+            columns: vec!["min".into(), "n".into()],
+            rows: vec![
+                vec![Value::Float(6.0), Value::Int(1)],
+                vec![Value::Float(7.0), Value::Int(1)],
+            ],
+            more: false,
+        });
+        let error = block_on(engine.resolve_collect()).unwrap_err();
+        assert!(
+            matches!(error, super::super::ReExecError::AggregateInstall(_)),
+            "the row count mismatch reports as an aggregate install failure, got {error:?}"
+        );
+        assert_eq!(
+            engine.pending_read_count(),
+            0,
+            "a non-retryable read is dropped, never requeued"
+        );
+        block_on(engine.resolve_collect()).expect("the next resolve is a clean no-op");
     }
 
     #[test]

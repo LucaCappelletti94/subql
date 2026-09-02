@@ -969,10 +969,14 @@ where
     /// Execute every queued read through the connector, delivering each
     /// installed answer into `sink` as it completes.
     ///
-    /// A read that fails stays queued together with every read behind it,
-    /// and the next `resolve` retries them. Deliveries already made stand:
-    /// their answers were installed, so retrying them would be a second
-    /// read of a current value, not a repair.
+    /// A read that fails a retryable way (a connector or cursor failure)
+    /// stays queued together with every read behind it, and the next
+    /// `resolve` retries them. A read that fails a non-retryable way, per
+    /// [`ReExecError::is_retryable`](super::ReExecError::is_retryable), is
+    /// dropped: the same read returns the same mismatched answer, and
+    /// requeueing it would block every read behind it forever. Deliveries
+    /// already made stand: their answers were installed, so retrying them
+    /// would be a second read of a current value, not a repair.
     ///
     /// # Errors
     ///
@@ -988,7 +992,9 @@ where
             match self.resolve_one(&trigger, &mut sink) {
                 Ok(()) => self.stamp_reexec(trigger.subscription_id, &trigger.read),
                 Err(error) => {
-                    self.pending_reads.insert(0, trigger);
+                    if error.is_retryable() {
+                        self.pending_reads.insert(0, trigger);
+                    }
                     return Err(error);
                 }
             }
@@ -1605,6 +1611,9 @@ mod tests {
         /// Pages a whole re-read serves, front first. Empty means the mock
         /// holds no cursors and `open_cursor` refuses.
         cursor_pages: RefCell<alloc::vec::Vec<super::super::RowPage<Postgres>>>,
+        /// Pages `read_page` serves, popped from the back like `values`.
+        /// Empty keeps the historic refusal, which the scalar tests rely on.
+        pages: RefCell<alloc::vec::Vec<super::super::RowPage<Postgres>>>,
         /// Interleaving log shared with the test's sink.
         log: alloc::rc::Rc<RefCell<alloc::vec::Vec<&'static str>>>,
     }
@@ -1618,11 +1627,15 @@ mod tests {
                 page_queries: RefCell::new(alloc::vec::Vec::new()),
                 cursor_queries: RefCell::new(alloc::vec::Vec::new()),
                 cursor_pages: RefCell::new(alloc::vec::Vec::new()),
+                pages: RefCell::new(alloc::vec::Vec::new()),
                 log: alloc::rc::Rc::new(RefCell::new(alloc::vec::Vec::new())),
             }
         }
         fn call_count(&self) -> usize {
             self.calls.borrow().len()
+        }
+        fn push_page(&self, page: super::super::RowPage<Postgres>) {
+            self.pages.borrow_mut().push(page);
         }
     }
 
@@ -1676,7 +1689,14 @@ mod tests {
             self.page_queries
                 .borrow_mut()
                 .push(query.clone().into_owned());
-            Err(MockError("read_page is not exercised by the scalar tests"))
+            let popped = self.pages.borrow_mut().pop();
+            let Some(page) = popped else {
+                return Err(MockError("read_page is not exercised by the scalar tests"));
+            };
+            Ok(super::super::connector::Snapshot {
+                value: page,
+                checkpoint: None,
+            })
         }
 
         fn open_cursor(
@@ -2551,6 +2571,80 @@ mod tests {
             2,
             "one queued read per displaced group, never coalesced across groups"
         );
+    }
+
+    /// An install failure is deterministic: the database answer does not
+    /// match the subscription, and the same read returns the same answer.
+    /// The failing read is dropped rather than requeued, exactly as the
+    /// resolve contract documents, so it cannot block every read behind it.
+    #[test]
+    fn a_failed_install_drops_the_read_instead_of_requeueing_it() {
+        let (mut engine, table) = engine_with_values(Vec::new());
+        let subscription = engine
+            .register(
+                SubscriptionRequest::new(
+                    1u64,
+                    "SELECT status, MIN(price) FROM orders GROUP BY status",
+                ),
+                (),
+            )
+            .expect("grouped minimum registers")
+            .subscription_id;
+        crate::Install::install(
+            &mut engine.inner,
+            subscription,
+            crate::GroupedScalarSeedInstall {
+                rows: vec![vec![
+                    Value::String("paid".into()),
+                    Value::Float(5.0),
+                    Value::Int(2),
+                ]],
+                read_at: None::<crate::NoCheckpoint>,
+            },
+        )
+        .expect("group map installs");
+        engine
+            .apply(
+                &TestEvent::<Postgres>::delete(
+                    table,
+                    vec![
+                        Value::Int(1),
+                        Value::Float(5.0),
+                        Value::Int(1),
+                        Value::String("paid".into()),
+                    ],
+                )
+                .with_pk_columns([0u16]),
+            )
+            .expect("the displacing delete dispatches");
+        assert_eq!(
+            engine.pending_read_count(),
+            1,
+            "the displacement queues one read"
+        );
+        // The re-read answers two rows for a one-group read, which can never
+        // install: retrying it would return the same malformed answer.
+        engine.connector().push_page(super::super::RowPage {
+            columns: vec!["min".into(), "n".into()],
+            rows: vec![
+                vec![Value::Float(6.0), Value::Int(1)],
+                vec![Value::Float(7.0), Value::Int(1)],
+            ],
+            more: false,
+        });
+        let error = engine.resolve_collect().unwrap_err();
+        assert!(
+            matches!(error, super::super::ReExecError::AggregateInstall(_)),
+            "the row count mismatch reports as an aggregate install failure, got {error:?}"
+        );
+        assert_eq!(
+            engine.pending_read_count(),
+            0,
+            "a non-retryable read is dropped, never requeued"
+        );
+        engine
+            .resolve_collect()
+            .expect("the next resolve is a clean no-op");
     }
 
     #[test]
