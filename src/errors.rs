@@ -30,6 +30,35 @@ pub enum AdvanceCursorError {
     },
 }
 
+/// A catalog metadata lookup that could not answer.
+///
+/// Fail-closed by construction: callers must route this rather than guess a
+/// default, because guessing `false` for row-level security shares one result
+/// across viewers whose rows differ, and guessing empty metadata erases
+/// primary keys or dependency columns.
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+pub enum CatalogError {
+    /// The table id is not in the catalog.
+    #[error("table id {0} is not in the catalog")]
+    UnknownTable(TableId),
+    /// A column the catalog itself names could not be resolved.
+    #[error("column ordinal {ordinal} of table {table_id} is not in the catalog")]
+    UnknownColumn {
+        /// Table whose column list is inconsistent.
+        table_id: TableId,
+        /// Ordinal the catalog named but could not resolve.
+        ordinal: usize,
+    },
+    /// The catalog's own lookup failed.
+    #[error("catalog lookup failed for table {table_id}: {error}")]
+    Lookup {
+        /// Table the lookup was about.
+        table_id: TableId,
+        /// The underlying resolver error.
+        error: sql_traits::errors::LookupError,
+    },
+}
+
 /// Errors during subscription registration
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
@@ -71,6 +100,11 @@ pub enum RegisterError {
     /// Generic schema-resolution error reported by the underlying database.
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// A catalog metadata lookup could not answer, so the registration is
+    /// refused rather than guessed at.
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
 
     /// Subscription registry is at its configured cap and the eviction
     /// policy is [`crate::EvictionPolicy::Reject`].
@@ -180,10 +214,6 @@ pub enum DispatchError {
     #[error("Unknown table ID: {0}")]
     UnknownTableId(TableId),
 
-    /// Table arity missing in schema catalog
-    #[error("Unknown table arity for table ID: {0}")]
-    UnknownTableArity(TableId),
-
     /// Event missing required row image
     #[error("Missing required row image: {0}")]
     MissingRequiredRowImage(&'static str),
@@ -238,6 +268,11 @@ pub enum DispatchError {
         /// Planner or registry invariant that failed.
         message: String,
     },
+
+    /// A catalog metadata lookup could not answer during dispatch, so the
+    /// event is refused rather than dispatched with invented metadata.
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
 }
 
 /// Errors during persistence operations
@@ -361,8 +396,8 @@ mod tests {
             "Unknown table ID: 42"
         );
         assert_eq!(
-            DispatchError::UnknownTableArity(42).to_string(),
-            "Unknown table arity for table ID: 42"
+            DispatchError::Catalog(CatalogError::UnknownTable(42)).to_string(),
+            "table id 42 is not in the catalog"
         );
         assert_eq!(
             DispatchError::MissingRequiredRowImage("old_row").to_string(),

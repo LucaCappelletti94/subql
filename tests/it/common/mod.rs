@@ -266,11 +266,34 @@ pub fn create_pgoutput_slot(conn: &mut PgConnection, name: &str) {
     .expect("create pgoutput slot");
 }
 
+// Compiled only when a consuming test module is: the union of the gates on
+// the postgres parked-read users and the mysql container users in
+// `tests/it/main.rs`.
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+    feature = "diesel-typed-mysql",
+    feature = "apply-patchset-mysql",
+    feature = "apply-patchset-mysql-async",
+))]
 pub use mysql_maxwell_helpers::{
     maxwell_collect, mysql_8, mysql_connect, mysql_networked, mysql_port, mysql_url,
     park_a_mysql_read, park_a_read, start_maxwell, PARK,
 };
 
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-postgres-r2d2",
+    feature = "executor-diesel-mysql",
+    feature = "executor-diesel-async-mysql",
+    feature = "diesel-typed-mysql",
+    feature = "apply-patchset-mysql",
+    feature = "apply-patchset-mysql-async",
+))]
 mod mysql_maxwell_helpers {
     use super::pg_connect;
     use diesel::{Connection, MysqlConnection, PgConnection, RunQueryDsl};

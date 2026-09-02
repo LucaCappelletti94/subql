@@ -68,6 +68,13 @@ pub mod sqlite;
 #[cfg(feature = "apply-patchset-sqlite")]
 pub use sqlite::SqliteAdapter;
 
+#[cfg(any(
+    feature = "apply-patchset-postgres",
+    feature = "apply-patchset-mysql",
+    feature = "apply-patchset-sqlite"
+))]
+pub(crate) mod columns;
+
 pub(crate) mod catalog_apply;
 #[cfg(any(
     feature = "apply-patchset-postgres-async",
@@ -425,7 +432,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_inserts_updates_deletes() {
         let (engine, mut conn) = fixture();
-        let adapter = SqliteAdapter::new(engine.database());
+        let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
 
         let inserted = engine
             .apply_diffset_bytes(&insert_bytes(1, "a", 10), &mut conn, &adapter)
@@ -488,7 +495,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_rejects_unparseable_bytes() {
         let (engine, mut conn) = fixture();
-        let adapter = SqliteAdapter::new(engine.database());
+        let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
         let err = engine
             .apply_diffset_bytes(b"not a diffset", &mut conn, &adapter)
             .unwrap_err();
@@ -502,7 +509,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_rejects_unknown_table() {
         let (engine, mut conn) = fixture();
-        let adapter = SqliteAdapter::new(engine.database());
+        let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
 
         let ghost = SimpleTable::new("ghosts", &["id"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(ghost)
@@ -559,7 +566,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_composite_pk_matches_all_key_columns() {
         let (engine, mut conn) = composite_fixture();
-        let adapter = SqliteAdapter::new(engine.database());
+        let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
 
         // Two rows share the first key column but differ in the second, so
         // a WHERE that matched only column `a` would corrupt the sibling.
@@ -643,7 +650,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_patchset_cannot_relocate_a_primary_key() {
         let (engine, mut conn) = fixture();
-        let adapter = SqliteAdapter::new(engine.database());
+        let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
         engine
             .apply_diffset_bytes(&insert_bytes(1, "a", 10), &mut conn, &adapter)
             .unwrap();
@@ -703,7 +710,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_changeset_relocates_a_primary_key() {
         let (engine, mut conn) = fixture();
-        let adapter = SqliteAdapter::new(engine.database());
+        let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
         engine
             .apply_diffset_bytes(&insert_bytes(1, "a", 10), &mut conn, &adapter)
             .unwrap();
@@ -769,7 +776,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_changeset_insert_update_delete() {
         let (engine, mut conn) = fixture();
-        let adapter = SqliteAdapter::new(engine.database());
+        let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
         engine
             .apply_diffset_bytes(&insert_bytes(1, "a", 10), &mut conn, &adapter)
             .unwrap();
@@ -815,7 +822,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_with_catalog_applies_a_patchset() {
         let (catalog, mut conn) = catalog_fixture();
-        let adapter = SqliteAdapter::new(&catalog);
+        let adapter = SqliteAdapter::new(&catalog).expect("the catalog indexes");
 
         let inserted = super::apply_diffset_bytes_with_catalog(
             &catalog,
@@ -855,7 +862,7 @@ mod tests {
     #[test]
     fn apply_diffset_bytes_with_catalog_relocates_a_primary_key() {
         let (catalog, mut conn) = catalog_fixture();
-        let adapter = SqliteAdapter::new(&catalog);
+        let adapter = SqliteAdapter::new(&catalog).expect("the catalog indexes");
         super::apply_diffset_bytes_with_catalog(
             &catalog,
             &insert_bytes(1, "a", 10),

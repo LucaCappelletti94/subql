@@ -231,7 +231,7 @@ where
     // building either view. Answering "complete" here would send the
     // caller on to judge an image it cannot measure, and a wrong answer
     // in that direction is a row dropped without notice.
-    let Some(arity) = crate::catalog_helpers::table_arity(db, row.table_id()) else {
+    let Ok(arity) = crate::catalog_helpers::table_arity(db, row.table_id()) else {
         return true;
     };
     let keys = event.pk_columns(db);

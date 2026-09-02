@@ -268,9 +268,9 @@ fn catalog_table<DB: DatabaseLike>(catalog: &DB, name: &str) -> QueryResult<Simp
             "uploaded patchset names table `{name}`, which is absent from the catalog"
         ))
     })?;
-    crate::catalog_helpers::simple_table(catalog, table_id).ok_or_else(|| {
+    crate::catalog_helpers::simple_table(catalog, table_id).map_err(|error| {
         ingest_error(alloc::format!(
-            "catalog table `{name}` could not be resolved to a schema"
+            "catalog table `{name}` could not be resolved to a schema: {error}"
         ))
     })
 }

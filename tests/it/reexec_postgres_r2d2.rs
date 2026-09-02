@@ -196,8 +196,8 @@ fn r2d2_pool_drives_snapshot_and_reexec() {
         events.extend(parse_message(msg));
     }
     assert_eq!(events.len(), 1, "expected one DELETE event");
-
-    let notifs = engine.consumers(&events[0]).expect("consumers dispatch");
+    engine.apply(&events[0]).expect("apply dispatch");
+    let notifs = engine.resolve_collect().expect("consumers dispatch");
     assert_eq!(notifs.scalar_updates.len(), 1);
     assert_eq!(notifs.scalar_updates[0].value, Value::Float(9.0));
     // The re-execution LSN should be at or after the snapshot LSN
@@ -354,26 +354,27 @@ fn a_captured_query_delivers_its_rows_again_when_the_table_changes() {
     let mut finals = 0;
     let mut pages = 0;
     for event in &events {
-        let notifications = engine.consumers(event).expect("dispatch");
-        for update in &notifications.rows_updates {
-            assert_eq!(update.subscription_id, subscription_id);
-            generations.push(update.generation);
-            pages += 1;
-            if !update.more {
-                finals += 1;
-            }
-            for row in &update.rows {
-                match row[0] {
-                    Value::Int(id) => delivered.push(id),
-                    ref other => panic!("id should decode as an integer, got {other:?}"),
-                }
+        engine.apply(event).expect("apply");
+    }
+    let notifications = engine.resolve_collect().expect("dispatch");
+    for update in &notifications.rows_updates {
+        assert_eq!(update.subscription_id, subscription_id);
+        generations.push(update.generation);
+        pages += 1;
+        if !update.more {
+            finals += 1;
+        }
+        for row in &update.rows {
+            match row[0] {
+                Value::Int(id) => delivered.push(id),
+                ref other => panic!("id should decode as an integer, got {other:?}"),
             }
         }
-        assert!(
-            notifications.scalar_updates.is_empty(),
-            "this tier delivers rows, not a scalar"
-        );
     }
+    assert!(
+        notifications.scalar_updates.is_empty(),
+        "this tier delivers rows, not a scalar"
+    );
 
     delivered.sort_unstable();
     assert_eq!(
@@ -526,10 +527,11 @@ fn a_joined_capture_is_triggered_by_either_table() {
         let mut delivered = 0;
         for msg in &msgs {
             for event in parse_message(msg) {
-                let notifications = engine.consumers(&event).expect("dispatch");
-                delivered += notifications.rows_updates.len();
+                engine.apply(&event).expect("apply");
             }
         }
+        let notifications = engine.resolve_collect().expect("dispatch");
+        delivered += notifications.rows_updates.len();
         assert!(
             delivered > 0,
             "a change to the {label} should re-read the join, got no pages"
@@ -953,9 +955,9 @@ fn a_panic_during_a_read_leaves_no_transaction_behind() {
         ],
     )
     .with_pk_columns([0u16]);
-
+    engine.apply(&event).expect("apply succeeds");
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = engine.consumers(&event);
+        let _ = engine.resolve_collect();
     }));
     assert!(unwound.is_err(), "the read must have panicked");
 
@@ -1077,8 +1079,9 @@ fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
 
     let events = parse_message(r#"{"action":"U","schema":"public","table":"orders"}"#);
     let notifications = engine
-        .consumers(&events[0])
-        .expect("keyless change transitions and re-reads");
+        .apply(&events[0])
+        .expect("keyless change transitions");
+    let resolved = engine.resolve_collect().expect("keyless change re-reads");
 
     assert_eq!(notifications.transitions.len(), 1);
     assert_eq!(
@@ -1096,7 +1099,7 @@ fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
             table_id: tables[0],
         }
     );
-    let mut ids: Vec<_> = notifications
+    let mut ids: Vec<_> = resolved
         .rows_updates
         .iter()
         .flat_map(|update| &update.rows)
@@ -1107,7 +1110,7 @@ fn a_keyless_change_transitions_and_runs_the_sync_replacement_read() {
         .collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2]);
-    assert!(notifications.triggers.is_empty());
+    assert_eq!(engine.pending_read_count(), 0);
 }
 
 /// The sync wrapper seeds grouped extrema and resolves a displaced group.
@@ -1181,8 +1184,9 @@ fn grouped_min_snapshots_and_rereads_one_group_sync() {
         .iter()
         .flat_map(|message| parse_message(message))
         .collect();
-    let output = engine.consumers(&events[0]).expect("group re-read");
-    assert!(output.triggers.is_empty());
+    engine.apply(&events[0]).expect("apply");
+    let output = engine.resolve_collect().expect("group re-read");
+    assert_eq!(engine.pending_read_count(), 0, "no pending reads");
     assert_eq!(output.aggregate_updates.len(), 1);
     assert_eq!(
         output.aggregate_updates[0].group.as_ref(),

@@ -965,22 +965,16 @@ mod render_tests {
             alloc::vec![Value::Int(1), Value::Null, Value::Bytes(bytes)],
         )
         .with_pk_columns([0u16]);
-        assert_eq!(
-            engine.consumers(&hit).expect("dispatch hit").inserted(),
-            &[1u64]
-        );
-
+        let notif = engine.consumers(&hit).expect("dispatch hit");
+        assert_eq!(notif.inserted(), &[1u64]);
         let miss = TestEvent::<SQLite>::insert(
             table_id,
             alloc::vec![Value::Int(2), Value::Null, Value::Bytes(alloc::vec![0x00])],
         )
         .with_pk_columns([0u16]);
+        let notif = engine.consumers(&miss).expect("dispatch miss");
         assert!(
-            engine
-                .consumers(&miss)
-                .expect("dispatch miss")
-                .inserted()
-                .is_empty(),
+            notif.inserted().is_empty(),
             "wrong payload bytes notified no consumer"
         );
     }
@@ -1029,11 +1023,8 @@ mod render_tests {
             ],
         )
         .with_pk_columns([0u16]);
-        assert_eq!(
-            engine.consumers(&hit).expect("dispatch hit").inserted(),
-            &[1u64]
-        );
-
+        let notif = engine.consumers(&hit).expect("dispatch hit");
+        assert_eq!(notif.inserted(), &[1u64]);
         let miss = TestEvent::<SQLite>::insert(
             table_id,
             alloc::vec![
@@ -1043,12 +1034,9 @@ mod render_tests {
             ],
         )
         .with_pk_columns([0u16]);
+        let notif = engine.consumers(&miss).expect("dispatch miss");
         assert!(
-            engine
-                .consumers(&miss)
-                .expect("dispatch miss")
-                .inserted()
-                .is_empty(),
+            notif.inserted().is_empty(),
             "wrong payload bytes notified no consumer"
         );
     }

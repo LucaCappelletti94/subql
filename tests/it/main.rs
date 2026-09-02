@@ -52,6 +52,10 @@ mod apply_patchset_sqlite_e2e;
 #[cfg(feature = "membership-term")]
 mod caller_term;
 
+#[cfg(any(
+    feature = "executor-diesel-postgres",
+    feature = "executor-diesel-mysql"
+))]
 mod canonical_group_key_equivalence;
 
 mod cdc_cross_db;

@@ -227,7 +227,7 @@ where
             return Ok(output);
         }
 
-        let arity = catalog_helpers::table_arity(&self.database, table_id).unwrap_or(0);
+        let arity = catalog_helpers::table_arity(&self.database, table_id)?;
         let partition = self
             .partitions
             .get(&table_id)

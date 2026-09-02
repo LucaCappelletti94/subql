@@ -228,7 +228,10 @@ proptest! {
             .enable_time()
             .build()
             .unwrap();
-        let outcome = runtime.block_on(engine.consumers_batch(&events)).unwrap();
+        for event in &events {
+            engine.apply(event).unwrap();
+        }
+        let outcome = runtime.block_on(engine.resolve_collect()).unwrap();
 
         let peak = engine.connector().peak();
         let total = engine.connector().total_calls();

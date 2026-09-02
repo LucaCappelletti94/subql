@@ -143,7 +143,7 @@ impl CdcEvent for ChangeEvent {
         let Some(table_id) = event_table_id(self, db) else {
             return Vec::new();
         };
-        let Some(arity) = catalog_helpers::table_arity(db, table_id) else {
+        let Ok(arity) = catalog_helpers::table_arity(db, table_id) else {
             return Vec::new();
         };
         // Derive only when both images cover every column (REPLICA

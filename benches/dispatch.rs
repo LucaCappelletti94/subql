@@ -668,6 +668,32 @@ fn registration_benchmark(c: &mut Criterion) {
         );
     });
 
+    // Registration into a preloaded engine. A registration that deep-clones
+    // the predicate store pays for every predicate already held, so these
+    // sizes make any per-mutation clone cost scale visibly.
+    for preload in [128_usize, 1_024] {
+        group.bench_with_input(
+            BenchmarkId::new("new_predicate_preloaded", preload),
+            &preload,
+            |b, &preload| {
+                let mut next_seed = 0xE0E0_u64;
+                b.iter_batched(
+                    || {
+                        let engine = build_scaling_engine(preload);
+                        let seed = next_seed;
+                        next_seed = next_seed.wrapping_add(1);
+                        (engine, seed)
+                    },
+                    |(mut engine, seed)| {
+                        let spec = SubscriptionRequest::new(9_999, realistic_tree_sql(seed));
+                        black_box(engine.register(spec).unwrap());
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
     group.finish();
 }
 

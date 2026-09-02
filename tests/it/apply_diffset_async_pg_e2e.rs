@@ -81,7 +81,7 @@ fn diffset_bytes_async_applies_patchset_bytes() {
             .expect("async pg connect");
 
         let engine = engine();
-        let adapter = PgAdapter::new(engine.database());
+        let adapter = PgAdapter::new(engine.database()).expect("the catalog indexes");
         let table = items_table();
 
         // Two inserts, serialized to SQLite session patchset bytes in memory.
@@ -180,7 +180,7 @@ fn apply_changeset_async_relocates_primary_key() {
             .expect("async pg connect");
 
         let engine = engine();
-        let adapter = PgAdapter::new(engine.database());
+        let adapter = PgAdapter::new(engine.database()).expect("the catalog indexes");
 
         let changeset = ChangeSet::<SimpleTable, String, Vec<u8>>::new().update(
             Update::<_, ChangesetFormat, String, Vec<u8>>::from(items_table())
@@ -237,7 +237,7 @@ fn diffset_bytes_async_applies_changeset_bytes_pk_change() {
             .expect("async pg connect");
 
         let engine = engine();
-        let adapter = PgAdapter::new(engine.database());
+        let adapter = PgAdapter::new(engine.database()).expect("the catalog indexes");
 
         let changeset_bytes = ChangeSet::<SimpleTable, String, Vec<u8>>::new()
             .update(

@@ -125,7 +125,10 @@ fn row_delta_install_adds_the_registered_identity_and_consumer() {
 
     assert_eq!(deltas[0].subscription_id, registered.subscription_id);
     assert_eq!(deltas[0].consumer_id, 9);
-    assert_eq!(deltas[0].columns, vec!["id", "price", "status"]);
+    assert_eq!(
+        deltas[0].columns.as_ref(),
+        ["id", "price", "status"].map(String::from)
+    );
 }
 
 #[test]

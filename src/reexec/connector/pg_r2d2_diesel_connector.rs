@@ -20,7 +20,7 @@ use thiserror::Error;
 /// transaction for LSN-anchored snapshots.
 ///
 /// Use this connector when the engine dispatches re-executions
-/// concurrently (the async engine with `consumers_batch`) or when
+/// concurrently (the async engine resolving a burst of reads) or when
 /// snapshots may interleave with CDC re-executions. Each call to
 /// [`execute_scalar`](Connector::execute_scalar) borrows a connection
 /// from the pool for the duration of the transaction and releases it on

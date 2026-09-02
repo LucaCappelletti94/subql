@@ -17,8 +17,10 @@ use alloc::boxed::Box;
 
 use diesel::result::Error as DieselError;
 use diesel::sqlite::Sqlite;
-use sql_traits::prelude::{ColumnLike, DatabaseLike, TableLike};
+use sql_traits::prelude::{ColumnLike, DatabaseLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
+
+use super::columns::{unknown_column_error, ColumnIndex};
 
 /// Adapter that resolves column names for a SQLite target from a subql
 /// catalog and delegates every bind to
@@ -28,22 +30,22 @@ use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 /// so no per-column dispatch is needed. See the module docs.
 #[derive(Debug)]
 pub struct SqliteAdapter<'db, DB: DatabaseLike> {
-    catalog: &'db DB,
+    columns: ColumnIndex<'db, DB>,
 }
 
 impl<'db, DB: DatabaseLike> SqliteAdapter<'db, DB> {
-    /// Build a new [`SqliteAdapter`] borrowing the given catalog.
-    #[must_use]
-    pub const fn new(catalog: &'db DB) -> Self {
-        Self { catalog }
-    }
-
-    fn column_at(&self, table_name: &str, index: usize) -> Option<&DB::Column> {
-        let table = self
-            .catalog
-            .tables()
-            .find(|t| t.table_name() == table_name)?;
-        table.columns(self.catalog).ok()?.nth(index)
+    /// Index the catalog once and build the adapter over the index.
+    ///
+    /// After construction the adapter holds no catalog handle at all, so
+    /// no lookup can walk the catalog again.
+    ///
+    /// # Errors
+    /// [`CatalogError`](crate::CatalogError) when the catalog fails to
+    /// yield a table's columns.
+    pub fn new(catalog: &'db DB) -> Result<Self, crate::CatalogError> {
+        Ok(Self {
+            columns: ColumnIndex::new(catalog)?,
+        })
     }
 }
 
@@ -54,16 +56,67 @@ where
     B: AsRef<[u8]> + Sync,
 {
     fn column_name(&self, table_name: &str, column_index: usize) -> &str {
-        self.column_at(table_name, column_index)
+        self.columns
+            .column_at(table_name, column_index)
             .map_or("", ColumnLike::column_name)
     }
 
     fn bind<'a>(
         &self,
-        _table_name: &str,
-        _column_index: usize,
+        table_name: &str,
+        column_index: usize,
         value: &'a Value<S, B>,
     ) -> Result<Box<dyn Binder<Sqlite> + Send + 'a>, DieselError> {
+        if self.columns.column_at(table_name, column_index).is_none() {
+            return Err(unknown_column_error(table_name, column_index));
+        }
         Ok(Box::new(DefaultBinder::from(value)))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    use diesel::sqlite::Sqlite;
+    use sql_traits::structs::ParserDB;
+    use sqlite_diff_rs::{Adapter, Value};
+    use sqlparser::dialect::SQLiteDialect;
+
+    use super::SqliteAdapter;
+
+    fn catalog() -> ParserDB {
+        ParserDB::parse::<SQLiteDialect>("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap()
+    }
+
+    /// A column or table the catalog does not know is refused at bind time
+    /// with an error naming the lookup, never silently bound with a default.
+    #[test]
+    fn an_unknown_column_is_refused_at_bind() {
+        let db = catalog();
+        let adapter = SqliteAdapter::new(&db).expect("the catalog indexes");
+
+        let err =
+            Adapter::<Sqlite, String, Vec<u8>>::bind(&adapter, "items", 9, &Value::Integer(1))
+                .map(drop)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("items") && err.contains('9'),
+            "the refusal names the table and the column index, got {err:?}"
+        );
+
+        let err =
+            Adapter::<Sqlite, String, Vec<u8>>::bind(&adapter, "ghosts", 0, &Value::Integer(1))
+                .map(drop)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("ghosts"),
+            "the refusal names the unknown table, got {err:?}"
+        );
     }
 }

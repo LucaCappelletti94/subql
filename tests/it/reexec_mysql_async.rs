@@ -209,7 +209,8 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
         let event =
             TestEvent::<MySql>::delete(table_id, orders_row(1, 5.0)).with_pk_columns([0u16]);
 
-        let notifs = engine.consumers(&event).await.expect("consumers dispatch");
+        engine.apply(&event).expect("apply");
+        let notifs = engine.resolve_collect().await.expect("consumers dispatch");
         assert_eq!(
             notifs.scalar_updates.len(),
             1,
@@ -223,8 +224,8 @@ fn delete_displacing_extreme_resolves_via_mysql_async_connector() {
             "connector re-queried live MySQL for the new MIN"
         );
         assert!(
-            notifs.triggers.is_empty(),
-            "auto-resolving engine drains triggers"
+            notifs.transitions.is_empty(),
+            "a plain scalar re-read changes no tier"
         );
     });
 }

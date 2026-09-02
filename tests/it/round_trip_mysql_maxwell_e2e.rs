@@ -439,7 +439,7 @@ fn finish_loop(
     let sqlite_catalog = ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).unwrap();
     let sqlite_engine: SubscriptionEngine<TestEvent<SqliteBackend>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(sqlite_catalog, SQLiteDialect {});
-    let sqlite_adapter = SqliteAdapter::new(sqlite_engine.database());
+    let sqlite_adapter = SqliteAdapter::new(sqlite_engine.database()).expect("the catalog indexes");
 
     sqlite_engine
         .apply_patchset(seed, &mut sqlite, &sqlite_adapter)
@@ -473,7 +473,7 @@ fn finish_loop(
 
     let my_engine: SubscriptionEngine<MaxwellMessage, DefaultIds, ParserDB> =
         SubscriptionEngine::new(subql_catalog(), MySqlDialect {});
-    let my_adapter = MysqlAdapter::new(my_engine.database());
+    let my_adapter = MysqlAdapter::new(my_engine.database()).expect("the catalog indexes");
 
     my_engine.apply_patchset(seed, my, &my_adapter).unwrap();
     assert_eq!(load_mysql(my), seed_mysql_rows(), "MySQL after re-seed");

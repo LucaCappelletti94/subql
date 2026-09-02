@@ -71,7 +71,7 @@ fn apply_patchset_async_bool_roundtrip_insert_update_delete_mysql() {
 
         // SQLite session table descriptor. Column 0 is the PK.
         let things = SimpleTable::new("things", &["id", "active"], &[0]);
-        let adapter = MysqlAdapter::new(engine.database());
+        let adapter = MysqlAdapter::new(engine.database()).expect("the catalog indexes");
 
         // Round 1: INSERT id=1 active=true, INSERT id=2 active=false.
         let inserts = PatchSet::<SimpleTable, String, Vec<u8>>::new()

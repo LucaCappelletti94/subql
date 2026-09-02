@@ -1,6 +1,8 @@
 //! Subscription traits and notification output types.
 
-use super::domain_id_types::{ColumnId, MergeJobId, TableId};
+#[cfg(feature = "std")]
+use super::domain_id_types::MergeJobId;
+use super::domain_id_types::{ColumnId, TableId};
 use super::generic_id_types::{IdTypes, SubscriptionId};
 #[cfg(feature = "std")]
 use super::subscription_types::MergeReport;

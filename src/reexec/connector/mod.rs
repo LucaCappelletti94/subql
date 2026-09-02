@@ -66,7 +66,14 @@ mod pg_r2d2_diesel_connector;
 #[cfg(feature = "executor-diesel")]
 pub use diesel_backend::DieselBackend;
 #[cfg(feature = "executor-diesel")]
-pub use diesel_connector::{DieselConnector, FloatRow, IntRow, TextRow};
+pub use diesel_connector::DieselConnector;
+// The scalar row shapes travel to the async connectors only, so the
+// re-export follows their backend features rather than `executor-diesel`.
+#[cfg(any(
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-async-mysql"
+))]
+pub use diesel_connector::{FloatRow, IntRow, TextRow};
 #[cfg(any(
     feature = "executor-diesel-mysql",
     feature = "executor-diesel-async-mysql"
@@ -554,9 +561,9 @@ where
     Ok(())
 }
 
-/// Error returned by [`AutoResolvingEngine::consumers`].
+/// Error returned by [`AutoResolvingEngine::resolve`].
 ///
-/// [`AutoResolvingEngine::consumers`]: super::AutoResolvingEngine::consumers
+/// [`AutoResolvingEngine::resolve`]: super::AutoResolvingEngine::resolve
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ReExecError<E> {
@@ -620,7 +627,7 @@ pub enum ScalarRowError<E> {
 /// `FETCH` round trip.
 #[cfg(any(
     feature = "executor-diesel-postgres-r2d2",
-    feature = "executor-diesel-async"
+    feature = "executor-diesel-async-postgres"
 ))]
 pub(super) fn drain_cursor_buffer<B: crate::backend::Backend>(
     leftover: &mut alloc::collections::VecDeque<alloc::vec::Vec<Value<B>>>,

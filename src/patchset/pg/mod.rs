@@ -52,12 +52,11 @@ use alloc::boxed::Box;
 use diesel::pg::Pg;
 use diesel::result::Error as DieselError;
 use sql_scalar_text::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
-use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TableLike, TypeMatchLike};
+use sql_traits::prelude::{ColumnLike, DatabaseLike, DialectLike, TypeMatchLike};
 use sqlite_diff_rs::{Adapter, Binder, DefaultBinder, Value};
 
 use crate::backend::{BuiltinKind, ScalarKindOf};
-use crate::catalog_helpers;
-use crate::types::ColumnId;
+use crate::patchset::columns::{unknown_column_error, ColumnIndex};
 
 pub(crate) mod binders;
 pub(crate) mod custom_type;
@@ -78,21 +77,26 @@ pub use custom_type::{bind_as, CustomTypePgAdapter, PgCustomBinder};
 #[derive(Debug)]
 pub struct PgAdapter<'db, DB: DatabaseLike> {
     catalog: &'db DB,
+    columns: ColumnIndex<'db, DB>,
 }
 
 impl<'db, DB: DatabaseLike> PgAdapter<'db, DB> {
-    /// Build a new [`PgAdapter`] borrowing the given catalog.
-    #[must_use]
-    pub const fn new(catalog: &'db DB) -> Self {
-        Self { catalog }
+    /// Index the catalog once and build the adapter over the index. The
+    /// catalog handle is kept only for per-column type classification,
+    /// which never walks the schema.
+    ///
+    /// # Errors
+    /// [`CatalogError`](crate::CatalogError) when the catalog fails to
+    /// yield a table's columns.
+    pub fn new(catalog: &'db DB) -> Result<Self, crate::CatalogError> {
+        Ok(Self {
+            catalog,
+            columns: ColumnIndex::new(catalog)?,
+        })
     }
 
-    fn column_at(&self, table_name: &str, index: usize) -> Option<&DB::Column> {
-        let table = self
-            .catalog
-            .tables()
-            .find(|t| t.table_name() == table_name)?;
-        table.columns(self.catalog).ok()?.nth(index)
+    fn column_at(&self, table_name: &str, index: usize) -> Option<&'db DB::Column> {
+        self.columns.column_at(table_name, index)
     }
 
     /// Classify the target column through the catalog's [`crate::backend::ScalarKind`],
@@ -104,12 +108,9 @@ impl<'db, DB: DatabaseLike> PgAdapter<'db, DB> {
         table_name: &str,
         column_index: usize,
     ) -> Option<ScalarKindOf<crate::backend::Postgres>> {
-        let table_id = catalog_helpers::table_id(self.catalog, table_name)?;
-        let column_id = ColumnId::try_from(column_index).ok()?;
-        catalog_helpers::column_scalar_kind::<crate::backend::Postgres, _>(
-            self.catalog,
-            table_id,
-            column_id,
+        let column = self.column_at(table_name, column_index)?;
+        crate::catalog_helpers::classify_scalar_kind::<crate::backend::Postgres>(
+            &column.data_type(self.catalog),
         )
     }
 
@@ -144,7 +145,7 @@ where
         value: &'a Value<S, B>,
     ) -> Result<Box<dyn Binder<Pg> + Send + 'a>, DieselError> {
         let Some(col) = self.column_at(table_name, column_index) else {
-            return Ok(Box::new(DefaultBinder::from(value)));
+            return Err(unknown_column_error(table_name, column_index));
         };
         let dialect = self.catalog.dialect();
         let col_name = col.column_name();
@@ -266,5 +267,52 @@ where
         }
         Value::Null => Ok(Box::new(DefaultBinder::from(value))),
         other => Err(bind_error(col_name, expected, shape_of(other))),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    use diesel::pg::Pg;
+    use sql_traits::structs::ParserDB;
+    use sqlite_diff_rs::{Adapter, Value};
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    use super::PgAdapter;
+
+    fn catalog() -> ParserDB {
+        ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE things (id BIGINT PRIMARY KEY, active BOOLEAN);",
+        )
+        .unwrap()
+    }
+
+    /// A column or table the catalog does not know is refused at bind time
+    /// with an error naming the lookup, never silently bound with a default.
+    #[test]
+    fn an_unknown_column_is_refused_at_bind() {
+        let db = catalog();
+        let adapter = PgAdapter::new(&db).expect("the catalog indexes");
+
+        let err = Adapter::<Pg, String, Vec<u8>>::bind(&adapter, "things", 9, &Value::Integer(1))
+            .map(drop)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("things") && err.contains('9'),
+            "the refusal names the table and the column index, got {err:?}"
+        );
+
+        let err = Adapter::<Pg, String, Vec<u8>>::bind(&adapter, "ghosts", 0, &Value::Integer(1))
+            .map(drop)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ghosts"),
+            "the refusal names the unknown table, got {err:?}"
+        );
     }
 }

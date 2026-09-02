@@ -442,8 +442,9 @@ fn assert_sync_scalar_authorization() {
     let event =
         TestEvent::<Postgres>::insert(table, vec![Value::Int(3), Value::String("paid".into())])
             .with_pk_columns([0u16]);
+    engine.apply(&event).expect("apply");
     let mut updates = engine
-        .consumers(&event)
+        .resolve_collect()
         .expect("scalar reads resolve")
         .scalar_updates;
     updates.sort_by_key(|update| update.consumer_id);
@@ -469,8 +470,9 @@ fn assert_sync_grouped_authorization() {
     let event =
         TestEvent::<Postgres>::insert(table, vec![Value::Int(3), Value::String("paid".into())])
             .with_pk_columns([0u16]);
+    engine.apply(&event).expect("apply");
     let mut updates = engine
-        .consumers(&event)
+        .resolve_collect()
         .expect("grouped reads resolve")
         .aggregate_updates;
     updates.sort_by_key(|update| update.consumer);
@@ -515,8 +517,9 @@ fn assert_sync_count_authorization() {
     let event =
         TestEvent::<Postgres>::insert(table, vec![Value::Int(3), Value::String("paid".into())])
             .with_pk_columns([0u16]);
+    engine.apply(&event).expect("apply");
     let mut updates = engine
-        .consumers(&event)
+        .resolve_collect()
         .expect("whole reads resolve")
         .rows_updates;
     updates.sort_by_key(|update| update.consumer_id);
@@ -585,8 +588,9 @@ async fn assert_async_scalar_authorization() {
     let event =
         TestEvent::<Postgres>::insert(table, vec![Value::Int(3), Value::String("paid".into())])
             .with_pk_columns([0u16]);
+    engine.apply(&event).expect("apply");
     let mut updates = engine
-        .consumers(&event)
+        .resolve_collect()
         .await
         .expect("scalar reads resolve")
         .scalar_updates;
@@ -613,8 +617,9 @@ async fn assert_async_grouped_authorization() {
     let event =
         TestEvent::<Postgres>::insert(table, vec![Value::Int(3), Value::String("paid".into())])
             .with_pk_columns([0u16]);
+    engine.apply(&event).expect("apply");
     let mut updates = engine
-        .consumers(&event)
+        .resolve_collect()
         .await
         .expect("grouped reads resolve")
         .aggregate_updates;
@@ -660,8 +665,9 @@ async fn assert_async_count_authorization() {
     let event =
         TestEvent::<Postgres>::insert(table, vec![Value::Int(3), Value::String("paid".into())])
             .with_pk_columns([0u16]);
+    engine.apply(&event).expect("apply");
     let mut updates = engine
-        .consumers(&event)
+        .resolve_collect()
         .await
         .expect("whole reads resolve")
         .rows_updates;
@@ -723,11 +729,9 @@ fn two_consumers_keep_separate_connector_authorization_values() {
     let event =
         TestEvent::<Postgres>::insert(table, vec![Value::Int(1), Value::String("paid".into())])
             .with_pk_columns([0u16]);
-    let output = engine.consumers(&event).expect("both reads resolve");
-    assert!(
-        output.triggers.is_empty(),
-        "connector mode consumes triggers"
-    );
+    engine.apply(&event).expect("apply");
+    let _output = engine.resolve_collect().expect("both reads resolve");
+    assert_eq!(engine.pending_read_count(), 0, "all pending reads resolved");
 
     let mut calls = engine.connector().calls.lock().clone();
     calls.sort();

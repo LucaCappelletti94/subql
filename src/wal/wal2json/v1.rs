@@ -68,7 +68,7 @@ impl CdcEvent for ChangeV1 {
     fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
         v1_naming(self)
             .and_then(|(schema, table)| resolve_table(schema, table, db).ok())
-            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id))
+            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id).ok())
             .unwrap_or_default()
     }
 
@@ -84,7 +84,7 @@ impl CdcEvent for ChangeV1 {
         else {
             return Vec::new();
         };
-        let Some(arity) = catalog_helpers::table_arity(db, table_id) else {
+        let Ok(arity) = catalog_helpers::table_arity(db, table_id) else {
             return Vec::new();
         };
         if columns.columnnames.len() != arity || oldkeys.keynames.len() != arity {

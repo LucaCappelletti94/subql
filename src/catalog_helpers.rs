@@ -16,7 +16,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sql_traits::{
     prelude::{ColumnLike, DatabaseLike, TableLike},
-    structs::{FingerprintError, SchemaFingerprint},
+    structs::{FingerprintError, SchemaFingerprint, TargetName},
     utils::{
         identifier_resolution::stored_identifier_matches_lookup, scalar_family::scalar_family,
     },
@@ -29,38 +29,44 @@ use crate::backend::{
 };
 use crate::types::{ColumnId, TableId};
 
-/// Resolve a table name (unquoted or quoted form) to subql's compact
-/// [`TableId`].
+/// Resolve a table name, written as SQL, to subql's compact [`TableId`].
 ///
-/// Accepts either a bare name (`orders`) or a schema-qualified name
-/// (`public.orders`). Schema qualification is detected by the presence
-/// of a single `.` separator outside of quotes. Both halves are passed
-/// to [`DatabaseLike::table`] unchanged. Note: the quote-detection is a
-/// simple `.contains('"')` heuristic and does not handle escaped quotes
-/// inside quoted identifiers (e.g. `"a""b".c`). Callers parsing such
-/// identifiers must pre-resolve them.
+/// The text is read by sqlparser's identifier grammar, so quoting decides
+/// case sensitivity, a dot separates the qualifier only outside quotes,
+/// and a doubled quote stands for one. Resolution is the catalog's own
+/// [`DatabaseLike::resolve_target_table`]: an unqualified name resolves
+/// through the search path, and a table stored without a schema resides
+/// in the default schema.
 ///
-/// Returns `None` when the table is not found, or when the database's
-/// index for the table exceeds `u32::MAX`. The two cases are
-/// indistinguishable to callers. The overflow case is effectively
-/// unreachable (it implies > 4 billion declared tables) but can collapse
-/// silently when introspecting untrusted sources.
+/// Returns `None` when the text is not one valid identifier or a
+/// qualified pair, when the catalog holds no such table, when the name is
+/// ambiguous across the search path, or when the table's index exceeds
+/// `u32::MAX`. The cases are indistinguishable to callers, whose question
+/// is "which compact id, if any".
 #[must_use]
 pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<TableId> {
-    // Heuristic split on the first unquoted '.' for schema-qualified names.
-    // Names like `"a.b"` (a single quoted identifier containing a dot) are
-    // preserved verbatim, since splitting them would change identifier
-    // semantics. This matches what consumers of `resolve_table` expect.
-    let (schema, bare) = if let Some((s, b)) = table_name.split_once('.') {
-        if !s.is_empty() && !s.contains('"') && !b.contains('"') {
-            (Some(s), b)
-        } else {
-            (None, table_name)
-        }
-    } else {
-        (None, table_name)
+    let dialect = sqlparser::dialect::GenericDialect {};
+    let mut parser = sqlparser::parser::Parser::new(&dialect)
+        .try_with_sql(table_name)
+        .ok()?;
+    let name = parser.parse_object_name(false).ok()?;
+    // The whole text must be the name: trailing tokens would mean the
+    // grammar read less than the caller wrote.
+    if parser.peek_token_ref().token != sqlparser::tokenizer::Token::EOF {
+        return None;
+    }
+    let parts: Vec<&sqlparser::ast::Ident> = name
+        .0
+        .iter()
+        .map(sqlparser::ast::ObjectNamePart::as_ident)
+        .collect::<Option<_>>()?;
+    let target = match parts.as_slice() {
+        [name] => TargetName::new(&name.value, name.quote_style.is_some()),
+        [schema, name] => TargetName::new(&name.value, name.quote_style.is_some())
+            .with_schema(&schema.value, schema.quote_style.is_some()),
+        _ => return None,
     };
-    let table = database.table(schema, bare)?;
+    let table = database.resolve_target_table(target).ok()??;
     let id = database.table_id(table)?;
     u32::try_from(id).ok()
 }
@@ -113,11 +119,32 @@ pub fn column_id<DB: DatabaseLike>(
     u16::try_from(ordinal).ok()
 }
 
+/// The catalog table for `table_id`, or the typed refusal every metadata
+/// helper shares.
+fn lookup_table<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+) -> Result<&DB::Table, crate::CatalogError> {
+    usize::try_from(table_id)
+        .ok()
+        .and_then(|index| database.table_by_id(index))
+        .ok_or(crate::CatalogError::UnknownTable(table_id))
+}
+
 /// Number of columns in the table.
-#[must_use]
-pub fn table_arity<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<usize> {
-    let table = database.table_by_id(table_id as usize)?;
-    table.number_of_columns(database).ok()
+///
+/// # Errors
+/// [`CatalogError::UnknownTable`](crate::CatalogError::UnknownTable) for an id
+/// the catalog does not know, [`CatalogError::Lookup`](crate::CatalogError::Lookup)
+/// when the catalog itself fails to answer.
+pub fn table_arity<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+) -> Result<usize, crate::CatalogError> {
+    let table = lookup_table(database, table_id)?;
+    table
+        .number_of_columns(database)
+        .map_err(|error| crate::CatalogError::Lookup { table_id, error })
 }
 
 /// Compute the spec-compliant [`SchemaFingerprint`] for the table.
@@ -146,23 +173,36 @@ pub fn schema_fingerprint<DB: DatabaseLike>(
 
 /// Primary-key column ordinals for the table, in declaration order.
 ///
-/// Returns `None` when the table id is unknown. Returns `Some(vec![])`
-/// for a table with no declared primary key. Columns whose ordinal
-/// exceeds `u16::MAX` are silently skipped (extreme schemas only).
-#[must_use]
+/// `Ok(vec![])` is a table with no declared primary key. Failure is typed:
+/// a key column this helper cannot resolve is an error, never a silently
+/// shorter key.
+///
+/// # Errors
+/// [`CatalogError`](crate::CatalogError) when the table is unknown, a lookup
+/// fails, or a key column has no resolvable ordinal.
 pub fn primary_key_columns<DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
-) -> Option<Vec<ColumnId>> {
-    let table = database.table_by_id(table_id as usize)?;
-    Some(
-        table
-            .primary_key_columns(database)
-            .ok()?
-            .filter_map(|col| col.column_id(database).ok().flatten())
-            .filter_map(|id| u16::try_from(id).ok())
-            .collect(),
-    )
+) -> Result<Vec<ColumnId>, crate::CatalogError> {
+    let table = lookup_table(database, table_id)?;
+    let lookup = |error| crate::CatalogError::Lookup { table_id, error };
+    let mut ordinals = Vec::new();
+    for column in table.primary_key_columns(database).map_err(lookup)? {
+        let ordinal = column.column_id(database).map_err(lookup)?.ok_or_else(|| {
+            crate::CatalogError::Lookup {
+                table_id,
+                error: sql_traits::errors::LookupError::ColumnNotFound {
+                    table_name: table.table_name().to_string(),
+                    column_name: column.column_name().to_string(),
+                },
+            }
+        })?;
+        ordinals.push(
+            u16::try_from(ordinal)
+                .map_err(|_| crate::CatalogError::UnknownColumn { table_id, ordinal })?,
+        );
+    }
+    Ok(ordinals)
 }
 
 /// Resolve a column's stored name from its compact [`ColumnId`].
@@ -187,30 +227,35 @@ pub fn column_name<DB: DatabaseLike>(
 /// Build a [`SimpleTable`] from the catalog for `table_id`.
 ///
 /// Reads the column names in order and the primary-key indices from the
-/// catalog, so the catalog is the authoritative source for both. Returns
-/// `None` when the table id or any of its columns cannot be resolved. The
+/// catalog, so the catalog is the authoritative source for both. The
 /// outbound emit path and the inbound patchset apply path both build their
 /// table shape through this one helper, so a single catalog is the source
 /// of truth for the column order and the primary key on both sides.
-#[must_use]
-pub fn simple_table<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<SimpleTable> {
-    use alloc::string::{String, ToString};
-
+///
+/// # Errors
+/// [`CatalogError`](crate::CatalogError) when the table id or any of its
+/// columns cannot be resolved.
+pub fn simple_table<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+) -> Result<SimpleTable, crate::CatalogError> {
     let arity = table_arity(database, table_id)?;
     let mut column_names: Vec<String> = Vec::with_capacity(arity);
     for ordinal in 0..arity {
-        let column_id = ColumnId::try_from(ordinal).ok()?;
-        column_names.push(column_name(database, table_id, column_id)?);
+        let column_id = ColumnId::try_from(ordinal)
+            .map_err(|_| crate::CatalogError::UnknownColumn { table_id, ordinal })?;
+        column_names.push(
+            column_name(database, table_id, column_id)
+                .ok_or(crate::CatalogError::UnknownColumn { table_id, ordinal })?,
+        );
     }
-    let index = usize::try_from(table_id).ok()?;
-    let table_name = database.table_by_id(index)?.table_name().to_string();
-    let pk_indices: Vec<usize> = primary_key_columns(database, table_id)
-        .unwrap_or_default()
+    let table_name = lookup_table(database, table_id)?.table_name().to_string();
+    let pk_indices: Vec<usize> = primary_key_columns(database, table_id)?
         .into_iter()
         .map(usize::from)
         .collect();
     let column_refs: Vec<&str> = column_names.iter().map(String::as_str).collect();
-    Some(SimpleTable::new(table_name, &column_refs, &pk_indices))
+    Ok(SimpleTable::new(table_name, &column_refs, &pk_indices))
 }
 
 /// A table resolved to subql's compact ids, returned by [`resolve_table`].
@@ -227,8 +272,8 @@ pub struct ResolvedTable {
 /// Resolve a table and a set of its columns in one call.
 ///
 /// Bundles [`table_id`], a [`column_id`] lookup per name, and
-/// [`primary_key_columns`]. Returns `None` if the table or any named column is
-/// not found.
+/// [`primary_key_columns`]. `Ok(None)` is a table or column name the catalog
+/// does not contain.
 ///
 /// ```
 /// use sql_traits::structs::ParserDB;
@@ -238,28 +283,36 @@ pub struct ResolvedTable {
 /// let db = ParserDB::parse::<PostgreSqlDialect>(
 ///     "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);",
 /// )?;
-/// let t = catalog_helpers::resolve_table(&db, "orders", &["id", "amount", "status"]).unwrap();
+/// let t = catalog_helpers::resolve_table(&db, "orders", &["id", "amount", "status"])?.unwrap();
 /// assert_eq!(t.column_ids, vec![0, 1, 2]);
 /// assert_eq!(t.primary_key, vec![0]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use]
+///
+/// # Errors
+/// [`CatalogError`](crate::CatalogError) when the catalog fails to answer a
+/// lookup about a table it does contain.
 pub fn resolve_table<DB: DatabaseLike, S: AsRef<str>>(
     database: &DB,
     table_name: &str,
     columns: &[S],
-) -> Option<ResolvedTable> {
-    let table_id = table_id(database, table_name)?;
+) -> Result<Option<ResolvedTable>, crate::CatalogError> {
+    let Some(table_id) = table_id(database, table_name) else {
+        return Ok(None);
+    };
     let mut column_ids = Vec::with_capacity(columns.len());
     for name in columns {
-        column_ids.push(column_id(database, table_id, name.as_ref())?);
+        let Some(column_id) = column_id(database, table_id, name.as_ref()) else {
+            return Ok(None);
+        };
+        column_ids.push(column_id);
     }
     let primary_key = primary_key_columns(database, table_id)?;
-    Some(ResolvedTable {
+    Ok(Some(ResolvedTable {
         table_id,
         column_ids,
         primary_key,
-    })
+    }))
 }
 
 /// Resolve a column's declared SQL type into its runtime [`ScalarKind`].
@@ -322,7 +375,10 @@ pub fn group_key_column<B: crate::backend::Backend, DB: DatabaseLike>(
     })
 }
 
-fn classify_scalar_kind<B: crate::backend::Backend>(
+/// Classify a declared SQL type into its runtime [`ScalarKind`], builtins
+/// first, then the backend's custom fallback. The type-only core of
+/// [`column_scalar_kind`], for callers that already hold the column.
+pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
     declared_type: &str,
 ) -> Option<ScalarKindOf<B>> {
     if let Some(family) = scalar_family(declared_type) {
@@ -352,15 +408,24 @@ pub fn column_builtin_kind<DB: DatabaseLike>(
 /// Whether the table has row-level security enabled (per
 /// [`TableLike::has_row_level_security`]).
 ///
-/// Returns `None` when the table id is unknown. The reexec wrapper consults
-/// this when classifying aggregator queries: under RLS, different viewers
-/// observe different result rows, so a single in-process IVM state would be
-/// unsafe to share across consumers. The wrapper rejects such registrations
-/// until per-consumer total re-execution lands.
-#[must_use]
-pub fn table_has_rls<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<bool> {
-    let table = database.table_by_id(table_id as usize)?;
-    table.has_row_level_security(database).ok()
+/// The reexec wrapper consults this when classifying aggregator queries:
+/// under RLS, different viewers observe different result rows, so a single
+/// in-process IVM state would be unsafe to share across consumers. The
+/// wrapper rejects such registrations until per-consumer total re-execution
+/// lands. Failure is typed so a catalog that cannot answer refuses the
+/// registration instead of silently authorizing a shared answer.
+///
+/// # Errors
+/// [`CatalogError`](crate::CatalogError) when the table is unknown or the
+/// lookup fails.
+pub fn table_has_rls<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+) -> Result<bool, crate::CatalogError> {
+    let table = lookup_table(database, table_id)?;
+    table
+        .has_row_level_security(database)
+        .map_err(|error| crate::CatalogError::Lookup { table_id, error })
 }
 
 #[cfg(test)]
@@ -382,13 +447,66 @@ mod tests {
     fn table_id_resolves_known_table() {
         let db = make_db();
         let tid = table_id(&db, "orders").expect("orders table exists");
-        assert_eq!(table_arity(&db, tid), Some(3));
+        assert_eq!(table_arity(&db, tid), Ok(3));
     }
 
     #[test]
     fn table_id_none_for_unknown_table() {
         let db = make_db();
         assert!(table_id(&db, "no_such_table").is_none());
+    }
+
+    /// The review's reproduction, kept permanently: a quoted, case-sensitive
+    /// qualified name resolves by identifier semantics, never by string
+    /// splitting on dots and quotes.
+    #[test]
+    fn table_id_resolves_quoted_qualified_name() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE SCHEMA "App"; CREATE TABLE "App"."Items" (id INT PRIMARY KEY);"#,
+        )
+        .unwrap();
+        assert_eq!(table_id(&db, r#""App"."Items""#), Some(0));
+    }
+
+    /// A dot inside a quoted identifier belongs to the identifier, never a
+    /// qualifier separator.
+    #[test]
+    fn table_id_resolves_quoted_name_containing_a_dot() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE TABLE "my.table" (id INT PRIMARY KEY);"#,
+        )
+        .unwrap();
+        assert_eq!(table_id(&db, r#""my.table""#), Some(0));
+    }
+
+    /// A doubled quote inside a quoted identifier stands for one quote.
+    #[test]
+    fn table_id_resolves_escaped_quotes() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r#"CREATE TABLE "we""ird" (id INT PRIMARY KEY);"#,
+        )
+        .unwrap();
+        assert_eq!(table_id(&db, r#""we""ird""#), Some(0));
+    }
+
+    /// An unqualified name resolves through the search path, exactly as the
+    /// catalog resolves every other written target.
+    #[test]
+    fn table_id_resolves_through_the_search_path() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE SCHEMA app; SET search_path TO app; CREATE TABLE app.docs (id INT PRIMARY KEY);",
+        )
+        .unwrap();
+        assert_eq!(table_id(&db, "docs"), Some(0));
+    }
+
+    /// A bare spelling and its default-schema qualified spelling reach the
+    /// same table.
+    #[test]
+    fn table_id_resolves_bare_and_qualified_spellings() {
+        let db = make_db();
+        assert_eq!(table_id(&db, "orders"), Some(0));
+        assert_eq!(table_id(&db, "public.orders"), Some(0));
     }
 
     #[test]
@@ -418,7 +536,7 @@ mod tests {
     fn primary_key_columns_returns_pk_ordinals() {
         let db = make_db();
         let tid = table_id(&db, "orders").unwrap();
-        assert_eq!(primary_key_columns(&db, tid), Some(vec![0]));
+        assert_eq!(primary_key_columns(&db, tid), Ok(vec![0]));
     }
 
     #[test]
@@ -426,7 +544,31 @@ mod tests {
         let db = ParserDB::parse::<GenericDialect>("CREATE TABLE t (a INT, b TEXT);")
             .expect("DDL parses");
         let tid = table_id(&db, "t").unwrap();
-        assert_eq!(primary_key_columns(&db, tid), Some(vec![]));
+        assert_eq!(primary_key_columns(&db, tid), Ok(vec![]));
+    }
+
+    /// A table id the catalog does not know is a typed refusal on every
+    /// metadata helper, never a silent empty or false answer.
+    #[test]
+    fn unknown_table_id_is_a_typed_error() {
+        let db = make_db();
+        let missing: TableId = 99;
+        assert_eq!(
+            table_arity(&db, missing),
+            Err(crate::CatalogError::UnknownTable(missing))
+        );
+        assert_eq!(
+            table_has_rls(&db, missing),
+            Err(crate::CatalogError::UnknownTable(missing))
+        );
+        assert_eq!(
+            primary_key_columns(&db, missing),
+            Err(crate::CatalogError::UnknownTable(missing))
+        );
+        assert_eq!(
+            simple_table(&db, missing).unwrap_err(),
+            crate::CatalogError::UnknownTable(missing)
+        );
     }
 
     #[test]

@@ -74,7 +74,7 @@ fn apply_patchset_bool_roundtrip_insert_update_delete() {
                 .unwrap(),
         );
 
-    let adapter = PgAdapter::new(engine.database());
+    let adapter = PgAdapter::new(engine.database()).expect("the catalog indexes");
     let n = engine
         .apply_patchset(&inserts, &mut conn, &adapter)
         .expect("apply inserts");

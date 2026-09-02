@@ -59,9 +59,6 @@ dioxus-free-icons = { version = "0.10", features = ["font-awesome-solid"] }
 # Random row generators for the simulation.
 rand = { version = "0.9", default-features = false, features = ["small_rng"] }
 
-# Logging plumbing during demo dev.
-log = "0.4"
-
 # Structured error types for the demo's sqlite/capture layer.
 thiserror = "2"
 

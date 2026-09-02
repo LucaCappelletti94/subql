@@ -1,5 +1,5 @@
 //! Integration test: peak concurrent `execute_scalar` calls during a
-//! single `consumers_batch` never exceed
+//! single resolve of an applied burst never exceed
 //! `with_max_concurrent_reexecutions(cap)`.
 //!
 //! The unit tests in `src/reexec/async_auto.rs` cannot observe this
@@ -234,7 +234,10 @@ async fn run_peak_inflight_assertion(cap: usize) {
     let events = vec![delete_event(tid, 1, 7.0, 1)];
 
     let started = Instant::now();
-    let outcome = engine.consumers_batch(&events).await.unwrap();
+    for event in &events {
+        engine.apply(event).unwrap();
+    }
+    let outcome = engine.resolve_collect().await.unwrap();
     let elapsed = started.elapsed();
 
     let peak = engine.connector().peak();

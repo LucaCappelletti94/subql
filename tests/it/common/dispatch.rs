@@ -506,7 +506,8 @@ mod schema_dml_fixtures {
         let sqlite_catalog = ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).unwrap();
         let sqlite_engine: SubscriptionEngine<TestEvent<SqliteBackend>, DefaultIds, ParserDB> =
             SubscriptionEngine::new(sqlite_catalog, SQLiteDialect {});
-        let sqlite_adapter = SqliteAdapter::new(sqlite_engine.database());
+        let sqlite_adapter =
+            SqliteAdapter::new(sqlite_engine.database()).expect("the catalog indexes");
 
         // Seed the replica before the session starts, so the session only
         // records the mutate (a genuine update and delete).
@@ -543,6 +544,7 @@ mod schema_dml_fixtures {
         let pg_engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
             SubscriptionEngine::new(subql_catalog(), PostgreSqlDialect {});
         let pg_adapter = CustomTypePgAdapter::new(pg_engine.database())
+            .expect("the catalog indexes")
             .register("mood", MoodBinding)
             .register("sku", SkuBinding);
 

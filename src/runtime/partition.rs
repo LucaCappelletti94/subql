@@ -7,9 +7,7 @@ use super::{
 };
 use crate::backend::Backend;
 use crate::term::TermKey;
-use crate::{
-    compiler::sql_shape::QueryProjection, ColumnId, EventKind, IdTypes, SubscriptionId, TableId,
-};
+use crate::{ColumnId, EventKind, IdTypes, SubscriptionId, TableId};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arc_swap::ArcSwap;
@@ -102,7 +100,9 @@ pub struct TablePartitionSnapshot<I: IdTypes, B: Backend> {
     pub predicates: Arc<PredicateStore<I, B>>,
 }
 
-pub(super) struct BindingRemoval<I: IdTypes> {
+/// What removing a binding removed: the consumer it belonged to, and whether
+/// its predicate went with it.
+pub struct BindingRemoval<I: IdTypes> {
     pub predicate_removed: bool,
     pub consumer_id: I::ConsumerId,
 }
@@ -118,6 +118,10 @@ pub struct TablePartition<I: IdTypes, B: Backend> {
     snapshot: ArcSwap<TablePartitionSnapshot<I, B>>,
     /// COW predicate store: `Arc::clone` for cheap snapshots, `Arc::make_mut` for mutations.
     mutable_predicates: Arc<PredicateStore<I, B>>,
+    /// Snapshots published so far, so tests can assert that related mutations
+    /// publish once.
+    #[cfg(test)]
+    publications: core::sync::atomic::AtomicU64,
 }
 
 impl<I: IdTypes, B: Backend> TablePartition<I, B> {
@@ -135,7 +139,16 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
             table_id,
             snapshot: ArcSwap::new(Arc::new(snapshot)),
             mutable_predicates: predicates,
+            #[cfg(test)]
+            publications: core::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How many snapshots this partition has published.
+    #[cfg(test)]
+    pub(crate) fn publication_count(&self) -> u64 {
+        self.publications
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Load current snapshot (lock-free)
@@ -144,153 +157,22 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         self.snapshot.load_full()
     }
 
-    /// Add predicate to partition
+    /// Apply one logical mutation and publish at most one new snapshot.
     ///
-    /// Rebuilds indexes and performs atomic swap.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn add_predicate(
-        &mut self,
-        predicate: Predicate<B>,
-        atoms: Vec<IndexableAtom>,
-    ) -> PredicateId {
-        let deps = predicate.dependency_columns.to_vec();
-        let projection = predicate.projection.clone();
-
-        // COW: clone-on-write if snapshot still shares this Arc
-        let pred_id = Arc::make_mut(&mut self.mutable_predicates).add_predicate(predicate);
-
-        // Incrementally update indexes
-        self.rebuild_indexes(&atoms, pred_id, &deps, &projection);
-
-        pred_id
-    }
-
-    /// Add binding to an existing predicate
-    ///
-    /// Increments refcount and updates snapshot.
-    pub fn add_binding(&mut self, binding: SubscriptionBinding<I>, pred_id: PredicateId) {
-        let store = Arc::make_mut(&mut self.mutable_predicates);
-        store.add_binding(binding);
-        store.increment_refcount(pred_id);
-
-        // Update snapshot with new predicates
-        self.update_snapshot();
-    }
-
-    /// Record which subscribers each of a predicate's terms admits, for one
-    /// newly bound subscription.
-    ///
-    /// `seeds` is indexed by term slot: `seeds[i]` is what this subscriber
-    /// states it matches through slot `i` today. One snapshot swap for every
-    /// slot, since a subscription is bound once.
-    pub fn seed_terms(
-        &mut self,
-        pred_id: PredicateId,
-        ordinal: ConsumerOrdinal,
-        subscriber: &TermKey<B>,
-        seeds: &[Vec<crate::term::TermRow<B>>],
-    ) {
-        let store = Arc::make_mut(&mut self.mutable_predicates);
-        for (slot, values) in seeds.iter().enumerate() {
-            let Ok(slot) = u16::try_from(slot) else {
-                continue;
-            };
-            store.seed_term(pred_id, slot, ordinal, subscriber.clone(), values.clone());
-        }
-        self.update_snapshot();
-    }
-
-    /// Move who one term admits, as a changed membership row does.
-    ///
-    /// `admitted` is the value the row keys, and `ordinals` are the subscribers
-    /// it names. Returns the subscribers actually moved, which is what the
-    /// notification reports, and is empty when the row names none of this
-    /// predicate's subscribers.
-    pub fn move_term_members(
-        &mut self,
-        pred_id: PredicateId,
-        slot: u16,
-        values: crate::term::TermRow<B>,
-        ordinals: &RoaringBitmap,
-        widen: bool,
-    ) {
-        let store = Arc::make_mut(&mut self.mutable_predicates);
-        let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
-            return;
+    /// Every change lands through the transaction handed to `f`: the store is
+    /// cloned at most once however many operations run, the indexes are
+    /// settled once, and the snapshot is published once at the end, or not at
+    /// all when nothing changed.
+    pub fn mutate<R>(&mut self, f: impl FnOnce(&mut PartitionTxn<'_, I, B>) -> R) -> R {
+        let mut txn = PartitionTxn {
+            partition: self,
+            indexes: None,
+            rebuild_all: false,
+            dirty: false,
         };
-        if widen {
-            members.widen(values, ordinals);
-        } else {
-            members.narrow(&values, ordinals);
-        }
-        self.update_snapshot();
-    }
-
-    /// Withdraw every value one term admits, and report what was withdrawn.
-    ///
-    /// Used when the table carrying the memberships is truncated: the values are
-    /// only knowable from the sets themselves, and the caller reports them.
-    pub fn clear_term_admissions(
-        &mut self,
-        pred_id: PredicateId,
-        slot: u16,
-    ) -> Vec<(crate::term::TermRow<B>, RoaringBitmap)> {
-        let store = Arc::make_mut(&mut self.mutable_predicates);
-        let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
-            return Vec::new();
-        };
-        let withdrawn = members.clear_admissions();
-        if !withdrawn.is_empty() {
-            self.update_snapshot();
-        }
-        withdrawn
-    }
-
-    /// Remove binding and decrement refcount
-    ///
-    /// If refcount reaches 0, predicate is removed and indexes are rebuilt.
-    /// Returns true if predicate was removed.
-    pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> bool {
-        self.remove_binding_detail(sub_id)
-            .is_some_and(|removal| removal.predicate_removed)
-    }
-
-    /// Remove binding and decrement refcount.
-    ///
-    /// Returns:
-    /// - `None` if no binding existed
-    /// - `Some(false)` if binding removed but predicate kept
-    /// - `Some(true)` if binding removed and predicate deleted
-    pub fn remove_binding_status(&mut self, sub_id: SubscriptionId) -> Option<bool> {
-        self.remove_binding_detail(sub_id)
-            .map(|removal| removal.predicate_removed)
-    }
-
-    #[allow(clippy::option_if_let_else)]
-    pub(super) fn remove_binding_detail(
-        &mut self,
-        sub_id: SubscriptionId,
-    ) -> Option<BindingRemoval<I>> {
-        let store = Arc::make_mut(&mut self.mutable_predicates);
-        if let Some(binding) = store.remove_binding(sub_id) {
-            let removed = store.decrement_refcount(binding.predicate_id);
-
-            // Update snapshot
-            if removed {
-                // Predicate was removed, need to rebuild indexes
-                self.rebuild_all_indexes();
-            } else {
-                // Just update snapshot (refcount changed)
-                self.update_snapshot();
-            }
-
-            Some(BindingRemoval {
-                predicate_removed: removed,
-                consumer_id: binding.consumer_id,
-            })
-        } else {
-            None
-        }
+        let result = f(&mut txn);
+        txn.commit();
+        result
     }
 
     /// Update snapshot with current mutable predicates (no index rebuild)
@@ -302,42 +184,9 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         };
 
         self.snapshot.store(Arc::new(new_snapshot));
-    }
-
-    /// Update snapshot with current mutable predicates (no index rebuild)
-    fn update_snapshot(&self) {
-        let current = self.load_snapshot();
-        self.store_snapshot_with_indexes(current.indexes.clone());
-    }
-
-    /// Incrementally update indexes for a single newly added predicate.
-    fn rebuild_indexes(
-        &self,
-        atoms: &[IndexableAtom],
-        pred_id: PredicateId,
-        deps: &[ColumnId],
-        projection: &QueryProjection,
-    ) {
-        let current = self.load_snapshot();
-        let mut new_indexes = current.indexes.clone();
-        new_indexes.add_predicate(pred_id, atoms, deps, projection);
-        self.store_snapshot_with_indexes(new_indexes);
-    }
-
-    /// Rebuild indexes from all predicates (used after predicate removal)
-    fn rebuild_all_indexes(&self) {
-        let mut new_indexes = HybridIndexes::new();
-
-        for (idx, pred) in &self.mutable_predicates.predicates {
-            new_indexes.add_predicate(
-                PredicateId::from_slab_index(idx),
-                &pred.index_atoms,
-                &pred.dependency_columns,
-                &pred.projection,
-            );
-        }
-
-        self.store_snapshot_with_indexes(new_indexes);
+        #[cfg(test)]
+        self.publications
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Select candidate predicates for one row image, as INSERT and DELETE
@@ -416,50 +265,6 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
         candidates
     }
 
-    /// Add multiple predicates and bindings in a single batch
-    ///
-    /// Performs one COW clone, inserts all predicates and bindings, rebuilds
-    /// indexes once, and performs a single atomic snapshot swap.
-    /// Much more efficient than calling `add_predicate`/`add_binding` in a loop.
-    #[allow(clippy::type_complexity)]
-    pub fn add_batch(
-        &mut self,
-        entries: &[(
-            Predicate<B>,
-            Vec<IndexableAtom>,
-            Vec<SubscriptionBinding<I>>,
-        )],
-    ) {
-        if entries.is_empty() {
-            return;
-        }
-
-        let current = self.load_snapshot();
-        let mut new_indexes = current.indexes.clone();
-        // Single COW clone for the entire batch
-        let store = Arc::make_mut(&mut self.mutable_predicates);
-
-        for (predicate, atoms, bindings) in entries {
-            let pred_id = store.add_predicate(Predicate::clone(predicate));
-            new_indexes.add_predicate(
-                pred_id,
-                atoms,
-                &predicate.dependency_columns,
-                &predicate.projection,
-            );
-
-            for binding in bindings {
-                let mut b = *binding;
-                b.predicate_id = pred_id;
-                store.add_binding(b);
-                store.increment_refcount(pred_id);
-            }
-        }
-
-        // Single atomic snapshot swap
-        self.store_snapshot_with_indexes(new_indexes);
-    }
-
     /// Select candidate row predicates for an UPDATE.
     ///
     /// Delegates to [`HybridIndexes::select_update_candidates`], which explains
@@ -489,6 +294,192 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
     }
 }
 
+/// One partition mutation in flight: operations accumulate against the
+/// mutable store, and the snapshot is published once on commit.
+///
+/// Reads through [`Self::store`] observe the operations already applied in
+/// this transaction, exactly as they observed the intermediate snapshots when
+/// each operation published its own.
+pub struct PartitionTxn<'a, I: IdTypes, B: Backend> {
+    partition: &'a mut TablePartition<I, B>,
+    /// Indexes patched incrementally, cloned from the current snapshot at the
+    /// first predicate add. `None` until then, and discarded when a removal
+    /// forces a full rebuild.
+    indexes: Option<HybridIndexes>,
+    /// A predicate was removed, so commit rebuilds the indexes from the final
+    /// store rather than patching incrementally.
+    rebuild_all: bool,
+    dirty: bool,
+}
+
+impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
+    /// The store as this transaction has left it so far.
+    #[must_use]
+    pub fn store(&self) -> &PredicateStore<I, B> {
+        &self.partition.mutable_predicates
+    }
+
+    /// Clone-on-write handle. The deep clone happens on the first call only:
+    /// after it, the published snapshot no longer shares the `Arc`.
+    fn store_mut(&mut self) -> &mut PredicateStore<I, B> {
+        Arc::make_mut(&mut self.partition.mutable_predicates)
+    }
+
+    /// Add a predicate, patching it into the indexes.
+    pub fn add_predicate(
+        &mut self,
+        predicate: Predicate<B>,
+        atoms: &[IndexableAtom],
+    ) -> PredicateId {
+        let deps = Arc::clone(&predicate.dependency_columns);
+        let projection = predicate.projection.clone();
+        let pred_id = self.store_mut().add_predicate(predicate);
+        self.dirty = true;
+        if !self.rebuild_all {
+            let indexes = self
+                .indexes
+                .get_or_insert_with(|| self.partition.load_snapshot().indexes.clone());
+            indexes.add_predicate(pred_id, atoms, &deps, &projection);
+        }
+        pred_id
+    }
+
+    /// Bind a subscription to an existing predicate, taking a refcount.
+    pub fn add_binding(&mut self, binding: SubscriptionBinding<I>, pred_id: PredicateId) {
+        let store = self.store_mut();
+        store.add_binding(binding);
+        store.increment_refcount(pred_id);
+        self.dirty = true;
+    }
+
+    /// Record which subscribers each of a predicate's terms admits, for one
+    /// newly bound subscription.
+    ///
+    /// `seeds` is indexed by term slot: `seeds[i]` is what this subscriber
+    /// states it matches through slot `i` today.
+    pub fn seed_terms(
+        &mut self,
+        pred_id: PredicateId,
+        ordinal: ConsumerOrdinal,
+        subscriber: &TermKey<B>,
+        seeds: &[Vec<crate::term::TermRow<B>>],
+    ) {
+        if seeds.is_empty() {
+            return;
+        }
+        let store = self.store_mut();
+        for (slot, values) in seeds.iter().enumerate() {
+            let Ok(slot) = u16::try_from(slot) else {
+                continue;
+            };
+            store.seed_term(pred_id, slot, ordinal, subscriber.clone(), values.clone());
+        }
+        self.dirty = true;
+    }
+
+    /// Move who one term admits, as a changed membership row does.
+    ///
+    /// `values` is what the row keys, and `ordinals` are the subscribers it
+    /// names. Nothing moves when the term is not tracked here, which is
+    /// checked on the shared view first so that case pays no store clone.
+    pub fn move_term_members(
+        &mut self,
+        pred_id: PredicateId,
+        slot: u16,
+        values: crate::term::TermRow<B>,
+        ordinals: &RoaringBitmap,
+        widen: bool,
+    ) {
+        if !self.store().term_members.contains_key(&(pred_id, slot)) {
+            return;
+        }
+        let store = self.store_mut();
+        let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
+            return;
+        };
+        if widen {
+            members.widen(values, ordinals);
+        } else {
+            members.narrow(&values, ordinals);
+        }
+        self.dirty = true;
+    }
+
+    /// Withdraw every value one term admits, and report what was withdrawn.
+    ///
+    /// Used when the table carrying the memberships is truncated: the values
+    /// are only knowable from the sets themselves, and the caller reports
+    /// them.
+    pub fn clear_term_admissions(
+        &mut self,
+        pred_id: PredicateId,
+        slot: u16,
+    ) -> Vec<(crate::term::TermRow<B>, RoaringBitmap)> {
+        if !self.store().term_members.contains_key(&(pred_id, slot)) {
+            return Vec::new();
+        }
+        let store = self.store_mut();
+        let Some(members) = store.term_members.get_mut(&(pred_id, slot)) else {
+            return Vec::new();
+        };
+        let withdrawn = members.clear_admissions();
+        if !withdrawn.is_empty() {
+            self.dirty = true;
+        }
+        withdrawn
+    }
+
+    /// Remove a binding and drop its refcount, removing the predicate when the
+    /// count reaches zero.
+    ///
+    /// Returns what was removed, or `None` when no binding existed, which is
+    /// checked on the shared view first so that case pays no store clone.
+    pub fn remove_binding(&mut self, sub_id: SubscriptionId) -> Option<BindingRemoval<I>> {
+        if !self.store().bindings.contains_key(&sub_id) {
+            return None;
+        }
+        let store = self.store_mut();
+        let binding = store.remove_binding(sub_id)?;
+        let removed = store.decrement_refcount(binding.predicate_id);
+        self.dirty = true;
+        if removed {
+            // The predicate is gone, so any incremental patches are moot:
+            // commit rebuilds from the final store.
+            self.rebuild_all = true;
+            self.indexes = None;
+        }
+        Some(BindingRemoval {
+            predicate_removed: removed,
+            consumer_id: binding.consumer_id,
+        })
+    }
+
+    /// Publish the accumulated changes as one snapshot, or none at all when no
+    /// operation changed anything.
+    fn commit(self) {
+        if !self.dirty {
+            return;
+        }
+        let indexes = if self.rebuild_all {
+            let mut rebuilt = HybridIndexes::new();
+            for (idx, pred) in &self.partition.mutable_predicates.predicates {
+                rebuilt.add_predicate(
+                    PredicateId::from_slab_index(idx),
+                    &pred.index_atoms,
+                    &pred.dependency_columns,
+                    &pred.projection,
+                );
+            }
+            rebuilt
+        } else if let Some(indexes) = self.indexes {
+            indexes
+        } else {
+            self.partition.load_snapshot().indexes.clone()
+        };
+        self.partition.store_snapshot_with_indexes(indexes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ids::ConsumerOrdinal;
@@ -499,6 +490,32 @@ mod tests {
         compiler::{BytecodeProgram, Instruction, PrefilterPlan},
         DefaultIds, SubscriptionScope,
     };
+
+    fn add_predicate(
+        partition: &mut TablePartition<DefaultIds, Postgres>,
+        pred: Predicate<Postgres>,
+        atoms: &[IndexableAtom],
+    ) -> PredicateId {
+        partition.mutate(|txn| txn.add_predicate(pred, atoms))
+    }
+
+    fn add_binding(
+        partition: &mut TablePartition<DefaultIds, Postgres>,
+        binding: SubscriptionBinding<DefaultIds>,
+        pred_id: PredicateId,
+    ) {
+        partition.mutate(|txn| txn.add_binding(binding, pred_id));
+    }
+
+    /// Whether removing the binding removed its predicate too.
+    fn remove_binding(
+        partition: &mut TablePartition<DefaultIds, Postgres>,
+        sub_id: SubscriptionId,
+    ) -> bool {
+        partition
+            .mutate(|txn| txn.remove_binding(sub_id))
+            .is_some_and(|removal| removal.predicate_removed)
+    }
 
     fn make_predicate(id: usize, hash: u128) -> Predicate<Postgres> {
         make_predicate_on_col(id, hash, 1)
@@ -558,12 +575,12 @@ mod tests {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
         let pred = make_predicate(0, 0x1234);
-        let atoms = vec![IndexableAtom::Equality {
+        let atoms = &[IndexableAtom::Equality {
             column_id: 5,
             value: IndexableCell::Int(42),
         }];
 
-        partition.add_predicate(pred, atoms);
+        add_predicate(&mut partition, pred, atoms);
 
         let snapshot = partition.load_snapshot();
         // Should be indexed in equality index, not fallback
@@ -575,7 +592,7 @@ mod tests {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
         let pred = make_predicate(0, 0x1234);
-        partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
+        add_predicate(&mut partition, pred, &[IndexableAtom::Fallback]);
 
         let row = make_row(vec![Value::<Postgres>::Int(100)]);
         let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
@@ -603,7 +620,7 @@ mod tests {
         // Add predicate
         let pred = make_predicate(0, 0x1234);
         let pred_id = pred.id;
-        partition.add_predicate(pred, vec![]);
+        add_predicate(&mut partition, pred, &[]);
 
         // Add two bindings for the same predicate
         let binding1 = SubscriptionBinding {
@@ -623,11 +640,11 @@ mod tests {
             updated_at_unix_ms: 0,
         };
 
-        partition.add_binding(binding1, pred_id);
-        partition.add_binding(binding2, pred_id);
+        add_binding(&mut partition, binding1, pred_id);
+        add_binding(&mut partition, binding2, pred_id);
 
         // Remove first binding - refcount decrements but predicate not removed
-        let predicate_removed = partition.remove_binding(100);
+        let predicate_removed = remove_binding(&mut partition, 100);
         assert!(!predicate_removed); // Predicate still has refcount > 0
 
         // Predicate should still exist
@@ -640,7 +657,7 @@ mod tests {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
         // Try to remove non-existent binding
-        let removed = partition.remove_binding(999);
+        let removed = remove_binding(&mut partition, 999);
         assert!(!removed);
     }
 
@@ -650,9 +667,10 @@ mod tests {
 
         // Add predicate with equality index
         let pred = make_predicate(0, 0x1234);
-        partition.add_predicate(
+        add_predicate(
+            &mut partition,
             pred,
-            vec![IndexableAtom::Equality {
+            &[IndexableAtom::Equality {
                 column_id: 0,
                 value: IndexableCell::Int(42),
             }],
@@ -672,9 +690,10 @@ mod tests {
 
         // Add predicate with IS NULL check
         let pred1 = make_predicate(0, 0x1234);
-        partition.add_predicate(
+        add_predicate(
+            &mut partition,
             pred1,
-            vec![IndexableAtom::Null {
+            &[IndexableAtom::Null {
                 column_id: 0,
                 kind: NullKind::IsNull,
             }],
@@ -682,9 +701,10 @@ mod tests {
 
         // Add predicate with IS NOT NULL check
         let pred2 = make_predicate(1, 0x5678);
-        partition.add_predicate(
+        add_predicate(
+            &mut partition,
             pred2,
-            vec![IndexableAtom::Null {
+            &[IndexableAtom::Null {
                 column_id: 1,
                 kind: NullKind::IsNotNull,
             }],
@@ -698,27 +718,106 @@ mod tests {
         assert!(!candidates.is_empty());
     }
 
+    /// Removing the last binding of a predicate rebuilds the indexes from the
+    /// remaining store, so a surviving predicate still matches and the removed
+    /// one is gone from the index.
     #[test]
-    fn test_rebuild_indexes_with_predicates() {
+    fn test_removal_rebuilds_indexes_from_remaining_predicates() {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
-        // Add a predicate
-        let pred = make_predicate(0, 0x1234);
-        partition.add_predicate(
-            pred,
-            vec![IndexableAtom::Equality {
+        let kept = make_predicate(0, 0x1234);
+        let kept_id = add_predicate(
+            &mut partition,
+            kept,
+            &[IndexableAtom::Equality {
                 column_id: 0,
                 value: IndexableCell::Int(42),
             }],
         );
+        let mut removed = make_predicate(1, 0x5678);
+        removed.refcount = 0;
+        let removed_id = add_predicate(
+            &mut partition,
+            removed,
+            &[IndexableAtom::Equality {
+                column_id: 0,
+                value: IndexableCell::Int(42),
+            }],
+        );
+        add_binding(
+            &mut partition,
+            SubscriptionBinding {
+                subscription_id: 100,
+                predicate_id: removed_id,
+                consumer_id: 1,
+                consumer_ordinal: ConsumerOrdinal::new(0),
+                scope: SubscriptionScope::Durable,
+                updated_at_unix_ms: 0,
+            },
+            removed_id,
+        );
 
-        // Manually trigger rebuild (normally happens on unsubscribe with removal)
-        partition.rebuild_all_indexes();
+        assert!(
+            remove_binding(&mut partition, 100),
+            "the only binding takes its predicate with it"
+        );
 
-        // Indexes should still work after rebuild
         let row = make_row(vec![Value::<Postgres>::Int(42)]);
         let candidates = partition.select_candidates(row.len(), probe_from_row(&row));
-        assert!(!candidates.is_empty());
+        assert!(
+            candidates.contains(kept_id.as_u32()),
+            "the surviving predicate is still indexed after the rebuild"
+        );
+        assert!(
+            !candidates.contains(removed_id.as_u32()),
+            "the removed predicate left the index"
+        );
+    }
+
+    /// One transaction spanning several operations publishes one snapshot, and
+    /// a transaction that changes nothing publishes none.
+    #[test]
+    fn a_transaction_publishes_once_and_a_noop_not_at_all() {
+        let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
+
+        partition.mutate(|txn| {
+            let pred_id = txn.add_predicate(make_predicate(0, 0x1234), &[IndexableAtom::Fallback]);
+            txn.add_binding(
+                SubscriptionBinding {
+                    subscription_id: 100,
+                    predicate_id: pred_id,
+                    consumer_id: 1,
+                    consumer_ordinal: ConsumerOrdinal::new(0),
+                    scope: SubscriptionScope::Durable,
+                    updated_at_unix_ms: 0,
+                },
+                pred_id,
+            );
+        });
+        assert_eq!(
+            partition.publication_count(),
+            1,
+            "predicate and binding ride one snapshot"
+        );
+
+        partition.mutate(|txn| {
+            assert!(txn.remove_binding(999).is_none());
+            txn.move_term_members(
+                PredicateId::from_slab_index(0),
+                0,
+                Vec::new(),
+                &RoaringBitmap::new(),
+                true,
+            );
+            assert!(txn
+                .clear_term_admissions(PredicateId::from_slab_index(0), 0)
+                .is_empty());
+        });
+        assert_eq!(
+            partition.publication_count(),
+            1,
+            "a transaction that changed nothing publishes no snapshot"
+        );
     }
 
     #[test]
@@ -730,9 +829,10 @@ mod tests {
         // Add predicate with IS NULL index on column 1
         let pred = make_predicate(0, 0x9999);
         let pred_id = pred.id;
-        partition.add_predicate(
+        add_predicate(
+            &mut partition,
             pred,
-            vec![IndexableAtom::Null {
+            &[IndexableAtom::Null {
                 column_id: 1,
                 kind: NullKind::IsNull,
             }],
@@ -757,9 +857,10 @@ mod tests {
 
         // Aggregate reading column 1 only.
         let pred = make_agg_predicate_on_col(0, 0xAAAA, 1);
-        let pred_id = partition.add_predicate(
+        let pred_id = add_predicate(
+            &mut partition,
             pred,
-            vec![IndexableAtom::Equality {
+            &[IndexableAtom::Equality {
                 column_id: 1,
                 value: IndexableCell::Int(100),
             }],
@@ -782,7 +883,7 @@ mod tests {
         let mut pred = make_predicate(0, 0xD00D);
         pred.dependency_columns = Arc::from([]);
         pred.index_atoms = Arc::from([IndexableAtom::Fallback]);
-        let pred_id = partition.add_predicate(pred, vec![IndexableAtom::Fallback]);
+        let pred_id = add_predicate(&mut partition, pred, &[IndexableAtom::Fallback]);
 
         let candidates = partition.select_update_candidates();
         assert!(candidates.contains(pred_id.as_u32()));
@@ -793,18 +894,20 @@ mod tests {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
         let changed = make_agg_predicate_on_col(0, 0xBBBB, 0);
-        let changed_id = partition.add_predicate(
+        let changed_id = add_predicate(
+            &mut partition,
             changed,
-            vec![IndexableAtom::Equality {
+            &[IndexableAtom::Equality {
                 column_id: 0,
                 value: IndexableCell::Int(1),
             }],
         );
 
         let unchanged = make_agg_predicate_on_col(1, 0xCCCC, 1);
-        let unchanged_id = partition.add_predicate(
+        let unchanged_id = add_predicate(
+            &mut partition,
             unchanged,
-            vec![IndexableAtom::Equality {
+            &[IndexableAtom::Equality {
                 column_id: 1,
                 value: IndexableCell::Int(100),
             }],
@@ -825,9 +928,10 @@ mod tests {
 
         // Equality predicate on col 0 == 42
         let pred = make_predicate_on_col(0, 0xAAAA, 0);
-        let pred_id = partition.add_predicate(
+        let pred_id = add_predicate(
+            &mut partition,
             pred,
-            vec![IndexableAtom::Equality {
+            &[IndexableAtom::Equality {
                 column_id: 0,
                 value: IndexableCell::Int(42),
             }],
@@ -864,9 +968,10 @@ mod tests {
 
         // Range predicate: col 0 > 10  (lower bound is inclusive 11)
         let pred = make_predicate_on_col(0, 0xBBBB, 0);
-        let pred_id = partition.add_predicate(
+        let pred_id = add_predicate(
+            &mut partition,
             pred,
-            vec![IndexableAtom::Range {
+            &[IndexableAtom::Range {
                 column_id: 0,
                 lower: Some(11),
                 upper: None,
@@ -903,9 +1008,10 @@ mod tests {
 
         // IS NULL predicate on col 0
         let pred = make_predicate_on_col(0, 0xCCCC, 0);
-        let pred_id = partition.add_predicate(
+        let pred_id = add_predicate(
+            &mut partition,
             pred,
-            vec![IndexableAtom::Null {
+            &[IndexableAtom::Null {
                 column_id: 0,
                 kind: NullKind::IsNull,
             }],
@@ -964,7 +1070,7 @@ mod tests {
 
         for (label, atom) in atoms {
             let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
-            let pred_id = partition.add_predicate(make_predicate(0, 0x0A11), vec![atom]);
+            let pred_id = add_predicate(&mut partition, make_predicate(0, 0x0A11), &[atom]);
 
             assert!(
                 partition

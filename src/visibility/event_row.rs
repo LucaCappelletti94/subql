@@ -77,7 +77,7 @@ impl<'a, E: CdcEvent, DB: DatabaseLike> EventRow<'a, E, DB> {
         let table = event.table_id(db);
         // Catches the `TableId::MAX` sentinel a name-resolving event
         // returns for an unknown table, and any id the catalog lost.
-        crate::catalog_helpers::table_arity(db, table)?;
+        crate::catalog_helpers::table_arity(db, table).ok()?;
         Some(Self {
             event,
             db,
