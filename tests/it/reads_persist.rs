@@ -200,6 +200,54 @@ fn saved_answers_come_back_with_their_identities() {
     );
 }
 
+/// A per-consumer read on a row-secured table registers, so it must also
+/// restore: per-consumer re-execution is exactly the mode that stays safe
+/// under row-level security, and dropping it on restart silently
+/// unsubscribes the consumer. Restore applies the same guard registration
+/// applies, on every plan shape.
+#[test]
+fn per_consumer_reads_on_a_row_secured_table_survive_a_restart() {
+    let rls_ddl = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, status TEXT);\
+                   ALTER TABLE orders ENABLE ROW LEVEL SECURITY;\
+                   CREATE TABLE managers (id INT PRIMARY KEY);";
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+
+    let (mut engine, _) =
+        Engine::with_storage(catalog(rls_ddl), PostgreSqlDialect {}, path.clone())
+            .expect("open store");
+    let scalar = engine
+        .register(SubscriptionRequest::new(1u64, EXTREME).database_reads_per_consumer())
+        .expect("a per-consumer scalar registers on the row-secured table");
+    let grouped = engine
+        .register(
+            SubscriptionRequest::new(
+                2u64,
+                "SELECT status, MIN(price) FROM orders GROUP BY status",
+            )
+            .database_reads_per_consumer(),
+        )
+        .expect("a per-consumer grouped read registers on the row-secured table");
+    drop(engine);
+
+    let (restored_engine, report) =
+        Engine::with_storage(catalog(rls_ddl), PostgreSqlDialect {}, path).expect("reopen store");
+    drop(dir);
+    assert!(
+        report.dropped.is_empty(),
+        "what registration accepted, restore must not drop: {:?}",
+        report.dropped
+    );
+    let mut restored: Vec<u64> = report.restored.iter().map(|r| r.subscription_id).collect();
+    restored.sort_unstable();
+    assert_eq!(
+        restored,
+        vec![scalar.subscription_id, grouped.subscription_id],
+        "both per-consumer reads come back"
+    );
+    assert_eq!(restored_engine.reread_count(), 2, "both are live again");
+}
+
 #[test]
 fn restored_fixed_tiers_report_exact_executable_queries() {
     let directory = tempfile::tempdir().expect("temp dir");
