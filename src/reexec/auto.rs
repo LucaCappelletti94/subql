@@ -553,12 +553,23 @@ where
         self.inner.describe_terms(spec)
     }
 
-    /// Unregister a session and drop every stored auth context that
-    /// belonged to it.
+    /// Drop every queued read whose subscription no longer holds a resolve
+    /// context, which is what unregistration leaves behind. A queued read
+    /// that outlived its subscription would send the next `resolve` to look
+    /// up state that is gone.
+    fn purge_unregistered_reads(&mut self) {
+        let contexts = &self.contexts;
+        self.pending_reads
+            .retain(|trigger| contexts.contains_key(&trigger.subscription_id));
+    }
+
+    /// Unregister a session and drop every stored auth context and queued
+    /// read that belonged to it.
     pub fn unregister_session(&mut self, session_id: I::SessionId) -> UnregisterReport {
         let engine = self.inner.unregister_session(session_id);
         self.contexts
             .retain(|_, ctx| ctx.session != Some(session_id));
+        self.purge_unregistered_reads();
         engine
     }
 
@@ -568,18 +579,21 @@ where
     /// One id counter serves both registries (`next_subscription_id` lives
     /// only on the inner engine), so an id cannot be claimed by both and the
     /// order below is a resolution, not a precedence. The read registry is
-    /// tried first, and when it claims the id the stored resolve context is
-    /// dropped with it.
+    /// tried first, and when it claims the id the stored resolve context and
+    /// any queued read are dropped with it.
     pub fn unregister_subscription(&mut self, subscription_id: SubscriptionId) -> bool {
         if self.inner.unregister_reread(subscription_id) {
             self.contexts.remove(&subscription_id);
+            self.purge_unregistered_reads();
             return true;
         }
         let removed = self.inner.unregister_subscription(subscription_id);
         if removed {
-            // Drop an in-process aggregate's stored context (auth for a possible
-            // demotion); a plain row subscription has none and this is a no-op.
+            // Drop an in-process aggregate's stored context (auth for a
+            // possible demotion) and any queued read. A plain row
+            // subscription has neither and this is a no-op.
             self.contexts.remove(&subscription_id);
+            self.purge_unregistered_reads();
         }
         removed
     }
@@ -2645,6 +2659,105 @@ mod tests {
             e.connector().call_count(),
             0,
             "no connector call after unregister"
+        );
+    }
+
+    /// A queued read must not outlive its subscription: unregistering purges
+    /// it, so the next resolve is a clean no-op rather than a panic on the
+    /// missing resolve context.
+    #[test]
+    fn unregister_subscription_drops_the_queued_read() {
+        let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(5.0)]);
+        let captured = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            captured,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+        assert_eq!(
+            e.pending_read_count(),
+            1,
+            "the displacement queues one read"
+        );
+        assert!(e.unregister_subscription(captured));
+        assert_eq!(
+            e.pending_read_count(),
+            0,
+            "the queued read left with its subscription"
+        );
+        e.resolve_collect().unwrap();
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "no read runs for a dead subscription"
+        );
+    }
+
+    /// The session twin: unregistering a session purges the queued reads of
+    /// every subscription it carried.
+    #[test]
+    fn unregister_session_drops_the_queued_reads() {
+        let (mut e, tid) = engine_with_values(alloc::vec![Value::Float(5.0)]);
+        let session = 9u64;
+        let captured = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders")
+                    .scope(crate::SubscriptionScope::Session(session)),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            captured,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+        assert_eq!(
+            e.pending_read_count(),
+            1,
+            "the displacement queues one read"
+        );
+        e.unregister_session(session);
+        assert_eq!(
+            e.pending_read_count(),
+            0,
+            "the session took its queued reads with it"
+        );
+        e.resolve_collect().unwrap();
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "no read runs for a dead session"
         );
     }
 
