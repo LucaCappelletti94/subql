@@ -1040,23 +1040,38 @@ impl<B: Backend> KeyedQuery<B> {
         }
     }
 
-    /// Take the keys accumulated so far, leaving none behind.
-    pub fn take_pending(&mut self) -> Vec<Vec<Value<B>>> {
-        self.seen.clear();
-        core::mem::take(&mut self.pending)
+    /// The keys accumulated so far, leaving them queued.
+    ///
+    /// A read works from this copy so that a failed or abandoned read loses
+    /// nothing: the keys stay recorded until [`remove_pending`](Self::remove_pending)
+    /// says they were delivered.
+    pub fn pending_snapshot(&self) -> Vec<Vec<Value<B>>> {
+        self.pending.clone()
     }
 
-    /// Put keys back after a read that never delivered them.
+    /// Drop exactly the delivered keys, keeping any recorded since the
+    /// snapshot they were read from.
     ///
-    /// Taking a key is a promise to ask the database about it, so a read that
-    /// failed has to give it back. This tier is the only one that cannot heal
-    /// itself: the others re-read everything, so a later change repairs an
-    /// earlier lost answer, while this one asks only about the keys named in
-    /// it, and a dropped key leaves that row wrong until it happens to change
-    /// again.
-    pub fn restore_pending(&mut self, keys: Vec<Vec<Value<B>>>) {
-        for key in keys {
-            self.record(key);
+    /// This tier is the only one that cannot heal itself: the others re-read
+    /// everything, so a later change repairs an earlier lost answer, while
+    /// this one asks only about the keys named in it, and a dropped key
+    /// leaves that row wrong until it happens to change again. Removal after
+    /// delivery is what makes a failed read cost a retry, never a row.
+    pub fn remove_pending(&mut self, delivered: &[Vec<Value<B>>]) {
+        let removed: hashbrown::HashSet<Vec<u8>> = delivered
+            .iter()
+            .filter_map(|key| crate::backend::encode_value_key(key))
+            .collect();
+        self.pending.retain(|key| {
+            crate::backend::encode_value_key(key).map_or_else(
+                // An unencodable key falls back to the scan, which is correct
+                // and merely slower, rather than being kept forever.
+                || !delivered.contains(key),
+                |encoded| !removed.contains(&encoded),
+            )
+        });
+        for encoded in &removed {
+            self.seen.remove(encoded);
         }
     }
 

@@ -71,6 +71,9 @@ pub struct RowsUpdate<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCh
     ///
     /// Pages of one re-read share a generation. A page carrying a higher one
     /// starts a new answer, which is the signal to discard the previous.
+    /// Pages stream as they are fetched, so a read that fails or is
+    /// abandoned leaves a generation with no final page. The retried read
+    /// delivers the higher generation that supersedes it.
     pub generation: u64,
     /// Column names as the database reported them, in projection order.
     pub columns: Vec<String>,
@@ -96,9 +99,11 @@ pub struct RowDelta<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoChec
     pub consumer_id: I::ConsumerId,
     /// Primary key values identifying the row, in key-column order.
     pub key: Vec<Value<B>>,
-    /// Column names for [`Self::row`], in projection order. Empty when the row
-    /// left the answer, since no row came back to describe.
-    pub columns: Vec<String>,
+    /// Column names for [`Self::row`], in projection order, shared across
+    /// every delta of one read so the schema is allocated once per read.
+    /// Empty when the row left the answer, since no row came back to
+    /// describe.
+    pub columns: alloc::sync::Arc<[String]>,
     /// The row as it now is, or `None` when it is no longer in the answer.
     pub row: Option<Vec<Value<B>>>,
     /// Position of the event that produced this, when known.
@@ -106,7 +111,7 @@ pub struct RowDelta<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoChec
 }
 
 /// Database read named by one re-execution trigger.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum ReExecutionRead<B: Backend = crate::backend::Postgres> {
     /// Use the fixed read declared by the registration tier.
     Subscription,
@@ -119,6 +124,25 @@ pub enum ReExecutionRead<B: Backend = crate::backend::Postgres> {
         /// Decode hints for the extreme and source-row count.
         column_kinds: [crate::backend::BuiltinKind; 2],
     },
+}
+
+// Manual rather than derived: the derive would demand `B: Clone` although
+// every stored field clones without it.
+impl<B: Backend> Clone for ReExecutionRead<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Subscription => Self::Subscription,
+            Self::GroupedScalar {
+                group,
+                query,
+                column_kinds,
+            } => Self::GroupedScalar {
+                group: group.clone(),
+                query: query.clone(),
+                column_kinds: *column_kinds,
+            },
+        }
+    }
 }
 
 impl<B: Backend> ReExecutionRead<B> {
@@ -140,7 +164,7 @@ impl<B: Backend> ReExecutionRead<B> {
 /// the same trigger twice is safe (a single re-execution serves any
 /// number of pending triggers), and `install` unconditionally overwrites
 /// the stored value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ReExecutionTrigger<
     I: IdTypes,
     C: crate::Checkpoint = crate::NoCheckpoint,
@@ -154,6 +178,19 @@ pub struct ReExecutionTrigger<
     pub read: ReExecutionRead<B>,
     /// Position of the event that triggered this re-execution, when known.
     pub checkpoint: Option<C>,
+}
+
+// Manual rather than derived: the derive would demand `I: Clone` although
+// only `I::ConsumerId` (always `Copy` per `Id`) is stored.
+impl<I: IdTypes, C: crate::Checkpoint, B: Backend> Clone for ReExecutionTrigger<I, C, B> {
+    fn clone(&self) -> Self {
+        Self {
+            subscription_id: self.subscription_id,
+            consumer_id: self.consumer_id,
+            read: self.read.clone(),
+            checkpoint: self.checkpoint.clone(),
+        }
+    }
 }
 
 /// Everything one dispatched event produced across seven channels.
@@ -186,28 +223,66 @@ pub struct ReExecNotifications<I: IdTypes, B: Backend, C: crate::Checkpoint = cr
     pub transitions: Vec<crate::MaintenanceTransition<B>>,
 }
 
-/// Batch result returned by both connector modes.
+/// One result delivered by `resolve` as its read completes.
 ///
-/// Keeps per-event row notifications in input order and coalesces database
-/// reads by subscription identity.
-/// **Every channel has to be drained**, for the reason given on
-/// [`ReExecNotifications`]: the deliveries have different shapes rather than
-/// being alternatives, so ignoring one silently drops every subscription that
-/// uses it.
-pub struct BatchOutcome<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
-    /// View-relative engine notifications, one entry per input event in
-    /// the order they were supplied.
-    pub per_event: Vec<ConsumerNotifications<I, C, B>>,
-    /// Grouped aggregate rows written or removed during the batch.
-    pub aggregate_updates: Vec<crate::AggregateValueUpdate<I, B>>,
-    /// Scalar updates produced in-process during the batch.
+/// The sink receives each installed answer the moment its read finishes,
+/// so retained memory tracks one read rather than the whole drain.
+#[derive(Debug, Clone)]
+pub enum ReadDelivery<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
+    /// A scalar captured query's re-read value.
+    Scalar(ScalarUpdate<I, B, C>),
+    /// A grouped aggregate row written or removed by a grouped read.
+    Aggregate(crate::AggregateValueUpdate<I, B>),
+    /// One page of a whole re-read answer.
+    Rows(RowsUpdate<I, B, C>),
+    /// One row of a keyed capture entering, changing, or leaving.
+    Delta(RowDelta<I, B, C>),
+    /// A subscription changed maintenance tier during resolution.
+    Transition(crate::MaintenanceTransition<B>),
+}
+
+/// Every delivery of one `resolve` drain, buffered by channel.
+///
+/// The convenience shape over the sink primitive, for callers that want the
+/// whole drain in hand. **Every channel has to be drained**, for the reason
+/// given on [`ReExecNotifications`]: the deliveries have different shapes
+/// rather than being alternatives, so ignoring one silently drops every
+/// subscription that uses it.
+#[derive(Debug, Clone)]
+pub struct ResolvedReads<I: IdTypes, B: Backend, C: crate::Checkpoint = crate::NoCheckpoint> {
+    /// Scalar re-read values, in delivery order.
     pub scalar_updates: Vec<ScalarUpdate<I, B, C>>,
-    /// Pages of re-read captured queries produced during the batch.
+    /// Grouped aggregate rows written or removed, in delivery order.
+    pub aggregate_updates: Vec<crate::AggregateValueUpdate<I, B>>,
+    /// Pages of whole re-read answers, in delivery order.
     pub rows_updates: Vec<RowsUpdate<I, B, C>>,
-    /// Per-row changes from keyed captures produced during the batch.
+    /// Per-row keyed changes, in delivery order.
     pub row_deltas: Vec<RowDelta<I, B, C>>,
-    /// Re-execution triggers, deduplicated by subscription and group scope.
-    pub triggers: Vec<ReExecutionTrigger<I, C, B>>,
-    /// Tier changes produced during the batch.
+    /// Tier changes produced during resolution.
     pub transitions: Vec<crate::MaintenanceTransition<B>>,
+}
+
+impl<I: IdTypes, B: Backend, C: crate::Checkpoint> Default for ResolvedReads<I, B, C> {
+    fn default() -> Self {
+        Self {
+            scalar_updates: Vec::new(),
+            aggregate_updates: Vec::new(),
+            rows_updates: Vec::new(),
+            row_deltas: Vec::new(),
+            transitions: Vec::new(),
+        }
+    }
+}
+
+impl<I: IdTypes, B: Backend, C: crate::Checkpoint> ResolvedReads<I, B, C> {
+    /// File one delivery under its channel.
+    pub fn push(&mut self, delivery: ReadDelivery<I, B, C>) {
+        match delivery {
+            ReadDelivery::Scalar(update) => self.scalar_updates.push(update),
+            ReadDelivery::Aggregate(update) => self.aggregate_updates.push(update),
+            ReadDelivery::Rows(update) => self.rows_updates.push(update),
+            ReadDelivery::Delta(delta) => self.row_deltas.push(delta),
+            ReadDelivery::Transition(transition) => self.transitions.push(transition),
+        }
+    }
 }

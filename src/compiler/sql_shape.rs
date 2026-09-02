@@ -445,7 +445,7 @@ fn is_complete_column_list<DB: DatabaseLike>(
     table_id: crate::TableId,
     database: &DB,
 ) -> bool {
-    let Some(arity) = catalog_helpers::table_arity(database, table_id) else {
+    let Ok(arity) = catalog_helpers::table_arity(database, table_id) else {
         return false;
     };
     if items.is_empty() {
@@ -1954,7 +1954,9 @@ pub(crate) struct ExistsParts<'a> {
     pub caller: &'a Expr,
     /// The membership table clause, verbatim, alias included.
     pub from: &'a sqlparser::ast::TableWithJoins,
-    /// The membership table, resolved.
+    /// The membership table, resolved. Read only by the `membership-term`
+    /// compiler half.
+    #[cfg(feature = "membership-term")]
     pub member_table: crate::TableId,
 }
 
@@ -1962,7 +1964,9 @@ pub(crate) struct ExistsParts<'a> {
 pub(crate) struct ExistsPair<'a> {
     /// The membership-side expression, verbatim, for the seed projection.
     pub inner_expr: &'a Expr,
-    /// The membership column it names, resolved on the membership table.
+    /// The membership column it names, resolved on the membership table. Read
+    /// only by the `membership-term` compiler half.
+    #[cfg(feature = "membership-term")]
     pub inner: crate::ColumnId,
     /// The compared column, resolved on the subscribed table.
     pub outer: crate::ColumnId,
@@ -2070,6 +2074,20 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
         }
         catalog_helpers::column_id(database, table_id, column)
     };
+    // Both builds resolve the membership column to classify the pair. Only
+    // the `membership-term` half stores it.
+    let make_pair = |member: &'a Expr, subscribed: &'a Expr| -> Option<ExistsPair<'a>> {
+        let inner = member_column(member)?;
+        let outer = subscribed_column(subscribed)?;
+        #[cfg(not(feature = "membership-term"))]
+        let _ = inner;
+        Some(ExistsPair {
+            inner_expr: member,
+            #[cfg(feature = "membership-term")]
+            inner,
+            outer,
+        })
+    };
 
     let Some(selection) = select.selection.as_ref() else {
         return Err(exists_refusal(
@@ -2112,21 +2130,7 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
                 "carries a condition that is neither a pair equality nor a caller comparison",
             ));
         };
-        let pair = match (member_column(left), subscribed_column(right)) {
-            (Some(inner), Some(outer)) => Some(ExistsPair {
-                inner_expr: left.as_ref(),
-                inner,
-                outer,
-            }),
-            _ => match (member_column(right), subscribed_column(left)) {
-                (Some(inner), Some(outer)) => Some(ExistsPair {
-                    inner_expr: right.as_ref(),
-                    inner,
-                    outer,
-                }),
-                _ => None,
-            },
-        };
+        let pair = make_pair(left, right).or_else(|| make_pair(right, left));
         let Some(pair) = pair else {
             return Err(exists_refusal(
                 "carries an equality that does not pair a membership column with a qualified \
@@ -2147,6 +2151,7 @@ pub(crate) fn membership_exists_parts<'a, DB: DatabaseLike>(
         pairs,
         caller,
         from: &select.from[0],
+        #[cfg(feature = "membership-term")]
         member_table,
     })
 }

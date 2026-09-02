@@ -233,11 +233,12 @@ fn engine_and_captured_paths_coexist_through_pg_async_connector() {
         let mut total_scalar_updates = Vec::new();
         let mut total_triggers = 0usize;
         for event in &events {
-            let notifs = engine.consumers(event).await.expect("consumers dispatch");
+            let notifs = engine.apply(event).expect("apply dispatch");
             total_inserted.extend(notifs.engine.inserted().iter().copied());
-            total_scalar_updates.extend(notifs.scalar_updates);
             total_triggers += notifs.triggers.len();
         }
+        let resolved = engine.resolve_collect().await.expect("consumers dispatch");
+        total_scalar_updates.extend(resolved.scalar_updates);
 
         assert!(
             total_inserted.contains(&engine_consumer),
@@ -727,19 +728,21 @@ fn the_keyed_tier_delivers_row_deltas_through_the_async_engine() {
 
         let mut deltas = Vec::new();
         for event in &events {
-            let notifs = engine.consumers(event).await.expect("dispatch");
-            assert!(
-                notifs.scalar_updates.is_empty(),
-                "a row query is not a scalar, got {:?}",
-                notifs.scalar_updates
-            );
-            assert!(
-                notifs.rows_updates.is_empty(),
-                "the keyed tier delivers per-row deltas, never whole pages: a page here \
-                 means the tier was decided again at resolve time and got it wrong"
-            );
-            deltas.extend(notifs.row_deltas);
+            let notifs = engine.apply(event).expect("apply dispatch");
+            assert!(notifs.row_deltas.is_empty(), "apply does not execute reads");
         }
+        let resolved = engine.resolve_collect().await.expect("dispatch");
+        assert!(
+            resolved.scalar_updates.is_empty(),
+            "a row query is not a scalar, got {:?}",
+            resolved.scalar_updates
+        );
+        assert!(
+            resolved.rows_updates.is_empty(),
+            "the keyed tier delivers per-row deltas, never whole pages: a page here \
+             means the tier was decided again at resolve time and got it wrong"
+        );
+        deltas.extend(resolved.row_deltas);
 
         assert!(
             deltas.iter().all(|d| d.subscription_id == subscription_id),
@@ -826,13 +829,18 @@ fn the_whole_reread_tier_delivers_pages_through_the_async_engine() {
 
         let mut pages = Vec::new();
         for event in &events {
-            let notifs = engine.consumers(event).await.expect("dispatch");
+            let notifs = engine.apply(event).expect("apply dispatch");
             assert!(
-                notifs.row_deltas.is_empty(),
-                "this tier delivers pages, not per-row deltas"
+                notifs.rows_updates.is_empty(),
+                "apply does not execute reads"
             );
-            pages.extend(notifs.rows_updates);
         }
+        let resolved = engine.resolve_collect().await.expect("dispatch");
+        assert!(
+            resolved.row_deltas.is_empty(),
+            "this tier delivers pages, not per-row deltas"
+        );
+        pages.extend(resolved.rows_updates);
 
         assert!(!pages.is_empty(), "a change must produce at least one page");
         assert!(
@@ -908,7 +916,10 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
         let events: Vec<MessageV2> = msgs.iter().flat_map(|m| parse_message(m)).collect();
         assert!(events.len() >= 3, "the slot must carry all three updates");
 
-        let outcome = engine.consumers_batch(&events).await.expect("batch");
+        for event in &events {
+            engine.apply(event).expect("apply dispatch");
+        }
+        let outcome = engine.resolve_collect().await.expect("batch");
         assert!(
             outcome.scalar_updates.is_empty() && outcome.rows_updates.is_empty(),
             "the keyed tier delivers per-row deltas only"
@@ -948,9 +959,13 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
         let keyless = parse_message(r#"{"action":"U","schema":"public","table":"orders"}"#);
         assert_eq!(keyless.len(), 1, "the probe must parse as one message");
         let output = engine
-            .consumers(&keyless[0])
+            .apply(&keyless[0])
+            .expect("keyless change transitions");
+        let resolved = engine
+            .resolve_collect()
             .await
-            .expect("keyless change transitions and re-reads");
+            .expect("keyless change re-reads");
+        // Transitions come from apply, rows_updates from resolve
         assert_eq!(output.transitions.len(), 1);
         assert_eq!(output.transitions[0].subscription_id, subscription_id);
         assert_eq!(output.transitions[0].from, TierKind::KeyedRows);
@@ -965,7 +980,7 @@ fn the_async_batch_path_delivers_row_deltas_and_transitions_a_keyless_change() {
             }
         );
         assert!(
-            !output.rows_updates.is_empty(),
+            !resolved.rows_updates.is_empty(),
             "the replacement read is delivered"
         );
     });
@@ -1247,8 +1262,9 @@ fn grouped_min_snapshots_and_rereads_one_group_async() {
             .iter()
             .flat_map(|message| parse_message(message))
             .collect();
-        let output = engine.consumers(&events[0]).await.expect("group re-read");
-        assert!(output.triggers.is_empty());
+        engine.apply(&events[0]).expect("apply");
+        let output = engine.resolve_collect().await.expect("group re-read");
+        assert_eq!(engine.pending_read_count(), 0, "all reads resolved");
         assert_eq!(output.aggregate_updates.len(), 1);
         assert_eq!(output.aggregate_updates[0].group.as_ref(), Some(&paid));
         assert_eq!(

@@ -1,16 +1,16 @@
 //! Async parallel of [`AutoResolvingEngine`](super::AutoResolvingEngine).
 //!
-//! Same surface (`register`, `install`, `snapshot`, `consumers`,
-//! `unregister_*`), with the methods that touch the connector returning
-//! `Send` futures. Pick this engine when the database driver is async
-//! (sqlx, tokio-postgres, diesel-async). Pick the sync engine when the
-//! driver is sync (diesel, rusqlite) or when you want the simpler
-//! testing surface.
+//! Same surface (`register`, `install`, `snapshot`, `apply`,
+//! `resolve_collect`, `unregister_*`), with the methods that touch the
+//! connector returning `Send` futures. Pick this engine when the database
+//! driver is async (sqlx, tokio-postgres, diesel-async). Pick the sync
+//! engine when the driver is sync (diesel, rusqlite) or when you want the
+//! simpler testing surface.
 
 use super::async_connector::AsyncConnector;
 use super::auto::{reconcile_checkpoint, AutoResolvingEngine, ResolverMode, SnapshotResult};
 use super::connector::ReExecError;
-use super::engine::{BatchOutcome, ReExecNotifications, ScalarUpdate};
+use super::engine::ReExecNotifications;
 use crate::backend::{Backend, CdcEvent, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::{IdTypes, SubscriptionId};
@@ -79,17 +79,23 @@ async fn acquire_permit(
 /// What one triggered query needs from the database, with every borrow of the
 /// engine already resolved.
 ///
-/// The async resolve runs in three phases: decide and take (needs `&mut self`),
-/// read concurrently (needs only shared borrows), install and emit (needs
-/// `&mut self` again). This type is what crosses the first boundary, so
-/// anything the read needs from engine state is owned by the time it is built.
-/// Pending keys in particular are *taken* in phase one, which is why they
-/// cannot be re-read later.
+/// The async resolve runs in three phases: plan against a snapshot (needs
+/// `&mut self`), read concurrently (needs only shared borrows), install and
+/// deliver (needs `&mut self` again, between awaits). This type is what
+/// crosses the first boundary, so anything the read needs from engine state
+/// is owned by the time it is built. Pending keys are copied, never taken,
+/// so a dropped or failed read loses nothing.
 type KeyedRows<B> = Vec<(Vec<Value<B>>, Vec<Value<B>>)>;
 
-/// Keys a resolve took from the engine, per query, so a failure can give them
-/// back.
-type BorrowedKeys<B> = Vec<(SubscriptionId, Vec<Vec<Value<B>>>)>;
+/// One queued read paired with the job phase one planned for it.
+type PlannedJob<I, C, B> = (super::ReExecutionTrigger<I, C, B>, ResolveJob<B>);
+
+/// One concurrent read's outcome, entering phase three.
+type ReadOutcome<I, C, B, E> =
+    Result<(super::ReExecutionTrigger<I, C, B>, Resolved<B>), ReExecError<E>>;
+
+/// Every outcome of one concurrent drain iteration, in completion order.
+type ReadOutcomes<I, C, B, E> = Vec<ReadOutcome<I, C, B, E>>;
 
 enum ResolveJob<B: Backend> {
     /// A scalar the connector reads in one call.
@@ -137,25 +143,15 @@ enum Resolved<B: Backend> {
         present: KeyedRows<B>,
     },
 
-    Whole {
-        generation: u64,
-        pages: Vec<ReadPage<B>>,
-    },
+    /// A whole re-read whose pages already streamed to the sink from the
+    /// concurrent phase. Nothing is installed for it.
+    WholeStreamed,
 }
-struct ResolveOutputs<'a, I: IdTypes, B: Backend, C: crate::Checkpoint> {
-    aggregate_updates: &'a mut Vec<crate::AggregateValueUpdate<I, B>>,
-    scalar_updates: &'a mut Vec<ScalarUpdate<I, B, C>>,
-    rows_updates: &'a mut Vec<super::engine::RowsUpdate<I, B, C>>,
-    row_deltas: &'a mut Vec<super::engine::RowDelta<I, B, C>>,
-    followup: &'a mut Vec<super::ReExecutionTrigger<I, C, B>>,
-    transitions: &'a mut Vec<crate::MaintenanceTransition<B>>,
-}
-
-/// One page of a whole re-read, as it will be delivered.
+/// One page of a whole re-read buffered for a snapshot answer, which returns
+/// the whole result by contract.
 struct ReadPage<B: Backend> {
     columns: Vec<alloc::string::String>,
     rows: Vec<Vec<Value<B>>>,
-    more: bool,
 }
 
 /// Asynchronous [`AsyncConnector`] mode.
@@ -189,8 +185,8 @@ where
     X: AsyncConnector<Backend = E::Backend>,
 {
     /// Cap the number of trigger re-executions that may be in flight
-    /// simultaneously across all [`consumers`](Self::consumers) and
-    /// [`consumers_batch`](Self::consumers_batch) calls.
+    /// simultaneously across all [`apply`](Self::apply) and
+    /// [`resolve_collect`](Self::resolve_collect) calls.
     ///
     /// The cap is enforced by a persistent semaphore on the engine: each
     /// `connector.execute_scalar(...)` acquires a permit before running
@@ -411,261 +407,216 @@ where
         Ok(Some(SnapshotResult::Scalar(value, checkpoint)))
     }
 
-    /// Dispatch a CDC event.
+    /// Execute every queued read through the connector, delivering each
+    /// installed answer into `sink` as its read completes.
     ///
-    /// For every [`ReExecutionTrigger`] the inner engine emits, this
-    /// method looks up the auth context, awaits the connector's
-    /// `execute_scalar`, installs the result, and replaces the trigger
-    /// with a [`ScalarUpdate`]. The first connector failure aborts the
-    /// rest of the batch and is surfaced as [`ReExecError::Connector`].
+    /// The reads of one drain iteration run concurrently, at most
+    /// [`with_max_concurrent_reexecutions`](Self::with_max_concurrent_reexecutions)
+    /// in flight (unbounded when not configured). A read that fails stays
+    /// queued and the next `resolve` retries it. Reads that succeeded in the
+    /// same iteration are still installed and delivered before the failure
+    /// is reported.
     ///
-    /// [`ReExecutionTrigger`]: super::ReExecutionTrigger
-    #[allow(clippy::too_many_lines)]
-    pub async fn consumers(
-        &mut self,
-        event: &E,
-    ) -> Result<ReExecNotifications<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
+    /// Dropping the returned future loses nothing: engine state moves only
+    /// between awaits, keys are copied rather than taken, and a read is
+    /// dequeued only in the same poll that installs and delivers it, so
+    /// undelivered reads stay queued for the next call.
+    ///
+    /// # Errors
+    ///
+    /// [`ReExecError::Connector`] and [`ReExecError::Cursor`] name the
+    /// subscription whose read failed. Install errors mean the database
+    /// answer does not match the subscription and are not retryable.
+    pub async fn resolve<S>(&mut self, mut sink: S) -> Result<(), ReExecError<X::Error>>
+    where
+        S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
+    {
         use futures_util::stream::StreamExt;
 
-        let ReExecNotifications {
-            engine,
-            mut aggregate_updates,
-            mut scalar_updates,
-            mut rows_updates,
-            mut row_deltas,
-            triggers,
-            mut transitions,
-        } = self
-            .inner
-            .reread_notifications(event)
-            .map_err(ReExecError::Dispatch)?;
-        self.apply_transitions(&transitions);
+        loop {
+            if self.pending_reads.is_empty() {
+                return Ok(());
+            }
+            let jobs = self.plan_pending_jobs();
+            if jobs.is_empty() {
+                continue;
+            }
 
-        // Pre-filter debounced triggers.
-        let actionable: Vec<_> = triggers
-            .into_iter()
-            .filter(|t| !self.debounce_skip(t.subscription_id, &t.read))
-            .collect();
+            // Phase two: shared borrows only, so the reads run concurrently.
+            let connector = &self.mode.connector;
+            let contexts = &self.contexts;
+            let max_page_bytes = self.max_page_bytes;
+            let throttle = self
+                .mode
+                .permits
+                .as_ref()
+                .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
+            let jobs_len = jobs.len();
+            let resolved = {
+                // Whole reads stream their pages from inside the concurrent
+                // phase, so the sink is shared under an async lock for the
+                // duration and handed back exclusively afterwards.
+                let shared_sink = async_lock::Mutex::new(&mut sink);
+                futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
+                    let auth = &contexts
+                        .get(&trigger.subscription_id)
+                        .expect(
+                            "every captured query stores its resolve context at register time, \
+                             trigger.subscription_id must exist in `contexts`",
+                        )
+                        .auth;
+                    Self::run_one(
+                        connector,
+                        &shared_sink,
+                        trigger,
+                        job,
+                        max_page_bytes,
+                        auth,
+                        throttle.clone(),
+                    )
+                }))
+                .buffer_unordered(jobs_len)
+                .collect::<Vec<_>>()
+                .await
+            };
 
-        if actionable.is_empty() {
-            return Ok(ReExecNotifications {
-                engine,
-                aggregate_updates,
-                scalar_updates,
-                rows_updates,
-                row_deltas,
-                triggers: Vec::new(),
-                transitions,
-            });
+            self.apply_outcomes(resolved, &mut sink)?;
+            // Grouped installs may have queued follow-up reads: loop drains
+            // them with the same concurrency.
         }
+    }
 
-        // Phase one, under `&mut self`: decide each query's tier and take the
-        // engine state its read needs. Pending keys are consumed here, so this
-        // cannot be folded into the concurrent phase below.
-        let (jobs, borrowed) = self.plan_jobs(actionable);
-        if jobs.is_empty() {
-            return Ok(ReExecNotifications {
-                engine,
-                aggregate_updates,
-                scalar_updates,
-                rows_updates,
-                row_deltas,
-                triggers: Vec::new(),
-                transitions,
-            });
+    /// Phase one of a resolve iteration, under `&mut self`: decide each
+    /// queued read's job against a snapshot. Keys are copied, never taken,
+    /// so a dropped future loses nothing. A read with nothing to ask is
+    /// dequeued with its debounce stamp moved, as if it had been read.
+    fn plan_pending_jobs(&mut self) -> Vec<PlannedJob<I, E::Checkpoint, E::Backend>> {
+        let snapshot = self.pending_reads.clone();
+        let mut jobs = Vec::with_capacity(snapshot.len());
+        for trigger in snapshot {
+            if let Some(job) = self.plan_job(&trigger) {
+                jobs.push((trigger, job));
+            } else {
+                self.dequeue_read(&trigger);
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+            }
         }
+        jobs
+    }
 
-        // Phase two: shared borrows only, so the reads can run concurrently.
-        // `inner` and `last_reexec_at` stay free for the mutation afterwards.
-        let connector = &self.mode.connector;
-        let contexts = &self.contexts;
-        let max_page_bytes = self.max_page_bytes;
-        let throttle = self
-            .mode
-            .permits
-            .as_ref()
-            .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
-        let jobs_len = jobs.len();
-
-        #[allow(clippy::type_complexity)]
-        let resolved: Vec<
-            Result<
-                (
-                    super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-                    Resolved<E::Backend>,
-                ),
-                ReExecError<X::Error>,
-            >,
-        > = futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
-            let auth = &contexts
-                .get(&trigger.subscription_id)
-                .expect(
-                    "every captured query stores its resolve context at register time, \
-                     trigger.subscription_id must exist in `contexts`",
-                )
-                .auth;
-            let throttle = throttle.clone();
-            async move {
-                let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
-                let answer = Self::run_job(
+    /// One planned read, phase two: a whole read streams its pages into the
+    /// shared sink, everything else resolves to an answer for phase three.
+    /// Holds no exclusive borrow of the engine, so these run concurrently.
+    async fn run_one<S>(
+        connector: &X,
+        shared_sink: &async_lock::Mutex<&mut S>,
+        trigger: super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
+        job: ResolveJob<E::Backend>,
+        max_page_bytes: usize,
+        auth: &X::AuthContext,
+        throttle: Option<(Arc<Semaphore>, Arc<AtomicUsize>)>,
+    ) -> ReadOutcome<I, E::Checkpoint, E::Backend, X::Error>
+    where
+        S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
+    {
+        let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
+        let answer = match job {
+            ResolveJob::Whole { query, generation } => {
+                Self::stream_whole(
                     connector,
-                    job,
-                    trigger.subscription_id,
+                    shared_sink,
+                    &trigger,
+                    &query,
+                    generation,
                     max_page_bytes,
                     auth,
                 )
                 .await?;
-                Ok::<_, ReExecError<X::Error>>((trigger, answer))
+                Resolved::WholeStreamed
             }
-        }))
-        .buffer_unordered(jobs_len)
-        .collect::<Vec<_>>()
-        .await;
-
-        // One failure fails the call, so nothing is delivered and every key
-        // taken goes back. Collected rather than short-circuited for exactly
-        // that reason: `try_collect` drops the other jobs, and their keys with
-        // them.
-        let answers = match Self::first_failure(resolved) {
-            Ok(answers) => answers,
-            Err(e) => {
-                self.restore_borrowed(borrowed);
-                return Err(e);
+            other => {
+                Self::run_job(
+                    connector,
+                    other,
+                    trigger.subscription_id,
+                    max_page_bytes,
+                    auth,
+                )
+                .await?
             }
         };
-
-        // Phase three: borrows released, apply what came back.
-        let mut followup = Vec::new();
-        for (trigger, answer) in answers {
-            self.stamp_reexec(trigger.subscription_id, &trigger.read);
-            self.apply_resolved(
-                &trigger,
-                answer,
-                &mut ResolveOutputs {
-                    aggregate_updates: &mut aggregate_updates,
-                    scalar_updates: &mut scalar_updates,
-                    rows_updates: &mut rows_updates,
-                    row_deltas: &mut row_deltas,
-                    followup: &mut followup,
-                    transitions: &mut transitions,
-                },
-            )?;
-        }
-        self.drain_followup(
-            &mut followup,
-            &mut aggregate_updates,
-            &mut scalar_updates,
-            &mut rows_updates,
-            &mut row_deltas,
-            &mut transitions,
-        )
-        .await?;
-
-        Ok(ReExecNotifications {
-            engine,
-            aggregate_updates,
-            scalar_updates,
-            rows_updates,
-            row_deltas,
-            triggers: Vec::new(),
-            transitions,
-        })
+        Ok((trigger, answer))
     }
 
-    /// Decide every triggered query's read, and record what was taken.
-    ///
-    /// Phase one of the resolve, and the only part needing `&mut self`, which
-    /// is what lets the reads themselves run concurrently. A failure here gives
-    /// back whatever earlier queries in the same call already took.
-    #[allow(clippy::type_complexity)]
-    fn plan_jobs(
+    /// Phase three, between awaits so it cannot be interrupted: install and
+    /// deliver the successes, keep the failures queued, and report the
+    /// first failure.
+    fn apply_outcomes<S>(
         &mut self,
-        actionable: Vec<super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>>,
-    ) -> (
-        Vec<(
-            super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-            ResolveJob<E::Backend>,
-        )>,
-        BorrowedKeys<E::Backend>,
-    ) {
-        let mut jobs = Vec::with_capacity(actionable.len());
-        // Taking a key is a promise to ask the database about it, and an error
-        // means nothing was delivered, so every key taken has to survive it.
-        let mut borrowed: BorrowedKeys<E::Backend> = Vec::new();
-        for trigger in actionable {
-            if let Some(job) = self.plan_job(&trigger) {
-                if let ResolveJob::Keyed(keyed) = &job {
-                    borrowed.push((trigger.subscription_id, keyed.keys.clone()));
+        resolved: ReadOutcomes<I, E::Checkpoint, E::Backend, X::Error>,
+        sink: &mut S,
+    ) -> Result<(), ReExecError<X::Error>>
+    where
+        S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
+    {
+        let mut first_error = None;
+        for outcome in resolved {
+            match outcome {
+                Ok((trigger, answer)) => {
+                    self.dequeue_read(&trigger);
+                    self.apply_answer(&trigger, answer, sink)?;
+                    self.stamp_reexec(trigger.subscription_id, &trigger.read);
                 }
-                jobs.push((trigger, job));
-            } else {
-                // Nothing to ask about, but the query was still triggered, so
-                // its debounce stamp moves as if it had been read.
-                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
-        (jobs, borrowed)
+        first_error.map_or(Ok(()), Err)
     }
 
-    /// Split collected outcomes into every answer, or the first failure.
+    /// Drain every queued read, buffering deliveries by channel.
     ///
-    /// Safe against dropped keys only because the caller materialises every
-    /// outcome with `.collect()` before calling this: the `?`-style walk
-    /// below does short-circuit, but by then every sibling job has already
-    /// finished and returned its keys. Swapping that `collect` for a lazy
-    /// try-collect would reintroduce the loss.
-    #[allow(clippy::type_complexity)]
-    fn first_failure(
-        resolved: Vec<
-            Result<
-                (
-                    super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-                    Resolved<E::Backend>,
-                ),
-                ReExecError<X::Error>,
-            >,
-        >,
-    ) -> Result<
-        Vec<(
-            super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-            Resolved<E::Backend>,
-        )>,
-        ReExecError<X::Error>,
-    > {
-        let mut answers = Vec::with_capacity(resolved.len());
-        for outcome in resolved {
-            answers.push(outcome?);
-        }
-        Ok(answers)
-    }
-
-    /// Give back every key a failed call had taken.
-    fn restore_borrowed(&mut self, borrowed: BorrowedKeys<E::Backend>) {
-        for (subscription_id, keys) in borrowed {
-            self.inner.restore_pending_keys(subscription_id, keys);
-        }
-    }
-
-    /// Install one answer and record what the caller should be told.
+    /// The convenience shape over [`resolve`](Self::resolve) for callers
+    /// that want the whole drain in hand rather than a delivery at a time.
     ///
-    /// Shared by the single-event and batch paths so the two cannot drift on
-    /// what a tier delivers.
-    fn apply_resolved(
+    /// # Errors
+    ///
+    /// As [`resolve`](Self::resolve). Deliveries made before the failure
+    /// are lost to the caller here, which is the buffering trade: use
+    /// [`resolve`](Self::resolve) to keep them.
+    pub async fn resolve_collect(
+        &mut self,
+    ) -> Result<super::ResolvedReads<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
+        let mut collected = super::ResolvedReads::default();
+        self.resolve(|delivery| collected.push(delivery)).await?;
+        Ok(collected)
+    }
+
+    /// Install one answer, deliver what it produced, and queue any follow-up
+    /// reads a grouped install displaced.
+    fn apply_answer<S>(
         &mut self,
         trigger: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
         answer: Resolved<E::Backend>,
-        outputs: &mut ResolveOutputs<'_, I, E::Backend, E::Checkpoint>,
-    ) -> Result<(), ReExecError<X::Error>> {
+        sink: &mut S,
+    ) -> Result<(), ReExecError<X::Error>>
+    where
+        S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>),
+    {
         match answer {
             Resolved::Scalar(value) => {
-                outputs.scalar_updates.push(crate::Install::install(
+                let update = crate::Install::install(
                     &mut self.inner,
                     trigger.subscription_id,
                     crate::ScalarInstall {
                         value,
                         checkpoint: trigger.checkpoint.clone(),
                     },
-                )?);
+                )?;
+                sink(super::ReadDelivery::Scalar(update));
             }
             Resolved::GroupedScalar { group, row } => {
                 let installed = crate::Install::install(
@@ -678,88 +629,37 @@ where
                     },
                 )?;
                 self.apply_transitions(&installed.transitions);
-                outputs.aggregate_updates.extend(installed.updates);
-                outputs.followup.extend(installed.triggers);
-                outputs.transitions.extend(installed.transitions);
+                for update in installed.updates {
+                    sink(super::ReadDelivery::Aggregate(update));
+                }
+                for transition in installed.transitions {
+                    sink(super::ReadDelivery::Transition(transition));
+                }
+                for followup in installed.triggers {
+                    self.enqueue_read(followup);
+                }
             }
             Resolved::Keyed {
                 keys,
                 columns,
                 present,
-            } => outputs.row_deltas.extend(super::auto::deltas_from(
-                trigger.subscription_id,
-                trigger.consumer_id,
-                trigger.checkpoint.as_ref(),
-                &keys,
-                &present,
-                &columns,
-            )),
-            // One update per page, same as the sync engine: a re-read is
-            // delivered in pages sharing a generation, not as one message.
-            Resolved::Whole { generation, pages } => {
-                outputs.rows_updates.extend(pages.into_iter().map(|page| {
-                    super::engine::RowsUpdate {
-                        subscription_id: trigger.subscription_id,
-                        consumer_id: trigger.consumer_id,
-                        generation,
-                        columns: page.columns,
-                        rows: page.rows,
-                        more: page.more,
-                        checkpoint: trigger.checkpoint.clone(),
-                    }
-                }));
+            } => {
+                // The keys were a snapshot: only a delivered read drops them.
+                self.inner
+                    .remove_pending_keys(trigger.subscription_id, &keys);
+                for delta in super::auto::deltas_from(
+                    trigger.subscription_id,
+                    trigger.consumer_id,
+                    trigger.checkpoint.as_ref(),
+                    &keys,
+                    &present,
+                    columns,
+                ) {
+                    sink(super::ReadDelivery::Delta(delta));
+                }
             }
-        }
-        Ok(())
-    }
-
-    /// Serve the follow-up triggers a resolve produced (a grouped read can
-    /// displace further groups), one at a time so each may push more.
-    /// Shared by [`consumers`](Self::consumers) and
-    /// [`consumers_batch`](Self::consumers_batch), which once carried
-    /// diverging copies of this loop.
-    async fn drain_followup(
-        &mut self,
-        followup: &mut Vec<super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>>,
-        aggregate_updates: &mut Vec<crate::AggregateValueUpdate<I, E::Backend>>,
-        scalar_updates: &mut Vec<ScalarUpdate<I, E::Backend, E::Checkpoint>>,
-        rows_updates: &mut Vec<super::engine::RowsUpdate<I, E::Backend, E::Checkpoint>>,
-        row_deltas: &mut Vec<super::engine::RowDelta<I, E::Backend, E::Checkpoint>>,
-        transitions: &mut Vec<crate::MaintenanceTransition<E::Backend>>,
-    ) -> Result<(), ReExecError<X::Error>> {
-        while let Some(trigger) = followup.pop() {
-            if self.debounce_skip(trigger.subscription_id, &trigger.read) {
-                continue;
-            }
-            let Some(job) = self.plan_job(&trigger) else {
-                continue;
-            };
-            let auth = &self
-                .contexts
-                .get(&trigger.subscription_id)
-                .expect("a follow-up read stores its connector context")
-                .auth;
-            let answer = Self::run_job(
-                &self.mode.connector,
-                job,
-                trigger.subscription_id,
-                self.max_page_bytes,
-                auth,
-            )
-            .await?;
-            self.stamp_reexec(trigger.subscription_id, &trigger.read);
-            self.apply_resolved(
-                &trigger,
-                answer,
-                &mut ResolveOutputs {
-                    aggregate_updates,
-                    scalar_updates,
-                    rows_updates,
-                    row_deltas,
-                    followup,
-                    transitions,
-                },
-            )?;
+            // Pages already streamed from the concurrent phase.
+            Resolved::WholeStreamed => {}
         }
         Ok(())
     }
@@ -809,7 +709,7 @@ where
             });
         }
 
-        let keys = self.inner.take_pending_keys(subscription_id);
+        let keys = self.inner.clone_pending_keys(subscription_id);
         if keys.is_empty() {
             return None;
         }
@@ -904,7 +804,8 @@ where
                     // would let a key answered on an earlier page back into the
                     // next statement, which delivers it twice and, with a
                     // stable row order, never terminates.
-                    let mut seen_in_batch: Vec<Vec<Value<E::Backend>>> = Vec::new();
+                    let mut seen_in_batch: super::auto::SeenKeys<E::Backend> =
+                        super::auto::SeenKeys::new();
                     loop {
                         let page = connector
                             .read_page(
@@ -920,13 +821,13 @@ where
                         if columns.is_empty() {
                             columns.clone_from(&page.value.columns);
                         }
-                        let before = seen_in_batch.len();
+                        let before = seen_in_batch.recorded();
                         for row in page.value.rows {
                             let key: Vec<Value<E::Backend>> = key_positions
                                 .iter()
                                 .filter_map(|i| row.get(*i).cloned())
                                 .collect();
-                            seen_in_batch.push(key.clone());
+                            seen_in_batch.record(&key);
                             present.push((key, row));
                         }
                         // A page with no rows ends the read whatever it claims
@@ -934,7 +835,7 @@ where
                         // that combination, but this trait has outside
                         // implementors, and without this a connector that did
                         // would loop here forever.
-                        if !page.value.more || seen_in_batch.len() == before {
+                        if !page.value.more || seen_in_batch.recorded() == before {
                             break;
                         }
                         // A batch whose rows do not fit one page resumes inside
@@ -968,16 +869,83 @@ where
                     present,
                 })
             }
-            ResolveJob::Whole { query, generation } => {
-                // The read's own position is discarded here on purpose: a
-                // re-read is delivered against the position of the event that
-                // triggered it, which is what a consumer reconciles by.
-                let (pages, _) =
-                    Self::read_whole_with(connector, subscription, &query, max_page_bytes, auth)
-                        .await?;
-                Ok(Resolved::Whole { generation, pages })
+            // Whole reads never reach here: `resolve` streams their pages
+            // from the concurrent phase instead.
+            ResolveJob::Whole { .. } => {
+                unreachable!("whole jobs stream pages in resolve")
             }
         }
+    }
+
+    /// Re-read a captured query in full, delivering each page into the
+    /// shared sink as it is fetched, so retained memory tracks one page and
+    /// never the whole answer.
+    ///
+    /// The read's own position is discarded on purpose: a re-read is
+    /// delivered against the position of the event that triggered it, which
+    /// is what a consumer reconciles by. A read that fails or is dropped
+    /// part way leaves a generation with no final page. The next re-read
+    /// delivers a higher generation, which is the consumer's signal to
+    /// discard the partial one.
+    async fn stream_whole<S>(
+        connector: &X,
+        sink: &async_lock::Mutex<&mut S>,
+        trigger: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
+        query: &super::BoundQuery<E::Backend>,
+        generation: u64,
+        max_page_bytes: usize,
+        auth: &X::AuthContext,
+    ) -> Result<(), ReExecError<X::Error>>
+    where
+        S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
+    {
+        let subscription = trigger.subscription_id;
+        let cursor = connector
+            .open_cursor(&query.as_read_query(), auth)
+            .await
+            .map_err(|error| ReExecError::Cursor {
+                subscription,
+                error,
+            })?;
+        let outcome = async {
+            loop {
+                let page = connector
+                    .fetch_cursor(cursor, max_page_bytes)
+                    .await
+                    .map_err(|error| ReExecError::Cursor {
+                        subscription,
+                        error,
+                    })?;
+                let more = page.value.more;
+                let delivery = super::ReadDelivery::Rows(super::engine::RowsUpdate {
+                    subscription_id: subscription,
+                    consumer_id: trigger.consumer_id,
+                    generation,
+                    columns: page.value.columns,
+                    rows: page.value.rows,
+                    more,
+                    checkpoint: trigger.checkpoint.clone(),
+                });
+                (*sink.lock().await)(delivery);
+                if !more {
+                    return Ok::<(), ReExecError<X::Error>>(());
+                }
+            }
+        }
+        .await;
+        // Close either way: a read error must not leave the cursor holding a
+        // transaction and a connection. A read error outranks a close failure,
+        // being the reason the caller asked.
+        let closed = connector
+            .close_cursor(cursor)
+            .await
+            .map_err(|error| ReExecError::Cursor {
+                subscription,
+                error,
+            });
+        outcome?;
+        closed?;
+        Ok(())
     }
 
     /// Page a whole result through a cursor, closing it on every path this
@@ -1022,7 +990,6 @@ where
                 pages.push(ReadPage {
                     columns: page.value.columns,
                     rows: page.value.rows,
-                    more,
                 });
                 if !more {
                     return Ok::<(), ReExecError<X::Error>>(());
@@ -1045,170 +1012,6 @@ where
         closed?;
         Ok((pages, checkpoint))
     }
-
-    /// Async batch variant of [`consumers`](Self::consumers).
-    ///
-    /// Runs each event through the inner trigger-emitting engine in input
-    /// order, then awaits the connector for each **deduplicated** trigger.
-    /// Dispatches the deduplicated triggers concurrently, keeping at most
-    /// [`with_max_concurrent_reexecutions`](Self::with_max_concurrent_reexecutions)
-    /// in flight at any time (unbounded when not configured). Per-event
-    /// engine notifications stay in input order. The returned
-    /// [`BatchOutcome::triggers`] is always empty after resolution.
-    ///
-    /// The first connector failure aborts the whole batch (remaining
-    /// in-flight futures are dropped). Partial notifications are
-    /// discarded. The caller retries.
-    #[allow(clippy::too_many_lines)]
-    pub async fn consumers_batch(
-        &mut self,
-        events: &[E],
-    ) -> Result<BatchOutcome<I, E::Backend, E::Checkpoint>, ReExecError<X::Error>> {
-        use futures_util::stream::StreamExt;
-
-        let BatchOutcome {
-            per_event,
-            mut aggregate_updates,
-            mut scalar_updates,
-            mut rows_updates,
-            mut row_deltas,
-            triggers,
-            mut transitions,
-        } = self
-            .inner
-            .reread_batch(events)
-            .map_err(ReExecError::Dispatch)?;
-        self.apply_transitions(&transitions);
-
-        // Pre-filter debounced triggers.
-        let actionable: alloc::vec::Vec<_> = triggers
-            .into_iter()
-            .filter(|t| !self.debounce_skip(t.subscription_id, &t.read))
-            .collect();
-
-        if actionable.is_empty() {
-            return Ok(BatchOutcome {
-                per_event,
-                aggregate_updates,
-                scalar_updates,
-                rows_updates,
-                row_deltas,
-                triggers: Vec::new(),
-                transitions,
-            });
-        }
-
-        // Phase one, under `&mut self`: same tier split as the single-event
-        // path. The batch already coalesced to one trigger per query, so a
-        // keyed job here carries every key the batch changed and reads once.
-        let (jobs, borrowed) = self.plan_jobs(actionable);
-        if jobs.is_empty() {
-            return Ok(BatchOutcome {
-                per_event,
-                aggregate_updates,
-                scalar_updates,
-                rows_updates,
-                row_deltas,
-                triggers: Vec::new(),
-                transitions,
-            });
-        }
-
-        // Phase two: shared borrows only, so the reads run concurrently.
-        let connector = &self.mode.connector;
-        let contexts = &self.contexts;
-        let max_page_bytes = self.max_page_bytes;
-        let throttle = self
-            .mode
-            .permits
-            .as_ref()
-            .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
-        let jobs_len = jobs.len();
-
-        #[allow(clippy::type_complexity)]
-        let resolved: alloc::vec::Vec<
-            Result<
-                (
-                    super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-                    Resolved<E::Backend>,
-                ),
-                ReExecError<X::Error>,
-            >,
-        > = futures_util::stream::iter(jobs.into_iter().map(|(trigger, job)| {
-            let auth = &contexts
-                .get(&trigger.subscription_id)
-                .expect(
-                    "every captured query stores its resolve context at register time, \
-                     trigger.subscription_id must exist in `contexts`",
-                )
-                .auth;
-            let throttle = throttle.clone();
-            async move {
-                let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
-                let answer = Self::run_job(
-                    connector,
-                    job,
-                    trigger.subscription_id,
-                    max_page_bytes,
-                    auth,
-                )
-                .await?;
-                Ok::<_, ReExecError<X::Error>>((trigger, answer))
-            }
-        }))
-        .buffer_unordered(jobs_len)
-        .collect::<Vec<_>>()
-        .await;
-
-        // One failure fails the call, so nothing is delivered and every key
-        // taken goes back. Collected rather than short-circuited for exactly
-        // that reason: `try_collect` drops the other jobs, and their keys with
-        // them.
-        let answers = match Self::first_failure(resolved) {
-            Ok(answers) => answers,
-            Err(e) => {
-                self.restore_borrowed(borrowed);
-                return Err(e);
-            }
-        };
-
-        // Phase three: borrows released, apply what came back.
-        let mut followup = Vec::new();
-        for (trigger, answer) in answers {
-            self.stamp_reexec(trigger.subscription_id, &trigger.read);
-            self.apply_resolved(
-                &trigger,
-                answer,
-                &mut ResolveOutputs {
-                    aggregate_updates: &mut aggregate_updates,
-                    scalar_updates: &mut scalar_updates,
-                    rows_updates: &mut rows_updates,
-                    row_deltas: &mut row_deltas,
-                    followup: &mut followup,
-                    transitions: &mut transitions,
-                },
-            )?;
-        }
-        self.drain_followup(
-            &mut followup,
-            &mut aggregate_updates,
-            &mut scalar_updates,
-            &mut rows_updates,
-            &mut row_deltas,
-            &mut transitions,
-        )
-        .await?;
-
-        Ok(BatchOutcome {
-            per_event,
-            aggregate_updates,
-            scalar_updates,
-            rows_updates,
-            row_deltas,
-            triggers: Vec::new(),
-            transitions,
-        })
-    }
 }
 
 impl<E, I, DB, X> crate::AsyncSubscriptionDispatch<I, E>
@@ -1226,14 +1029,14 @@ where
     X::AuthContext: Send + Sync,
 {
     type Notifications = ReExecNotifications<I, E::Backend, E::Checkpoint>;
-    type Error = ReExecError<X::Error>;
+    type Error = crate::DispatchError;
 
     #[allow(clippy::manual_async_fn)]
     fn consumers(
         &mut self,
         event: &E,
     ) -> impl core::future::Future<Output = Result<Self::Notifications, Self::Error>> + Send {
-        async move { Self::consumers(self, event).await }
+        core::future::ready(self.apply(event))
     }
 }
 
@@ -1296,6 +1099,19 @@ mod tests {
         scalar_queries: Mutex<Vec<super::super::ReadQuery<'static, Postgres>>>,
         page_queries: Mutex<Vec<super::super::ReadQuery<'static, Postgres>>>,
         cursor_queries: Mutex<Vec<super::super::ReadQuery<'static, Postgres>>>,
+        /// When set, the next scalar read suspends once before answering, so
+        /// a test can drop a resolve future mid-read.
+        pend_next_read: Mutex<bool>,
+        /// Pages a whole re-read serves, front first. Empty means the mock
+        /// holds no cursors and `open_cursor` refuses.
+        cursor_pages: Mutex<Vec<crate::reexec::RowPage<Postgres>>>,
+        /// Fetch index that suspends once before serving, so a test can drop
+        /// a resolve future between pages.
+        pend_fetch_at: Mutex<Option<usize>>,
+        /// Fetches served so far.
+        fetch_count: Mutex<usize>,
+        /// Interleaving log shared with the test's sink.
+        log: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl MockAsyncConnector {
@@ -1306,6 +1122,11 @@ mod tests {
                 scalar_queries: Mutex::new(Vec::new()),
                 page_queries: Mutex::new(Vec::new()),
                 cursor_queries: Mutex::new(Vec::new()),
+                pend_next_read: Mutex::new(false),
+                cursor_pages: Mutex::new(Vec::new()),
+                pend_fetch_at: Mutex::new(None),
+                fetch_count: Mutex::new(0),
+                log: Arc::new(Mutex::new(Vec::new())),
             }
         }
         fn call_count(&self) -> usize {
@@ -1319,6 +1140,23 @@ mod tests {
     impl core::fmt::Display for MockError {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             write!(f, "{}", self.0)
+        }
+    }
+
+    /// Pending on its first poll, ready on the second: the seam that lets a
+    /// test observe a resolve suspended inside a connector read.
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
         }
     }
 
@@ -1339,6 +1177,9 @@ mod tests {
         ) -> impl Future<Output = Result<(Value<Postgres>, Option<Self::Checkpoint>), Self::Error>> + Send
         {
             async move {
+                if core::mem::take(&mut *self.pend_next_read.lock()) {
+                    YieldOnce(false).await;
+                }
                 *self.call_count.lock() += 1;
                 self.scalar_queries.lock().push(query.clone().into_owned());
                 let value = self.values.lock().pop().ok_or(MockError("queue empty"))?;
@@ -1371,7 +1212,49 @@ mod tests {
             Output = Result<super::super::CursorId, super::super::CursorError<Self::Error>>,
         > + Send {
             self.cursor_queries.lock().push(query.clone().into_owned());
-            core::future::ready(Err(super::super::CursorError::Unsupported))
+            if self.cursor_pages.lock().is_empty() {
+                return core::future::ready(Err(super::super::CursorError::Unsupported));
+            }
+            self.log.lock().push("open");
+            core::future::ready(Ok(super::super::CursorId(1)))
+        }
+
+        fn fetch_cursor(
+            &self,
+            _cursor: super::super::CursorId,
+            _max_bytes: usize,
+        ) -> impl Future<
+            Output = Result<
+                Snapshot<crate::reexec::RowPage<Postgres>, Self::Checkpoint>,
+                super::super::CursorError<Self::Error>,
+            >,
+        > + Send {
+            async move {
+                let index = {
+                    let mut count = self.fetch_count.lock();
+                    let index = *count;
+                    *count += 1;
+                    index
+                };
+                if *self.pend_fetch_at.lock() == Some(index) {
+                    YieldOnce(false).await;
+                }
+                self.log.lock().push("fetch");
+                let page = self.cursor_pages.lock().remove(0);
+                Ok(Snapshot {
+                    value: page,
+                    checkpoint: None,
+                })
+            }
+        }
+
+        fn close_cursor(
+            &self,
+            _cursor: super::super::CursorId,
+        ) -> impl Future<Output = Result<(), super::super::CursorError<Self::Error>>> + Send
+        {
+            self.log.lock().push("close");
+            core::future::ready(Ok(()))
         }
     }
 
@@ -1459,16 +1342,16 @@ mod tests {
         assert_eq!(e.connector().call_count(), 1);
 
         // Insert above the extreme: in-process Unchanged, no connector call.
-        let n = block_on(e.consumers(&insert_event(tid, 2, 9.0))).unwrap();
+        let n = e.apply(&insert_event(tid, 2, 9.0)).unwrap();
         assert!(n.scalar_updates.is_empty());
         assert_eq!(e.connector().call_count(), 1);
 
         // Delete the extreme: trigger -> connector -> ScalarUpdate.
-        let n = block_on(e.consumers(&delete_event(tid, 1, 5.0))).unwrap();
+        e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+        let n = block_on(e.resolve_collect()).unwrap();
         assert_eq!(n.scalar_updates.len(), 1);
         assert_eq!(n.scalar_updates[0].subscription_id, qid);
         assert_eq!(n.scalar_updates[0].value, Value::Float(9.0));
-        assert!(n.triggers.is_empty(), "async engine drains triggers");
         assert_eq!(e.connector().call_count(), 2);
     }
 
@@ -1514,7 +1397,10 @@ mod tests {
         )
         .expect("scalar installs");
 
-        block_on(engine.consumers(&delete_event(table, 1, 5.0))).expect("delete resolves");
+        engine
+            .apply(&delete_event(table, 1, 5.0))
+            .expect("apply succeeds");
+        let _ = block_on(engine.resolve_collect()).expect("resolve succeeds");
         let queries = engine.connector().scalar_queries.lock();
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].binds(), &[Value::Int(0)]);
@@ -1554,7 +1440,8 @@ mod tests {
             )
             .expect("keyed read registers");
 
-        let _ = block_on(engine.consumers(&delete_event(table, 1, 5.0)));
+        engine.apply(&delete_event(table, 1, 5.0)).unwrap();
+        let _ = block_on(engine.resolve_collect());
         let queries = engine.connector().page_queries.lock();
         assert_eq!(queries.len(), 1);
         assert_eq!(
@@ -1618,7 +1505,8 @@ mod tests {
         )
         .expect("grouped seed installs");
 
-        let _ = block_on(engine.consumers(&delete_event(table, 1, 5.0)));
+        engine.apply(&delete_event(table, 1, 5.0)).unwrap();
+        let _ = block_on(engine.resolve_collect());
         let queries = engine.connector().page_queries.lock();
         assert_eq!(queries.len(), 1);
         assert_eq!(
@@ -1663,7 +1551,8 @@ mod tests {
             )
             .expect("whole read registers");
 
-        let _ = block_on(engine.consumers(&insert_event(table, 2, 9.0)));
+        engine.apply(&insert_event(table, 2, 9.0)).unwrap();
+        let _ = block_on(engine.resolve_collect());
         let queries = engine.connector().cursor_queries.lock();
         assert_eq!(queries.len(), 1);
         assert_eq!(
@@ -1705,7 +1594,7 @@ mod tests {
 
         let event = update_status_only(tid, 1, 10.0);
 
-        let n = block_on(e.consumers(&event)).unwrap();
+        let n = e.apply(&event).unwrap();
         assert!(n.scalar_updates.is_empty());
         assert!(n.triggers.is_empty());
         assert_eq!(e.connector().call_count(), 0);
@@ -1747,7 +1636,8 @@ mod tests {
         )
         .is_ok());
 
-        match block_on(e.consumers(&delete_event(tid, 1, 5.0))) {
+        e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+        match block_on(e.resolve_collect()) {
             Ok(_) => panic!("expected Connector error, got Ok"),
             Err(ReExecError::Connector {
                 error: MockError(msg),
@@ -1760,7 +1650,7 @@ mod tests {
     /// Async batch coalesces repeated triggers for the same query into a
     /// single connector call. Mirrors the sync engine's T4.1 assertion.
     #[test]
-    fn async_engine_consumers_batch_coalesces_repeated_triggers() {
+    fn async_applied_burst_coalesces_repeated_triggers() {
         let (mut e, tid) = engine_with_values(vec![Value::Float(99.0)]);
         let qid = match e
             .register(
@@ -1786,14 +1676,15 @@ mod tests {
         )
         .is_ok());
 
-        let events = vec![
+        let events = [
             delete_event(tid, 1, 5.0),
             delete_event(tid, 2, 5.0),
             delete_event(tid, 3, 5.0),
         ];
 
-        let outcome = block_on(e.consumers_batch(&events)).unwrap();
-        assert_eq!(outcome.per_event.len(), 3, "per_event positional alignment");
+        let per_event: Vec<_> = events.iter().map(|ev| e.apply(ev).unwrap()).collect();
+        assert_eq!(per_event.len(), 3, "per_event positional alignment");
+        let outcome = block_on(e.resolve_collect()).unwrap();
         assert_eq!(
             e.connector().call_count(),
             1,
@@ -1801,15 +1692,14 @@ mod tests {
         );
         assert_eq!(outcome.scalar_updates.len(), 1);
         assert_eq!(outcome.scalar_updates[0].value, Value::Float(99.0));
-        assert!(outcome.triggers.is_empty());
     }
 
     /// `with_max_concurrent_reexecutions` does not change the result of
-    /// `consumers_batch`. Correctness is preserved. The cap is a
+    /// one resolve of a burst. Correctness is preserved. The cap is a
     /// throughput / fairness knob, not a semantic one.
     #[test]
     #[allow(clippy::similar_names)]
-    fn async_engine_consumers_batch_respects_max_concurrent_cap() {
+    fn async_applied_burst_respects_max_concurrent_cap() {
         // Two distinct captured queries, each displaced once in the
         // batch. Both must resolve regardless of the cap.
         let (e0, tid) = engine_with_values(vec![Value::Float(22.0), Value::Float(11.0)]);
@@ -1862,7 +1752,10 @@ mod tests {
         .is_ok());
 
         let events = vec![delete_event(tid, 1, 7.0)];
-        let outcome = block_on(e.consumers_batch(&events)).unwrap();
+        for event in &events {
+            e.apply(event).unwrap();
+        }
+        let outcome = block_on(e.resolve_collect()).unwrap();
         assert_eq!(e.connector().call_count(), 2);
         assert_eq!(outcome.scalar_updates.len(), 2);
         let qids: std::collections::BTreeSet<_> = outcome
@@ -1934,7 +1827,7 @@ mod tests {
         assert_eq!(e.concurrency_cap(), Some(1));
     }
 
-    /// Cleanup invariant: after a successful `consumers_batch` the
+    /// Cleanup invariant: after a successful resolve of a burst the
     /// inflight counter is back to 0. Tests that the `InflightGuard`
     /// drop path actually fires when futures complete.
     #[test]
@@ -1988,7 +1881,8 @@ mod tests {
         )
         .is_ok());
 
-        let _ = block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).unwrap();
+        e.apply(&delete_event(tid, 1, 7.0)).unwrap();
+        let _ = block_on(e.resolve_collect()).unwrap();
         assert_eq!(
             e.inflight(),
             0,
@@ -2051,7 +1945,8 @@ mod tests {
         )
         .is_ok());
 
-        assert!(block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).is_err());
+        e.apply(&delete_event(tid, 1, 7.0)).unwrap();
+        assert!(block_on(e.resolve_collect()).is_err());
         assert_eq!(
             e.inflight(),
             0,
@@ -2099,7 +1994,8 @@ mod tests {
             )
             .is_ok());
         }
-        let outcome = block_on(e.consumers_batch(&[delete_event(tid, 1, 7.0)])).unwrap();
+        e.apply(&delete_event(tid, 1, 7.0)).unwrap();
+        let outcome = block_on(e.resolve_collect()).unwrap();
         assert_eq!(
             e.connector().call_count(),
             3,
@@ -2205,7 +2101,7 @@ mod tests {
         assert_eq!(e.contexts.len(), 1);
         assert!(e.unregister_subscription(captured));
         assert_eq!(e.contexts.len(), 0, "the resolve context is dropped");
-        let n = block_on(e.consumers(&delete_event(tid, 1, 5.0))).unwrap();
+        let n = e.apply(&delete_event(tid, 1, 5.0)).unwrap();
         assert!(n.scalar_updates.is_empty());
         assert_eq!(
             e.connector().call_count(),
@@ -2284,7 +2180,8 @@ mod tests {
 
         // The live dispatch of the same delete is still the first read: proof
         // match_rows left the re-execution model untouched.
-        let live = block_on(e.consumers(&ev)).unwrap();
+        e.apply(&ev).unwrap();
+        let live = block_on(e.resolve_collect()).unwrap();
         assert_eq!(
             e.connector().call_count(),
             1,
@@ -2342,7 +2239,8 @@ mod tests {
             },
         )
         .unwrap();
-        match block_on(e.consumers(&delete_event(tid, 1, 5.0))) {
+        e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+        match block_on(e.resolve_collect()) {
             Ok(_) => panic!("expected the triggered read to fail"),
             Err(ReExecError::Connector {
                 subscription,
@@ -2411,7 +2309,7 @@ mod tests {
             },
         )
         .unwrap();
-        let n = block_on(e.consumers(&insert_event(tid, 1, 5.0))).unwrap();
+        let n = e.apply(&insert_event(tid, 1, 5.0)).unwrap();
         assert_eq!(
             n.aggregate_updates.len(),
             1,
@@ -2430,7 +2328,7 @@ mod tests {
     }
 
     #[test]
-    fn async_ungrouped_aggregate_folds_through_the_batch_wrapper() {
+    fn async_ungrouped_aggregate_folds_across_an_applied_burst() {
         let (mut e, tid) = engine_with_values(vec![]);
         let count_id = match e
             .register(
@@ -2455,12 +2353,13 @@ mod tests {
             },
         )
         .unwrap();
-        let outcome =
-            block_on(e.consumers_batch(&[insert_event(tid, 1, 5.0), insert_event(tid, 2, 6.0)]))
-                .unwrap();
-        assert_eq!(outcome.aggregate_updates.len(), 2, "each insert folds");
+        let aggregate_updates: Vec<_> = [insert_event(tid, 1, 5.0), insert_event(tid, 2, 6.0)]
+            .iter()
+            .flat_map(|ev| e.apply(ev).unwrap().aggregate_updates)
+            .collect();
+        assert_eq!(aggregate_updates.len(), 2, "each insert folds");
         assert_eq!(
-            outcome.aggregate_updates.last().unwrap().folded_value(),
+            aggregate_updates.last().unwrap().folded_value(),
             Some(crate::AggValue::Count(7)),
             "the running total after both inserts"
         );
@@ -2495,7 +2394,8 @@ mod tests {
         let missing_old = TestEvent::<Postgres>::update(tid, vec![], row(1, 5.0))
             .with_pk_columns([0u16])
             .with_changed_columns([3u16]);
-        match block_on(e.consumers(&missing_old)) {
+        e.apply(&missing_old).unwrap();
+        match block_on(e.resolve_collect()) {
             Err(ReExecError::Cursor { subscription, .. }) => {
                 assert_eq!(
                     subscription, count_id,
@@ -2614,7 +2514,7 @@ mod tests {
             } => {}
             other => panic!("expected InProcess for an ordered row query, got {other:?}"),
         }
-        let n = block_on(e.consumers(&insert_event(tid, 1, 5.0))).unwrap();
+        let n = e.apply(&insert_event(tid, 1, 5.0)).unwrap();
         assert!(
             n.engine.inserted().contains(&1),
             "the ordered row list is notified of the insert"
@@ -2623,6 +2523,181 @@ mod tests {
             e.connector().call_count(),
             0,
             "an ordered row list reads nothing"
+        );
+    }
+
+    /// Dropping a resolve mid-read loses nothing: the read stays queued, a
+    /// fresh resolve completes it, and the event is never reapplied.
+    #[test]
+    fn dropped_resolve_keeps_the_read_queued() {
+        let (mut e, tid) = engine_with_values(vec![Value::Float(7.0)]);
+        let qid = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            qid,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<NoCheckpoint>,
+            },
+        )
+        .unwrap();
+
+        let applied = e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+        assert!(
+            applied.scalar_updates.is_empty(),
+            "the read is queued, not run"
+        );
+        assert_eq!(e.pending_read_count(), 1);
+
+        *e.connector().pend_next_read.lock() = true;
+        {
+            let waker = Arc::new(NoopWake).into();
+            let mut ctx = Context::from_waker(&waker);
+            let mut sink =
+                |_delivery: super::super::ReadDelivery<DefaultIds, Postgres, NoCheckpoint>| {};
+            let fut = e.resolve(&mut sink);
+            let mut pinned = pin!(fut);
+            assert!(
+                pinned.as_mut().poll(&mut ctx).is_pending(),
+                "the resolve suspends inside the connector read"
+            );
+            // Dropped here, mid-read.
+        }
+        assert_eq!(e.pending_read_count(), 1, "the dropped read stayed queued");
+        assert_eq!(e.connector().call_count(), 0, "the read never completed");
+
+        let resolved = block_on(e.resolve_collect()).unwrap();
+        assert_eq!(resolved.scalar_updates.len(), 1);
+        assert_eq!(resolved.scalar_updates[0].value, Value::Float(7.0));
+        assert_eq!(e.pending_read_count(), 0);
+        assert_eq!(
+            e.connector().call_count(),
+            1,
+            "one completed read, no redispatch"
+        );
+    }
+
+    /// Each page reaches the sink before the next page is fetched, so
+    /// retained memory tracks one page rather than the whole answer.
+    #[test]
+    fn async_pages_reach_the_sink_before_the_next_fetch() {
+        let (mut e, tid) = engine_with_values(vec![]);
+        e.register(
+            SubscriptionRequest::new(1u64, "SELECT DISTINCT status FROM orders"),
+            (),
+        )
+        .expect("whole read registers");
+        e.connector().cursor_pages.lock().extend([
+            crate::reexec::RowPage {
+                columns: vec![String::from("status")],
+                rows: vec![vec![Value::String("paid".into())]],
+                more: true,
+            },
+            crate::reexec::RowPage {
+                columns: vec![String::from("status")],
+                rows: vec![vec![Value::String("void".into())]],
+                more: false,
+            },
+        ]);
+        e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+
+        let log = Arc::clone(&e.connector().log);
+        block_on(e.resolve(move |delivery| {
+            if matches!(delivery, crate::reexec::ReadDelivery::Rows(_)) {
+                log.lock().push("deliver");
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            *e.connector().log.lock(),
+            ["open", "fetch", "deliver", "fetch", "deliver", "close"],
+            "a page is delivered before the next one is fetched"
+        );
+    }
+
+    /// A resolve dropped between pages leaves the read queued, and the retry
+    /// streams a complete answer under a higher generation, which is the
+    /// consumer's signal to discard the partial one.
+    #[test]
+    fn dropped_stream_is_superseded_by_a_higher_generation() {
+        let (mut e, tid) = engine_with_values(vec![]);
+        e.register(
+            SubscriptionRequest::new(1u64, "SELECT DISTINCT status FROM orders"),
+            (),
+        )
+        .expect("whole read registers");
+        e.connector().cursor_pages.lock().extend([
+            crate::reexec::RowPage {
+                columns: vec![String::from("status")],
+                rows: vec![vec![Value::String("paid".into())]],
+                more: true,
+            },
+            crate::reexec::RowPage {
+                columns: vec![String::from("status")],
+                rows: vec![vec![Value::String("void".into())]],
+                more: false,
+            },
+        ]);
+        e.apply(&insert_event(tid, 1, 5.0)).unwrap();
+
+        // The second fetch suspends, and the future is dropped there: one
+        // partial page was already delivered.
+        *e.connector().pend_fetch_at.lock() = Some(1);
+        let partial = Arc::new(Mutex::new(Vec::new()));
+        {
+            let partial = Arc::clone(&partial);
+            let waker = Arc::new(NoopWake).into();
+            let mut ctx = Context::from_waker(&waker);
+            let fut = e.resolve(move |delivery| {
+                if let crate::reexec::ReadDelivery::Rows(page) = delivery {
+                    partial.lock().push(page.generation);
+                }
+            });
+            let mut pinned = pin!(fut);
+            assert!(
+                pinned.as_mut().poll(&mut ctx).is_pending(),
+                "the resolve suspends between pages"
+            );
+        }
+        assert_eq!(partial.lock().len(), 1, "one partial page was delivered");
+        assert_eq!(e.pending_read_count(), 1, "the dropped read stayed queued");
+
+        // The retry streams a complete answer under a higher generation.
+        e.connector()
+            .cursor_pages
+            .lock()
+            .push(crate::reexec::RowPage {
+                columns: vec![String::from("status")],
+                rows: vec![vec![Value::String("paid".into())]],
+                more: false,
+            });
+        let retried = block_on(e.resolve_collect()).unwrap();
+        assert_eq!(e.pending_read_count(), 0);
+        assert!(!retried.rows_updates.is_empty());
+        let partial_generation = partial.lock()[0];
+        assert!(
+            retried
+                .rows_updates
+                .iter()
+                .all(|page| page.generation > partial_generation),
+            "the complete answer supersedes the partial generation"
+        );
+        assert!(
+            !retried.rows_updates.last().unwrap().more,
+            "the retry ends its generation"
         );
     }
 }

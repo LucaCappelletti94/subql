@@ -87,7 +87,7 @@ fn op_to_event<DB: DatabaseLike>(
     let schema = op.table();
     let table_name = schema.name();
     let table_id = resolve_table("", table_name.as_str(), database)?;
-    let arity = catalog_helpers::table_arity(database, table_id).ok_or_else(|| {
+    let arity = catalog_helpers::table_arity(database, table_id).map_err(|_| {
         WalParseError::UnknownTable {
             schema: alloc::string::String::new(),
             table: table_name.clone(),

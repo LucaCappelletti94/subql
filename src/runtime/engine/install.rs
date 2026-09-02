@@ -5,6 +5,7 @@
 use super::{
     CdcEvent, DatabaseLike, IdTypes, SqlLiteralParse, SubscriptionEngine, SubscriptionId, Vec,
 };
+use alloc::string::String;
 
 impl<E, I, DB, C> crate::Install<crate::ScalarInstall<E::Backend, C>>
     for SubscriptionEngine<E, I, DB>
@@ -284,6 +285,9 @@ where
             });
         }
         let crate::KeyedRowsInstall { columns, deltas } = input;
+        // One shared allocation for every carried row, one for the removals.
+        let columns: alloc::sync::Arc<[String]> = columns.into();
+        let removed: alloc::sync::Arc<[String]> = alloc::sync::Arc::from(Vec::new());
         Ok(deltas
             .into_iter()
             .map(|delta| {
@@ -292,7 +296,11 @@ where
                     subscription_id,
                     consumer_id: entry.consumer_id,
                     key: delta.key,
-                    columns: if has_row { columns.clone() } else { Vec::new() },
+                    columns: if has_row {
+                        alloc::sync::Arc::clone(&columns)
+                    } else {
+                        alloc::sync::Arc::clone(&removed)
+                    },
                     row: delta.row,
                     checkpoint: delta.checkpoint,
                 }

@@ -39,4 +39,4 @@ impl fmt::Display for BindTypeMismatch {
     }
 }
 
-impl std::error::Error for BindTypeMismatch {}
+impl core::error::Error for BindTypeMismatch {}

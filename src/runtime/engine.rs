@@ -8,7 +8,7 @@ use super::indexes::IndexableAtom;
 use super::{
     dispatch::{dispatch_consumers, dispatch_consumers_with_stamps, ConsumerDictionary},
     ids::{ConsumerOrdinal, PredicateId},
-    partition::TablePartition,
+    partition::{PartitionTxn, TablePartition},
     predicate::{Predicate, SubscriptionBinding},
 };
 use crate::backend::{Backend, CdcEvent, RowKind, Value};
@@ -368,6 +368,19 @@ struct TermWatch {
     member_subject: crate::ColumnId,
 }
 
+/// One term movement read from a membership event, applied under the
+/// subscribed partition's transaction.
+enum TermAction<B: Backend> {
+    /// Move the subscribers claiming `subject` under `values`.
+    Move {
+        values: crate::term::TermRow<B>,
+        subject: TermKey<B>,
+        entered: bool,
+    },
+    /// Withdraw everything the term admits, as a truncate does.
+    Clear,
+}
+
 /// One subscription's term seeding, held until its predicate id is final.
 struct PendingSeed<B: Backend> {
     table: TableId,
@@ -478,7 +491,7 @@ where
         if matches!(
             compiled.projection,
             QueryProjection::Aggregate(_) | QueryProjection::GroupedAggregate { .. }
-        ) && catalog_helpers::table_has_rls(&self.database, compiled.table_id).unwrap_or(false)
+        ) && catalog_helpers::table_has_rls(&self.database, compiled.table_id)?
         {
             if database_reads_per_consumer {
                 return Err(RegisterError::UnsupportedSql(
@@ -827,7 +840,7 @@ where
     /// Nothing to do for a filter naming no term, which is the case for every
     /// filter until one is registered.
     fn seed_terms(
-        partition: &mut TablePartition<I, E::Backend>,
+        txn: &mut PartitionTxn<'_, I, E::Backend>,
         compiled: &CompiledSpec<I, E::Backend>,
         pred_id: PredicateId,
         ordinal: ConsumerOrdinal,
@@ -835,7 +848,7 @@ where
         let Some(subscriber) = compiled.term_subscriber.as_ref() else {
             return Vec::new();
         };
-        partition.seed_terms(pred_id, ordinal, subscriber, &compiled.term_seeds);
+        txn.seed_terms(pred_id, ordinal, subscriber, &compiled.term_seeds);
 
         compiled
             .term_plans
@@ -1454,27 +1467,24 @@ where
             .try_get_or_create(compiled.spec.consumer_id)
             .map_err(|e| RegisterError::Storage(e.to_string()))?;
 
-        // 6. Check if predicate exists (deduplication)
-        let snapshot = partition.load_snapshot();
-        let (pred_id, created_new) = snapshot
-            .predicates
-            .find_by_hash_and_sql(hash, &compiled.normalized)
-            .map_or_else(
+        // 6 and 7: dedup the predicate, bind, and seed, as one mutation of the
+        // partition publishing one snapshot.
+        let (created_new, watches) = partition.mutate(|txn| {
+            let existing = txn.store().find_by_hash_and_sql(hash, &compiled.normalized);
+            let (pred_id, created_new) = existing.map_or_else(
                 || {
                     let (pred, atoms) =
                         Self::make_predicate_from_compiled(&self.database, &compiled);
-                    let pred_id = partition.add_predicate(pred, atoms);
-                    (pred_id, true)
+                    (txn.add_predicate(pred, &atoms), true)
                 },
                 |existing| (existing, false),
             );
-
-        // 7. Create binding
-        let binding = Self::make_binding(&compiled.spec, subscription_id, pred_id, consumer_ord);
-
-        // Add binding to partition
-        partition.add_binding(binding, pred_id);
-        let watches = Self::seed_terms(partition, &compiled, pred_id, consumer_ord);
+            let binding =
+                Self::make_binding(&compiled.spec, subscription_id, pred_id, consumer_ord);
+            txn.add_binding(binding, pred_id);
+            let watches = Self::seed_terms(txn, &compiled, pred_id, consumer_ord);
+            (created_new, watches)
+        });
         self.watch_terms(watches);
 
         // 8. Index subscription for O(1) unregister/upsert lookups.
@@ -1552,66 +1562,23 @@ where
             database_reads_per_consumer,
         };
         match planned {
-            Ok(crate::reexec::plan::QueryPlan::GroupedPartial(plan)) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
-                    .unwrap_or(false)
-                    && !database_reads_per_consumer
-                {
-                    return Err(RegisterError::AggregatorOnRlsTable {
-                        table_id: plan.table_id,
-                    });
-                }
+            Ok(planned) => {
+                self.registration_rls_refusal(&planned, database_reads_per_consumer)?;
                 let subscription_id = self.allocate_subscription_id();
-                let mut registered =
-                    self.capture_grouped_scalar(subscription_id, *plan, &registration);
-                registered.not_served_because = Some(refusal);
-                self.persist_reads_after_change(subscription_id)?;
-                Ok(registered)
-            }
-            Ok(crate::reexec::plan::QueryPlan::Partial(plan)) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
-                    .unwrap_or(false)
-                    && !database_reads_per_consumer
-                {
-                    return Err(RegisterError::AggregatorOnRlsTable {
-                        table_id: plan.table_id,
-                    });
-                }
-                let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_scalar(subscription_id, plan, &registration);
-                registered.not_served_because = Some(refusal);
-                self.persist_reads_after_change(subscription_id)?;
-                Ok(registered)
-            }
-            Ok(crate::reexec::plan::QueryPlan::Keyed(plan)) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table)
-                    .unwrap_or(false)
-                    && !database_reads_per_consumer
-                {
-                    return Err(RegisterError::RowCaptureOnRlsTable {
-                        table_id: plan.table,
-                    });
-                }
-                let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_keyed(subscription_id, *plan, &registration);
-                registered.not_served_because = Some(refusal);
-                self.persist_reads_after_change(subscription_id)?;
-                Ok(registered)
-            }
-            Ok(crate::reexec::plan::QueryPlan::Total(plan)) => {
-                if let Some(table) = plan
-                    .tables
-                    .iter()
-                    .copied()
-                    .find(|t| {
-                        crate::catalog_helpers::table_has_rls(&self.database, *t).unwrap_or(false)
-                    })
-                    .filter(|_| !database_reads_per_consumer)
-                {
-                    return Err(RegisterError::RowCaptureOnRlsTable { table_id: table });
-                }
-                let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_whole(subscription_id, plan, &registration);
+                let mut registered = match planned {
+                    crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
+                        self.capture_grouped_scalar(subscription_id, *plan, &registration)
+                    }
+                    crate::reexec::plan::QueryPlan::Partial(plan) => {
+                        self.capture_scalar(subscription_id, plan, &registration)
+                    }
+                    crate::reexec::plan::QueryPlan::Keyed(plan) => {
+                        self.capture_keyed(subscription_id, *plan, &registration)
+                    }
+                    crate::reexec::plan::QueryPlan::Total(plan) => {
+                        self.capture_whole(subscription_id, plan, &registration)
+                    }
+                };
                 registered.not_served_because = Some(refusal);
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
@@ -1619,6 +1586,53 @@ where
             // No tier can serve it either, so the compiler's refusal stands.
             Err(_) => Err(RegisterError::UnsupportedSql(refusal)),
         }
+    }
+
+    /// The registration-time row-security refusal for one planned tier, or
+    /// `Ok(())` when it may register.
+    ///
+    /// A shared answer is unsafe when the read's table filters rows per
+    /// viewer, unless the subscription reads per consumer, which is exactly
+    /// the mode that stays safe under row-level security.
+    fn registration_rls_refusal(
+        &self,
+        planned: &crate::reexec::plan::QueryPlan<E::Backend>,
+        database_reads_per_consumer: bool,
+    ) -> Result<(), RegisterError> {
+        if database_reads_per_consumer {
+            return Ok(());
+        }
+        match planned {
+            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)? {
+                    return Err(RegisterError::AggregatorOnRlsTable {
+                        table_id: plan.table_id,
+                    });
+                }
+            }
+            crate::reexec::plan::QueryPlan::Partial(plan) => {
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)? {
+                    return Err(RegisterError::AggregatorOnRlsTable {
+                        table_id: plan.table_id,
+                    });
+                }
+            }
+            crate::reexec::plan::QueryPlan::Keyed(plan) => {
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table)? {
+                    return Err(RegisterError::RowCaptureOnRlsTable {
+                        table_id: plan.table,
+                    });
+                }
+            }
+            crate::reexec::plan::QueryPlan::Total(plan) => {
+                for table in plan.tables.iter().copied() {
+                    if crate::catalog_helpers::table_has_rls(&self.database, table)? {
+                        return Err(RegisterError::RowCaptureOnRlsTable { table_id: table });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
     fn plan_whole_reread(
         &mut self,
@@ -2171,45 +2185,6 @@ where
         })
     }
 
-    /// Dispatch several events, coalescing reads by subscription identity.
-    pub(crate) fn reread_batch(
-        &mut self,
-        events: &[E],
-    ) -> Result<crate::reexec::BatchOutcome<I, E::Backend, E::Checkpoint>, DispatchError> {
-        let mut per_event = Vec::with_capacity(events.len());
-        let mut aggregate_updates = Vec::new();
-        let mut scalar_updates = Vec::new();
-        let mut transitions = Vec::new();
-        let mut triggers: HashMap<
-            (SubscriptionId, Option<Vec<u8>>),
-            crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-        > = HashMap::new();
-        for event in events {
-            let output = self.reread_notifications(event)?;
-            per_event.push(output.engine);
-            aggregate_updates.extend(output.aggregate_updates);
-            scalar_updates.extend(output.scalar_updates);
-            transitions.extend(output.transitions);
-            for trigger in output.triggers {
-                let group = match &trigger.read {
-                    crate::reexec::ReExecutionRead::GroupedScalar { group, .. } => {
-                        Some(group.clone())
-                    }
-                    crate::reexec::ReExecutionRead::Subscription => None,
-                };
-                triggers.insert((trigger.subscription_id, group), trigger);
-            }
-        }
-        Ok(crate::reexec::BatchOutcome {
-            per_event,
-            aggregate_updates,
-            scalar_updates,
-            rows_updates: Vec::new(),
-            row_deltas: Vec::new(),
-            triggers: triggers.into_values().collect(),
-            transitions,
-        })
-    }
     /// Whether a change to `table_id` moves any re-read answer.
     pub(crate) fn routes_reread(&self, table_id: TableId) -> bool {
         self.table_deps.contains_key(&table_id)
@@ -2221,33 +2196,32 @@ where
         self.reexec.len()
     }
 
-    /// Take the keys a keyed re-read accumulated since the last read.
-    pub(crate) fn take_pending_keys(
-        &mut self,
+    /// The keys a keyed re-read has accumulated, left queued until
+    /// [`remove_pending_keys`](Self::remove_pending_keys) says a read
+    /// delivered them.
+    pub(crate) fn clone_pending_keys(
+        &self,
         subscription_id: SubscriptionId,
     ) -> Vec<Vec<Value<E::Backend>>> {
-        match self
-            .reexec
-            .get_mut(&subscription_id)
-            .map(|e| &mut e.runtime)
-        {
-            Some(crate::reexec::maintain::QueryRuntime::Keyed(q)) => q.take_pending(),
+        match self.reexec.get(&subscription_id).map(|e| &e.runtime) {
+            Some(crate::reexec::maintain::QueryRuntime::Keyed(q)) => q.pending_snapshot(),
             _ => Vec::new(),
         }
     }
 
-    /// Put a keyed re-read's keys back after a read that never delivered them.
-    pub(crate) fn restore_pending_keys(
+    /// Drop exactly the keys a delivered keyed read asked about, keeping any
+    /// recorded since its snapshot.
+    pub(crate) fn remove_pending_keys(
         &mut self,
         subscription_id: SubscriptionId,
-        keys: Vec<Vec<Value<E::Backend>>>,
+        delivered: &[Vec<Value<E::Backend>>],
     ) {
         if let Some(crate::reexec::maintain::QueryRuntime::Keyed(q)) = self
             .reexec
             .get_mut(&subscription_id)
             .map(|e| &mut e.runtime)
         {
-            q.restore_pending(keys);
+            q.remove_pending(delivered);
         }
     }
 
@@ -2464,31 +2438,9 @@ where
         // Row-level filtering may have been enabled without changing the SQL
         // text. A restored shared answer is unsafe in that case for the same
         // reason a fresh registration is: viewers can see different rows.
-        let rls_table = match &planned {
-            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
-                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
-                    .unwrap_or(false)
-                    .then_some(plan.table_id)
-            }
-            crate::reexec::plan::QueryPlan::Partial(plan) => {
-                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
-                    .unwrap_or(false)
-                    .then_some(plan.table_id)
-            }
-            crate::reexec::plan::QueryPlan::Keyed(plan) => (!entry.database_reads_per_consumer
-                && crate::catalog_helpers::table_has_rls(&self.database, plan.table)
-                    .unwrap_or(false))
-            .then_some(plan.table),
-            crate::reexec::plan::QueryPlan::Total(plan) => (!entry.database_reads_per_consumer)
-                .then(|| {
-                    plan.tables.iter().copied().find(|table_id| {
-                        crate::catalog_helpers::table_has_rls(&self.database, *table_id)
-                            .unwrap_or(false)
-                    })
-                })
-                .flatten(),
-        };
-        if let Some(table_id) = rls_table {
+        if let Some(table_id) =
+            self.restored_rls_table(&planned, entry.database_reads_per_consumer)?
+        {
             return Err(DropReason::Unplannable {
                 message: format!(
                     "table {table_id} now filters rows per viewer, so one shared answer is unsafe"
@@ -2532,6 +2484,50 @@ where
             tier: registered.tier,
             tier_changed: now != entry.tier,
         })
+    }
+
+    /// The row-secured table that makes restoring `planned` unsafe as one
+    /// shared answer, or `None` when the restore may proceed.
+    #[cfg(feature = "std")]
+    fn restored_rls_table(
+        &self,
+        planned: &crate::reexec::plan::QueryPlan<E::Backend>,
+        database_reads_per_consumer: bool,
+    ) -> Result<Option<TableId>, DropReason> {
+        let catalog_failed = |e: crate::CatalogError| DropReason::Unplannable {
+            message: format!("row-security could not be checked: {e}"),
+        };
+        let found = match planned {
+            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
+                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
+                    .map_err(catalog_failed)?
+                    .then_some(plan.table_id)
+            }
+            crate::reexec::plan::QueryPlan::Partial(plan) => {
+                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
+                    .map_err(catalog_failed)?
+                    .then_some(plan.table_id)
+            }
+            crate::reexec::plan::QueryPlan::Keyed(plan) => (!database_reads_per_consumer
+                && crate::catalog_helpers::table_has_rls(&self.database, plan.table)
+                    .map_err(catalog_failed)?)
+            .then_some(plan.table),
+            crate::reexec::plan::QueryPlan::Total(plan) => {
+                let mut found = None;
+                if !database_reads_per_consumer {
+                    for table_id in plan.tables.iter().copied() {
+                        if crate::catalog_helpers::table_has_rls(&self.database, table_id)
+                            .map_err(catalog_failed)?
+                        {
+                            found = Some(table_id);
+                            break;
+                        }
+                    }
+                }
+                found
+            }
+        };
+        Ok(found)
     }
 
     /// Register a `SELECT` for `consumer_id`, building the
@@ -2624,8 +2620,7 @@ where
     ) -> Result<Registered<E::Backend>, RegisterError> {
         let table_id = catalog_helpers::table_id(&self.database, table)
             .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
-        let pk_cols = catalog_helpers::primary_key_columns(&self.database, table_id)
-            .ok_or_else(|| RegisterError::UnknownTable(table.to_string()))?;
+        let pk_cols = catalog_helpers::primary_key_columns(&self.database, table_id)?;
         if pk_cols.is_empty() {
             return Err(RegisterError::NoPrimaryKey { table_id });
         }
@@ -2958,7 +2953,7 @@ where
                 // Existing-predicate path commits subscription_to_table
                 // immediately below. Does NOT add to pending_uncommitted.
                 let binding = Self::make_binding(&c.spec, subscription_id, pred_id, consumer_ord);
-                partition.add_binding(binding, pred_id);
+                partition.mutate(|txn| txn.add_binding(binding, pred_id));
                 self.subscription_to_table
                     .insert(subscription_id, c.table_id);
                 created_new = false;
@@ -3041,7 +3036,16 @@ where
                 }
                 continue;
             };
-            partition.add_batch(&entries);
+            partition.mutate(|txn| {
+                for (predicate, atoms, bindings) in &entries {
+                    let pred_id = txn.add_predicate(Predicate::clone(predicate), atoms);
+                    for binding in bindings {
+                        let mut bound = *binding;
+                        bound.predicate_id = pred_id;
+                        txn.add_binding(bound, pred_id);
+                    }
+                }
+            });
             for (_, _, bindings) in &entries {
                 for binding in bindings {
                     self.subscription_to_table
@@ -3067,12 +3071,14 @@ where
             else {
                 continue;
             };
-            partition.seed_terms(
-                binding.predicate_id,
-                binding.consumer_ordinal,
-                &pending.subscriber,
-                &pending.seeds,
-            );
+            partition.mutate(|txn| {
+                txn.seed_terms(
+                    binding.predicate_id,
+                    binding.consumer_ordinal,
+                    &pending.subscriber,
+                    &pending.seeds,
+                );
+            });
             watches.extend(pending.plans.iter().filter_map(|plan| {
                 let movement = plan.moved_by.as_ref()?;
                 Some(TermWatch {
@@ -3415,7 +3421,7 @@ where
             let removal = self
                 .partitions
                 .get_mut(&table_id)
-                .and_then(|partition| partition.remove_binding_detail(subscription_id));
+                .and_then(|partition| partition.mutate(|txn| txn.remove_binding(subscription_id)));
             if let Some(removal) = removal {
                 self.subscription_to_table.remove(&subscription_id);
                 self.subscription_activity.remove(&subscription_id);
@@ -3433,7 +3439,7 @@ where
         // Fallback scan for pre-index or inconsistent states.
         let mut removed = None;
         for (&table_id, partition) in &mut self.partitions {
-            if let Some(removal) = partition.remove_binding_detail(subscription_id) {
+            if let Some(removal) = partition.mutate(|txn| txn.remove_binding(subscription_id)) {
                 removed = Some((table_id, removal));
                 break;
             }
@@ -3561,7 +3567,7 @@ where
         // vector.
         let needs_stamps = self.eviction_strategy.needs_activity_tracking();
 
-        let arity = catalog_helpers::table_arity(&self.database, table_id).unwrap_or(0);
+        let arity = catalog_helpers::table_arity(&self.database, table_id)?;
 
         let (partition, consumer_dict) =
             table_context(&self.partitions, &self.consumer_dictionaries, table_id)?;
@@ -3603,24 +3609,43 @@ where
         let Some(watches) = self.term_watch.get(&table_id) else {
             return Vec::new();
         };
-        // Cloned so the loop can take the partition mutably. One small copy per
-        // event on a table some subscription reads memberships from, and none at
-        // all on any other table.
+        // Cloned so the mutation below can take the partition mutably. One small
+        // copy per event on a table some subscription reads memberships from,
+        // and none at all on any other table.
         let watches = watches.clone();
-        let mut out = Vec::new();
 
+        // Read every movement first, then apply them grouped by subscribed
+        // partition, so one event publishes each partition at most once
+        // however many terms it moves.
+        let mut actions: Vec<(TermWatch, TermAction<E::Backend>)> = Vec::new();
         for watch in watches {
             match event.kind() {
                 EventKind::Insert => {
-                    if let Some((value, subject)) = self.read_term_pair(event, &watch, RowKind::New)
+                    if let Some((values, subject)) =
+                        self.read_term_pair(event, &watch, RowKind::New)
                     {
-                        self.move_term(&watch, value, &subject, true, &mut out);
+                        actions.push((
+                            watch,
+                            TermAction::Move {
+                                values,
+                                subject,
+                                entered: true,
+                            },
+                        ));
                     }
                 }
                 EventKind::Delete => {
-                    if let Some((value, subject)) = self.read_term_pair(event, &watch, RowKind::Old)
+                    if let Some((values, subject)) =
+                        self.read_term_pair(event, &watch, RowKind::Old)
                     {
-                        self.move_term(&watch, value, &subject, false, &mut out);
+                        actions.push((
+                            watch,
+                            TermAction::Move {
+                                values,
+                                subject,
+                                entered: false,
+                            },
+                        ));
                     }
                 }
                 EventKind::Update => {
@@ -3629,19 +3654,62 @@ where
                     if before == after {
                         continue;
                     }
-                    if let Some((value, subject)) = before {
-                        self.move_term(&watch, value, &subject, false, &mut out);
+                    if let Some((values, subject)) = before {
+                        actions.push((
+                            watch.clone(),
+                            TermAction::Move {
+                                values,
+                                subject,
+                                entered: false,
+                            },
+                        ));
                     }
-                    if let Some((value, subject)) = after {
-                        self.move_term(&watch, value, &subject, true, &mut out);
+                    if let Some((values, subject)) = after {
+                        actions.push((
+                            watch,
+                            TermAction::Move {
+                                values,
+                                subject,
+                                entered: true,
+                            },
+                        ));
                     }
                 }
                 // Every membership is gone, so every value the term admitted is
                 // withdrawn. Doing nothing here would leave the sets admitting
                 // rows through memberships that no longer exist, which is the one
                 // error direction the whole design refuses.
-                EventKind::Truncate => self.clear_term(&watch, &mut out),
+                EventKind::Truncate => actions.push((watch, TermAction::Clear)),
             }
+        }
+
+        let mut grouped: Vec<(TableId, Vec<(TermWatch, TermAction<E::Backend>)>)> = Vec::new();
+        for (watch, action) in actions {
+            match grouped
+                .iter_mut()
+                .find(|(table, _)| *table == watch.subscribed)
+            {
+                Some((_, list)) => list.push((watch, action)),
+                None => grouped.push((watch.subscribed, alloc::vec![(watch, action)])),
+            }
+        }
+        let mut out = Vec::new();
+        for (table, list) in grouped {
+            let Some(partition) = self.partitions.get_mut(&table) else {
+                continue;
+            };
+            partition.mutate(|txn| {
+                for (watch, action) in list {
+                    match action {
+                        TermAction::Move {
+                            values,
+                            subject,
+                            entered,
+                        } => Self::move_term(txn, &watch, values, &subject, entered, &mut out),
+                        TermAction::Clear => Self::clear_term(txn, &watch, &mut out),
+                    }
+                }
+            });
         }
         out
     }
@@ -3675,21 +3743,15 @@ where
     /// Add or remove the subscribers claiming `subscriber` from what `values`
     /// admit, and report the subscriptions moved.
     fn move_term(
-        &mut self,
+        txn: &mut PartitionTxn<'_, I, E::Backend>,
         watch: &TermWatch,
         values: crate::term::TermRow<E::Backend>,
         subscriber: &TermKey<E::Backend>,
         entered: bool,
         out: &mut Vec<crate::TermNarrowing<E::Backend>>,
     ) {
-        let Some(partition) = self.partitions.get_mut(&watch.subscribed) else {
-            return;
-        };
-        let snapshot = partition.load_snapshot();
-        let Some(members) = snapshot
-            .predicates
-            .term_members(watch.predicate, watch.slot)
-        else {
+        let store = txn.store();
+        let Some(members) = store.term_members(watch.predicate, watch.slot) else {
             return;
         };
         let Some(claiming) = members.claimed_by(subscriber) else {
@@ -3697,11 +3759,7 @@ where
         };
         // Only this predicate's own subscribers: an ordinal is dense per table
         // and several predicates share the numbering.
-        let moved = match snapshot
-            .predicates
-            .predicate_consumers
-            .get(&watch.predicate)
-        {
+        let moved = match store.predicate_consumers.get(&watch.predicate) {
             Some(bitmap) => claiming & bitmap,
             None => return,
         };
@@ -3709,9 +3767,8 @@ where
             return;
         }
 
-        let subscriptions = subscriptions_for(&snapshot.predicates, watch.predicate, &moved);
-        drop(snapshot);
-        partition.move_term_members(watch.predicate, watch.slot, values.clone(), &moved, entered);
+        let subscriptions = subscriptions_for(store, watch.predicate, &moved);
+        txn.move_term_members(watch.predicate, watch.slot, values.clone(), &moved, entered);
 
         let values: Vec<_> = values.into_iter().map(TermKey::into_value).collect();
         out.extend(
@@ -3729,18 +3786,19 @@ where
 
     /// Withdraw every value one term admitted, as a truncate of the table
     /// carrying its memberships does.
-    fn clear_term(&mut self, watch: &TermWatch, out: &mut Vec<crate::TermNarrowing<E::Backend>>) {
-        let Some(partition) = self.partitions.get_mut(&watch.subscribed) else {
-            return;
-        };
-        let withdrawn = partition.clear_term_admissions(watch.predicate, watch.slot);
+    fn clear_term(
+        txn: &mut PartitionTxn<'_, I, E::Backend>,
+        watch: &TermWatch,
+        out: &mut Vec<crate::TermNarrowing<E::Backend>>,
+    ) {
+        let withdrawn = txn.clear_term_admissions(watch.predicate, watch.slot);
         if withdrawn.is_empty() {
             return;
         }
 
-        let snapshot = partition.load_snapshot();
+        let store = txn.store();
         for (values, ordinals) in withdrawn {
-            let subscriptions = subscriptions_for(&snapshot.predicates, watch.predicate, &ordinals);
+            let subscriptions = subscriptions_for(store, watch.predicate, &ordinals);
             let values: Vec<_> = values.into_iter().map(TermKey::into_value).collect();
             out.extend(
                 subscriptions
@@ -4080,7 +4138,7 @@ where
     /// table with no subscription (dispatch is a no-op) from a genuinely
     /// unknown table id (dispatch errors).
     fn table_in_catalog(&self, table_id: TableId) -> bool {
-        catalog_helpers::table_arity(&self.database, table_id).is_some()
+        catalog_helpers::table_arity(&self.database, table_id).is_ok()
     }
 
     /// Get number of registered predicates for a table
@@ -4455,7 +4513,16 @@ where
     ) -> Result<(), RebuildPayloadError> {
         let (consumer_dict, entries) = self.rebuild_entries_from_payload(table_id, payload)?;
         let mut partition = TablePartition::new(table_id);
-        partition.add_batch(&entries);
+        partition.mutate(|txn| {
+            for (predicate, atoms, bindings) in &entries {
+                let pred_id = txn.add_predicate(Predicate::clone(predicate), atoms);
+                for binding in bindings {
+                    let mut bound = *binding;
+                    bound.predicate_id = pred_id;
+                    txn.add_binding(bound, pred_id);
+                }
+            }
+        });
         self.replace_table_state(table_id, partition, consumer_dict, &entries);
         Ok(())
     }
@@ -5314,5 +5381,80 @@ mod tests {
             .expect("whole read is stored");
         assert!(entry.database_reads_per_consumer);
         assert_eq!(entry.source_query.binds(), &[Value::String("paid".into())]);
+    }
+
+    /// One registration performs one logical mutation of its partition, so it
+    /// publishes exactly one new snapshot: predicate, binding, and seeds land
+    /// together, never as separate publications each paying a store clone.
+    #[test]
+    fn one_registration_publishes_one_partition_snapshot() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+        engine.register(spec(1, 1)).expect("registers");
+        let partition = engine
+            .partitions
+            .values()
+            .next()
+            .expect("one registration creates its partition");
+        assert_eq!(
+            partition.publication_count(),
+            1,
+            "predicate and binding must publish together, not one snapshot each"
+        );
+    }
+
+    /// One membership event is one logical mutation of the subscribed
+    /// partition, even when it moves both halves of an update, so it publishes
+    /// at most one new snapshot.
+    #[cfg(feature = "membership-term")]
+    #[test]
+    fn one_membership_event_publishes_one_partition_snapshot() {
+        use crate::backend::Value;
+        use rls2fga::translator::TranslatorBuilder;
+        use rls2fga::types::ConfidenceLevel;
+
+        let ddl = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE project_members(project_id INTEGER REFERENCES projects(id), user_id TEXT, PRIMARY KEY(project_id, user_id));
+             CREATE TABLE docs(id INTEGER PRIMARY KEY, project_id INTEGER, title TEXT);";
+        let db = ParserDB::parse::<PostgreSqlDialect>(ddl).expect("DDL parses");
+        let docs = crate::catalog_helpers::table_id(&db, "docs").expect("docs");
+        let members = crate::catalog_helpers::table_id(&db, "project_members").expect("members");
+        let translator = TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .build();
+        let mut engine: Engine =
+            SubscriptionEngine::new(db, PostgreSqlDialect {}).with_translator(translator);
+        engine
+            .register(
+                SubscriptionRequest::new(
+                    1u64,
+                    "SELECT * FROM docs WHERE project_id IN \
+                     (SELECT project_id FROM project_members \
+                      WHERE user_id = current_setting('app.user_id', true))",
+                )
+                .subscriber(Value::String("alice".into()))
+                .term_values(
+                    alloc::vec!["project_id"],
+                    alloc::vec![alloc::vec![Value::Int(7)]],
+                ),
+            )
+            .expect("term subscription registers");
+
+        let before = engine.partitions[&docs].publication_count();
+        // An update moves both halves, leaving project 7 and entering 11, which
+        // is the strongest case: two term moves in one event.
+        engine
+            .consumers(&TestEvent::update(
+                members,
+                alloc::vec![Value::Int(7), Value::String("alice".into())],
+                alloc::vec![Value::Int(11), Value::String("alice".into())],
+            ))
+            .expect("membership event dispatches");
+        let after = engine.partitions[&docs].publication_count();
+        assert_eq!(
+            after - before,
+            1,
+            "both halves of the move must ride one snapshot publication"
+        );
     }
 }

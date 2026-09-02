@@ -123,7 +123,7 @@ fn round_trip_pk_change_via_changeset() {
         ParserDB::parse::<PostgreSqlDialect>(SUBQL_PG_DDL).unwrap(),
         PostgreSqlDialect {},
     );
-    let pg_adapter = PgAdapter::new(pg_engine.database());
+    let pg_adapter = PgAdapter::new(pg_engine.database()).expect("the catalog indexes");
     pg_engine
         .apply_diffset_bytes(&changeset, &mut pg, &pg_adapter)
         .unwrap();

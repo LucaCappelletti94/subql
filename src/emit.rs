@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 
 use hashbrown::HashMap;
 use maxwell_cdc::Message as MaxwellMessage;
-use sql_traits::prelude::DatabaseLike;
+use sql_traits::prelude::{DatabaseLike, TableLike};
 use sqlite_diff_rs::maxwell::{ConversionError as MaxwellConversionError, Maxwell};
 #[cfg(feature = "pgoutput-emit")]
 use sqlite_diff_rs::pg_walstream::{
@@ -148,15 +148,20 @@ impl ColumnNames for WireTable {
 
 /// A subql catalog exposed as a `sqlite-diff-rs` [`WireSchema`].
 ///
-/// Holds one owned [`WireTable`] per catalog table, keyed by bare table
-/// name (the name a wal2json message carries in its `table` field).
-/// Built once from a [`DatabaseLike`] catalog and reused across a batch
-/// of events. When two schemas declare the same bare table name the
-/// last one enumerated wins, which matches the bare-name lookup the wire
-/// events perform.
+/// Holds one owned [`WireTable`] per catalog table, grouped by bare table
+/// name and carrying each table's declaring schema. Built once from a
+/// [`DatabaseLike`] catalog and reused across a batch of events.
+///
+/// Lookup is source-qualified: when several tables share a bare name, the
+/// event's source schema must name the declaring schema exactly, and an
+/// unmatched qualifier refuses rather than guessing. A bare name with one
+/// candidate resolves under any qualifier, because a Maxwell event
+/// qualifies by MySQL database name, which a PG-parsed catalog cannot
+/// know.
 #[derive(Debug, Clone)]
 pub struct WireCatalog {
-    tables: HashMap<String, WireTable>,
+    /// Bare table name to declaring schema and table, one entry per table.
+    tables: HashMap<String, Vec<(Option<String>, WireTable)>>,
 }
 
 impl WireCatalog {
@@ -165,25 +170,34 @@ impl WireCatalog {
     /// Columns whose declared SQL type does not map to a [`BuiltinKind`]
     /// fall back to [`WireType::Text`], the lossless affinity for an
     /// unmodeled type on the SQLite side.
-    #[must_use]
-    pub fn from_database<DB: DatabaseLike>(database: &DB) -> Self {
-        let mut tables = HashMap::new();
+    ///
+    /// # Errors
+    /// [`CatalogError`](crate::CatalogError) when any table's metadata cannot
+    /// be resolved: a catalog that cannot describe itself must not emit.
+    pub fn from_database<DB: DatabaseLike>(database: &DB) -> Result<Self, crate::CatalogError> {
+        let mut tables: HashMap<String, Vec<(Option<String>, WireTable)>> = HashMap::new();
         for index in 0..database.number_of_tables() {
             let Ok(table_id) = TableId::try_from(index) else {
                 break;
             };
-            let Some(wire_table) = build_wire_table(database, table_id) else {
-                continue;
-            };
-            tables.insert(wire_table.name().to_string(), wire_table);
+            let schema = database
+                .table_by_id(index)
+                .ok_or(crate::CatalogError::UnknownTable(table_id))?
+                .table_schema()
+                .map(ToString::to_string);
+            let wire_table = build_wire_table(database, table_id)?;
+            tables
+                .entry(wire_table.name().to_string())
+                .or_default()
+                .push((schema, wire_table));
         }
-        Self { tables }
+        Ok(Self { tables })
     }
 
     /// Number of resolved tables.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tables.len()
+        self.tables.values().map(Vec::len).sum()
     }
 
     /// True when no table resolved.
@@ -196,24 +210,39 @@ impl WireCatalog {
 impl WireSchema for WireCatalog {
     type Table = WireTable;
 
-    fn get(&self, table_name: &str) -> Option<&WireTable> {
-        self.tables.get(table_name)
+    fn get(&self, source_schema: Option<&str>, table_name: &str) -> Option<&WireTable> {
+        let candidates = self.tables.get(table_name)?;
+        let exact = candidates
+            .iter()
+            .find(|(schema, _)| schema.as_deref() == source_schema)
+            .map(|(_, table)| table);
+        if exact.is_some() {
+            return exact;
+        }
+        // One candidate is unambiguous under any qualifier.
+        match candidates.as_slice() {
+            [(_, only)] => Some(only),
+            _ => None,
+        }
     }
 }
 
-/// Build one [`WireTable`] for `table_id`, or `None` when the table id
-/// or any of its columns cannot be resolved.
-fn build_wire_table<DB: DatabaseLike>(database: &DB, table_id: TableId) -> Option<WireTable> {
+/// Build one [`WireTable`] for `table_id`.
+fn build_wire_table<DB: DatabaseLike>(
+    database: &DB,
+    table_id: TableId,
+) -> Result<WireTable, crate::CatalogError> {
     let inner = catalog_helpers::simple_table(database, table_id)?;
     let arity = inner.number_of_columns();
     let mut wire_types: Vec<WireType> = Vec::with_capacity(arity);
     for ordinal in 0..arity {
-        let column_id = ColumnId::try_from(ordinal).ok()?;
+        let column_id = ColumnId::try_from(ordinal)
+            .map_err(|_| crate::CatalogError::UnknownColumn { table_id, ordinal })?;
         let wire_type = catalog_helpers::column_builtin_kind(database, table_id, column_id)
             .map_or(WireType::Text, scalar_kind_to_wire_type);
         wire_types.push(wire_type);
     }
-    Some(WireTable { inner, wire_types })
+    Ok(WireTable { inner, wire_types })
 }
 
 /// The wal2json decoder registry subql feeds to `digest`.
@@ -262,7 +291,8 @@ where
         Error = ConversionError,
     >,
 {
-    let catalog = WireCatalog::from_database(database);
+    let catalog = WireCatalog::from_database(database)
+        .map_err(|e| ConversionError::TableNotFound(e.to_string()))?;
     let adapter = wal2json_adapter();
     let mut builder = PatchSet::<WireTable, String, Vec<u8>>::new();
     for event in events {
@@ -326,7 +356,8 @@ where
         Error = ConversionError,
     >,
 {
-    let catalog = WireCatalog::from_database(database);
+    let catalog = WireCatalog::from_database(database)
+        .map_err(|e| ConversionError::TableNotFound(e.to_string()))?;
     let adapter = wal2json_adapter();
     let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
     for event in events {
@@ -387,7 +418,8 @@ pub fn pgoutput_patchset_builder<DB: DatabaseLike>(
     database: &DB,
     events: &[PgChangeEvent],
 ) -> Result<PatchSet<WireTable, String, Vec<u8>>, PgConversionError> {
-    let catalog = WireCatalog::from_database(database);
+    let catalog = WireCatalog::from_database(database)
+        .map_err(|e| PgConversionError::TableNotFound(e.to_string()))?;
     let adapter = pgoutput_adapter();
     let mut builder = PatchSet::<WireTable, String, Vec<u8>>::new();
     for event in events {
@@ -426,7 +458,8 @@ pub fn pgoutput_changeset_builder<DB: DatabaseLike>(
     database: &DB,
     events: &[PgChangeEvent],
 ) -> Result<ChangeSet<WireTable, String, Vec<u8>>, PgConversionError> {
-    let catalog = WireCatalog::from_database(database);
+    let catalog = WireCatalog::from_database(database)
+        .map_err(|e| PgConversionError::TableNotFound(e.to_string()))?;
     let adapter = pgoutput_adapter();
     let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
     for event in events {
@@ -476,7 +509,8 @@ pub fn maxwell_patchset_builder<DB: DatabaseLike>(
     database: &DB,
     events: &[MaxwellMessage],
 ) -> Result<PatchSet<WireTable, String, Vec<u8>>, MaxwellConversionError> {
-    let catalog = WireCatalog::from_database(database);
+    let catalog = WireCatalog::from_database(database)
+        .map_err(|e| MaxwellConversionError::TableNotFound(e.to_string()))?;
     let adapter = maxwell_adapter();
     let mut builder = PatchSet::<WireTable, String, Vec<u8>>::new();
     for event in events {
@@ -513,7 +547,8 @@ pub fn maxwell_changeset_builder<DB: DatabaseLike>(
     database: &DB,
     events: &[MaxwellMessage],
 ) -> Result<ChangeSet<WireTable, String, Vec<u8>>, MaxwellConversionError> {
-    let catalog = WireCatalog::from_database(database);
+    let catalog = WireCatalog::from_database(database)
+        .map_err(|e| MaxwellConversionError::TableNotFound(e.to_string()))?;
     let adapter = maxwell_adapter();
     let mut builder = ChangeSet::<WireTable, String, Vec<u8>>::new();
     for event in events {
@@ -580,7 +615,7 @@ pub fn pgbinary_patchset_builder<DB: DatabaseLike>(
     let table_id = catalog_helpers::table_id(database, table)
         .ok_or_else(|| ConversionError::TableNotFound(table.to_string()))?;
     let simple = catalog_helpers::simple_table(database, table_id)
-        .ok_or_else(|| ConversionError::TableNotFound(table.to_string()))?;
+        .map_err(|e| ConversionError::TableNotFound(e.to_string()))?;
 
     // Catalog column list once: name plus wire type per ordinal, both read
     // from the already-resolved `simple` (as `build_wire_table` does)
@@ -689,13 +724,13 @@ mod tests {
     #[test]
     fn wire_catalog_resolves_declared_table() {
         let db = orders_db();
-        let catalog = WireCatalog::from_database(&db);
+        let catalog = WireCatalog::from_database(&db).expect("catalog resolves");
         assert_eq!(catalog.len(), 1);
-        let table = catalog.get("orders").expect("orders resolves");
+        let table = catalog.get(None, "orders").expect("orders resolves");
         assert_eq!(table.number_of_columns(), 3);
         assert_eq!(table.column_type(0), WireType::Int);
         assert_eq!(table.column_type(2), WireType::Text);
-        assert!(catalog.get("missing").is_none());
+        assert!(catalog.get(None, "missing").is_none());
     }
 
     #[test]
@@ -1086,5 +1121,94 @@ mod tests {
         let rows = vec![vec![Some(uuid_bytes.as_slice())]];
         let err = pgbinary_patchset(&db, "absent", &["id"], &rows).unwrap_err();
         assert!(matches!(err, ConversionError::TableNotFound(name) if name == "absent"));
+    }
+
+    /// Two schemas declaring the same bare table name must resolve by the
+    /// event's source schema, never by which one the catalog enumerated last.
+    #[test]
+    fn wal2json_resolves_duplicate_table_names_by_schema() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA a; CREATE SCHEMA b; \
+             CREATE TABLE a.items (id INT PRIMARY KEY, left_text TEXT); \
+             CREATE TABLE b.items (id INT PRIMARY KEY, right_num INT);",
+        )
+        .unwrap();
+        let line = r#"{"action":"I","schema":"a","table":"items","columns":[{"name":"id","type":"integer","value":1},{"name":"left_text","type":"text","value":"x"}]}"#;
+        let msg = parse_v2(line).unwrap();
+        let bytes = wal2json_patchset(&db, core::slice::from_ref(&msg)).unwrap();
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
+            unreachable!("marker checked above");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        assert_eq!(ops.len(), 1);
+        let PatchsetOp::Insert { values, .. } = &ops[0] else {
+            panic!("expected an insert op, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            values.to_vec(),
+            vec![WireValue::Integer(1), WireValue::Text(String::from("x"))]
+        );
+        // A source schema neither table carries must refuse, not guess.
+        let unknown = r#"{"action":"I","schema":"c","table":"items","columns":[{"name":"id","type":"integer","value":3}]}"#;
+        let err =
+            wal2json_patchset(&db, core::slice::from_ref(&parse_v2(unknown).unwrap())).unwrap_err();
+        assert!(matches!(err, ConversionError::TableNotFound(_)));
+    }
+
+    /// Same contract on the pgoutput vehicle.
+    #[cfg(feature = "pgoutput-emit")]
+    #[test]
+    fn pgoutput_resolves_duplicate_table_names_by_schema() {
+        use sqlite_diff_rs::pg_walstream::{ColumnValue, EventType, Lsn, RowData};
+
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA a; CREATE SCHEMA b; \
+             CREATE TABLE a.items (id INT PRIMARY KEY, left_text TEXT); \
+             CREATE TABLE b.items (id INT PRIMARY KEY, right_num INT);",
+        )
+        .unwrap();
+        let ev = PgChangeEvent {
+            event_type: EventType::Insert {
+                schema: "a".into(),
+                table: "items".into(),
+                relation_oid: 1,
+                data: RowData::from_pairs(vec![
+                    ("id", ColumnValue::text("1")),
+                    ("left_text", ColumnValue::text("x")),
+                ]),
+            },
+            lsn: Lsn::new(1),
+            metadata: None,
+        };
+        let bytes = pgoutput_patchset(&db, core::slice::from_ref(&ev)).unwrap();
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
+            unreachable!("marker checked above");
+        };
+        let ops: Vec<_> = diff.iter().collect();
+        assert_eq!(ops.len(), 1);
+        let PatchsetOp::Insert { values, .. } = &ops[0] else {
+            panic!("expected an insert op, got {:?}", ops[0]);
+        };
+        assert_eq!(
+            values.to_vec(),
+            vec![WireValue::Integer(1), WireValue::Text(String::from("x"))]
+        );
+    }
+
+    /// A Maxwell event qualifies by MySQL database name, which the PG-parsed
+    /// catalog does not know. A bare name that is unique across the catalog
+    /// must still resolve.
+    #[test]
+    fn maxwell_database_qualifier_resolves_unqualified_catalog_table() {
+        let db = orders_db();
+        let msg = maxwell_cdc::parse(
+            r#"{"database":"testdb","table":"orders","type":"insert","data":{"id":1,"amount":100,"status":"new"}}"#,
+        )
+        .unwrap();
+        let bytes = maxwell_patchset(&db, core::slice::from_ref(&msg)).unwrap();
+        let ParsedDiffSet::Patchset(diff) = parse_patchset(&bytes) else {
+            unreachable!("marker checked above");
+        };
+        assert_eq!(diff.iter().count(), 1);
     }
 }

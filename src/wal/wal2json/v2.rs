@@ -68,7 +68,7 @@ impl CdcEvent for MessageV2 {
             return Vec::new();
         }
         v2_table_id(self, db)
-            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id))
+            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id).ok())
             .unwrap_or_default()
     }
 
@@ -87,7 +87,7 @@ impl CdcEvent for MessageV2 {
         let Some(table_id) = v2_table_id(self, db) else {
             return Vec::new();
         };
-        let Some(arity) = catalog_helpers::table_arity(db, table_id) else {
+        let Ok(arity) = catalog_helpers::table_arity(db, table_id) else {
             return Vec::new();
         };
         // Derive only when both images cover every column (REPLICA IDENTITY

@@ -29,11 +29,14 @@ pub(super) fn build_table_meta(
             PgSqliteEmuError::UnknownTable(alloc::format!("id {idx} exceeds TableId space"))
         })?;
         let name = table.table_name().to_string();
-        let arity = catalog_helpers::table_arity(pg_catalog, table_id)
-            .ok_or_else(|| PgSqliteEmuError::UnknownTable(name.clone()))?;
+        let arity = catalog_helpers::table_arity(pg_catalog, table_id).map_err(|error| {
+            PgSqliteEmuError::Catalog(alloc::string::ToString::to_string(&error))
+        })?;
         let pk_cols: HashSet<crate::ColumnId> =
             catalog_helpers::primary_key_columns(pg_catalog, table_id)
-                .unwrap_or_default()
+                .map_err(|error| {
+                    PgSqliteEmuError::Catalog(alloc::string::ToString::to_string(&error))
+                })?
                 .into_iter()
                 .collect();
 

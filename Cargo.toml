@@ -180,7 +180,7 @@ r2d2 = { version = "0.8", optional = true }
 diesel-async = { version = "0.7", optional = true, default-features = false }
 
 # SQLite patchsets and digest conversion for both CDC wire formats.
-sqlite-diff-rs = { version = "0.10", default-features = false, features = ["wal2json", "maxwell"] }
+sqlite-diff-rs = { version = "0.11", default-features = false, features = ["wal2json", "maxwell"] }
 # PostgreSQL wal2json parser and model.
 wal2json-events = { version = "0.1.0", default-features = false }
 # MySQL Maxwell parser and model. Direct, like `wal2json-events` and for the

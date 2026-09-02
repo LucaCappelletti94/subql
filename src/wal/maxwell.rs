@@ -118,7 +118,7 @@ impl CdcEvent for Message {
         // The primary key is the row identity subql matches follows and PK
         // projections against, so it comes from the catalog.
         table_of(self, db)
-            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id))
+            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id).ok())
             .unwrap_or_default()
     }
 

@@ -235,7 +235,7 @@ where
 
     let mut dependency_columns = Vec::new();
     for table in &tables {
-        let arity = crate::catalog_helpers::table_arity(database, *table).unwrap_or(0);
+        let arity = crate::catalog_helpers::table_arity(database, *table)?;
         for ordinal in 0..arity {
             // Column ids are ordinals in the table's own order.
             let Ok(column) = ColumnId::try_from(ordinal) else {
@@ -733,12 +733,7 @@ where
     )
     .map_err(|_| RegisterError::UnknownTable(name.unqualified.clone()))?;
 
-    let key_columns =
-        crate::catalog_helpers::primary_key_columns(database, table).ok_or_else(|| {
-            RegisterError::UnsupportedSql(
-                "a keyed read needs a primary key to identify a delivered row by".to_string(),
-            )
-        })?;
+    let key_columns = crate::catalog_helpers::primary_key_columns(database, table)?;
     if key_columns.is_empty() {
         return Err(RegisterError::UnsupportedSql(
             "a keyed read needs a primary key to identify a delivered row by".to_string(),
@@ -786,7 +781,7 @@ where
         ));
     }
 
-    let arity = crate::catalog_helpers::table_arity(database, table).unwrap_or(0);
+    let arity = crate::catalog_helpers::table_arity(database, table)?;
     let dependency_columns = (0..arity)
         .filter_map(|o| ColumnId::try_from(o).ok())
         .collect();

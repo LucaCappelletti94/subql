@@ -200,7 +200,7 @@ fn finish_loop(
     let sqlite_catalog = ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).unwrap();
     let sqlite_engine: SubscriptionEngine<TestEvent<SqliteBackend>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(sqlite_catalog, SQLiteDialect {});
-    let sqlite_adapter = SqliteAdapter::new(sqlite_engine.database());
+    let sqlite_adapter = SqliteAdapter::new(sqlite_engine.database()).expect("the catalog indexes");
 
     sqlite_engine
         .apply_patchset(seed, &mut sqlite, &sqlite_adapter)
@@ -231,7 +231,7 @@ fn finish_loop(
 
     let pg_engine: SubscriptionEngine<ChangeEvent, DefaultIds, ParserDB> =
         SubscriptionEngine::new(subql_catalog(), PostgreSqlDialect {});
-    let pg_adapter = PgAdapter::new(pg_engine.database());
+    let pg_adapter = PgAdapter::new(pg_engine.database()).expect("the catalog indexes");
 
     pg_engine.apply_patchset(seed, pg, &pg_adapter).unwrap();
     assert_eq!(load_pg(pg), seed_pg_rows(), "Postgres after re-seed");

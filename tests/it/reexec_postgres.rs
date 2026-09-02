@@ -274,12 +274,13 @@ fn engine_and_captured_paths_coexist_through_pg_connector() {
     let mut total_scalar_updates = Vec::new();
     let mut total_triggers = 0usize;
     for event in &events {
-        let notifs = engine.consumers(event).expect("consumers dispatch");
+        let notifs = engine.apply(event).expect("apply dispatch");
         total_inserted.extend(notifs.engine.inserted().iter().copied());
         total_deleted.extend(notifs.engine.deleted().iter().copied());
-        total_scalar_updates.extend(notifs.scalar_updates);
         total_triggers += notifs.triggers.len();
     }
+    let resolved = engine.resolve_collect().expect("resolve dispatch");
+    total_scalar_updates.extend(resolved.scalar_updates);
 
     // Engine-supported subscription: the INSERT id=3 (price=11.0) matches
     // the `> 8.0` predicate -> `inserted`. The DELETE id=1 (price=5.0) does
@@ -365,11 +366,12 @@ fn update_displacing_extreme_resolves_via_pg_connector() {
     }
     assert_eq!(events.len(), 1, "expected exactly one UPDATE event");
 
-    let notifs = engine.consumers(&events[0]).expect("consumers dispatch");
+    engine.apply(&events[0]).expect("apply dispatch");
+    let notifs = engine.resolve_collect().expect("consumers dispatch");
     assert_eq!(notifs.scalar_updates.len(), 1, "expected one ScalarUpdate");
     assert_eq!(notifs.scalar_updates[0].subscription_id, captured_qid);
     assert_eq!(notifs.scalar_updates[0].value, Value::Float(20.0));
-    assert!(notifs.triggers.is_empty());
+    assert_eq!(engine.pending_read_count(), 0, "no pending reads");
 }
 
 /// Test 3 - PgDieselConnector::snapshot returns a real PgLsn.
@@ -534,8 +536,9 @@ fn a_key_column_needing_quotes_is_still_readable() {
         vec![Value::Int(1), Value::String("paid".into())],
     )
     .with_pk_columns([0u16]);
+    engine.apply(&event).expect("apply dispatch");
     let notifications = engine
-        .consumers(&event)
+        .resolve_collect()
         .expect("a quoted key column must be readable, not fail on every change");
 
     assert_eq!(notifications.row_deltas.len(), 1);

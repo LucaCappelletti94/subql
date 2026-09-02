@@ -51,7 +51,7 @@ fn apply_patchset_sqlite_roundtrip_insert_update_delete() {
     let catalog = ParserDB::parse::<SQLiteDialect>(DDL).expect("parse subql DDL");
     let engine: SubscriptionEngine<TestEvent<subql::backend::SQLite>, DefaultIds, ParserDB> =
         SubscriptionEngine::new(catalog, SQLiteDialect {});
-    let adapter = SqliteAdapter::new(engine.database());
+    let adapter = SqliteAdapter::new(engine.database()).expect("the catalog indexes");
 
     let things = SimpleTable::new("things", &["id", "name", "active", "blob_col"], &[0]);
 

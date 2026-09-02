@@ -130,7 +130,7 @@ fn changeset_emit_propagates_pk_change_to_replica() {
             ParserDB::parse::<SQLiteDialect>(SQLITE_DDL).unwrap(),
             SQLiteDialect {},
         );
-    let sqlite_adapter = SqliteAdapter::new(sqlite_engine.database());
+    let sqlite_adapter = SqliteAdapter::new(sqlite_engine.database()).expect("the catalog indexes");
 
     // Seed phase: source inserts emitted as a changeset
     for (id, label, qty) in SEED {

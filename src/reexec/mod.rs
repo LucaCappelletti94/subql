@@ -48,14 +48,23 @@ pub(crate) mod plan;
 // gated inside their modules.
 mod async_auto;
 mod async_connector;
-#[cfg(feature = "executor-diesel-async")]
+// Under the union of the backend sub-features rather than the bare
+// `executor-diesel-async`: every item inside is a pool-backed connector or
+// its plumbing, and only the backend features enable `diesel-async/bb8`.
+#[cfg(any(
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-async-mysql"
+))]
 mod async_diesel;
 mod auto;
 mod connector;
 
 pub use async_auto::AsyncMode;
 pub use async_connector::AsyncConnector;
-#[cfg(feature = "executor-diesel-async")]
+#[cfg(any(
+    feature = "executor-diesel-async-postgres",
+    feature = "executor-diesel-async-mysql"
+))]
 pub use async_diesel::DieselAsyncError;
 #[cfg(feature = "executor-diesel-async-mysql")]
 pub use async_diesel::MysqlAsyncDieselConnector;
@@ -79,6 +88,6 @@ pub use connector::{DieselBackend, DieselConnector};
 pub use connector::{PgR2D2DieselConnector, PgR2D2Error};
 pub(crate) use engine::ReExecEntry;
 pub use engine::{
-    BatchOutcome, ReExecNotifications, ReExecutionRead, ReExecutionTrigger, RowDelta, RowsUpdate,
-    ScalarUpdate,
+    ReExecNotifications, ReExecutionRead, ReExecutionTrigger, ReadDelivery, ResolvedReads,
+    RowDelta, RowsUpdate, ScalarUpdate,
 };

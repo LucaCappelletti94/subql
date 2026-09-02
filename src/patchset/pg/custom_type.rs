@@ -139,7 +139,9 @@ where
 ///     "CREATE TABLE t (id INT PRIMARY KEY, feeling mood);",
 /// )
 /// .expect("valid DDL");
-/// let adapter = CustomTypePgAdapter::new(&catalog).register("mood", MoodBinder);
+/// let adapter = CustomTypePgAdapter::new(&catalog)
+///     .expect("the catalog indexes")
+///     .register("mood", MoodBinder);
 ///
 /// // The `feeling` column (index 1) routes to the registered binder.
 /// assert!(adapter.bind("t", 1, &Value::Text("happy".to_owned())).is_ok());
@@ -154,14 +156,17 @@ pub struct CustomTypePgAdapter<'db, DB: DatabaseLike, S, B> {
 }
 
 impl<'db, DB: DatabaseLike, S, B> CustomTypePgAdapter<'db, DB, S, B> {
-    /// Build a wrapper around a fresh [`PgAdapter`] borrowing `catalog`,
+    /// Build a wrapper around a fresh [`PgAdapter`] indexing `catalog`,
     /// with no custom types registered yet.
-    #[must_use]
-    pub const fn new(catalog: &'db DB) -> Self {
-        Self {
-            inner: PgAdapter::new(catalog),
+    ///
+    /// # Errors
+    /// [`CatalogError`](crate::CatalogError) when the catalog fails to
+    /// yield a table's columns.
+    pub fn new(catalog: &'db DB) -> Result<Self, crate::CatalogError> {
+        Ok(Self {
+            inner: PgAdapter::new(catalog)?,
             binders: Vec::new(),
-        }
+        })
     }
 
     /// Register `binder` for every column whose declared catalog type
@@ -269,7 +274,9 @@ mod tests {
     }
 
     fn adapter(db: &ParserDB) -> CustomTypePgAdapter<'_, ParserDB, String, Vec<u8>> {
-        CustomTypePgAdapter::new(db).register("mood", MoodBinder)
+        CustomTypePgAdapter::new(db)
+            .expect("the catalog indexes")
+            .register("mood", MoodBinder)
     }
 
     #[test]
