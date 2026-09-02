@@ -2,7 +2,7 @@
 
 use super::{
     ids::{ConsumerOrdinal, PredicateId},
-    indexes::{HybridIndexes, IndexableAtom, IndexableCell},
+    indexes::{HybridIndexes, IndexableCell},
     predicate::{Predicate, PredicateStore, SubscriptionBinding},
 };
 use crate::backend::Backend;
@@ -325,12 +325,13 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
         Arc::make_mut(&mut self.partition.mutable_predicates)
     }
 
-    /// Add a predicate, patching it into the indexes.
-    pub fn add_predicate(
-        &mut self,
-        predicate: Predicate<B>,
-        atoms: &[IndexableAtom],
-    ) -> PredicateId {
+    /// Add a predicate, patching its own
+    /// [`index_atoms`](Predicate::index_atoms) into the indexes.
+    ///
+    /// The stored atoms are the only index source, so the incremental patch
+    /// here and the full rebuild after a removal can never diverge.
+    pub fn add_predicate(&mut self, predicate: Predicate<B>) -> PredicateId {
+        let atoms = Arc::clone(&predicate.index_atoms);
         let deps = Arc::clone(&predicate.dependency_columns);
         let projection = predicate.projection.clone();
         let pred_id = self.store_mut().add_predicate(predicate);
@@ -339,7 +340,7 @@ impl<I: IdTypes, B: Backend> PartitionTxn<'_, I, B> {
             let indexes = self
                 .indexes
                 .get_or_insert_with(|| self.partition.load_snapshot().indexes.clone());
-            indexes.add_predicate(pred_id, atoms, &deps, &projection);
+            indexes.add_predicate(pred_id, &atoms, &deps, &projection);
         }
         pred_id
     }
@@ -491,12 +492,15 @@ mod tests {
         DefaultIds, SubscriptionScope,
     };
 
+    /// Test spelling that states the atoms in one place: they are written
+    /// into the predicate, which is the index's single source.
     fn add_predicate(
         partition: &mut TablePartition<DefaultIds, Postgres>,
-        pred: Predicate<Postgres>,
+        mut pred: Predicate<Postgres>,
         atoms: &[IndexableAtom],
     ) -> PredicateId {
-        partition.mutate(|txn| txn.add_predicate(pred, atoms))
+        pred.index_atoms = Arc::from(atoms);
+        partition.mutate(|txn| txn.add_predicate(pred))
     }
 
     fn add_binding(
@@ -781,7 +785,7 @@ mod tests {
         let mut partition = TablePartition::<DefaultIds, Postgres>::new(1);
 
         partition.mutate(|txn| {
-            let pred_id = txn.add_predicate(make_predicate(0, 0x1234), &[IndexableAtom::Fallback]);
+            let pred_id = txn.add_predicate(make_predicate(0, 0x1234));
             txn.add_binding(
                 SubscriptionBinding {
                     subscription_id: 100,
