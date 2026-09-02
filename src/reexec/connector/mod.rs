@@ -602,6 +602,19 @@ pub enum ReExecError<E> {
     },
 }
 
+impl<E> ReExecError<E> {
+    /// Whether retrying the same read can change the outcome.
+    ///
+    /// An install failure means the database answer does not match the
+    /// subscription, so the same read returns the same mismatch and a
+    /// retry can only repeat it. Everything else reports a condition that
+    /// can clear, a failed connection or statement above all.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        !matches!(self, Self::Install(_) | Self::AggregateInstall(_))
+    }
+}
+
 /// Error from [`Connector::execute_scalar_row`] and its async peer.
 ///
 /// Distinguishes "this connector has no multi-column seed support" (the
