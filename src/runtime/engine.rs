@@ -2488,12 +2488,18 @@ where
 
     /// The row-secured table that makes restoring `planned` unsafe as one
     /// shared answer, or `None` when the restore may proceed.
+    ///
+    /// The same guard registration applies: per-consumer reads stay safe
+    /// under row-level filtering, on every plan shape alike.
     #[cfg(feature = "std")]
     fn restored_rls_table(
         &self,
         planned: &crate::reexec::plan::QueryPlan<E::Backend>,
         database_reads_per_consumer: bool,
     ) -> Result<Option<TableId>, DropReason> {
+        if database_reads_per_consumer {
+            return Ok(None);
+        }
         let catalog_failed = |e: crate::CatalogError| DropReason::Unplannable {
             message: format!("row-security could not be checked: {e}"),
         };
@@ -2508,20 +2514,19 @@ where
                     .map_err(catalog_failed)?
                     .then_some(plan.table_id)
             }
-            crate::reexec::plan::QueryPlan::Keyed(plan) => (!database_reads_per_consumer
-                && crate::catalog_helpers::table_has_rls(&self.database, plan.table)
-                    .map_err(catalog_failed)?)
-            .then_some(plan.table),
+            crate::reexec::plan::QueryPlan::Keyed(plan) => {
+                crate::catalog_helpers::table_has_rls(&self.database, plan.table)
+                    .map_err(catalog_failed)?
+                    .then_some(plan.table)
+            }
             crate::reexec::plan::QueryPlan::Total(plan) => {
                 let mut found = None;
-                if !database_reads_per_consumer {
-                    for table_id in plan.tables.iter().copied() {
-                        if crate::catalog_helpers::table_has_rls(&self.database, table_id)
-                            .map_err(catalog_failed)?
-                        {
-                            found = Some(table_id);
-                            break;
-                        }
+                for table_id in plan.tables.iter().copied() {
+                    if crate::catalog_helpers::table_has_rls(&self.database, table_id)
+                        .map_err(catalog_failed)?
+                    {
+                        found = Some(table_id);
+                        break;
                     }
                 }
                 found
