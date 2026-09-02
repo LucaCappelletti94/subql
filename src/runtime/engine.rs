@@ -1562,59 +1562,23 @@ where
             database_reads_per_consumer,
         };
         match planned {
-            Ok(crate::reexec::plan::QueryPlan::GroupedPartial(plan)) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)?
-                    && !database_reads_per_consumer
-                {
-                    return Err(RegisterError::AggregatorOnRlsTable {
-                        table_id: plan.table_id,
-                    });
-                }
+            Ok(planned) => {
+                self.registration_rls_refusal(&planned, database_reads_per_consumer)?;
                 let subscription_id = self.allocate_subscription_id();
-                let mut registered =
-                    self.capture_grouped_scalar(subscription_id, *plan, &registration);
-                registered.not_served_because = Some(refusal);
-                self.persist_reads_after_change(subscription_id)?;
-                Ok(registered)
-            }
-            Ok(crate::reexec::plan::QueryPlan::Partial(plan)) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)?
-                    && !database_reads_per_consumer
-                {
-                    return Err(RegisterError::AggregatorOnRlsTable {
-                        table_id: plan.table_id,
-                    });
-                }
-                let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_scalar(subscription_id, plan, &registration);
-                registered.not_served_because = Some(refusal);
-                self.persist_reads_after_change(subscription_id)?;
-                Ok(registered)
-            }
-            Ok(crate::reexec::plan::QueryPlan::Keyed(plan)) => {
-                if crate::catalog_helpers::table_has_rls(&self.database, plan.table)?
-                    && !database_reads_per_consumer
-                {
-                    return Err(RegisterError::RowCaptureOnRlsTable {
-                        table_id: plan.table,
-                    });
-                }
-                let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_keyed(subscription_id, *plan, &registration);
-                registered.not_served_because = Some(refusal);
-                self.persist_reads_after_change(subscription_id)?;
-                Ok(registered)
-            }
-            Ok(crate::reexec::plan::QueryPlan::Total(plan)) => {
-                if !database_reads_per_consumer {
-                    for table in plan.tables.iter().copied() {
-                        if crate::catalog_helpers::table_has_rls(&self.database, table)? {
-                            return Err(RegisterError::RowCaptureOnRlsTable { table_id: table });
-                        }
+                let mut registered = match planned {
+                    crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
+                        self.capture_grouped_scalar(subscription_id, *plan, &registration)
                     }
-                }
-                let subscription_id = self.allocate_subscription_id();
-                let mut registered = self.capture_whole(subscription_id, plan, &registration);
+                    crate::reexec::plan::QueryPlan::Partial(plan) => {
+                        self.capture_scalar(subscription_id, plan, &registration)
+                    }
+                    crate::reexec::plan::QueryPlan::Keyed(plan) => {
+                        self.capture_keyed(subscription_id, *plan, &registration)
+                    }
+                    crate::reexec::plan::QueryPlan::Total(plan) => {
+                        self.capture_whole(subscription_id, plan, &registration)
+                    }
+                };
                 registered.not_served_because = Some(refusal);
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
@@ -1622,6 +1586,53 @@ where
             // No tier can serve it either, so the compiler's refusal stands.
             Err(_) => Err(RegisterError::UnsupportedSql(refusal)),
         }
+    }
+
+    /// The registration-time row-security refusal for one planned tier, or
+    /// `Ok(())` when it may register.
+    ///
+    /// A shared answer is unsafe when the read's table filters rows per
+    /// viewer, unless the subscription reads per consumer, which is exactly
+    /// the mode that stays safe under row-level security.
+    fn registration_rls_refusal(
+        &self,
+        planned: &crate::reexec::plan::QueryPlan<E::Backend>,
+        database_reads_per_consumer: bool,
+    ) -> Result<(), RegisterError> {
+        if database_reads_per_consumer {
+            return Ok(());
+        }
+        match planned {
+            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)? {
+                    return Err(RegisterError::AggregatorOnRlsTable {
+                        table_id: plan.table_id,
+                    });
+                }
+            }
+            crate::reexec::plan::QueryPlan::Partial(plan) => {
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)? {
+                    return Err(RegisterError::AggregatorOnRlsTable {
+                        table_id: plan.table_id,
+                    });
+                }
+            }
+            crate::reexec::plan::QueryPlan::Keyed(plan) => {
+                if crate::catalog_helpers::table_has_rls(&self.database, plan.table)? {
+                    return Err(RegisterError::RowCaptureOnRlsTable {
+                        table_id: plan.table,
+                    });
+                }
+            }
+            crate::reexec::plan::QueryPlan::Total(plan) => {
+                for table in plan.tables.iter().copied() {
+                    if crate::catalog_helpers::table_has_rls(&self.database, table)? {
+                        return Err(RegisterError::RowCaptureOnRlsTable { table_id: table });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
     fn plan_whole_reread(
         &mut self,
@@ -2427,40 +2438,9 @@ where
         // Row-level filtering may have been enabled without changing the SQL
         // text. A restored shared answer is unsafe in that case for the same
         // reason a fresh registration is: viewers can see different rows.
-        let catalog_failed = |e: crate::CatalogError| DropReason::Unplannable {
-            message: format!("row-security could not be checked: {e}"),
-        };
-        let rls_table = match &planned {
-            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
-                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
-                    .map_err(catalog_failed)?
-                    .then_some(plan.table_id)
-            }
-            crate::reexec::plan::QueryPlan::Partial(plan) => {
-                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
-                    .map_err(catalog_failed)?
-                    .then_some(plan.table_id)
-            }
-            crate::reexec::plan::QueryPlan::Keyed(plan) => (!entry.database_reads_per_consumer
-                && crate::catalog_helpers::table_has_rls(&self.database, plan.table)
-                    .map_err(catalog_failed)?)
-            .then_some(plan.table),
-            crate::reexec::plan::QueryPlan::Total(plan) => {
-                let mut found = None;
-                if !entry.database_reads_per_consumer {
-                    for table_id in plan.tables.iter().copied() {
-                        if crate::catalog_helpers::table_has_rls(&self.database, table_id)
-                            .map_err(catalog_failed)?
-                        {
-                            found = Some(table_id);
-                            break;
-                        }
-                    }
-                }
-                found
-            }
-        };
-        if let Some(table_id) = rls_table {
+        if let Some(table_id) =
+            self.restored_rls_table(&planned, entry.database_reads_per_consumer)?
+        {
             return Err(DropReason::Unplannable {
                 message: format!(
                     "table {table_id} now filters rows per viewer, so one shared answer is unsafe"
@@ -2504,6 +2484,50 @@ where
             tier: registered.tier,
             tier_changed: now != entry.tier,
         })
+    }
+
+    /// The row-secured table that makes restoring `planned` unsafe as one
+    /// shared answer, or `None` when the restore may proceed.
+    #[cfg(feature = "std")]
+    fn restored_rls_table(
+        &self,
+        planned: &crate::reexec::plan::QueryPlan<E::Backend>,
+        database_reads_per_consumer: bool,
+    ) -> Result<Option<TableId>, DropReason> {
+        let catalog_failed = |e: crate::CatalogError| DropReason::Unplannable {
+            message: format!("row-security could not be checked: {e}"),
+        };
+        let found = match planned {
+            crate::reexec::plan::QueryPlan::GroupedPartial(plan) => {
+                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
+                    .map_err(catalog_failed)?
+                    .then_some(plan.table_id)
+            }
+            crate::reexec::plan::QueryPlan::Partial(plan) => {
+                crate::catalog_helpers::table_has_rls(&self.database, plan.table_id)
+                    .map_err(catalog_failed)?
+                    .then_some(plan.table_id)
+            }
+            crate::reexec::plan::QueryPlan::Keyed(plan) => (!database_reads_per_consumer
+                && crate::catalog_helpers::table_has_rls(&self.database, plan.table)
+                    .map_err(catalog_failed)?)
+            .then_some(plan.table),
+            crate::reexec::plan::QueryPlan::Total(plan) => {
+                let mut found = None;
+                if !database_reads_per_consumer {
+                    for table_id in plan.tables.iter().copied() {
+                        if crate::catalog_helpers::table_has_rls(&self.database, table_id)
+                            .map_err(catalog_failed)?
+                        {
+                            found = Some(table_id);
+                            break;
+                        }
+                    }
+                }
+                found
+            }
+        };
+        Ok(found)
     }
 
     /// Register a `SELECT` for `consumer_id`, building the

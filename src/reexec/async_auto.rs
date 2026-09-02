@@ -87,6 +87,16 @@ async fn acquire_permit(
 /// so a dropped or failed read loses nothing.
 type KeyedRows<B> = Vec<(Vec<Value<B>>, Vec<Value<B>>)>;
 
+/// One queued read paired with the job phase one planned for it.
+type PlannedJob<I, C, B> = (super::ReExecutionTrigger<I, C, B>, ResolveJob<B>);
+
+/// One concurrent read's outcome, entering phase three.
+type ReadOutcome<I, C, B, E> =
+    Result<(super::ReExecutionTrigger<I, C, B>, Resolved<B>), ReExecError<E>>;
+
+/// Every outcome of one concurrent drain iteration, in completion order.
+type ReadOutcomes<I, C, B, E> = Vec<ReadOutcome<I, C, B, E>>;
+
 enum ResolveJob<B: Backend> {
     /// A scalar the connector reads in one call.
     Scalar {
@@ -417,10 +427,6 @@ where
     /// [`ReExecError::Connector`] and [`ReExecError::Cursor`] name the
     /// subscription whose read failed. Install errors mean the database
     /// answer does not match the subscription and are not retryable.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the three phases share borrows that splitting would hand around"
-    )]
     pub async fn resolve<S>(&mut self, mut sink: S) -> Result<(), ReExecError<X::Error>>
     where
         S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
@@ -431,21 +437,7 @@ where
             if self.pending_reads.is_empty() {
                 return Ok(());
             }
-            // Phase one, under `&mut self`: decide each read's job against a
-            // snapshot. Keys are copied, never taken, so a dropped future
-            // loses nothing.
-            let snapshot = self.pending_reads.clone();
-            let mut jobs = Vec::with_capacity(snapshot.len());
-            for trigger in snapshot {
-                if let Some(job) = self.plan_job(&trigger) {
-                    jobs.push((trigger, job));
-                } else {
-                    // Nothing to ask, but the query was still triggered, so
-                    // its debounce stamp moves as if it had been read.
-                    self.dequeue_read(&trigger);
-                    self.stamp_reexec(trigger.subscription_id, &trigger.read);
-                }
-            }
+            let jobs = self.plan_pending_jobs();
             if jobs.is_empty() {
                 continue;
             }
@@ -460,16 +452,7 @@ where
                 .as_ref()
                 .map(|s| (Arc::clone(&s.sem), Arc::clone(&s.inflight)));
             let jobs_len = jobs.len();
-            #[allow(clippy::type_complexity)]
-            let resolved: Vec<
-                Result<
-                    (
-                        super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
-                        Resolved<E::Backend>,
-                    ),
-                    ReExecError<X::Error>,
-                >,
-            > = {
+            let resolved = {
                 // Whole reads stream their pages from inside the concurrent
                 // phase, so the sink is shared under an async lock for the
                 // duration and handed back exclusively afterwards.
@@ -482,68 +465,116 @@ where
                              trigger.subscription_id must exist in `contexts`",
                         )
                         .auth;
-                    let throttle = throttle.clone();
-                    let shared_sink = &shared_sink;
-                    async move {
-                        let _guard =
-                            acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
-                        let answer = match job {
-                            ResolveJob::Whole { query, generation } => {
-                                Self::stream_whole(
-                                    connector,
-                                    shared_sink,
-                                    &trigger,
-                                    &query,
-                                    generation,
-                                    max_page_bytes,
-                                    auth,
-                                )
-                                .await?;
-                                Resolved::WholeStreamed
-                            }
-                            other => {
-                                Self::run_job(
-                                    connector,
-                                    other,
-                                    trigger.subscription_id,
-                                    max_page_bytes,
-                                    auth,
-                                )
-                                .await?
-                            }
-                        };
-                        Ok::<_, ReExecError<X::Error>>((trigger, answer))
-                    }
+                    Self::run_one(
+                        connector,
+                        &shared_sink,
+                        trigger,
+                        job,
+                        max_page_bytes,
+                        auth,
+                        throttle.clone(),
+                    )
                 }))
                 .buffer_unordered(jobs_len)
                 .collect::<Vec<_>>()
                 .await
             };
 
-            // Phase three, between awaits so it cannot be interrupted:
-            // install and deliver the successes, keep the failures queued,
-            // and report the first failure.
-            let mut first_error = None;
-            for outcome in resolved {
-                match outcome {
-                    Ok((trigger, answer)) => {
-                        self.dequeue_read(&trigger);
-                        self.apply_answer(&trigger, answer, &mut sink)?;
-                        self.stamp_reexec(trigger.subscription_id, &trigger.read);
-                    }
-                    Err(error) => {
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
-                }
-            }
-            if let Some(error) = first_error {
-                return Err(error);
-            }
+            self.apply_outcomes(resolved, &mut sink)?;
             // Grouped installs may have queued follow-up reads: loop drains
             // them with the same concurrency.
         }
+    }
+
+    /// Phase one of a resolve iteration, under `&mut self`: decide each
+    /// queued read's job against a snapshot. Keys are copied, never taken,
+    /// so a dropped future loses nothing. A read with nothing to ask is
+    /// dequeued with its debounce stamp moved, as if it had been read.
+    fn plan_pending_jobs(&mut self) -> Vec<PlannedJob<I, E::Checkpoint, E::Backend>> {
+        let snapshot = self.pending_reads.clone();
+        let mut jobs = Vec::with_capacity(snapshot.len());
+        for trigger in snapshot {
+            if let Some(job) = self.plan_job(&trigger) {
+                jobs.push((trigger, job));
+            } else {
+                self.dequeue_read(&trigger);
+                self.stamp_reexec(trigger.subscription_id, &trigger.read);
+            }
+        }
+        jobs
+    }
+
+    /// One planned read, phase two: a whole read streams its pages into the
+    /// shared sink, everything else resolves to an answer for phase three.
+    /// Holds no exclusive borrow of the engine, so these run concurrently.
+    async fn run_one<S>(
+        connector: &X,
+        shared_sink: &async_lock::Mutex<&mut S>,
+        trigger: super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
+        job: ResolveJob<E::Backend>,
+        max_page_bytes: usize,
+        auth: &X::AuthContext,
+        throttle: Option<(Arc<Semaphore>, Arc<AtomicUsize>)>,
+    ) -> ReadOutcome<I, E::Checkpoint, E::Backend, X::Error>
+    where
+        S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
+    {
+        let _guard = acquire_permit(throttle.as_ref(), trigger.subscription_id).await;
+        let answer = match job {
+            ResolveJob::Whole { query, generation } => {
+                Self::stream_whole(
+                    connector,
+                    shared_sink,
+                    &trigger,
+                    &query,
+                    generation,
+                    max_page_bytes,
+                    auth,
+                )
+                .await?;
+                Resolved::WholeStreamed
+            }
+            other => {
+                Self::run_job(
+                    connector,
+                    other,
+                    trigger.subscription_id,
+                    max_page_bytes,
+                    auth,
+                )
+                .await?
+            }
+        };
+        Ok((trigger, answer))
+    }
+
+    /// Phase three, between awaits so it cannot be interrupted: install and
+    /// deliver the successes, keep the failures queued, and report the
+    /// first failure.
+    fn apply_outcomes<S>(
+        &mut self,
+        resolved: ReadOutcomes<I, E::Checkpoint, E::Backend, X::Error>,
+        sink: &mut S,
+    ) -> Result<(), ReExecError<X::Error>>
+    where
+        S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>) + Send,
+    {
+        let mut first_error = None;
+        for outcome in resolved {
+            match outcome {
+                Ok((trigger, answer)) => {
+                    self.dequeue_read(&trigger);
+                    self.apply_answer(&trigger, answer, sink)?;
+                    self.stamp_reexec(trigger.subscription_id, &trigger.read);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Drain every queued read, buffering deliveries by channel.
