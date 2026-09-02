@@ -1355,6 +1355,55 @@ mod tests {
         assert_eq!(e.connector().call_count(), 2);
     }
 
+    /// A queued read must not outlive its subscription, the async twin:
+    /// unregistering purges it, so the next resolve is a clean no-op rather
+    /// than a panic on the missing resolve context in `plan_job`.
+    #[test]
+    fn unregister_subscription_drops_the_queued_read() {
+        let (mut e, tid) = engine_with_values(vec![Value::Float(5.0)]);
+        let captured = match e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT MIN(price) FROM orders"),
+                (),
+            )
+            .unwrap()
+        {
+            Registered {
+                subscription_id,
+                tier: Tier::Scalar { .. },
+                ..
+            } => subscription_id,
+            other => panic!("expected Scalar, got {other:?}"),
+        };
+        crate::Install::install(
+            &mut e,
+            captured,
+            crate::ScalarInstall {
+                value: Value::Float(5.0),
+                checkpoint: None::<crate::NoCheckpoint>,
+            },
+        )
+        .unwrap();
+        e.apply(&delete_event(tid, 1, 5.0)).unwrap();
+        assert_eq!(
+            e.pending_read_count(),
+            1,
+            "the displacement queues one read"
+        );
+        assert!(e.unregister_subscription(captured));
+        assert_eq!(
+            e.pending_read_count(),
+            0,
+            "the queued read left with its subscription"
+        );
+        block_on(e.resolve_collect()).unwrap();
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "no read runs for a dead subscription"
+        );
+    }
+
     #[test]
     fn async_scalar_initial_snapshot_forwards_registration_binds() {
         let (mut engine, _) = engine_with_values(vec![Value::Float(5.0)]);
