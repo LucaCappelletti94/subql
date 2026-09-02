@@ -183,7 +183,149 @@ where
     /// `resolve`, deduplicated by subscription and group. A failed or
     /// abandoned resolve leaves them here, so retrying costs a read and
     /// never a second application of the event.
-    pub(super) pending_reads: Vec<super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>>,
+    pub(super) pending_reads: ReadQueue<I, E::Checkpoint, E::Backend>,
+}
+
+/// Queued reads in arrival order, indexed by `(subscription, group)`.
+///
+/// The order lives in a `VecDeque` whose entries can be tombstoned in
+/// place, and the index maps each live key to a monotonically assigned
+/// sequence number, so enqueue deduplication, in-place replacement, and
+/// removal by key are each one hash lookup instead of a scan of the queue.
+pub(super) struct ReadQueue<I: IdTypes, C: crate::Checkpoint, B: Backend> {
+    entries: alloc::collections::VecDeque<Option<super::ReExecutionTrigger<I, C, B>>>,
+    /// Live keys to the sequence number of their entry.
+    queued: hashbrown::HashMap<(SubscriptionId, Option<Vec<u8>>), u64>,
+    /// Sequence number of the front entry of `entries`.
+    head_seq: u64,
+    /// Tombstoned entries still holding a slot, compacted away as soon as
+    /// they outnumber the live ones, so storage stays proportional to the
+    /// queue and every walk stays amortized constant per operation.
+    tombstones: usize,
+}
+
+impl<I: IdTypes, C: crate::Checkpoint, B: Backend> ReadQueue<I, C, B> {
+    fn new() -> Self {
+        Self {
+            entries: alloc::collections::VecDeque::new(),
+            queued: hashbrown::HashMap::new(),
+            head_seq: 0,
+            tombstones: 0,
+        }
+    }
+    fn key_of(trigger: &super::ReExecutionTrigger<I, C, B>) -> (SubscriptionId, Option<Vec<u8>>) {
+        (
+            trigger.subscription_id,
+            trigger.read.group_key().map(<[u8]>::to_vec),
+        )
+    }
+
+    fn index_of(&self, seq: u64) -> usize {
+        usize::try_from(seq - self.head_seq).expect("a live sequence number is within the queue")
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.queued.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.queued.is_empty()
+    }
+
+    /// Queue `trigger`, replacing a queued read of the same subscription and
+    /// group in place, so a burst keeps one read at its original position.
+    fn enqueue(&mut self, trigger: super::ReExecutionTrigger<I, C, B>) {
+        let key = Self::key_of(&trigger);
+        if let Some(&seq) = self.queued.get(&key) {
+            let index = self.index_of(seq);
+            self.entries[index] = Some(trigger);
+            return;
+        }
+        let seq = self.head_seq + self.entries.len() as u64;
+        self.entries.push_back(Some(trigger));
+        self.queued.insert(key, seq);
+    }
+
+    /// Drop the queued read of `(subscription_id, group_key)`, tombstoning
+    /// its entry so no position shifts, and compacting once tombstones
+    /// outnumber live reads.
+    fn remove(&mut self, subscription_id: SubscriptionId, group_key: Option<&[u8]>) {
+        let key = (subscription_id, group_key.map(<[u8]>::to_vec));
+        if let Some(seq) = self.queued.remove(&key) {
+            let index = self.index_of(seq);
+            self.entries[index] = None;
+            self.tombstones += 1;
+            self.compact_if_mostly_dead();
+        }
+    }
+
+    /// The oldest queued read, skipping tombstones.
+    fn pop_front(&mut self) -> Option<super::ReExecutionTrigger<I, C, B>> {
+        while let Some(slot) = self.entries.pop_front() {
+            self.head_seq += 1;
+            if let Some(trigger) = slot {
+                self.queued.remove(&Self::key_of(&trigger));
+                return Some(trigger);
+            }
+            self.tombstones -= 1;
+        }
+        None
+    }
+
+    /// Put back the read `pop_front` just handed out, at the front sequence
+    /// it vacated. Only that read may come back, which is what keeps the
+    /// head sequence from underflowing.
+    fn push_front(&mut self, trigger: super::ReExecutionTrigger<I, C, B>) {
+        self.head_seq -= 1;
+        self.queued.insert(Self::key_of(&trigger), self.head_seq);
+        self.entries.push_front(Some(trigger));
+    }
+
+    /// Tombstone every queued read `keep` refuses. Positions do not shift,
+    /// so the index stays valid until the compaction that runs when the
+    /// tombstones outnumber the live reads.
+    fn retain(&mut self, mut keep: impl FnMut(&super::ReExecutionTrigger<I, C, B>) -> bool) {
+        for slot in &mut self.entries {
+            let Some(trigger) = slot else {
+                continue;
+            };
+            if !keep(trigger) {
+                self.queued.remove(&Self::key_of(trigger));
+                *slot = None;
+                self.tombstones += 1;
+            }
+        }
+        self.compact_if_mostly_dead();
+    }
+
+    /// Reclaim tombstoned slots once they outnumber the live reads, in one
+    /// pass that keeps arrival order and reindexes the survivors from a
+    /// fresh head sequence. Amortized constant per removal.
+    fn compact_if_mostly_dead(&mut self) {
+        if self.tombstones <= self.queued.len() {
+            return;
+        }
+        self.entries.retain(Option::is_some);
+        self.head_seq = 0;
+        self.tombstones = 0;
+        self.queued.clear();
+        for (index, slot) in self.entries.iter().enumerate() {
+            let trigger = slot.as_ref().expect("compaction kept only live entries");
+            self.queued.insert(Self::key_of(trigger), index as u64);
+        }
+    }
+
+    /// The live queued reads in order, cloned.
+    pub(super) fn snapshot(&self) -> Vec<super::ReExecutionTrigger<I, C, B>> {
+        self.entries.iter().flatten().cloned().collect()
+    }
+
+    /// Storage slots held, tombstones included: the reclamation tests'
+    /// window into what [`Self::len`] cannot see.
+    #[cfg(test)]
+    fn entry_slots(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl<E, I, DB, M> AutoResolvingEngine<E, I, DB, M>
@@ -205,7 +347,7 @@ where
             clock: None,
             debounce: None,
             last_reexec_at: HashMap::new(),
-            pending_reads: Vec::new(),
+            pending_reads: ReadQueue::new(),
         }
     }
 
@@ -357,14 +499,7 @@ where
         if self.debounce_skip(trigger.subscription_id, &trigger.read) {
             return;
         }
-        if let Some(existing) = self.pending_reads.iter_mut().find(|queued| {
-            queued.subscription_id == trigger.subscription_id
-                && queued.read.group_key() == trigger.read.group_key()
-        }) {
-            *existing = trigger;
-        } else {
-            self.pending_reads.push(trigger);
-        }
+        self.pending_reads.enqueue(trigger);
     }
 
     /// Drop one queued read after its answer was installed and delivered.
@@ -372,15 +507,13 @@ where
         &mut self,
         trigger: &super::ReExecutionTrigger<I, E::Checkpoint, E::Backend>,
     ) {
-        self.pending_reads.retain(|queued| {
-            queued.subscription_id != trigger.subscription_id
-                || queued.read.group_key() != trigger.read.group_key()
-        });
+        self.pending_reads
+            .remove(trigger.subscription_id, trigger.read.group_key());
     }
 
     /// Reads waiting for the next `resolve`.
     #[must_use]
-    pub const fn pending_read_count(&self) -> usize {
+    pub fn pending_read_count(&self) -> usize {
         self.pending_reads.len()
     }
 
@@ -987,13 +1120,12 @@ where
     where
         S: FnMut(super::ReadDelivery<I, E::Backend, E::Checkpoint>),
     {
-        while !self.pending_reads.is_empty() {
-            let trigger = self.pending_reads.remove(0);
+        while let Some(trigger) = self.pending_reads.pop_front() {
             match self.resolve_one(&trigger, &mut sink) {
                 Ok(()) => self.stamp_reexec(trigger.subscription_id, &trigger.read),
                 Err(error) => {
                     if error.is_retryable() {
-                        self.pending_reads.insert(0, trigger);
+                        self.pending_reads.push_front(trigger);
                     }
                     return Err(error);
                 }
@@ -2645,6 +2777,31 @@ mod tests {
         engine
             .resolve_collect()
             .expect("the next resolve is a clean no-op");
+    }
+
+    /// Removing reads by key must not leave storage behind: the async
+    /// resolver drains exclusively through key removal and never pops, so
+    /// consumed entries have to be reclaimed or the queue grows for the
+    /// process lifetime and every snapshot rescans dead history.
+    #[test]
+    fn key_removal_reclaims_queue_storage() {
+        let mut queue: super::ReadQueue<DefaultIds, crate::NoCheckpoint, Postgres> =
+            super::ReadQueue::new();
+        for round in 0..64u64 {
+            queue.enqueue(super::super::ReExecutionTrigger {
+                subscription_id: round,
+                consumer_id: 1u64,
+                read: super::super::ReExecutionRead::Subscription,
+                checkpoint: None,
+            });
+            queue.remove(round, None);
+        }
+        assert!(queue.is_empty(), "every queued read was removed");
+        assert!(
+            queue.entry_slots() <= 1,
+            "consumed entries are reclaimed, got {} slots for an empty queue",
+            queue.entry_slots()
+        );
     }
 
     #[test]
