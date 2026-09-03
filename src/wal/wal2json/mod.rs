@@ -76,7 +76,7 @@ mod tests {
         let db = orders();
         let ev = one_v2(
             br#"{"action":"U","schema":"public","table":"orders",
-                 "columns":[{"name":"id","type":"integer","value":7},
+                 "columns":[{"name":"id","type":"integer","value":8},
                             {"name":"customer","type":"integer","value":3},
                             {"name":"amount","type":"integer","value":250},
                             {"name":"status","type":"text","value":"paid"}],
@@ -85,9 +85,11 @@ mod tests {
                              {"name":"amount","type":"integer","value":100},
                              {"name":"status","type":"text","value":"pending"}]}"#,
         );
+        let _ = super::decode_helpers::take_index_hashes();
         let mut changed = ev.changed_columns(&db);
         changed.sort_unstable();
-        assert_eq!(changed, alloc::vec![2u16, 3u16]);
+        assert_eq!(changed, alloc::vec![0u16, 2u16, 3u16]);
+        assert_eq!(super::decode_helpers::take_index_hashes(), 16);
         assert_eq!(
             ev.value_at(&db, RowKind::Old, 2).expect("old amount"),
             Value::Int(100)
@@ -95,6 +97,11 @@ mod tests {
         assert_eq!(
             ev.value_at(&db, RowKind::New, 2).expect("new amount"),
             Value::Int(250)
+        );
+        let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+        assert_eq!(
+            resolved.value_at_known_pk(&db, 0).expect("old primary key"),
+            Value::Int(7)
         );
     }
 
@@ -131,6 +138,32 @@ mod tests {
             Value::Int(42)
         );
         assert_eq!(ev.checkpoint(), None);
+    }
+
+    #[test]
+    fn v1_full_identity_derives_changed_columns() {
+        let db = orders();
+        let mut events = parse_wal2json_v1(
+            br#"{"change":[{"kind":"update","schema":"public","table":"orders",
+                 "columnnames":["id","customer","amount","status"],
+                 "columntypes":["integer","integer","integer","text"],
+                 "columnvalues":[8,3,250,"paid"],
+                 "oldkeys":{"keynames":["id","customer","amount","status"],
+                            "keytypes":["integer","integer","integer","text"],
+                            "keyvalues":[7,3,100,"pending"]}}]}"#,
+        )
+        .expect("parse");
+        let ev = events.remove(0);
+        let _ = super::decode_helpers::take_index_hashes();
+        let mut changed = ev.changed_columns(&db);
+        changed.sort_unstable();
+        assert_eq!(changed, alloc::vec![0u16, 2u16, 3u16]);
+        assert_eq!(super::decode_helpers::take_index_hashes(), 16);
+        let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+        assert_eq!(
+            resolved.value_at_known_pk(&db, 0).expect("old primary key"),
+            Value::Int(7)
+        );
     }
 
     #[test]

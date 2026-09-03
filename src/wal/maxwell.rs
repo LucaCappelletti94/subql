@@ -21,9 +21,10 @@ use sql_traits::prelude::DatabaseLike;
 
 use super::pg_type::json_value_to_mysql_value_by_kind;
 use super::{resolve_table, WalParseError};
-use crate::backend::{CdcEvent, MySql, RowKind, Value};
+use crate::backend::{MySql, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
+use crate::wal::wire_event::{wire_cdc_event, WireEvent};
 
 /// Parse one Maxwell JSON message into the row events subql dispatches.
 ///
@@ -94,60 +95,47 @@ fn table_of<DB: DatabaseLike>(msg: &Message, db: &DB) -> Option<TableId> {
     resolve_table(&payload.database, &payload.table, db).ok()
 }
 
-impl CdcEvent for Message {
+wire_cdc_event!(Message, MySql, crate::NoCheckpoint);
+
+impl WireEvent for Message {
     type Backend = MySql;
     type Checkpoint = crate::NoCheckpoint;
 
-    fn kind(&self) -> EventKind {
+    fn wire_kind(&self) -> EventKind {
         kind_of(self).expect(
             "CdcEvent::kind called on a Maxwell message with no row. Filter with parse_messages first",
         )
     }
 
-    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+    fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         // Infallible in the trait, so an unresolved name yields the `u32`
         // sentinel, which the engine reports as an unknown table.
         table_of(self, db).unwrap_or(TableId::MAX)
     }
 
-    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+    fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {
         None
     }
 
-    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        // The primary key is the row identity subql matches follows and PK
-        // projections against, so it comes from the catalog.
-        table_of(self, db)
-            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id).ok())
-            .unwrap_or_default()
-    }
-
-    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+    fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         let Self::Update(payload) = self else {
             return Vec::new();
         };
         let Some(old) = payload.old.as_ref() else {
             return Vec::new();
         };
-        let Some(table_id) = table_of(self, db) else {
-            return Vec::new();
-        };
-        // Maxwell's `old` carries exactly the columns whose value changed, so
-        // it is an authoritative changed-column set.
         old.keys()
             .filter_map(|name| catalog_helpers::column_id(db, table_id, name))
             .collect()
     }
 
-    fn value_at<DB: DatabaseLike>(
+    fn wire_value_at<DB: DatabaseLike>(
         &self,
         db: &DB,
+        table_id: TableId,
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<MySql>, crate::ValueError> {
-        let Some(table_id) = table_of(self, db) else {
-            return Ok(Value::Missing);
-        };
         if row == RowKind::Pk
             && !catalog_helpers::primary_key_columns(db, table_id)
                 .unwrap_or_default()
@@ -172,12 +160,32 @@ impl CdcEvent for Message {
                 }),
         }
     }
+
+    /// Maxwell's old image carries only the changed fields, so an unchanged
+    /// key is read from the new one instead.
+    fn wire_value_at_known_pk<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        col: ColumnId,
+    ) -> Result<Value<MySql>, crate::ValueError> {
+        match self.wire_kind() {
+            EventKind::Insert => self.wire_value_at(db, table_id, RowKind::New, col),
+            EventKind::Delete => self.wire_value_at(db, table_id, RowKind::Old, col),
+            EventKind::Update => match self.wire_value_at(db, table_id, RowKind::Old, col)? {
+                Value::Missing => self.wire_value_at(db, table_id, RowKind::New, col),
+                value => Ok(value),
+            },
+            EventKind::Truncate => Ok(Value::Missing),
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::backend::CdcEvent;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::MySqlDialect;
 
@@ -219,14 +227,35 @@ mod tests {
     fn update_old_field_is_authoritative_changed_columns() {
         let db = orders();
         let ev = one(br#"{"database":"test","table":"orders","type":"update",
-                 "data":{"id":7,"amount":250,"status":"paid"},
-                 "old":{"amount":100,"status":"pending"}}"#);
+                 "data":{"id":8,"amount":250,"status":"paid"},
+                 "old":{"id":7,"amount":100,"status":"pending"}}"#);
         assert_eq!(ev.kind(), EventKind::Update);
         let mut changed = ev.changed_columns(&db);
         changed.sort_unstable();
-        assert_eq!(changed, alloc::vec![1u16, 2u16]);
+        assert_eq!(changed, alloc::vec![0u16, 1u16, 2u16]);
         assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Int(250));
         assert_eq!(ev.value_at(&db, RowKind::Old, 1).unwrap(), Value::Int(100));
+        let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+        assert_eq!(
+            resolved.value_at_known_pk(&db, 0).expect("old primary key"),
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn update_known_pk_falls_back_to_the_new_image() {
+        let db = orders();
+        let ev = one(br#"{"database":"test","table":"orders","type":"update",
+                 "data":{"id":7,"amount":250,"status":"paid"},
+                 "old":{"amount":100}}"#);
+        let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+
+        assert_eq!(
+            resolved
+                .value_at_known_pk(&db, 0)
+                .expect("unchanged primary key"),
+            Value::Int(7)
+        );
     }
 
     #[test]

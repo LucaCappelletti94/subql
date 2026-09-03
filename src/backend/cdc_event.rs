@@ -69,6 +69,22 @@ pub trait CdcEvent {
     /// replace this later if profiling shows it matters.
     fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId>;
 
+    #[doc(hidden)]
+    fn pk_columns_resolved<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
+        let _ = table_id;
+        self.pk_columns(db)
+    }
+
+    #[doc(hidden)]
+    fn with_pk_columns<DB: DatabaseLike, R>(
+        &self,
+        db: &DB,
+        read: impl FnOnce(&[ColumnId]) -> R,
+    ) -> R {
+        let columns = self.pk_columns(db);
+        read(&columns)
+    }
+
     /// Column ids whose cells changed on an Update event.
     ///
     /// For non-Update events the result is empty. For Update events
@@ -79,6 +95,26 @@ pub trait CdcEvent {
     /// a hint for optimisation, not as an authoritative diff. `db`
     /// resolves wire names to subql column ordinals.
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId>;
+
+    #[doc(hidden)]
+    fn changed_columns_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+    ) -> Vec<ColumnId> {
+        let _ = table_id;
+        self.changed_columns(db)
+    }
+
+    #[doc(hidden)]
+    fn with_changed_columns<DB: DatabaseLike, R>(
+        &self,
+        db: &DB,
+        read: impl FnOnce(&[ColumnId]) -> R,
+    ) -> R {
+        let columns = self.changed_columns(db);
+        read(&columns)
+    }
 
     /// Decode one cell to an owned [`Value<Self::Backend>`].
     ///
@@ -98,6 +134,141 @@ pub trait CdcEvent {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Self::Backend>, crate::ValueError>;
+
+    #[doc(hidden)]
+    fn value_at_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Self::Backend>, crate::ValueError> {
+        let _ = table_id;
+        self.value_at(db, row, col)
+    }
+
+    #[doc(hidden)]
+    fn value_at_known_pk<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        col: ColumnId,
+    ) -> Result<Value<Self::Backend>, crate::ValueError> {
+        self.value_at(db, RowKind::Pk, col)
+    }
+
+    #[doc(hidden)]
+    fn value_at_known_pk_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        col: ColumnId,
+    ) -> Result<Value<Self::Backend>, crate::ValueError> {
+        self.value_at_resolved(db, table_id, RowKind::Pk, col)
+    }
+}
+
+/// One event paired with its resolved catalog table.
+pub struct ResolvedEvent<'a, E: CdcEvent> {
+    event: &'a E,
+    table_id: TableId,
+    pk_columns: core::cell::OnceCell<Vec<ColumnId>>,
+    changed_columns: core::cell::OnceCell<Vec<ColumnId>>,
+}
+
+impl<'a, E: CdcEvent> ResolvedEvent<'a, E> {
+    pub(crate) fn new<DB: DatabaseLike>(event: &'a E, database: &DB) -> Self {
+        Self {
+            event,
+            table_id: event.table_id(database),
+            pk_columns: core::cell::OnceCell::new(),
+            changed_columns: core::cell::OnceCell::new(),
+        }
+    }
+
+    pub(crate) const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    pub(crate) fn pk_columns<DB: DatabaseLike>(&self, database: &DB) -> &[ColumnId] {
+        self.pk_columns
+            .get_or_init(|| self.event.pk_columns_resolved(database, self.table_id))
+            .as_slice()
+    }
+
+    pub(crate) fn changed_columns<DB: DatabaseLike>(&self, database: &DB) -> &[ColumnId] {
+        self.changed_columns
+            .get_or_init(|| self.event.changed_columns_resolved(database, self.table_id))
+            .as_slice()
+    }
+
+    pub(crate) fn value_at<DB: DatabaseLike>(
+        &self,
+        database: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<E::Backend>, crate::ValueError> {
+        self.event
+            .value_at_resolved(database, self.table_id, row, col)
+    }
+}
+
+impl<E: CdcEvent> CdcEvent for ResolvedEvent<'_, E> {
+    type Backend = E::Backend;
+    type Checkpoint = E::Checkpoint;
+
+    fn kind(&self) -> EventKind {
+        self.event.kind()
+    }
+
+    fn table_id<DB: DatabaseLike>(&self, _db: &DB) -> TableId {
+        self.table_id
+    }
+
+    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+        self.event.checkpoint()
+    }
+
+    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        ResolvedEvent::pk_columns(self, db).to_vec()
+    }
+
+    fn with_pk_columns<DB: DatabaseLike, R>(
+        &self,
+        db: &DB,
+        read: impl FnOnce(&[ColumnId]) -> R,
+    ) -> R {
+        read(ResolvedEvent::pk_columns(self, db))
+    }
+
+    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        ResolvedEvent::changed_columns(self, db).to_vec()
+    }
+
+    fn with_changed_columns<DB: DatabaseLike, R>(
+        &self,
+        db: &DB,
+        read: impl FnOnce(&[ColumnId]) -> R,
+    ) -> R {
+        read(ResolvedEvent::changed_columns(self, db))
+    }
+
+    fn value_at<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Self::Backend>, crate::ValueError> {
+        self.event.value_at_resolved(db, self.table_id, row, col)
+    }
+
+    fn value_at_known_pk<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        col: ColumnId,
+    ) -> Result<Value<Self::Backend>, crate::ValueError> {
+        self.event
+            .value_at_known_pk_resolved(db, self.table_id, col)
+    }
 }
 
 /// Decode one cell whose column kind may name a custom type, by handing a

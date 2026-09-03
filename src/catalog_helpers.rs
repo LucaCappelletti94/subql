@@ -70,6 +70,18 @@ pub fn table_id<DB: DatabaseLike>(database: &DB, table_name: &str) -> Option<Tab
     let id = database.table_id(table)?;
     u32::try_from(id).ok()
 }
+
+/// Resolve a table from separate schema and relation names.
+#[must_use]
+pub(crate) fn table_id_in_schema<DB: DatabaseLike>(
+    database: &DB,
+    schema: Option<&str>,
+    table_name: &str,
+) -> Option<TableId> {
+    let table = database.table(schema, table_name)?;
+    let id = database.table_id(table)?;
+    u32::try_from(id).ok()
+}
 #[cfg(feature = "visibility-records")]
 pub(crate) fn contract_table_id<DB: DatabaseLike>(
     database: &DB,
@@ -208,7 +220,7 @@ pub fn primary_key_columns<DB: DatabaseLike>(
 /// Resolve a column's stored name from its compact [`ColumnId`].
 ///
 /// The inverse of [`column_id`]. Returns `None` when the table or column id is
-/// unknown. O(n) over the table's columns.
+/// unknown.
 #[must_use]
 pub fn column_name<DB: DatabaseLike>(
     database: &DB,
@@ -216,12 +228,11 @@ pub fn column_name<DB: DatabaseLike>(
     column_id: ColumnId,
 ) -> Option<alloc::string::String> {
     use alloc::string::ToString;
-    let table = database.table_by_id(table_id as usize)?;
-    table
-        .columns(database)
-        .ok()?
-        .find(|col| col.column_id(database).ok().flatten() == Some(column_id as usize))
-        .map(|col| col.column_name().to_string())
+    let table = database.table_by_id(usize::try_from(table_id).ok()?)?;
+    let column = table
+        .column_by_id(usize::from(column_id), database)
+        .ok()??;
+    Some(column.column_name().to_string())
 }
 
 /// Build a [`SimpleTable`] from the catalog for `table_id`.
@@ -510,12 +521,37 @@ mod tests {
     }
 
     #[test]
+    fn table_id_in_schema_keeps_the_name_parts_separate() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "CREATE SCHEMA east;
+             CREATE SCHEMA west;
+             CREATE TABLE east.orders (id INT);
+             CREATE TABLE west.orders (id INT);",
+        )
+        .expect("DDL parses");
+
+        let east = table_id_in_schema(&db, Some("east"), "orders").expect("east orders exists");
+        let west = table_id_in_schema(&db, Some("west"), "orders").expect("west orders exists");
+
+        assert_ne!(east, west);
+    }
+
+    #[test]
     fn column_id_resolves_each_column_to_its_ordinal() {
         let db = make_db();
         let tid = table_id(&db, "orders").unwrap();
         assert_eq!(column_id(&db, tid, "id"), Some(0));
         assert_eq!(column_id(&db, tid, "amount"), Some(1));
         assert_eq!(column_id(&db, tid, "status"), Some(2));
+    }
+
+    #[test]
+    fn column_name_resolves_the_requested_ordinal() {
+        let db = make_db();
+        let table = table_id(&db, "orders").expect("orders exists");
+
+        assert_eq!(column_name(&db, table, 1).as_deref(), Some("amount"));
+        assert_eq!(column_name(&db, table, 3), None);
     }
 
     #[test]

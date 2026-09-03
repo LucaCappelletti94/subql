@@ -23,10 +23,33 @@ pub fn resolve_table_reference<DB: DatabaseLike>(
 ) -> Result<TableId, TableResolutionError> {
     let qualified_id = qualified.and_then(|name| catalog_helpers::table_id(database, name));
     let unqualified_id = catalog_helpers::table_id(database, unqualified);
+    resolve_table_ids(qualified_id, unqualified_id, unqualified, || {
+        qualified.map(ToString::to_string)
+    })
+}
 
+pub fn resolve_table_parts<DB: DatabaseLike>(
+    schema: Option<&str>,
+    table: &str,
+    database: &DB,
+) -> Result<TableId, TableResolutionError> {
+    let qualified_id = schema
+        .and_then(|schema| catalog_helpers::table_id_in_schema(database, Some(schema), table));
+    let unqualified_id = catalog_helpers::table_id(database, table);
+    resolve_table_ids(qualified_id, unqualified_id, table, || {
+        schema.map(|schema| alloc::format!("{schema}.{table}"))
+    })
+}
+
+fn resolve_table_ids(
+    qualified_id: Option<TableId>,
+    unqualified_id: Option<TableId>,
+    unqualified: &str,
+    qualified_name: impl FnOnce() -> Option<String>,
+) -> Result<TableId, TableResolutionError> {
     match (qualified_id, unqualified_id) {
         (Some(q), Some(u)) if q != u => Err(TableResolutionError::Ambiguous {
-            qualified: qualified.unwrap_or_default().to_string(),
+            qualified: qualified_name().unwrap_or_default(),
             unqualified: unqualified.to_string(),
             qualified_id: q,
             unqualified_id: u,
@@ -34,7 +57,7 @@ pub fn resolve_table_reference<DB: DatabaseLike>(
         (Some(q), _) => Ok(q),
         (None, Some(u)) => Ok(u),
         (None, None) => Err(TableResolutionError::Unknown {
-            qualified: qualified.map(str::to_string),
+            qualified: qualified_name(),
             unqualified: unqualified.to_string(),
         }),
     }

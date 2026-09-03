@@ -1,14 +1,22 @@
 #![allow(clippy::type_complexity)]
 //! Binlog-position-aware sync [`Connector`] for MySQL.
 
+// The async connector reads `LogStatusRow` from this module, so the module is
+// compiled without the sync feature: everything the sync connector alone needs
+// follows it.
+#[cfg(feature = "executor-diesel-mysql")]
 use super::diesel_connector::{load_page, load_scalar, load_scalar_row};
+#[cfg(feature = "executor-diesel-mysql")]
 use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
+#[cfg(feature = "executor-diesel-mysql")]
 use crate::backend::{BuiltinKind, Value};
 use alloc::string::String;
+#[cfg(feature = "executor-diesel-mysql")]
 use core::cell::RefCell;
 use diesel::sql_types::{BigInt, Nullable, Text};
+#[cfg(feature = "executor-diesel-mysql")]
 use diesel::{sql_query, Connection, RunQueryDsl};
 
 /// Sync [`Connector`] backed by a diesel `MysqlConnection` that anchors every

@@ -1,14 +1,16 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use wal2json_events::ChangeV1;
 
-use crate::backend::{CdcEvent, Postgres, RowKind, Value};
+use crate::backend::{Postgres, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
+use crate::wal::wire_event::{wire_cdc_event, WireEvent};
 use crate::wal::{changed_columns_by_name, resolve_table};
 
-use super::decode_helpers::decode_cell;
+use super::decode_helpers::{decode_cell, IndexedName};
 use super::parse_helpers::v1_row_kind;
 
 /// The `(names, values)` parallel arrays `row` selects for `change`, or
@@ -45,42 +47,43 @@ fn v1_value<'a>(
         .and_then(|i| values.get(i))
 }
 
-impl CdcEvent for ChangeV1 {
+fn v1_index<'a>(
+    names: &'a [String],
+    values: &'a [serde_json::Value],
+) -> HashMap<IndexedName<'a>, &'a serde_json::Value> {
+    let mut index = HashMap::with_capacity(names.len().min(values.len()));
+    for (name, value) in names.iter().zip(values) {
+        index.entry(IndexedName::new(name)).or_insert(value);
+    }
+    index
+}
+
+wire_cdc_event!(ChangeV1, Postgres, crate::NoCheckpoint);
+
+impl WireEvent for ChangeV1 {
     type Backend = Postgres;
     type Checkpoint = crate::NoCheckpoint;
 
-    fn kind(&self) -> EventKind {
+    fn wire_kind(&self) -> EventKind {
         v1_row_kind(self).expect(
             "CdcEvent::kind called on a non-row wal2json v1 change. Filter with parse_wal2json_v1 first",
         )
     }
 
-    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+    fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         v1_naming(self)
             .and_then(|(schema, table)| resolve_table(schema, table, db).ok())
             .unwrap_or(TableId::MAX)
     }
 
-    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+    fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {
         None
     }
 
-    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        v1_naming(self)
-            .and_then(|(schema, table)| resolve_table(schema, table, db).ok())
-            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id).ok())
-            .unwrap_or_default()
-    }
-
-    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+    fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         let Self::Update {
             columns, oldkeys, ..
         } = self
-        else {
-            return Vec::new();
-        };
-        let Some(table_id) =
-            v1_naming(self).and_then(|(schema, table)| resolve_table(schema, table, db).ok())
         else {
             return Vec::new();
         };
@@ -90,26 +93,27 @@ impl CdcEvent for ChangeV1 {
         if columns.columnnames.len() != arity || oldkeys.keynames.len() != arity {
             return Vec::new();
         }
+        let old = v1_index(&oldkeys.keynames, &oldkeys.keyvalues);
+        let new = v1_index(&columns.columnnames, &columns.columnvalues);
         changed_columns_by_name(db, table_id, arity, |name| {
             (
-                v1_value(&oldkeys.keynames, &oldkeys.keyvalues, name),
-                v1_value(&columns.columnnames, &columns.columnvalues, name),
+                old.get(&IndexedName::new(name)).copied(),
+                new.get(&IndexedName::new(name)).copied(),
             )
         })
     }
 
-    fn value_at<DB: DatabaseLike>(
+    fn wire_value_at<DB: DatabaseLike>(
         &self,
         db: &DB,
+        table_id: TableId,
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Postgres>, crate::ValueError> {
-        let Some(table_id) =
-            v1_naming(self).and_then(|(schema, table)| resolve_table(schema, table, db).ok())
-        else {
-            return Ok(Value::Missing);
-        };
-        if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
+        if row == RowKind::Pk
+            && !catalog_helpers::primary_key_columns(db, table_id)
+                .is_ok_and(|columns| columns.contains(&col))
+        {
             return Ok(Value::Missing);
         }
         let Some((names, values)) = v1_image(self, row) else {

@@ -23,9 +23,10 @@ use sql_traits::prelude::DatabaseLike;
 
 use super::pg_type::text_to_pg_value_by_kind;
 use super::resolve_table;
-use crate::backend::{CdcEvent, Postgres, RowKind, Value};
+use crate::backend::{Postgres, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
+use crate::wal::wire_event::{wire_cdc_event, WireEvent};
 
 /// The DML or truncate kind of `event`, or `None` for the non-row events
 /// (`Begin`, `Commit`, `Relation`, streaming and two-phase markers) that a
@@ -94,35 +95,29 @@ const fn image_for(event: &ChangeEvent, row: RowKind) -> Option<&RowData> {
     }
 }
 
-impl CdcEvent for ChangeEvent {
+wire_cdc_event!(ChangeEvent, Postgres, crate::PgLsn);
+
+impl WireEvent for ChangeEvent {
     type Backend = Postgres;
     type Checkpoint = crate::PgLsn;
 
-    fn kind(&self) -> EventKind {
+    fn wire_kind(&self) -> EventKind {
         dml_kind(self).expect(
             "CdcEvent::kind called on a non-row ChangeEvent. Sources must reduce the stream with into_engine_events first",
         )
     }
 
-    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+    fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         // Infallible in the trait, so an unresolved name yields the
         // `u32` sentinel, which the engine reports as an unknown table.
         event_table_id(self, db).unwrap_or(TableId::MAX)
     }
 
-    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+    fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {
         Some(crate::PgLsn(self.lsn.value()))
     }
 
-    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        let Some(table_id) = event_table_id(self, db) else {
-            return Vec::new();
-        };
-        // The primary key is the row identity subql matches follows and
-        // PK projections against. It is a catalog fact, so it comes from
-        // the catalog rather than the wire replica-identity key, which
-        // under REPLICA IDENTITY FULL spans every column. Column
-        // availability in the old image is handled by `value_at`.
+    fn wire_pk_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         match &self.event_type {
             EventType::Insert { .. } | EventType::Update { .. } | EventType::Delete { .. } => {
                 catalog_helpers::primary_key_columns(db, table_id).unwrap_or_default()
@@ -131,7 +126,7 @@ impl CdcEvent for ChangeEvent {
         }
     }
 
-    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+    fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         let EventType::Update {
             old_data: Some(old),
             new_data,
@@ -140,15 +135,9 @@ impl CdcEvent for ChangeEvent {
         else {
             return Vec::new();
         };
-        let Some(table_id) = event_table_id(self, db) else {
-            return Vec::new();
-        };
         let Ok(arity) = catalog_helpers::table_arity(db, table_id) else {
             return Vec::new();
         };
-        // Derive only when both images cover every column (REPLICA
-        // IDENTITY FULL). A sparser old image leaves the result empty,
-        // which the engine treats as a conservative over-notification.
         if old.len() != arity || new_data.len() != arity {
             return Vec::new();
         }
@@ -157,16 +146,14 @@ impl CdcEvent for ChangeEvent {
         })
     }
 
-    fn value_at<DB: DatabaseLike>(
+    fn wire_value_at<DB: DatabaseLike>(
         &self,
         db: &DB,
+        table_id: TableId,
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Postgres>, crate::ValueError> {
-        let Some(table_id) = event_table_id(self, db) else {
-            return Ok(Value::Missing);
-        };
-        if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
+        if row == RowKind::Pk && !WireEvent::wire_pk_columns(self, db, table_id).contains(&col) {
             return Ok(Value::Missing);
         }
         let Some(image) = image_for(self, row) else {
@@ -215,6 +202,7 @@ impl CdcEvent for ChangeEvent {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::backend::CdcEvent;
     use crate::PgLsn;
     use pg_walstream::{Lsn, ReplicaIdentity};
     use sql_traits::structs::ParserDB;
@@ -283,7 +271,7 @@ mod tests {
                     ("status", ColumnValue::text("pending")),
                 ])),
                 new_data: row(vec![
-                    ("id", ColumnValue::text("7")),
+                    ("id", ColumnValue::text("8")),
                     ("customer", ColumnValue::text("3")),
                     ("amount", ColumnValue::text("250")),
                     ("status", ColumnValue::text("paid")),
@@ -298,9 +286,14 @@ mod tests {
         assert_eq!(ev.pk_columns(&db), vec![0u16]);
         let mut changed = ev.changed_columns(&db);
         changed.sort_unstable();
-        assert_eq!(changed, vec![2u16, 3u16]);
+        assert_eq!(changed, vec![0u16, 2u16, 3u16]);
         assert_eq!(ev.value_at(&db, RowKind::Old, 2).unwrap(), Value::Int(100));
         assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Int(250));
+        let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+        assert_eq!(
+            resolved.value_at_known_pk(&db, 0).expect("old primary key"),
+            Value::Int(7)
+        );
     }
 
     #[test]

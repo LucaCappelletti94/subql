@@ -233,10 +233,7 @@ where
 ///
 /// Uses `sql_query` because the re-execution query is user-supplied SQL
 /// that the typed DSL cannot express.
-#[cfg(any(
-    feature = "executor-diesel-postgres",
-    feature = "executor-diesel-async-postgres"
-))]
+#[cfg(feature = "executor-diesel-postgres")]
 pub(super) fn boxed_postgres_read_query<'a>(
     query: &'a ReadQuery<'_, crate::backend::Postgres>,
 ) -> QueryResult<BoxedSqlQuery<'a, diesel::pg::Pg, SqlQuery>> {

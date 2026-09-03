@@ -3,13 +3,20 @@
 
 #[cfg(feature = "executor-diesel-postgres")]
 use super::diesel_connector::{load_page_postgres, load_scalar, load_scalar_row};
+// The async connector reads `PgLsnRow` from this module, so the module is
+// compiled without the sync feature: everything the sync connector alone needs
+// follows it.
+#[cfg(feature = "executor-diesel-postgres")]
 use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
+#[cfg(feature = "executor-diesel-postgres")]
 use crate::backend::{BuiltinKind, Value};
 use alloc::string::String;
+#[cfg(feature = "executor-diesel-postgres")]
 use core::cell::RefCell;
 use diesel::sql_types::Text;
+#[cfg(feature = "executor-diesel-postgres")]
 use diesel::{sql_query, Connection, RunQueryDsl};
 
 /// Sync [`Connector`] backed by a diesel `PgConnection` that anchors

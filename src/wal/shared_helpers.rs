@@ -1,4 +1,4 @@
-use crate::table_resolution::{resolve_table_reference, TableResolutionError};
+use crate::table_resolution::{resolve_table_parts, TableResolutionError};
 use crate::{catalog_helpers, ColumnId, TableId};
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -17,24 +17,25 @@ pub fn resolve_table<DB: DatabaseLike>(
     table: &str,
     database: &DB,
 ) -> Result<TableId, WalParseError> {
-    let qualified = (!schema.is_empty()).then(|| format!("{schema}.{table}"));
-    resolve_table_reference(qualified.as_deref(), table, database).map_err(|err| match err {
-        TableResolutionError::Ambiguous {
-            qualified,
-            qualified_id,
-            unqualified_id,
-            ..
-        } => WalParseError::AmbiguousTable {
-            schema: schema.to_string(),
-            table: table.to_string(),
-            qualified,
-            qualified_id,
-            unqualified_id,
-        },
-        TableResolutionError::Unknown { .. } => WalParseError::UnknownTable {
-            schema: schema.to_string(),
-            table: table.to_string(),
-        },
+    resolve_table_parts((!schema.is_empty()).then_some(schema), table, database).map_err(|err| {
+        match err {
+            TableResolutionError::Ambiguous {
+                qualified,
+                qualified_id,
+                unqualified_id,
+                ..
+            } => WalParseError::AmbiguousTable {
+                schema: schema.to_string(),
+                table: table.to_string(),
+                qualified,
+                qualified_id,
+                unqualified_id,
+            },
+            TableResolutionError::Unknown { .. } => WalParseError::UnknownTable {
+                schema: schema.to_string(),
+                table: table.to_string(),
+            },
+        }
     })
 }
 

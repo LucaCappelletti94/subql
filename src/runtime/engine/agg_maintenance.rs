@@ -210,7 +210,16 @@ where
         event: &E,
     ) -> Result<crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>, DispatchError>
     {
-        let table_id = event.table_id(&self.database);
+        let event = crate::backend::ResolvedEvent::new(event, &self.database);
+        self.aggregate_updates_resolved(&event)
+    }
+
+    pub(super) fn aggregate_updates_resolved(
+        &mut self,
+        event: &crate::backend::ResolvedEvent<'_, E>,
+    ) -> Result<crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>, DispatchError>
+    {
+        let table_id = event.table_id();
         if !self.partitions.contains_key(&table_id) {
             return if self.table_in_catalog(table_id) {
                 Ok(crate::AggregateMaintenanceOutput::empty())
@@ -448,9 +457,9 @@ where
     /// the bootstrap SQL returned at registration.
     pub(super) fn unseeded_aggregate_triggers(
         &self,
-        event: &E,
+        event: &crate::backend::ResolvedEvent<'_, E>,
     ) -> Vec<crate::reexec::ReExecutionTrigger<I, E::Checkpoint, E::Backend>> {
-        let table_id = event.table_id(&self.database);
+        let table_id = event.table_id();
         let mut triggers: Vec<_> = self
             .aggregates
             .iter()

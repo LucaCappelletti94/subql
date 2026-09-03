@@ -74,19 +74,13 @@ pub use diesel_connector::DieselConnector;
     feature = "executor-diesel-async-mysql"
 ))]
 pub use diesel_connector::{FloatRow, IntRow, TextRow};
-#[cfg(any(
-    feature = "executor-diesel-mysql",
-    feature = "executor-diesel-async-mysql"
-))]
+#[cfg(feature = "executor-diesel-async-mysql")]
 pub use mysql_diesel_connector::LogStatusRow;
 #[cfg(feature = "executor-diesel-mysql")]
 pub use mysql_diesel_connector::MysqlDieselConnector;
 #[cfg(feature = "executor-diesel-postgres")]
 pub use pg_diesel_connector::PgDieselConnector;
-#[cfg(any(
-    feature = "executor-diesel-postgres",
-    feature = "executor-diesel-async-postgres"
-))]
+#[cfg(feature = "executor-diesel-async-postgres")]
 pub use pg_diesel_connector::PgLsnRow;
 #[cfg(feature = "executor-diesel-postgres-r2d2")]
 pub use pg_r2d2_diesel_connector::{PgR2D2DieselConnector, PgR2D2Error};

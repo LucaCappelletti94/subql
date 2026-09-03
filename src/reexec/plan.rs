@@ -17,7 +17,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use sql_traits::prelude::DatabaseLike;
-use sqlparser::ast::{Ident, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{BinaryOperator, Expr, Ident, SelectItem, SetExpr, Statement};
 use sqlparser::dialect::Dialect;
 
 /// Column alias the re-execution query projects its scalar result under, so the
@@ -901,7 +901,7 @@ fn key_projection_positions<DB: DatabaseLike>(
         .collect()
 }
 
-/// Render the caller's own query restricted to the rows whose keys changed.
+/// The caller's own query, restricted to the rows whose keys changed.
 ///
 /// `SELECT ... FROM t WHERE (<the caller's filter>) AND (k1, k2) IN ((..), (..))`,
 /// built as AST and rendered by sqlparser so the quoting is the parser's own
@@ -909,92 +909,155 @@ fn key_projection_positions<DB: DatabaseLike>(
 /// because guessing one is how an injection or a silently wrong comparison gets
 /// in.
 ///
-/// Returns `None` when `keys` is empty: there is nothing to ask about.
-pub fn render_scoped_read<B: Backend>(
-    plan: &KeyedPlan,
-    keys: &[Vec<Value<B>>],
-) -> Result<Option<String>, RegisterError> {
-    use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr};
-    let key_names = &plan.key_idents;
+/// Owns one copy of the plan's statement, with the caller's filter already
+/// conjoined to an empty key list: a read spanning several key batches and
+/// pages replaces only that list instead of cloning the AST per statement.
+pub struct ScopedRead {
+    statement: Statement,
+    key_columns: usize,
+}
 
-    if keys.is_empty() {
-        return Ok(None);
+impl ScopedRead {
+    /// Take one copy of `plan`'s statement and install the empty key list.
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterError::UnsupportedSql`] when the plan's statement is not a
+    /// plain `SELECT`, which is the only shape a key restriction can narrow.
+    pub fn new(plan: &KeyedPlan) -> Result<Self, RegisterError> {
+        let mut statement = plan.statement.clone();
+        let select = select_mut(&mut statement)?;
+        let caller_filter = select.selection.take();
+        // The caller's filter is kept whole and parenthesised: `AND`-ing into
+        // an `OR` without brackets would widen the answer rather than narrow
+        // it.
+        select.selection = Some(caller_filter.map_or_else(
+            || key_predicate(plan),
+            |existing| Expr::BinaryOp {
+                left: alloc::boxed::Box::new(Expr::Nested(alloc::boxed::Box::new(existing))),
+                op: BinaryOperator::And,
+                right: alloc::boxed::Box::new(key_predicate(plan)),
+            },
+        ));
+        Ok(Self {
+            statement,
+            key_columns: plan.key_idents.len(),
+        })
     }
 
-    let mut statement = plan.statement.clone();
-    let Statement::Query(query) = &mut statement else {
+    /// The statement asking which of `keys` are in the answer.
+    ///
+    /// Returns `None` when `keys` is empty: there is nothing to ask about.
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterError::UnsupportedSql`] when a changed row carries a key of
+    /// the wrong width, and whatever [`parser::value_to_sql_value`] refuses for
+    /// a value with no literal spelling.
+    pub fn render<B: Backend>(
+        &mut self,
+        keys: &[Vec<Value<B>>],
+    ) -> Result<Option<String>, RegisterError> {
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let keys = self.key_list_for(keys)?;
+        *self.key_list() = keys;
+        Ok(Some(alloc::format!("{}", self.statement)))
+    }
+
+    fn key_list_for<B: Backend>(&self, keys: &[Vec<Value<B>>]) -> Result<Vec<Expr>, RegisterError> {
+        let mut list = Vec::with_capacity(keys.len());
+        for key in keys {
+            if key.len() != self.key_columns {
+                return Err(RegisterError::UnsupportedSql(alloc::format!(
+                    "a changed row carried {} key value(s) for a {}-column key",
+                    key.len(),
+                    self.key_columns
+                )));
+            }
+            let mut parts = Vec::with_capacity(key.len());
+            for value in key {
+                parts.push(Expr::Value(
+                    crate::compiler::parser::value_to_sql_value(value)?.into(),
+                ));
+            }
+            // A single key column compares directly; several compare as a
+            // tuple, which is what a compound key needs.
+            list.push(match <[Expr; 1]>::try_from(parts) {
+                Ok([only]) => only,
+                Err(parts) => Expr::Tuple(parts),
+            });
+        }
+        Ok(list)
+    }
+
+    /// The key list the rendered predicate compares against, so a re-render
+    /// replaces the keys rather than conjoining another predicate.
+    ///
+    /// The slot is found by shape: the only `AND` this renderer writes is the
+    /// one over the caller's own filter, whose right arm is the key predicate,
+    /// and a filterless query carries the key predicate as its whole `WHERE`.
+    fn key_list(&mut self) -> &mut Vec<Expr> {
+        let select = select_mut(&mut self.statement)
+            .expect("the statement was accepted as a plain SELECT when the renderer was built");
+        let selection = select
+            .selection
+            .as_mut()
+            .expect("the renderer installs the key predicate when it is built");
+        let predicate = match selection {
+            Expr::BinaryOp { right, .. } => &mut **right,
+            whole => whole,
+        };
+        match predicate {
+            Expr::InList { list, .. } => Some(list),
+            _ => None,
+        }
+        .expect("the renderer installs an IN-list key predicate when it is built")
+    }
+}
+
+/// The `SELECT` a key restriction narrows, for a statement a keyed plan holds.
+fn select_mut(statement: &mut Statement) -> Result<&mut sqlparser::ast::Select, RegisterError> {
+    let Statement::Query(query) = statement else {
         return Err(RegisterError::UnsupportedSql(
             "a keyed read needs a SELECT to restrict".to_string(),
         ));
     };
-    let Query { body, .. } = &mut **query;
-    let SetExpr::Select(select) = &mut **body else {
+    let SetExpr::Select(select) = &mut *query.body else {
         return Err(RegisterError::UnsupportedSql(
             "a keyed read needs a plain SELECT to restrict".to_string(),
         ));
     };
+    Ok(select)
+}
 
-    // One key column reads as `k IN (a, b)`; several as a row comparison, which
-    // is what a composite key needs and what sqlparser spells as a tuple. The
-    // identifiers come from the plan already quoted the way the dialect wants,
-    // because an unquoted name is not always the same column.
-    let key_expr = if key_names.len() == 1 {
-        Expr::Identifier(key_names[0].clone())
+/// The key comparison with no keys in it yet: `k IN ()`, or a tuple comparison
+/// for a compound key. The identifiers come from the plan already quoted the
+/// way the dialect wants, because an unquoted name is not always the same
+/// column.
+fn key_predicate(plan: &KeyedPlan) -> Expr {
+    let key_expr = if plan.key_idents.len() == 1 {
+        Expr::Identifier(plan.key_idents[0].clone())
     } else {
         Expr::Tuple(
-            key_names
+            plan.key_idents
                 .iter()
                 .map(|ident| Expr::Identifier(ident.clone()))
                 .collect(),
         )
     };
-
-    let mut list = Vec::with_capacity(keys.len());
-    for key in keys {
-        if key.len() != key_names.len() {
-            return Err(RegisterError::UnsupportedSql(alloc::format!(
-                "a changed row carried {} key value(s) for a {}-column key",
-                key.len(),
-                key_names.len()
-            )));
-        }
-        let mut parts = Vec::with_capacity(key.len());
-        for value in key {
-            parts.push(Expr::Value(
-                crate::compiler::parser::value_to_sql_value(value)?.into(),
-            ));
-        }
-        // A single key column compares directly; several compare as a tuple,
-        // which is what a compound key needs.
-        list.push(match <[Expr; 1]>::try_from(parts) {
-            Ok([only]) => only,
-            Err(parts) => Expr::Tuple(parts),
-        });
-    }
-
-    let scoped = Expr::InList {
+    Expr::InList {
         expr: alloc::boxed::Box::new(key_expr),
-        list,
+        list: Vec::new(),
         negated: false,
-    };
-    // The caller's filter is kept whole and parenthesised: `AND`-ing into an
-    // `OR` without brackets would widen the answer rather than narrow it.
-    select.selection = Some(match select.selection.take() {
-        Some(existing) => Expr::BinaryOp {
-            left: alloc::boxed::Box::new(Expr::Nested(alloc::boxed::Box::new(existing))),
-            op: BinaryOperator::And,
-            right: alloc::boxed::Box::new(scoped),
-        },
-        None => scoped,
-    });
-
-    Ok(Some(alloc::format!("{statement}")))
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod scoped_read_tests {
-    use super::{render_scoped_read, KeyedPlan};
+    use super::{KeyedPlan, ScopedRead};
     use crate::backend::{Postgres, Value};
 
     /// A plan over `sql` whose key columns are `columns`, rendered unquoted.
@@ -1016,16 +1079,23 @@ mod scoped_read_tests {
         }
     }
 
+    /// One render of `plan` over `keys`.
+    fn render(plan: &KeyedPlan, keys: &[alloc::vec::Vec<Value<Postgres>>]) -> Option<String> {
+        ScopedRead::new(plan)
+            .unwrap()
+            .render::<Postgres>(keys)
+            .unwrap()
+    }
+
     /// The caller's filter survives whole and the key restriction is added, so
     /// the read answers "which of these rows belong" rather than a new question.
     #[test]
     fn a_scoped_read_keeps_the_callers_filter_and_adds_the_keys() {
         let plan = plan_keyed("SELECT * FROM t WHERE lower(name) = 'x'", &["id"]);
-        let sql = render_scoped_read::<Postgres>(
+        let sql = render(
             &plan,
             &alloc::vec![alloc::vec![Value::Int(7)], alloc::vec![Value::Int(9)]],
         )
-        .unwrap()
         .unwrap();
         assert!(sql.contains("lower(name) = 'x'"), "filter kept: {sql}");
         assert!(sql.contains("id IN (7, 9)"), "keys added: {sql}");
@@ -1038,9 +1108,7 @@ mod scoped_read_tests {
     #[test]
     fn an_or_filter_is_bracketed_so_the_keys_narrow_rather_than_widen() {
         let plan = plan_keyed("SELECT * FROM t WHERE a = 1 OR b = 2", &["id"]);
-        let sql = render_scoped_read::<Postgres>(&plan, &alloc::vec![alloc::vec![Value::Int(1)]])
-            .unwrap()
-            .unwrap();
+        let sql = render(&plan, &alloc::vec![alloc::vec![Value::Int(1)]]).unwrap();
         assert!(
             sql.contains("(a = 1 OR b = 2) AND id IN (1)"),
             "the filter must be bracketed: {sql}"
@@ -1051,9 +1119,7 @@ mod scoped_read_tests {
     #[test]
     fn a_query_with_no_filter_is_restricted_by_the_keys_alone() {
         let plan = plan_keyed("SELECT * FROM t", &["id"]);
-        let sql = render_scoped_read::<Postgres>(&plan, &alloc::vec![alloc::vec![Value::Int(3)]])
-            .unwrap()
-            .unwrap();
+        let sql = render(&plan, &alloc::vec![alloc::vec![Value::Int(3)]]).unwrap();
         assert!(sql.ends_with("WHERE id IN (3)"), "{sql}");
     }
 
@@ -1062,14 +1128,13 @@ mod scoped_read_tests {
     #[test]
     fn a_composite_key_reads_as_a_tuple() {
         let plan = plan_keyed("SELECT * FROM t", &["country", "code"]);
-        let sql = render_scoped_read::<Postgres>(
+        let sql = render(
             &plan,
             &alloc::vec![
                 alloc::vec![Value::String("it".into()), Value::Int(1)],
                 alloc::vec![Value::String("fr".into()), Value::Int(2)],
             ],
         )
-        .unwrap()
         .unwrap();
         assert!(
             sql.contains("(country, code) IN (('it', 1), ('fr', 2))"),
@@ -1083,13 +1148,12 @@ mod scoped_read_tests {
     #[test]
     fn a_key_containing_a_quote_is_escaped_by_the_parser() {
         let plan = plan_keyed("SELECT * FROM t", &["name"]);
-        let sql = render_scoped_read::<Postgres>(
+        let sql = render(
             &plan,
             &alloc::vec![alloc::vec![Value::String(
                 "o'brien'; DROP TABLE t --".into()
             )]],
         )
-        .unwrap()
         .unwrap();
         assert!(
             sql.contains("'o''brien''; DROP TABLE t --'"),
@@ -1109,9 +1173,7 @@ mod scoped_read_tests {
     #[test]
     fn no_keys_renders_no_read() {
         let plan = plan_keyed("SELECT * FROM t", &["id"]);
-        assert!(render_scoped_read::<Postgres>(&plan, &[])
-            .unwrap()
-            .is_none());
+        assert!(render(&plan, &[]).is_none());
     }
 
     /// A key value with no SQL literal spelling refuses rather than guessing
@@ -1119,10 +1181,10 @@ mod scoped_read_tests {
     #[test]
     fn a_key_with_no_literal_spelling_is_refused() {
         let plan = plan_keyed("SELECT * FROM t", &["id"]);
-        assert!(
-            render_scoped_read::<Postgres>(&plan, &alloc::vec![alloc::vec![Value::Missing]],)
-                .is_err()
-        );
+        assert!(ScopedRead::new(&plan)
+            .unwrap()
+            .render::<Postgres>(&alloc::vec![alloc::vec![Value::Missing]])
+            .is_err());
     }
 
     /// A row whose key arity disagrees with the table's is refused, because
@@ -1130,9 +1192,29 @@ mod scoped_read_tests {
     #[test]
     fn a_key_of_the_wrong_arity_is_refused() {
         let plan = plan_keyed("SELECT * FROM t", &["country", "code"]);
-        assert!(
-            render_scoped_read::<Postgres>(&plan, &alloc::vec![alloc::vec![Value::Int(1)]],)
-                .is_err()
-        );
+        assert!(ScopedRead::new(&plan)
+            .unwrap()
+            .render::<Postgres>(&alloc::vec![alloc::vec![Value::Int(1)]])
+            .is_err());
+    }
+
+    /// One renderer serves a whole read, so a second batch replaces the keys
+    /// of the first rather than conjoining another restriction.
+    #[test]
+    fn a_second_batch_replaces_the_keys_of_the_first() {
+        let plan = plan_keyed("SELECT * FROM t WHERE a = 1", &["id"]);
+        let mut scoped = ScopedRead::new(&plan).unwrap();
+
+        let first = scoped
+            .render::<Postgres>(&alloc::vec![alloc::vec![Value::Int(7)]])
+            .unwrap()
+            .unwrap();
+        let second = scoped
+            .render::<Postgres>(&alloc::vec![alloc::vec![Value::Int(9)]])
+            .unwrap()
+            .unwrap();
+
+        assert!(first.ends_with("WHERE (a = 1) AND id IN (7)"), "{first}");
+        assert_eq!(second, first.replace("IN (7)", "IN (9)"));
     }
 }
