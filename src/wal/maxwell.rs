@@ -117,23 +117,28 @@ impl CdcEvent for Message {
     fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
         // The primary key is the row identity subql matches follows and PK
         // projections against, so it comes from the catalog.
-        table_of(self, db)
-            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id).ok())
-            .unwrap_or_default()
+        self.pk_columns_resolved(db, self.table_id(db))
+    }
+
+    fn pk_columns_resolved<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
+        catalog_helpers::primary_key_columns(db, table_id).unwrap_or_default()
     }
 
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        self.changed_columns_resolved(db, self.table_id(db))
+    }
+
+    fn changed_columns_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+    ) -> Vec<ColumnId> {
         let Self::Update(payload) = self else {
             return Vec::new();
         };
         let Some(old) = payload.old.as_ref() else {
             return Vec::new();
         };
-        let Some(table_id) = table_of(self, db) else {
-            return Vec::new();
-        };
-        // Maxwell's `old` carries exactly the columns whose value changed, so
-        // it is an authoritative changed-column set.
         old.keys()
             .filter_map(|name| catalog_helpers::column_id(db, table_id, name))
             .collect()
@@ -145,9 +150,16 @@ impl CdcEvent for Message {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<MySql>, crate::ValueError> {
-        let Some(table_id) = table_of(self, db) else {
-            return Ok(Value::Missing);
-        };
+        self.value_at_resolved(db, self.table_id(db), row, col)
+    }
+
+    fn value_at_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<MySql>, crate::ValueError> {
         if row == RowKind::Pk
             && !catalog_helpers::primary_key_columns(db, table_id)
                 .unwrap_or_default()
@@ -170,6 +182,23 @@ impl CdcEvent for Message {
                         json_value_to_mysql_value_by_kind(value, builtin)
                     })
                 }),
+        }
+    }
+
+    fn value_at_known_pk_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        col: ColumnId,
+    ) -> Result<Value<MySql>, crate::ValueError> {
+        match self.kind() {
+            EventKind::Insert => self.value_at_resolved(db, table_id, RowKind::New, col),
+            EventKind::Delete => self.value_at_resolved(db, table_id, RowKind::Old, col),
+            EventKind::Update => match self.value_at_resolved(db, table_id, RowKind::Old, col)? {
+                Value::Missing => self.value_at_resolved(db, table_id, RowKind::New, col),
+                value => Ok(value),
+            },
+            EventKind::Truncate => Ok(Value::Missing),
         }
     }
 }
@@ -219,14 +248,35 @@ mod tests {
     fn update_old_field_is_authoritative_changed_columns() {
         let db = orders();
         let ev = one(br#"{"database":"test","table":"orders","type":"update",
-                 "data":{"id":7,"amount":250,"status":"paid"},
-                 "old":{"amount":100,"status":"pending"}}"#);
+                 "data":{"id":8,"amount":250,"status":"paid"},
+                 "old":{"id":7,"amount":100,"status":"pending"}}"#);
         assert_eq!(ev.kind(), EventKind::Update);
         let mut changed = ev.changed_columns(&db);
         changed.sort_unstable();
-        assert_eq!(changed, alloc::vec![1u16, 2u16]);
+        assert_eq!(changed, alloc::vec![0u16, 1u16, 2u16]);
         assert_eq!(ev.value_at(&db, RowKind::New, 1).unwrap(), Value::Int(250));
         assert_eq!(ev.value_at(&db, RowKind::Old, 1).unwrap(), Value::Int(100));
+        let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+        assert_eq!(
+            resolved.value_at_known_pk(&db, 0).expect("old primary key"),
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn update_known_pk_falls_back_to_the_new_image() {
+        let db = orders();
+        let ev = one(br#"{"database":"test","table":"orders","type":"update",
+                 "data":{"id":7,"amount":250,"status":"paid"},
+                 "old":{"amount":100}}"#);
+        let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+
+        assert_eq!(
+            resolved
+                .value_at_known_pk(&db, 0)
+                .expect("unchanged primary key"),
+            Value::Int(7)
+        );
     }
 
     #[test]

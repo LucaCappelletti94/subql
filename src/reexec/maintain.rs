@@ -607,8 +607,10 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                 .groups
                 .get(&key)
                 .map_or(values, |group| group.values.clone());
-            self.pending_reads.insert(key.clone(), values.clone());
+            // Rendered before the read is recorded, so `values` moves into the
+            // map rather than being copied for both.
             let query = crate::reexec::plan::render_grouped_scalar_read(&self.plan, &values)?;
+            self.pending_reads.insert(key.clone(), values);
             output.reads.push(GroupedRead {
                 group: key,
                 query,
@@ -1091,20 +1093,20 @@ impl<B: Backend> MaintainedQuery<B> for KeyedQuery<B> {
         // The primary-key projection is always populated for a row-level event,
         // which is what lets this tier ask about the changed row by name
         // whatever the change was, including a delete whose row is gone.
-        let mut key = Vec::new();
-        for column in event.pk_columns(database) {
-            match event.value_at(database, crate::backend::RowKind::Pk, column) {
-                Ok(value) if !value.is_missing() => key.push(value),
-                _ => {
-                    self.keyless_change = Some(event.table_id(database));
-                    return Maintenance::NeedsReexecution;
+        let key = event.with_pk_columns(database, |columns| {
+            let mut key = Vec::with_capacity(columns.len());
+            for &column in columns {
+                match event.value_at_known_pk(database, column) {
+                    Ok(value) if !value.is_missing() => key.push(value),
+                    _ => return None,
                 }
             }
-        }
-        if key.is_empty() {
+            (!key.is_empty()).then_some(key)
+        });
+        let Some(key) = key else {
             self.keyless_change = Some(event.table_id(database));
             return Maintenance::NeedsReexecution;
-        }
+        };
         self.record(key);
         Maintenance::NeedsReexecution
     }

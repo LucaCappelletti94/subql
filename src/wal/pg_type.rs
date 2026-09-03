@@ -101,10 +101,11 @@ pub(super) fn json_value_to_pg_value_by_kind(
 /// Decode a JSON wire value into a typed [`Value<MySql>`] routed by the
 /// column's catalog [`BuiltinKind`] (the schema-driven path for Maxwell).
 ///
-/// Mirrors [`json_value_to_pg_value_by_kind`]. The two differ only on
-/// [`BuiltinKind::Uuid`]: MySQL has no native UUID type and stores it as
-/// text, so the wire string is taken verbatim rather than parsed into a
-/// [`uuid::Uuid`].
+/// Mirrors [`json_value_to_pg_value_by_kind`] except on two kinds:
+/// [`BuiltinKind::Uuid`], which MySQL stores as text so the wire string is
+/// taken verbatim rather than parsed into a [`uuid::Uuid`], and
+/// [`BuiltinKind::Bytes`], which accepts only the `\x`-prefixed hex form while
+/// the Postgres path also accepts bare hex.
 pub(super) fn json_value_to_mysql_value_by_kind(
     value: &serde_json::Value,
     kind: BuiltinKind,
@@ -134,8 +135,8 @@ pub(super) fn json_value_to_mysql_value_by_kind(
 }
 
 // Backend-agnostic pure JSON scalar parsers shared by the two by-kind
-// decoders above. Only the `Value<B>` wrapping and the Uuid arm differ
-// between backends, so the parsing itself lives here once.
+// decoders above. The `Value<B>` wrapping, the Uuid arm and the Bytes arm are
+// what differ between backends, so the parsing itself lives here once.
 
 #[allow(
     clippy::cast_precision_loss,

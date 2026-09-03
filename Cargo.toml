@@ -72,6 +72,10 @@ name = "dispatch"
 harness = false
 
 [[bench]]
+name = "lookups"
+harness = false
+
+[[bench]]
 name = "memory"
 harness = false
 required-features = ["dhat-heap"]

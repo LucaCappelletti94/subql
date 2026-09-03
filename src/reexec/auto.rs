@@ -1298,26 +1298,27 @@ where
         let Some(plan) = self.inner.keyed_plan(subscription_id) else {
             return Ok(Vec::new());
         };
-        let key_positions = plan.key_positions.clone();
-        let plan_ref = plan.clone();
-
+        let mut columns = Vec::new();
+        let mut present: Vec<(Vec<Value<E::Backend>>, Vec<Value<E::Backend>>)> = Vec::new();
         // Asked in bounded batches. Statement duration tracks how many keys a
         // statement names, and a caller's statement timeout applies per
         // statement, so one unbounded request disables the only read ceiling
         // the caller has. Each key appears in exactly one batch, so no key is
-        // asked about twice however many rows come back.
+        // asked about twice however many rows come back. One renderer serves
+        // every batch and page, so the plan's statement is copied once.
         //
         // The keys are a snapshot, removed only after every batch delivered.
         // A failure therefore loses nothing: the whole set stays recorded,
         // and the retry asks again, which is the cost of an all-or-nothing
         // result.
-        let mut columns = Vec::new();
-        let mut present: Vec<(Vec<Value<E::Backend>>, Vec<Value<E::Backend>>)> = Vec::new();
+        let mut scoped = crate::reexec::plan::ScopedRead::new(plan).map_err(|e| {
+            ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!("{e}")))
+        })?;
         for batch in KeyBatches::new(&keys, self.max_keys_per_read) {
             self.read_one_batch(
                 subscription_id,
-                &plan_ref,
-                &key_positions,
+                &mut scoped,
+                &plan.key_positions,
                 batch,
                 &mut columns,
                 &mut present,
@@ -1344,7 +1345,7 @@ where
     fn read_one_batch(
         &self,
         subscription_id: SubscriptionId,
-        plan: &crate::reexec::plan::KeyedPlan,
+        scoped: &mut crate::reexec::plan::ScopedRead,
         key_positions: &[usize],
         batch: &[Vec<Value<E::Backend>>],
         columns: &mut Vec<String>,
@@ -1354,12 +1355,13 @@ where
             .contexts
             .get(&subscription_id)
             .expect("a captured query stores its context at register time");
-        let render = |keys: &[Vec<Value<E::Backend>>]| {
-            crate::reexec::plan::render_scoped_read::<E::Backend>(plan, keys).map_err(|e| {
+        let render = |scoped: &mut crate::reexec::plan::ScopedRead,
+                      keys: &[Vec<Value<E::Backend>>]| {
+            scoped.render::<E::Backend>(keys).map_err(|e| {
                 ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!("{e}")))
             })
         };
-        let Some(mut page_sql) = render(batch)? else {
+        let Some(mut page_sql) = render(scoped, batch)? else {
             return Ok(());
         };
         // Accumulated across pages, not per page. Resetting it would let a key
@@ -1410,7 +1412,7 @@ where
             if remaining.is_empty() {
                 return Ok(());
             }
-            match render(&remaining)? {
+            match render(scoped, &remaining)? {
                 Some(next) => page_sql = next,
                 None => return Ok(()),
             }

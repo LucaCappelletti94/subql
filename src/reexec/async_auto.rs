@@ -125,8 +125,7 @@ enum ResolveJob<B: Backend> {
 
 /// The keyed tier's read, as planned.
 struct KeyedJob<B: Backend> {
-    plan: super::plan::KeyedPlan,
-    key_positions: Vec<usize>,
+    plan: Arc<super::plan::KeyedPlan>,
     keys: Vec<Vec<Value<B>>>,
     query: super::BoundQuery<B>,
     /// Keys one statement may name, carried so the read needs nothing from the
@@ -733,13 +732,10 @@ where
         if keys.is_empty() {
             return None;
         }
-        let plan = self.inner.keyed_plan(subscription_id)?;
-        let plan = plan.clone();
-        let key_positions = plan.key_positions.clone();
+        let plan = Arc::clone(self.inner.keyed_plan(subscription_id)?);
         let query = ctx.query.clone();
         Some(ResolveJob::Keyed(alloc::boxed::Box::new(KeyedJob {
             plan,
-            key_positions,
             keys,
             query,
             max_keys: self.max_keys_per_read,
@@ -798,11 +794,13 @@ where
             ResolveJob::Keyed(job) => {
                 let KeyedJob {
                     plan,
-                    key_positions,
                     keys,
                     query,
                     max_keys,
                 } = *job;
+                let mut scoped = super::plan::ScopedRead::new(&plan).map_err(|e| {
+                    ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!("{e}")))
+                })?;
                 let mut columns = Vec::new();
                 let mut present: KeyedRows<E::Backend> = Vec::new();
                 // Bounded batches, same reason as the sync engine: statement
@@ -810,12 +808,9 @@ where
                 // caller's statement timeout applies per statement, so one
                 // unbounded request disables the only read ceiling it has.
                 for batch in super::auto::KeyBatches::new(&keys, max_keys) {
-                    let Some(sql) = super::plan::render_scoped_read::<E::Backend>(&plan, batch)
-                        .map_err(|e| {
-                            ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!(
-                                "{e}"
-                            )))
-                        })?
+                    let Some(sql) = scoped.render::<E::Backend>(batch).map_err(|e| {
+                        ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!("{e}")))
+                    })?
                     else {
                         continue;
                     };
@@ -843,7 +838,8 @@ where
                         }
                         let before = seen_in_batch.recorded();
                         for row in page.value.rows {
-                            let key: Vec<Value<E::Backend>> = key_positions
+                            let key: Vec<Value<E::Backend>> = plan
+                                .key_positions
                                 .iter()
                                 .filter_map(|i| row.get(*i).cloned())
                                 .collect();
@@ -870,13 +866,11 @@ where
                         if remaining.is_empty() {
                             break;
                         }
-                        let Some(next) =
-                            super::plan::render_scoped_read::<E::Backend>(&plan, &remaining)
-                                .map_err(|e| {
-                                    ReExecError::Dispatch(crate::DispatchError::VmError(
-                                        alloc::format!("{e}"),
-                                    ))
-                                })?
+                        let Some(next) = scoped.render::<E::Backend>(&remaining).map_err(|e| {
+                            ReExecError::Dispatch(crate::DispatchError::VmError(alloc::format!(
+                                "{e}"
+                            )))
+                        })?
                         else {
                             break;
                         };

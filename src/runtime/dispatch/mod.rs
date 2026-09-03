@@ -202,6 +202,9 @@ where
 
     let mut truths = alloc::vec![Tri::Unknown; facts.len()];
     let mut matched = RoaringBitmap::new();
+    // Reused across assignments: each one starts from the predicate's own
+    // subscribers, so the buffer is refilled rather than reallocated.
+    let mut described = RoaringBitmap::new();
     for assignment in 0..(1u32 << varying.len()) {
         for (bit, &slot) in varying.iter().enumerate() {
             truths[slot] = if assignment & (1 << bit) == 0 {
@@ -223,22 +226,24 @@ where
         // subscriber is in, out of every term it says they are not. Complemented
         // against the predicate's own subscribers, since a term set never reaches
         // outside them.
-        let mut described = bitmap.clone();
+        described.clone_from(bitmap);
         for (bit, &slot) in varying.iter().enumerate() {
             let TermFacts::Admits(admits) = facts[slot] else {
                 continue;
             };
-            let admits = admits.map_or_else(RoaringBitmap::new, Clone::clone);
-            if assignment & (1 << bit) == 0 {
-                described -= admits;
-            } else {
-                described &= admits;
+            match (assignment & (1 << bit) == 0, admits) {
+                // Out of a term is out of nothing when the term admits nobody,
+                // and in it describes nobody at all.
+                (true, Some(admits)) => described -= admits,
+                (true, None) => {}
+                (false, Some(admits)) => described &= admits,
+                (false, None) => described.clear(),
             }
             if described.is_empty() {
                 break;
             }
         }
-        matched |= described;
+        matched |= &described;
     }
 
     Ok(Matched::Narrowed(matched))
@@ -926,14 +931,12 @@ where
     let mut net: AggregateNet<E::Backend> = HashMap::new();
     let snapshot = partition.load_snapshot();
 
-    // For UPDATE, use dependency-aware candidate selection; for INSERT /
-    // DELETE pass empty changed_cols to get all agg candidates.
-    let changed_cols: Vec<crate::ColumnId> = if event.kind() == EventKind::Update {
-        event.changed_columns(db)
+    let kind = event.kind();
+    let candidates = if kind == EventKind::Update {
+        event.with_changed_columns(db, |changed| partition.select_agg_candidates(kind, changed))
     } else {
-        Vec::new()
+        partition.select_agg_candidates(kind, &[])
     };
-    let candidates = partition.select_agg_candidates(event.kind(), &changed_cols);
     let missing_old = subscriptions_missing_old(event, &candidates, &snapshot.predicates, db);
     let mut group_key_failed = HashSet::new();
 

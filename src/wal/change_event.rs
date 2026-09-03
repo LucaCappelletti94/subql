@@ -115,14 +115,10 @@ impl CdcEvent for ChangeEvent {
     }
 
     fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        let Some(table_id) = event_table_id(self, db) else {
-            return Vec::new();
-        };
-        // The primary key is the row identity subql matches follows and
-        // PK projections against. It is a catalog fact, so it comes from
-        // the catalog rather than the wire replica-identity key, which
-        // under REPLICA IDENTITY FULL spans every column. Column
-        // availability in the old image is handled by `value_at`.
+        self.pk_columns_resolved(db, self.table_id(db))
+    }
+
+    fn pk_columns_resolved<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         match &self.event_type {
             EventType::Insert { .. } | EventType::Update { .. } | EventType::Delete { .. } => {
                 catalog_helpers::primary_key_columns(db, table_id).unwrap_or_default()
@@ -132,6 +128,14 @@ impl CdcEvent for ChangeEvent {
     }
 
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        self.changed_columns_resolved(db, self.table_id(db))
+    }
+
+    fn changed_columns_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+    ) -> Vec<ColumnId> {
         let EventType::Update {
             old_data: Some(old),
             new_data,
@@ -140,15 +144,9 @@ impl CdcEvent for ChangeEvent {
         else {
             return Vec::new();
         };
-        let Some(table_id) = event_table_id(self, db) else {
-            return Vec::new();
-        };
         let Ok(arity) = catalog_helpers::table_arity(db, table_id) else {
             return Vec::new();
         };
-        // Derive only when both images cover every column (REPLICA
-        // IDENTITY FULL). A sparser old image leaves the result empty,
-        // which the engine treats as a conservative over-notification.
         if old.len() != arity || new_data.len() != arity {
             return Vec::new();
         }
@@ -163,10 +161,17 @@ impl CdcEvent for ChangeEvent {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Postgres>, crate::ValueError> {
-        let Some(table_id) = event_table_id(self, db) else {
-            return Ok(Value::Missing);
-        };
-        if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
+        self.value_at_resolved(db, self.table_id(db), row, col)
+    }
+
+    fn value_at_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
+        if row == RowKind::Pk && !self.pk_columns_resolved(db, table_id).contains(&col) {
             return Ok(Value::Missing);
         }
         let Some(image) = image_for(self, row) else {
@@ -208,6 +213,20 @@ impl CdcEvent for ChangeEvent {
                 )
             }
         }
+    }
+
+    fn value_at_known_pk_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
+        let row = match self.kind() {
+            EventKind::Insert => RowKind::New,
+            EventKind::Update | EventKind::Delete => RowKind::Old,
+            EventKind::Truncate => return Ok(Value::Missing),
+        };
+        self.value_at_resolved(db, table_id, row, col)
     }
 }
 
@@ -283,7 +302,7 @@ mod tests {
                     ("status", ColumnValue::text("pending")),
                 ])),
                 new_data: row(vec![
-                    ("id", ColumnValue::text("7")),
+                    ("id", ColumnValue::text("8")),
                     ("customer", ColumnValue::text("3")),
                     ("amount", ColumnValue::text("250")),
                     ("status", ColumnValue::text("paid")),
@@ -298,9 +317,14 @@ mod tests {
         assert_eq!(ev.pk_columns(&db), vec![0u16]);
         let mut changed = ev.changed_columns(&db);
         changed.sort_unstable();
-        assert_eq!(changed, vec![2u16, 3u16]);
+        assert_eq!(changed, vec![0u16, 2u16, 3u16]);
         assert_eq!(ev.value_at(&db, RowKind::Old, 2).unwrap(), Value::Int(100));
         assert_eq!(ev.value_at(&db, RowKind::New, 2).unwrap(), Value::Int(250));
+        let resolved = crate::backend::ResolvedEvent::new(&ev, &db);
+        assert_eq!(
+            resolved.value_at_known_pk(&db, 0).expect("old primary key"),
+            Value::Int(7)
+        );
     }
 
     #[test]

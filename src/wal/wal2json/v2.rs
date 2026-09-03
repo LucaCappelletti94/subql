@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use wal2json_events::{Action, Column, MessageV2, RowV2};
 
@@ -7,7 +8,7 @@ use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
 use crate::wal::{changed_columns_by_name, resolve_table};
 
-use super::decode_helpers::{column_value, decode_cell};
+use super::decode_helpers::{column_value, decode_cell, IndexedName};
 use super::parse_helpers::v2_row_kind;
 
 /// The row payload, for the row actions that carry one.
@@ -32,6 +33,16 @@ fn v2_image(msg: &MessageV2, row: RowKind) -> Option<&[Column]> {
         }
         _ => None,
     }
+}
+
+fn v2_index(columns: &[Column]) -> HashMap<IndexedName<'_>, &Column> {
+    let mut index = HashMap::with_capacity(columns.len());
+    for column in columns {
+        index
+            .entry(IndexedName::new(&column.name))
+            .or_insert(column);
+    }
+    index
 }
 
 fn v2_table_id<DB: DatabaseLike>(msg: &MessageV2, db: &DB) -> Option<TableId> {
@@ -64,15 +75,25 @@ impl CdcEvent for MessageV2 {
     }
 
     fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        self.pk_columns_resolved(db, self.table_id(db))
+    }
+
+    fn pk_columns_resolved<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         if self.action() == Action::Truncate {
             return Vec::new();
         }
-        v2_table_id(self, db)
-            .and_then(|table_id| catalog_helpers::primary_key_columns(db, table_id).ok())
-            .unwrap_or_default()
+        catalog_helpers::primary_key_columns(db, table_id).unwrap_or_default()
     }
 
     fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
+        self.changed_columns_resolved(db, self.table_id(db))
+    }
+
+    fn changed_columns_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+    ) -> Vec<ColumnId> {
         if self.action() != Action::Update {
             return Vec::new();
         }
@@ -84,19 +105,21 @@ impl CdcEvent for MessageV2 {
         else {
             return Vec::new();
         };
-        let Some(table_id) = v2_table_id(self, db) else {
-            return Vec::new();
-        };
         let Ok(arity) = catalog_helpers::table_arity(db, table_id) else {
             return Vec::new();
         };
-        // Derive only when both images cover every column (REPLICA IDENTITY
-        // FULL). A sparser identity leaves the result empty.
         if new_cols.len() != arity || old_cols.len() != arity {
             return Vec::new();
         }
+        let old = v2_index(old_cols);
+        let new = v2_index(new_cols);
         changed_columns_by_name(db, table_id, arity, |name| {
-            (column_value(old_cols, name), column_value(new_cols, name))
+            (
+                old.get(&IndexedName::new(name))
+                    .and_then(|column| column.value.as_ref()),
+                new.get(&IndexedName::new(name))
+                    .and_then(|column| column.value.as_ref()),
+            )
         })
     }
 
@@ -106,10 +129,20 @@ impl CdcEvent for MessageV2 {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Postgres>, crate::ValueError> {
-        let Some(table_id) = v2_table_id(self, db) else {
-            return Ok(Value::Missing);
-        };
-        if row == RowKind::Pk && !self.pk_columns(db).contains(&col) {
+        self.value_at_resolved(db, self.table_id(db), row, col)
+    }
+
+    fn value_at_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        row: RowKind,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
+        if row == RowKind::Pk
+            && !catalog_helpers::primary_key_columns(db, table_id)
+                .is_ok_and(|columns| columns.contains(&col))
+        {
             return Ok(Value::Missing);
         }
         let Some(columns) = v2_image(self, row) else {
@@ -119,5 +152,19 @@ impl CdcEvent for MessageV2 {
             return Ok(Value::Missing);
         };
         decode_cell(column_value(columns, &name), db, table_id, col)
+    }
+
+    fn value_at_known_pk_resolved<DB: DatabaseLike>(
+        &self,
+        db: &DB,
+        table_id: TableId,
+        col: ColumnId,
+    ) -> Result<Value<Postgres>, crate::ValueError> {
+        let row = match self.kind() {
+            EventKind::Insert => RowKind::New,
+            EventKind::Update | EventKind::Delete => RowKind::Old,
+            EventKind::Truncate => return Ok(Value::Missing),
+        };
+        self.value_at_resolved(db, table_id, row, col)
     }
 }

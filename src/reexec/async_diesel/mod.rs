@@ -27,6 +27,9 @@
 //! Backends are Postgres and MySQL only: `diesel-async` 0.7 has no real
 //! async SQLite backend.
 
+// The MySQL connector lives in this module; the Postgres one lives in its own
+// file and imports what it needs there.
+#[cfg(feature = "executor-diesel-async-mysql")]
 use super::async_connector::AsyncConnector;
 #[cfg(feature = "executor-diesel-async-mysql")]
 use super::connector::boxed_mysql_read_query_owned;
@@ -34,15 +37,18 @@ use super::connector::boxed_mysql_read_query_owned;
 use super::connector::boxed_postgres_read_query_owned;
 #[cfg(feature = "executor-diesel-async-mysql")]
 use super::connector::LogStatusRow;
-use super::connector::{
-    FloatRow, IntRow, ReadQuery, ScalarRowError, SessionSetup, Snapshot, TextRow,
-};
+use super::connector::{FloatRow, IntRow, ReadQuery, TextRow};
+#[cfg(feature = "executor-diesel-async-mysql")]
+use super::connector::{ScalarRowError, SessionSetup, Snapshot};
 use crate::backend::{Backend, BuiltinKind, ScalarKind, Value};
 use alloc::vec::Vec;
+#[cfg(feature = "executor-diesel-async-mysql")]
 use core::future::Future;
 use diesel::query_builder::SqlQuery;
 use diesel::sql_query;
+#[cfg(feature = "executor-diesel-async-mysql")]
 use diesel_async::pooled_connection::bb8::Pool;
+#[cfg(feature = "executor-diesel-async-mysql")]
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, RunQueryDsl as _};
 use thiserror::Error;

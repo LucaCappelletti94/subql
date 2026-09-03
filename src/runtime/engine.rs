@@ -334,7 +334,7 @@ where
     table_deps: HashMap<TableId, hashbrown::HashSet<SubscriptionId>>,
     /// Plans for keyed re-reads, kept so a read renders the scoped statement
     /// from the caller's own SQL rather than from a reconstruction.
-    keyed_plans: HashMap<SubscriptionId, crate::reexec::plan::KeyedPlan>,
+    keyed_plans: HashMap<SubscriptionId, alloc::sync::Arc<crate::reexec::plan::KeyedPlan>>,
     /// Session -> its re-read answers, for session-scoped cleanup.
     reexec_sessions: HashMap<I::SessionId, Vec<SubscriptionId>>,
 }
@@ -1826,7 +1826,8 @@ where
         );
         let tier_query = read_query.clone();
         let dependency_columns = plan.dependency_columns.clone();
-        self.keyed_plans.insert(subscription_id, plan);
+        self.keyed_plans
+            .insert(subscription_id, alloc::sync::Arc::new(plan));
         self.reexec.insert(
             subscription_id,
             crate::reexec::ReExecEntry {
@@ -1992,9 +1993,9 @@ where
         clippy::too_many_lines,
         reason = "one routing pass preserves event order across every read tier"
     )]
-    pub(crate) fn maintain(
+    pub(crate) fn maintain_resolved(
         &mut self,
-        event: &E,
+        event: &crate::backend::ResolvedEvent<'_, E>,
     ) -> Result<
         (
             Vec<crate::AggregateValueUpdate<I, E::Backend>>,
@@ -2006,7 +2007,7 @@ where
     > {
         use crate::reexec::maintain::{Maintenance, QueryRuntime};
 
-        let table_id = event.table_id(&self.database);
+        let table_id = event.table_id();
         let subscription_ids: Vec<SubscriptionId> = match self.table_deps.get(&table_id) {
             Some(ids) => ids.iter().copied().collect(),
             None => return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new())),
@@ -2139,11 +2140,10 @@ where
         event: &E,
     ) -> Result<crate::reexec::ReExecNotifications<I, E::Backend, E::Checkpoint>, DispatchError>
     {
-        let engine = match self.consumers(event) {
+        let event = crate::backend::ResolvedEvent::new(event, &self.database);
+        let engine = match self.consumers_resolved(&event) {
             Ok(notifications) => notifications,
-            Err(DispatchError::UnknownTableId(_))
-                if self.routes_reread(event.table_id(&self.database)) =>
-            {
+            Err(DispatchError::UnknownTableId(_)) if self.routes_reread(event.table_id()) => {
                 crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
             }
             Err(error) => return Err(error),
@@ -2154,9 +2154,9 @@ where
         // so a demotion it triggers is visible to the reexec registry `maintain`
         // then reads. `unseeded_aggregate_triggers` is deliberately left out:
         // the facade seeds an aggregate through `Install`, never auto-bootstraps.
-        let mut aggregate = self.aggregate_updates(event)?;
+        let mut aggregate = self.aggregate_updates_resolved(&event)?;
         let (grouped_updates, scalar_updates, mut triggers, mut transitions) =
-            self.maintain(event)?;
+            self.maintain_resolved(&event)?;
         aggregate.updates.extend(grouped_updates);
         triggers.extend(aggregate.triggers);
         triggers.sort_unstable_by(|left, right| {
@@ -2223,7 +2223,7 @@ where
     pub(crate) fn keyed_plan(
         &self,
         subscription_id: SubscriptionId,
-    ) -> Option<&crate::reexec::plan::KeyedPlan> {
+    ) -> Option<&alloc::sync::Arc<crate::reexec::plan::KeyedPlan>> {
         self.keyed_plans.get(&subscription_id)
     }
 
@@ -3530,7 +3530,15 @@ where
         &mut self,
         event: &E,
     ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError> {
-        let table_id = event.table_id(&self.database);
+        let event = crate::backend::ResolvedEvent::new(event, &self.database);
+        self.consumers_resolved(&event)
+    }
+
+    fn consumers_resolved(
+        &mut self,
+        event: &crate::backend::ResolvedEvent<'_, E>,
+    ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError> {
+        let table_id = event.table_id();
         let notifs = self.row_consumers(event, table_id)?;
         // After the row dispatch rather than before it. A table can be both the
         // one a subscription reads and the one carrying its memberships, and then
@@ -3545,7 +3553,7 @@ where
     /// The view-relative notifications for subscriptions reading `table_id`.
     fn row_consumers(
         &mut self,
-        event: &E,
+        event: &crate::backend::ResolvedEvent<'_, E>,
         table_id: TableId,
     ) -> Result<crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError> {
         // An event for a table that is in the catalog but has no
@@ -3602,7 +3610,7 @@ where
     /// subscriber. Neither is guessed from the filter text.
     fn move_watched_terms(
         &mut self,
-        event: &E,
+        event: &crate::backend::ResolvedEvent<'_, E>,
         table_id: TableId,
     ) -> Vec<crate::TermNarrowing<E::Backend>> {
         let Some(watches) = self.term_watch.get(&table_id) else {
@@ -3718,7 +3726,7 @@ where
     #[allow(clippy::type_complexity)]
     fn read_term_pair(
         &self,
-        event: &E,
+        event: &crate::backend::ResolvedEvent<'_, E>,
         watch: &TermWatch,
         row: RowKind,
     ) -> Option<(crate::term::TermRow<E::Backend>, TermKey<E::Backend>)> {
@@ -3886,21 +3894,20 @@ where
         &mut self,
         event: &E,
     ) -> Result<crate::DispatchOutput<I, E::Checkpoint, E::Backend>, DispatchError> {
-        let notifications = match self.consumers(event) {
+        let event = crate::backend::ResolvedEvent::new(event, &self.database);
+        let notifications = match self.consumers_resolved(&event) {
             Ok(notifications) => notifications,
-            Err(DispatchError::UnknownTableId(_))
-                if self.routes_reread(event.table_id(&self.database)) =>
-            {
+            Err(DispatchError::UnknownTableId(_)) if self.routes_reread(event.table_id()) => {
                 crate::ConsumerNotifications::empty().with_checkpoint(event.checkpoint())
             }
             Err(error) => return Err(error),
         };
-        let mut aggregate = self.aggregate_updates(event)?;
+        let mut aggregate = self.aggregate_updates_resolved(&event)?;
         let (grouped_updates, scalar_updates, mut triggers, mut transitions) =
-            self.maintain(event)?;
+            self.maintain_resolved(&event)?;
         aggregate.updates.extend(grouped_updates);
         triggers.extend(aggregate.triggers);
-        triggers.extend(self.unseeded_aggregate_triggers(event));
+        triggers.extend(self.unseeded_aggregate_triggers(&event));
         triggers.sort_unstable_by(|left, right| {
             (left.subscription_id, left.read.group_key())
                 .cmp(&(right.subscription_id, right.read.group_key()))
@@ -3917,13 +3924,8 @@ where
             triggers,
             transitions,
         );
-        // Any single-row (pk) follow whose row was just deleted
-        // self-closes. Its `WHERE pk = <value>` predicate can never
-        // match again, so leaving the subscription registered would
-        // leak memory and spuriously fire on future rows that reuse
-        // the same PK.
         if event.kind() == EventKind::Delete && !self.pk_follows.is_empty() {
-            self.close_deleted_pk_follows(event);
+            self.close_deleted_pk_follows(&event);
         }
         Ok(output)
     }
@@ -3941,15 +3943,15 @@ where
     /// best-effort per the `pk_follows` doc contract; loss of the
     /// auto-close marker degrades gracefully to an ordinary inert
     /// subscription rather than surfacing an error.
-    fn close_deleted_pk_follows(&mut self, event: &E) {
-        let table_id = event.table_id(&self.database);
-        let pk_cols: alloc::vec::Vec<crate::ColumnId> = event.pk_columns(&self.database);
+    fn close_deleted_pk_follows(&mut self, event: &crate::backend::ResolvedEvent<'_, E>) {
+        let table_id = event.table_id();
+        let pk_cols = event.pk_columns(&self.database);
 
         // Extract the event's PK cells once so we can compare each
         // follow against the same materialised Vec.
         let mut event_pk: alloc::vec::Vec<Value<E::Backend>> =
             alloc::vec::Vec::with_capacity(pk_cols.len());
-        for &col in &pk_cols {
+        for &col in pk_cols {
             let Some(v) = extract_pk_value(event, &self.database, col) else {
                 return;
             };
@@ -4876,16 +4878,14 @@ where
 
 // Test body deferred to Phase 10 per docs/refactor-cdc-event-handoff.md.
 
-/// Read one primary-key column off a [`CdcEvent`] via [`RowKind::Pk`].
-/// Returns `None` when the cell is [`Value::Missing`], [`Value::Null`], or
-/// carried a value subql could not decode, so callers upstream can bail
-/// out cleanly without materialising a partial key.
+/// Read one selected primary-key column, returning `None` when it is absent or
+/// undecodable.
 fn extract_pk_value<E: CdcEvent, DB: DatabaseLike>(
-    event: &E,
+    event: &crate::backend::ResolvedEvent<'_, E>,
     db: &DB,
     col: crate::ColumnId,
 ) -> Option<Value<E::Backend>> {
-    match event.value_at(db, RowKind::Pk, col) {
+    match event.value_at_known_pk(db, col) {
         Ok(Value::Missing | Value::Null) | Err(_) => None,
         Ok(v) => Some(v),
     }
@@ -4903,6 +4903,200 @@ mod tests {
     const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT, status TEXT);";
 
     type Engine = SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>;
+
+    struct CountingEvent {
+        inner: TestEvent<Postgres>,
+        table_id_calls: core::cell::Cell<usize>,
+        pk_columns_calls: core::cell::Cell<usize>,
+        resolved_pk_columns_calls: core::cell::Cell<usize>,
+        changed_columns_calls: core::cell::Cell<usize>,
+        resolved_changed_columns_calls: core::cell::Cell<usize>,
+        value_at_calls: core::cell::Cell<usize>,
+        resolved_value_at_calls: core::cell::Cell<usize>,
+    }
+
+    impl CdcEvent for CountingEvent {
+        type Backend = Postgres;
+        type Checkpoint = crate::NoCheckpoint;
+
+        fn kind(&self) -> EventKind {
+            self.inner.kind()
+        }
+
+        fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+            self.table_id_calls.set(self.table_id_calls.get() + 1);
+            self.inner.table_id(db)
+        }
+
+        fn checkpoint(&self) -> Option<Self::Checkpoint> {
+            self.inner.checkpoint()
+        }
+
+        fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<crate::ColumnId> {
+            self.pk_columns_calls.set(self.pk_columns_calls.get() + 1);
+            self.inner.pk_columns(db)
+        }
+
+        fn pk_columns_resolved<DB: DatabaseLike>(
+            &self,
+            db: &DB,
+            _table_id: TableId,
+        ) -> Vec<crate::ColumnId> {
+            self.resolved_pk_columns_calls
+                .set(self.resolved_pk_columns_calls.get() + 1);
+            self.inner.pk_columns(db)
+        }
+
+        fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<crate::ColumnId> {
+            self.changed_columns_calls
+                .set(self.changed_columns_calls.get() + 1);
+            self.inner.changed_columns(db)
+        }
+
+        fn changed_columns_resolved<DB: DatabaseLike>(
+            &self,
+            db: &DB,
+            _table_id: TableId,
+        ) -> Vec<crate::ColumnId> {
+            self.resolved_changed_columns_calls
+                .set(self.resolved_changed_columns_calls.get() + 1);
+            self.inner.changed_columns(db)
+        }
+
+        fn value_at<DB: DatabaseLike>(
+            &self,
+            db: &DB,
+            row: RowKind,
+            col: crate::ColumnId,
+        ) -> Result<Value<Self::Backend>, crate::ValueError> {
+            self.value_at_calls.set(self.value_at_calls.get() + 1);
+            self.inner.value_at(db, row, col)
+        }
+
+        fn value_at_resolved<DB: DatabaseLike>(
+            &self,
+            db: &DB,
+            table_id: TableId,
+            row: RowKind,
+            col: crate::ColumnId,
+        ) -> Result<Value<Self::Backend>, crate::ValueError> {
+            if row == RowKind::Pk {
+                let _ = self.pk_columns_resolved(db, table_id);
+            }
+            self.resolved_value_at_calls
+                .set(self.resolved_value_at_calls.get() + 1);
+            self.inner.value_at(db, row, col)
+        }
+
+        fn value_at_known_pk_resolved<DB: DatabaseLike>(
+            &self,
+            db: &DB,
+            _table_id: TableId,
+            col: crate::ColumnId,
+        ) -> Result<Value<Self::Backend>, crate::ValueError> {
+            self.resolved_value_at_calls
+                .set(self.resolved_value_at_calls.get() + 1);
+            self.inner.value_at(db, RowKind::Pk, col)
+        }
+    }
+
+    #[test]
+    fn dispatch_resolves_the_event_table_once() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        let table_id = catalog_helpers::table_id(&db, "orders").expect("orders exists");
+        let mut engine: SubscriptionEngine<CountingEvent, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(db, PostgreSqlDialect {});
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE amount > 100",
+            ))
+            .expect("the subscription registers");
+        engine
+            .register(SubscriptionRequest::new(
+                2,
+                "SELECT * FROM orders WHERE lower(status) = 'paid'",
+            ))
+            .expect("the first keyed read registers");
+        engine
+            .register(SubscriptionRequest::new(
+                3,
+                "SELECT * FROM orders WHERE lower(status) = 'pending'",
+            ))
+            .expect("the second keyed read registers");
+        let event = CountingEvent {
+            inner: TestEvent::update(
+                table_id,
+                vec![
+                    Value::Int(1),
+                    Value::Int(100),
+                    Value::String("pending".into()),
+                ],
+                vec![Value::Int(1), Value::Int(250), Value::String("paid".into())],
+            )
+            .with_changed_columns([1u16, 2u16]),
+            table_id_calls: core::cell::Cell::new(0),
+            pk_columns_calls: core::cell::Cell::new(0),
+            resolved_pk_columns_calls: core::cell::Cell::new(0),
+            changed_columns_calls: core::cell::Cell::new(0),
+            resolved_changed_columns_calls: core::cell::Cell::new(0),
+            value_at_calls: core::cell::Cell::new(0),
+            resolved_value_at_calls: core::cell::Cell::new(0),
+        };
+
+        engine.dispatch(&event).expect("the event dispatches");
+
+        assert_eq!(event.table_id_calls.get(), 1);
+        assert_eq!(event.changed_columns_calls.get(), 0);
+        assert_eq!(event.resolved_changed_columns_calls.get(), 1);
+        assert_eq!(event.value_at_calls.get(), 0);
+        assert!(event.resolved_value_at_calls.get() > 0);
+    }
+
+    #[test]
+    fn dispatch_reads_primary_keys_through_the_resolved_event() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");
+        let table_id = catalog_helpers::table_id(&db, "orders").expect("orders exists");
+        let mut engine: SubscriptionEngine<CountingEvent, DefaultIds, ParserDB> =
+            SubscriptionEngine::new(db, PostgreSqlDialect {});
+        engine
+            .register(SubscriptionRequest::new(
+                1,
+                "SELECT * FROM orders WHERE lower(status) = 'paid'",
+            ))
+            .expect("the first keyed read registers");
+        engine
+            .register(SubscriptionRequest::new(
+                2,
+                "SELECT * FROM orders WHERE lower(status) = 'pending'",
+            ))
+            .expect("the second keyed read registers");
+        engine
+            .follow_row(3, "orders", vec![Value::Int(1)])
+            .expect("the row follow registers");
+        let event = CountingEvent {
+            inner: TestEvent::delete(
+                table_id,
+                vec![Value::Int(1), Value::Int(250), Value::String("paid".into())],
+            )
+            .with_pk_columns([0u16]),
+            table_id_calls: core::cell::Cell::new(0),
+            pk_columns_calls: core::cell::Cell::new(0),
+            resolved_pk_columns_calls: core::cell::Cell::new(0),
+            changed_columns_calls: core::cell::Cell::new(0),
+            resolved_changed_columns_calls: core::cell::Cell::new(0),
+            value_at_calls: core::cell::Cell::new(0),
+            resolved_value_at_calls: core::cell::Cell::new(0),
+        };
+
+        engine.dispatch(&event).expect("the event dispatches");
+
+        assert_eq!(event.table_id_calls.get(), 1);
+        assert_eq!(event.pk_columns_calls.get(), 0);
+        assert_eq!(event.resolved_pk_columns_calls.get(), 1);
+        assert_eq!(event.value_at_calls.get(), 0);
+        assert!(event.resolved_value_at_calls.get() > 0);
+    }
 
     fn cap1_evict_oldest() -> Engine {
         let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("parse DDL");

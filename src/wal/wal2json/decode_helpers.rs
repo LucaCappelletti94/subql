@@ -1,3 +1,5 @@
+use core::hash::{Hash, Hasher};
+
 use sql_traits::prelude::DatabaseLike;
 use wal2json_events::Column;
 
@@ -5,6 +7,33 @@ use crate::backend::{Postgres, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, TableId};
 use crate::wal::pg_type::json_value_to_pg_value_by_kind;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct IndexedName<'a>(&'a str);
+
+impl<'a> IndexedName<'a> {
+    pub(super) const fn new(name: &'a str) -> Self {
+        Self(name)
+    }
+}
+
+impl Hash for IndexedName<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        #[cfg(test)]
+        INDEX_HASHES.with(|hashes| hashes.set(hashes.get() + 1));
+        self.0.hash(state);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static INDEX_HASHES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn take_index_hashes() -> usize {
+    INDEX_HASHES.with(|hashes| hashes.replace(0))
+}
 
 /// Decode one wal2json JSON cell against the catalog's declared type.
 /// `None` (the wire did not carry the column) yields `Ok(Value::Missing)`,
