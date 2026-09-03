@@ -58,6 +58,7 @@ mod tests {
     use rls2fga::generator::well_known::can_select_relation;
     use rls2fga::translator::TranslatorBuilder;
     use rls2fga_types::ConfidenceLevel;
+    use rls2fga_types::TypeName;
     use rls2fga_types::{
         ColumnKind, ContextRendering, ObjectKey, RecordContext, RecordContextEntry,
         RecordDerivation, RecordDescription, RecordTemplate, SubjectKey, ValueSource,
@@ -386,7 +387,7 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
             let translation = translator.translate(&db).unwrap();
             (
                 Cow::from(translation.row_naming()).into_owned(),
-                translation.action_relations(),
+                translation.action_relations().to_vec(),
                 translation.notes().to_vec(),
             )
         };
@@ -753,10 +754,10 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
                     derivation: RecordDerivation::FromRow {
                         table: test_names::table("docs"),
                         template: Box::new(RecordTemplate {
-                            object_type: "docs".to_string(),
+                            object_type: TypeName::canonicalized("docs"),
                             object_key: id_key(),
                             relation: test_names::relation("owner"),
-                            subject_type: "user".to_string(),
+                            subject_type: TypeName::canonicalized("user"),
                             subject_key: SubjectKey::new(ValueSource::ListElements(
                                 test_names::column_read("owner_id"),
                             )),
@@ -2106,10 +2107,10 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
             derivation: RecordDerivation::FromRow {
                 table: test_names::table(table),
                 template: Box::new(RecordTemplate {
-                    object_type: table.to_string(),
+                    object_type: TypeName::canonicalized(table),
                     object_key: id_key(),
                     relation: test_names::relation("owner"),
-                    subject_type: "user".to_string(),
+                    subject_type: TypeName::canonicalized("user"),
                     subject_key: SubjectKey::wildcard(),
                     context: Some(RecordContext {
                         condition: format!("when_{key}"),
@@ -2133,10 +2134,10 @@ CREATE POLICY notes_p ON notes USING (owner = current_setting('app.department', 
             derivation: RecordDerivation::FromRow {
                 table: test_names::table(table),
                 template: Box::new(RecordTemplate {
-                    object_type: table.to_string(),
+                    object_type: TypeName::canonicalized(table),
                     object_key: id_key(),
                     relation: test_names::relation("owner"),
-                    subject_type: "user".to_string(),
+                    subject_type: TypeName::canonicalized("user"),
                     subject_key: SubjectKey::column(subject),
                     context: None,
                 }),

@@ -77,7 +77,7 @@ fn wiring(sql: &str) -> Wiring {
             translation.relations().to_vec(),
             Cow::from(translation.row_naming()).into_owned(),
             translation.notes().to_vec(),
-            translation.action_relations(),
+            translation.action_relations().to_vec(),
         )
     };
     let model = translator
@@ -532,8 +532,7 @@ CREATE POLICY p ON docs FOR SELECT USING (
     };
     let condition = requery
         .query
-        .condition
-        .as_deref()
+        .condition()
         .expect("the membership is conditional");
     backend
         .write_records(&[membership(

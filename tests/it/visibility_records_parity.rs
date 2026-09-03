@@ -580,19 +580,20 @@ fn compound_replay_relations(catalog: &ParserDB) -> Vec<RelationShapes> {
                 "meter_members".to_owned(),
             )],
             derivation: RecordDerivation::Joined {
-                queries: vec![BoundQuery {
-                    table: rls2fga::types::TableId::from_stored(None, "meter_members".to_owned()),
-                    key_columns: vec![column("tenant_id"), column("meter_id")],
-                    sql: "SELECT 'meters:' || tenant_id::text || '|' || meter_id::text AS object, \
-                          'can_select' AS relation, 'user:' || user_id::text AS subject \
-                          FROM meter_members WHERE tenant_id = $1 AND meter_id = $2"
+                queries: vec![BoundQuery::new(
+                    rls2fga::types::TableId::from_stored(None, "meter_members".to_owned()),
+                    vec![column("tenant_id"), column("meter_id")],
+                    "SELECT 'meters:' || tenant_id::text || '|' || meter_id::text AS object, \
+                     'can_select' AS relation, 'user:' || user_id::text AS subject \
+                     FROM meter_members WHERE tenant_id = $1 AND meter_id = $2"
                         .to_owned(),
-                    condition: None,
-                    scope: ReplayScope::Object {
+                    None,
+                    ReplayScope::Object {
                         object_type: "meters".to_owned(),
                         relations: vec![relation],
                     },
-                }],
+                )
+                .expect("the fixture query binds its key")],
                 reason: "compound replay fixture".to_owned(),
             },
         }],
@@ -665,30 +666,34 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
         "the change must hand over at least one replay: {diff:?}"
     );
     for requery in &diff.requeries {
-        assert_eq!(requery.query.table.name(), "meter_members");
-        assert_eq!(requery.query.key_columns, ["tenant_id", "meter_id"]);
+        assert_eq!(requery.query.table().name(), "meter_members");
+        assert_eq!(requery.query.key_columns(), ["tenant_id", "meter_id"]);
 
         // The one statement the typed DSL cannot express, since rls2fga
         // generates its text at run time. Bound with the same SQL type the
         // `table!` above gives these columns, so the two cannot drift.
-        let rows = sql_query(&requery.query.sql)
+        let rows = sql_query(requery.query.sql())
             .bind::<Integer, _>(key_int(&requery.key[0]))
             .bind::<Integer, _>(key_int(&requery.key[1]))
             .load::<TupleRow>(&mut pg)
             .unwrap_or_else(|error| {
-                panic!("the replayed query failed: {error}\n{}", requery.query.sql)
+                panic!(
+                    "the replayed query failed: {error}\n{}",
+                    requery.query.sql()
+                )
             });
 
         assert!(
             !rows.is_empty(),
             "the replay returns the changed row's facts:\n{}",
-            requery.query.sql
+            requery.query.sql()
         );
         for row in &rows {
             assert_eq!(
-                row.object, "meters:1|20",
+                row.object,
+                "meters:1|20",
                 "the whole key names the changed row and no other:\n{}",
-                requery.query.sql
+                requery.query.sql()
             );
         }
     }

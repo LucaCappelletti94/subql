@@ -563,9 +563,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         );
         assert_eq!(diff.requeries.len(), 1);
         let requery = &diff.requeries[0];
-        assert_eq!(requery.query.table.name(), "team_members");
-        assert_eq!(requery.query.key_columns, ["team_id"]);
-        assert!(requery.query.sql.contains("$1"));
+        assert_eq!(requery.query.table().name(), "team_members");
+        assert_eq!(requery.query.key_columns(), ["team_id"]);
+        assert!(requery.query.sql().contains("$1"));
         assert_eq!(requery.key, [Value::Int(3)]);
     }
 
@@ -688,7 +688,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let requery = &diff.requeries[0];
         assert_eq!(requery.key, [Value::Int(3)]);
         assert_eq!(
-            requery.query.scope,
+            *requery.query.scope(),
             ReplayScope::Object {
                 object_type: "teams".to_string(),
                 relations: alloc::vec![member_relation()],
@@ -717,17 +717,17 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
 
         assert_eq!(diff.requeries.len(), 1, "{:?}", diff.requeries);
         let requery = &diff.requeries[0];
-        assert_eq!(requery.query.key_columns, ["tenant_id", "reading_id"]);
+        assert_eq!(requery.query.key_columns(), ["tenant_id", "reading_id"]);
         assert_eq!(requery.key, [Value::Int(7), Value::Int(9)]);
         // What makes the pair above one row's key rather than two values in
         // some order: the query takes them in exactly this order.
         assert!(
             requery
                 .query
-                .sql
+                .sql()
                 .contains("\"tenant_id\" = $1 AND \"reading_id\" = $2"),
             "{}",
-            requery.query.sql
+            requery.query.sql()
         );
     }
 
@@ -1024,47 +1024,40 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let diff = store.diff(&event).unwrap();
 
         assert_eq!(diff.requeries.len(), 1, "only the resolvable query");
-        assert_eq!(diff.requeries[0].query.key_columns, ["id"]);
+        assert_eq!(diff.requeries[0].query.key_columns(), ["id"]);
     }
 
-    /// A key this catalog cannot bind whole is dropped whole, in either of the
-    /// two ways that happens: a column it does not have, and no columns at all.
+    /// A key naming a column this catalog does not have is dropped whole.
     /// Keeping the columns that did resolve would answer for every row sharing
     /// them, and the SQL takes one placeholder per column so it could not be
     /// run anyway. The table is named instead of being left silently unserved,
     /// which is the difference between a gap a caller can see and one it
-    /// cannot.
+    /// cannot. A key with no columns at all cannot arrive: `BoundQuery` refuses
+    /// one at construction.
     #[test]
     fn a_key_this_catalog_cannot_bind_drops_the_query_and_names_the_table() {
-        for key_columns in [vec!["id", "absent_column"], Vec::new()] {
-            let db = ParserDB::parse::<PostgreSqlDialect>(
-                "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);",
-            )
-            .unwrap();
-            let store = Shapes::new::<Postgres>(
-                db,
-                &[joined(&["docs"], vec![bound("docs", &key_columns)])],
-            );
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id TEXT);",
+        )
+        .unwrap();
+        let store = Shapes::new::<Postgres>(
+            db,
+            &[joined(
+                &["docs"],
+                vec![bound("docs", &["id", "absent_column"])],
+            )],
+        );
 
-            let uncovered = store.uncovered();
-            assert_eq!(uncovered.len(), 1, "{key_columns:?}: {uncovered:?}");
-            assert_eq!(uncovered[0].table, "docs", "{key_columns:?}");
-            assert_eq!(
-                uncovered[0].reason,
-                UncoveredReason::NoBoundQuery,
-                "{key_columns:?}"
-            );
+        let uncovered = store.uncovered();
+        assert_eq!(uncovered.len(), 1, "{uncovered:?}");
+        assert_eq!(uncovered[0].table, "docs");
+        assert_eq!(uncovered[0].reason, UncoveredReason::NoBoundQuery);
 
-            let docs = table(&store, "docs");
-            let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
-                .with_pk_columns([0u16]);
-            let diff = store.diff(&event).unwrap();
-            assert!(
-                diff.requeries.is_empty(),
-                "{key_columns:?}: {:?}",
-                diff.requeries
-            );
-        }
+        let docs = table(&store, "docs");
+        let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
+            .with_pk_columns([0u16]);
+        let diff = store.diff(&event).unwrap();
+        assert!(diff.requeries.is_empty(), "{:?}", diff.requeries);
     }
 
     /// One shape per relation, both binding the same table on the same
@@ -1098,7 +1091,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let mut sql: Vec<&str> = diff
             .requeries
             .iter()
-            .map(|requery| requery.query.sql.as_str())
+            .map(|requery| requery.query.sql())
             .collect();
         sql.sort_unstable();
         assert_eq!(
@@ -1159,16 +1152,17 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             shapes: vec![RecordDescription {
                 tables: vec![test_names::table("docs")],
                 derivation: RecordDerivation::Joined {
-                    queries: vec![BoundQuery {
-                        table: test_names::table("docs"),
-                        key_columns: vec![test_names::column("id")],
-                        sql: sql.to_string(),
-                        condition: None,
-                        scope: ReplayScope::Object {
+                    queries: vec![BoundQuery::new(
+                        test_names::table("docs"),
+                        vec![test_names::column("id")],
+                        sql.to_string(),
+                        None,
+                        ReplayScope::Object {
                             object_type: test_names::docs_type().as_str().to_string(),
                             relations: scope_relations.to_vec(),
                         },
-                    }],
+                    )
+                    .expect("the fixture query binds its key")],
                     reason: "two rows".to_string(),
                 },
             }],
@@ -1186,20 +1180,21 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             .map(|(index, column)| alloc::format!("\"{column}\" = ${}", index + 1))
             .collect::<Vec<String>>()
             .join(" AND ");
-        BoundQuery {
-            table: test_names::table(table),
-            key_columns: key_columns
+        BoundQuery::new(
+            test_names::table(table),
+            key_columns
                 .iter()
                 .copied()
                 .map(test_names::column)
                 .collect(),
-            sql: alloc::format!("SELECT 1 FROM \"{table}\" WHERE {predicate};"),
-            condition: None,
-            scope: ReplayScope::Object {
+            alloc::format!("SELECT 1 FROM \"{table}\" WHERE {predicate};"),
+            None,
+            ReplayScope::Object {
                 object_type: table.to_string(),
                 relations: alloc::vec![can_select_relation()],
             },
-        }
+        )
+        .expect("the fixture query binds its key")
     }
 
     /// A store over one compound-key table, reached only by a bound query.

@@ -59,7 +59,7 @@ static UNRESTRICTED: ActionAnswer = ActionAnswer::Unrestricted;
 /// // copy and end the borrow before `Shapes::new` takes the catalog.
 /// let relations = translation.relations().to_vec();
 /// let naming = std::borrow::Cow::from(translation.row_naming()).into_owned();
-/// let answers = translation.action_relations();
+/// let answers = translation.action_relations().to_vec();
 /// drop(translation);
 ///
 /// let shapes = Arc::new(
@@ -258,8 +258,8 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// // owned copy and end the borrow before `Shapes::new` takes the catalog.
     /// let relations = translation.relations().to_vec();
     /// let naming = std::borrow::Cow::from(translation.row_naming()).into_owned();
-    /// let answers = translation.action_relations();
-    /// let open = translation.unrestricted_tables();
+    /// let answers = translation.action_relations().to_vec();
+    /// let open = translation.unrestricted_tables().to_vec();
     /// drop(translation);
     ///
     /// let shapes = Shapes::new::<Postgres>(db, &relations)
@@ -467,13 +467,13 @@ fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
         RecordDerivation::Joined { queries, .. } => {
             let mut bound: Vec<&ContractTableId> = Vec::with_capacity(queries.len());
             for query in queries {
-                let Some(id) = catalog_helpers::contract_table_id(db, &query.table) else {
+                let Some(id) = catalog_helpers::contract_table_id(db, query.table()) else {
                     continue;
                 };
-                let Some(key) = resolve_key(db, id, &query.key_columns) else {
+                let Some(key) = resolve_key(db, id, query.key_columns()) else {
                     continue;
                 };
-                bound.push(&query.table);
+                bound.push(query.table());
                 by_table
                     .entry(id)
                     .or_default()
@@ -530,12 +530,12 @@ fn contested_pairs(relations: &[RelationShapes]) -> HashSet<(String, RelationNam
 fn stated_pairs(shape: &RecordDescription) -> Vec<(String, RelationName)> {
     match &shape.derivation {
         RecordDerivation::FromRow { template, .. } => {
-            alloc::vec![(template.object_type.clone(), template.relation.clone())]
+            alloc::vec![(template.object_type.to_string(), template.relation.clone())]
         }
         RecordDerivation::Joined { queries, .. } => {
             let mut out = Vec::new();
             for query in queries {
-                match &query.scope {
+                match query.scope() {
                     ReplayScope::Object {
                         object_type,
                         relations,
@@ -667,8 +667,8 @@ mod tests {
         let (relations, naming, answers, unrestricted) = (
             translation.relations().to_vec(),
             alloc::borrow::Cow::from(translation.row_naming()).into_owned(),
-            translation.action_relations(),
-            translation.unrestricted_tables(),
+            translation.action_relations().to_vec(),
+            translation.unrestricted_tables().to_vec(),
         );
         drop(translation);
         Shapes::new::<Postgres>(db, &relations)
