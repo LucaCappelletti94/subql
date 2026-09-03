@@ -24,6 +24,32 @@ fn column_scalar_of<B: Backend, DB: DatabaseLike>(
     crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col)
 }
 
+/// The [`crate::backend::ScalarKind`] of the first column `expr` names, looking
+/// through the arithmetic and grouping a comparison side may wrap it in.
+///
+/// A bare column is the common case, but `amount * quantity > 100` carries its
+/// columns one level down, and typing the literal against the table's first
+/// text column instead refuses the number.
+fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
+    expr: &Expr,
+    table_id: TableId,
+    database: &DB,
+) -> Option<ScalarKindOf<B>> {
+    if let Some(kind) = column_scalar_of::<B, DB>(expr, table_id, database) {
+        return Some(kind);
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            nested_column_scalar_of::<B, DB>(left, table_id, database)
+                .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database))
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            nested_column_scalar_of::<B, DB>(expr, table_id, database)
+        }
+        _ => None,
+    }
+}
+
 /// Return `true` if `instr` produces a [`crate::compiler::Tri`] on the
 /// stack. Used to detect whether a top-level WHERE program leaves a
 /// boolean at TOS or needs to be wrapped with `= true`.
@@ -272,8 +298,8 @@ where
                     // then emit the op. Target-typed literal inference
                     // picks whichever sibling is a column reference and
                     // uses its ScalarKind for the other side's literal.
-                    let child_target = column_scalar_of::<B, DB>(left, table_id, database)
-                        .or_else(|| column_scalar_of::<B, DB>(right, table_id, database))
+                    let child_target = nested_column_scalar_of::<B, DB>(left, table_id, database)
+                        .or_else(|| nested_column_scalar_of::<B, DB>(right, table_id, database))
                         .unwrap_or_else(|| BuiltinKind::String.into());
                     compile_expr_recursive::<B, DB>(
                         left,

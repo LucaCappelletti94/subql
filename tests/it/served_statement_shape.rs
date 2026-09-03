@@ -14,7 +14,7 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect};
-use subql::backend::{MySql, Postgres};
+use subql::backend::{MySql, Postgres, Value};
 use subql::testing::TestEvent;
 use subql::{DefaultIds, RegisterError, Registered, SubscriptionEngine, SubscriptionRequest, Tier};
 
@@ -516,4 +516,39 @@ fn text_grouping_is_served_on_postgres_and_refused_on_mysql() {
         outcome.is_ok(),
         "an integer group column is served on MySQL too, got {outcome:?}"
     );
+}
+
+/// A comparison whose side is arithmetic over columns takes the paired
+/// literal's type from those columns. Reading the type only off a bare column
+/// reference left `amount * id > 100` with a text target, and the number then
+/// refused to parse as text.
+#[test]
+fn arithmetic_over_columns_types_the_paired_literal() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    let table = subql::catalog_helpers::table_id(&db, "t").unwrap();
+    let mut engine: Engine = SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let registered = engine
+        .register(SubscriptionRequest::new(
+            7u64,
+            "SELECT * FROM t WHERE amount * id > 100",
+        ))
+        .expect("an arithmetic comparison is served in process");
+    assert!(
+        matches!(registered.tier, Tier::InProcess(_)),
+        "got {:?}",
+        registered.tier
+    );
+
+    let row = |id: i64, amount: i64| {
+        vec![
+            Value::Int(id),
+            Value::String("paid".into()),
+            Value::Int(amount),
+        ]
+    };
+    let over = TestEvent::<Postgres>::insert(table, row(20, 6));
+    assert_eq!(engine.consumers(&over).unwrap().inserted(), vec![7]);
+
+    let under = TestEvent::<Postgres>::insert(table, row(2, 6));
+    assert!(engine.consumers(&under).unwrap().inserted().is_empty());
 }
