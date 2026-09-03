@@ -552,3 +552,16 @@ fn arithmetic_over_columns_types_the_paired_literal() {
     let under = TestEvent::<Postgres>::insert(table, row(2, 6));
     assert!(engine.consumers(&under).unwrap().inserted().is_empty());
 }
+
+/// A flat operator chain nests one level per term, so the type lookup for the
+/// paired literal has to stop at the same ceiling compilation refuses past
+/// rather than walking the whole chain.
+#[test]
+fn a_deep_operator_chain_is_refused() {
+    let chain = vec!["amount"; 400].join(" + ");
+    let message = refusal(&format!("SELECT * FROM t WHERE {chain} > 1"));
+    assert!(
+        message.contains("deep"),
+        "the refusal should name the nesting, got {message:?}"
+    );
+}
