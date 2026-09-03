@@ -4,9 +4,10 @@ use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use wal2json_events::ChangeV1;
 
-use crate::backend::{CdcEvent, Postgres, RowKind, Value};
+use crate::backend::{Postgres, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
+use crate::wal::wire_event::{wire_cdc_event, WireEvent};
 use crate::wal::{changed_columns_by_name, resolve_table};
 
 use super::decode_helpers::{decode_cell, IndexedName};
@@ -57,43 +58,29 @@ fn v1_index<'a>(
     index
 }
 
-impl CdcEvent for ChangeV1 {
+wire_cdc_event!(ChangeV1, Postgres, crate::NoCheckpoint);
+
+impl WireEvent for ChangeV1 {
     type Backend = Postgres;
     type Checkpoint = crate::NoCheckpoint;
 
-    fn kind(&self) -> EventKind {
+    fn wire_kind(&self) -> EventKind {
         v1_row_kind(self).expect(
             "CdcEvent::kind called on a non-row wal2json v1 change. Filter with parse_wal2json_v1 first",
         )
     }
 
-    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+    fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         v1_naming(self)
             .and_then(|(schema, table)| resolve_table(schema, table, db).ok())
             .unwrap_or(TableId::MAX)
     }
 
-    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+    fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {
         None
     }
 
-    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        self.pk_columns_resolved(db, self.table_id(db))
-    }
-
-    fn pk_columns_resolved<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
-        catalog_helpers::primary_key_columns(db, table_id).unwrap_or_default()
-    }
-
-    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        self.changed_columns_resolved(db, self.table_id(db))
-    }
-
-    fn changed_columns_resolved<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        table_id: TableId,
-    ) -> Vec<ColumnId> {
+    fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         let Self::Update {
             columns, oldkeys, ..
         } = self
@@ -116,16 +103,7 @@ impl CdcEvent for ChangeV1 {
         })
     }
 
-    fn value_at<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        row: RowKind,
-        col: ColumnId,
-    ) -> Result<Value<Postgres>, crate::ValueError> {
-        self.value_at_resolved(db, self.table_id(db), row, col)
-    }
-
-    fn value_at_resolved<DB: DatabaseLike>(
+    fn wire_value_at<DB: DatabaseLike>(
         &self,
         db: &DB,
         table_id: TableId,
@@ -145,19 +123,5 @@ impl CdcEvent for ChangeV1 {
             return Ok(Value::Missing);
         };
         decode_cell(v1_value(names, values, &name), db, table_id, col)
-    }
-
-    fn value_at_known_pk_resolved<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        table_id: TableId,
-        col: ColumnId,
-    ) -> Result<Value<Postgres>, crate::ValueError> {
-        let row = match self.kind() {
-            EventKind::Insert => RowKind::New,
-            EventKind::Update | EventKind::Delete => RowKind::Old,
-            EventKind::Truncate => return Ok(Value::Missing),
-        };
-        self.value_at_resolved(db, table_id, row, col)
     }
 }

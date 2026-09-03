@@ -3,9 +3,10 @@ use hashbrown::HashMap;
 use sql_traits::prelude::DatabaseLike;
 use wal2json_events::{Action, Column, MessageV2, RowV2};
 
-use crate::backend::{CdcEvent, Postgres, RowKind, Value};
+use crate::backend::{Postgres, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
+use crate::wal::wire_event::{wire_cdc_event, WireEvent};
 use crate::wal::{changed_columns_by_name, resolve_table};
 
 use super::decode_helpers::{column_value, decode_cell, IndexedName};
@@ -51,21 +52,23 @@ fn v2_table_id<DB: DatabaseLike>(msg: &MessageV2, db: &DB) -> Option<TableId> {
     resolve_table(schema, table, db).ok()
 }
 
-impl CdcEvent for MessageV2 {
+wire_cdc_event!(MessageV2, Postgres, crate::PgLsn);
+
+impl WireEvent for MessageV2 {
     type Backend = Postgres;
     type Checkpoint = crate::PgLsn;
 
-    fn kind(&self) -> EventKind {
+    fn wire_kind(&self) -> EventKind {
         v2_row_kind(self.action()).expect(
             "CdcEvent::kind called on a non-row wal2json v2 message. Filter with parse_wal2json_v2 first",
         )
     }
 
-    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+    fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         v2_table_id(self, db).unwrap_or(TableId::MAX)
     }
 
-    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+    fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {
         let lsn = match self {
             Self::Insert(row) | Self::Update(row) | Self::Delete(row) => row.lsn.as_deref(),
             Self::Truncate(truncate) => truncate.lsn.as_deref(),
@@ -74,26 +77,14 @@ impl CdcEvent for MessageV2 {
         lsn.and_then(crate::PgLsn::parse)
     }
 
-    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        self.pk_columns_resolved(db, self.table_id(db))
-    }
-
-    fn pk_columns_resolved<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
+    fn wire_pk_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         if self.action() == Action::Truncate {
             return Vec::new();
         }
         catalog_helpers::primary_key_columns(db, table_id).unwrap_or_default()
     }
 
-    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        self.changed_columns_resolved(db, self.table_id(db))
-    }
-
-    fn changed_columns_resolved<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        table_id: TableId,
-    ) -> Vec<ColumnId> {
+    fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         if self.action() != Action::Update {
             return Vec::new();
         }
@@ -123,16 +114,7 @@ impl CdcEvent for MessageV2 {
         })
     }
 
-    fn value_at<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        row: RowKind,
-        col: ColumnId,
-    ) -> Result<Value<Postgres>, crate::ValueError> {
-        self.value_at_resolved(db, self.table_id(db), row, col)
-    }
-
-    fn value_at_resolved<DB: DatabaseLike>(
+    fn wire_value_at<DB: DatabaseLike>(
         &self,
         db: &DB,
         table_id: TableId,
@@ -152,19 +134,5 @@ impl CdcEvent for MessageV2 {
             return Ok(Value::Missing);
         };
         decode_cell(column_value(columns, &name), db, table_id, col)
-    }
-
-    fn value_at_known_pk_resolved<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        table_id: TableId,
-        col: ColumnId,
-    ) -> Result<Value<Postgres>, crate::ValueError> {
-        let row = match self.kind() {
-            EventKind::Insert => RowKind::New,
-            EventKind::Update | EventKind::Delete => RowKind::Old,
-            EventKind::Truncate => return Ok(Value::Missing),
-        };
-        self.value_at_resolved(db, table_id, row, col)
     }
 }

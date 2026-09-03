@@ -15,6 +15,7 @@ pub(crate) mod shared_helpers;
 #[cfg(feature = "std")]
 mod streaming;
 mod wal2json;
+pub(crate) mod wire_event;
 
 #[cfg(any(feature = "pg-streaming", feature = "pg-sqlite-emu"))]
 pub(crate) use change_event::into_engine_events;

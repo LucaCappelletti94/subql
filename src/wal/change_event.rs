@@ -23,9 +23,10 @@ use sql_traits::prelude::DatabaseLike;
 
 use super::pg_type::text_to_pg_value_by_kind;
 use super::resolve_table;
-use crate::backend::{CdcEvent, Postgres, RowKind, Value};
+use crate::backend::{Postgres, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
+use crate::wal::wire_event::{wire_cdc_event, WireEvent};
 
 /// The DML or truncate kind of `event`, or `None` for the non-row events
 /// (`Begin`, `Commit`, `Relation`, streaming and two-phase markers) that a
@@ -94,31 +95,29 @@ const fn image_for(event: &ChangeEvent, row: RowKind) -> Option<&RowData> {
     }
 }
 
-impl CdcEvent for ChangeEvent {
+wire_cdc_event!(ChangeEvent, Postgres, crate::PgLsn);
+
+impl WireEvent for ChangeEvent {
     type Backend = Postgres;
     type Checkpoint = crate::PgLsn;
 
-    fn kind(&self) -> EventKind {
+    fn wire_kind(&self) -> EventKind {
         dml_kind(self).expect(
             "CdcEvent::kind called on a non-row ChangeEvent. Sources must reduce the stream with into_engine_events first",
         )
     }
 
-    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+    fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         // Infallible in the trait, so an unresolved name yields the
         // `u32` sentinel, which the engine reports as an unknown table.
         event_table_id(self, db).unwrap_or(TableId::MAX)
     }
 
-    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+    fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {
         Some(crate::PgLsn(self.lsn.value()))
     }
 
-    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        self.pk_columns_resolved(db, self.table_id(db))
-    }
-
-    fn pk_columns_resolved<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
+    fn wire_pk_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         match &self.event_type {
             EventType::Insert { .. } | EventType::Update { .. } | EventType::Delete { .. } => {
                 catalog_helpers::primary_key_columns(db, table_id).unwrap_or_default()
@@ -127,15 +126,7 @@ impl CdcEvent for ChangeEvent {
         }
     }
 
-    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        self.changed_columns_resolved(db, self.table_id(db))
-    }
-
-    fn changed_columns_resolved<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        table_id: TableId,
-    ) -> Vec<ColumnId> {
+    fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         let EventType::Update {
             old_data: Some(old),
             new_data,
@@ -155,23 +146,14 @@ impl CdcEvent for ChangeEvent {
         })
     }
 
-    fn value_at<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        row: RowKind,
-        col: ColumnId,
-    ) -> Result<Value<Postgres>, crate::ValueError> {
-        self.value_at_resolved(db, self.table_id(db), row, col)
-    }
-
-    fn value_at_resolved<DB: DatabaseLike>(
+    fn wire_value_at<DB: DatabaseLike>(
         &self,
         db: &DB,
         table_id: TableId,
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Postgres>, crate::ValueError> {
-        if row == RowKind::Pk && !self.pk_columns_resolved(db, table_id).contains(&col) {
+        if row == RowKind::Pk && !WireEvent::wire_pk_columns(self, db, table_id).contains(&col) {
             return Ok(Value::Missing);
         }
         let Some(image) = image_for(self, row) else {
@@ -214,26 +196,13 @@ impl CdcEvent for ChangeEvent {
             }
         }
     }
-
-    fn value_at_known_pk_resolved<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        table_id: TableId,
-        col: ColumnId,
-    ) -> Result<Value<Postgres>, crate::ValueError> {
-        let row = match self.kind() {
-            EventKind::Insert => RowKind::New,
-            EventKind::Update | EventKind::Delete => RowKind::Old,
-            EventKind::Truncate => return Ok(Value::Missing),
-        };
-        self.value_at_resolved(db, table_id, row, col)
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::backend::CdcEvent;
     use crate::PgLsn;
     use pg_walstream::{Lsn, ReplicaIdentity};
     use sql_traits::structs::ParserDB;

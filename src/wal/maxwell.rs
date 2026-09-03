@@ -21,9 +21,10 @@ use sql_traits::prelude::DatabaseLike;
 
 use super::pg_type::json_value_to_mysql_value_by_kind;
 use super::{resolve_table, WalParseError};
-use crate::backend::{CdcEvent, MySql, RowKind, Value};
+use crate::backend::{MySql, RowKind, Value};
 use crate::catalog_helpers;
 use crate::types::{ColumnId, EventKind, TableId};
+use crate::wal::wire_event::{wire_cdc_event, WireEvent};
 
 /// Parse one Maxwell JSON message into the row events subql dispatches.
 ///
@@ -94,45 +95,29 @@ fn table_of<DB: DatabaseLike>(msg: &Message, db: &DB) -> Option<TableId> {
     resolve_table(&payload.database, &payload.table, db).ok()
 }
 
-impl CdcEvent for Message {
+wire_cdc_event!(Message, MySql, crate::NoCheckpoint);
+
+impl WireEvent for Message {
     type Backend = MySql;
     type Checkpoint = crate::NoCheckpoint;
 
-    fn kind(&self) -> EventKind {
+    fn wire_kind(&self) -> EventKind {
         kind_of(self).expect(
             "CdcEvent::kind called on a Maxwell message with no row. Filter with parse_messages first",
         )
     }
 
-    fn table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
+    fn wire_table_id<DB: DatabaseLike>(&self, db: &DB) -> TableId {
         // Infallible in the trait, so an unresolved name yields the `u32`
         // sentinel, which the engine reports as an unknown table.
         table_of(self, db).unwrap_or(TableId::MAX)
     }
 
-    fn checkpoint(&self) -> Option<Self::Checkpoint> {
+    fn wire_checkpoint(&self) -> Option<Self::Checkpoint> {
         None
     }
 
-    fn pk_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        // The primary key is the row identity subql matches follows and PK
-        // projections against, so it comes from the catalog.
-        self.pk_columns_resolved(db, self.table_id(db))
-    }
-
-    fn pk_columns_resolved<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
-        catalog_helpers::primary_key_columns(db, table_id).unwrap_or_default()
-    }
-
-    fn changed_columns<DB: DatabaseLike>(&self, db: &DB) -> Vec<ColumnId> {
-        self.changed_columns_resolved(db, self.table_id(db))
-    }
-
-    fn changed_columns_resolved<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        table_id: TableId,
-    ) -> Vec<ColumnId> {
+    fn wire_changed_columns<DB: DatabaseLike>(&self, db: &DB, table_id: TableId) -> Vec<ColumnId> {
         let Self::Update(payload) = self else {
             return Vec::new();
         };
@@ -144,16 +129,7 @@ impl CdcEvent for Message {
             .collect()
     }
 
-    fn value_at<DB: DatabaseLike>(
-        &self,
-        db: &DB,
-        row: RowKind,
-        col: ColumnId,
-    ) -> Result<Value<MySql>, crate::ValueError> {
-        self.value_at_resolved(db, self.table_id(db), row, col)
-    }
-
-    fn value_at_resolved<DB: DatabaseLike>(
+    fn wire_value_at<DB: DatabaseLike>(
         &self,
         db: &DB,
         table_id: TableId,
@@ -185,17 +161,19 @@ impl CdcEvent for Message {
         }
     }
 
-    fn value_at_known_pk_resolved<DB: DatabaseLike>(
+    /// Maxwell's old image carries only the changed fields, so an unchanged
+    /// key is read from the new one instead.
+    fn wire_value_at_known_pk<DB: DatabaseLike>(
         &self,
         db: &DB,
         table_id: TableId,
         col: ColumnId,
     ) -> Result<Value<MySql>, crate::ValueError> {
-        match self.kind() {
-            EventKind::Insert => self.value_at_resolved(db, table_id, RowKind::New, col),
-            EventKind::Delete => self.value_at_resolved(db, table_id, RowKind::Old, col),
-            EventKind::Update => match self.value_at_resolved(db, table_id, RowKind::Old, col)? {
-                Value::Missing => self.value_at_resolved(db, table_id, RowKind::New, col),
+        match self.wire_kind() {
+            EventKind::Insert => self.wire_value_at(db, table_id, RowKind::New, col),
+            EventKind::Delete => self.wire_value_at(db, table_id, RowKind::Old, col),
+            EventKind::Update => match self.wire_value_at(db, table_id, RowKind::Old, col)? {
+                Value::Missing => self.wire_value_at(db, table_id, RowKind::New, col),
                 value => Ok(value),
             },
             EventKind::Truncate => Ok(Value::Missing),
@@ -207,6 +185,7 @@ impl CdcEvent for Message {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::backend::CdcEvent;
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::MySqlDialect;
 
