@@ -351,6 +351,33 @@ impl TextRule {
 /// Comparison facts under backend `B`.
 pub type ColumnComparisonOf<B> = ColumnComparison<<<B as Backend>::Custom as CustomScalars>::Kind>;
 
+/// How a comparison reads a numeric pair whose two operands are different
+/// scalars.
+///
+/// Measured 2026-09-04, using `9007199254740993` against
+/// `9007199254740992`, the smallest pair `f64` cannot separate:
+///
+/// ```text
+/// pair                 pg      mysql   sqlite
+/// integer vs float     lossy   lossy   exact
+/// integer vs decimal   exact   exact   no decimal type
+/// decimal vs float     lossy   lossy   no decimal type
+/// ```
+///
+/// So there is no single widening. PostgreSQL and MySQL cast the other
+/// operand to `double precision` when one side is a float, and compare
+/// exactly against a decimal; SQLite compares an integer against a real
+/// without rounding either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NumericWidening {
+    /// Compare in `f64`, reproducing a cast to `double precision`. Two
+    /// integers `f64` cannot separate then compare equal, which is what
+    /// those engines answer.
+    AtFloatWidth,
+    /// Compare without losing a digit.
+    Exact,
+}
+
 /// The catalog facts of both operands of one comparison.
 ///
 /// Two-sided because a comparison's answer can depend on both columns, not
@@ -599,7 +626,8 @@ fn canonical_f64(value: f64) -> f64 {
 }
 
 #[allow(clippy::cast_precision_loss)]
-pub(super) const fn widen_i64_to_f64(value: i64) -> f64 {
+#[must_use]
+pub const fn widen_i64_to_f64(value: i64) -> f64 {
     value as f64 // Deliberate SQL double-precision rounding.
 }
 

@@ -103,6 +103,15 @@ struct Custom;
 impl Backend for Custom {
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
+    /// No cross-kind numeric comparison: this backend's fixtures compare
+    /// same-kind values only.
+    fn numeric_widening(
+        _left: subql::backend::BuiltinKind,
+        _right: subql::backend::BuiltinKind,
+    ) -> Option<subql::backend::NumericWidening> {
+        None
+    }
+
     /// Byte comparison, which is all this backend's fixtures need.
     fn text_rule(
         _comparison: &subql::backend::ComparisonContext<'_, Self>,

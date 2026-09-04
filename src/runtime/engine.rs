@@ -1620,6 +1620,17 @@ where
             Refusal::CollationNotReproducible { column, collation } => {
                 crate::NotServed::CollationNotReproducible { column, collation }
             }
+            Refusal::CrossKindComparison {
+                left,
+                left_kind,
+                right,
+                right_kind,
+            } => crate::NotServed::CrossKindComparison {
+                left,
+                left_kind: left_kind.into(),
+                right,
+                right_kind: right_kind.into(),
+            },
             Refusal::Unsupported(prose) => crate::NotServed::UnsupportedSql(prose),
         }
     }

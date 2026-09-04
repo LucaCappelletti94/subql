@@ -702,6 +702,18 @@ pub enum NotServed<B: Backend> {
         /// database default and for rules the catalog cannot name.
         collation: Option<String>,
     },
+    /// The comparison names two columns whose kinds this backend does not
+    /// reconcile in process.
+    CrossKindComparison {
+        /// Left operand column.
+        left: ColumnId,
+        /// Left operand's declared scalar kind.
+        left_kind: ScalarKindOf<B>,
+        /// Right operand column.
+        right: ColumnId,
+        /// Right operand's declared scalar kind.
+        right_kind: ScalarKindOf<B>,
+    },
     /// A form the compiler refused with prose rather than a structured
     /// cause.
     UnsupportedSql(String),
@@ -754,6 +766,18 @@ impl<B: Backend> core::fmt::Display for NotServed<B> {
                      so subql cannot reproduce its comparison in process"
                 ),
             },
+            Self::CrossKindComparison {
+                left,
+                left_kind,
+                right,
+                right_kind,
+            } => write!(
+                f,
+                "column {left} has type {left_name} and column {right} has type \
+                 {right_name}, and subql does not reconcile the two in process",
+                left_name = ScalarKindName::<B>(left_kind),
+                right_name = ScalarKindName::<B>(right_kind)
+            ),
             Self::UnsupportedSql(message) => f.write_str(message),
         }
     }

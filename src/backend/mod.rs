@@ -46,15 +46,18 @@ pub(crate) mod scalar_value;
 pub(crate) mod scalars_and_backend;
 pub(crate) mod shipped;
 
+pub use crate::compiler::value_cmp::cross_kind_numeric_ordering;
 pub(crate) use cdc_event::ResolvedEvent;
 pub use cdc_event::{decode_cell, encode_value_key, CdcEvent, CellPresence};
 pub use row_kind::RowKind;
 pub(crate) use scalar_value::jsonb_payloads_equal;
 pub use scalar_value::single_column_rule;
+pub use scalar_value::widen_i64_to_f64;
 pub use scalar_value::{
     BuiltinKind, Carried, CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf,
-    ComparisonContext, CustomScalars, GroupKeyEncoder, NoCustom, NoCustomScalars, ScalarKind,
-    ScalarKindOf, TextCase, TextOperation, TextRule, TrailingSpacePadding, TrailingSpaces, Value,
+    ComparisonContext, CustomScalars, GroupKeyEncoder, NoCustom, NoCustomScalars, NumericWidening,
+    ScalarKind, ScalarKindOf, TextCase, TextOperation, TextRule, TrailingSpacePadding,
+    TrailingSpaces, Value,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

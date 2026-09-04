@@ -7,8 +7,8 @@ use super::scalar_value::{
     sqlite_text_rule, widen_i64_to_f64,
 };
 use super::{
-    Backend, BuiltinKind, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, ScalarKindOf,
-    SqliteJson, TextOperation, TextRule, Value,
+    Backend, BuiltinKind, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, NumericWidening,
+    ScalarKindOf, SqliteJson, TextOperation, TextRule, Value,
 };
 use alloc::string::ToString;
 
@@ -51,6 +51,29 @@ fn postgres_trailing_spaces<V: postgres_jsonb_canonical::PgVersion + 'static>(
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
+    /// Measured: against a float, both engines cast the other operand to
+    /// `double precision`, so two integers `f64` cannot separate compare
+    /// equal. Against a decimal an integer compares exactly.
+    fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
+        match (left, right) {
+            (BuiltinKind::Float, BuiltinKind::Int | BuiltinKind::Decimal)
+            | (BuiltinKind::Int | BuiltinKind::Decimal, BuiltinKind::Float) => {
+                Some(NumericWidening::AtFloatWidth)
+            }
+            (BuiltinKind::Int, BuiltinKind::Decimal) | (BuiltinKind::Decimal, BuiltinKind::Int) => {
+                Some(NumericWidening::Exact)
+            }
+            _ => None,
+        }
+    }
+
+    fn compare_cross_kind_numeric(
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering> {
+        crate::backend::cross_kind_numeric_ordering(left, right)
+    }
+
     /// Measured on 16.11. Equality under a deterministic collation is byte
     /// equality, including for the database default, since `CREATE
     /// DATABASE` cannot select a nondeterministic collation. Ordering is
@@ -193,6 +216,29 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
+    /// Measured: against a float, both engines cast the other operand to
+    /// `double precision`, so two integers `f64` cannot separate compare
+    /// equal. Against a decimal an integer compares exactly.
+    fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
+        match (left, right) {
+            (BuiltinKind::Float, BuiltinKind::Int | BuiltinKind::Decimal)
+            | (BuiltinKind::Int | BuiltinKind::Decimal, BuiltinKind::Float) => {
+                Some(NumericWidening::AtFloatWidth)
+            }
+            (BuiltinKind::Int, BuiltinKind::Decimal) | (BuiltinKind::Decimal, BuiltinKind::Int) => {
+                Some(NumericWidening::Exact)
+            }
+            _ => None,
+        }
+    }
+
+    fn compare_cross_kind_numeric(
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering> {
+        crate::backend::cross_kind_numeric_ordering(left, right)
+    }
+
     /// A `PAD SPACE` collation ignores trailing spaces on both sides, which
     /// no structural comparison reproduces.
     fn scalars_equal(
@@ -318,6 +364,24 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    /// Measured: SQLite compares an integer against a real without
+    /// rounding either, so the pair is exact. It has no decimal type.
+    fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
+        match (left, right) {
+            (BuiltinKind::Int, BuiltinKind::Float) | (BuiltinKind::Float, BuiltinKind::Int) => {
+                Some(NumericWidening::Exact)
+            }
+            _ => None,
+        }
+    }
+
+    fn compare_cross_kind_numeric(
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering> {
+        crate::backend::cross_kind_numeric_ordering(left, right)
+    }
+
     /// `NOCASE` folds ASCII case and `RTRIM` ignores trailing spaces, and
     /// no structural comparison reproduces either.
     fn scalars_equal(

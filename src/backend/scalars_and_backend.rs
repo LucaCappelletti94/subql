@@ -299,6 +299,47 @@ pub trait Backend: 'static {
         crate::compiler::value_cmp::structural_ordering(left, right)
     }
 
+    /// How this backend reads a numeric pair whose operands are two
+    /// different scalars, or `None` when it does not compare that pair at
+    /// all, which classifies the comparison as a database read.
+    ///
+    /// Required, and per backend, because the engines disagree: measured,
+    /// PostgreSQL and MySQL cast the other operand to `double precision`
+    /// against a float and compare exactly against a decimal, while SQLite
+    /// compares an integer against a real exactly. Both kinds are builtin,
+    /// since only the numeric builtins have a widening.
+    ///
+    /// The compiler asks this at registration to decide whether to serve
+    /// the comparison, and the comparator asks it to answer one, so the
+    /// two cannot disagree.
+    #[must_use]
+    fn numeric_widening(
+        left: super::scalar_value::BuiltinKind,
+        right: super::scalar_value::BuiltinKind,
+    ) -> Option<super::scalar_value::NumericWidening>
+    where
+        Self: Sized;
+
+    /// How a numeric pair of two different scalars orders under this
+    /// backend's widening, or `None` when there is none.
+    ///
+    /// Defaults to `None`, which classifies every cross-kind comparison as
+    /// a database read: a backend carrying its numbers in types other than
+    /// `i64`, `f64` and `BigDecimal` has no widening this crate can
+    /// perform. A backend on the standard carriers delegates to
+    /// [`crate::backend::cross_kind_numeric_ordering`], which
+    /// reads the policy from [`Backend::numeric_widening`].
+    #[must_use]
+    fn compare_cross_kind_numeric(
+        _left: &Value<Self>,
+        _right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// How this backend answers one text comparison in process, or `None`
     /// when no in-process comparison reproduces it and the statement must
     /// take a database read.

@@ -58,6 +58,42 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     }
 }
 
+/// Refuse a comparison between two columns of different kinds that this
+/// backend does not widen.
+///
+/// The widening is the engine's, and the engines disagree: against a float
+/// PostgreSQL and MySQL cast to `double precision` while SQLite compares
+/// exactly. Nothing coerces silently here, because a coercion the engine
+/// does not perform is a wrong answer.
+fn refuse_unwidened_pair<B: Backend, DB: DatabaseLike>(
+    operands: [&Expr; 2],
+    table_id: TableId,
+    database: &DB,
+) -> Result<(), RegisterError> {
+    let sides: Vec<(crate::ColumnId, BuiltinKind)> = operands
+        .iter()
+        .filter_map(|side| {
+            let column = resolve_column_ref(side, table_id, database)?;
+            let kind = crate::catalog_helpers::column_builtin_kind(database, table_id, column)?;
+            Some((column, kind))
+        })
+        .collect();
+    let [(left, left_kind), (right, right_kind)] = sides[..] else {
+        return Ok(());
+    };
+    if left_kind == right_kind || B::numeric_widening(left_kind, right_kind).is_some() {
+        return Ok(());
+    }
+    Err(RegisterError::NotServedInProcess(
+        crate::errors::Refusal::CrossKindComparison {
+            left,
+            left_kind,
+            right,
+            right_kind,
+        },
+    ))
+}
+
 /// Refuse a text comparison the backend does not reproduce in process.
 ///
 /// Asked per operation, because reproducibility does not factor per column:
@@ -416,6 +452,7 @@ where
 
                     match op {
                         BinaryOperator::Eq | BinaryOperator::NotEq => {
+                            refuse_unwidened_pair::<B, DB>([left, right], table_id, database)?;
                             refuse_unreproducible_text::<B, DB>(
                                 [left, right],
                                 crate::backend::TextOperation::Equality,
@@ -433,6 +470,7 @@ where
                         | BinaryOperator::Gt
                         | BinaryOperator::GtEq => {
                             refuse_unordered_kind::<DB>([left, right], table_id, database)?;
+                            refuse_unwidened_pair::<B, DB>([left, right], table_id, database)?;
                             refuse_unreproducible_text::<B, DB>(
                                 [left, right],
                                 crate::backend::TextOperation::Ordering,

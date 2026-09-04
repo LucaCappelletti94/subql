@@ -108,6 +108,19 @@ pub enum Refusal {
         /// database default and for rules the catalog cannot name.
         collation: Option<String>,
     },
+    /// The comparison names two columns of different kinds and this
+    /// backend has no widening for the pair.
+    #[error("columns {left} and {right} have kinds {left_kind:?} and {right_kind:?}, which are not compared in process")]
+    CrossKindComparison {
+        /// Left operand column.
+        left: crate::ColumnId,
+        /// Left operand's builtin kind.
+        left_kind: crate::backend::BuiltinKind,
+        /// Right operand column.
+        right: crate::ColumnId,
+        /// Right operand's builtin kind.
+        right_kind: crate::backend::BuiltinKind,
+    },
     /// A form with no structured cause, carrying the compiler's own words.
     #[error("{0}")]
     Unsupported(String),

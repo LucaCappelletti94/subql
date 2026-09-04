@@ -42,6 +42,9 @@ use crate::compiler::Tri;
 /// * `Value::Float(NaN)` against anything -> `false`, the IEEE rule.
 ///   PostgreSQL disagrees, which is why a backend can override it.
 pub fn structural_equality<B: Backend>(a: &Value<B>, b: &Value<B>) -> bool {
+    if let Some(ordering) = B::compare_cross_kind_numeric(a, b) {
+        return ordering == core::cmp::Ordering::Equal;
+    }
     match (a, b) {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
@@ -79,6 +82,9 @@ pub fn structural_ordering<B: Backend>(
     if lhs.is_absent() || rhs.is_absent() {
         return None;
     }
+    if let Some(ordering) = B::compare_cross_kind_numeric(lhs, rhs) {
+        return Some(ordering);
+    }
     match (lhs, rhs) {
         (Value::Bool(x), Value::Bool(y)) => x.partial_cmp(y),
         (Value::Int(x), Value::Int(y)) => x.partial_cmp(y),
@@ -101,6 +107,89 @@ pub fn structural_ordering<B: Backend>(
 ///
 /// Every evaluation path (VM, prefilter, re-execution maintenance) asks
 /// here, so one backend rule serves them all.
+/// The builtin kind a runtime numeric scalar carries, or `None` when the
+/// value is not numeric.
+const fn numeric_kind<B: Backend>(value: &Value<B>) -> Option<crate::backend::BuiltinKind> {
+    match value {
+        Value::Int(_) => Some(crate::backend::BuiltinKind::Int),
+        Value::Float(_) => Some(crate::backend::BuiltinKind::Float),
+        Value::Decimal(_) => Some(crate::backend::BuiltinKind::Decimal),
+        _ => None,
+    }
+}
+
+/// How a numeric pair of two different scalars orders, or `None` when the
+/// pair is not one this backend widens.
+///
+/// The widening is the backend's, because the engines disagree: measured,
+/// PostgreSQL and MySQL cast the other operand to `double precision`
+/// against a float and compare exactly against a decimal, while SQLite
+/// compares an integer against a real exactly.
+///
+/// Bounded on the standard numeric carriers rather than written for every
+/// `Backend`, because `B::Int` and `B::Float` are associated types with no
+/// conversion to `i64` and `f64`. A backend carrying its numbers otherwise
+/// implements the comparison itself.
+pub fn cross_kind_numeric_ordering<B>(
+    left: &Value<B>,
+    right: &Value<B>,
+) -> Option<core::cmp::Ordering>
+where
+    B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
+{
+    use crate::backend::NumericWidening;
+
+    let (left_kind, right_kind) = (numeric_kind(left)?, numeric_kind(right)?);
+    if left_kind == right_kind {
+        // Same scalar on both sides: not this function's question.
+        return None;
+    }
+    match B::numeric_widening(left_kind, right_kind)? {
+        NumericWidening::AtFloatWidth => at_float_width(left)?.partial_cmp(&at_float_width(right)?),
+        NumericWidening::Exact => exactly(left)?.partial_cmp(&exactly(right)?),
+    }
+}
+
+/// One numeric operand as `f64`, reproducing a cast to `double precision`.
+fn at_float_width<B>(value: &Value<B>) -> Option<f64>
+where
+    B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
+{
+    match value {
+        Value::Int(int) => Some(crate::backend::widen_i64_to_f64(*int)),
+        Value::Float(float) => Some(*float),
+        // The parse is the cast the server performs. A decimal outside
+        // `f64`'s range has no `double precision` to be cast to, so the
+        // pair has no order.
+        Value::Decimal(decimal) => {
+            <bigdecimal::BigDecimal as bigdecimal::ToPrimitive>::to_f64(decimal)
+        }
+        _ => None,
+    }
+}
+
+/// One numeric operand with every digit kept.
+///
+/// A non-finite float has no decimal to compare against, so such a pair has
+/// no order, which is the same answer the structural rule gives.
+fn exactly<B>(value: &Value<B>) -> Option<bigdecimal::BigDecimal>
+where
+    B: Backend<Int = i64, Float = f64, Decimal = bigdecimal::BigDecimal>,
+{
+    match value {
+        Value::Int(int) => Some(bigdecimal::BigDecimal::from(*int)),
+        Value::Float(float) => {
+            <bigdecimal::BigDecimal as bigdecimal::FromPrimitive>::from_f64(*float)
+        }
+        Value::Decimal(decimal) => Some(decimal.clone()),
+        _ => None,
+    }
+}
+
+/// Equality as backend `B` answers it for this pair of operands.
+///
+/// Every evaluation path asks through here, so a backend that overrides
+/// the structural rule answers all of them at once.
 pub fn values_equal<B: Backend>(
     comparison: ComparisonContext<'_, B>,
     a: &Value<B>,
@@ -263,6 +352,14 @@ mod tests {
         !v.is_absent()
     }
 
+    /// Whether both values are numeric, which is the one cross-scalar
+    /// family this backend widens rather than refuses.
+    fn numeric_pair(a: &Value<Postgres>, b: &Value<Postgres>) -> bool {
+        let numeric =
+            |v: &Value<Postgres>| matches!(v, Value::Int(_) | Value::Float(_) | Value::Decimal(_));
+        numeric(a) && numeric(b)
+    }
+
     fn is_nan(v: &Value<Postgres>) -> bool {
         matches!(v, Value::Float(f) if f.is_nan())
     }
@@ -310,6 +407,7 @@ mod tests {
         fn cross_scalar_pairs_are_never_equal(a in arb_value(), b in arb_value()) {
             if is_present(&a) && is_present(&b)
                 && core::mem::discriminant(&a) != core::mem::discriminant(&b)
+                && !numeric_pair(&a, &b)
             {
                 prop_assert!(
                     !values_equal(ComparisonContext::none(), &a, &b),
@@ -388,15 +486,16 @@ mod tests {
             }
         }
 
-        /// Cross-scalar pairs, and same-scalar pairs on variants without a
-        /// `PartialOrd` bound (`Bool`, `Json`, `Jsonb`), collapse to
-        /// `Tri::Unknown`.
+        /// Cross-scalar pairs collapse to `Tri::Unknown`: there is no
+        /// coercion between scalars, so no order across them either.
         #[test]
         fn ordered_cmp_unknown_on_incomparable(a in arb_value(), b in arb_value()) {
             if !is_present(&a) || !is_present(&b) || is_nan(&a) || is_nan(&b) {
                 return Ok(());
             }
-            if core::mem::discriminant(&a) != core::mem::discriminant(&b) {
+            if core::mem::discriminant(&a) != core::mem::discriminant(&b)
+                && !numeric_pair(&a, &b)
+            {
                 let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
                 prop_assert_eq!(
                     got,
@@ -425,20 +524,25 @@ mod tests {
     /// Sanity check: cross-scalar equality on hand-picked concrete values
     /// returns `false` (no coercion).
     #[test]
-    fn cross_scalar_equality_is_false_for_concrete_values() {
+    fn cross_scalar_equality_is_false_outside_the_numeric_family() {
         let int_one = Value::<Postgres>::Int(1);
+
+        // A numeric pair is compared under the backend's widening, which
+        // is what the engine does: `1 = 1.0` is a row.
         let float_one = Value::<Postgres>::Float(1.0);
-        assert!(!values_equal(
+        assert!(values_equal(
             ComparisonContext::none(),
             &int_one,
             &float_one
         ));
-        assert!(!values_equal(
+        assert!(values_equal(
             ComparisonContext::none(),
             &float_one,
             &int_one
         ));
 
+        // Outside it, nothing coerces: PostgreSQL has no operator for this
+        // pair, so there is nothing to reproduce.
         let str_one = Value::<Postgres>::String("1".to_string());
         assert!(!values_equal(ComparisonContext::none(), &int_one, &str_one));
     }
