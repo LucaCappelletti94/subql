@@ -103,6 +103,13 @@ struct Custom;
 impl Backend for Custom {
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
+    /// Exact bytes, which is all this backend's fixtures need.
+    fn trailing_spaces(
+        _comparison: &subql::backend::ComparisonContext<'_, Self>,
+    ) -> subql::backend::TrailingSpaces {
+        subql::backend::TrailingSpaces::BothSignificant
+    }
+
     type Dialect = PostgreSqlDialect;
     type Custom = MyScalars;
     type Bool = bool;

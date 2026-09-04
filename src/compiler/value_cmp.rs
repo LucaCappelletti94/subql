@@ -154,8 +154,8 @@ mod comparison_descriptor_tests {
             "CREATE TABLE t (code CHARACTER(5));",
         ] {
             assert!(
-                comparison(ddl, "code").is_blank_padded(),
-                "a declared char type is blank padded: {ddl}"
+                comparison(ddl, "code").declares_char_type(),
+                "a declared char type is fixed width: {ddl}"
             );
         }
         for ddl in [
@@ -163,7 +163,7 @@ mod comparison_descriptor_tests {
             "CREATE TABLE t (code TEXT);",
         ] {
             assert!(
-                !comparison(ddl, "code").is_blank_padded(),
+                !comparison(ddl, "code").declares_char_type(),
                 "a varying type keeps trailing spaces: {ddl}"
             );
         }

@@ -194,19 +194,70 @@ pub struct ColumnComparison<C> {
 }
 
 impl<C> ColumnComparison<C> {
-    /// Whether the declared type is blank padded, so comparison ignores
-    /// trailing spaces.
+    /// Whether the declared type is a fixed-width character type.
     ///
-    /// `char(n)` ignores them on PostgreSQL and MySQL whatever the collation
-    /// says, and for any `n`, so the rule needs the type and not the width.
-    /// The width is not available anyway: `sql-traits` canonicalizes
-    /// `CHARACTER(5)` to `CHAR`.
+    /// PostgreSQL pads such a column out to its width on write and then
+    /// ignores those trailing spaces when comparing, so the rule needs the
+    /// type and not the width. The width is not available anyway:
+    /// `sql-traits` canonicalizes `CHARACTER(5)` to `CHAR`.
+    ///
+    /// This is only the type fact. Whether it makes a comparison ignore
+    /// trailing spaces is the backend's decision, because the engines
+    /// differ: PostgreSQL decides on the type, while MySQL decides on the
+    /// collation and strips a `CHAR` column's trailing spaces on write, so
+    /// no padded cell reaches a comparison at all.
     #[must_use]
-    pub fn is_blank_padded(&self) -> bool {
+    pub fn declares_char_type(&self) -> bool {
         let declared = self.declared_type.trim();
         ["char", "character", "bpchar", "nchar"]
             .iter()
             .any(|name| declared.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether the column's collation declares that comparisons ignore
+    /// trailing spaces, which is MySQL's `PAD SPACE`.
+    #[must_use]
+    pub const fn collation_pads_trailing_spaces(&self) -> bool {
+        matches!(
+            &self.collation,
+            CollationFacts::Named {
+                padding: Some(TrailingSpacePadding::PadSpace),
+                ..
+            }
+        )
+    }
+}
+
+/// How each side of a text comparison is read, once the backend has
+/// decided what the operands' declared types and collations mean.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum TrailingSpaces {
+    /// Both sides keep their trailing spaces: the exact-bytes rule.
+    BothSignificant,
+    /// Neither side's trailing spaces count, which is PostgreSQL comparing
+    /// two `char` values, or a `char` against a `varchar` or a literal, and
+    /// MySQL under a `PAD SPACE` collation.
+    BothIgnored,
+    /// Only the left side's trailing spaces are dropped, which is
+    /// PostgreSQL comparing a `char` column against a `text` one: the
+    /// conversion to `text` strips the padding and the comparison is then
+    /// exact.
+    LeftStripped,
+    /// The mirror of [`Self::LeftStripped`].
+    RightStripped,
+}
+
+impl TrailingSpaces {
+    /// The two operands as this rule reads them.
+    #[must_use]
+    pub fn apply<'a>(self, left: &'a str, right: &'a str) -> (&'a str, &'a str) {
+        let trim = |text: &'a str| text.trim_end_matches(' ');
+        match self {
+            Self::BothSignificant => (left, right),
+            Self::BothIgnored => (trim(left), trim(right)),
+            Self::LeftStripped => (trim(left), right),
+            Self::RightStripped => (left, trim(right)),
+        }
     }
 }
 
@@ -498,16 +549,28 @@ fn append_text(output: &mut alloc::vec::Vec<u8>, tag: u8, value: &str, mode: Tex
     }
 }
 
-pub(super) const fn postgres_text_key(column: &ColumnComparisonOf<Postgres>) -> Option<TextKey> {
-    match &column.collation {
-        // PostgreSQL CREATE DATABASE cannot select nondeterministic comparisons.
-        CollationFacts::DatabaseDefault => Some(TextKey::Exact),
+pub(super) fn postgres_text_key(column: &ColumnComparisonOf<Postgres>) -> Option<TextKey> {
+    // A `char(n)` cell arrives padded out to its width, and PostgreSQL
+    // ignores those spaces when comparing, so two spellings of one value
+    // must encode to one key. Reading only the collation answered `Exact`
+    // and split `ab` from `ab   ` into two groups.
+    let deterministic = match &column.collation {
+        // PostgreSQL CREATE DATABASE cannot select nondeterministic
+        // comparisons.
+        CollationFacts::DatabaseDefault => true,
         CollationFacts::Named {
             postgres_deterministic: Some(true),
             ..
-        } => Some(TextKey::Exact),
-        CollationFacts::Named { .. } | CollationFacts::Unknown => None,
+        } => true,
+        CollationFacts::Named { .. } | CollationFacts::Unknown => false,
+    };
+    if !deterministic {
+        return None;
     }
+    if column.declares_char_type() {
+        return Some(TextKey::TrimTrailingSpace);
+    }
+    Some(TextKey::Exact)
 }
 
 pub(super) fn sqlite_text_key(column: &ColumnComparisonOf<SQLite>) -> Option<TextKey> {

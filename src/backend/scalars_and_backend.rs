@@ -312,6 +312,20 @@ pub trait Backend: 'static {
         crate::compiler::value_cmp::structural_ordering(left, right)
     }
 
+    /// How a text comparison between these two operands reads their
+    /// trailing spaces.
+    ///
+    /// Required rather than defaulted, and asked of the backend rather than
+    /// computed from the descriptor, because the engines decide it by
+    /// different routes: PostgreSQL decides on the declared type, MySQL on
+    /// the collation. Guessing one rule for both answers one of them wrongly.
+    #[must_use]
+    fn trailing_spaces(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+    ) -> super::scalar_value::TrailingSpaces
+    where
+        Self: Sized;
+
     /// The character a `LIKE` pattern uses to escape the next character
     /// without an `ESCAPE` clause, or `None` when the engine has no default.
     ///

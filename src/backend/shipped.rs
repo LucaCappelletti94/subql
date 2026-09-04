@@ -19,6 +19,33 @@ use alloc::string::ToString;
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
+    /// PostgreSQL decides on the declared type: a `char(n)` side is padded
+    /// out to its width on write, and the padding is ignored when comparing
+    /// against another `char`, a `varchar` or a literal.
+    ///
+    /// Measured asymmetry: a `char` against a `text` column strips only the
+    /// `char` side, because converting `char` to `text` drops the padding
+    /// and the comparison is then exact. A side whose facts are unknown is
+    /// treated as a literal, which is what an unknown side usually is.
+    fn trailing_spaces(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+    ) -> super::scalar_value::TrailingSpaces {
+        use super::scalar_value::TrailingSpaces;
+        let padded = |side: Option<&ColumnComparisonOf<Self>>| {
+            side.is_some_and(ColumnComparisonOf::<Self>::declares_char_type)
+        };
+        let text_typed = |side: Option<&ColumnComparisonOf<Self>>| {
+            side.is_some_and(|facts| facts.declared_type.trim().eq_ignore_ascii_case("text"))
+        };
+        match (padded(comparison.left), padded(comparison.right)) {
+            (true, true) => TrailingSpaces::BothIgnored,
+            (true, false) if text_typed(comparison.right) => TrailingSpaces::LeftStripped,
+            (false, true) if text_typed(comparison.left) => TrailingSpaces::RightStripped,
+            (true, false) | (false, true) => TrailingSpaces::BothIgnored,
+            (false, false) => TrailingSpaces::BothSignificant,
+        }
+    }
+
     /// Measured: a backslash escapes the next character.
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
@@ -36,13 +63,17 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     /// server, but [`Backend::Decimal`] is a `BigDecimal`, which cannot
     /// represent one, so no such value reaches here.
     fn scalars_equal(
-        _comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
         left: &Value<Self>,
         right: &Value<Self>,
     ) -> bool {
         match (left, right) {
             (Value::Float(x), Value::Float(y)) if x.is_nan() || y.is_nan() => {
                 x.is_nan() && y.is_nan()
+            }
+            (Value::String(x), Value::String(y)) => {
+                let (x, y) = Self::trailing_spaces(&comparison).apply(x, y);
+                x == y
             }
             _ => crate::compiler::value_cmp::structural_equality(left, right),
         }
@@ -52,7 +83,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     /// equal to another NaN. IEEE leaves every such pair unordered, which
     /// answered `Tri::Unknown` and dropped the row.
     fn compare_scalars(
-        _comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
         left: &Value<Self>,
         right: &Value<Self>,
     ) -> Option<core::cmp::Ordering> {
@@ -65,6 +96,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
                 } else {
                     core::cmp::Ordering::Less
                 })
+            }
+            (Value::String(x), Value::String(y)) => {
+                let (x, y) = Self::trailing_spaces(&comparison).apply(x, y);
+                Some(x.cmp(y))
             }
             _ => crate::compiler::value_cmp::structural_ordering(left, right),
         }
@@ -126,6 +161,59 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
+    /// A `PAD SPACE` collation ignores trailing spaces on both sides, which
+    /// no structural comparison reproduces.
+    fn scalars_equal(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> bool {
+        match (left, right) {
+            (Value::String(x), Value::String(y)) => {
+                let (x, y) = Self::trailing_spaces(&comparison).apply(x, y);
+                x == y
+            }
+            _ => crate::compiler::value_cmp::structural_equality(left, right),
+        }
+    }
+
+    /// Ordering reads trailing spaces the same way equality does.
+    fn compare_scalars(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering> {
+        match (left, right) {
+            (Value::String(x), Value::String(y)) => {
+                let (x, y) = Self::trailing_spaces(&comparison).apply(x, y);
+                Some(x.cmp(y))
+            }
+            _ => crate::compiler::value_cmp::structural_ordering(left, right),
+        }
+    }
+
+    /// MySQL decides on the collation, not the type: a `PAD SPACE`
+    /// collation ignores trailing spaces and `NO PAD`, the 8.0 default,
+    /// does not. A `CHAR` column never delivers a padded cell at all,
+    /// because the server strips trailing spaces on write.
+    ///
+    /// A collation whose padding the catalog does not carry compares
+    /// exactly, which is right for the 8.0 default and the reason the
+    /// unknown case is asserted rather than assumed.
+    fn trailing_spaces(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+    ) -> super::scalar_value::TrailingSpaces {
+        use super::scalar_value::TrailingSpaces;
+        let pads = |side: Option<&ColumnComparisonOf<Self>>| {
+            side.is_some_and(ColumnComparisonOf::<Self>::collation_pads_trailing_spaces)
+        };
+        if pads(comparison.left) || pads(comparison.right) {
+            TrailingSpaces::BothIgnored
+        } else {
+            TrailingSpaces::BothSignificant
+        }
+    }
+
     /// Measured: a backslash escapes the next character.
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
@@ -195,6 +283,14 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    /// SQLite pads nothing: `CHAR(n)` is not a fixed-width type there, and
+    /// trailing spaces are always significant under `BINARY`.
+    fn trailing_spaces(
+        _comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+    ) -> super::scalar_value::TrailingSpaces {
+        super::scalar_value::TrailingSpaces::BothSignificant
+    }
+
     /// Measured: SQLite has no default escape, so a backslash in a
     /// pattern matches a backslash.
     const LIKE_DEFAULT_ESCAPE: Option<char> = None;

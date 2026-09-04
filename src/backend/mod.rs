@@ -53,7 +53,7 @@ pub(crate) use scalar_value::jsonb_payloads_equal;
 pub use scalar_value::{
     BuiltinKind, Carried, CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf,
     ComparisonContext, CustomScalars, GroupKeyEncoder, NoCustom, NoCustomScalars, ScalarKind,
-    ScalarKindOf, TextKey, TrailingSpacePadding, Value,
+    ScalarKindOf, TextKey, TrailingSpacePadding, TrailingSpaces, Value,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,
