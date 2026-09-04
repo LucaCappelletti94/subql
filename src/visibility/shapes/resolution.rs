@@ -744,10 +744,14 @@ fn replay_of(
         if candidate.description != producer.shape {
             continue;
         }
-        // One description reported with two different queries is an ambiguity
-        // nothing here can settle, so the region is refused rather than
-        // reconciled from a guess.
-        if found.is_some_and(|held| held.sql != candidate.sql) {
+        // One description reported twice is an ambiguity nothing here can
+        // settle, so the region is refused rather than reconciled from a
+        // guess. The condition counts as much as the text: it decides whether
+        // the rows carry a condition and which one, so taking either of two
+        // would grant on terms the other did not state.
+        if found
+            .is_some_and(|held| held.sql != candidate.sql || held.condition != candidate.condition)
+        {
             return None;
         }
         found = Some(candidate);

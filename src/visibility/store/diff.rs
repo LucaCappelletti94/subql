@@ -1816,4 +1816,86 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             store.uncovered()
         );
     }
+
+    /// Two enumerations for one producer that agree on the SQL but differ on
+    /// the condition are still an ambiguity.
+    ///
+    /// The condition decides whether the replayed rows carry one and which,
+    /// so taking either would grant on terms the other did not state. The
+    /// region is refused instead, which is what a caller can see.
+    #[test]
+    fn enumerations_disagreeing_only_on_the_condition_refuse_the_region() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(MEMBERSHIP).unwrap();
+        let shape = RecordDescription {
+            tables: vec![test_names::table("team_members")],
+            derivation: RecordDerivation::WholeShape {
+                query: "SELECT object, relation, subject FROM held;".to_string(),
+                condition: None,
+                scope: ReplayScope::Object {
+                    object_type: "docs".to_string(),
+                    relations: vec![can_select_relation()],
+                },
+                reason: "rows no key names".to_string(),
+            },
+        };
+        // A second producer on the same region, so the group needs both and
+        // this one is reached through the enumerations rather than its own
+        // query.
+        let settled = RecordDescription {
+            tables: vec![test_names::table("team_members")],
+            derivation: RecordDerivation::Joined {
+                queries: vec![BoundQuery::new(
+                    test_names::table("team_members"),
+                    vec![test_names::column("team_id")],
+                    "SELECT 1 WHERE team_id = $1;".to_string(),
+                    None,
+                    ReplayScope::Object {
+                        object_type: "docs".to_string(),
+                        relations: vec![can_select_relation()],
+                    },
+                )
+                .unwrap()],
+                reason: "two rows".to_string(),
+            },
+        };
+        let entry = |shape: RecordDescription| RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![shape],
+            decision: None,
+            grants_nobody: false,
+        };
+        let same = "SELECT object, relation, subject FROM grants;";
+        let store = Shapes::new::<Postgres>(
+            db,
+            &[entry(shape), entry(settled.clone())],
+            &[
+                Enumeration {
+                    description: &settled,
+                    sql: same,
+                    condition: None,
+                },
+                Enumeration {
+                    description: &settled,
+                    sql: same,
+                    condition: Some("when_expires_at"),
+                },
+            ],
+        );
+
+        assert!(
+            store.materialisations().is_empty(),
+            "the condition is not this index's to choose: {:?}",
+            store.materialisations()
+        );
+        assert!(
+            store
+                .uncovered()
+                .iter()
+                .any(|gap| gap.reason == UncoveredReason::MissingEnumeration),
+            "and the region is reported rather than reconciled: {:?}",
+            store.uncovered()
+        );
+    }
 }
