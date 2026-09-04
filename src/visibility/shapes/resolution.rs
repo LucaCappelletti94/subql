@@ -847,6 +847,12 @@ fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
                     name_gap(entry, shape, table, UncoveredReason::MissingEnumeration)
                 }),
             );
+            // Refused for maintenance, which is a different question from what
+            // a row implies. The row policy and the resulting-row check of a
+            // write both read that, and neither deletes anything, so keeping it
+            // cannot reach the store. Dropping it would deny a write the row's
+            // own facts would have admitted.
+            index_implied(db, shape, by_table);
             return;
         }
         Placement::Grouped(group) => {
@@ -944,8 +950,19 @@ fn index_grouped<DB: DatabaseLike>(
             held.groups.push(group);
         }
     }
-    // A row of the table still implies these records, which is a different
-    // question from who keeps the store current.
+    index_implied(db, shape, by_table);
+}
+
+/// Record what a row of the table implies, without maintaining anything.
+///
+/// A different question from who keeps the store current: the row policy and a
+/// write's resulting-row check both read this, and neither removes a fact, so
+/// it is recorded whatever the maintenance decision was.
+fn index_implied<DB: DatabaseLike>(
+    db: &DB,
+    shape: &RecordDescription,
+    by_table: &mut HashMap<TableId, TableShapes>,
+) {
     if let RecordDerivation::FromRow { table, .. } = &shape.derivation {
         if let Some(id) = catalog_helpers::contract_table_id(db, table) {
             by_table.entry(id).or_default().settled.push(shape.clone());

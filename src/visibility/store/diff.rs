@@ -1815,6 +1815,15 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             "the settled producer's refusal is reported: {:?}",
             store.uncovered()
         );
+        let docs_table = table(&store, "docs");
+        assert!(
+            store
+                .table_records(docs_table)
+                .is_some_and(|shapes| !shapes.is_empty()),
+            "but what a row of the table implies is a different question, and a \
+             write's resulting-row check reads it, so refusing the maintenance \
+             must not empty it"
+        );
     }
 
     /// Two enumerations for one producer that agree on the SQL but differ on
