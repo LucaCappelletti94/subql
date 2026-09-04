@@ -1052,3 +1052,59 @@ impl<B: Backend> PartialEq for Value<B> {
         }
     }
 }
+
+#[cfg(test)]
+mod jsonb_order_tests {
+    use alloc::vec::Vec;
+
+    /// PostgreSQL 16.15 answering `SELECT left > right` for each pair, as
+    /// measured for this crate's `jsonb` work.
+    const VECTORS: &[(&str, &str, bool)] = &[
+        ("{}", "[1]", true),
+        ("[]", "true", false),
+        ("[1]", "true", true),
+        ("true", "1", true),
+        ("false", "1", true),
+        ("1", "\"a\"", true),
+        ("\"a\"", "null", true),
+        ("[1,2]", "[9]", true),
+        ("[2]", "[1,9]", false),
+        ("{\"a\":1,\"b\":2}", "{\"z\":9}", true),
+        ("{\"b\":1}", "{\"a\":9}", true),
+        ("1.0", "1", false),
+        ("\"a\"", "\"B\"", false),
+    ];
+
+    /// The canonical binary form is not ordered the way the server orders
+    /// `jsonb`, so comparing encoded bytes is not a cheap way to answer an
+    /// ordered `jsonb` comparison in process. This is the evidence behind
+    /// classifying the form as a read instead of serving it: five of these
+    /// thirteen measured pairs come out backwards.
+    ///
+    /// The last of them, `"a" > "B"`, is also why an ordering comparator
+    /// alone would not settle the question: `jsonb` string ordering follows
+    /// the database collation.
+    #[test]
+    fn canonical_bytes_do_not_order_like_postgres() {
+        let disagreements: Vec<&str> = VECTORS
+            .iter()
+            .filter(|(left, right, postgres)| {
+                let decode = |text: &str| -> serde_json::Value {
+                    serde_json::from_str(text).expect("vector is valid JSON")
+                };
+                let encode = |value: &serde_json::Value| -> Vec<u8> {
+                    postgres_jsonb_canonical::encode::<postgres_jsonb_canonical::Pg18>(value)
+                        .expect("vector is storable")
+                };
+                (encode(&decode(left)) > encode(&decode(right))) != *postgres
+            })
+            .map(|(left, _, _)| *left)
+            .collect();
+
+        assert_eq!(
+            disagreements,
+            ["[]", "true", "false", "1", "\"a\""],
+            "the pairs whose byte order contradicts the server, keyed by left operand"
+        );
+    }
+}

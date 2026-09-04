@@ -58,6 +58,40 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     }
 }
 
+/// Refuse an ordered comparison whose operand kind has no order this build
+/// reproduces.
+///
+/// `jsonb` is that kind. PostgreSQL's order over it is neither the order of
+/// the canonical binary form nor a byte order at all: its string arm follows
+/// the database collation. Answering such a comparison in process would
+/// answer it differently from the server, so the statement is classified at
+/// registration and served by a database read instead.
+///
+/// Equality is unaffected, being equivalence of the canonical form, which
+/// the encoder already reproduces.
+fn refuse_unordered_kind<DB: DatabaseLike>(
+    operands: [&Expr; 2],
+    table_id: TableId,
+    database: &DB,
+) -> Result<(), RegisterError> {
+    for side in operands {
+        let Some(column) = resolve_column_ref(side, table_id, database) else {
+            continue;
+        };
+        if crate::catalog_helpers::column_builtin_kind(database, table_id, column)
+            == Some(BuiltinKind::Jsonb)
+        {
+            return Err(RegisterError::NotServedInProcess(
+                crate::errors::Refusal::OrderNotReproducible {
+                    column,
+                    kind: BuiltinKind::Jsonb,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Return `true` if `instr` produces a [`crate::compiler::Tri`] on the
 /// stack. Used to detect whether a top-level WHERE program leaves a
 /// boolean at TOS or needs to be wrapped with `= true`.
@@ -332,10 +366,18 @@ where
                     match op {
                         BinaryOperator::Eq => out.push(Instruction::Equal),
                         BinaryOperator::NotEq => out.push(Instruction::NotEqual),
-                        BinaryOperator::Lt => out.push(Instruction::LessThan),
-                        BinaryOperator::LtEq => out.push(Instruction::LessThanOrEqual),
-                        BinaryOperator::Gt => out.push(Instruction::GreaterThan),
-                        BinaryOperator::GtEq => out.push(Instruction::GreaterThanOrEqual),
+                        BinaryOperator::Lt
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::GtEq => {
+                            refuse_unordered_kind::<DB>([left, right], table_id, database)?;
+                            out.push(match op {
+                                BinaryOperator::Lt => Instruction::LessThan,
+                                BinaryOperator::LtEq => Instruction::LessThanOrEqual,
+                                BinaryOperator::Gt => Instruction::GreaterThan,
+                                _ => Instruction::GreaterThanOrEqual,
+                            });
+                        }
 
                         BinaryOperator::Plus => out.push(Instruction::Add),
                         BinaryOperator::Minus => out.push(Instruction::Subtract),
@@ -491,6 +533,11 @@ where
             high,
             negated,
         } => {
+            // A range is two ordered comparisons, so the same classification
+            // applies to each bound.
+            refuse_unordered_kind::<DB>([expr, low], table_id, database)?;
+            refuse_unordered_kind::<DB>([expr, high], table_id, database)?;
+
             let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
                 .unwrap_or_else(|| BuiltinKind::String.into());
 

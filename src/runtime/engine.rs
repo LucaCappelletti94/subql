@@ -1611,6 +1611,12 @@ where
                 kind: kind.into(),
                 function,
             },
+            Refusal::OrderNotReproducible { column, kind } => {
+                crate::NotServed::OrderNotReproducible {
+                    column,
+                    kind: kind.into(),
+                }
+            }
             Refusal::Unsupported(prose) => crate::NotServed::UnsupportedSql(prose),
         }
     }

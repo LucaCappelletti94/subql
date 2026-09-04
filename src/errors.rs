@@ -85,6 +85,17 @@ pub enum Refusal {
         /// The aggregate function, as the statement spelled it.
         function: String,
     },
+    /// The comparison orders a kind whose order this build cannot
+    /// reproduce, `jsonb` being the one such kind today.
+    #[error(
+        "ordered comparison on column {column} of type {kind:?} is not reproducible in process"
+    )]
+    OrderNotReproducible {
+        /// The compared column.
+        column: crate::ColumnId,
+        /// The column's builtin kind, which is what carries no order here.
+        kind: crate::backend::BuiltinKind,
+    },
     /// A form with no structured cause, carrying the compiler's own words.
     #[error("{0}")]
     Unsupported(String),

@@ -683,6 +683,16 @@ pub enum NotServed<B: Backend> {
         /// The aggregate function, as the statement spelled it.
         function: String,
     },
+    /// The comparison orders a kind whose order this build cannot
+    /// reproduce. `jsonb` is the one such kind today: PostgreSQL's order
+    /// over it is not the order of the canonical binary form, and its
+    /// string arm follows the database collation.
+    OrderNotReproducible {
+        /// The compared column.
+        column: ColumnId,
+        /// The column's declared scalar kind.
+        kind: ScalarKindOf<B>,
+    },
     /// A form the compiler refused with prose rather than a structured
     /// cause.
     UnsupportedSql(String),
@@ -715,6 +725,12 @@ impl<B: Backend> core::fmt::Display for NotServed<B> {
                 f,
                 "{function} requires a numeric column (Int, Float, or Decimal), \
                  but column {column} has type {kind}",
+                kind = ScalarKindName::<B>(kind)
+            ),
+            Self::OrderNotReproducible { column, kind } => write!(
+                f,
+                "column {column} has type {kind}, whose ordered comparison \
+                 subql cannot reproduce in process",
                 kind = ScalarKindName::<B>(kind)
             ),
             Self::UnsupportedSql(message) => f.write_str(message),
