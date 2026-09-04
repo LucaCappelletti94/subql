@@ -236,7 +236,42 @@ pub struct ConsumerNotifications<
     /// no-match, because `Value::Null` composes through `OR` and would turn
     /// a refusal into a silent wrong answer.
     pub(crate) evaluation_failures: Vec<EvaluationFailure<I>>,
+    /// Subscriptions whose predicate read a cell the event does not carry,
+    /// so it has no answer for this row rather than a false one.
+    ///
+    /// Reported rather than collapsed into a no-match: `Value::Missing` is
+    /// not `Value::Null`, and a caller holding a connector can re-execute
+    /// the subscription to get the answer the stream could not give.
+    pub(crate) unanswered: Vec<UnansweredCell<I>>,
 }
+
+/// One subscription's predicate that read a cell the change stream did not
+/// carry.
+///
+/// Per subscription, like an evaluation failure: one consumer can hold
+/// several, and only those whose predicate actually read the absent cell
+/// are unanswerable.
+#[derive(Clone, Copy, Debug)]
+pub struct UnansweredCell<I: IdTypes> {
+    /// The subscription that could not be answered.
+    pub subscription_id: crate::SubscriptionId,
+    /// The consumer that subscription belongs to.
+    pub consumer_id: I::ConsumerId,
+    /// The column the event does not carry.
+    pub column: crate::ColumnId,
+}
+
+// Hand-implemented for the same reason as `EvaluationFailure`: `#[derive]`
+// would require `I: PartialEq`, which `IdTypes` does not imply.
+impl<I: IdTypes> PartialEq for UnansweredCell<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.subscription_id == other.subscription_id
+            && self.consumer_id == other.consumer_id
+            && self.column == other.column
+    }
+}
+
+impl<I: IdTypes> Eq for UnansweredCell<I> {}
 
 /// One subscription's predicate that the target engine refuses to evaluate
 /// for one row.
@@ -285,6 +320,7 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> ConsumerNotifications<I, C, B> {
             checkpoint: None,
             narrowings: Vec::new(),
             evaluation_failures: Vec::new(),
+            unanswered: Vec::new(),
         }
     }
 
@@ -336,6 +372,21 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> ConsumerNotifications<I, C, B> {
         &self.evaluation_failures
     }
 
+    /// The subscriptions whose predicate read a cell this event does not
+    /// carry. Empty for every event that carries every cell its
+    /// subscriptions read.
+    #[must_use]
+    pub fn unanswered(&self) -> &[UnansweredCell<I>] {
+        &self.unanswered
+    }
+
+    /// Attach the unanswerable subscriptions one event produced.
+    #[must_use]
+    pub(crate) fn with_unanswered(mut self, unanswered: Vec<UnansweredCell<I>>) -> Self {
+        self.unanswered = unanswered;
+        self
+    }
+
     /// Attach the evaluation failures one event produced.
     #[must_use]
     pub(crate) fn with_evaluation_failures(mut self, failures: Vec<EvaluationFailure<I>>) -> Self {
@@ -375,6 +426,14 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> core::fmt::Debug for ConsumerNotific
                     .evaluation_failures
                     .iter()
                     .map(|failure| failure.refusal)
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "unanswered",
+                &self
+                    .unanswered
+                    .iter()
+                    .map(|entry| (entry.subscription_id, entry.column))
                     .collect::<Vec<_>>(),
             )
             .finish()

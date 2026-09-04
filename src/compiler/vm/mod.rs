@@ -145,6 +145,14 @@ impl<B: Backend> PartialEq for StackValue<B> {
 pub struct Vm<B: Backend> {
     /// Value stack (grows during evaluation).
     stack: Vec<StackValue<B>>,
+    /// The first column this evaluation read that the event does not
+    /// carry, cleared at the start of each evaluation.
+    ///
+    /// Recorded where the cell is read rather than derived from the
+    /// program's column list, so a short circuit that never reaches the
+    /// absent cell records nothing, and so a `Null` cell, which is a value
+    /// the database holds, is never mistaken for an absent one.
+    absent_column: Option<crate::ColumnId>,
 }
 
 impl<B: Backend> Vm<B> {
@@ -156,6 +164,7 @@ impl<B: Backend> Vm<B> {
     pub fn new() -> Self {
         Self {
             stack: Vec::with_capacity(16),
+            absent_column: None,
         }
     }
 
@@ -185,6 +194,17 @@ impl<B: Backend> Vm<B> {
         self.eval_with_terms(program, event, row, db, &[])
     }
 
+    /// The column the last evaluation read and the event did not carry, or
+    /// `None` when every cell it read was there.
+    ///
+    /// Only meaningful immediately after an evaluation, which resets it.
+    /// The caller decides what an absent cell means: the answer is not
+    /// false, it is missing, and a caller holding a connector can re-read.
+    #[must_use]
+    pub const fn absent_column(&self) -> Option<crate::ColumnId> {
+        self.absent_column
+    }
+
     /// Evaluate `program` with one truth per membership term slot.
     ///
     /// A membership term answers differently for different subscribers, so its
@@ -210,6 +230,7 @@ impl<B: Backend> Vm<B> {
         DB: DatabaseLike,
     {
         self.stack.clear();
+        self.absent_column = None;
 
         let instructions = &program.instructions;
         let len = instructions.len();
@@ -298,6 +319,11 @@ impl<B: Backend> Vm<B> {
 
             Instruction::LoadColumn(col_id) => {
                 let value = event.value_at(db, row, *col_id).map_err(VmError::Value)?;
+                // Recorded here, where the cell is read: a predicate that
+                // short-circuits before this load has nothing absent.
+                if value.is_missing() && self.absent_column.is_none() {
+                    self.absent_column = Some(*col_id);
+                }
                 self.stack.push(StackValue::Value(value, Some(*col_id)));
             }
 

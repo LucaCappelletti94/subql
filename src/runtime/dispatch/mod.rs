@@ -39,6 +39,7 @@ fn dispatch_vm_error(error: VmError) -> DispatchError {
 #[derive(Default)]
 struct DispatchReports {
     refusals: Vec<(ConsumerOrdinal, SubscriptionId, EvaluationRefusal)>,
+    unanswered: Vec<(ConsumerOrdinal, SubscriptionId, crate::ColumnId)>,
 }
 
 /// The four values every evaluation pass carries: which event, which row
@@ -92,6 +93,10 @@ struct RowVerdict<'a> {
     matched: Matched<'a>,
     /// The subscribers whose evaluation the engine refuses, and why.
     refused: Option<(RoaringBitmap, EvaluationRefusal)>,
+    /// The subscribers whose evaluation read a cell the event does not
+    /// carry, and which column. Not a refusal: the engine would answer
+    /// this comparison, the stream simply did not carry the cell.
+    unanswered: Option<(RoaringBitmap, crate::ColumnId)>,
 }
 
 impl Matched<'_> {
@@ -203,10 +208,19 @@ where
                 return Ok(RowVerdict {
                     matched: Matched::Nobody,
                     refused: Some((bitmap.clone(), failure)),
+                    unanswered: None,
                 })
             }
             Err(other) => return Err(dispatch_vm_error(other)),
         };
+        // Only an unknown verdict is unanswerable. A decisive `false`
+        // read the absent cell and SQL's three-valued logic settled the
+        // answer anyway, as in `body = 'x' AND tag = 'no'`, so there is
+        // nothing a read would tell the caller.
+        let absent = (verdict == Tri::Unknown)
+            .then(|| vm.absent_column())
+            .flatten()
+            .map(|column| (bitmap.clone(), column));
         return Ok(RowVerdict {
             matched: if verdict == Tri::True {
                 Matched::Every(bitmap)
@@ -214,10 +228,11 @@ where
                 Matched::Nobody
             },
             refused: None,
+            unanswered: absent,
         });
     }
 
-    let facts = term_facts_for_row(pred, store, event, row, db)?;
+    let (facts, term_absent) = term_facts_for_row(pred, store, event, row, db)?;
 
     // Only a term the row can answer partitions the subscribers. One it cannot
     // answers alike for all of them, so it is a fixed `Unknown` rather than an
@@ -238,6 +253,8 @@ where
     let mut cause: Option<EvaluationRefusal> = None;
     // The same, per assignment, for a cell the event does not carry: an
     // assignment that short-circuits before reading it is answered.
+    let mut unanswered = RoaringBitmap::new();
+    let mut absent: Option<crate::ColumnId> = None;
     // Reused across assignments: each one starts from the predicate's own
     // subscribers, so the buffer is refilled rather than reallocated.
     let mut described = RoaringBitmap::new();
@@ -253,10 +270,17 @@ where
         // Only an assignment that matched, was refused, or could not be
         // answered needs its subscriber set computed, so this costs what it
         // did before either report existed.
+        let mut missing_here = None;
         let refusal = match vm.eval_with_terms(&pred.bytecode, event, row, db, &truths) {
             Ok(Tri::True) => None,
-            // Every other verdict is an answer, so this assignment reports
-            // nothing.
+            // Same rule per assignment: a decisive `false` is an answer.
+            Ok(Tri::Unknown) => match vm.absent_column().or(term_absent) {
+                Some(column) => {
+                    missing_here = Some(column);
+                    None
+                }
+                None => continue,
+            },
             Ok(_) => continue,
             Err(VmError::Refused(failure)) => Some(failure),
             Err(other) => return Err(dispatch_vm_error(other)),
@@ -286,6 +310,9 @@ where
         if let Some(failure) = refusal {
             refused |= &described;
             cause = Some(failure);
+        } else if let Some(column) = missing_here {
+            unanswered |= &described;
+            absent = Some(column);
         } else {
             matched |= &described;
         }
@@ -296,6 +323,9 @@ where
         refused: cause
             .filter(|_| !refused.is_empty())
             .map(|failure| (refused, failure)),
+        unanswered: absent
+            .filter(|_| !unanswered.is_empty())
+            .map(|column| (unanswered, column)),
     })
 }
 
@@ -303,20 +333,21 @@ where
 /// first column the event did not carry.
 ///
 /// A term's columns are read here rather than by the VM, so an absent one is
-/// invisible to the evaluator and settled here.
+/// invisible to [`Vm::absent_column`] and is carried out alongside the facts.
 fn term_facts_for_row<'a, I, E, DB>(
     pred: &Predicate<E::Backend>,
     store: &'a PredicateStore<I, E::Backend>,
     event: &E,
     row: RowKind,
     db: &DB,
-) -> Result<Vec<TermFacts<'a>>, DispatchError>
+) -> Result<(Vec<TermFacts<'a>>, Option<crate::ColumnId>), DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
     DB: DatabaseLike,
 {
     let mut facts: Vec<TermFacts<'a>> = Vec::with_capacity(pred.bytecode.term_columns.len());
+    let mut term_absent: Option<crate::ColumnId> = None;
     for (slot, columns) in pred.bytecode.term_columns.iter().enumerate() {
         let slot = u16::try_from(slot).unwrap_or(u16::MAX);
         // A NULL cell dominates an unreadable one: SQL never matches through a
@@ -329,11 +360,15 @@ where
             let value = event
                 .value_at(db, row, *column)
                 .map_err(DispatchError::Value)?;
+            let missing = value.is_missing();
             match TermLookup::of(value) {
                 TermLookup::Key(key) => keys.push(key),
                 TermLookup::Nobody => nobody = true,
                 TermLookup::Unknown => {
                     unknown = true;
+                    if missing && term_absent.is_none() {
+                        term_absent = Some(*column);
+                    }
                 }
             }
         }
@@ -349,7 +384,7 @@ where
             )
         });
     }
-    Ok(facts)
+    Ok((facts, term_absent))
 }
 
 /// Consumer dictionary translating between ordinals and ConsumerIds.
@@ -646,12 +681,41 @@ where
             })
         })
         .collect();
+    let unanswered = reports
+        .unanswered
+        .into_iter()
+        .filter_map(|(ordinal, subscription_id, column)| {
+            Some(crate::types::UnansweredCell {
+                subscription_id,
+                consumer_id: consumer_dict.get_consumer(ordinal)?,
+                column,
+            })
+        })
+        .collect();
     Ok((
         notifs
             .with_checkpoint(checkpoint)
-            .with_evaluation_failures(failures),
+            .with_evaluation_failures(failures)
+            .with_unanswered(unanswered),
         stamps,
     ))
+}
+
+/// Record one unanswerable predicate against every subscription bound to
+/// it, for the same reason refusals are recorded per subscription.
+fn collect_unanswered_for_predicate<I: IdTypes, B: Backend>(
+    predicates: &PredicateStore<I, B>,
+    pred_id: PredicateId,
+    consumers: &RoaringBitmap,
+    column: crate::ColumnId,
+    out: &mut Vec<(ConsumerOrdinal, SubscriptionId, crate::ColumnId)>,
+) {
+    for ord_u32 in consumers {
+        let ord = ConsumerOrdinal::new(ord_u32);
+        if let Some(sub_ids) = predicates.binding_lookup.get(&(pred_id, ord)) {
+            out.extend(sub_ids.iter().map(|sub_id| (ord, *sub_id, column)));
+        }
+    }
 }
 
 /// Record one refused predicate against every subscription bound to it.
@@ -775,6 +839,27 @@ where
             refused_here |= consumers;
         }
 
+        // The same rule for a cell the event did not carry, which is the
+        // case that produces one in production: an unchanged TOASTed column
+        // is omitted from an update's message whatever the replica identity
+        // says.
+        //
+        // The new version only. An absent cell in the old image is the
+        // replica-identity story, which `REPLICA_IDENTITY_AUDIT_SQL` covers
+        // and the transition rules already account for: under the default
+        // identity the old image is the key alone, so treating that as
+        // unanswerable would report every update on such a table.
+        if let Some((consumers, column)) = new_matched.unanswered {
+            collect_unanswered_for_predicate(
+                &snapshot.predicates,
+                pred_id,
+                &consumers,
+                column,
+                &mut reports.unanswered,
+            );
+            refused_here |= consumers;
+        }
+
         let new_served = new_matched.matched.without(&refused_here);
         let old_served = old_matched.matched.without(&refused_here);
         split_transition(&new_served, &old_served, |slot, set| {
@@ -883,6 +968,15 @@ where
                 &consumers,
                 failure,
                 &mut reports.refusals,
+            );
+        }
+        if let Some((consumers, column)) = verdict.unanswered {
+            collect_unanswered_for_predicate(
+                store,
+                pred_id,
+                &consumers,
+                column,
+                &mut reports.unanswered,
             );
         }
         if let Some(reached) = verdict.matched.bitmap().filter(|set| !set.is_empty()) {

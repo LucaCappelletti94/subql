@@ -234,8 +234,12 @@ impl<I: IdTypes, B: Backend> TablePartition<I, B> {
                         candidates |= bitmap;
                     }
                 }
-                CellPresence::Missing => {}
-                CellPresence::Undecodable => {
+                // A cell the event does not carry cannot be indexed, so
+                // pruning on it would drop a predicate the comparator
+                // would have judged, exactly as for a cell that failed to
+                // decode. Every predicate reading the column stays a
+                // candidate and the evaluation decides.
+                CellPresence::Missing | CellPresence::Undecodable => {
                     if let Some(deps) = snapshot.indexes.dependency.get(&col_id) {
                         candidates |= deps;
                     }
