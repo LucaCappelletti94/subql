@@ -607,15 +607,21 @@ impl GroupPlan {
 /// The region and its constants are settled before that decision, because two
 /// of the three reasons cannot be read off the members alone.
 ///
-/// # A producer nothing can place refuses every group
+/// # A producer nothing can place refuses every removal
 ///
-/// A group deletes over its whole region. A producer whose facts cannot be
-/// placed can neither be gathered into that group nor shown to lie outside it,
-/// so while one exists no group may delete anything at all. That is what this
-/// path did before groups existed, by reconciling nothing, and it was safe for
-/// the same reason. Such a producer is separately named in
-/// [`Shapes::uncovered`](Shapes::uncovered), so the refusal is reported rather
-/// than silent.
+/// Every removal here deletes over some region: a group over its whole one, a
+/// keyed replay over the slice its key names, and a difference over whatever
+/// the changed row stopped stating. A producer whose facts cannot be placed
+/// could hold facts in any of them, so while one exists nothing may delete at
+/// all, and every producer that states a region is refused rather than left to
+/// maintain itself. Refusing only the groups would leave a row-settled
+/// producer differencing, and a difference deletes.
+///
+/// That is what this path did before groups existed, by reconciling nothing,
+/// and it was safe for the same reason. The unplaceable producer keeps its own
+/// placement so that the gap it raises names its own cause, and every refusal
+/// is reported through [`Shapes::uncovered`](Shapes::uncovered) rather than
+/// being silent.
 fn plan_groups(producers: &[Producer<'_>], enumerations: &[Enumeration<'_>]) -> GroupPlan {
     let mut groups = Vec::new();
     let mut placed = alloc::vec![Placement::Alone; producers.len()];
@@ -623,6 +629,11 @@ fn plan_groups(producers: &[Producer<'_>], enumerations: &[Enumeration<'_>]) -> 
         .iter()
         .any(|producer| bounds_no_region(producer.shape))
     {
+        for (position, producer) in producers.iter().enumerate() {
+            if producer.region.is_some() {
+                placed[position] = Placement::Refused;
+            }
+        }
         return GroupPlan { groups, placed };
     }
 

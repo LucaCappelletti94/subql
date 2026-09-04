@@ -1759,4 +1759,61 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             store.uncovered()
         );
     }
+
+    /// While a producer nothing can place exists, a row-settled producer stops
+    /// differencing too, because a difference deletes.
+    ///
+    /// Refusing only the groups would leave the settled producer maintaining
+    /// itself, and deleting its row then removes a fact the unplaceable
+    /// producer may still state. Nothing may delete until every producer's
+    /// facts can be placed.
+    #[test]
+    fn an_unplaceable_producer_stops_the_differencing_beside_it() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(OWNERSHIP).unwrap();
+        let outputs = TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .build()
+            .translate(&db)
+            .unwrap()
+            .outputs_accepting_gaps();
+        let mut relations = outputs.translation().relations().to_vec();
+        relations.push(RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: test_names::relation("owner"),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: vec![test_names::table("docs")],
+                derivation: RecordDerivation::Joined {
+                    queries: Vec::new(),
+                    reason: "nothing could be bound".to_string(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        });
+        let store = Shapes::new::<Postgres>(db, &relations, &[]);
+
+        let docs = table(&store, "docs");
+        let event =
+            TestEvent::<Postgres>::delete(docs, vec![Value::Int(4), text("alice"), text("b")]);
+        let diff = store.diff(&event).unwrap();
+
+        assert!(
+            diff.removed.is_empty(),
+            "the fact the row stated may be stated by the producer nothing can \
+             place, so nothing may remove it: {diff:?}"
+        );
+        assert!(
+            diff.added.is_empty() && diff.requeries.is_empty(),
+            "and nothing is maintained at all: {diff:?}"
+        );
+        assert!(
+            store
+                .uncovered()
+                .iter()
+                .any(|gap| gap.reason == UncoveredReason::MissingEnumeration),
+            "the settled producer's refusal is reported: {:?}",
+            store.uncovered()
+        );
+    }
 }
