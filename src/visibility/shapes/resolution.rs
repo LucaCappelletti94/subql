@@ -623,7 +623,6 @@ impl GroupPlan {
 /// is reported through [`Shapes::uncovered`](Shapes::uncovered) rather than
 /// being silent.
 fn plan_groups(producers: &[Producer<'_>], enumerations: &[Enumeration<'_>]) -> GroupPlan {
-    let mut groups = Vec::new();
     let mut placed = alloc::vec![Placement::Alone; producers.len()];
     if producers
         .iter()
@@ -634,59 +633,93 @@ fn plan_groups(producers: &[Producer<'_>], enumerations: &[Enumeration<'_>]) -> 
                 placed[position] = Placement::Refused;
             }
         }
-        return GroupPlan { groups, placed };
+        return GroupPlan {
+            groups: Vec::new(),
+            placed,
+        };
     }
 
+    let mut groups = Vec::new();
     for members in components(producers) {
-        let mut region: Option<Region> = None;
-        for position in &members {
-            if let Some(own) = producers[*position].region.as_ref() {
-                match region.as_mut() {
-                    Some(held) => held.absorb(own),
-                    None => region = Some(own.clone()),
-                }
+        let outcome = plan_component(producers, &members, enumerations);
+        let placement = match outcome {
+            Planned::Alone => continue,
+            Planned::Refused => Placement::Refused,
+            Planned::Grouped(group) => {
+                groups.push(group);
+                Placement::Grouped(groups.len() - 1)
             }
-        }
-        let Some(region) = region else {
-            continue;
         };
-        // Gathered by the fact each one states, since a constant holds no
-        // region to overlap with.
-        let constants: Vec<Record> = producers
-            .iter()
-            .filter_map(|producer| constant_of(producer.shape))
-            .filter(|record| region.holds_record(record))
-            .cloned()
-            .collect();
-        if !needs_group(producers, &members, &constants) {
-            continue;
-        }
-
-        let mut replays = Vec::with_capacity(members.len());
-        let mut enumerable = true;
         for position in &members {
-            let producer = &producers[*position];
-            let Some(own) = producer.region.as_ref() else {
-                continue;
-            };
-            match replay_of(producer, own, enumerations) {
-                Some(replay) => replays.push(replay),
-                None => enumerable = false,
-            }
+            placed[*position] = placement;
         }
-        if !enumerable {
-            for position in &members {
-                placed[*position] = Placement::Refused;
-            }
-            continue;
-        }
-        for position in &members {
-            placed[*position] = Placement::Grouped(groups.len());
-        }
-        groups.push(Materialisation::new(region, replays, constants));
     }
 
     GroupPlan { groups, placed }
+}
+
+/// What one component of overlapping producers turned out to need.
+enum Planned {
+    /// No group: each member maintains itself.
+    Alone,
+    /// A group is needed and a member's facts are enumerated by nothing.
+    Refused,
+    /// The group, ready to reconcile.
+    Grouped(Materialisation),
+}
+
+/// Decide what `members` need, and build the group where they need one.
+fn plan_component(
+    producers: &[Producer<'_>],
+    members: &[usize],
+    enumerations: &[Enumeration<'_>],
+) -> Planned {
+    let Some(region) = union_region(producers, members) else {
+        return Planned::Alone;
+    };
+    let constants = constants_within(producers, &region);
+    if !needs_group(producers, members, &constants) {
+        return Planned::Alone;
+    }
+    let mut replays = Vec::with_capacity(members.len());
+    for position in members {
+        let producer = &producers[*position];
+        let Some(own) = producer.region.as_ref() else {
+            continue;
+        };
+        match replay_of(producer, own, enumerations) {
+            Some(replay) => replays.push(replay),
+            None => return Planned::Refused,
+        }
+    }
+    Planned::Grouped(Materialisation::new(region, replays, constants))
+}
+
+/// The union of every region `members` state facts in.
+fn union_region(producers: &[Producer<'_>], members: &[usize]) -> Option<Region> {
+    let mut region: Option<Region> = None;
+    for position in members {
+        if let Some(own) = producers[*position].region.as_ref() {
+            match region.as_mut() {
+                Some(held) => held.absorb(own),
+                None => region = Some(own.clone()),
+            }
+        }
+    }
+    region
+}
+
+/// Every constant fact lying inside `region`.
+///
+/// Gathered by the fact each one states, since a constant holds no region to
+/// overlap with.
+fn constants_within(producers: &[Producer<'_>], region: &Region) -> Vec<Record> {
+    producers
+        .iter()
+        .filter_map(|producer| constant_of(producer.shape))
+        .filter(|record| region.holds_record(record))
+        .cloned()
+        .collect()
 }
 
 /// The unnarrowed query for one producer, or [`None`] where nothing enumerates
