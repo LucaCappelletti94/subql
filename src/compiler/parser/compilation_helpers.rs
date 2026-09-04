@@ -1,7 +1,7 @@
 //! Expression compilation helpers split out of the parser.
 
 use super::{Compiling, MAX_TERMS_PER_FILTER};
-use crate::backend::{Backend, BuiltinKind, ScalarKindOf, Value};
+use crate::backend::{Backend, BuiltinKind, Value, ValueKindOf};
 use crate::compiler::bytecode::ComparisonRef;
 use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
 use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction};
@@ -13,16 +13,21 @@ use sql_traits::prelude::DatabaseLike;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 use sqlparser_canonicalize::Canonicalizer;
 
-/// If `expr` is a bare column reference, return the [`crate::backend::ScalarKind`] of that
-/// column via the catalog. Otherwise `None`. Used to derive the target
-/// type for a paired literal in a comparison or an IN list.
+/// If `expr` is a bare column reference, return what a value of that column
+/// is, via the catalog. Otherwise `None`. Used to derive the target for a
+/// paired literal in a comparison or an IN list.
+///
+/// A value kind rather than the column's declared type, because that is what
+/// a literal can be parsed at: the spelling `'0.1'` says nothing about the
+/// width the column declares.
 fn column_scalar_of<B: Backend, DB: DatabaseLike>(
     expr: &Expr,
     table_id: TableId,
     database: &DB,
-) -> Option<ScalarKindOf<B>> {
+) -> Option<ValueKindOf<B>> {
     let col = resolve_column_ref(expr, table_id, database)?;
     crate::catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, col)
+        .map(|kind| kind.value_kind())
 }
 
 /// The [`crate::backend::ScalarKind`] of the first column `expr` names, looking
@@ -40,7 +45,7 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     table_id: TableId,
     database: &DB,
     depth: usize,
-) -> Option<ScalarKindOf<B>> {
+) -> Option<ValueKindOf<B>> {
     if let Some(kind) = column_scalar_of::<B, DB>(expr, table_id, database) {
         return Some(kind);
     }
@@ -203,7 +208,7 @@ fn canonicalize_term_slots<B: Backend>(
 /// Recursive helper for expression compilation.
 ///
 /// Compiles an expression to leave its result on top of stack. The
-/// `target_kind` argument names the [`crate::backend::ScalarKind`] a standalone literal
+/// `target_kind` argument names the [`crate::backend::ValueKind`] a standalone literal
 /// leaf should coerce to; comparison / arithmetic / IN / BETWEEN /
 /// LIKE arms override this per-child by peeking at whichever sibling is
 /// a column reference.
@@ -214,7 +219,7 @@ fn compile_expr_recursive<B, DB>(
     database: &DB,
     out: &mut Compiling<B>,
     depth: usize,
-    target_kind: ScalarKindOf<B>,
+    target_kind: ValueKindOf<B>,
 ) -> Result<(), RegisterError>
 where
     B: Backend + SqlLiteralParse,

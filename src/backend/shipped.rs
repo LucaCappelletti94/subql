@@ -8,7 +8,7 @@ use super::scalar_value::{
 };
 use super::{
     Backend, BuiltinKind, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, NumericWidening,
-    ScalarKindOf, SqliteJson, TextRule, Value,
+    SqliteJson, TextRule, Value,
 };
 use alloc::string::ToString;
 
@@ -64,6 +64,28 @@ fn postgres_trailing_spaces<V: postgres_jsonb_canonical::PgVersion + 'static>(
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
+    /// Measured: `real` and `float4` are float4, `double precision` and
+    /// `float8` are float8.
+    fn refine_builtin(
+        family: super::scalar_value::BuiltinKind,
+        declared_type: &str,
+    ) -> super::scalar_value::BuiltinType {
+        let declared = declared_type.trim();
+        let float = if ["real", "float4"]
+            .iter()
+            .any(|name| declared.eq_ignore_ascii_case(name))
+        {
+            super::scalar_value::FloatWidth::Single
+        } else {
+            super::scalar_value::FloatWidth::Double
+        };
+        super::scalar_value::refined_builtin(
+            family,
+            float,
+            super::scalar_value::declares_fixed_width_text(declared),
+        )
+    }
+
     /// Measured: PostgreSQL raises `division by zero`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::Fails;
@@ -227,7 +249,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         supported.then(|| GroupKeyEncoder::new(columns, encode_postgres_component))
     }
 
-    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
+    fn decode_group_value(
+        kind: super::scalar_value::ValueKindOf<Self>,
+        value: Value<Self>,
+    ) -> Option<Value<Self>> {
         match (kind.as_builtin(), value) {
             (Some(BuiltinKind::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
@@ -260,6 +285,24 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
+    /// Measured: MySQL's `FLOAT` is float4 and its `DOUBLE` is float8.
+    fn refine_builtin(
+        family: super::scalar_value::BuiltinKind,
+        declared_type: &str,
+    ) -> super::scalar_value::BuiltinType {
+        let declared = declared_type.trim();
+        let float = if declared.eq_ignore_ascii_case("float") {
+            super::scalar_value::FloatWidth::Single
+        } else {
+            super::scalar_value::FloatWidth::Double
+        };
+        super::scalar_value::refined_builtin(
+            family,
+            float,
+            super::scalar_value::declares_fixed_width_text(declared),
+        )
+    }
+
     type Custom = NoCustomScalars<Self>;
 
     /// Measured: a backslash escapes, and a pattern ending with one
@@ -373,7 +416,10 @@ impl Backend for MySql {
         supported.then(|| GroupKeyEncoder::new(columns, encode_mysql_component))
     }
 
-    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
+    fn decode_group_value(
+        kind: super::scalar_value::ValueKindOf<Self>,
+        value: Value<Self>,
+    ) -> Option<Value<Self>> {
         match (kind.as_builtin(), value) {
             (Some(BuiltinKind::Float), Value::Int(value)) => {
                 Some(Value::Float(widen_i64_to_f64(value)))
@@ -412,6 +458,20 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    /// SQLite has one floating type, `REAL`, and it is float8. Its
+    /// `CHAR(n)` is advisory, stored as given, so no text type is fixed
+    /// width here.
+    fn refine_builtin(
+        family: super::scalar_value::BuiltinKind,
+        _declared_type: &str,
+    ) -> super::scalar_value::BuiltinType {
+        super::scalar_value::refined_builtin(
+            family,
+            super::scalar_value::FloatWidth::Double,
+            super::scalar_value::TextWidth::Varying,
+        )
+    }
+
     type Custom = NoCustomScalars<Self>;
 
     /// Measured: SQLite answers `NULL`.
@@ -527,7 +587,10 @@ impl Backend for SQLite {
     type Decimal = bigdecimal::BigDecimal;
     type Json = SqliteJson;
 
-    fn decode_group_value(kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>> {
+    fn decode_group_value(
+        kind: super::scalar_value::ValueKindOf<Self>,
+        value: Value<Self>,
+    ) -> Option<Value<Self>> {
         match (kind.as_builtin(), value) {
             (Some(BuiltinKind::Bool), Value::Int(value)) => Some(Value::Bool(value)),
             (Some(BuiltinKind::Uuid), Value::String(value)) => Some(Value::Uuid(value)),

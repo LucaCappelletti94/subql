@@ -40,7 +40,7 @@ use super::connector::LogStatusRow;
 use super::connector::{FloatRow, IntRow, ReadQuery, TextRow};
 #[cfg(feature = "executor-diesel-async-mysql")]
 use super::connector::{ScalarRowError, SessionSetup, Snapshot};
-use crate::backend::{Backend, BuiltinKind, ScalarKind, Value};
+use crate::backend::{Backend, BuiltinKind, Value};
 use alloc::vec::Vec;
 #[cfg(feature = "executor-diesel-async-mysql")]
 use core::future::Future;
@@ -184,8 +184,11 @@ pub(super) async fn load_scalar_row_postgres_async(
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            crate::backend::Postgres::decode_group_value(ScalarKind::from(*kind), value)
-                .unwrap_or(Value::Missing)
+            crate::backend::Postgres::decode_group_value(
+                crate::backend::ValueKind::from(*kind),
+                value,
+            )
+            .unwrap_or(Value::Missing)
         })
         .collect())
 }
@@ -209,7 +212,7 @@ pub(super) async fn load_scalar_row_mysql_async(
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            crate::backend::MySql::decode_group_value(ScalarKind::from(*kind), value)
+            crate::backend::MySql::decode_group_value(crate::backend::ValueKind::from(*kind), value)
                 .unwrap_or(Value::Missing)
         })
         .collect())

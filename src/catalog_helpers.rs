@@ -392,7 +392,13 @@ pub(crate) fn classify_scalar_kind<B: crate::backend::Backend>(
     declared_type: &str,
 ) -> Option<ScalarKindOf<B>> {
     if let Some(family) = scalar_family(declared_type) {
-        return Some(family.into());
+        // The family is upstream's coarse answer; the refinements the
+        // declaration fixes are the backend's, because the spellings differ
+        // per engine.
+        return Some(ScalarKind::Builtin(B::refine_builtin(
+            family,
+            declared_type,
+        )));
     }
     <B::Custom as crate::backend::CustomScalars>::classify(declared_type).map(ScalarKind::Custom)
 }

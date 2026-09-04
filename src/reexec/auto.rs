@@ -1487,7 +1487,7 @@ pub(super) fn decode_grouped_seed_rows<B: Backend>(
     for row in rows {
         for (value, kind) in row.iter_mut().zip(kinds) {
             let raw = core::mem::replace(value, Value::Missing);
-            *value = B::decode_group_value(crate::backend::ScalarKind::from(*kind), raw)
+            *value = B::decode_group_value(crate::backend::ValueKind::from(*kind), raw)
                 .unwrap_or(Value::Missing);
         }
     }

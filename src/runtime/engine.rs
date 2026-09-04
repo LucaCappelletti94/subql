@@ -737,11 +737,15 @@ where
         let mut seeds: Vec<Vec<crate::term::TermRow<E::Backend>>> =
             alloc::vec![Vec::new(); terms.len()];
         for term in terms.iter().filter(|term| term.compares_the_caller()) {
+            // Compared as values, not as declared types: a subscriber value
+            // carries no declaration, so the shared fact is the family. A
+            // `char(5)` column and a text subscriber name the same rows.
             let compared = catalog_helpers::column_scalar_kind::<E::Backend, _>(
                 &self.database,
                 table_id,
                 term.columns[0],
-            );
+            )
+            .map(|kind| kind.value_kind());
             let stated = subscriber.scalar_kind();
             if compared != Some(stated) {
                 return Err(RegisterError::MembershipTermRefused(format!(

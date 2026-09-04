@@ -407,7 +407,7 @@ fn planned_having<B: Backend + SqlLiteralParse>(
             op: having.op,
             threshold: B::parse_literal(
                 &having.literal,
-                crate::backend::ScalarKind::from(agg_kind),
+                crate::backend::ValueKind::from(agg_kind),
             )?,
         },
         crate::compiler::sql_shape::ExtremeHavingSubject::RowCount => {

@@ -441,19 +441,21 @@ impl<B: Backend> TermKey<B> {
     /// kind would never find what it stored and the subscription would be
     /// served dead.
     #[must_use]
-    pub fn scalar_kind(&self) -> ScalarKindOf<B> {
+    pub fn scalar_kind(&self) -> crate::backend::ValueKindOf<B> {
         match self {
-            Self::Custom(value) => ScalarKind::Custom(<B::Custom as CustomScalars>::kind_of(value)),
-            Self::Bool(_) => BuiltinKind::Bool.into(),
-            Self::Int(_) => BuiltinKind::Int.into(),
-            Self::String(_) => BuiltinKind::String.into(),
-            Self::Bytes(_) => BuiltinKind::Bytes.into(),
-            Self::Uuid(_) => BuiltinKind::Uuid.into(),
-            Self::Timestamp(_) => BuiltinKind::Timestamp.into(),
-            Self::TimestampTz(_) => BuiltinKind::TimestampTz.into(),
-            Self::Date(_) => BuiltinKind::Date.into(),
-            Self::Time(_) => BuiltinKind::Time.into(),
-            Self::Decimal(_) => BuiltinKind::Decimal.into(),
+            Self::Custom(value) => {
+                crate::backend::ValueKind::Custom(<B::Custom as CustomScalars>::kind_of(value))
+            }
+            Self::Bool(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Bool),
+            Self::Int(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Int),
+            Self::String(_) => crate::backend::ValueKind::Builtin(BuiltinKind::String),
+            Self::Bytes(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Bytes),
+            Self::Uuid(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Uuid),
+            Self::Timestamp(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Timestamp),
+            Self::TimestampTz(_) => crate::backend::ValueKind::Builtin(BuiltinKind::TimestampTz),
+            Self::Date(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Date),
+            Self::Time(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Time),
+            Self::Decimal(_) => crate::backend::ValueKind::Builtin(BuiltinKind::Decimal),
         }
     }
 }
@@ -555,7 +557,7 @@ pub fn kind_can_key<B: Backend>(kind: ScalarKindOf<B>) -> bool {
         // A custom type answers for itself. Its value is `Eq + Hash`, so the
         // reflexivity the builtin rule demands is already promised.
         ScalarKind::Custom(custom) => <B::Custom as CustomScalars>::can_key(custom),
-        ScalarKind::Builtin(family) => match family {
+        ScalarKind::Builtin(builtin) => match builtin.family() {
             BuiltinKind::Bool
             | BuiltinKind::Int
             | BuiltinKind::String

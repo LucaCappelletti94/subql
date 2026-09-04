@@ -517,7 +517,7 @@ fn literal_index_key<B: SqlLiteralParse, DB: DatabaseLike>(
             return None;
         }
     }
-    PlannerValue::from_value(&B::parse_literal(&value.value, kind).ok()?)
+    PlannerValue::from_value(&B::parse_literal(&value.value, kind.value_kind()).ok()?)
 }
 
 /// An integer bound for a range atom. Range entries hold `i64` bounds and

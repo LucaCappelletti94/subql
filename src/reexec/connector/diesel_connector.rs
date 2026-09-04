@@ -7,7 +7,7 @@ use super::diesel_backend::{boxed_read_query, DieselBackend};
 use super::{
     run_setup_statements, Connector, ReadQuery, RowPage, ScalarRowError, SessionSetup, Snapshot,
 };
-use crate::backend::{BuiltinKind, ScalarKind, Value};
+use crate::backend::{BuiltinKind, Value};
 use alloc::boxed::Box;
 use alloc::string::String;
 use core::cell::RefCell;
@@ -180,7 +180,10 @@ where
             .v
             .map_or(Value::Null, B::value_from_string),
     };
-    Ok(B::decode_group_value(ScalarKind::from(kind), value).unwrap_or(Value::Missing))
+    Ok(
+        B::decode_group_value(crate::backend::ValueKind::from(kind), value)
+            .unwrap_or(Value::Missing),
+    )
 }
 
 /// Decodes one aggregate seed row using its runtime database types.
@@ -233,7 +236,8 @@ where
         .into_iter()
         .zip(kinds)
         .map(|(value, kind)| {
-            B::decode_group_value(ScalarKind::from(*kind), value).unwrap_or(Value::Missing)
+            B::decode_group_value(crate::backend::ValueKind::from(*kind), value)
+                .unwrap_or(Value::Missing)
         })
         .collect())
 }

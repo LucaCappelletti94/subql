@@ -12,7 +12,7 @@ use super::parse_helpers::{
 };
 use super::{parse_custom_literal, SqlLiteralParse};
 use crate::backend::{
-    BuiltinKind, MySql, Postgres, SQLite, ScalarKind, ScalarKindOf, SqliteJson, Value,
+    BuiltinKind, MySql, Postgres, SQLite, SqliteJson, Value, ValueKind, ValueKindOf,
 };
 use crate::RegisterError;
 use alloc::string::ToString;
@@ -21,14 +21,14 @@ use sqlparser::ast::Value as SqlValue;
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> SqlLiteralParse for Postgres<V> {
     fn parse_literal(
         sql: &SqlValue,
-        target: ScalarKindOf<Self>,
+        target: ValueKindOf<Self>,
     ) -> Result<Value<Self>, RegisterError> {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
         let family = match target {
-            ScalarKind::Builtin(family) => family,
-            ScalarKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
+            ValueKind::Builtin(family) => family,
+            ValueKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
         };
         match (family, sql) {
             (BuiltinKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
@@ -85,14 +85,14 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> SqlLiteralParse for Postg
 impl SqlLiteralParse for MySql {
     fn parse_literal(
         sql: &SqlValue,
-        target: ScalarKindOf<Self>,
+        target: ValueKindOf<Self>,
     ) -> Result<Value<Self>, RegisterError> {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
         let family = match target {
-            ScalarKind::Builtin(family) => family,
-            ScalarKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
+            ValueKind::Builtin(family) => family,
+            ValueKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
         };
         match (family, sql) {
             (BuiltinKind::Bool, SqlValue::Boolean(b)) => Ok(Value::Bool(*b)),
@@ -145,14 +145,14 @@ impl SqlLiteralParse for MySql {
 impl SqlLiteralParse for SQLite {
     fn parse_literal(
         sql: &SqlValue,
-        target: ScalarKindOf<Self>,
+        target: ValueKindOf<Self>,
     ) -> Result<Value<Self>, RegisterError> {
         if matches!(sql, SqlValue::Null) {
             return Ok(Value::Null);
         }
         let family = match target {
-            ScalarKind::Builtin(family) => family,
-            ScalarKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
+            ValueKind::Builtin(family) => family,
+            ValueKind::Custom(custom) => return parse_custom_literal::<Self>(sql, custom),
         };
         match (family, sql) {
             // SQLite has no native BOOL. The column contract stores 0 or 1

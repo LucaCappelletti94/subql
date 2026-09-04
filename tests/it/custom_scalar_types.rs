@@ -16,7 +16,7 @@ use subql::backend::Postgres;
 use subql::backend::{
     Backend, BuiltinKind, Carried, CustomScalars, ScalarKind, ScalarKindOf, Value,
 };
-use subql::backend::{NumericWidening, TextOperation, TextRule};
+use subql::backend::{NumericWidening, TextOperation, TextRule, ValueKind, ValueKindOf};
 use subql::compiler::vm::arithmetic::checked_integer_binary;
 use subql::compiler::vm::refusal::{
     ArithmeticOp, DanglingEscape, DivisionByZero, EvaluationRefusal, IntegerOverflow, LikeEscape,
@@ -137,6 +137,19 @@ impl Backend for Custom {
         None
     }
 
+    /// The fixtures declare no fixed-width or single-width column, so the
+    /// common refinements serve.
+    fn refine_builtin(
+        family: subql::backend::BuiltinKind,
+        _declared_type: &str,
+    ) -> subql::backend::BuiltinType {
+        subql::backend::refined_builtin(
+            family,
+            subql::backend::FloatWidth::Double,
+            subql::backend::TextWidth::Varying,
+        )
+    }
+
     /// Byte comparison, which is all this backend's fixtures need.
     fn text_rule(
         _comparison: &subql::backend::ComparisonContext<'_, Self>,
@@ -166,18 +179,18 @@ impl Backend for Custom {
 impl SqlLiteralParse for Custom {
     fn parse_literal(
         sql: &SqlValue,
-        target: ScalarKindOf<Self>,
+        target: ValueKindOf<Self>,
     ) -> Result<Value<Self>, RegisterError> {
         // A backend with custom types implements the builtin arms itself and
         // routes the custom one through the engine, which is what keeps a
         // literal and a row cell on one conversion.
-        if let ScalarKind::Custom(custom) = target {
+        if let ValueKind::Custom(custom) = target {
             return subql::compiler::parse_custom_literal::<Self>(sql, custom);
         }
         let builtin = target.as_builtin().expect("not custom, so builtin");
         Ok(widen(Postgres::<Pg18>::parse_literal(
             sql,
-            ScalarKind::from(builtin),
+            ValueKind::from(builtin),
         )?))
     }
 }
@@ -304,14 +317,14 @@ fn a_refused_conversion_is_reported_as_itself_not_as_a_bad_carrier() {
 fn a_custom_literal_parses_through_the_same_conversion() {
     let happy = Custom::parse_literal(
         &SqlValue::SingleQuotedString("happy".to_owned()),
-        ScalarKind::Custom(MyKind::Mood),
+        ValueKind::Custom(MyKind::Mood),
     )
     .expect("happy is a mood");
     assert_eq!(happy, Value::Custom(MyValue::Mood(Mood::Happy)));
 
     let glad = Custom::parse_literal(
         &SqlValue::SingleQuotedString("glad".to_owned()),
-        ScalarKind::Custom(MyKind::Mood),
+        ValueKind::Custom(MyKind::Mood),
     )
     .expect("glad is a mood");
     assert_eq!(
@@ -321,7 +334,7 @@ fn a_custom_literal_parses_through_the_same_conversion() {
 
     let refused = Custom::parse_literal(
         &SqlValue::SingleQuotedString("furious".to_owned()),
-        ScalarKind::Custom(MyKind::Mood),
+        ValueKind::Custom(MyKind::Mood),
     );
     assert!(
         matches!(refused, Err(RegisterError::TypeError(_))),
@@ -330,7 +343,7 @@ fn a_custom_literal_parses_through_the_same_conversion() {
 
     let build = Custom::parse_literal(
         &SqlValue::Number("42".to_owned(), false),
-        ScalarKind::Custom(MyKind::Build),
+        ValueKind::Custom(MyKind::Build),
     )
     .expect("42 is a build");
     assert_eq!(build, Value::Custom(MyValue::Build(42)));
@@ -361,9 +374,15 @@ fn keying_is_answered_per_custom_type() {
 #[test]
 fn a_custom_value_names_its_own_kind() {
     let value: Value<Custom> = Value::Custom(MyValue::Mood(Mood::Sad));
-    assert_eq!(value.scalar_kind(), Some(ScalarKind::Custom(MyKind::Mood)));
+    assert_eq!(
+        value.scalar_kind(),
+        Some(subql::backend::ValueKind::Custom(MyKind::Mood))
+    );
     let value: Value<Custom> = Value::Custom(MyValue::Build(3));
-    assert_eq!(value.scalar_kind(), Some(ScalarKind::Custom(MyKind::Build)));
+    assert_eq!(
+        value.scalar_kind(),
+        Some(subql::backend::ValueKind::Custom(MyKind::Build))
+    );
 }
 
 /// The whole path, end to end: a subscription filtering on a column of the

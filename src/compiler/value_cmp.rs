@@ -290,6 +290,77 @@ mod comparison_descriptor_tests {
         }
     }
 
+    /// A float column's declared type fixes its width, and the type says so
+    /// rather than a later layer re-deriving it from the spelling.
+    ///
+    /// PostgreSQL's `real` is float4 and `double precision` is float8, and
+    /// the wire text for a float4 column is the shortest round-trip text of
+    /// the float4 value, so a decoder that cannot tell them apart parses the
+    /// wrong value.
+    #[test]
+    fn a_declared_float_type_carries_its_width() {
+        use crate::backend::{BuiltinType, FloatWidth};
+
+        for (ddl, width) in [
+            ("CREATE TABLE t (v REAL);", FloatWidth::Single),
+            ("CREATE TABLE t (v FLOAT4);", FloatWidth::Single),
+            ("CREATE TABLE t (v DOUBLE PRECISION);", FloatWidth::Double),
+            ("CREATE TABLE t (v FLOAT8);", FloatWidth::Double),
+        ] {
+            assert_eq!(
+                comparison(ddl, "v").kind.builtin(),
+                Some(BuiltinType::Float(width)),
+                "the type carries the width the declaration fixes: {ddl}"
+            );
+        }
+    }
+
+    /// The same for text: a fixed-width character type is a different type
+    /// from a varying one, which the padding rule reads off the type instead
+    /// of matching the declared spelling itself.
+    #[test]
+    fn a_declared_char_type_is_fixed_width() {
+        use crate::backend::{BuiltinType, TextWidth};
+
+        assert_eq!(
+            comparison("CREATE TABLE t (code CHAR(5));", "code")
+                .kind
+                .builtin(),
+            Some(BuiltinType::Text(TextWidth::Fixed))
+        );
+        assert_eq!(
+            comparison("CREATE TABLE t (code TEXT);", "code")
+                .kind
+                .builtin(),
+            Some(BuiltinType::Text(TextWidth::Varying))
+        );
+    }
+
+    /// A compiled program persists the kinds of the columns it loads, so the
+    /// refinements have to survive the stored form: a `real` column that
+    /// reloads as float8 would answer differently after a restart.
+    #[test]
+    fn a_persisted_kind_round_trips_its_refinements() {
+        use crate::backend::{BuiltinType, FloatWidth, ScalarKindOf, TextWidth};
+
+        for kind in [
+            BuiltinType::Float(FloatWidth::Single),
+            BuiltinType::Float(FloatWidth::Double),
+            BuiltinType::Text(TextWidth::Fixed),
+            BuiltinType::Text(TextWidth::Varying),
+            BuiltinType::Int,
+        ] {
+            let stored: ScalarKindOf<Postgres> = kind.into();
+            let bytes = postcard::to_allocvec(&stored).expect("the kind serializes");
+            assert_eq!(
+                postcard::from_bytes::<ScalarKindOf<Postgres>>(&bytes)
+                    .expect("the kind deserializes"),
+                stored,
+                "{kind:?} must reload as itself"
+            );
+        }
+    }
+
     #[test]
     fn descriptor_refuses_a_nondeterministic_collation() {
         let ci = comparison(

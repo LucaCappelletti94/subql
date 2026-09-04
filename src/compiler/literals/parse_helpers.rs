@@ -1,6 +1,6 @@
 //! Shared SQL literal parsing helpers used by all backend impls.
 
-use crate::backend::{BuiltinKind, NoCustom, ScalarKind};
+use crate::backend::{BuiltinKind, NoCustom, ValueKind};
 use crate::RegisterError;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -8,7 +8,7 @@ use sqlparser::ast::Value as SqlValue;
 
 pub(super) fn err_shape<C: core::fmt::Debug + Copy>(
     sql: &SqlValue,
-    target: ScalarKind<C>,
+    target: ValueKind<C>,
 ) -> RegisterError {
     RegisterError::TypeError(format!("cannot use SQL literal {sql:?} as {target:?}"))
 }
@@ -18,12 +18,12 @@ pub(super) fn err_parse(
     family: BuiltinKind,
     msg: impl core::fmt::Display,
 ) -> RegisterError {
-    err_parse_kind(sql, ScalarKind::<NoCustom>::from(family), msg)
+    err_parse_kind(sql, ValueKind::<NoCustom>::from(family), msg)
 }
 
 pub(super) fn err_parse_kind<C: core::fmt::Debug + Copy>(
     sql: &SqlValue,
-    target: ScalarKind<C>,
+    target: ValueKind<C>,
     msg: impl core::fmt::Display,
 ) -> RegisterError {
     RegisterError::TypeError(format!(

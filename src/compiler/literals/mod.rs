@@ -15,7 +15,7 @@ mod backend_impls;
 mod column_ref;
 mod parse_helpers;
 
-use crate::backend::{Backend, CustomScalars, ScalarKind, ScalarKindOf, Value};
+use crate::backend::{Backend, CustomScalars, Value, ValueKind, ValueKindOf};
 use crate::RegisterError;
 use alloc::format;
 use parse_helpers::err_shape;
@@ -29,7 +29,7 @@ pub(super) use parse_helpers::hex_upper;
 /// Implemented per shipped [`Backend`]. The compiler bounds its entry
 /// points on `B: Backend + SqlLiteralParse` so the parser can turn any
 /// sqlparser literal into a `Value<B>` targeting a known
-/// [`ScalarKind`].
+/// [`ValueKind`].
 ///
 /// # Contract
 ///
@@ -55,7 +55,7 @@ pub trait SqlLiteralParse: Backend + Sized {
     /// non-boolean context, etc.).
     fn parse_literal(
         sql: &SqlValue,
-        target: ScalarKindOf<Self>,
+        target: ValueKindOf<Self>,
     ) -> Result<Value<Self>, RegisterError>;
 }
 
@@ -74,7 +74,7 @@ pub fn parse_custom_literal<B: SqlLiteralParse>(
     let raw = B::parse_literal(sql, carrier.into())?;
     let view = raw
         .as_carried()
-        .ok_or_else(|| err_shape(sql, ScalarKind::<()>::from(carrier)))?;
+        .ok_or_else(|| err_shape(sql, ValueKind::<()>::from(carrier)))?;
     <B::Custom as CustomScalars>::convert(custom, view)
         .map(Value::Custom)
         .ok_or_else(|| {

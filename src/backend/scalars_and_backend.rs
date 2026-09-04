@@ -2,7 +2,7 @@
 //! rather than a banner comment.
 
 use super::scalar_value::default_group_key_encoder;
-use super::{ColumnComparisonOf, Cow, CustomScalars, GroupKeyEncoder, ScalarKindOf, Value};
+use super::{ColumnComparisonOf, Cow, CustomScalars, GroupKeyEncoder, Value};
 use alloc::string::ToString;
 
 /// Trait bounds every [`Backend`] associated scalar type must satisfy.
@@ -256,7 +256,10 @@ pub trait Backend: 'static {
 
     /// Reinterprets a database row field using the planned group-column kind.
     #[must_use]
-    fn decode_group_value(_kind: ScalarKindOf<Self>, value: Value<Self>) -> Option<Value<Self>>
+    fn decode_group_value(
+        _kind: super::scalar_value::ValueKindOf<Self>,
+        value: Value<Self>,
+    ) -> Option<Value<Self>>
     where
         Self: Sized,
     {
@@ -274,6 +277,20 @@ pub trait Backend: 'static {
     /// One answer rather than two constants: an engine with no default
     /// escape cannot have a dangling one, so the two facts belong together.
     const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape>;
+
+    /// The exact type a declaration of `family` names on this engine.
+    ///
+    /// Required rather than defaulted, because the spellings differ: `real`
+    /// and `float4` are single width on PostgreSQL, `FLOAT` is on MySQL, and
+    /// SQLite's one `REAL` is double. Guessing a width is the defect this
+    /// replaces, so each backend states its own.
+    #[must_use]
+    fn refine_builtin(
+        family: super::scalar_value::BuiltinKind,
+        declared_type: &str,
+    ) -> super::scalar_value::BuiltinType
+    where
+        Self: Sized;
 
     /// How this backend answers one text comparison in process, or `None`
     /// when no in-process comparison reproduces it and the statement must

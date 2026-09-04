@@ -50,14 +50,16 @@ pub use crate::compiler::value_cmp::cross_kind_numeric_ordering;
 pub(crate) use cdc_event::ResolvedEvent;
 pub use cdc_event::{decode_cell, encode_value_key, CdcEvent, CellPresence};
 pub use row_kind::RowKind;
+pub use scalar_value::declares_fixed_width_text;
 pub(crate) use scalar_value::jsonb_payloads_equal;
+pub use scalar_value::refined_builtin;
 pub use scalar_value::single_column_rule;
 pub use scalar_value::widen_i64_to_f64;
 pub use scalar_value::{
-    BuiltinKind, Carried, CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf,
-    ComparisonContext, CustomScalars, GroupKeyEncoder, NoCustom, NoCustomScalars, NumericWidening,
-    ScalarKind, ScalarKindOf, TextCase, TextOperation, TextRule, TrailingSpacePadding,
-    TrailingSpaces, Value,
+    BuiltinKind, BuiltinType, Carried, CollationFacts, CollationName, ColumnComparison,
+    ColumnComparisonOf, ComparisonContext, CustomScalars, FloatWidth, GroupKeyEncoder, NoCustom,
+    NoCustomScalars, NumericWidening, ScalarKind, ScalarKindOf, TextCase, TextOperation, TextRule,
+    TextWidth, TrailingSpacePadding, TrailingSpaces, Value, ValueKind, ValueKindOf,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

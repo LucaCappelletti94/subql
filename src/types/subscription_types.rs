@@ -2,7 +2,7 @@
 
 use super::domain_id_types::{ColumnId, TableId};
 use super::generic_id_types::{IdTypes, SubscriptionId, SubscriptionScope};
-use crate::backend::{Backend, BuiltinKind, ScalarKindOf, Value};
+use crate::backend::{Backend, BuiltinKind, Value, ValueKind, ValueKindOf};
 use crate::checkpoint::{Checkpoint, NoCheckpoint};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -678,8 +678,9 @@ pub enum NotServed<B: Backend> {
     UnfoldableAggregate {
         /// The aggregated column.
         column: ColumnId,
-        /// The column's declared scalar kind.
-        kind: ScalarKindOf<B>,
+        /// What a value of the column is, which is what the compiler knew
+        /// when it refused: a family, or one custom type.
+        kind: ValueKindOf<B>,
         /// The aggregate function, as the statement spelled it.
         function: String,
     },
@@ -690,8 +691,9 @@ pub enum NotServed<B: Backend> {
     OrderNotReproducible {
         /// The compared column.
         column: ColumnId,
-        /// The column's declared scalar kind.
-        kind: ScalarKindOf<B>,
+        /// What a value of the column is, which is what the compiler knew
+        /// when it refused: a family, or one custom type.
+        kind: ValueKindOf<B>,
     },
     /// The column's collation is one the in-process comparator cannot
     /// reproduce, so only the database can answer comparisons on it.
@@ -707,12 +709,12 @@ pub enum NotServed<B: Backend> {
     CrossKindComparison {
         /// Left operand column.
         left: ColumnId,
-        /// Left operand's declared scalar kind.
-        left_kind: ScalarKindOf<B>,
+        /// What a value of the left operand is.
+        left_kind: ValueKindOf<B>,
         /// Right operand column.
         right: ColumnId,
-        /// Right operand's declared scalar kind.
-        right_kind: ScalarKindOf<B>,
+        /// What a value of the right operand is.
+        right_kind: ValueKindOf<B>,
     },
     /// A form with no structured cause to report, carrying the compiler's own
     /// words.
@@ -721,13 +723,13 @@ pub enum NotServed<B: Backend> {
 
 /// Renders a scalar kind the way a refusal message names it: the builtin's
 /// own name, without the wrapper `Debug` would print.
-struct ScalarKindName<'a, B: Backend>(&'a ScalarKindOf<B>);
+struct ScalarKindName<'a, B: Backend>(&'a ValueKindOf<B>);
 
 impl<B: Backend> core::fmt::Display for ScalarKindName<'_, B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.0.as_builtin() {
-            Some(builtin) => write!(f, "{builtin:?}"),
-            None => write!(f, "{:?}", self.0),
+        match self.0 {
+            ValueKind::Builtin(family) => write!(f, "{family:?}"),
+            ValueKind::Custom(custom) => write!(f, "{custom:?}"),
         }
     }
 }
