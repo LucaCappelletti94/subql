@@ -383,7 +383,7 @@ where
         // A still-folding in-process aggregate is seeded through Install, not
         // read here. After a demotion the context is `whole_result` and handled
         // above, so this only fires before any demotion.
-        if context.aggregate {
+        if context.in_process == Some(super::auto::InProcessKind::FoldingAggregate) {
             return Ok(None);
         }
         let (value, checkpoint) = self

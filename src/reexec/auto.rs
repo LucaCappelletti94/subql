@@ -121,12 +121,10 @@ pub(super) struct ResolveContext<I: IdTypes, B: Backend, A> {
     pub(super) whole_result: bool,
     /// Whether resolving means asking only about the rows that changed.
     pub(super) keyed: bool,
-    /// Whether this is a still-folding in-process aggregate. Such a context
-    /// carries only the auth and session for a possible demotion to a whole
-    /// re-read (an UPDATE without its old row image demotes an ungrouped
-    /// SUM/AVG). The fold itself runs in the engine, so snapshot skips it and
-    /// no read is issued until a demotion sets `whole_result`.
-    pub(super) aggregate: bool,
+    /// Set when the engine, not a read, maintains this subscription, in
+    /// which case the stored query is held for one contingency rather than
+    /// being how the answer is produced. `None` for every read tier.
+    pub(super) in_process: Option<InProcessKind>,
     /// Which re-read the next page belongs to, so a consumer can tell a new
     /// answer from a continuation of the old one.
     pub(super) generation: u64,
@@ -135,6 +133,23 @@ pub(super) struct ResolveContext<I: IdTypes, B: Backend, A> {
     pub(super) session: Option<I::SessionId>,
     /// Per-subscription auth state, passed verbatim to the connector.
     pub(super) auth: A,
+}
+
+/// Why an in-process subscription holds a resolve context at all, since
+/// neither kind is resolved by a read while it stays in process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InProcessKind {
+    /// A still-folding aggregate, keeping the auth and session for a
+    /// possible demotion to a whole re-read: an update without its old row
+    /// image demotes an ungrouped `SUM`/`AVG`. The fold runs in the engine,
+    /// so snapshot skips it and no read is issued until a demotion sets
+    /// `whole_result`.
+    FoldingAggregate,
+    /// A row filter the stream answers, keeping its own query for the one
+    /// case the stream cannot answer: a cell the event did not carry. That
+    /// is a report-driven read, not a snapshot, so priming such a
+    /// subscription from the database still reads nothing.
+    StreamServedFilter,
 }
 
 /// Connector execution mode used by [`AutoResolvingEngine`].
@@ -547,6 +562,7 @@ where
         for trigger in triggers {
             self.enqueue_read(trigger);
         }
+        self.enqueue_unanswered(&engine, event);
         Ok(ReExecNotifications {
             engine,
             aggregate_updates,
@@ -556,6 +572,28 @@ where
             triggers: Vec::new(),
             transitions,
         })
+    }
+
+    /// Queue a read for every subscription the event could not answer.
+    ///
+    /// The core reports these and stops there: it holds no connector, so a
+    /// cell the stream did not carry leaves it with no answer to give. Here
+    /// the query is retained and the connector is owned, so the report
+    /// becomes the read that answers it, deduplicated and debounced like
+    /// every other discovered read.
+    fn enqueue_unanswered(
+        &mut self,
+        notifications: &crate::ConsumerNotifications<I, E::Checkpoint, E::Backend>,
+        event: &E,
+    ) {
+        for entry in notifications.unanswered() {
+            self.enqueue_read(super::ReExecutionTrigger {
+                subscription_id: entry.subscription_id,
+                consumer_id: entry.consumer_id,
+                read: super::ReExecutionRead::Subscription,
+                checkpoint: event.checkpoint(),
+            });
+        }
     }
 
     /// Register a subscription. `auth` is stored alongside the captured
@@ -577,6 +615,10 @@ where
             SubscriptionScope::Session(s) => Some(s),
             SubscriptionScope::Durable => None,
         };
+        // Retained before the spec is consumed, for the one case that needs
+        // it: an in-process filter the stream later cannot answer, whose
+        // report has to become a read. Nothing reads it per event.
+        let source_query = crate::reexec::BoundQuery::new(spec.sql.clone(), spec.binds.clone());
         let result = self
             .inner
             .register_request(spec, database_reads_per_consumer)?;
@@ -590,7 +632,7 @@ where
                         grouped_bootstrap: None,
                         whole_result: false,
                         keyed: false,
-                        aggregate: false,
+                        in_process: None,
                         generation: 0,
                         session,
                         auth,
@@ -610,7 +652,7 @@ where
                         grouped_bootstrap: Some(bootstrap.clone()),
                         whole_result: false,
                         keyed: false,
-                        aggregate: false,
+                        in_process: None,
                         generation: 0,
                         session,
                         auth,
@@ -634,7 +676,7 @@ where
                         // so.
                         whole_result: matches!(result.tier, Tier::WholeRows { .. }),
                         keyed: matches!(result.tier, Tier::KeyedRows { .. }),
-                        aggregate: false,
+                        in_process: None,
                         generation: 0,
                         session,
                         auth,
@@ -645,24 +687,37 @@ where
                 // A still-folding in-process aggregate keeps only its auth and
                 // session, so a later demotion to a whole re-read resolves with
                 // the caller's own auth. The fold runs in the engine; nothing is
-                // read here. A plain row subscription (no bootstrap) stores
-                // nothing, as before.
-                if let Some(bootstrap) = &served.aggregate_bootstrap {
-                    self.contexts.insert(
-                        result.subscription_id,
-                        ResolveContext {
-                            query: bootstrap.query.clone(),
-                            column_kind: BuiltinKind::String,
-                            grouped_bootstrap: None,
-                            whole_result: false,
-                            keyed: false,
-                            aggregate: true,
-                            generation: 0,
-                            session,
-                            auth,
-                        },
-                    );
-                }
+                // read here.
+                //
+                // A plain row filter keeps its own query as a whole read. It
+                // is never executed while the stream can answer the filter,
+                // and exists for the case where the stream cannot: a cell the
+                // event did not carry has no answer in memory, and the read is
+                // the only way to give the subscriber one.
+                let (query, whole_result, kind) = served.aggregate_bootstrap.as_ref().map_or(
+                    (source_query, true, InProcessKind::StreamServedFilter),
+                    |bootstrap| {
+                        (
+                            bootstrap.query.clone(),
+                            false,
+                            InProcessKind::FoldingAggregate,
+                        )
+                    },
+                );
+                self.contexts.insert(
+                    result.subscription_id,
+                    ResolveContext {
+                        query,
+                        column_kind: BuiltinKind::String,
+                        grouped_bootstrap: None,
+                        whole_result,
+                        keyed: false,
+                        in_process: Some(kind),
+                        generation: 0,
+                        session,
+                        auth,
+                    },
+                );
             }
         }
         Ok(result)
@@ -722,9 +777,9 @@ where
         }
         let removed = self.inner.unregister_subscription(subscription_id);
         if removed {
-            // Drop an in-process aggregate's stored context (auth for a
-            // possible demotion) and any queued read. A plain row
-            // subscription has neither and this is a no-op.
+            // Drop the stored context and any queued read: an in-process
+            // aggregate's auth for a possible demotion, or a row filter's
+            // retained query for a report the stream could not answer.
             self.contexts.remove(&subscription_id);
             self.purge_unregistered_reads();
         }
@@ -926,6 +981,11 @@ where
         let Some(context) = self.contexts.get(&subscription_id) else {
             return Ok(None);
         };
+        // A subscription the stream maintains has nothing to prime: its
+        // retained query answers a report, not a snapshot.
+        if context.in_process == Some(InProcessKind::StreamServedFilter) {
+            return Ok(None);
+        }
         let grouped_bootstrap = context.grouped_bootstrap.clone();
         if let Some(bootstrap) = grouped_bootstrap {
             let (_, mut rows, checkpoint) = self.read_whole(&context.query, subscription_id)?;
@@ -992,7 +1052,7 @@ where
         // A still-folding in-process aggregate is seeded through Install, not
         // read here. After a demotion the context is `whole_result` and handled
         // above, so this only fires before any demotion.
-        if context.aggregate {
+        if context.in_process == Some(InProcessKind::FoldingAggregate) {
             return Ok(None);
         }
         let (value, checkpoint) = self
@@ -3615,6 +3675,88 @@ mod tests {
             *e.connector().log.borrow(),
             ["open", "fetch", "deliver", "fetch", "deliver", "close"],
             "a page is delivered before the next one is fetched"
+        );
+    }
+
+    /// An in-process row subscription whose predicate read a cell the event
+    /// did not carry is re-executed against the database, which is the half
+    /// of the missing-cell work the core cannot do: it holds no connector.
+    ///
+    /// The core reports; the wrapper owns the connector and turns the report
+    /// into a read, which is the same ladder every other unresolvable
+    /// maintenance takes.
+    #[test]
+    fn an_unanswered_cell_is_re_executed_by_the_auto_engine() {
+        let (mut e, tid) = engine_with_values(alloc::vec![]);
+        e.register(
+            SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+            (),
+        )
+        .expect("the filter is served in process");
+        e.connector()
+            .cursor_pages
+            .borrow_mut()
+            .push(super::super::RowPage {
+                columns: alloc::vec![String::from("id"), String::from("status")],
+                rows: alloc::vec![alloc::vec![Value::Int(1), Value::String("paid".into())]],
+                more: false,
+            });
+
+        // The row image omits `status`, which the predicate reads, so the
+        // event cannot answer it: an unchanged TOASTed column arrives this
+        // way.
+        let mut cells = row(1, 5.0);
+        cells[3] = Value::Missing;
+        let event = TestEvent::<Postgres>::update(tid, row(1, 5.0), cells)
+            .with_pk_columns([0u16])
+            .with_changed_columns([1u16]);
+
+        let applied = e.apply(&event).expect("the event applies");
+        assert_eq!(
+            applied.engine.unanswered().len(),
+            1,
+            "the core reports the subscription it could not answer"
+        );
+        assert_eq!(
+            e.pending_read_count(),
+            1,
+            "and the wrapper queues a read for it"
+        );
+
+        let resolved = e.resolve_collect().expect("the read resolves");
+        assert_eq!(
+            resolved.rows_updates.len(),
+            1,
+            "the subscriber is given the answer the database holds"
+        );
+        assert_eq!(
+            resolved.rows_updates[0].subscription_id,
+            applied.engine.unanswered()[0].subscription_id
+        );
+    }
+
+    /// Retaining the query does not make an in-process filter snapshottable.
+    /// The stream is how that answer is produced, so priming it from the
+    /// database was never part of its contract and still reads nothing.
+    #[test]
+    fn a_stream_served_filter_is_not_snapshotted() {
+        let (mut e, _) = engine_with_values(alloc::vec![]);
+        let id = e
+            .register(
+                SubscriptionRequest::new(1u64, "SELECT * FROM orders WHERE status = 'paid'"),
+                (),
+            )
+            .expect("the filter is served in process")
+            .subscription_id;
+
+        assert!(
+            e.snapshot(id).unwrap().is_none(),
+            "the stream answers this subscription, so there is nothing to prime"
+        );
+        assert_eq!(
+            e.connector().call_count(),
+            0,
+            "and no read is issued for it"
         );
     }
 }
