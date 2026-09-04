@@ -30,7 +30,7 @@ enum Mood {
 }
 
 /// The two types this backend adds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum MyKind {
     /// Carried as text.
     Mood,
