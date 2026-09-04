@@ -1045,6 +1045,7 @@ mod describe_terms {
                 );
                 let reason = registered
                     .not_served_because
+                    .map(|reason| reason.to_string())
                     .expect("a tier that needs a read says why");
                 assert!(
                     described.contains(&reason),

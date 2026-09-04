@@ -1,8 +1,8 @@
 //! Subscription request, registration, and install types.
 
-use super::domain_id_types::TableId;
+use super::domain_id_types::{ColumnId, TableId};
 use super::generic_id_types::{IdTypes, SubscriptionId, SubscriptionScope};
-use crate::backend::{Backend, BuiltinKind, Value};
+use crate::backend::{Backend, BuiltinKind, ScalarKindOf, Value};
 use crate::checkpoint::{Checkpoint, NoCheckpoint};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -653,6 +653,75 @@ impl<B: Backend> Clone for AggregateBootstrap<B> {
     }
 }
 
+/// Why an answer is maintained by a database read instead of in process.
+///
+/// Typed so a caller branches rather than parsing prose: "a shared answer
+/// over this table would be one viewer's answer served to another" is a
+/// deployment fact, while "this aggregate reads a column the fold cannot
+/// carry" is a query fix, and the two used to arrive as the same `String`.
+///
+/// Generic over the backend because a cause names a column's scalar kind, and
+/// a custom backend kind is not a [`BuiltinKind`](crate::backend::BuiltinKind).
+///
+/// [`Display`](core::fmt::Display) renders the sentence a caller logs today,
+/// so migrating is a match arm rather than a message change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NotServed<B: Backend> {
+    /// A shared in-process answer over a row-security table would be one
+    /// viewer's answer served to another, so the read happens per consumer.
+    RowSecurityNeedsPerConsumerRead {
+        /// The table whose row security forces the read.
+        table: TableId,
+    },
+    /// The aggregate reads a column the fold cannot carry.
+    UnfoldableAggregate {
+        /// The aggregated column.
+        column: ColumnId,
+        /// The column's declared scalar kind.
+        kind: ScalarKindOf<B>,
+        /// The aggregate function, as the statement spelled it.
+        function: String,
+    },
+    /// A form the compiler refused with prose rather than a structured
+    /// cause.
+    UnsupportedSql(String),
+}
+
+/// A scalar kind as a refusal names it: a builtin by its own name, a custom
+/// kind by the embedder's `Debug`.
+struct ScalarKindName<'a, B: Backend>(&'a ScalarKindOf<B>);
+
+impl<B: Backend> core::fmt::Display for ScalarKindName<'_, B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0.as_builtin() {
+            Some(builtin) => write!(f, "{builtin:?}"),
+            None => write!(f, "{:?}", self.0),
+        }
+    }
+}
+
+impl<B: Backend> core::fmt::Display for NotServed<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RowSecurityNeedsPerConsumerRead { .. } => {
+                f.write_str("aggregate on RLS table requires database re-execution")
+            }
+            Self::UnfoldableAggregate {
+                column,
+                kind,
+                function,
+            } => write!(
+                f,
+                "{function} requires a numeric column (Int, Float, or Decimal), \
+                 but column {column} has type {kind}",
+                kind = ScalarKindName::<B>(kind)
+            ),
+            Self::UnsupportedSql(message) => f.write_str(message),
+        }
+    }
+}
+
 /// What a registration produced: the identity, and the tier that maintains it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Registered<B: Backend = crate::backend::Postgres> {
@@ -673,7 +742,7 @@ pub struct Registered<B: Backend = crate::backend::Postgres> {
     /// tier this is what the in-process evaluator said it could not do, which
     /// is the only thing telling a caller why its query costs a read per
     /// change rather than being answered from memory.
-    pub not_served_because: Option<String>,
+    pub not_served_because: Option<NotServed<B>>,
 }
 
 impl<B: Backend> Registered<B> {

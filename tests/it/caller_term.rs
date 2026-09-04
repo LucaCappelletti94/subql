@@ -409,6 +409,7 @@ mod refusals {
         );
         let reason = registered
             .not_served_because
+            .map(|reason| reason.to_string())
             .expect("a read tier says why it is one");
         assert!(
             reason.contains("caller"),

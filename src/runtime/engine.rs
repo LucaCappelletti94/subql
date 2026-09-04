@@ -13,6 +13,7 @@ use super::{
 };
 use crate::backend::{Backend, CdcEvent, RowKind, Value};
 use crate::compiler::literals::SqlLiteralParse;
+use crate::errors::Refusal;
 use crate::{
     catalog_helpers,
     compiler::{
@@ -46,9 +47,6 @@ use sql_traits::prelude::DatabaseLike;
 use std::io::Write;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-const RLS_AGGREGATE_NEEDS_DATABASE_READ: &str =
-    "aggregate on RLS table requires database re-execution";
-
 type BatchEntries<I, B> = Vec<(Predicate<B>, Vec<SubscriptionBinding<I>>)>;
 
 /// Per-subscription activity counters used by activity-aware eviction
@@ -490,8 +488,10 @@ where
         ) && catalog_helpers::table_has_rls(&self.database, compiled.table_id)?
         {
             if database_reads_per_consumer {
-                return Err(RegisterError::UnsupportedSql(
-                    RLS_AGGREGATE_NEEDS_DATABASE_READ.to_string(),
+                return Err(RegisterError::NotServedInProcess(
+                    Refusal::RowSecurityNeedsPerConsumerRead {
+                        table: compiled.table_id,
+                    },
                 ));
             }
             return Err(RegisterError::AggregatorOnRlsTable {
@@ -1399,7 +1399,16 @@ where
         };
         let compiled = match self.compile_spec(spec, database_reads_per_consumer) {
             Ok(compiled) => compiled,
-            Err(RegisterError::UnsupportedSql(refusal)) => {
+            Err(RegisterError::UnsupportedSql(prose)) => {
+                return self.plan_reread(
+                    &source_query,
+                    Refusal::Unsupported(prose),
+                    consumer_id,
+                    session,
+                    database_reads_per_consumer,
+                )
+            }
+            Err(RegisterError::NotServedInProcess(refusal)) => {
                 return self.plan_reread(
                     &source_query,
                     refusal,
@@ -1536,12 +1545,14 @@ where
     fn plan_reread(
         &mut self,
         source_query: &crate::reexec::BoundQuery<E::Backend>,
-        refusal: String,
+        refusal: Refusal,
         consumer_id: I::ConsumerId,
         session: Option<I::SessionId>,
         database_reads_per_consumer: bool,
     ) -> Result<Registered<E::Backend>, RegisterError> {
-        if database_reads_per_consumer && refusal == RLS_AGGREGATE_NEEDS_DATABASE_READ {
+        if database_reads_per_consumer
+            && matches!(refusal, Refusal::RowSecurityNeedsPerConsumerRead { .. })
+        {
             return self.plan_whole_reread(source_query, refusal, consumer_id, session);
         }
         let planned = crate::reexec::plan::build_plan::<E::Backend, DB>(
@@ -1573,12 +1584,34 @@ where
                         self.capture_whole(subscription_id, plan, &registration)
                     }
                 };
-                registered.not_served_because = Some(refusal);
+                registered.not_served_because = Some(Self::lift_refusal(refusal));
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
             }
             // No tier can serve it either, so the compiler's refusal stands.
-            Err(_) => Err(RegisterError::UnsupportedSql(refusal)),
+            Err(_) => Err(RegisterError::UnsupportedSql(
+                Self::lift_refusal(refusal).to_string(),
+            )),
+        }
+    }
+
+    /// Lift a compiler refusal into the reason a caller reads, widening each
+    /// builtin kind it carries into this backend's scalar kind.
+    fn lift_refusal(refusal: Refusal) -> crate::NotServed<E::Backend> {
+        match refusal {
+            Refusal::RowSecurityNeedsPerConsumerRead { table } => {
+                crate::NotServed::RowSecurityNeedsPerConsumerRead { table }
+            }
+            Refusal::UnfoldableAggregate {
+                column,
+                kind,
+                function,
+            } => crate::NotServed::UnfoldableAggregate {
+                column,
+                kind: kind.into(),
+                function,
+            },
+            Refusal::Unsupported(prose) => crate::NotServed::UnsupportedSql(prose),
         }
     }
 
@@ -1631,7 +1664,7 @@ where
     fn plan_whole_reread(
         &mut self,
         source_query: &crate::reexec::BoundQuery<E::Backend>,
-        refusal: String,
+        refusal: Refusal,
         consumer_id: I::ConsumerId,
         session: Option<I::SessionId>,
     ) -> Result<Registered<E::Backend>, RegisterError> {
@@ -1648,7 +1681,7 @@ where
             database_reads_per_consumer: true,
         };
         let mut registered = self.capture_whole(subscription_id, plan, &registration);
-        registered.not_served_because = Some(refusal);
+        registered.not_served_because = Some(Self::lift_refusal(refusal));
         self.persist_reads_after_change(subscription_id)?;
         Ok(registered)
     }
@@ -5125,6 +5158,7 @@ mod tests {
             }) => panic!("{where_clause} should not be served in process, got {served:?}"),
             Ok(registered) => registered
                 .not_served_because
+                .map(|reason| reason.to_string())
                 .expect("a tier that needs a read says why"),
             Err(e) => panic!("{where_clause} should register on a read tier, got {e:?}"),
         }

@@ -59,6 +59,37 @@ pub enum CatalogError {
     },
 }
 
+/// A cause the in-process evaluator cannot answer, at the compiler's error
+/// boundary.
+///
+/// Carries only backend-independent data, because this type is not generic
+/// and a custom backend scalar kind cannot cross it. A cause whose operands
+/// are builtin travels whole; a cause naming a custom kind has to be built in
+/// generic code instead.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// A shared answer over a row-security table would be unsafe.
+    #[error("aggregate on RLS table requires database re-execution")]
+    RowSecurityNeedsPerConsumerRead {
+        /// The table whose row security forces the read.
+        table: crate::TableId,
+    },
+    /// The aggregate reads a column the fold cannot carry.
+    #[error("{function} requires a numeric column (Int, Float, or Decimal), but column {column} has type {kind:?}")]
+    UnfoldableAggregate {
+        /// The aggregated column.
+        column: crate::ColumnId,
+        /// The column's builtin kind, which is what the fold checked.
+        kind: crate::backend::BuiltinKind,
+        /// The aggregate function, as the statement spelled it.
+        function: String,
+    },
+    /// A form with no structured cause, carrying the compiler's own words.
+    #[error("{0}")]
+    Unsupported(String),
+}
+
 /// Errors during subscription registration
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
@@ -74,6 +105,13 @@ pub enum RegisterError {
     /// SQL uses unsupported features
     #[error("Unsupported SQL: {0}")]
     UnsupportedSql(String),
+
+    /// The compiler can register the statement, but the in-process evaluator
+    /// cannot answer it, so a tier that reads the database has to. Lifted to
+    /// [`NotServed<B>`](crate::NotServed) at the engine boundary, widening a
+    /// builtin kind into that backend's scalar kind.
+    #[error("{0}")]
+    NotServedInProcess(Refusal),
 
     /// Table name not found in catalog
     #[error("Unknown table: {0}")]

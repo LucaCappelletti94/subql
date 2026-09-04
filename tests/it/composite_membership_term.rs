@@ -348,6 +348,7 @@ mod refusals {
         );
         registered
             .not_served_because
+            .map(|reason| reason.to_string())
             .expect("the fallback names why the fold refused")
     }
 
@@ -400,6 +401,7 @@ mod refusals {
         );
         let reason = registered
             .not_served_because
+            .map(|reason| reason.to_string())
             .expect("the fallback names why the fold refused");
         assert!(
             reason.contains("subtraction"),

@@ -404,10 +404,13 @@ fn resolve_numeric_agg_column<DB: DatabaseLike>(
             // kind in the error so the message matches the aggregate's
             // requirement.
             other => {
-                return Err(RegisterError::UnsupportedSql(format!(
-                    "{display} requires a numeric column (Int, Float, or Decimal), \
-                     but column {column} has type {other:?}"
-                )));
+                return Err(RegisterError::NotServedInProcess(
+                    crate::errors::Refusal::UnfoldableAggregate {
+                        column,
+                        kind: other,
+                        function: display,
+                    },
+                ));
             }
         }
     }

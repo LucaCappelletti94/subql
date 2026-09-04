@@ -10,8 +10,8 @@ pub use generic_id_types::{DefaultIds, Id, IdTypes, SubscriptionId, Subscription
 pub use subscription_types::{
     AggregateBootstrap, AggregateInstallError, AggregateSeedInstall, DropReason, DroppedRead,
     EvictionPolicy, GroupedScalarInstall, GroupedScalarSeedInstall, Install, InstallError,
-    InstalledPage, InstalledRowDelta, KeyedRowsInstall, PerConsumerDatabaseReads, ReadTier,
-    Registered, RegistrationRequest, RestoredRead, RestoredReads, ScalarInstall, Served,
+    InstalledPage, InstalledRowDelta, KeyedRowsInstall, NotServed, PerConsumerDatabaseReads,
+    ReadTier, Registered, RegistrationRequest, RestoredRead, RestoredReads, ScalarInstall, Served,
     StatedTermValues, SubscriptionMetadata, SubscriptionRequest, SubscriptionsView, Tier, TierKind,
     UnregisterReport, WholeRowsInstall,
 };
