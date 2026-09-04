@@ -101,6 +101,8 @@ impl CustomScalars for MyScalars {
 struct Custom;
 
 impl Backend for Custom {
+    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+
     type Dialect = PostgreSqlDialect;
     type Custom = MyScalars;
     type Bool = bool;

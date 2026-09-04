@@ -312,6 +312,16 @@ pub trait Backend: 'static {
         crate::compiler::value_cmp::structural_ordering(left, right)
     }
 
+    /// The character a `LIKE` pattern uses to escape the next character
+    /// without an `ESCAPE` clause, or `None` when the engine has no default.
+    ///
+    /// A constant rather than a dialect lookup at match time, because it is
+    /// a property of the engine and every row would otherwise pay for the
+    /// lookup. Measured: PostgreSQL and MySQL escape with a backslash,
+    /// SQLite has no default escape at all, so a backslash in a SQLite
+    /// pattern matches a backslash.
+    const LIKE_DEFAULT_ESCAPE: Option<char>;
+
     /// SQL parser dialect for this backend.
     type Dialect: sqlparser::dialect::Dialect;
 

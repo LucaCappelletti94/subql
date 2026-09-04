@@ -442,9 +442,13 @@ impl<B: Backend> Vm<B> {
                     };
 
                 let matched = if *case_sensitive {
-                    simple_like(str_val, pat_val)
+                    simple_like(str_val, pat_val, B::LIKE_DEFAULT_ESCAPE)
                 } else {
-                    simple_like(&str_val.to_lowercase(), &pat_val.to_lowercase())
+                    simple_like(
+                        &str_val.to_lowercase(),
+                        &pat_val.to_lowercase(),
+                        B::LIKE_DEFAULT_ESCAPE,
+                    )
                 };
 
                 self.stack.push(StackValue::Tri(if matched {
@@ -600,9 +604,51 @@ impl<B: Backend> Default for Vm<B> {
 ///
 /// Supports `%` (zero or more characters) and `_` (exactly one character).
 /// Does not support `ESCAPE` clauses.
-fn simple_like(string: &str, pattern: &str) -> bool {
+/// One step of a compiled `LIKE` pattern.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PatternAtom {
+    /// `%`: zero or more characters.
+    AnySequence,
+    /// `_`: exactly one character.
+    AnyChar,
+    /// One character, matched as itself.
+    Literal(char),
+    /// The escape character with nothing left to escape, which only the
+    /// final position can hold. It matches nothing.
+    DanglingEscape,
+}
+
+/// Compile `pattern` under `escape`, the engine's default escape character.
+///
+/// With `escape` `None` every character is ordinary, which is SQLite's
+/// rule: a backslash in a pattern matches a backslash.
+fn compile_pattern(pattern: &str, escape: Option<char>) -> Vec<PatternAtom> {
+    let mut atoms = Vec::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if Some(ch) == escape {
+            // The escape applies to whatever follows, wildcard or not:
+            // both engines that have it answer `'ab' LIKE 'a\b'` true.
+            atoms.push(
+                chars
+                    .next()
+                    .map_or(PatternAtom::DanglingEscape, PatternAtom::Literal),
+            );
+            continue;
+        }
+        atoms.push(match ch {
+            '%' => PatternAtom::AnySequence,
+            '_' => PatternAtom::AnyChar,
+            literal => PatternAtom::Literal(literal),
+        });
+    }
+    atoms
+}
+
+/// SQL `LIKE` pattern matching under one engine's default escape.
+fn simple_like(string: &str, pattern: &str, escape: Option<char>) -> bool {
     let s: Vec<char> = string.chars().collect();
-    let p: Vec<char> = pattern.chars().collect();
+    let p = compile_pattern(pattern, escape);
     let pn = p.len();
 
     // dp[j] = true when s[0..i] matches p[0..j].
@@ -610,8 +656,8 @@ fn simple_like(string: &str, pattern: &str) -> bool {
     dp[0] = true;
 
     // Leading '%' can match the empty string.
-    for (j, &ch) in p.iter().enumerate() {
-        if ch == '%' {
+    for (j, atom) in p.iter().enumerate() {
+        if *atom == PatternAtom::AnySequence {
             dp[j + 1] = dp[j];
         } else {
             break;
@@ -621,24 +667,29 @@ fn simple_like(string: &str, pattern: &str) -> bool {
     for &sc in &s {
         let mut new_dp = vec![false; pn + 1];
         for j in 0..pn {
-            if !(dp[j] || (p[j] == '%' && new_dp[j])) {
+            if !(dp[j] || (p[j] == PatternAtom::AnySequence && new_dp[j])) {
                 continue;
             }
             match p[j] {
-                '%' => {
+                PatternAtom::AnySequence => {
                     new_dp[j] = true;
                     new_dp[j + 1] = true;
                 }
-                '_' => {
+                PatternAtom::AnyChar => {
                     if dp[j] {
                         new_dp[j + 1] = true;
                     }
                 }
-                ch => {
+                PatternAtom::Literal(ch) => {
                     if dp[j] && sc == ch {
                         new_dp[j + 1] = true;
                     }
                 }
+                // Matches nothing, so a pattern ending with the escape
+                // answers no-match. PostgreSQL raises here instead, which
+                // needs a per-subscription failure channel the engine does
+                // not carry yet.
+                PatternAtom::DanglingEscape => {}
             }
         }
         dp = new_dp;

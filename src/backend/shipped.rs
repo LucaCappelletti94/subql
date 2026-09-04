@@ -19,6 +19,9 @@ use alloc::string::ToString;
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
+    /// Measured: a backslash escapes the next character.
+    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+
     type Custom = NoCustomScalars<Self>;
 
     fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
@@ -123,6 +126,9 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
+    /// Measured: a backslash escapes the next character.
+    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+
     type Custom = NoCustomScalars<Self>;
 
     fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
@@ -189,6 +195,10 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    /// Measured: SQLite has no default escape, so a backslash in a
+    /// pattern matches a backslash.
+    const LIKE_DEFAULT_ESCAPE: Option<char> = None;
+
     type Custom = NoCustomScalars<Self>;
 
     fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
