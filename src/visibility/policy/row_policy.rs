@@ -71,7 +71,7 @@ use crate::TableId;
 /// // copy and end the borrow before `Shapes::new` takes the catalog.
 /// let relations = translation.relations().to_vec();
 /// let naming = std::borrow::Cow::from(translation.row_naming()).into_owned();
-/// let answers = translation.action_relations();
+/// let answers = translation.action_relations().to_vec();
 /// drop(translation);
 /// let shapes = Arc::new(
 ///     Shapes::new::<Postgres>(db, &relations)

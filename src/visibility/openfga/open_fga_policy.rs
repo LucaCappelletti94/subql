@@ -651,7 +651,7 @@ where
         requery: &Requery<'_, B>,
         records: &[Record],
     ) -> Result<Reconciled, OpenFgaError> {
-        let scope = &requery.query.scope;
+        let scope = requery.query.scope();
         let mut rendered = Vec::with_capacity(requery.key.len());
         for value in &requery.key {
             let Some(text) = render_text(value) else {
@@ -1549,7 +1549,7 @@ CREATE POLICY notes_p ON notes USING (
         let (relations, naming, answers) = (
             translation.relations().to_vec(),
             Cow::from(translation.row_naming()).into_owned(),
-            translation.action_relations(),
+            translation.action_relations().to_vec(),
         );
         drop(translation);
         let shapes = Arc::new(

@@ -1895,7 +1895,7 @@ checksum = "ad5208a115eaba24916f7456929832e310a81518c641f93fee4f89aa93aa3675"
 dependencies = [
  "cfg-if",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2021,7 +2021,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2269,7 +2269,7 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#59f580bcf10f357e81f606db693dfc49f20ee863"
+source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#fab6b7fa559a987f569a01765411ff55158e6a5c"
 dependencies = [
  "barnes-hut-tree",
  "bitvec",
@@ -2638,7 +2638,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3830,10 +3830,11 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#e8151c160ae8ab53d7c190996af373af9585575c"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#8ca2446f83d4e8e62c053285b359832886704342"
 dependencies = [
  "sql-traits",
  "sqlparser",
+ "sqlparser-plpgsql",
  "thiserror 2.0.20",
 ]
 
@@ -4115,7 +4116,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -4134,7 +4135,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4280,7 +4281,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4318,9 +4319,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4590,7 +4591,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#98bda10681e5603aefa5382af990370bc1116f34"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#72811572c2ac21660a673ffd13f70477d2dca15d"
 dependencies = [
  "openfga-client",
  "rls2fga-types",
@@ -4604,7 +4605,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#98bda10681e5603aefa5382af990370bc1116f34"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#72811572c2ac21660a673ffd13f70477d2dca15d"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -4673,7 +4674,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5176,7 +5177,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#e6b2a8da40f2af2ad44e8c119320dfb3604137dc"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#eed59a3e113f1f93b28a23b71f699d7a2ec407d7"
 dependencies = [
  "geometric-traits",
  "sha2 0.10.9",
@@ -5245,9 +5246,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlparser-plpgsql"
+version = "0.1.0"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-plpgsql?branch=main#29b94b9ab351f916295a323429e71759be83ec5f"
+dependencies = [
+ "sqlparser",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c0054b7785322fe9e4b0ce485749ad730e7ef278"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#5c974dd1399d9d16cc2924bef1846dbfba91cd49"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5485,10 +5495,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6395,7 +6405,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
