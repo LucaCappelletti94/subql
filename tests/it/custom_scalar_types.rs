@@ -103,6 +103,10 @@ struct Custom;
 impl Backend for Custom {
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
+    /// The fixtures raise on a zero divisor, as PostgreSQL does.
+    const DIVISION_BY_ZERO: subql::compiler::vm::arithmetic::DivisionByZero =
+        subql::compiler::vm::arithmetic::DivisionByZero::Fails;
+
     /// The fixtures use the standard integer carrier, so the shared
     /// checked arithmetic serves, raising as PostgreSQL does.
     fn integer_binary(

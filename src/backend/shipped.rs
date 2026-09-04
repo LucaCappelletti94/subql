@@ -51,6 +51,10 @@ fn postgres_trailing_spaces<V: postgres_jsonb_canonical::PgVersion + 'static>(
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
+    /// Measured: PostgreSQL raises `division by zero`.
+    const DIVISION_BY_ZERO: crate::compiler::vm::arithmetic::DivisionByZero =
+        crate::compiler::vm::arithmetic::DivisionByZero::Fails;
+
     /// Measured: PostgreSQL raises `bigint out of range`.
     fn integer_binary(
         operation: crate::compiler::vm::arithmetic::ArithmeticOp,
@@ -241,6 +245,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
+    /// Measured: MySQL answers `NULL`.
+    const DIVISION_BY_ZERO: crate::compiler::vm::arithmetic::DivisionByZero =
+        crate::compiler::vm::arithmetic::DivisionByZero::IsNull;
+
     /// Measured: MySQL raises `BIGINT value is out of range`.
     fn integer_binary(
         operation: crate::compiler::vm::arithmetic::ArithmeticOp,
@@ -414,6 +422,10 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    /// Measured: SQLite answers `NULL`.
+    const DIVISION_BY_ZERO: crate::compiler::vm::arithmetic::DivisionByZero =
+        crate::compiler::vm::arithmetic::DivisionByZero::IsNull;
+
     /// Measured: SQLite carries the overflowed result as a real.
     fn integer_binary(
         operation: crate::compiler::vm::arithmetic::ArithmeticOp,

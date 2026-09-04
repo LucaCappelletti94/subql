@@ -889,10 +889,14 @@ mod tests {
         );
     }
 
+    /// Division by zero under the PostgreSQL backend is a refusal, not a
+    /// null: measured, the server raises `division by zero`. The VM
+    /// surfaces it so the caller can report it against the one
+    /// subscription that asked.
     #[test]
-    fn division_by_zero_yields_null_then_unknown() {
+    fn division_by_zero_is_refused_under_postgres() {
         let mut vm: Vm<Postgres> = Vm::new();
-        // (col0 / 0) > 1 -> Unknown
+        // (col0 / 0) > 1
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(0)),
@@ -903,8 +907,12 @@ mod tests {
 
         let e = insert_pg(vec![Value::Int(10)]);
         assert_eq!(
-            vm.eval(&program, &e, RowKind::New, &pg_catalog()).unwrap(),
-            Tri::Unknown
+            vm.eval(&program, &e, RowKind::New, &pg_catalog()),
+            Err(VmError::Arithmetic(
+                super::arithmetic::ArithmeticFailure::DivisionByZero {
+                    operation: super::arithmetic::ArithmeticOp::Divide,
+                }
+            ))
         );
     }
 

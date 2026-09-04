@@ -19,6 +19,15 @@ pub enum ArithmeticOp {
     Modulo,
 }
 
+/// What a backend answers when a divisor is zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DivisionByZero {
+    /// Raise, which becomes a per-subscription evaluation failure.
+    Fails,
+    /// Answer SQL `NULL`, which composes to `Tri::Unknown`.
+    IsNull,
+}
+
 /// An evaluation the target engine refuses to answer.
 ///
 /// Not a `Value::Null`: null composes through `OR` and would turn a refused
@@ -32,6 +41,13 @@ pub enum ArithmeticFailure {
     /// real, which is an answer rather than a failure.
     IntegerOverflow {
         /// The operation whose result did not fit.
+        operation: ArithmeticOp,
+    },
+    /// The divisor is zero. Measured: PostgreSQL raises `division by zero`
+    /// for `/` and `%` alike and for every numeric type, while MySQL and
+    /// SQLite answer `NULL`, which is unknown rather than a failure.
+    DivisionByZero {
+        /// The operator whose divisor was zero.
         operation: ArithmeticOp,
     },
 }
@@ -168,6 +184,20 @@ pub(crate) fn arithmetic_multiply<B: Backend>(
 }
 
 /// Divide: same-scalar only.
+///
+/// A zero divisor is the engine's answer, not one rule: measured,
+/// PostgreSQL raises `division by zero` for every numeric type while MySQL
+/// and SQLite answer `NULL`.
+///
+/// Zero is detected by `b - b == b`, an identity that holds only for the
+/// additive identity of a `Sub<Output = Self> + PartialEq` type. This
+/// avoids adding a `Zero` bound to `Backend`.
+///
+/// # Errors
+///
+/// [`ArithmeticFailure::DivisionByZero`] on a zero divisor where this
+/// backend raises, and [`ArithmeticFailure::IntegerOverflow`] for the one
+/// quotient that does not fit, `i64::MIN / -1`.
 pub(crate) fn arithmetic_divide<B: Backend>(
     a: Value<B>,
     b: Value<B>,
@@ -177,15 +207,20 @@ pub(crate) fn arithmetic_divide<B: Backend>(
     }
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => {
-            if is_zero_scalar(&y) {
-                return Ok(Value::Null);
+            if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
+                return Ok(null);
             }
             return B::integer_binary(ArithmeticOp::Divide, x, y);
         }
-        (Value::Float(x), Value::Float(y)) => Value::Float(x / y),
+        (Value::Float(x), Value::Float(y)) => {
+            if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
+                return Ok(null);
+            }
+            Value::Float(x / y)
+        }
         (Value::Decimal(x), Value::Decimal(y)) => {
-            if is_zero_scalar(&y) {
-                return Ok(Value::Null);
+            if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Divide)? {
+                return Ok(null);
             }
             Value::Decimal(x / y)
         }
@@ -193,7 +228,11 @@ pub(crate) fn arithmetic_divide<B: Backend>(
     })
 }
 
-/// Modulo: `Int % Int` only.
+/// Modulo: `Int % Int` only, same zero rule as division.
+///
+/// # Errors
+///
+/// As [`arithmetic_divide`].
 pub(crate) fn arithmetic_modulo<B: Backend>(
     a: Value<B>,
     b: Value<B>,
@@ -203,13 +242,36 @@ pub(crate) fn arithmetic_modulo<B: Backend>(
     }
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => {
-            if is_zero_scalar(&y) {
-                return Ok(Value::Null);
+            if let Some(null) = zero_divisor::<B, _>(&y, ArithmeticOp::Modulo)? {
+                return Ok(null);
             }
             return B::integer_binary(ArithmeticOp::Modulo, x, y);
         }
         _ => Value::Null,
     })
+}
+
+/// This backend's answer for a zero divisor: `None` when the divisor is not
+/// zero, `Some(Value::Null)` where the engine answers null, and the failure
+/// where it raises.
+///
+/// # Errors
+///
+/// [`ArithmeticFailure::DivisionByZero`] where this backend raises.
+fn zero_divisor<B: Backend, T>(
+    divisor: &T,
+    operation: ArithmeticOp,
+) -> Result<Option<Value<B>>, ArithmeticFailure>
+where
+    T: Clone + PartialEq + core::ops::Sub<Output = T>,
+{
+    if !is_zero_scalar(divisor) {
+        return Ok(None);
+    }
+    match B::DIVISION_BY_ZERO {
+        DivisionByZero::IsNull => Ok(Some(Value::Null)),
+        DivisionByZero::Fails => Err(ArithmeticFailure::DivisionByZero { operation }),
+    }
 }
 
 /// Negate: same-scalar only.

@@ -299,6 +299,13 @@ pub trait Backend: 'static {
         crate::compiler::value_cmp::structural_ordering(left, right)
     }
 
+    /// What this backend answers when a divisor is zero.
+    ///
+    /// Required rather than defaulted, because the engines disagree:
+    /// measured, PostgreSQL raises `division by zero` for `/` and `%` alike
+    /// and for every numeric type, while MySQL and SQLite answer `NULL`.
+    const DIVISION_BY_ZERO: crate::compiler::vm::arithmetic::DivisionByZero;
+
     /// This backend's checked integer arithmetic, or the failure it raises.
     ///
     /// Required rather than defaulted, because the engines disagree:
