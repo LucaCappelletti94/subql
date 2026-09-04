@@ -319,6 +319,8 @@ mod served_statement_shape;
 
 mod semantics_nan;
 
+mod semantics_bool_order;
+
 // Docker-free coverage for the connector session-setup seam (U8) over in-memory
 // SQLite, plus Docker-gated cursor and async-MySQL coverage in the connector
 // test files. The SQLite target needs the same features as the other sqlite

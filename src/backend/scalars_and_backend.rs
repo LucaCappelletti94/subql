@@ -315,9 +315,13 @@ pub trait Backend: 'static {
     /// SQL parser dialect for this backend.
     type Dialect: sqlparser::dialect::Dialect;
 
-    /// SQL `BOOL` representation. Only equality-shaped operations are
-    /// applied to booleans, so truth is the extra row-side capability.
-    type Bool: ScalarKey + ScalarTruth;
+    /// SQL `BOOL` representation.
+    ///
+    /// `PartialOrd` is required because SQL orders booleans, and the order
+    /// has to be the carrier's own: a backend whose boolean really is an
+    /// integer, as SQLite's is, reports `2` above `1`, which deriving the
+    /// order from [`ScalarTruth`] would flatten to equal.
+    type Bool: ScalarKey + ScalarTruth + PartialOrd;
     /// The embedder's own scalar types, or [`crate::backend::NoCustomScalars`] for a backend
     /// serving none. One rule classifies a declared type name into this set
     /// and both the read and the write side consult it, so a column cannot

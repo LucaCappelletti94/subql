@@ -80,6 +80,7 @@ pub fn structural_ordering<B: Backend>(
         return None;
     }
     match (lhs, rhs) {
+        (Value::Bool(x), Value::Bool(y)) => x.partial_cmp(y),
         (Value::Int(x), Value::Int(y)) => x.partial_cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
         (Value::String(x), Value::String(y)) => x.partial_cmp(y),
@@ -90,8 +91,8 @@ pub fn structural_ordering<B: Backend>(
         (Value::Date(x), Value::Date(y)) => x.partial_cmp(y),
         (Value::Time(x), Value::Time(y)) => x.partial_cmp(y),
         (Value::Decimal(x), Value::Decimal(y)) => x.partial_cmp(y),
-        // Bool / Json / Jsonb have no PartialOrd bound in Backend.
-        // Cross-scalar mismatch also lands here.
+        // Json / Jsonb have no order here; a cross-scalar mismatch also
+        // lands on this arm.
         _ => None,
     }
 }
@@ -266,13 +267,6 @@ mod tests {
         matches!(v, Value::Float(f) if f.is_nan())
     }
 
-    /// Two values are "same scalar variant" when they can meaningfully
-    /// participate in a same-scalar comparison. Missing/Null pairs are
-    /// excluded (they collapse to Unknown regardless).
-    fn same_variant(a: &Value<Postgres>, b: &Value<Postgres>) -> bool {
-        core::mem::discriminant(a) == core::mem::discriminant(b) && is_present(a)
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 512,
@@ -376,6 +370,24 @@ mod tests {
             }
         }
 
+        /// Booleans order, `false` below `true`, because SQL orders them and
+        /// the engines agree.
+        #[test]
+        fn ordered_cmp_orders_booleans(a in arb_value(), b in arb_value()) {
+            if let (Value::Bool(x), Value::Bool(y)) = (&a, &b) {
+                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
+                let expected = if !x && *y { Tri::True } else { Tri::False };
+                prop_assert_eq!(
+                    got,
+                    expected,
+                    "expected {:?} for ({:?}, {:?})",
+                    expected,
+                    a,
+                    b,
+                );
+            }
+        }
+
         /// Cross-scalar pairs, and same-scalar pairs on variants without a
         /// `PartialOrd` bound (`Bool`, `Json`, `Jsonb`), collapse to
         /// `Tri::Unknown`.
@@ -384,15 +396,12 @@ mod tests {
             if !is_present(&a) || !is_present(&b) || is_nan(&a) || is_nan(&b) {
                 return Ok(());
             }
-            let cross_scalar =
-                core::mem::discriminant(&a) != core::mem::discriminant(&b);
-            let no_partial_ord = matches!(&a, Value::Bool(_)) && same_variant(&a, &b);
-            if cross_scalar || no_partial_ord {
+            if core::mem::discriminant(&a) != core::mem::discriminant(&b) {
                 let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
                 prop_assert_eq!(
                     got,
                     Tri::Unknown,
-                    "incomparable pair ({:?}, {:?}) did not yield Unknown",
+                    "cross-scalar pair ({:?}, {:?}) did not yield Unknown",
                     a,
                     b,
                 );
@@ -434,19 +443,23 @@ mod tests {
         assert!(!values_equal(ComparisonContext::none(), &int_one, &str_one));
     }
 
-    /// Sanity check: ordered comparison on `Bool` is `Unknown` because
-    /// `Backend::Bool` has no `PartialOrd` bound.
+    /// SQL orders booleans, `false` below `true`, and all three engines
+    /// agree. The comparator used to answer `Unknown`, which dropped the row.
     #[test]
-    fn bool_ordered_comparison_is_unknown() {
+    fn bool_ordered_comparison_puts_false_below_true() {
         let f = Value::<Postgres>::Bool(false);
         let t = Value::<Postgres>::Bool(true);
         assert_eq!(
             compare_ordered_values(ComparisonContext::none(), &f, &t, Ordering::is_lt),
-            Tri::Unknown
+            Tri::True
         );
         assert_eq!(
             compare_ordered_values(ComparisonContext::none(), &t, &f, Ordering::is_lt),
-            Tri::Unknown
+            Tri::False
+        );
+        assert_eq!(
+            compare_ordered_values(ComparisonContext::none(), &t, &t, Ordering::is_le),
+            Tri::True
         );
     }
 
