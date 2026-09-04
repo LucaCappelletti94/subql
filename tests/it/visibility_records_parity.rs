@@ -584,7 +584,7 @@ fn compound_replay_relations(catalog: &ParserDB) -> Vec<RelationShapes> {
         .clone();
     let relation = can_select_relation();
     vec![RelationShapes {
-        type_name: meters_type,
+        type_name: meters_type.clone(),
         relation: relation.clone(),
         from_one_row: false,
         shapes: vec![RecordDescription {
@@ -602,7 +602,7 @@ fn compound_replay_relations(catalog: &ParserDB) -> Vec<RelationShapes> {
                         .to_owned(),
                     None,
                     ReplayScope::Object {
-                        object_type: "meters".to_owned(),
+                        object_type: meters_type,
                         relations: vec![relation],
                     },
                 )

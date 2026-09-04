@@ -763,7 +763,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         assert_eq!(
             *keyed.query.scope(),
             ReplayScope::Object {
-                object_type: "teams".to_string(),
+                object_type: test_names::object_type("teams"),
                 relations: alloc::vec![member_relation()],
             },
             "the replay determines the one team's member facts"
@@ -1204,7 +1204,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                         sql.to_string(),
                         None,
                         ReplayScope::Object {
-                            object_type: test_names::docs_type().as_str().to_string(),
+                            object_type: test_names::docs_type(),
                             relations: scope_relations.to_vec(),
                         },
                     )
@@ -1236,7 +1236,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             alloc::format!("SELECT 1 FROM \"{table}\" WHERE {predicate};"),
             None,
             ReplayScope::Object {
-                object_type: table.to_string(),
+                object_type: test_names::object_type(table),
                 relations: alloc::vec![can_select_relation()],
             },
         )
@@ -1438,9 +1438,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                     query: "SELECT object, relation, subject FROM held;".to_string(),
                     condition: None,
                     scope: ReplayScope::Subject {
-                        subject_type: "user".to_string(),
+                        subject_type: test_names::object_type("user"),
                         relation: can_select_relation(),
-                        object_type: "docs".to_string(),
+                        object_type: test_names::docs_type(),
                     },
                     reason: "the holder is decided by rows no key names".to_string(),
                 },
@@ -1497,9 +1497,9 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                     query: alloc::format!("SELECT object, relation, subject FROM {subject_type};"),
                     condition: None,
                     scope: ReplayScope::Subject {
-                        subject_type: subject_type.to_string(),
+                        subject_type: test_names::object_type(subject_type),
                         relation: can_select_relation(),
-                        object_type: "docs".to_string(),
+                        object_type: test_names::docs_type(),
                     },
                     reason: "the holder is decided by rows no key names".to_string(),
                 },
@@ -1587,7 +1587,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                     query: "SELECT object, relation, subject FROM held;".to_string(),
                     condition: None,
                     scope: ReplayScope::Object {
-                        object_type: "docs".to_string(),
+                        object_type: test_names::docs_type(),
                         relations: vec![can_select_relation()],
                     },
                     reason: "the holder is decided by rows no key names".to_string(),
@@ -1727,7 +1727,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                     query: "SELECT object, relation, subject FROM held;".to_string(),
                     condition: None,
                     scope: ReplayScope::Object {
-                        object_type: "docs".to_string(),
+                        object_type: test_names::docs_type(),
                         relations: vec![can_select_relation()],
                     },
                     reason: "rows no key names".to_string(),
@@ -1841,7 +1841,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 query: "SELECT object, relation, subject FROM held;".to_string(),
                 condition: None,
                 scope: ReplayScope::Object {
-                    object_type: "docs".to_string(),
+                    object_type: test_names::docs_type(),
                     relations: vec![can_select_relation()],
                 },
                 reason: "rows no key names".to_string(),
@@ -1859,7 +1859,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                     "SELECT 1 WHERE team_id = $1;".to_string(),
                     None,
                     ReplayScope::Object {
-                        object_type: "docs".to_string(),
+                        object_type: test_names::docs_type(),
                         relations: vec![can_select_relation()],
                     },
                 )

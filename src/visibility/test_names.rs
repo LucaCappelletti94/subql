@@ -41,6 +41,16 @@ pub fn table(name: &str) -> TableId {
     TableId::from_stored(None, String::from(name))
 }
 
+/// The type rls2fga mints for a table, by its own canonicalisation.
+///
+/// For a fixture naming a table whose translation it does not build, so
+/// there is no model to ask. Still not spelled here: the name is whatever
+/// the generator's own rule makes of it.
+#[must_use]
+pub fn object_type(name: &str) -> TypeName {
+    TypeName::canonicalized(name)
+}
+
 /// The type rls2fga names `docs`.
 #[must_use]
 pub fn docs_type() -> TypeName {

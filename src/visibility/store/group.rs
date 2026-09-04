@@ -127,7 +127,7 @@ impl Region {
             } => relations
                 .iter()
                 .map(|relation| RegionPart {
-                    object_type: object_type.clone(),
+                    object_type: object_type.as_str().to_owned(),
                     relation: relation.clone(),
                     subject_type: None,
                 })
@@ -137,9 +137,9 @@ impl Region {
                 relation,
                 object_type,
             } => alloc::vec![RegionPart {
-                object_type: object_type.clone(),
+                object_type: object_type.as_str().to_owned(),
                 relation: relation.clone(),
-                subject_type: Some(subject_type.clone()),
+                subject_type: Some(subject_type.as_str().to_owned()),
             }],
         };
         let mut region = Self { parts };
