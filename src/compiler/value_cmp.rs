@@ -287,21 +287,22 @@ mod tests {
 
         /// Reflexivity for present, non-NaN values.
         #[test]
-        fn values_equal_is_reflexive_for_present_non_nan(v in arb_value()) {
-            if is_present(&v) && !is_nan(&v) {
+        fn values_equal_is_reflexive_for_present_values(v in arb_value()) {
+            if is_present(&v) {
                 prop_assert!(
                     values_equal(ComparisonContext::none(), &v, &v),
-                    "present non-NaN value {:?} not equal to itself",
+                    "present value {:?} not equal to itself",
                     v,
                 );
             }
         }
 
-        /// `Missing`, `Null`, and `Float(NaN)` are never self-equal. These
-        /// three shapes are the ones the VM lifts to `Tri::Unknown`.
+        /// `Missing` and `Null` are never self-equal, which is what the VM
+        /// lifts to `Tri::Unknown`. A NaN is not in that set under this
+        /// backend: PostgreSQL answers `NaN = NaN` true.
         #[test]
-        fn null_missing_nan_are_not_self_equal(v in arb_value()) {
-            if !is_present(&v) || is_nan(&v) {
+        fn null_and_missing_are_not_self_equal(v in arb_value()) {
+            if !is_present(&v) {
                 prop_assert!(
                     !values_equal(ComparisonContext::none(), &v, &v),
                     "non-present-or-NaN value {:?} unexpectedly self-equal",
@@ -351,19 +352,26 @@ mod tests {
             }
         }
 
-        /// Ordered comparison collapses to `Unknown` whenever either
-        /// `Float` operand is NaN.
+        /// NaN follows PostgreSQL's float order: above every non-NaN value
+        /// and equal to another NaN, rather than IEEE's no-order. A NaN
+        /// against a non-float is still a cross-scalar pair.
         #[test]
-        fn ordered_cmp_unknown_on_nan(a in arb_value(), b in arb_value()) {
+        fn ordered_cmp_follows_postgres_nan_order(a in arb_value(), b in arb_value()) {
             if (is_nan(&a) || is_nan(&b)) && is_present(&a) && is_present(&b) {
                 let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
+                let expected = match (&a, &b) {
+                    (Value::Float(_), Value::Float(_)) if is_nan(&a) => Tri::False,
+                    (Value::Float(_), Value::Float(_)) => Tri::True,
+                    _ => Tri::Unknown,
+                };
                 prop_assert_eq!(
                     got,
-                    Tri::Unknown,
-                    "expected Unknown for NaN operand, got {:?} for ({:?}, {:?})",
-                    got,
+                    expected,
+                    "expected {:?} for ({:?}, {:?}), got {:?}",
+                    expected,
                     a,
                     b,
+                    got,
                 );
             }
         }

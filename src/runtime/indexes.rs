@@ -360,26 +360,38 @@ impl HybridIndexes {
         value: &IndexableCell,
         out: &mut RoaringBitmap,
     ) {
-        // Only works for numeric values; NaN never matches ordered ranges.
         let Some(numeric) = NumericValue::from_indexable(value) else {
             return;
         };
 
-        if let Some(entries) = self.range.get(&col_id) {
-            for entry in entries {
-                // Entries are sorted by lower bound; once lower exceeds the
-                // searched value, no later entries can match.
-                if let Some(lower) = entry.lower {
-                    if !numeric.gte_lower(lower) {
-                        break;
-                    }
-                }
+        let Some(entries) = self.range.get(&col_id) else {
+            return;
+        };
 
-                let in_upper = entry.upper.is_none_or(|u| numeric.lte_upper(u));
+        // A NaN has no place on the numeric line, and this index is not told
+        // which backend it serves: PostgreSQL orders NaN above every number,
+        // IEEE leaves it unordered. Bounding it here would put the prefilter
+        // ahead of the comparator and drop rows the database returns, so
+        // every entry on the column stays a candidate and the comparator
+        // alone decides.
+        if numeric.is_unordered() {
+            out.extend(entries.iter().map(|entry| entry.predicate_id.as_u32()));
+            return;
+        }
 
-                if in_upper {
-                    out.insert(entry.predicate_id.as_u32());
+        for entry in entries {
+            // Entries are sorted by lower bound; once lower exceeds the
+            // searched value, no later entries can match.
+            if let Some(lower) = entry.lower {
+                if !numeric.gte_lower(lower) {
+                    break;
                 }
+            }
+
+            let in_upper = entry.upper.is_none_or(|u| numeric.lte_upper(u));
+
+            if in_upper {
+                out.insert(entry.predicate_id.as_u32());
             }
         }
     }
@@ -410,15 +422,19 @@ impl NumericValue {
     const fn from_indexable(value: &IndexableCell) -> Option<Self> {
         match value {
             IndexableCell::Int(i) => Some(Self::Int(*i)),
-            IndexableCell::Float(bits) => {
-                let f = f64::from_bits(*bits);
-                if f.is_nan() {
-                    None
-                } else {
-                    Some(Self::Float(f))
-                }
-            }
+            // NaN is carried, not dropped: the caller decides what an
+            // unordered value means for pruning.
+            IndexableCell::Float(bits) => Some(Self::Float(f64::from_bits(*bits))),
             _ => None,
+        }
+    }
+
+    /// Whether this value has no position on the numeric line, which only a
+    /// NaN has. The bound tests below are meaningless for it.
+    const fn is_unordered(self) -> bool {
+        match self {
+            Self::Int(_) => false,
+            Self::Float(v) => v.is_nan(),
         }
     }
 

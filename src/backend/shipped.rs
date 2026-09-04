@@ -25,6 +25,48 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         postgres_text_key(column)
     }
 
+    /// PostgreSQL's own float rule: NaN equals NaN. IEEE, which is what
+    /// `PartialOrd` on `f64` implements, says a NaN equals nothing, so
+    /// `WHERE value = value` skipped the row the server returns.
+    ///
+    /// Only the float variants differ. `numeric` also has a NaN in the
+    /// server, but [`Backend::Decimal`] is a `BigDecimal`, which cannot
+    /// represent one, so no such value reaches here.
+    fn scalars_equal(
+        _comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> bool {
+        match (left, right) {
+            (Value::Float(x), Value::Float(y)) if x.is_nan() || y.is_nan() => {
+                x.is_nan() && y.is_nan()
+            }
+            _ => crate::compiler::value_cmp::structural_equality(left, right),
+        }
+    }
+
+    /// NaN is PostgreSQL's largest float: above every non-NaN value, and
+    /// equal to another NaN. IEEE leaves every such pair unordered, which
+    /// answered `Tri::Unknown` and dropped the row.
+    fn compare_scalars(
+        _comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering> {
+        match (left, right) {
+            (Value::Float(x), Value::Float(y)) if x.is_nan() || y.is_nan() => {
+                Some(if x.is_nan() && y.is_nan() {
+                    core::cmp::Ordering::Equal
+                } else if x.is_nan() {
+                    core::cmp::Ordering::Greater
+                } else {
+                    core::cmp::Ordering::Less
+                })
+            }
+            _ => crate::compiler::value_cmp::structural_ordering(left, right),
+        }
+    }
+
     fn group_key_encoder(
         columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
