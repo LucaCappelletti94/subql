@@ -2,7 +2,7 @@
 //! rather than a banner comment.
 
 use super::scalar_value::default_group_key_encoder;
-use super::{Cow, CustomScalars, GroupKeyColumnOf, GroupKeyEncoder, ScalarKindOf, Value};
+use super::{ColumnComparisonOf, Cow, CustomScalars, GroupKeyEncoder, ScalarKindOf, Value};
 use alloc::string::ToString;
 
 /// Trait bounds every [`Backend`] associated scalar type must satisfy.
@@ -246,7 +246,7 @@ pub trait Backend: 'static {
     /// Selects a canonical encoder for resolved group columns.
     #[must_use]
     fn group_key_encoder(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>>
     where
         Self: Sized,
@@ -262,6 +262,56 @@ pub trait Backend: 'static {
     {
         (!value.is_missing()).then_some(value)
     }
+
+    /// Which in-process text comparison reproduces this column's collation,
+    /// or `None` when none does.
+    ///
+    /// The group-key encoder and the predicate comparator ask the same
+    /// question of the same facts, so they read one answer.
+    #[must_use]
+    fn text_key(column: &ColumnComparisonOf<Self>) -> Option<super::scalar_value::TextKey>
+    where
+        Self: Sized,
+    {
+        super::scalar_value::exact_text_key::<Self>(column)
+    }
+
+    /// Whether two scalars are equal for this backend, given both operands'
+    /// catalog facts.
+    ///
+    /// The default is the structural same-scalar rule and reads no facts. A
+    /// backend whose engine disagrees (PostgreSQL NaN, a collation the
+    /// comparator can reproduce, `char(n)` padding, a cross-width numeric
+    /// pair) overrides this and reads the context, which is why the context
+    /// carries both sides rather than one.
+    #[must_use]
+    fn scalars_equal(
+        _comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        crate::compiler::value_cmp::structural_equality(left, right)
+    }
+
+    /// How two scalars order for this backend, or `None` when the pair has
+    /// no defined order, which the caller lifts to `Tri::Unknown`.
+    ///
+    /// Same contract as [`Backend::scalars_equal`].
+    #[must_use]
+    fn compare_scalars(
+        _comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering>
+    where
+        Self: Sized,
+    {
+        crate::compiler::value_cmp::structural_ordering(left, right)
+    }
+
     /// SQL parser dialect for this backend.
     type Dialect: sqlparser::dialect::Dialect;
 

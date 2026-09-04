@@ -126,9 +126,9 @@ mod scalar_kind_serde_tests {
         assert!(postcard::from_bytes::<ScalarKind<TestCustom>>(&[0, 13]).is_err());
     }
 }
-/// Owned SQL name for a group-key column's declared collation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct GroupKeyCollationName {
+/// Owned SQL name for a column's declared collation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CollationName {
     /// Identifier without surrounding quotes.
     pub name: alloc::string::String,
     /// Whether the identifier was quoted.
@@ -139,44 +139,152 @@ pub struct GroupKeyCollationName {
     pub schema_is_quoted: bool,
 }
 
-/// Comparison metadata for a group-key column.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum GroupKeyCollation {
+/// Whether a collation ignores trailing spaces, mirrored from
+/// [`sql_traits::traits::MySqlCollationPadding`] so a persisted descriptor
+/// carries no foreign type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum TrailingSpacePadding {
+    /// Comparisons ignore trailing spaces.
+    PadSpace,
+    /// Comparisons keep trailing spaces significant.
+    NoPad,
+}
+
+impl From<sql_traits::traits::MySqlCollationPadding> for TrailingSpacePadding {
+    fn from(padding: sql_traits::traits::MySqlCollationPadding) -> Self {
+        match padding {
+            sql_traits::traits::MySqlCollationPadding::PadSpace => Self::PadSpace,
+            sql_traits::traits::MySqlCollationPadding::NoPad => Self::NoPad,
+        }
+    }
+}
+
+/// Comparison metadata a column's declared collation carries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CollationFacts {
     /// The database default applies.
     DatabaseDefault,
     /// The column declares a named collation.
     Named {
         /// Declared collation name.
-        name: GroupKeyCollationName,
+        name: CollationName,
         /// PostgreSQL determinism when known.
         postgres_deterministic: Option<bool>,
-        /// MySQL padding behavior when known.
-        mysql_padding: Option<sql_traits::traits::MySqlCollationPadding>,
+        /// Trailing-space rule when known.
+        padding: Option<TrailingSpacePadding>,
     },
     /// Comparison rules changed without a resolved collation name.
     Unknown,
 }
 
-/// Catalog facts needed to decide whether a column can form a group key.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct GroupKeyColumn<C> {
+/// The catalog facts a comparison of one column depends on.
+///
+/// Resolved once per registration and carried in the compiled program, so no
+/// comparison consults the catalog per row. Also decides whether a column can
+/// form a group key, which is the same question asked of the same facts.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "C: serde::Serialize + for<'d> serde::Deserialize<'d>")]
+pub struct ColumnComparison<C> {
     /// Scalar kind used by subql.
     pub kind: ScalarKind<C>,
     /// Canonical declared SQL type.
     pub declared_type: alloc::string::String,
     /// Column comparison metadata.
-    pub collation: GroupKeyCollation,
+    pub collation: CollationFacts,
 }
 
-/// Group-key catalog facts under backend `B`.
-pub type GroupKeyColumnOf<B> = GroupKeyColumn<<<B as Backend>::Custom as CustomScalars>::Kind>;
+impl<C> ColumnComparison<C> {
+    /// Whether the declared type is blank padded, so comparison ignores
+    /// trailing spaces.
+    ///
+    /// `char(n)` ignores them on PostgreSQL and MySQL whatever the collation
+    /// says, and for any `n`, so the rule needs the type and not the width.
+    /// The width is not available anyway: `sql-traits` canonicalizes
+    /// `CHARACTER(5)` to `CHAR`.
+    #[must_use]
+    pub fn is_blank_padded(&self) -> bool {
+        let declared = self.declared_type.trim();
+        ["char", "character", "bpchar", "nchar"]
+            .iter()
+            .any(|name| declared.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Comparison facts under backend `B`.
+pub type ColumnComparisonOf<B> = ColumnComparison<<<B as Backend>::Custom as CustomScalars>::Kind>;
+
+/// The catalog facts of both operands of one comparison.
+///
+/// Two-sided because a comparison's answer can depend on both columns, not
+/// on one: `real` against `double precision` compares at the wider column's
+/// width, and two differently collated text columns have no single collation
+/// to consult. A side that is a literal carries `None`.
+pub struct ComparisonContext<'a, B: Backend> {
+    /// Facts for the left operand, or `None` when it is not a column.
+    pub left: Option<&'a ColumnComparisonOf<B>>,
+    /// Facts for the right operand, or `None` when it is not a column.
+    pub right: Option<&'a ColumnComparisonOf<B>>,
+}
+
+// Hand-implemented for the same reason as `Value<B>`: `#[derive]` would
+// require `B: Clone`, which `Backend` does not imply. The struct holds two
+// shared references and nothing else.
+impl<B: Backend> Clone for ComparisonContext<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<B: Backend> Copy for ComparisonContext<'_, B> {}
+
+impl<B: Backend> Default for ComparisonContext<'_, B> {
+    fn default() -> Self {
+        Self {
+            left: None,
+            right: None,
+        }
+    }
+}
+
+impl<'a, B: Backend> ComparisonContext<'a, B> {
+    /// A comparison whose operand facts are both unknown, which is what a
+    /// literal-only comparison and a program compiled before the descriptors
+    /// existed both carry.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            left: None,
+            right: None,
+        }
+    }
+
+    /// A comparison between a column and a literal.
+    #[must_use]
+    pub const fn column(facts: &'a ColumnComparisonOf<B>) -> Self {
+        Self {
+            left: Some(facts),
+            right: None,
+        }
+    }
+
+    /// The facts both sides agree on, or `None` when they differ or either
+    /// side is unknown. The one honest single-sided answer.
+    #[must_use]
+    pub fn agreed(&self) -> Option<&'a ColumnComparisonOf<B>> {
+        match (self.left, self.right) {
+            (Some(left), None) | (None, Some(left)) => Some(left),
+            (Some(left), Some(right)) if left == right => Some(left),
+            _ => None,
+        }
+    }
+}
 
 type GroupKeyComponentEncoder<B> =
-    fn(&GroupKeyColumnOf<B>, &Value<B>, &mut alloc::vec::Vec<u8>) -> bool;
+    fn(&ColumnComparisonOf<B>, &Value<B>, &mut alloc::vec::Vec<u8>) -> bool;
 
 /// Canonical identity encoder selected for one grouped projection.
 pub struct GroupKeyEncoder<B: Backend> {
-    columns: alloc::sync::Arc<[GroupKeyColumnOf<B>]>,
+    columns: alloc::sync::Arc<[ColumnComparisonOf<B>]>,
     encode_component: GroupKeyComponentEncoder<B>,
 }
 
@@ -184,7 +292,7 @@ impl<B: Backend> GroupKeyEncoder<B> {
     /// Creates an encoder from resolved columns and one backend component writer.
     #[must_use]
     pub fn new(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<B>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<B>>,
         encode_component: GroupKeyComponentEncoder<B>,
     ) -> Self {
         Self {
@@ -219,7 +327,7 @@ impl<B: Backend> GroupKeyEncoder<B> {
 
     /// Columns whose comparison contract selected this encoder.
     #[must_use]
-    pub fn columns(&self) -> &[GroupKeyColumnOf<B>] {
+    pub fn columns(&self) -> &[ColumnComparisonOf<B>] {
         &self.columns
     }
 }
@@ -270,7 +378,7 @@ fn append_postcard<T: serde::Serialize + ?Sized>(
 }
 
 fn encode_exact_component<B: Backend>(
-    column: &GroupKeyColumnOf<B>,
+    column: &ColumnComparisonOf<B>,
     value: &Value<B>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
@@ -312,7 +420,7 @@ fn encode_exact_component<B: Backend>(
 }
 
 pub(super) fn default_group_key_encoder<B: Backend>(
-    columns: alloc::vec::Vec<GroupKeyColumnOf<B>>,
+    columns: alloc::vec::Vec<ColumnComparisonOf<B>>,
 ) -> Option<GroupKeyEncoder<B>> {
     let supported = columns.iter().all(|column| {
         matches!(
@@ -342,10 +450,14 @@ pub(super) fn decode_exact_group_value<B: Backend>(
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum TextKey {
+/// The in-process text comparison a column's collation maps to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextKey {
+    /// Byte comparison.
     Exact,
+    /// ASCII case-insensitive comparison.
     AsciiNoCase,
+    /// Trailing spaces ignored.
     TrimTrailingSpace,
 }
 
@@ -386,51 +498,53 @@ fn append_text(output: &mut alloc::vec::Vec<u8>, tag: u8, value: &str, mode: Tex
     }
 }
 
-pub(super) const fn postgres_text_key(column: &GroupKeyColumnOf<Postgres>) -> Option<TextKey> {
+pub(super) const fn postgres_text_key(column: &ColumnComparisonOf<Postgres>) -> Option<TextKey> {
     match &column.collation {
         // PostgreSQL CREATE DATABASE cannot select nondeterministic comparisons.
-        GroupKeyCollation::DatabaseDefault => Some(TextKey::Exact),
-        GroupKeyCollation::Named {
+        CollationFacts::DatabaseDefault => Some(TextKey::Exact),
+        CollationFacts::Named {
             postgres_deterministic: Some(true),
             ..
         } => Some(TextKey::Exact),
-        GroupKeyCollation::Named { .. } | GroupKeyCollation::Unknown => None,
+        CollationFacts::Named { .. } | CollationFacts::Unknown => None,
     }
 }
 
-pub(super) fn sqlite_text_key(column: &GroupKeyColumnOf<SQLite>) -> Option<TextKey> {
+pub(super) fn sqlite_text_key(column: &ColumnComparisonOf<SQLite>) -> Option<TextKey> {
     match &column.collation {
-        GroupKeyCollation::DatabaseDefault => Some(TextKey::Exact),
-        GroupKeyCollation::Named { name, .. } if name.name.eq_ignore_ascii_case("binary") => {
+        CollationFacts::DatabaseDefault => Some(TextKey::Exact),
+        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("binary") => {
             Some(TextKey::Exact)
         }
-        GroupKeyCollation::Named { name, .. } if name.name.eq_ignore_ascii_case("nocase") => {
+        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("nocase") => {
             Some(TextKey::AsciiNoCase)
         }
-        GroupKeyCollation::Named { name, .. } if name.name.eq_ignore_ascii_case("rtrim") => {
+        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("rtrim") => {
             Some(TextKey::TrimTrailingSpace)
         }
-        GroupKeyCollation::Named { .. } | GroupKeyCollation::Unknown => None,
+        CollationFacts::Named { .. } | CollationFacts::Unknown => None,
     }
 }
 
-pub(super) fn mysql_text_key(column: &GroupKeyColumnOf<MySql>) -> Option<TextKey> {
-    let GroupKeyCollation::Named {
-        name,
-        mysql_padding,
-        ..
-    } = &column.collation
-    else {
+/// The default `Backend::text_key`: byte comparison under the database
+/// default collation, and nothing else reproduced.
+pub(super) const fn exact_text_key<B: Backend>(column: &ColumnComparisonOf<B>) -> Option<TextKey> {
+    match &column.collation {
+        CollationFacts::DatabaseDefault => Some(TextKey::Exact),
+        CollationFacts::Named { .. } | CollationFacts::Unknown => None,
+    }
+}
+
+pub(super) fn mysql_text_key(column: &ColumnComparisonOf<MySql>) -> Option<TextKey> {
+    let CollationFacts::Named { name, padding, .. } = &column.collation else {
         return None;
     };
     if !name.name.to_ascii_lowercase().ends_with("_bin") {
         return None;
     }
-    match mysql_padding {
-        Some(sql_traits::traits::MySqlCollationPadding::PadSpace) => {
-            Some(TextKey::TrimTrailingSpace)
-        }
-        Some(sql_traits::traits::MySqlCollationPadding::NoPad) => Some(TextKey::Exact),
+    match padding {
+        Some(TrailingSpacePadding::PadSpace) => Some(TextKey::TrimTrailingSpace),
+        Some(TrailingSpacePadding::NoPad) => Some(TextKey::Exact),
         None if name.name.eq_ignore_ascii_case("utf8mb4_bin") => Some(TextKey::TrimTrailingSpace),
         None if name.name.eq_ignore_ascii_case("utf8mb4_0900_bin") => Some(TextKey::Exact),
         None => None,
@@ -456,7 +570,7 @@ pub fn jsonb_payloads_equal<B: Backend>(left: &B::Jsonb, right: &B::Jsonb) -> bo
 }
 
 pub(super) fn encode_postgres_component<V: postgres_jsonb_canonical::PgVersion + 'static>(
-    column: &GroupKeyColumnOf<Postgres<V>>,
+    column: &ColumnComparisonOf<Postgres<V>>,
     value: &Value<Postgres<V>>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
@@ -478,7 +592,7 @@ pub(super) fn encode_postgres_component<V: postgres_jsonb_canonical::PgVersion +
 }
 
 pub(super) fn encode_mysql_component(
-    column: &GroupKeyColumnOf<MySql>,
+    column: &ColumnComparisonOf<MySql>,
     value: &Value<MySql>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
@@ -500,7 +614,7 @@ pub(super) fn encode_mysql_component(
 }
 
 fn append_sqlite_json(
-    column: &GroupKeyColumnOf<SQLite>,
+    column: &ColumnComparisonOf<SQLite>,
     value: &SqliteJson,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
@@ -523,7 +637,7 @@ fn append_sqlite_json(
 }
 
 pub(super) fn encode_sqlite_component(
-    column: &GroupKeyColumnOf<SQLite>,
+    column: &ColumnComparisonOf<SQLite>,
     value: &Value<SQLite>,
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
@@ -603,8 +717,18 @@ impl<C> ScalarKind<C> {
 ///   type, the same question [`crate::term::kind_can_key`] answers for
 ///   builtins.
 pub trait CustomScalars: 'static {
-    /// The embedder's types, one variant per type.
-    type Kind: Copy + Eq + core::hash::Hash + core::fmt::Debug + Send + Sync + 'static;
+    /// The embedder's types, one variant per type. The serde bounds because
+    /// a compiled predicate persists the comparison facts of every column it
+    /// loads, and those name the column's kind.
+    type Kind: Copy
+        + Eq
+        + core::hash::Hash
+        + core::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + Send
+        + Sync
+        + 'static;
 
     /// A decoded custom value. `Eq + Hash` because a membership term keys
     /// its lookup on this value (see [`Self::can_key`]), and the serde

@@ -248,6 +248,15 @@ pub struct BytecodeProgram<B: Backend> {
     /// reloaded term with no columns would narrow nothing and deliver the row to
     /// every subscriber sharing the predicate.
     pub term_columns: Vec<Vec<ColumnId>>,
+
+    /// The catalog facts each loaded column's comparisons depend on, sorted
+    /// by column id.
+    ///
+    /// Resolved once at registration so no comparison consults the catalog
+    /// per row, and carried in the program because the program is what
+    /// persistence stores and reloads. A column absent here has no resolved
+    /// facts and compares structurally.
+    pub column_comparisons: Vec<(ColumnId, crate::backend::ColumnComparisonOf<B>)>,
 }
 
 impl<B: Backend> BytecodeProgram<B> {
@@ -266,12 +275,47 @@ impl<B: Backend> BytecodeProgram<B> {
     /// program pruned on the load set alone would miss it.
     #[must_use]
     pub fn with_terms(instructions: Vec<Instruction<B>>, term_columns: Vec<Vec<ColumnId>>) -> Self {
+        Self::with_comparisons(instructions, term_columns, Vec::new())
+    }
+
+    /// Build a program whose loaded columns carry resolved comparison facts.
+    #[must_use]
+    pub fn with_comparisons(
+        instructions: Vec<Instruction<B>>,
+        term_columns: Vec<Vec<ColumnId>>,
+        mut column_comparisons: Vec<(ColumnId, crate::backend::ColumnComparisonOf<B>)>,
+    ) -> Self {
+        column_comparisons.sort_by_key(|(column, _)| *column);
         let dependency_columns = Self::extract_dependencies(&instructions, &term_columns);
         Self {
             instructions,
             dependency_columns,
             term_columns,
+            column_comparisons,
         }
+    }
+
+    /// The resolved comparison facts for `column`, or `None` when the
+    /// compiler resolved none.
+    #[must_use]
+    pub fn comparison_for(
+        &self,
+        column: ColumnId,
+    ) -> Option<&crate::backend::ColumnComparisonOf<B>> {
+        self.column_comparisons
+            .binary_search_by_key(&column, |(id, _)| *id)
+            .ok()
+            .map(|index| &self.column_comparisons[index].1)
+    }
+
+    /// Install the comparison facts the compiler resolved for this program's
+    /// loaded columns.
+    pub fn set_column_comparisons(
+        &mut self,
+        mut comparisons: Vec<(ColumnId, crate::backend::ColumnComparisonOf<B>)>,
+    ) {
+        comparisons.sort_by_key(|(column, _)| *column);
+        self.column_comparisons = comparisons;
     }
 
     /// Column ids referenced by any [`Instruction::LoadColumn`] in
@@ -419,6 +463,7 @@ impl<B: Backend> Clone for BytecodeProgram<B> {
             instructions: self.instructions.clone(),
             dependency_columns: self.dependency_columns.clone(),
             term_columns: self.term_columns.clone(),
+            column_comparisons: self.column_comparisons.clone(),
         }
     }
 }
@@ -429,6 +474,7 @@ impl<B: Backend> core::fmt::Debug for BytecodeProgram<B> {
             .field("instructions", &self.instructions)
             .field("dependency_columns", &self.dependency_columns)
             .field("term_columns", &self.term_columns)
+            .field("column_comparisons", &self.column_comparisons)
             .finish()
     }
 }
@@ -438,6 +484,7 @@ impl<B: Backend> PartialEq for BytecodeProgram<B> {
         self.instructions == other.instructions
             && self.dependency_columns == other.dependency_columns
             && self.term_columns == other.term_columns
+            && self.column_comparisons == other.column_comparisons
     }
 }
 #[cfg(test)]

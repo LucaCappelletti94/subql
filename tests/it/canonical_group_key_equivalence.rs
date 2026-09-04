@@ -13,8 +13,8 @@ use diesel::prelude::*;
 use sql_traits::traits::MySqlCollationPadding;
 use std::str::FromStr;
 use subql::backend::{
-    Backend, BuiltinKind, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, MySql,
-    NoCustom, Postgres, SQLite, SqliteJson, Value,
+    Backend, BuiltinKind, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom,
+    Postgres, SQLite, SqliteJson, Value,
 };
 #[cfg(feature = "executor-diesel-mysql")]
 use subql::reexec::MysqlDieselConnector;
@@ -65,9 +65,9 @@ struct CountRow {
 
 fn column(
     kind: subql::backend::BuiltinKind,
-    collation: GroupKeyCollation,
-) -> GroupKeyColumn<NoCustom> {
-    GroupKeyColumn {
+    collation: CollationFacts,
+) -> ColumnComparison<NoCustom> {
+    ColumnComparison {
         kind: kind.into(),
         declared_type: String::from("test"),
         collation,
@@ -77,17 +77,17 @@ fn column(
 fn named(
     name: &str,
     postgres_deterministic: Option<bool>,
-    mysql_padding: Option<MySqlCollationPadding>,
-) -> GroupKeyCollation {
-    GroupKeyCollation::Named {
-        name: GroupKeyCollationName {
+    padding: Option<MySqlCollationPadding>,
+) -> CollationFacts {
+    CollationFacts::Named {
+        name: CollationName {
             name: String::from(name),
             name_is_quoted: false,
             schema: None,
             schema_is_quoted: false,
         },
         postgres_deterministic,
-        mysql_padding,
+        padding: padding.map(Into::into),
     }
 }
 
@@ -231,7 +231,7 @@ fn postgres_keys_match_group_by_equality() {
     assert_eq!(float_groups.len(), 2);
     let float_encoder = Postgres::<Pg18>::group_key_encoder(vec![column(
         BuiltinKind::Float,
-        GroupKeyCollation::DatabaseDefault,
+        CollationFacts::DatabaseDefault,
     )])
     .unwrap();
     assert_eq!(
@@ -275,7 +275,7 @@ fn postgres_keys_match_group_by_equality() {
     assert_eq!(jsonb_groups.len(), 7);
     let jsonb_encoder = Postgres::<Pg18>::group_key_encoder(vec![column(
         BuiltinKind::Jsonb,
-        GroupKeyCollation::DatabaseDefault,
+        CollationFacts::DatabaseDefault,
     )])
     .unwrap();
     assert_eq!(
@@ -410,7 +410,7 @@ fn mysql_keys_match_binary_collations_and_decimal_equality() {
     assert_eq!(single_groups.len(), 2);
     assert!(MySql::group_key_encoder(vec![column(
         BuiltinKind::Float,
-        GroupKeyCollation::DatabaseDefault,
+        CollationFacts::DatabaseDefault,
     )])
     .is_none());
 
@@ -512,7 +512,7 @@ fn sqlite_keys_match_builtin_collations_and_dynamic_numeric_equality() {
     assert_eq!(groups.count, 1);
     let json_encoder = SQLite::group_key_encoder(vec![column(
         BuiltinKind::Json,
-        GroupKeyCollation::DatabaseDefault,
+        CollationFacts::DatabaseDefault,
     )])
     .unwrap();
     assert_eq!(

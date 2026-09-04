@@ -30,9 +30,10 @@ use sql_traits::{
     structs::{AlgorithmId, SchemaFingerprint},
 };
 
-/// Shard format version. v7: full fingerprint envelope replaces the legacy
-/// `u64` field.
-const SHARD_VERSION: u16 = 7;
+/// Shard format version. v8: a stored bytecode program carries the comparison
+/// facts of every column it loads. v7: full fingerprint envelope replaced the
+/// legacy `u64` field.
+const SHARD_VERSION: u16 = 8;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 ///
@@ -631,7 +632,7 @@ mod tests {
 
     /// Every envelope field roundtrips through the on-wire header.
     #[test]
-    fn test_v7_envelope_roundtrip() {
+    fn test_v8_envelope_roundtrip() {
         let catalog = make_catalog();
         let tid = fixture_table_id(&catalog);
         let payload = shard_payload_with_consumers(vec![1, 2, 3], 42);
@@ -639,7 +640,7 @@ mod tests {
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
         let (header, _) = deserialize_shard::<DefaultIds, _>(&bytes, &catalog).unwrap();
 
-        assert_eq!(header.version, 7);
+        assert_eq!(header.version, 8);
         assert_eq!(header.fingerprint.algorithm_id, ALGORITHM_ID_SHA2_256);
         assert_eq!(header.fingerprint.canonicalization_version, 1);
         assert_eq!(header.fingerprint.profile_id, 1);
@@ -650,30 +651,32 @@ mod tests {
         assert_eq!(header.fingerprint.digest128, live.fingerprint128());
     }
 
-    /// Loading a shard whose header carries v6 must fail with
-    /// `VersionMismatch`: no legacy decode path is supported.
+    /// Loading a shard whose header carries an older version must fail with
+    /// `VersionMismatch`: no legacy decode path is supported. v7 is the
+    /// version whose stored bytecode carries no per-column comparison facts,
+    /// so decoding it under v8's shape would misread the payload.
     #[test]
-    fn test_v6_rejected() {
+    fn test_older_versions_rejected() {
         let catalog = make_catalog();
         let tid = fixture_table_id(&catalog);
         let payload = empty_shard_payload(1);
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
 
-        let tampered = tamper_shard_header(&bytes, |hdr| {
-            hdr.version = 6;
-        });
+        for stored in [6_u16, 7] {
+            let tampered = tamper_shard_header(&bytes, |hdr| {
+                hdr.version = stored;
+            });
 
-        let result = deserialize_shard::<DefaultIds, _>(&tampered, &catalog);
-        assert!(
-            matches!(
-                &result,
-                Err(StorageError::VersionMismatch {
-                    expected: 7,
-                    got: 6
-                })
-            ),
-            "expected VersionMismatch{{expected: 7, got: 6}}, got {result:?}"
-        );
+            let result = deserialize_shard::<DefaultIds, _>(&tampered, &catalog);
+            assert!(
+                matches!(
+                    &result,
+                    Err(StorageError::VersionMismatch { expected: 8, got })
+                        if *got == stored
+                ),
+                "expected VersionMismatch{{expected: 8, got: {stored}}}, got {result:?}"
+            );
+        }
     }
 
     /// Writing a shard under one schema and loading it under a different

@@ -429,21 +429,21 @@ mod value_key_tests {
 #[allow(clippy::unwrap_used)]
 mod canonical_group_key_tests {
     use crate::backend::{
-        Backend, BuiltinKind, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, MySql,
-        NoCustom, Pg18, Postgres, SQLite, SqliteJson, Value,
+        Backend, BuiltinKind, CollationFacts, CollationName, ColumnComparison, MySql, NoCustom,
+        Pg18, Postgres, SQLite, SqliteJson, Value,
     };
     use alloc::{string::String, vec};
     use sql_traits::traits::MySqlCollationPadding;
 
-    fn column(kind: BuiltinKind) -> GroupKeyColumn<NoCustom> {
-        column_with_collation(kind, GroupKeyCollation::DatabaseDefault)
+    fn column(kind: BuiltinKind) -> ColumnComparison<NoCustom> {
+        column_with_collation(kind, CollationFacts::DatabaseDefault)
     }
 
     fn column_with_collation(
         kind: BuiltinKind,
-        collation: GroupKeyCollation,
-    ) -> GroupKeyColumn<NoCustom> {
-        GroupKeyColumn {
+        collation: CollationFacts,
+    ) -> ColumnComparison<NoCustom> {
+        ColumnComparison {
             kind: kind.into(),
             declared_type: String::from("test"),
             collation,
@@ -453,17 +453,17 @@ mod canonical_group_key_tests {
     fn named_collation(
         name: &str,
         postgres_deterministic: Option<bool>,
-        mysql_padding: Option<MySqlCollationPadding>,
-    ) -> GroupKeyCollation {
-        GroupKeyCollation::Named {
-            name: GroupKeyCollationName {
+        padding: Option<MySqlCollationPadding>,
+    ) -> CollationFacts {
+        CollationFacts::Named {
+            name: CollationName {
                 name: String::from(name),
                 name_is_quoted: false,
                 schema: None,
                 schema_is_quoted: false,
             },
             postgres_deterministic,
-            mysql_padding,
+            padding: padding.map(Into::into),
         }
     }
 
@@ -538,7 +538,7 @@ mod canonical_group_key_tests {
         assert!(
             Postgres::<Pg18>::group_key_encoder(vec![column_with_collation(
                 BuiltinKind::String,
-                GroupKeyCollation::Unknown,
+                CollationFacts::Unknown,
             )])
             .is_none()
         );

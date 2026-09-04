@@ -10,7 +10,7 @@
 //!
 //! Functions: [`table_id`], [`table_name`], [`column_id`], [`resolve_table`],
 //! [`table_arity`], [`schema_fingerprint`], [`primary_key_columns`],
-//! [`column_scalar_kind`], [`group_key_column`], [`table_has_rls`].
+//! [`column_scalar_kind`], [`column_comparison`], [`table_has_rls`].
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -24,8 +24,7 @@ use sql_traits::{
 use sqlite_diff_rs::SimpleTable;
 
 use crate::backend::{
-    GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn, GroupKeyColumnOf, ScalarKind,
-    ScalarKindOf,
+    CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf, ScalarKind, ScalarKindOf,
 };
 use crate::types::{ColumnId, TableId};
 
@@ -350,11 +349,11 @@ pub fn column_scalar_kind<B: crate::backend::Backend, DB: DatabaseLike>(
 
 /// Returns the scalar and comparison facts for one group-key column.
 #[must_use]
-pub fn group_key_column<B: crate::backend::Backend, DB: DatabaseLike>(
+pub fn column_comparison<B: crate::backend::Backend, DB: DatabaseLike>(
     database: &DB,
     table_id: TableId,
     column_id: ColumnId,
-) -> Option<GroupKeyColumnOf<B>> {
+) -> Option<ColumnComparisonOf<B>> {
     let table_index = usize::try_from(table_id).ok()?;
     let table = database.table_by_id(table_index)?;
     let column = table
@@ -363,23 +362,23 @@ pub fn group_key_column<B: crate::backend::Backend, DB: DatabaseLike>(
     let declared_type = column.data_type(database).into_owned();
     let kind = classify_scalar_kind::<B>(&declared_type)?;
     let collation = match column.collation(database).ok()? {
-        sql_traits::traits::ColumnCollation::DatabaseDefault => GroupKeyCollation::DatabaseDefault,
+        sql_traits::traits::ColumnCollation::DatabaseDefault => CollationFacts::DatabaseDefault,
         sql_traits::traits::ColumnCollation::Named(collation) => {
             let target = collation.name();
-            GroupKeyCollation::Named {
-                name: GroupKeyCollationName {
+            CollationFacts::Named {
+                name: CollationName {
                     name: target.name().to_string(),
                     name_is_quoted: target.name_is_quoted(),
                     schema: target.schema().map(ToString::to_string),
                     schema_is_quoted: target.schema_is_quoted(),
                 },
                 postgres_deterministic: collation.postgres_deterministic(),
-                mysql_padding: collation.mysql_padding(),
+                padding: collation.mysql_padding().map(Into::into),
             }
         }
-        sql_traits::traits::ColumnCollation::Unknown => GroupKeyCollation::Unknown,
+        sql_traits::traits::ColumnCollation::Unknown => CollationFacts::Unknown,
     };
-    Some(GroupKeyColumn {
+    Some(ColumnComparison {
         kind,
         declared_type,
         collation,
@@ -695,8 +694,8 @@ mod tests {
     }
 
     #[test]
-    fn group_key_column_preserves_postgres_collation_facts() {
-        use crate::backend::{GroupKeyCollation, GroupKeyColumnOf};
+    fn column_comparison_preserves_postgres_collation_facts() {
+        use crate::backend::{CollationFacts, ColumnComparisonOf};
 
         let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
             "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
@@ -705,11 +704,11 @@ mod tests {
         .unwrap();
         let table = table_id(&db, "labels").unwrap();
 
-        let column: GroupKeyColumnOf<Postgres> =
-            group_key_column::<Postgres, _>(&db, table, 0).unwrap();
+        let column: ColumnComparisonOf<Postgres> =
+            column_comparison::<Postgres, _>(&db, table, 0).unwrap();
         assert_eq!(column.kind, BuiltinKind::String.into());
         assert_eq!(column.declared_type, "TEXT");
-        let GroupKeyCollation::Named {
+        let CollationFacts::Named {
             name,
             postgres_deterministic,
             ..
@@ -722,25 +721,25 @@ mod tests {
     }
 
     #[test]
-    fn group_key_column_distinguishes_default_and_unknown_collations() {
-        use crate::backend::{GroupKeyCollation, GroupKeyColumnOf};
+    fn column_comparison_distinguishes_default_and_unknown_collations() {
+        use crate::backend::{CollationFacts, ColumnComparisonOf};
 
         let default_db = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
             "CREATE TABLE labels (name TEXT);",
         )
         .unwrap();
         let table = table_id(&default_db, "labels").unwrap();
-        let column: GroupKeyColumnOf<crate::backend::SQLite> =
-            group_key_column::<crate::backend::SQLite, _>(&default_db, table, 0).unwrap();
-        assert_eq!(column.collation, GroupKeyCollation::DatabaseDefault);
+        let column: ColumnComparisonOf<crate::backend::SQLite> =
+            column_comparison::<crate::backend::SQLite, _>(&default_db, table, 0).unwrap();
+        assert_eq!(column.collation, CollationFacts::DatabaseDefault);
 
         let unknown_db = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(
             "CREATE TABLE labels (name TEXT CHARACTER SET utf8mb4);",
         )
         .unwrap();
         let table = table_id(&unknown_db, "labels").unwrap();
-        let column: GroupKeyColumnOf<crate::backend::MySql> =
-            group_key_column::<crate::backend::MySql, _>(&unknown_db, table, 0).unwrap();
-        assert_eq!(column.collation, GroupKeyCollation::Unknown);
+        let column: ColumnComparisonOf<crate::backend::MySql> =
+            column_comparison::<crate::backend::MySql, _>(&unknown_db, table, 0).unwrap();
+        assert_eq!(column.collation, CollationFacts::Unknown);
     }
 }

@@ -284,7 +284,7 @@ where
         .groups
         .iter()
         .map(|column| {
-            crate::catalog_helpers::group_key_column::<B, _>(database, parsed.table_id, *column)
+            crate::catalog_helpers::column_comparison::<B, _>(database, parsed.table_id, *column)
         })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {

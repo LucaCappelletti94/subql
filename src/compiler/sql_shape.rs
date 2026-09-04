@@ -700,7 +700,7 @@ fn grouped_projection<B: crate::backend::Backend, DB: DatabaseLike>(
 ) -> Result<QueryProjection, RegisterError> {
     let columns: Vec<_> = groups
         .iter()
-        .map(|column| catalog_helpers::group_key_column::<B, _>(database, table_id, *column))
+        .map(|column| catalog_helpers::column_comparison::<B, _>(database, table_id, *column))
         .collect::<Option<_>>()
         .ok_or_else(|| {
             RegisterError::UnsupportedSql(
@@ -1020,7 +1020,7 @@ pub(crate) fn extract_grouped_extreme<B: crate::backend::Backend, DB: DatabaseLi
     };
     let Some(columns) = groups
         .iter()
-        .map(|column| catalog_helpers::group_key_column::<B, _>(database, table_id, *column))
+        .map(|column| catalog_helpers::column_comparison::<B, _>(database, table_id, *column))
         .collect::<Option<Vec<_>>>()
     else {
         return Ok(None);

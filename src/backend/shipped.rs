@@ -6,8 +6,8 @@ use super::scalar_value::{
     encode_sqlite_component, mysql_text_key, postgres_text_key, sqlite_text_key, widen_i64_to_f64,
 };
 use super::{
-    Backend, BuiltinKind, GroupKeyColumnOf, GroupKeyEncoder, NoCustomScalars, ScalarKindOf,
-    SqliteJson, Value,
+    Backend, BuiltinKind, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, ScalarKindOf,
+    SqliteJson, TextKey, Value,
 };
 use alloc::string::ToString;
 
@@ -21,8 +21,12 @@ pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomDat
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     type Custom = NoCustomScalars<Self>;
 
+    fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
+        postgres_text_key(column)
+    }
+
     fn group_key_encoder(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
         let supported = columns.iter().all(|column| match column.kind.as_builtin() {
             Some(
@@ -37,7 +41,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
                 | BuiltinKind::Float
                 | BuiltinKind::Jsonb,
             ) => true,
-            Some(BuiltinKind::String) => postgres_text_key(column).is_some(),
+            Some(BuiltinKind::String) => Self::text_key(column).is_some(),
             // PostgreSQL numeric waits on Diesel #5168 for infinity support.
             Some(BuiltinKind::Decimal | BuiltinKind::Json) | None => false,
         });
@@ -79,8 +83,12 @@ pub struct MySql;
 impl Backend for MySql {
     type Custom = NoCustomScalars<Self>;
 
+    fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
+        mysql_text_key(column)
+    }
+
     fn group_key_encoder(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
         let supported = columns.iter().all(|column| match column.kind.as_builtin() {
             Some(
@@ -93,7 +101,7 @@ impl Backend for MySql {
                 | BuiltinKind::Time
                 | BuiltinKind::Decimal,
             ) => true,
-            Some(BuiltinKind::String | BuiltinKind::Uuid) => mysql_text_key(column).is_some(),
+            Some(BuiltinKind::String | BuiltinKind::Uuid) => Self::text_key(column).is_some(),
             // MySQL 8.0 groups persisted signed zero into two groups.
             Some(BuiltinKind::Float | BuiltinKind::Json | BuiltinKind::Jsonb) | None => false,
         });
@@ -141,8 +149,12 @@ pub struct SQLite;
 impl Backend for SQLite {
     type Custom = NoCustomScalars<Self>;
 
+    fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
+        sqlite_text_key(column)
+    }
+
     fn group_key_encoder(
-        columns: alloc::vec::Vec<GroupKeyColumnOf<Self>>,
+        columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
     ) -> Option<GroupKeyEncoder<Self>> {
         let supported = columns.iter().all(|column| match column.kind.as_builtin() {
             Some(
@@ -157,7 +169,7 @@ impl Backend for SQLite {
                 | BuiltinKind::Json
                 | BuiltinKind::Jsonb,
             ) => true,
-            Some(BuiltinKind::String | BuiltinKind::Uuid) => sqlite_text_key(column).is_some(),
+            Some(BuiltinKind::String | BuiltinKind::Uuid) => Self::text_key(column).is_some(),
             Some(BuiltinKind::Decimal) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_sqlite_component))

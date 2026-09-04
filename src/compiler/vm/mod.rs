@@ -33,7 +33,8 @@ use super::{
     value_cmp::{compare_ordered_values, values_equal},
     BytecodeProgram, Instruction, Tri,
 };
-use crate::backend::{Backend, CdcEvent, RowKind, Value};
+use crate::backend::{Backend, CdcEvent, ComparisonContext, RowKind, Value};
+use crate::ColumnId;
 use alloc::vec::Vec;
 use arithmetic::{
     arithmetic_add, arithmetic_divide, arithmetic_modulo, arithmetic_multiply, arithmetic_negate,
@@ -86,8 +87,10 @@ pub enum VmError {
 /// arithmetic instructions. `Tri(_)` variants come from comparison,
 /// null-check, and logical instructions.
 enum StackValue<B: Backend> {
-    /// Scalar value (from literals, column loads, or arithmetic results).
-    Value(Value<B>),
+    /// Scalar value, with the column it was loaded from when it came from
+    /// one. The provenance is what lets a comparison consult the compared
+    /// columns' catalog facts without a per-row lookup.
+    Value(Value<B>, Option<ColumnId>),
     /// Tri-state boolean (from comparisons, null checks, or logical ops).
     Tri(Tri),
 }
@@ -99,7 +102,7 @@ enum StackValue<B: Backend> {
 impl<B: Backend> Clone for StackValue<B> {
     fn clone(&self) -> Self {
         match self {
-            Self::Value(v) => Self::Value(v.clone()),
+            Self::Value(v, column) => Self::Value(v.clone(), *column),
             Self::Tri(t) => Self::Tri(*t),
         }
     }
@@ -108,7 +111,7 @@ impl<B: Backend> Clone for StackValue<B> {
 impl<B: Backend> core::fmt::Debug for StackValue<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Value(v) => f.debug_tuple("Value").field(v).finish(),
+            Self::Value(v, column) => f.debug_tuple("Value").field(v).field(column).finish(),
             Self::Tri(t) => f.debug_tuple("Tri").field(t).finish(),
         }
     }
@@ -117,7 +120,7 @@ impl<B: Backend> core::fmt::Debug for StackValue<B> {
 impl<B: Backend> PartialEq for StackValue<B> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Value(a), Self::Value(b)) => a == b,
+            (Self::Value(a, left), Self::Value(b, right)) => a == b && left == right,
             (Self::Tri(a), Self::Tri(b)) => a == b,
             _ => false,
         }
@@ -234,7 +237,7 @@ impl<B: Backend> Vm<B> {
                     }
                 }
                 other => {
-                    self.execute(other, event, row, db, truths)?;
+                    self.execute(other, program, event, row, db, truths)?;
                 }
             }
             ip += 1;
@@ -248,7 +251,7 @@ impl<B: Backend> Vm<B> {
                     Err(VmError::MalformedProgram)
                 }
             }
-            Some(StackValue::Value(v)) => {
+            Some(StackValue::Value(v, _)) => {
                 // Bare `Null` / `Missing` at TOS is a legitimate `WHERE NULL`
                 // (or a `value_at` that returned `Value::Missing` fed
                 // straight into the WHERE): both collapse to `Unknown`.
@@ -268,6 +271,7 @@ impl<B: Backend> Vm<B> {
     fn execute<E, DB>(
         &mut self,
         instruction: &Instruction<B>,
+        program: &BytecodeProgram<B>,
         event: &E,
         row: RowKind,
         db: &DB,
@@ -279,45 +283,45 @@ impl<B: Backend> Vm<B> {
     {
         match instruction {
             Instruction::PushLiteral(value) => {
-                self.stack.push(StackValue::Value(value.clone()));
+                self.stack.push(StackValue::Value(value.clone(), None));
             }
 
             Instruction::LoadColumn(col_id) => {
                 let value = event.value_at(db, row, *col_id).map_err(VmError::Value)?;
-                self.stack.push(StackValue::Value(value));
+                self.stack.push(StackValue::Value(value, Some(*col_id)));
             }
 
             Instruction::Equal => {
-                let result = self.compare_values(values_equal)?;
+                let result = self.compare_values(program, |ctx, a, b| values_equal(ctx, a, b))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::NotEqual => {
-                let result = self.compare_values(|a, b| !values_equal(a, b))?;
+                let result = self.compare_values(program, |ctx, a, b| !values_equal(ctx, a, b))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::LessThan => {
                 let result =
-                    self.compare_ordered(|ord| matches!(ord, core::cmp::Ordering::Less))?;
+                    self.compare_ordered(program, |ord| matches!(ord, core::cmp::Ordering::Less))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::LessThanOrEqual => {
-                let result =
-                    self.compare_ordered(|ord| !matches!(ord, core::cmp::Ordering::Greater))?;
+                let result = self
+                    .compare_ordered(program, |ord| !matches!(ord, core::cmp::Ordering::Greater))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::GreaterThan => {
-                let result =
-                    self.compare_ordered(|ord| matches!(ord, core::cmp::Ordering::Greater))?;
+                let result = self
+                    .compare_ordered(program, |ord| matches!(ord, core::cmp::Ordering::Greater))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
             Instruction::GreaterThanOrEqual => {
                 let result =
-                    self.compare_ordered(|ord| !matches!(ord, core::cmp::Ordering::Less))?;
+                    self.compare_ordered(program, |ord| !matches!(ord, core::cmp::Ordering::Less))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
@@ -359,7 +363,8 @@ impl<B: Backend> Vm<B> {
             }
 
             Instruction::In(literals) => {
-                let value = self.pop_value()?;
+                let (value, origin) = self.pop_operand()?;
+                let ctx = comparison_context(program, origin, None);
 
                 if value.is_absent() {
                     self.stack.push(StackValue::Tri(Tri::Unknown));
@@ -371,7 +376,7 @@ impl<B: Backend> Vm<B> {
                 for lit in literals {
                     if lit.is_absent() {
                         has_null_rhs = true;
-                    } else if values_equal(&value, lit) {
+                    } else if values_equal(ctx, &value, lit) {
                         found = true;
                         break;
                     }
@@ -389,21 +394,27 @@ impl<B: Backend> Vm<B> {
             }
 
             Instruction::Between => {
-                let upper = self.pop_value()?;
-                let lower = self.pop_value()?;
-                let value = self.pop_value()?;
+                let (upper, upper_origin) = self.pop_operand()?;
+                let (lower, lower_origin) = self.pop_operand()?;
+                let (value, origin) = self.pop_operand()?;
 
                 if value.is_absent() || lower.is_absent() || upper.is_absent() {
                     self.stack.push(StackValue::Tri(Tri::Unknown));
                     return Ok(());
                 }
 
-                let ge_lower = compare_ordered_values(&value, &lower, |ord| {
-                    !matches!(ord, core::cmp::Ordering::Less)
-                });
-                let le_upper = compare_ordered_values(&value, &upper, |ord| {
-                    !matches!(ord, core::cmp::Ordering::Greater)
-                });
+                let ge_lower = compare_ordered_values(
+                    comparison_context(program, origin, lower_origin),
+                    &value,
+                    &lower,
+                    |ord| !matches!(ord, core::cmp::Ordering::Less),
+                );
+                let le_upper = compare_ordered_values(
+                    comparison_context(program, origin, upper_origin),
+                    &value,
+                    &upper,
+                    |ord| !matches!(ord, core::cmp::Ordering::Greater),
+                );
 
                 let result = ge_lower.and(le_upper);
                 self.stack.push(StackValue::Tri(result));
@@ -452,7 +463,7 @@ impl<B: Backend> Vm<B> {
             Instruction::Negate => {
                 let a = self.pop_value()?;
                 let result = arithmetic_negate::<B>(a);
-                self.stack.push(StackValue::Value(result));
+                self.stack.push(StackValue::Value(result, None));
             }
 
             // Jumps are handled in eval() before execute() is called.
@@ -476,13 +487,25 @@ impl<B: Backend> Vm<B> {
     ) -> Result<(), VmError> {
         let b = self.pop_value()?;
         let a = self.pop_value()?;
-        self.stack.push(StackValue::Value(op(a, b)));
+        self.stack.push(StackValue::Value(op(a, b), None));
         Ok(())
+    }
+
+    /// Pop a value together with the column it was loaded from, when any.
+    fn pop_operand(&mut self) -> Result<(Value<B>, Option<ColumnId>), VmError> {
+        match self.stack.pop() {
+            Some(StackValue::Value(v, column)) => Ok((v, column)),
+            Some(StackValue::Tri(_)) => Err(VmError::TypeMismatch {
+                expected: "Value",
+                got: "Tri",
+            }),
+            None => Err(VmError::StackUnderflow),
+        }
     }
 
     fn pop_value(&mut self) -> Result<Value<B>, VmError> {
         match self.stack.pop() {
-            Some(StackValue::Value(v)) => Ok(v),
+            Some(StackValue::Value(v, _)) => Ok(v),
             Some(StackValue::Tri(_)) => Err(VmError::TypeMismatch {
                 expected: "Value",
                 got: "Tri",
@@ -498,8 +521,8 @@ impl<B: Backend> Vm<B> {
             // (`NULL AND true` = `Unknown`). Concrete scalar values are
             // NOT, the compiler must lower boolean columns via an
             // explicit comparison. `Bool` on the stack is a compiler bug.
-            Some(StackValue::Value(v)) if v.is_absent() => Ok(Tri::Unknown),
-            Some(StackValue::Value(_)) => Err(VmError::TypeMismatch {
+            Some(StackValue::Value(v, _)) if v.is_absent() => Ok(Tri::Unknown),
+            Some(StackValue::Value(_, _)) => Err(VmError::TypeMismatch {
                 expected: "Tri",
                 got: "Value",
             }),
@@ -510,8 +533,8 @@ impl<B: Backend> Vm<B> {
     fn peek_tri(&self) -> Result<Tri, VmError> {
         match self.stack.last() {
             Some(StackValue::Tri(t)) => Ok(*t),
-            Some(StackValue::Value(v)) if v.is_absent() => Ok(Tri::Unknown),
-            Some(StackValue::Value(_)) => Err(VmError::TypeMismatch {
+            Some(StackValue::Value(v, _)) if v.is_absent() => Ok(Tri::Unknown),
+            Some(StackValue::Value(_, _)) => Err(VmError::TypeMismatch {
                 expected: "Tri",
                 got: "Value",
             }),
@@ -519,27 +542,49 @@ impl<B: Backend> Vm<B> {
         }
     }
 
-    fn compare_values<F>(&mut self, f: F) -> Result<Tri, VmError>
+    fn compare_values<F>(&mut self, program: &BytecodeProgram<B>, f: F) -> Result<Tri, VmError>
     where
-        F: FnOnce(&Value<B>, &Value<B>) -> bool,
+        F: FnOnce(ComparisonContext<'_, B>, &Value<B>, &Value<B>) -> bool,
     {
-        let b = self.pop_value()?;
-        let a = self.pop_value()?;
+        let (b, right) = self.pop_operand()?;
+        let (a, left) = self.pop_operand()?;
 
         if a.is_absent() || b.is_absent() {
             return Ok(Tri::Unknown);
         }
 
-        Ok(if f(&a, &b) { Tri::True } else { Tri::False })
+        let ctx = comparison_context(program, left, right);
+        Ok(if f(ctx, &a, &b) {
+            Tri::True
+        } else {
+            Tri::False
+        })
     }
 
-    fn compare_ordered<F>(&mut self, f: F) -> Result<Tri, VmError>
+    fn compare_ordered<F>(&mut self, program: &BytecodeProgram<B>, f: F) -> Result<Tri, VmError>
     where
         F: FnOnce(core::cmp::Ordering) -> bool,
     {
-        let b = self.pop_value()?;
-        let a = self.pop_value()?;
-        Ok(compare_ordered_values(&a, &b, f))
+        let (b, right) = self.pop_operand()?;
+        let (a, left) = self.pop_operand()?;
+        Ok(compare_ordered_values(
+            comparison_context(program, left, right),
+            &a,
+            &b,
+            f,
+        ))
+    }
+}
+
+/// The comparison facts the program resolved for these two operands.
+fn comparison_context<B: Backend>(
+    program: &BytecodeProgram<B>,
+    left: Option<ColumnId>,
+    right: Option<ColumnId>,
+) -> ComparisonContext<'_, B> {
+    ComparisonContext {
+        left: left.and_then(|column| program.comparison_for(column)),
+        right: right.and_then(|column| program.comparison_for(column)),
     }
 }
 

@@ -150,6 +150,30 @@ impl SqlTableName {
     }
 }
 
+/// Resolve the comparison facts of every column a compiled program loads.
+///
+/// One catalog pass per registration, so no comparison consults the catalog
+/// per row. A column the catalog cannot classify carries no facts and
+/// compares structurally, which is what an unresolvable column did before.
+fn resolve_column_comparisons<B, DB>(
+    program: &mut BytecodeProgram<B>,
+    table_id: TableId,
+    database: &DB,
+) where
+    B: Backend,
+    DB: DatabaseLike,
+{
+    let comparisons = program
+        .dependency_columns
+        .iter()
+        .filter_map(|column| {
+            crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, *column)
+                .map(|facts| (*column, facts))
+        })
+        .collect();
+    program.set_column_comparisons(comparisons);
+}
+
 /// Parse and compile a subscription SQL statement into bytecode.
 ///
 /// # Arguments
@@ -276,6 +300,9 @@ where
             (BytecodeProgram::new(instructions), Vec::new())
         };
 
+    let mut program = program;
+    resolve_column_comparisons::<B, DB>(&mut program, pq.table_id, database);
+
     let prefilter_plan =
         build_prefilter_plan::<B, DB>(pq.where_clause.as_ref(), pq.table_id, database);
 
@@ -360,6 +387,8 @@ where
         wrap_bare_value_as_tri::<B>(&mut instructions)?;
         BytecodeProgram::new(instructions)
     };
+    let mut where_program = where_program;
+    resolve_column_comparisons::<B, DB>(&mut where_program, table_id, database);
     let where_dependency_columns = where_program.dependency_columns.clone();
     Ok(TableAndWhereDeps {
         table_id,

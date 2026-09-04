@@ -365,7 +365,7 @@ where
                 let columns = groups
                     .iter()
                     .map(|column| {
-                        crate::catalog_helpers::group_key_column::<E::Backend, _>(
+                        crate::catalog_helpers::column_comparison::<E::Backend, _>(
                             &self.database,
                             table_id,
                             *column,

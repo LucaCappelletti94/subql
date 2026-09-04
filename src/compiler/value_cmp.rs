@@ -29,19 +29,19 @@
 //! `PartialOrd::partial_cmp` returns `None` on NaN operands; the helper
 //! propagates that as `Tri::Unknown` rather than crashing.
 
-use crate::backend::{Backend, Value};
+use crate::backend::{Backend, ComparisonContext, Value};
 use crate::compiler::Tri;
 
-/// Structural equality between two same-scalar [`Value`]s.
+/// Structural equality between two same-scalar [`Value`]s: the default a
+/// backend inherits from [`Backend::scalars_equal`].
 ///
-/// * Both operands carrying the same scalar variant with equal payload -> `true`.
-/// * Both operands carrying the same scalar variant with unequal payload -> `false`.
+/// * Same scalar variant, equal payload -> `true`; unequal payload -> `false`.
 /// * Cross-scalar mismatch -> `false`.
 /// * Either operand `Missing` or `Null` -> `false` (the VM lifts those to
-///   `Tri::Unknown` before calling this helper; this function itself never
-///   returns tri-state).
-/// * `Value::Float(NaN)` == anything -> `false` (SQL/IEEE rule; `NaN != NaN`).
-pub fn values_equal<B: Backend>(a: &Value<B>, b: &Value<B>) -> bool {
+///   `Tri::Unknown` before asking; this function never returns tri-state).
+/// * `Value::Float(NaN)` against anything -> `false`, the IEEE rule.
+///   PostgreSQL disagrees, which is why a backend can override it.
+pub fn structural_equality<B: Backend>(a: &Value<B>, b: &Value<B>) -> bool {
     match (a, b) {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
@@ -66,27 +66,20 @@ pub fn values_equal<B: Backend>(a: &Value<B>, b: &Value<B>) -> bool {
     }
 }
 
-/// Ordered comparison between two same-scalar [`Value`]s under a caller
-/// predicate on [`core::cmp::Ordering`].
+/// Structural ordering between two same-scalar [`Value`]s: the default a
+/// backend inherits from [`Backend::compare_scalars`].
 ///
-/// * Either operand `Missing` or `Null` -> `Tri::Unknown`.
-/// * Cross-scalar mismatch -> `Tri::Unknown`.
-/// * Variant lacks a `PartialOrd` bound in [`Backend`] (`Bool`, `Json`,
-///   `Jsonb`) -> `Tri::Unknown`.
-/// * `partial_cmp` returns `None` (NaN operand on `Float`) -> `Tri::Unknown`.
-/// * Otherwise the predicate is invoked on the resolved `Ordering` and the
-///   result is lifted to `Tri::True` / `Tri::False`.
-pub fn compare_ordered_values<B, F>(lhs: &Value<B>, rhs: &Value<B>, predicate: F) -> Tri
-where
-    B: Backend,
-    F: FnOnce(core::cmp::Ordering) -> bool,
-{
-    // Missing / Null -> Unknown.
+/// `None` means the pair has no defined order: `Missing`, `Null`, a
+/// cross-scalar pair, a variant with no `PartialOrd` bound (`Bool`, `Json`,
+/// `Jsonb`), or a NaN operand.
+pub fn structural_ordering<B: Backend>(
+    lhs: &Value<B>,
+    rhs: &Value<B>,
+) -> Option<core::cmp::Ordering> {
     if lhs.is_absent() || rhs.is_absent() {
-        return Tri::Unknown;
+        return None;
     }
-
-    let ord = match (lhs, rhs) {
+    match (lhs, rhs) {
         (Value::Int(x), Value::Int(y)) => x.partial_cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
         (Value::String(x), Value::String(y)) => x.partial_cmp(y),
@@ -99,13 +92,114 @@ where
         (Value::Decimal(x), Value::Decimal(y)) => x.partial_cmp(y),
         // Bool / Json / Jsonb have no PartialOrd bound in Backend.
         // Cross-scalar mismatch also lands here.
-        _ => return Tri::Unknown,
-    };
+        _ => None,
+    }
+}
 
-    match ord {
-        Some(o) if predicate(o) => Tri::True,
+/// Equality as backend `B` answers it for this pair of operands.
+///
+/// Every evaluation path (VM, prefilter, re-execution maintenance) asks
+/// here, so one backend rule serves them all.
+pub fn values_equal<B: Backend>(
+    comparison: ComparisonContext<'_, B>,
+    a: &Value<B>,
+    b: &Value<B>,
+) -> bool {
+    B::scalars_equal(comparison, a, b)
+}
+
+/// Ordered comparison as backend `B` answers it, lifted to [`Tri`] under a
+/// caller predicate on [`core::cmp::Ordering`].
+///
+/// `Tri::Unknown` whenever the backend reports no defined order.
+pub fn compare_ordered_values<B, F>(
+    comparison: ComparisonContext<'_, B>,
+    lhs: &Value<B>,
+    rhs: &Value<B>,
+    predicate: F,
+) -> Tri
+where
+    B: Backend,
+    F: FnOnce(core::cmp::Ordering) -> bool,
+{
+    match B::compare_scalars(comparison, lhs, rhs) {
+        Some(ordering) if predicate(ordering) => Tri::True,
         Some(_) => Tri::False,
         None => Tri::Unknown,
+    }
+}
+
+/// The descriptor the compiler resolves per compared column, and the backend
+/// trait that consults it.
+#[cfg(all(test, feature = "std"))]
+#[allow(clippy::unwrap_used)]
+mod comparison_descriptor_tests {
+    use crate::backend::{Backend, ColumnComparisonOf, Postgres, TextKey};
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    fn comparison(ddl: &str, column: &str) -> ColumnComparisonOf<Postgres> {
+        let db = ParserDB::parse::<PostgreSqlDialect>(ddl).expect("the DDL parses");
+        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        let column_id = crate::catalog_helpers::column_id(&db, table, column).expect("the column");
+        crate::catalog_helpers::column_comparison::<Postgres, _>(&db, table, column_id)
+            .expect("the column classifies")
+    }
+
+    #[test]
+    fn descriptor_reports_char_padding_from_the_declared_type() {
+        for ddl in [
+            "CREATE TABLE t (code CHAR(5));",
+            "CREATE TABLE t (code CHARACTER(5));",
+        ] {
+            assert!(
+                comparison(ddl, "code").is_blank_padded(),
+                "a declared char type is blank padded: {ddl}"
+            );
+        }
+        for ddl in [
+            "CREATE TABLE t (code VARCHAR(5));",
+            "CREATE TABLE t (code TEXT);",
+        ] {
+            assert!(
+                !comparison(ddl, "code").is_blank_padded(),
+                "a varying type keeps trailing spaces: {ddl}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_refuses_a_nondeterministic_collation() {
+        let ci = comparison(
+            "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', \
+             deterministic = false); CREATE TABLE t (name TEXT COLLATE ci);",
+            "name",
+        );
+        assert_eq!(<Postgres as Backend>::text_key(&ci), None);
+        let plain = comparison("CREATE TABLE t (name TEXT);", "name");
+        assert_eq!(
+            <Postgres as Backend>::text_key(&plain),
+            Some(TextKey::Exact)
+        );
+    }
+
+    #[test]
+    fn bytecode_carries_the_resolved_descriptor() {
+        let db =
+            ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT PRIMARY KEY, name TEXT);")
+                .expect("the DDL parses");
+        let compiled = crate::compiler::parse_compile_normalize_and_prefilter::<Postgres, _>(
+            "SELECT * FROM t WHERE name = 'x'",
+            &PostgreSqlDialect {},
+            &db,
+        )
+        .expect("the query compiles");
+        let name = crate::catalog_helpers::column_id(&db, 0, "name").expect("the column");
+        let carried = compiled
+            .program
+            .comparison_for(name)
+            .expect("the compiler resolved the compared column's descriptor");
+        assert_eq!(carried.declared_type, "TEXT");
     }
 }
 
@@ -188,7 +282,7 @@ mod tests {
         /// Equality is symmetric in both arguments.
         #[test]
         fn values_equal_is_symmetric(a in arb_value(), b in arb_value()) {
-            prop_assert_eq!(values_equal(&a, &b), values_equal(&b, &a));
+            prop_assert_eq!(values_equal(ComparisonContext::none(), &a, &b), values_equal(ComparisonContext::none(), &b, &a));
         }
 
         /// Reflexivity for present, non-NaN values.
@@ -196,7 +290,7 @@ mod tests {
         fn values_equal_is_reflexive_for_present_non_nan(v in arb_value()) {
             if is_present(&v) && !is_nan(&v) {
                 prop_assert!(
-                    values_equal(&v, &v),
+                    values_equal(ComparisonContext::none(), &v, &v),
                     "present non-NaN value {:?} not equal to itself",
                     v,
                 );
@@ -209,7 +303,7 @@ mod tests {
         fn null_missing_nan_are_not_self_equal(v in arb_value()) {
             if !is_present(&v) || is_nan(&v) {
                 prop_assert!(
-                    !values_equal(&v, &v),
+                    !values_equal(ComparisonContext::none(), &v, &v),
                     "non-present-or-NaN value {:?} unexpectedly self-equal",
                     v,
                 );
@@ -223,7 +317,7 @@ mod tests {
                 && core::mem::discriminant(&a) != core::mem::discriminant(&b)
             {
                 prop_assert!(
-                    !values_equal(&a, &b),
+                    !values_equal(ComparisonContext::none(), &a, &b),
                     "cross-scalar pair ({:?}, {:?}) reported equal",
                     a,
                     b,
@@ -244,7 +338,7 @@ mod tests {
                     Ordering::is_ge,
                 ];
                 for pred in preds {
-                    let got = compare_ordered_values(&a, &b, pred);
+                    let got = compare_ordered_values(ComparisonContext::none(), &a, &b, pred);
                     prop_assert_eq!(
                         got,
                         Tri::Unknown,
@@ -262,7 +356,7 @@ mod tests {
         #[test]
         fn ordered_cmp_unknown_on_nan(a in arb_value(), b in arb_value()) {
             if (is_nan(&a) || is_nan(&b)) && is_present(&a) && is_present(&b) {
-                let got = compare_ordered_values(&a, &b, Ordering::is_lt);
+                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
                 prop_assert_eq!(
                     got,
                     Tri::Unknown,
@@ -286,7 +380,7 @@ mod tests {
                 core::mem::discriminant(&a) != core::mem::discriminant(&b);
             let no_partial_ord = matches!(&a, Value::Bool(_)) && same_variant(&a, &b);
             if cross_scalar || no_partial_ord {
-                let got = compare_ordered_values(&a, &b, Ordering::is_lt);
+                let got = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
                 prop_assert_eq!(
                     got,
                     Tri::Unknown,
@@ -303,8 +397,8 @@ mod tests {
         /// mutually vacuous).
         #[test]
         fn lt_and_ge_partition_defined_pairs(a in arb_value(), b in arb_value()) {
-            let lt = compare_ordered_values(&a, &b, Ordering::is_lt);
-            let ge = compare_ordered_values(&a, &b, Ordering::is_ge);
+            let lt = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt);
+            let ge = compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_ge);
             if lt != Tri::Unknown && ge != Tri::Unknown {
                 prop_assert_ne!(lt, ge, "`<` and `>=` agreed on ({:?}, {:?})", a, b);
             }
@@ -317,11 +411,19 @@ mod tests {
     fn cross_scalar_equality_is_false_for_concrete_values() {
         let int_one = Value::<Postgres>::Int(1);
         let float_one = Value::<Postgres>::Float(1.0);
-        assert!(!values_equal(&int_one, &float_one));
-        assert!(!values_equal(&float_one, &int_one));
+        assert!(!values_equal(
+            ComparisonContext::none(),
+            &int_one,
+            &float_one
+        ));
+        assert!(!values_equal(
+            ComparisonContext::none(),
+            &float_one,
+            &int_one
+        ));
 
         let str_one = Value::<Postgres>::String("1".to_string());
-        assert!(!values_equal(&int_one, &str_one));
+        assert!(!values_equal(ComparisonContext::none(), &int_one, &str_one));
     }
 
     /// Sanity check: ordered comparison on `Bool` is `Unknown` because
@@ -331,11 +433,11 @@ mod tests {
         let f = Value::<Postgres>::Bool(false);
         let t = Value::<Postgres>::Bool(true);
         assert_eq!(
-            compare_ordered_values(&f, &t, Ordering::is_lt),
+            compare_ordered_values(ComparisonContext::none(), &f, &t, Ordering::is_lt),
             Tri::Unknown
         );
         assert_eq!(
-            compare_ordered_values(&t, &f, Ordering::is_lt),
+            compare_ordered_values(ComparisonContext::none(), &t, &f, Ordering::is_lt),
             Tri::Unknown
         );
     }
@@ -346,7 +448,13 @@ mod tests {
     fn bytes_ordered_comparison_is_lexicographic() {
         let a = Value::<Postgres>::Bytes(vec![0, 1, 2]);
         let b = Value::<Postgres>::Bytes(vec![0, 1, 3]);
-        assert_eq!(compare_ordered_values(&a, &b, Ordering::is_lt), Tri::True);
-        assert_eq!(compare_ordered_values(&b, &a, Ordering::is_lt), Tri::False);
+        assert_eq!(
+            compare_ordered_values(ComparisonContext::none(), &a, &b, Ordering::is_lt),
+            Tri::True
+        );
+        assert_eq!(
+            compare_ordered_values(ComparisonContext::none(), &b, &a, Ordering::is_lt),
+            Tri::False
+        );
     }
 }

@@ -51,8 +51,9 @@ pub use cdc_event::{decode_cell, encode_value_key, CdcEvent};
 pub use row_kind::RowKind;
 pub(crate) use scalar_value::jsonb_payloads_equal;
 pub use scalar_value::{
-    BuiltinKind, Carried, CustomScalars, GroupKeyCollation, GroupKeyCollationName, GroupKeyColumn,
-    GroupKeyColumnOf, GroupKeyEncoder, NoCustom, NoCustomScalars, ScalarKind, ScalarKindOf, Value,
+    BuiltinKind, Carried, CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf,
+    ComparisonContext, CustomScalars, GroupKeyEncoder, NoCustom, NoCustomScalars, ScalarKind,
+    ScalarKindOf, TextKey, TrailingSpacePadding, Value,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

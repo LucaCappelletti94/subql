@@ -6,6 +6,7 @@
 //! touches the database: it only reads cells through the event's `value_at`
 //! accessor and evaluates the query's WHERE clause via the engine VM.
 
+use crate::backend::ComparisonContext;
 use crate::backend::{Backend, CdcEvent, RowKind, ScalarText, Value};
 use crate::compiler::literals::SqlLiteralParse;
 use crate::compiler::sql_shape::ScalarAggKind;
@@ -141,7 +142,7 @@ impl<B: Backend> MinMaxQuery<B> {
             ScalarAggKind::Max => |o| o == Ordering::Greater,
         };
         Some(matches!(
-            compare_ordered_values(candidate, current, wins),
+            compare_ordered_values(ComparisonContext::none(), candidate, current, wins),
             Tri::True
         ))
     }
@@ -202,7 +203,7 @@ impl<B: Backend> MinMaxQuery<B> {
             return Maintenance::NeedsReexecution;
         };
         let value = self.agg_value(event, row, db);
-        if !value.is_absent() && values_equal(&value, current) {
+        if !value.is_absent() && values_equal(ComparisonContext::none(), &value, current) {
             // The current extreme (or a tie of it) was removed, the next
             // extreme is unknown without a scan.
             Maintenance::NeedsReexecution
@@ -470,7 +471,10 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             ScalarAggKind::Min => |ordering| ordering == Ordering::Less,
             ScalarAggKind::Max => |ordering| ordering == Ordering::Greater,
         };
-        matches!(compare_ordered_values(candidate, current, wins), Tri::True)
+        matches!(
+            compare_ordered_values(ComparisonContext::none(), candidate, current, wins),
+            Tri::True
+        )
     }
 
     /// Whether a group with this extreme and row count belongs to the
@@ -486,7 +490,12 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             Some(crate::reexec::plan::GroupedHavingCheck::Extreme { op, threshold }) => {
                 let op = *op;
                 matches!(
-                    compare_ordered_values(current, threshold, move |ordering| op.admits(ordering)),
+                    compare_ordered_values(
+                        ComparisonContext::none(),
+                        current,
+                        threshold,
+                        move |ordering| op.admits(ordering),
+                    ),
                     Tri::True
                 )
             }
@@ -509,7 +518,7 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
             let repeat = group
                 .announced
                 .as_ref()
-                .is_some_and(|seen| values_equal(seen, &group.current));
+                .is_some_and(|seen| values_equal(ComparisonContext::none(), seen, &group.current));
             group.announced = Some(group.current.clone());
             return (!repeat).then(|| {
                 crate::AggregateValueChange::Set(crate::AggregateResultValue::Scalar(
@@ -573,7 +582,9 @@ impl<B: Backend + SqlLiteralParse, C: Checkpoint> GroupedMinMaxQuery<B, C> {
                                 ));
                             }
                         }
-                    } else if !row.value.is_absent() && values_equal(&row.value, &group.current) {
+                    } else if !row.value.is_absent()
+                        && values_equal(ComparisonContext::none(), &row.value, &group.current)
+                    {
                         refresh.insert(row.key.clone(), row.values.clone());
                     } else {
                         touch(&mut touched, &row.key);
