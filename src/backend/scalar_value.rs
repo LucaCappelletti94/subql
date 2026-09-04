@@ -261,6 +261,93 @@ impl TrailingSpaces {
     }
 }
 
+/// Which text comparison the in-process comparator performs, once the
+/// backend has read the operands' collations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum TextCase {
+    /// Compare the characters as they are.
+    Exact,
+    /// Fold ASCII case only, which is what SQLite's `NOCASE` does and,
+    /// measured, all that it does: it leaves a ligature or a non-ASCII
+    /// letter alone.
+    AsciiNoCase,
+}
+
+/// The operation a text comparison performs, because reproducibility does
+/// not factor per column.
+///
+/// PostgreSQL's default collation is the proof: equality is byte equality,
+/// while ordering is the locale's and byte order does not reproduce it. A
+/// single answer per column cannot express that, so the backend is asked
+/// per operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextOperation {
+    /// `=`, `<>`, `IN`, and group-key membership, which is equality.
+    Equality,
+    /// `<`, `<=`, `>`, `>=`, `BETWEEN`, and extreme maintenance.
+    Ordering,
+    /// `LIKE` and `ILIKE`. A separate operation because the engines do not
+    /// answer it like equality: PostgreSQL's `LIKE` reads a `char(n)`
+    /// column's padding where its `=` ignores it.
+    Pattern,
+}
+
+/// How one text comparison is answered in process, resolved once at
+/// registration from both operands' declared types and collations.
+///
+/// Carried in the compiled program, so no comparison consults a collation
+/// per row. Its absence is not "compare exactly": it means no in-process
+/// comparison reproduces the engine, and the statement takes a database
+/// read instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TextRule {
+    /// Character handling.
+    pub case: TextCase,
+    /// Trailing-space handling.
+    pub spaces: TrailingSpaces,
+}
+
+impl TextRule {
+    /// Byte comparison: the rule for a binary collation, and for
+    /// PostgreSQL equality under any deterministic collation.
+    pub const EXACT: Self = Self {
+        case: TextCase::Exact,
+        spaces: TrailingSpaces::BothSignificant,
+    };
+
+    /// This rule with `spaces` replaced, for a backend that resolves the
+    /// two facts separately.
+    #[must_use]
+    pub const fn with_spaces(self, spaces: TrailingSpaces) -> Self {
+        Self { spaces, ..self }
+    }
+
+    /// Whether two text operands are equal under this rule.
+    #[must_use]
+    pub fn equal(self, left: &str, right: &str) -> bool {
+        let (left, right) = self.spaces.apply(left, right);
+        match self.case {
+            TextCase::Exact => left == right,
+            TextCase::AsciiNoCase => left.eq_ignore_ascii_case(right),
+        }
+    }
+
+    /// How two text operands order under this rule.
+    #[must_use]
+    pub fn compare(self, left: &str, right: &str) -> core::cmp::Ordering {
+        let (left, right) = self.spaces.apply(left, right);
+        match self.case {
+            TextCase::Exact => left.cmp(right),
+            // Fold each byte as it is compared rather than allocating a
+            // lowercased copy of both sides.
+            TextCase::AsciiNoCase => left
+                .bytes()
+                .map(|byte| byte.to_ascii_lowercase())
+                .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase())),
+        }
+    }
+}
+
 /// Comparison facts under backend `B`.
 pub type ColumnComparisonOf<B> = ColumnComparison<<<B as Backend>::Custom as CustomScalars>::Kind>;
 
@@ -501,17 +588,6 @@ pub(super) fn decode_exact_group_value<B: Backend>(
     }
 }
 
-/// The in-process text comparison a column's collation maps to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextKey {
-    /// Byte comparison.
-    Exact,
-    /// ASCII case-insensitive comparison.
-    AsciiNoCase,
-    /// Trailing spaces ignored.
-    TrimTrailingSpace,
-}
-
 fn canonical_f64(value: f64) -> f64 {
     if value == 0.0 {
         0.0
@@ -536,81 +612,24 @@ fn append_tagged<T: serde::Serialize + ?Sized>(
     append_postcard(output, value)
 }
 
-fn append_text(output: &mut alloc::vec::Vec<u8>, tag: u8, value: &str, mode: TextKey) -> bool {
-    match mode {
-        TextKey::Exact => append_tagged(output, tag, value),
-        TextKey::TrimTrailingSpace => append_tagged(output, tag, value.trim_end_matches(' ')),
-        TextKey::AsciiNoCase => {
-            let mut canonical = value.as_bytes().to_vec();
+/// Write one text component under the rule the comparator uses, so a group
+/// key and a predicate never disagree about which values are the same.
+fn append_text(output: &mut alloc::vec::Vec<u8>, tag: u8, value: &str, rule: TextRule) -> bool {
+    let trimmed = match rule.spaces {
+        TrailingSpaces::BothSignificant => value,
+        // One column against itself, so the one-sided rules cannot arise.
+        TrailingSpaces::BothIgnored
+        | TrailingSpaces::LeftStripped
+        | TrailingSpaces::RightStripped => value.trim_end_matches(' '),
+    };
+    match rule.case {
+        TextCase::Exact => append_tagged(output, tag, trimmed),
+        TextCase::AsciiNoCase => {
+            let mut canonical = trimmed.as_bytes().to_vec();
             canonical.make_ascii_lowercase();
             output.push(tag);
             append_postcard(output, canonical.as_slice())
         }
-    }
-}
-
-pub(super) fn postgres_text_key(column: &ColumnComparisonOf<Postgres>) -> Option<TextKey> {
-    // A `char(n)` cell arrives padded out to its width, and PostgreSQL
-    // ignores those spaces when comparing, so two spellings of one value
-    // must encode to one key. Reading only the collation answered `Exact`
-    // and split `ab` from `ab   ` into two groups.
-    let deterministic = match &column.collation {
-        // PostgreSQL CREATE DATABASE cannot select nondeterministic
-        // comparisons.
-        CollationFacts::DatabaseDefault => true,
-        CollationFacts::Named {
-            postgres_deterministic: Some(true),
-            ..
-        } => true,
-        CollationFacts::Named { .. } | CollationFacts::Unknown => false,
-    };
-    if !deterministic {
-        return None;
-    }
-    if column.declares_char_type() {
-        return Some(TextKey::TrimTrailingSpace);
-    }
-    Some(TextKey::Exact)
-}
-
-pub(super) fn sqlite_text_key(column: &ColumnComparisonOf<SQLite>) -> Option<TextKey> {
-    match &column.collation {
-        CollationFacts::DatabaseDefault => Some(TextKey::Exact),
-        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("binary") => {
-            Some(TextKey::Exact)
-        }
-        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("nocase") => {
-            Some(TextKey::AsciiNoCase)
-        }
-        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("rtrim") => {
-            Some(TextKey::TrimTrailingSpace)
-        }
-        CollationFacts::Named { .. } | CollationFacts::Unknown => None,
-    }
-}
-
-/// The default `Backend::text_key`: byte comparison under the database
-/// default collation, and nothing else reproduced.
-pub(super) const fn exact_text_key<B: Backend>(column: &ColumnComparisonOf<B>) -> Option<TextKey> {
-    match &column.collation {
-        CollationFacts::DatabaseDefault => Some(TextKey::Exact),
-        CollationFacts::Named { .. } | CollationFacts::Unknown => None,
-    }
-}
-
-pub(super) fn mysql_text_key(column: &ColumnComparisonOf<MySql>) -> Option<TextKey> {
-    let CollationFacts::Named { name, padding, .. } = &column.collation else {
-        return None;
-    };
-    if !name.name.to_ascii_lowercase().ends_with("_bin") {
-        return None;
-    }
-    match padding {
-        Some(TrailingSpacePadding::PadSpace) => Some(TextKey::TrimTrailingSpace),
-        Some(TrailingSpacePadding::NoPad) => Some(TextKey::Exact),
-        None if name.name.eq_ignore_ascii_case("utf8mb4_bin") => Some(TextKey::TrimTrailingSpace),
-        None if name.name.eq_ignore_ascii_case("utf8mb4_0900_bin") => Some(TextKey::Exact),
-        None => None,
     }
 }
 
@@ -642,7 +661,8 @@ pub(super) fn encode_postgres_component<V: postgres_jsonb_canonical::PgVersion +
             append_tagged(output, 3, &canonical_f64(*value))
         }
         (ScalarKind::Builtin(BuiltinKind::String), Value::String(value)) => {
-            postgres_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
+            single_column_rule::<Postgres>(column)
+                .is_some_and(|rule| append_text(output, 4, value, rule))
         }
         (ScalarKind::Builtin(BuiltinKind::Jsonb), Value::Jsonb(value)) => {
             output.push(13);
@@ -664,10 +684,12 @@ pub(super) fn encode_mysql_component(
             append_tagged(output, 3, &canonical_f64(*value))
         }
         (ScalarKind::Builtin(BuiltinKind::String), Value::String(value)) => {
-            mysql_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
+            single_column_rule::<MySql>(column)
+                .is_some_and(|rule| append_text(output, 4, value, rule))
         }
         (ScalarKind::Builtin(BuiltinKind::Uuid), Value::Uuid(value)) => {
-            mysql_text_key(column).is_some_and(|mode| append_text(output, 6, value, mode))
+            single_column_rule::<MySql>(column)
+                .is_some_and(|rule| append_text(output, 6, value, rule))
         }
         (ScalarKind::Builtin(BuiltinKind::Decimal), Value::Decimal(value)) => {
             append_tagged(output, 11, &value.normalized())
@@ -682,9 +704,8 @@ fn append_sqlite_json(
     output: &mut alloc::vec::Vec<u8>,
 ) -> bool {
     match value.storage() {
-        SqliteJsonStorage::Text(value) => {
-            sqlite_text_key(column).is_some_and(|mode| append_text(output, 0, value, mode))
-        }
+        SqliteJsonStorage::Text(value) => single_column_rule::<SQLite>(column)
+            .is_some_and(|rule| append_text(output, 0, value, rule)),
         SqliteJsonStorage::Integer(value) => append_tagged(output, 1, value),
         SqliteJsonStorage::Real(value) => {
             let canonical = canonical_f64(*value);
@@ -710,10 +731,12 @@ pub(super) fn encode_sqlite_component(
             append_tagged(output, 3, &canonical_f64(*value))
         }
         (ScalarKind::Builtin(BuiltinKind::String), Value::String(value)) => {
-            sqlite_text_key(column).is_some_and(|mode| append_text(output, 4, value, mode))
+            single_column_rule::<SQLite>(column)
+                .is_some_and(|rule| append_text(output, 4, value, rule))
         }
         (ScalarKind::Builtin(BuiltinKind::Uuid), Value::Uuid(value)) => {
-            sqlite_text_key(column).is_some_and(|mode| append_text(output, 6, value, mode))
+            single_column_rule::<SQLite>(column)
+                .is_some_and(|rule| append_text(output, 6, value, rule))
         }
         (ScalarKind::Builtin(BuiltinKind::Json), Value::Json(value)) => {
             output.push(12);
@@ -1169,5 +1192,107 @@ mod jsonb_order_tests {
             ["[]", "true", "false", "1", "\"a\""],
             "the pairs whose byte order contradicts the server, keyed by left operand"
         );
+    }
+}
+
+/// The rule for one column compared against itself, which is what group-key
+/// membership and an index key are: both ask whether two values are the
+/// same value.
+pub fn single_column_rule<B: Backend>(column: &ColumnComparisonOf<B>) -> Option<TextRule> {
+    B::text_rule(
+        &ComparisonContext {
+            left: Some(column),
+            right: Some(column),
+        },
+        TextOperation::Equality,
+    )
+}
+
+/// Whether any in-process comparison reproduces this PostgreSQL column for
+/// `operation`.
+///
+/// Equality under a deterministic collation is byte equality, which is what
+/// deterministic means, and `CREATE DATABASE` cannot select a
+/// nondeterministic collation, so the database default qualifies. Ordering
+/// is the locale's, and measured, byte order does not reproduce it: the
+/// server answers `'a' < 'B'` true where bytes answer false. Only `C` and
+/// `POSIX` order by byte.
+pub(super) fn postgres_reproduces(
+    column: &ColumnComparisonOf<Postgres>,
+    operation: TextOperation,
+) -> bool {
+    use TextOperation;
+
+    let byte_ordered = |name: &CollationName| {
+        name.name.eq_ignore_ascii_case("C") || name.name.eq_ignore_ascii_case("POSIX")
+    };
+    match (&column.collation, operation) {
+        // A byte-ordered collation reproduces every operation.
+        (CollationFacts::Named { name, .. }, _) if byte_ordered(name) => true,
+        // Ordering under any other collation is the locale's.
+        (_, TextOperation::Ordering) => false,
+        (CollationFacts::DatabaseDefault, _) => true,
+        (
+            CollationFacts::Named {
+                postgres_deterministic: Some(true),
+                ..
+            },
+            _,
+        ) => true,
+        (CollationFacts::Named { .. } | CollationFacts::Unknown, _) => false,
+    }
+}
+
+/// The in-process comparison for a MySQL column, or `None` when none
+/// reproduces it.
+///
+/// Only the binary collations qualify. Measured on 8.4.11: the server
+/// default folds case and accents, and `utf8mb4_0900_as_cs` reports the NFC
+/// and NFD spellings of one letter equal, so case sensitivity is not byte
+/// exactness. Padding still differs inside the binary family, which
+/// `information_schema.COLLATIONS.PAD_ATTRIBUTE` names: `utf8mb4_bin` is
+/// `PAD SPACE` and `utf8mb4_0900_bin` is `NO PAD`, both measured.
+pub(super) fn mysql_binary_text_rule(column: &ColumnComparisonOf<MySql>) -> Option<TextRule> {
+    let CollationFacts::Named { name, padding, .. } = &column.collation else {
+        return None;
+    };
+    if !name.name.to_ascii_lowercase().ends_with("_bin") {
+        return None;
+    }
+    let spaces = match padding {
+        Some(TrailingSpacePadding::PadSpace) => TrailingSpaces::BothIgnored,
+        Some(TrailingSpacePadding::NoPad) => TrailingSpaces::BothSignificant,
+        None if name.name.eq_ignore_ascii_case("utf8mb4_bin") => TrailingSpaces::BothIgnored,
+        None if name.name.eq_ignore_ascii_case("utf8mb4_0900_bin") => {
+            TrailingSpaces::BothSignificant
+        }
+        // A binary collation this build cannot place on either side of the
+        // padding question is not reproduced, rather than guessed.
+        None => return None,
+    };
+    Some(TextRule::EXACT.with_spaces(spaces))
+}
+
+/// The in-process comparison for a SQLite column.
+///
+/// All three built-in collations are exactly reproducible, and the same
+/// rule serves every operation. `NOCASE` folds ASCII case only, measured:
+/// it leaves a ligature and the NFC/NFD distinction alone.
+pub(super) fn sqlite_text_rule(column: &ColumnComparisonOf<SQLite>) -> Option<TextRule> {
+    match &column.collation {
+        CollationFacts::DatabaseDefault => Some(TextRule::EXACT),
+        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("binary") => {
+            Some(TextRule::EXACT)
+        }
+        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("nocase") => {
+            Some(TextRule {
+                case: TextCase::AsciiNoCase,
+                spaces: TrailingSpaces::BothSignificant,
+            })
+        }
+        CollationFacts::Named { name, .. } if name.name.eq_ignore_ascii_case("rtrim") => {
+            Some(TextRule::EXACT.with_spaces(TrailingSpaces::BothIgnored))
+        }
+        CollationFacts::Named { .. } | CollationFacts::Unknown => None,
     }
 }

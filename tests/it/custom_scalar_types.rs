@@ -103,11 +103,12 @@ struct Custom;
 impl Backend for Custom {
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
-    /// Exact bytes, which is all this backend's fixtures need.
-    fn trailing_spaces(
+    /// Byte comparison, which is all this backend's fixtures need.
+    fn text_rule(
         _comparison: &subql::backend::ComparisonContext<'_, Self>,
-    ) -> subql::backend::TrailingSpaces {
-        subql::backend::TrailingSpaces::BothSignificant
+        _operation: subql::backend::TextOperation,
+    ) -> Option<subql::backend::TextRule> {
+        Some(subql::backend::TextRule::EXACT)
     }
 
     type Dialect = PostgreSqlDialect;

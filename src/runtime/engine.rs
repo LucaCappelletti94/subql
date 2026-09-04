@@ -1617,6 +1617,9 @@ where
                     kind: kind.into(),
                 }
             }
+            Refusal::CollationNotReproducible { column, collation } => {
+                crate::NotServed::CollationNotReproducible { column, collation }
+            }
             Refusal::Unsupported(prose) => crate::NotServed::UnsupportedSql(prose),
         }
     }

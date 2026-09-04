@@ -58,6 +58,57 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     }
 }
 
+/// Refuse a text comparison the backend does not reproduce in process.
+///
+/// Asked per operation, because reproducibility does not factor per column:
+/// PostgreSQL's default collation has byte equality and locale ordering at
+/// once, so `name = 'a'` is served while `name < 'B'` is not. Resolved here,
+/// at registration, so the statement takes a database read rather than
+/// answering every row with the wrong rule.
+fn refuse_unreproducible_text<B: Backend, DB: DatabaseLike>(
+    operands: [&Expr; 2],
+    operation: crate::backend::TextOperation,
+    table_id: TableId,
+    database: &DB,
+) -> Result<(), RegisterError> {
+    let facts: Vec<(crate::ColumnId, crate::backend::ColumnComparisonOf<B>)> = operands
+        .iter()
+        .filter_map(|side| {
+            let column = resolve_column_ref(side, table_id, database)?;
+            let facts =
+                crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)?;
+            Some((column, facts))
+        })
+        .collect();
+    if !facts
+        .iter()
+        .any(|(_, facts)| facts.kind.as_builtin() == Some(BuiltinKind::String))
+    {
+        return Ok(());
+    }
+    let context = crate::backend::ComparisonContext {
+        left: facts.first().map(|(_, facts)| facts),
+        right: facts.get(1).map(|(_, facts)| facts),
+    };
+    if B::text_rule(&context, operation).is_some() {
+        return Ok(());
+    }
+    let (column, facts) = facts
+        .first()
+        .expect("a text operand resolved its facts above");
+    let collation = match &facts.collation {
+        crate::backend::CollationFacts::Named { name, .. } => Some(name.name.clone()),
+        crate::backend::CollationFacts::DatabaseDefault
+        | crate::backend::CollationFacts::Unknown => None,
+    };
+    Err(RegisterError::NotServedInProcess(
+        crate::errors::Refusal::CollationNotReproducible {
+            column: *column,
+            collation,
+        },
+    ))
+}
+
 /// Refuse an ordered comparison whose operand kind has no order this build
 /// reproduces.
 ///
@@ -364,13 +415,30 @@ where
                     )?;
 
                     match op {
-                        BinaryOperator::Eq => out.push(Instruction::Equal),
-                        BinaryOperator::NotEq => out.push(Instruction::NotEqual),
+                        BinaryOperator::Eq | BinaryOperator::NotEq => {
+                            refuse_unreproducible_text::<B, DB>(
+                                [left, right],
+                                crate::backend::TextOperation::Equality,
+                                table_id,
+                                database,
+                            )?;
+                            out.push(if matches!(op, BinaryOperator::Eq) {
+                                Instruction::Equal
+                            } else {
+                                Instruction::NotEqual
+                            });
+                        }
                         BinaryOperator::Lt
                         | BinaryOperator::LtEq
                         | BinaryOperator::Gt
                         | BinaryOperator::GtEq => {
                             refuse_unordered_kind::<DB>([left, right], table_id, database)?;
+                            refuse_unreproducible_text::<B, DB>(
+                                [left, right],
+                                crate::backend::TextOperation::Ordering,
+                                table_id,
+                                database,
+                            )?;
                             out.push(match op {
                                 BinaryOperator::Lt => Instruction::LessThan,
                                 BinaryOperator::LtEq => Instruction::LessThanOrEqual,
@@ -537,6 +605,18 @@ where
             // applies to each bound.
             refuse_unordered_kind::<DB>([expr, low], table_id, database)?;
             refuse_unordered_kind::<DB>([expr, high], table_id, database)?;
+            refuse_unreproducible_text::<B, DB>(
+                [expr, low],
+                crate::backend::TextOperation::Ordering,
+                table_id,
+                database,
+            )?;
+            refuse_unreproducible_text::<B, DB>(
+                [expr, high],
+                crate::backend::TextOperation::Ordering,
+                table_id,
+                database,
+            )?;
 
             let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
                 .unwrap_or_else(|| BuiltinKind::String.into());
@@ -664,6 +744,12 @@ where
                 BuiltinKind::String.into(),
             )?;
 
+            refuse_unreproducible_text::<B, DB>(
+                [expr, pattern],
+                crate::backend::TextOperation::Pattern,
+                table_id,
+                database,
+            )?;
             out.push(Instruction::Like {
                 case_sensitive: true,
             });
@@ -703,6 +789,12 @@ where
                 BuiltinKind::String.into(),
             )?;
 
+            refuse_unreproducible_text::<B, DB>(
+                [expr, pattern],
+                crate::backend::TextOperation::Pattern,
+                table_id,
+                database,
+            )?;
             out.push(Instruction::Like {
                 case_sensitive: false,
             });

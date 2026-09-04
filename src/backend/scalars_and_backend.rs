@@ -263,19 +263,6 @@ pub trait Backend: 'static {
         (!value.is_missing()).then_some(value)
     }
 
-    /// Which in-process text comparison reproduces this column's collation,
-    /// or `None` when none does.
-    ///
-    /// The group-key encoder and the predicate comparator ask the same
-    /// question of the same facts, so they read one answer.
-    #[must_use]
-    fn text_key(column: &ColumnComparisonOf<Self>) -> Option<super::scalar_value::TextKey>
-    where
-        Self: Sized,
-    {
-        super::scalar_value::exact_text_key::<Self>(column)
-    }
-
     /// Whether two scalars are equal for this backend, given both operands'
     /// catalog facts.
     ///
@@ -312,17 +299,23 @@ pub trait Backend: 'static {
         crate::compiler::value_cmp::structural_ordering(left, right)
     }
 
-    /// How a text comparison between these two operands reads their
-    /// trailing spaces.
+    /// How this backend answers one text comparison in process, or `None`
+    /// when no in-process comparison reproduces it and the statement must
+    /// take a database read.
     ///
-    /// Required rather than defaulted, and asked of the backend rather than
-    /// computed from the descriptor, because the engines decide it by
-    /// different routes: PostgreSQL decides on the declared type, MySQL on
-    /// the collation. Guessing one rule for both answers one of them wrongly.
+    /// Asked per operation because reproducibility does not factor per
+    /// column: PostgreSQL's default collation has byte equality and locale
+    /// ordering at once. Resolved at registration, so a refusal is a
+    /// classification rather than a wrong answer per row.
+    ///
+    /// Required rather than defaulted: byte comparison is right for some
+    /// engines and silently wrong for others, and guessing is the defect
+    /// this replaces.
     #[must_use]
-    fn trailing_spaces(
+    fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
-    ) -> super::scalar_value::TrailingSpaces
+        operation: super::scalar_value::TextOperation,
+    ) -> Option<super::scalar_value::TextRule>
     where
         Self: Sized;
 

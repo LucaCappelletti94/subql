@@ -135,7 +135,7 @@ where
 #[cfg(all(test, feature = "std"))]
 #[allow(clippy::unwrap_used)]
 mod comparison_descriptor_tests {
-    use crate::backend::{Backend, ColumnComparisonOf, Postgres, TextKey};
+    use crate::backend::{single_column_rule, ColumnComparisonOf, Postgres, TextRule};
     use sql_traits::structs::ParserDB;
     use sqlparser::dialect::PostgreSqlDialect;
 
@@ -176,11 +176,11 @@ mod comparison_descriptor_tests {
              deterministic = false); CREATE TABLE t (name TEXT COLLATE ci);",
             "name",
         );
-        assert_eq!(<Postgres as Backend>::text_key(&ci), None);
+        assert_eq!(single_column_rule::<Postgres>(&ci), None);
         let plain = comparison("CREATE TABLE t (name TEXT);", "name");
         assert_eq!(
-            <Postgres as Backend>::text_key(&plain),
-            Some(TextKey::Exact)
+            single_column_rule::<Postgres>(&plain),
+            Some(TextRule::EXACT)
         );
     }
 

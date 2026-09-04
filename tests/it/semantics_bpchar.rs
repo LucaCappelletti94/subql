@@ -117,6 +117,26 @@ fn char_ordering_ignores_trailing_spaces() {
     );
 }
 
+/// Ordering a `char` column under a locale collation is a database read:
+/// the padding rule is reproducible but the order is not, and both have to
+/// be for the comparison to be answered in process.
+#[test]
+fn char_ordering_under_a_locale_collation_is_a_read() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(PG_DDL).expect("DDL parses");
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let registered = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM codes WHERE code > 'ab'",
+        ))
+        .expect("a read answers it");
+    assert!(
+        registered.served().is_none(),
+        "byte order does not reproduce the database collation's order"
+    );
+}
+
 /// The control: `varchar` and `text` keep trailing spaces significant, so
 /// the rule must not become a global string rule.
 #[test]

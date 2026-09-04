@@ -506,13 +506,14 @@ fn literal_index_key<B: SqlLiteralParse, DB: DatabaseLike>(
     let kind = catalog_helpers::column_scalar_kind::<B, DB>(database, table_id, column_id)?;
     // The equality index is probed by exact key, so a column whose
     // comparison is not byte-exact cannot be indexed by one: a `char(n)`
-    // cell carries padding the comparison ignores, and a `PAD SPACE`
-    // collation has the same problem. Such a predicate stays unindexed and
-    // the comparator answers it, rather than the probe pruning a row the
-    // comparator would have matched.
+    // cell carries padding the comparison ignores, and a case-insensitive
+    // or trailing-space-insensitive collation has the same problem. Such a
+    // predicate stays unindexed and the comparator answers it, rather than
+    // the probe pruning a row the comparator would have matched.
     if kind.as_builtin() == Some(crate::backend::BuiltinKind::String) {
         let facts = catalog_helpers::column_comparison::<B, DB>(database, table_id, column_id)?;
-        if facts.declares_char_type() || facts.collation_pads_trailing_spaces() {
+        let rule = crate::backend::single_column_rule::<B>(&facts);
+        if rule != Some(crate::backend::TextRule::EXACT) {
             return None;
         }
     }

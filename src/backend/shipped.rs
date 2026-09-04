@@ -3,13 +3,45 @@
 
 use super::scalar_value::{
     decode_exact_group_value, encode_mysql_component, encode_postgres_component,
-    encode_sqlite_component, mysql_text_key, postgres_text_key, sqlite_text_key, widen_i64_to_f64,
+    encode_sqlite_component, mysql_binary_text_rule, postgres_reproduces, single_column_rule,
+    sqlite_text_rule, widen_i64_to_f64,
 };
 use super::{
     Backend, BuiltinKind, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, ScalarKindOf,
-    SqliteJson, TextKey, Value,
+    SqliteJson, TextOperation, TextRule, Value,
 };
 use alloc::string::ToString;
+
+/// The `text` row is not an inconsistency: converting `char` to `text`
+/// strips the padding, and `text` comparison is then exact. So a `char`
+/// against `text` answers `false` for `ab` versus `ab   `, while the same
+/// pair as `char` against `varchar` answers `true`.
+fn postgres_trailing_spaces<V: postgres_jsonb_canonical::PgVersion + 'static>(
+    comparison: &super::scalar_value::ComparisonContext<'_, Postgres<V>>,
+) -> super::TrailingSpaces {
+    use super::TrailingSpaces;
+
+    let declares_char = |side: Option<&ColumnComparisonOf<Postgres<V>>>| {
+        side.is_some_and(ColumnComparisonOf::<Postgres<V>>::declares_char_type)
+    };
+    // `text` is the one partner that keeps its own trailing spaces while
+    // stripping the `char` side. A literal carries no facts and resolves
+    // to the `char` side's type, so it is not this case.
+    let declares_text = |side: Option<&ColumnComparisonOf<Postgres<V>>>| {
+        side.is_some_and(|facts| facts.declared_type.trim().eq_ignore_ascii_case("text"))
+    };
+
+    match (
+        declares_char(comparison.left),
+        declares_char(comparison.right),
+    ) {
+        (true, true) => TrailingSpaces::BothIgnored,
+        (true, false) if declares_text(comparison.right) => TrailingSpaces::LeftStripped,
+        (false, true) if declares_text(comparison.left) => TrailingSpaces::RightStripped,
+        (true, false) | (false, true) => TrailingSpaces::BothIgnored,
+        (false, false) => TrailingSpaces::BothSignificant,
+    }
+}
 
 /// Postgres backend marker, parameterised by the server major it targets.
 ///
@@ -19,41 +51,39 @@ use alloc::string::ToString;
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
-    /// PostgreSQL decides on the declared type: a `char(n)` side is padded
-    /// out to its width on write, and the padding is ignored when comparing
-    /// against another `char`, a `varchar` or a literal.
-    ///
-    /// Measured asymmetry: a `char` against a `text` column strips only the
-    /// `char` side, because converting `char` to `text` drops the padding
-    /// and the comparison is then exact. A side whose facts are unknown is
-    /// treated as a literal, which is what an unknown side usually is.
-    fn trailing_spaces(
+    /// Measured on 16.11. Equality under a deterministic collation is byte
+    /// equality, including for the database default, since `CREATE
+    /// DATABASE` cannot select a nondeterministic collation. Ordering is
+    /// the locale's and byte order does not reproduce it, so only `C` and
+    /// `POSIX` are served. A `char(n)` column's padding is then handled on
+    /// top, per operation: `=` and `<` ignore it, `LIKE` does not.
+    fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
-    ) -> super::scalar_value::TrailingSpaces {
-        use super::scalar_value::TrailingSpaces;
-        let padded = |side: Option<&ColumnComparisonOf<Self>>| {
-            side.is_some_and(ColumnComparisonOf::<Self>::declares_char_type)
-        };
-        let text_typed = |side: Option<&ColumnComparisonOf<Self>>| {
-            side.is_some_and(|facts| facts.declared_type.trim().eq_ignore_ascii_case("text"))
-        };
-        match (padded(comparison.left), padded(comparison.right)) {
-            (true, true) => TrailingSpaces::BothIgnored,
-            (true, false) if text_typed(comparison.right) => TrailingSpaces::LeftStripped,
-            (false, true) if text_typed(comparison.left) => TrailingSpaces::RightStripped,
-            (true, false) | (false, true) => TrailingSpaces::BothIgnored,
-            (false, false) => TrailingSpaces::BothSignificant,
+        operation: crate::backend::TextOperation,
+    ) -> Option<crate::backend::TextRule> {
+        use crate::backend::{TextOperation, TextRule};
+
+        for side in [comparison.left, comparison.right] {
+            let Some(facts) = side else { continue };
+            if !postgres_reproduces(facts, operation) {
+                return None;
+            }
         }
+        let rule = TextRule::EXACT;
+        Some(match operation {
+            // `LIKE` reads the stored value, padding included: measured,
+            // a `char(5)` holding `ab` does not match the pattern `ab`.
+            TextOperation::Pattern => rule,
+            TextOperation::Equality | TextOperation::Ordering => {
+                rule.with_spaces(postgres_trailing_spaces(comparison))
+            }
+        })
     }
 
     /// Measured: a backslash escapes the next character.
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
     type Custom = NoCustomScalars<Self>;
-
-    fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
-        postgres_text_key(column)
-    }
 
     /// PostgreSQL's own float rule: NaN equals NaN. IEEE, which is what
     /// `PartialOrd` on `f64` implements, says a NaN equals nothing, so
@@ -72,8 +102,9 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
                 x.is_nan() && y.is_nan()
             }
             (Value::String(x), Value::String(y)) => {
-                let (x, y) = Self::trailing_spaces(&comparison).apply(x, y);
-                x == y
+                Self::text_rule(&comparison, TextOperation::Equality)
+                    .unwrap_or(TextRule::EXACT)
+                    .equal(x, y)
             }
             _ => crate::compiler::value_cmp::structural_equality(left, right),
         }
@@ -97,10 +128,11 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
                     core::cmp::Ordering::Less
                 })
             }
-            (Value::String(x), Value::String(y)) => {
-                let (x, y) = Self::trailing_spaces(&comparison).apply(x, y);
-                Some(x.cmp(y))
-            }
+            (Value::String(x), Value::String(y)) => Some(
+                Self::text_rule(&comparison, TextOperation::Ordering)
+                    .unwrap_or(TextRule::EXACT)
+                    .compare(x, y),
+            ),
             _ => crate::compiler::value_cmp::structural_ordering(left, right),
         }
     }
@@ -121,7 +153,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
                 | BuiltinKind::Float
                 | BuiltinKind::Jsonb,
             ) => true,
-            Some(BuiltinKind::String) => Self::text_key(column).is_some(),
+            Some(BuiltinKind::String) => single_column_rule::<Self>(column).is_some(),
             // PostgreSQL numeric waits on Diesel #5168 for infinity support.
             Some(BuiltinKind::Decimal | BuiltinKind::Json) | None => false,
         });
@@ -170,8 +202,9 @@ impl Backend for MySql {
     ) -> bool {
         match (left, right) {
             (Value::String(x), Value::String(y)) => {
-                let (x, y) = Self::trailing_spaces(&comparison).apply(x, y);
-                x == y
+                Self::text_rule(&comparison, TextOperation::Equality)
+                    .unwrap_or(TextRule::EXACT)
+                    .equal(x, y)
             }
             _ => crate::compiler::value_cmp::structural_equality(left, right),
         }
@@ -184,44 +217,44 @@ impl Backend for MySql {
         right: &Value<Self>,
     ) -> Option<core::cmp::Ordering> {
         match (left, right) {
-            (Value::String(x), Value::String(y)) => {
-                let (x, y) = Self::trailing_spaces(&comparison).apply(x, y);
-                Some(x.cmp(y))
-            }
+            (Value::String(x), Value::String(y)) => Some(
+                Self::text_rule(&comparison, TextOperation::Ordering)
+                    .unwrap_or(TextRule::EXACT)
+                    .compare(x, y),
+            ),
             _ => crate::compiler::value_cmp::structural_ordering(left, right),
         }
     }
 
-    /// MySQL decides on the collation, not the type: a `PAD SPACE`
-    /// collation ignores trailing spaces and `NO PAD`, the 8.0 default,
-    /// does not. A `CHAR` column never delivers a padded cell at all,
-    /// because the server strips trailing spaces on write.
-    ///
-    /// A collation whose padding the catalog does not carry compares
-    /// exactly, which is right for the 8.0 default and the reason the
-    /// unknown case is asserted rather than assumed.
-    fn trailing_spaces(
+    /// Measured on 8.4.11: only the binary collations are reproducible.
+    /// The server default folds case and accents, and a case-sensitive UCA
+    /// collation is not byte-exact either, since `utf8mb4_0900_as_cs`
+    /// reports the NFC and NFD spellings of one letter equal where
+    /// `utf8mb4_bin` reports them different. Every other collation, and an
+    /// unnamed database default, is a database read.
+    fn text_rule(
         comparison: &super::scalar_value::ComparisonContext<'_, Self>,
-    ) -> super::scalar_value::TrailingSpaces {
-        use super::scalar_value::TrailingSpaces;
-        let pads = |side: Option<&ColumnComparisonOf<Self>>| {
-            side.is_some_and(ColumnComparisonOf::<Self>::collation_pads_trailing_spaces)
-        };
-        if pads(comparison.left) || pads(comparison.right) {
-            TrailingSpaces::BothIgnored
-        } else {
-            TrailingSpaces::BothSignificant
+        _operation: crate::backend::TextOperation,
+    ) -> Option<crate::backend::TextRule> {
+        use crate::backend::TextRule;
+
+        for side in [comparison.left, comparison.right] {
+            let Some(facts) = side else { continue };
+            mysql_binary_text_rule(facts)?;
         }
+        // Both sides agree, so either resolves the pair; a literal side
+        // takes the column's collation.
+        comparison
+            .left
+            .or(comparison.right)
+            .and_then(mysql_binary_text_rule)
+            .or(Some(TextRule::EXACT))
     }
 
     /// Measured: a backslash escapes the next character.
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
     type Custom = NoCustomScalars<Self>;
-
-    fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
-        mysql_text_key(column)
-    }
 
     fn group_key_encoder(
         columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
@@ -237,7 +270,9 @@ impl Backend for MySql {
                 | BuiltinKind::Time
                 | BuiltinKind::Decimal,
             ) => true,
-            Some(BuiltinKind::String | BuiltinKind::Uuid) => Self::text_key(column).is_some(),
+            Some(BuiltinKind::String | BuiltinKind::Uuid) => {
+                single_column_rule::<Self>(column).is_some()
+            }
             // MySQL 8.0 groups persisted signed zero into two groups.
             Some(BuiltinKind::Float | BuiltinKind::Json | BuiltinKind::Jsonb) | None => false,
         });
@@ -283,12 +318,53 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
-    /// SQLite pads nothing: `CHAR(n)` is not a fixed-width type there, and
-    /// trailing spaces are always significant under `BINARY`.
-    fn trailing_spaces(
-        _comparison: &super::scalar_value::ComparisonContext<'_, Self>,
-    ) -> super::scalar_value::TrailingSpaces {
-        super::scalar_value::TrailingSpaces::BothSignificant
+    /// `NOCASE` folds ASCII case and `RTRIM` ignores trailing spaces, and
+    /// no structural comparison reproduces either.
+    fn scalars_equal(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> bool {
+        match (left, right) {
+            (Value::String(x), Value::String(y)) => {
+                Self::text_rule(&comparison, TextOperation::Equality)
+                    .unwrap_or(TextRule::EXACT)
+                    .equal(x, y)
+            }
+            _ => crate::compiler::value_cmp::structural_equality(left, right),
+        }
+    }
+
+    /// Ordering reads the collation the same way equality does.
+    fn compare_scalars(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering> {
+        match (left, right) {
+            (Value::String(x), Value::String(y)) => Some(
+                Self::text_rule(&comparison, TextOperation::Ordering)
+                    .unwrap_or(TextRule::EXACT)
+                    .compare(x, y),
+            ),
+            _ => crate::compiler::value_cmp::structural_ordering(left, right),
+        }
+    }
+
+    /// SQLite's three built-in collations are all exactly reproducible,
+    /// and the same rule serves every operation: `BINARY` compares bytes,
+    /// `NOCASE` folds ASCII case only, measured as leaving a ligature
+    /// alone, and `RTRIM` ignores trailing spaces.
+    fn text_rule(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+        _operation: crate::backend::TextOperation,
+    ) -> Option<crate::backend::TextRule> {
+        let mut rule = crate::backend::TextRule::EXACT;
+        for side in [comparison.left, comparison.right] {
+            let Some(facts) = side else { continue };
+            rule = sqlite_text_rule(facts)?;
+        }
+        Some(rule)
     }
 
     /// Measured: SQLite has no default escape, so a backslash in a
@@ -296,10 +372,6 @@ impl Backend for SQLite {
     const LIKE_DEFAULT_ESCAPE: Option<char> = None;
 
     type Custom = NoCustomScalars<Self>;
-
-    fn text_key(column: &ColumnComparisonOf<Self>) -> Option<TextKey> {
-        sqlite_text_key(column)
-    }
 
     fn group_key_encoder(
         columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
@@ -317,7 +389,9 @@ impl Backend for SQLite {
                 | BuiltinKind::Json
                 | BuiltinKind::Jsonb,
             ) => true,
-            Some(BuiltinKind::String | BuiltinKind::Uuid) => Self::text_key(column).is_some(),
+            Some(BuiltinKind::String | BuiltinKind::Uuid) => {
+                single_column_rule::<Self>(column).is_some()
+            }
             Some(BuiltinKind::Decimal) | None => false,
         });
         supported.then(|| GroupKeyEncoder::new(columns, encode_sqlite_component))

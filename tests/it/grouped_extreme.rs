@@ -196,7 +196,8 @@ fn registration_binds_precede_group_scope_binds() {
 #[test]
 fn positional_registration_binds_follow_rewritten_sql_order_mysql() {
     let catalog = ParserDB::parse::<MySqlDialect>(
-        "CREATE TABLE orders (id INT PRIMARY KEY, region VARCHAR(32) COLLATE utf8mb4_bin, amount INT, status VARCHAR(32));",
+        "CREATE TABLE orders (id INT PRIMARY KEY, region VARCHAR(32) COLLATE utf8mb4_bin, \
+         amount INT, status VARCHAR(32) COLLATE utf8mb4_bin);",
     )
     .expect("parse DDL");
     let orders = catalog_helpers::table_id(&catalog, "orders").expect("orders resolves");

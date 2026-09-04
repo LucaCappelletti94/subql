@@ -693,6 +693,15 @@ pub enum NotServed<B: Backend> {
         /// The column's declared scalar kind.
         kind: ScalarKindOf<B>,
     },
+    /// The column's collation is one the in-process comparator cannot
+    /// reproduce, so only the database can answer comparisons on it.
+    CollationNotReproducible {
+        /// The compared column.
+        column: ColumnId,
+        /// The collation as the catalog names it, or `None` for the
+        /// database default and for rules the catalog cannot name.
+        collation: Option<String>,
+    },
     /// A form the compiler refused with prose rather than a structured
     /// cause.
     UnsupportedSql(String),
@@ -733,6 +742,18 @@ impl<B: Backend> core::fmt::Display for NotServed<B> {
                  subql cannot reproduce in process",
                 kind = ScalarKindName::<B>(kind)
             ),
+            Self::CollationNotReproducible { column, collation } => match collation {
+                Some(name) => write!(
+                    f,
+                    "column {column} declares collation {name}, whose comparison \
+                     subql cannot reproduce in process"
+                ),
+                None => write!(
+                    f,
+                    "column {column} declares a collation the catalog cannot name, \
+                     so subql cannot reproduce its comparison in process"
+                ),
+            },
             Self::UnsupportedSql(message) => f.write_str(message),
         }
     }

@@ -50,10 +50,11 @@ pub(crate) use cdc_event::ResolvedEvent;
 pub use cdc_event::{decode_cell, encode_value_key, CdcEvent, CellPresence};
 pub use row_kind::RowKind;
 pub(crate) use scalar_value::jsonb_payloads_equal;
+pub use scalar_value::single_column_rule;
 pub use scalar_value::{
     BuiltinKind, Carried, CollationFacts, CollationName, ColumnComparison, ColumnComparisonOf,
     ComparisonContext, CustomScalars, GroupKeyEncoder, NoCustom, NoCustomScalars, ScalarKind,
-    ScalarKindOf, TextKey, TrailingSpacePadding, TrailingSpaces, Value,
+    ScalarKindOf, TextCase, TextOperation, TextRule, TrailingSpacePadding, TrailingSpaces, Value,
 };
 pub use scalars_and_backend::{
     Backend, JsonDocument, ScalarCore, ScalarKey, ScalarText, ScalarTruth, SqliteJson,

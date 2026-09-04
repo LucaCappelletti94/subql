@@ -96,6 +96,18 @@ pub enum Refusal {
         /// The column's builtin kind, which is what carries no order here.
         kind: crate::backend::BuiltinKind,
     },
+    /// The operands' collations describe a text comparison this build does
+    /// not reproduce.
+    #[error(
+        "column {column} declares a collation whose comparison is not reproducible in process"
+    )]
+    CollationNotReproducible {
+        /// The compared column.
+        column: crate::ColumnId,
+        /// The collation as the catalog names it, or `None` for the
+        /// database default and for rules the catalog cannot name.
+        collation: Option<String>,
+    },
     /// A form with no structured cause, carrying the compiler's own words.
     #[error("{0}")]
     Unsupported(String),
