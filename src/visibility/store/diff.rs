@@ -14,7 +14,7 @@ use crate::visibility::transition::is_key_only;
 use crate::visibility::{EventRow, RowView};
 use crate::{ColumnId, EventKind};
 
-use super::{Requery, StoreDiff, StoreDiffError, Uncovered, UncoveredReason};
+use super::{KeyedRequery, Requery, StoreDiff, StoreDiffError, Uncovered, UncoveredReason};
 
 impl<DB: DatabaseLike> Shapes<DB> {
     /// What `event` moved.
@@ -48,42 +48,50 @@ impl<DB: DatabaseLike> Shapes<DB> {
             return Ok(StoreDiff::empty());
         };
 
-        // Only a settled shape has to read the row, so a key-only previous
-        // image is harmless for a table reached only by a bound query.
-        let before = match previous.as_ref().filter(|_| !shapes.settled.is_empty()) {
+        // Only a differenced shape has to read the row, so a key-only previous
+        // image is harmless for a table reached only by a query, whether that
+        // is a bound one or a group's.
+        let before = match previous.as_ref().filter(|_| !shapes.differenced.is_empty()) {
             Some(row) if is_key_only(row, event, db) => {
                 return Err(StoreDiffError::IncompletePreviousImage)
             }
-            Some(row) => records_of::<_, DB>(&shapes.settled, row, db)?,
+            Some(row) => records_of::<_, DB>(shapes, row, db)?,
             None => BTreeSet::new(),
         };
         let after = match current.as_ref() {
-            Some(row) => records_of(&shapes.settled, row, db)?,
+            Some(row) => records_of(shapes, row, db)?,
             None => BTreeSet::new(),
         };
 
         Ok(StoreDiff {
             added: after.difference(&before).cloned().collect(),
             removed: before.difference(&after).cloned().collect(),
-            requeries: requeries(shapes, current.as_ref(), previous.as_ref())?,
+            requeries: requeries(self, shapes, current.as_ref(), previous.as_ref())?,
         })
     }
 }
 
-/// One entry per query and per distinct key the two images carry for it.
+/// One entry per group the change obliged, then one per query and per distinct
+/// key the two images carry for it.
 ///
-/// Both images are read because moving the bound key moves records under the
-/// old value and the new one, and replaying only one of them leaves the
-/// other stale.
-fn requeries<'a, R>(
+/// Both images are read for a keyed query because moving the bound key moves
+/// records under the old value and the new one, and replaying only one of them
+/// leaves the other stale. A group takes no key, so one entry covers the
+/// change however many of its tables the event touched.
+fn requeries<'a, R, DB>(
+    index: &'a Shapes<DB>,
     shapes: &'a TableShapes,
     current: Option<&R>,
     previous: Option<&R>,
 ) -> Result<Vec<Requery<'a, R::Backend>>, StoreDiffError>
 where
     R: RowView,
+    DB: DatabaseLike,
 {
     let mut out = Vec::new();
+    for group in &shapes.groups {
+        out.push(Requery::Whole(&index.materialisations()[*group]));
+    }
     for (key_columns, query) in &shapes.requeries {
         for row in [current, previous].into_iter().flatten() {
             let Some(key) = read_key(row, key_columns)? else {
@@ -94,13 +102,12 @@ where
             // already seen would leave the records it reaches stale. An
             // identical query indexed twice, which happens when one source
             // feeds several relations, still collapses here.
-            if out
-                .iter()
-                .any(|seen: &Requery<'a, R::Backend>| seen.query == query && seen.key == key)
-            {
+            if out.iter().any(|seen| {
+                matches!(seen, Requery::Keyed(seen) if seen.query == query && seen.key == key)
+            }) {
                 continue;
             }
-            out.push(Requery { query, key });
+            out.push(Requery::Keyed(KeyedRequery { query, key }));
         }
     }
     Ok(out)
@@ -162,9 +169,14 @@ pub fn name_gap(
     }
 }
 
-/// Every record `shapes` state about `row`, deduplicated.
+/// Every record the shapes this differences state about `row`, deduplicated.
+///
+/// Reads [`TableShapes::differenced`] rather than every settled shape: a shape
+/// a group maintains is still settled, because a row of the table still
+/// implies its records, but differencing it beside the group would be a second
+/// authoritative operation over one region.
 fn records_of<R, DB>(
-    shapes: &[RecordDescription],
+    shapes: &TableShapes,
     row: &R,
     db: &DB,
 ) -> Result<BTreeSet<Record>, RowRecordError>
@@ -173,8 +185,12 @@ where
     DB: DatabaseLike,
 {
     let mut out = BTreeSet::new();
-    for shape in shapes {
-        out.extend(records_from_row_view::<R, DB>(shape, row, db)?);
+    for position in &shapes.differenced {
+        out.extend(records_from_row_view::<R, DB>(
+            &shapes.settled[*position],
+            row,
+            db,
+        )?);
     }
     Ok(out)
 }
@@ -183,7 +199,7 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use alloc::vec;
-    use alloc::vec::Vec;
+    use rls2fga_types::{BoundQuery, Record, RecordDerivation, RecordDescription, ReplayScope};
 
     use rls2fga::generator::well_known::{
         can_delete_relation, can_select_relation, member_relation,
@@ -193,14 +209,13 @@ mod tests {
     use rls2fga_types::RecordError;
     use rls2fga_types::RelationName;
     use rls2fga_types::RelationShapes;
-    use rls2fga_types::{BoundQuery, Record, RecordDerivation, RecordDescription, ReplayScope};
     use sqlparser::dialect::PostgreSqlDialect;
 
     use crate::backend::{CdcEvent, Postgres, RowKind, Value};
     use crate::testing::TestEvent;
     use crate::visibility::records::RowRecordError;
     use crate::visibility::shapes::Shapes;
-    use crate::visibility::store::{StoreDiffError, UncoveredReason};
+    use crate::visibility::store::{Enumeration, Requery, StoreDiffError, UncoveredReason};
     use crate::visibility::test_names;
     use crate::{
         catalog_helpers, ColumnId, EventKind, NoCheckpoint, ParserDB, TableId, ValueError,
@@ -275,6 +290,36 @@ CREATE POLICY p ON docs FOR SELECT USING (
             AND team_guests.expires_at > now()));
 ";
 
+    /// A membership whose residual compares one row against an aggregate over
+    /// the whole table, so no key narrows the replay and the shape carries the
+    /// unnarrowed query instead.
+    const WHOLE_SHAPE: &str = "
+CREATE TABLE public.papers(id INTEGER PRIMARY KEY, owner TEXT);
+CREATE TABLE public.paper_shares(paper_id INTEGER REFERENCES papers(id), viewer TEXT,
+    weight NUMERIC, PRIMARY KEY(paper_id, viewer));
+ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON papers FOR SELECT USING (
+  EXISTS (SELECT 1 FROM paper_shares s
+          WHERE s.paper_id = papers.id AND s.viewer = current_user
+            AND s.weight > (SELECT avg(weight) FROM paper_shares)));
+";
+
+    /// Two membership sources a row settles on its own, on different tables.
+    /// Differencing one of them cannot see the other, so a fact both state is
+    /// deleted when either row goes.
+    const TWO_SETTLED: &str = "
+CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
+CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+CREATE TABLE public.team_leads(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+CREATE TABLE public.docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user)
+  OR EXISTS (SELECT 1 FROM team_leads
+          WHERE team_leads.team_id = docs.team_id AND team_leads.user_id = current_user));
+";
+
     /// The subjects live in a list column, which no row image can expand.
     const ARRAY: &str = "
 CREATE TABLE docs(id INTEGER PRIMARY KEY, members TEXT[]);
@@ -292,14 +337,26 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
 
     fn shapes(sql: &str) -> Shapes<ParserDB> {
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
-        let relations = TranslatorBuilder::new()
+        let outputs = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .build()
             .translate(&db)
             .unwrap()
-            .relations()
-            .to_vec();
-        Shapes::new::<Postgres>(db, &relations)
+            .outputs_accepting_gaps();
+        // A skipped query carries no description, so `filter_map` drops exactly
+        // the entries that enumerate nothing.
+        let enumerations: Vec<Enumeration<'_>> = outputs
+            .tuple_queries()
+            .iter()
+            .filter_map(|query| {
+                query.description.as_ref().map(|description| Enumeration {
+                    description,
+                    sql: &query.sql,
+                    condition: query.condition.as_deref(),
+                })
+            })
+            .collect();
+        Shapes::new::<Postgres>(db, outputs.translation().relations(), &enumerations)
     }
 
     fn table(shapes: &Shapes<ParserDB>, name: &str) -> TableId {
@@ -562,11 +619,13 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             "an insert into a two-table shape removes nothing"
         );
         assert_eq!(diff.requeries.len(), 1);
-        let requery = &diff.requeries[0];
-        assert_eq!(requery.query.table().name(), "team_members");
-        assert_eq!(requery.query.key_columns(), ["team_id"]);
-        assert!(requery.query.sql().contains("$1"));
-        assert_eq!(requery.key, [Value::Int(3)]);
+        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+            panic!("expected Keyed requery, got {:?}", diff.requeries[0]);
+        };
+        assert_eq!(keyed.query.table().name(), "team_members");
+        assert_eq!(keyed.query.key_columns(), ["team_id"]);
+        assert!(keyed.query.sql().contains("$1"));
+        assert_eq!(keyed.key, [Value::Int(3)]);
     }
 
     /// Moving the key moves records under both the old value and the new
@@ -583,8 +642,14 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
 
         let diff = store.diff(&event).unwrap();
 
-        let keys: Vec<Vec<Value<Postgres>>> =
-            diff.requeries.iter().map(|r| r.key.clone()).collect();
+        let keys: Vec<_> = diff
+            .requeries
+            .iter()
+            .filter_map(|r| match r {
+                Requery::Keyed(keyed) => Some(keyed.key.clone()),
+                Requery::Whole(_) => None,
+            })
+            .collect();
         assert_eq!(keys, [vec![Value::Int(4)], vec![Value::Int(3)]]);
     }
 
@@ -602,7 +667,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let diff = store.diff(&event).unwrap();
 
         assert_eq!(diff.requeries.len(), 1);
-        assert_eq!(diff.requeries[0].key, [Value::Int(3)]);
+        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+            panic!("expected Keyed requery");
+        };
+        assert_eq!(keyed.key, [Value::Int(3)]);
     }
 
     /// A key-only previous image is only a problem for a shape that had to
@@ -622,7 +690,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let diff = store.diff(&event).unwrap();
 
         assert_eq!(diff.requeries.len(), 1);
-        assert_eq!(diff.requeries[0].key, [Value::Int(3)]);
+        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+            panic!("expected Keyed requery");
+        };
+        assert_eq!(keyed.key, [Value::Int(3)]);
     }
 
     /// The finding this module's reconciliation contract closes: a residual
@@ -685,10 +756,12 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             "no row image evaluates the clock, so the replay is the remover"
         );
         assert_eq!(diff.requeries.len(), 1);
-        let requery = &diff.requeries[0];
-        assert_eq!(requery.key, [Value::Int(3)]);
+        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+            panic!("expected Keyed requery");
+        };
+        assert_eq!(keyed.key, [Value::Int(3)]);
         assert_eq!(
-            *requery.query.scope(),
+            *keyed.query.scope(),
             ReplayScope::Object {
                 object_type: "teams".to_string(),
                 relations: alloc::vec![member_relation()],
@@ -716,18 +789,18 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let diff = store.diff(&event).unwrap();
 
         assert_eq!(diff.requeries.len(), 1, "{:?}", diff.requeries);
-        let requery = &diff.requeries[0];
-        assert_eq!(requery.query.key_columns(), ["tenant_id", "reading_id"]);
-        assert_eq!(requery.key, [Value::Int(7), Value::Int(9)]);
-        // What makes the pair above one row's key rather than two values in
-        // some order: the query takes them in exactly this order.
+        let Requery::Keyed(keyed) = &diff.requeries[0] else {
+            panic!("expected Keyed requery");
+        };
+        assert_eq!(keyed.query.key_columns(), ["tenant_id", "reading_id"]);
+        assert_eq!(keyed.key, [Value::Int(7), Value::Int(9)]);
         assert!(
-            requery
+            keyed
                 .query
                 .sql()
                 .contains("\"tenant_id\" = $1 AND \"reading_id\" = $2"),
             "{}",
-            requery.query.sql()
+            keyed.query.sql()
         );
     }
 
@@ -758,43 +831,6 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         assert!(
             diff.removed.is_empty(),
             "the row is new so nothing was held before"
-        );
-    }
-
-    /// A replay's slice another shape also states is not its own to
-    /// reconcile: what the replay stopped returning may be the other shape's
-    /// living fact. The joined shape is named uncovered and hands nothing
-    /// over, while the settled sibling keeps differencing.
-    #[test]
-    fn a_replay_whose_slice_another_shape_states_is_named_as_uncovered() {
-        let store = shapes(SHARED_SLICE);
-
-        let uncovered = store.uncovered();
-        assert!(
-            uncovered.iter().any(|gap| gap.table == "public.team_guests"
-                && gap.reason == UncoveredReason::SharedSlice),
-            "the guest shape's slice is also stated by the member shape: {uncovered:?}"
-        );
-
-        let guests = table(&store, "team_guests");
-        let event = TestEvent::<Postgres>::delete(
-            guests,
-            vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
-        );
-        let diff = store.diff(&event).unwrap();
-        assert!(
-            diff.requeries.is_empty(),
-            "a replay nobody may reconcile is not handed over: {:?}",
-            diff.requeries
-        );
-
-        let members = table(&store, "team_members");
-        let event = TestEvent::<Postgres>::delete(members, vec![Value::Int(3), text("alice")]);
-        let diff = store.diff(&event).unwrap();
-        assert_eq!(
-            diff.removed,
-            [record("teams:3", member_relation(), "user:alice")],
-            "the settled sibling still differences its own rows"
         );
     }
 
@@ -1009,6 +1045,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                     bound("docs", &["absent_column"]),
                 ],
             )],
+            &[],
         );
 
         let uncovered = store.uncovered();
@@ -1023,8 +1060,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             .with_pk_columns([0u16]);
         let diff = store.diff(&event).unwrap();
 
-        assert_eq!(diff.requeries.len(), 1, "only the resolvable query");
-        assert_eq!(diff.requeries[0].query.key_columns(), ["id"]);
+        let [Requery::Keyed(keyed)] = diff.requeries.as_slice() else {
+            panic!("only the resolvable query: {:?}", diff.requeries);
+        };
+        assert_eq!(keyed.query.key_columns(), ["id"]);
     }
 
     /// A key naming a column this catalog does not have is dropped whole.
@@ -1046,6 +1085,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 &["docs"],
                 vec![bound("docs", &["id", "absent_column"])],
             )],
+            &[],
         );
 
         let uncovered = store.uncovered();
@@ -1081,7 +1121,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 "SELECT 'delete' WHERE id = $1;",
             ),
         ];
-        let store = Shapes::new::<Postgres>(db, &relations);
+        let store = Shapes::new::<Postgres>(db, &relations, &[]);
         let docs = table(&store, "docs");
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
@@ -1091,7 +1131,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
         let mut sql: Vec<&str> = diff
             .requeries
             .iter()
-            .map(|requery| requery.query.sql())
+            .filter_map(|r| match r {
+                Requery::Keyed(keyed) => Some(keyed.query.sql()),
+                Requery::Whole(_) => None,
+            })
             .collect();
         sql.sort_unstable();
         assert_eq!(
@@ -1101,7 +1144,10 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 "SELECT 'read' WHERE id = $1;"
             ]
         );
-        assert!(diff.requeries.iter().all(|r| r.key == [Value::Int(4)]));
+        assert!(diff.requeries.iter().all(|r| match r {
+            Requery::Keyed(keyed) => keyed.key == [Value::Int(4)],
+            Requery::Whole(_) => false,
+        }));
     }
 
     /// The same query reached through two relations, which is what one tuple
@@ -1125,7 +1171,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
                 same,
             ),
         ];
-        let store = Shapes::new::<Postgres>(db, &relations);
+        let store = Shapes::new::<Postgres>(db, &relations, &[]);
         let docs = table(&store, "docs");
         let event = TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice")])
             .with_pk_columns([0u16]);
@@ -1221,7 +1267,7 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             decision: None,
             grants_nobody: false,
         };
-        Shapes::new::<Postgres>(db, &[entry])
+        Shapes::new::<Postgres>(db, &[entry], &[])
     }
 
     /// One `can_select` relation filled by a joining shape that reads `tables`
@@ -1241,5 +1287,476 @@ CREATE TABLE readings(tenant_id INTEGER, reading_id INTEGER, starts_at TIMESTAMP
             decision: None,
             grants_nobody: false,
         }
+    }
+
+    /// A whole shape carries the unnarrowed query and declares the slice it
+    /// determines, so naming it as carrying no query to fall back on was
+    /// wrong. It is indexed against every table it reads.
+    #[test]
+    fn a_whole_shape_is_indexed_rather_than_uncovered() {
+        let store = shapes(WHOLE_SHAPE);
+        // The premise, asserted rather than assumed: a translation that stopped
+        // emitting this derivation would otherwise make the claim below vacuous.
+        assert!(
+            store.materialisations().iter().any(|group| {
+                group
+                    .region()
+                    .parts()
+                    .iter()
+                    .any(|part| part.object_type() == "papers")
+            }),
+            "the aggregate residual groups on the type it grants: {:?}",
+            store.materialisations()
+        );
+        assert!(
+            store.uncovered().is_empty(),
+            "the aggregate residual carries its own query: {:?}",
+            store.uncovered()
+        );
+    }
+
+    /// A change to a table a whole shape reads schedules the whole group,
+    /// because no key narrows what that change moved.
+    #[test]
+    fn an_event_on_a_trigger_table_schedules_the_whole_group() {
+        let store = shapes(WHOLE_SHAPE);
+        let shares = table(&store, "paper_shares");
+
+        let event =
+            TestEvent::<Postgres>::insert(shares, vec![Value::Int(7), text("alice"), text("5")])
+                .with_pk_columns([0u16, 1u16]);
+        let diff = store.diff(&event).unwrap();
+
+        let [Requery::Whole(group)] = diff.requeries.as_slice() else {
+            panic!("one group, and no keyed replay: {:?}", diff.requeries);
+        };
+        let [part] = group.region().parts() else {
+            panic!("one relation on one type: {group:?}");
+        };
+        assert_eq!(part.object_type(), "papers");
+        assert_eq!(part.relation(), &member_relation());
+        assert_eq!(
+            part.subject_type(),
+            None,
+            "an object-scoped member is authoritative over every subject"
+        );
+        let [member] = group.members() else {
+            panic!("one producer states this region: {group:?}");
+        };
+        assert!(
+            member.sql().contains("avg(weight)"),
+            "the residual travels in the query rather than being dropped: {}",
+            member.sql()
+        );
+    }
+
+    /// Two producers stating one region form one group, where the old code
+    /// refused the pair outright. That their facts survive the reconcile is a
+    /// property of the reconcile, proven against a real store in
+    /// `tests/it/visibility_openfga_e2e.rs`.
+    #[test]
+    fn a_group_of_two_producers_is_formed_over_the_shared_region() {
+        let store = shapes(SHARED_SLICE);
+        assert!(
+            store.uncovered().is_empty(),
+            "both producers enumerate, so the region is reconcilable: {:?}",
+            store.uncovered()
+        );
+
+        let guests = table(&store, "team_guests");
+        let event = TestEvent::<Postgres>::delete(
+            guests,
+            vec![Value::Int(3), text("alice"), text("2027-01-01T00:00:00Z")],
+        );
+        let diff = store.diff(&event).unwrap();
+
+        let [Requery::Whole(group)] = diff.requeries.as_slice() else {
+            panic!("one group over the shared region: {:?}", diff.requeries);
+        };
+        assert_eq!(
+            group.members().len(),
+            2,
+            "the settled member and the replayed one both state this region: {group:?}"
+        );
+        assert!(
+            group
+                .members()
+                .iter()
+                .any(|member| member.sql().contains("team_members")),
+            "the sibling's own facts are in the union: {group:?}"
+        );
+        assert!(
+            group
+                .members()
+                .iter()
+                .any(|member| member.sql().contains("team_guests")),
+            "and so are the changed table's: {group:?}"
+        );
+        assert!(
+            diff.removed.is_empty(),
+            "a grouped producer is not differenced as well, since the group is \
+             the one authoritative operation over its region: {diff:?}"
+        );
+    }
+
+    /// Two row-settled producers on different tables state one region, which
+    /// differencing alone gets wrong: deleting a row on one table removes a
+    /// fact the other table's producer still states.
+    #[test]
+    fn two_settled_producers_on_one_region_are_grouped() {
+        let store = shapes(TWO_SETTLED);
+        assert!(store.uncovered().is_empty(), "{:?}", store.uncovered());
+
+        let leads = table(&store, "team_leads");
+        let event = TestEvent::<Postgres>::delete(leads, vec![Value::Int(3), text("alice")]);
+        let diff = store.diff(&event).unwrap();
+
+        let [Requery::Whole(group)] = diff.requeries.as_slice() else {
+            panic!("one group over the shared region: {:?}", diff.requeries);
+        };
+        assert_eq!(group.members().len(), 2, "{group:?}");
+        assert!(
+            diff.removed.is_empty(),
+            "the fact the lead row stated may still be stated by a member row, \
+             so only the group's union may remove it: {diff:?}"
+        );
+    }
+
+    /// A whole shape reaches the subject scope too, and a subject-scoped
+    /// region is confined to one subject type: a fact granting to another
+    /// subject type is outside it and must not be deleted by its reconcile.
+    #[test]
+    fn a_subject_scoped_whole_shape_confines_its_region_to_one_subject_type() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(MEMBERSHIP).unwrap();
+        let entry = RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: vec![test_names::table("team_members")],
+                derivation: RecordDerivation::WholeShape {
+                    query: "SELECT object, relation, subject FROM held;".to_string(),
+                    condition: None,
+                    scope: ReplayScope::Subject {
+                        subject_type: "user".to_string(),
+                        relation: can_select_relation(),
+                        object_type: "docs".to_string(),
+                    },
+                    reason: "the holder is decided by rows no key names".to_string(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        };
+        let store = Shapes::new::<Postgres>(db, &[entry], &[]);
+
+        let [group] = store.materialisations() else {
+            panic!("one group: {:?}", store.materialisations());
+        };
+        let [part] = group.region().parts() else {
+            panic!("one relation on one type: {group:?}");
+        };
+        assert_eq!(part.object_type(), "docs");
+        assert_eq!(
+            part.subject_type(),
+            Some("user"),
+            "a subject-scoped member is authoritative over one subject type only"
+        );
+        assert!(
+            group
+                .region()
+                .holds("docs:4", can_select_relation().as_str(), "user:alice"),
+            "a fact granting to that subject type is inside the region"
+        );
+        assert!(
+            !group
+                .region()
+                .holds("docs:4", can_select_relation().as_str(), "team:ops"),
+            "and one granting to another subject type is not, so the reconcile \
+             leaves it alone"
+        );
+    }
+
+    /// Two producers on one type and one relation whose subject types differ
+    /// state disjoint facts, so they are two regions rather than one.
+    ///
+    /// Grouping them would hand each the authority to delete the other's
+    /// facts, which is the clobber the region arithmetic exists to refuse. It
+    /// is also why a row-settled producer's region keeps its template's
+    /// subject type instead of spanning every subject.
+    #[test]
+    fn producers_differing_only_in_subject_type_are_not_grouped() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(MEMBERSHIP).unwrap();
+        let held = |subject_type: &str| RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: vec![test_names::table("team_members")],
+                derivation: RecordDerivation::WholeShape {
+                    query: alloc::format!("SELECT object, relation, subject FROM {subject_type};"),
+                    condition: None,
+                    scope: ReplayScope::Subject {
+                        subject_type: subject_type.to_string(),
+                        relation: can_select_relation(),
+                        object_type: "docs".to_string(),
+                    },
+                    reason: "the holder is decided by rows no key names".to_string(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        };
+        let store = Shapes::new::<Postgres>(db, &[held("user"), held("team")], &[]);
+
+        assert_eq!(
+            store.materialisations().len(),
+            2,
+            "disjoint subject types are disjoint regions: {:?}",
+            store.materialisations()
+        );
+        for group in store.materialisations() {
+            assert_eq!(
+                group.members().len(),
+                1,
+                "neither group may delete over the other's subjects: {group:?}"
+            );
+        }
+    }
+
+    /// One source feeding two relations is reported under both, and is still
+    /// one producer.
+    ///
+    /// Counted twice its region would look shared and a group would form,
+    /// which costs a full enumeration and a whole-store pass per event where
+    /// differencing the row was correct and free.
+    #[test]
+    fn one_source_reported_under_two_relations_is_one_producer() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(OWNERSHIP).unwrap();
+        let outputs = TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .build()
+            .translate(&db)
+            .unwrap()
+            .outputs_accepting_gaps();
+        // The real description, reported a second time under another relation,
+        // which is what one source feeding two relations looks like.
+        let mut relations = outputs.translation().relations().to_vec();
+        let mut again = relations
+            .iter()
+            .find(|entry| !entry.shapes.is_empty())
+            .expect("the ownership policy describes records")
+            .clone();
+        again.relation = can_delete_relation();
+        relations.push(again);
+        let store = Shapes::new::<Postgres>(db, &relations, &[]);
+
+        assert!(
+            store.materialisations().is_empty(),
+            "one producer alone in its region needs no group: {:?}",
+            store.materialisations()
+        );
+        let docs = table(&store, "docs");
+        let event =
+            TestEvent::<Postgres>::insert(docs, vec![Value::Int(4), text("alice"), text("b")])
+                .with_pk_columns([0u16]);
+        let diff = store.diff(&event).unwrap();
+        assert_eq!(
+            diff.added,
+            [record(
+                "docs:4",
+                test_names::relation("owner"),
+                "user:alice"
+            )],
+            "and it is differenced from the row, once: {diff:?}"
+        );
+    }
+
+    /// A constant fact inside a group's region joins the union, so the
+    /// reconcile does not delete what the load wrote and no query returns.
+    #[test]
+    fn a_constant_inside_a_region_is_donated_to_its_group() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(MEMBERSHIP).unwrap();
+        let replayed = RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: vec![test_names::table("team_members")],
+                derivation: RecordDerivation::WholeShape {
+                    query: "SELECT object, relation, subject FROM held;".to_string(),
+                    condition: None,
+                    scope: ReplayScope::Object {
+                        object_type: "docs".to_string(),
+                        relations: vec![can_select_relation()],
+                    },
+                    reason: "the holder is decided by rows no key names".to_string(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        };
+        let granted = record("docs:4", can_select_relation(), "user:root");
+        let constant = RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: Vec::new(),
+                derivation: RecordDerivation::Constant {
+                    record: granted.clone(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        };
+        let store = Shapes::new::<Postgres>(db, &[replayed, constant], &[]);
+
+        let [group] = store.materialisations() else {
+            panic!("one group: {:?}", store.materialisations());
+        };
+        assert_eq!(
+            group.constants(),
+            [granted],
+            "the constant lies in the region, so the union has to state it"
+        );
+    }
+
+    /// A constant beside a row-settled producer in one region pulls it into a
+    /// group rather than leaving it differenced.
+    ///
+    /// Differencing reports what that producer stopped stating, so deleting
+    /// its row removes a fact the constant still states, and the load would
+    /// put it back only on the next restart. The constant carries no query, so
+    /// it donates its fact to the union rather than refusing the region.
+    #[test]
+    fn a_constant_pulls_a_settled_producer_into_a_group() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(OWNERSHIP).unwrap();
+        let outputs = TranslatorBuilder::new()
+            .with_min_confidence(ConfidenceLevel::B)
+            .build()
+            .translate(&db)
+            .unwrap()
+            .outputs_accepting_gaps();
+        let enumerations: Vec<Enumeration<'_>> = outputs
+            .tuple_queries()
+            .iter()
+            .filter_map(|query| {
+                query.description.as_ref().map(|description| Enumeration {
+                    description,
+                    sql: &query.sql,
+                    condition: query.condition.as_deref(),
+                })
+            })
+            .collect();
+        let mut relations = outputs.translation().relations().to_vec();
+        // A fact the load writes outright, in the very region the ownership
+        // producer states its own facts in.
+        let granted = record("docs:9", test_names::relation("owner"), "user:root");
+        relations.push(RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: test_names::relation("owner"),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: Vec::new(),
+                derivation: RecordDerivation::Constant {
+                    record: granted.clone(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        });
+        let store = Shapes::new::<Postgres>(db, &relations, &enumerations);
+
+        assert!(store.uncovered().is_empty(), "{:?}", store.uncovered());
+        let [group] = store.materialisations() else {
+            panic!("one group: {:?}", store.materialisations());
+        };
+        assert_eq!(group.constants(), [granted]);
+        assert_eq!(
+            group.members().len(),
+            1,
+            "the settled producer enumerates, the constant needs no query: {group:?}"
+        );
+
+        let docs = table(&store, "docs");
+        let event =
+            TestEvent::<Postgres>::delete(docs, vec![Value::Int(4), text("alice"), text("b")]);
+        let diff = store.diff(&event).unwrap();
+        let [Requery::Whole(scheduled)] = diff.requeries.as_slice() else {
+            panic!("the change schedules the group: {diff:?}");
+        };
+        assert_eq!(scheduled.region(), group.region());
+        assert!(
+            diff.removed.is_empty(),
+            "only the group's union may remove here: {diff:?}"
+        );
+    }
+
+    /// A producer whose facts nothing can place refuses every group.
+    ///
+    /// A joining shape carrying no query at all states facts and the load
+    /// writes them, but its scope lives inside the query it does not have, so
+    /// it can neither be gathered into the group whose region covers it nor be
+    /// shown to lie outside it. Forming the group anyway would delete those
+    /// facts, which is what reconciling nothing never did.
+    #[test]
+    fn a_producer_nothing_can_place_refuses_every_group() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(MEMBERSHIP).unwrap();
+        let unbound = RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: vec![test_names::table("team_members")],
+                derivation: RecordDerivation::Joined {
+                    queries: Vec::new(),
+                    reason: "nothing could be bound".to_string(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        };
+        let replayed = RelationShapes {
+            type_name: test_names::docs_type(),
+            relation: can_select_relation(),
+            from_one_row: false,
+            shapes: vec![RecordDescription {
+                tables: vec![test_names::table("team_members")],
+                derivation: RecordDerivation::WholeShape {
+                    query: "SELECT object, relation, subject FROM held;".to_string(),
+                    condition: None,
+                    scope: ReplayScope::Object {
+                        object_type: "docs".to_string(),
+                        relations: vec![can_select_relation()],
+                    },
+                    reason: "rows no key names".to_string(),
+                },
+            }],
+            decision: None,
+            grants_nobody: false,
+        };
+        let store = Shapes::new::<Postgres>(db, &[unbound, replayed], &[]);
+
+        assert!(
+            store.materialisations().is_empty(),
+            "the whole shape's region covers facts the unbound producer states, \
+             so nothing may delete over it: {:?}",
+            store.materialisations()
+        );
+        let reasons: Vec<UncoveredReason> =
+            store.uncovered().iter().map(|gap| gap.reason).collect();
+        assert!(
+            reasons.contains(&UncoveredReason::NoBoundQuery),
+            "the producer that caused it is named: {:?}",
+            store.uncovered()
+        );
+        assert!(
+            reasons.contains(&UncoveredReason::MissingEnumeration)
+                && !reasons.contains(&UncoveredReason::UnknownDerivation),
+            "and the whole shape is reported as a region nothing could reconcile, \
+             not as a derivation this does not understand: {:?}",
+            store.uncovered()
+        );
     }
 }

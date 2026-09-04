@@ -8,14 +8,16 @@ use rls2fga_types::RowNaming;
 use rls2fga_types::TranslationNote;
 use rls2fga_types::UnrestrictedTable;
 use rls2fga_types::{ActionAnswer, ActionRelations, ActionStatement};
-use rls2fga_types::{RecordDerivation, RecordDescription, ReplayScope};
+use rls2fga_types::{Record, RecordDerivation, RecordDescription};
 use rls2fga_types::{RelationShapes, RowDecision};
 
 use rls2fga_types::{ColumnName, RelationName, TableId as ContractTableId};
 use sql_traits::prelude::DatabaseLike;
 
 use crate::visibility::records::is_evaluable;
-use crate::visibility::store::{name_gap, Uncovered, UncoveredReason};
+use crate::visibility::store::{
+    name_gap, Enumeration, Materialisation, Region, Replay, Uncovered, UncoveredReason,
+};
 use crate::{catalog_helpers, ColumnId, TableId};
 
 use super::required_parameter::{RequiredParameter, TableShapes};
@@ -42,6 +44,7 @@ static UNRESTRICTED: ActionAnswer = ActionAnswer::Unrestricted;
 /// use sqlparser::dialect::PostgreSqlDialect;
 /// use rls2fga_types::ActionStatement;
 /// use subql::visibility::shapes::Shapes;
+/// use subql::visibility::store::Enumeration;
 /// use subql::{catalog_helpers, ParserDB};
 ///
 /// let db = ParserDB::parse::<PostgreSqlDialect>(
@@ -54,16 +57,26 @@ static UNRESTRICTED: ActionAnswer = ActionAnswer::Unrestricted;
 /// let translator = TranslatorBuilder::new()
 ///     .with_min_confidence(ConfidenceLevel::B)
 ///     .build();
-/// let translation = translator.translate(&db)?;
-/// // `relations` borrows the translation, which borrows `db`, so take an owned
-/// // copy and end the borrow before `Shapes::new` takes the catalog.
-/// let relations = translation.relations().to_vec();
+/// let outputs = translator.translate(&db)?.outputs_accepting_gaps();
+/// let translation = outputs.translation();
+/// // A skipped query carries no description, so this drops exactly the
+/// // entries that enumerate nothing.
+/// let enumerations: Vec<Enumeration<'_>> = outputs
+///     .tuple_queries()
+///     .iter()
+///     .filter_map(|query| {
+///         query.description.as_ref().map(|description| Enumeration {
+///             description,
+///             sql: &query.sql,
+///             condition: query.condition.as_deref(),
+///         })
+///     })
+///     .collect();
 /// let naming = std::borrow::Cow::from(translation.row_naming()).into_owned();
 /// let answers = translation.action_relations().to_vec();
-/// drop(translation);
 ///
 /// let shapes = Arc::new(
-///     Shapes::new::<Postgres>(db, &relations)
+///     Shapes::new::<Postgres>(db, translation.relations(), &enumerations)
 ///         .with_row_naming(&naming)
 ///         .with_action_relations(&answers),
 /// );
@@ -93,6 +106,8 @@ pub struct Shapes<DB> {
     by_table: HashMap<TableId, TableShapes>,
     /// Shapes whose records nothing here can keep current.
     uncovered: Vec<Uncovered>,
+    /// Every region reconciled as one unit, which a table's entry indexes into.
+    groups: Vec<Materialisation>,
     /// How the model names a row of each table it names rows of.
     naming: HashMap<TableId, RowNaming>,
     /// Tables the database filters nothing on, which the action report cannot
@@ -123,17 +138,29 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// reported: that table produces no events here, so skipping it introduces
     /// no staleness and there would be no remedy to name.
     #[must_use]
-    pub fn new<B: crate::backend::Backend>(db: DB, relations: &[RelationShapes]) -> Self {
+    pub fn new<B: crate::backend::Backend>(
+        db: DB,
+        relations: &[RelationShapes],
+        enumerations: &[Enumeration<'_>],
+    ) -> Self {
         let mut recipes = HashMap::new();
         let mut by_table: HashMap<TableId, TableShapes> = HashMap::new();
         let mut uncovered = Vec::new();
-        let contested = contested_pairs(relations);
+
+        let producers = producers(relations);
+        let plan = plan_groups(&producers, enumerations);
 
         for entry in relations {
             index_recipe::<B, DB>(&db, entry, &mut recipes);
-            for shape in &entry.shapes {
-                index_shape::<B, DB>(&db, entry, shape, &contested, &mut by_table, &mut uncovered);
-            }
+        }
+        for (position, producer) in producers.iter().enumerate() {
+            index_shape::<B, DB>(
+                &db,
+                producer,
+                plan.of(position),
+                &mut by_table,
+                &mut uncovered,
+            );
         }
 
         Self {
@@ -141,6 +168,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
             recipes,
             by_table,
             uncovered,
+            groups: plan.groups,
             answers: HashMap::new(),
             naming: HashMap::new(),
             unrestricted: HashSet::new(),
@@ -240,6 +268,7 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// use sqlparser::dialect::PostgreSqlDialect;
     /// use subql::backend::Postgres;
     /// use subql::visibility::shapes::Shapes;
+    /// use subql::visibility::store::Enumeration;
     /// use subql::{catalog_helpers, ParserDB};
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
@@ -251,18 +280,27 @@ impl<DB: DatabaseLike> Shapes<DB> {
     /// let translator = TranslatorBuilder::new()
     ///     .with_min_confidence(ConfidenceLevel::B)
     ///     .build();
-    /// let translation = translator
+    /// let outputs = translator
     ///     .translate(&db)
-    ///     .expect("the schema translates");
-    /// // `relations` borrows the translation, which borrows `db`, so take an
-    /// // owned copy and end the borrow before `Shapes::new` takes the catalog.
-    /// let relations = translation.relations().to_vec();
+    ///     .expect("the schema translates")
+    ///     .outputs_accepting_gaps();
+    /// let translation = outputs.translation();
+    /// let enumerations: Vec<Enumeration<'_>> = outputs
+    ///     .tuple_queries()
+    ///     .iter()
+    ///     .filter_map(|query| {
+    ///         query.description.as_ref().map(|description| Enumeration {
+    ///             description,
+    ///             sql: &query.sql,
+    ///             condition: query.condition.as_deref(),
+    ///         })
+    ///     })
+    ///     .collect();
     /// let naming = std::borrow::Cow::from(translation.row_naming()).into_owned();
     /// let answers = translation.action_relations().to_vec();
     /// let open = translation.unrestricted_tables().to_vec();
-    /// drop(translation);
     ///
-    /// let shapes = Shapes::new::<Postgres>(db, &relations)
+    /// let shapes = Shapes::new::<Postgres>(db, translation.relations(), &enumerations)
     ///     .with_row_naming(&naming)
     ///     .with_action_relations(&answers)
     ///     .with_unrestricted_tables(&open);
@@ -369,6 +407,18 @@ impl<DB: DatabaseLike> Shapes<DB> {
         &self.uncovered
     }
 
+    /// Every region reconciled as one unit, which the load runs in full.
+    ///
+    /// The load and an event run the same operation: the load runs all of
+    /// these, an event runs the ones its own change obliged. That is what makes
+    /// the load self-healing, and it is why the replay path is exercised by
+    /// every fixture at startup rather than only by a change that happens to
+    /// arrive.
+    #[must_use]
+    pub fn materialisations(&self) -> &[Materialisation] {
+        &self.groups
+    }
+
     /// Shapes whose records a row of `table` settles on its own.
     ///
     /// A question about a row the store has never seen carries the facts that
@@ -422,16 +472,342 @@ fn index_recipe<B: crate::backend::Backend, DB: DatabaseLike>(
     recipes.insert((table, entry.relation.clone()), decision.clone());
 }
 
-/// Index one shape by the table whose changes move it, naming it uncovered
+/// One description, with the region it states facts in.
+struct Producer<'a> {
+    entry: &'a RelationShapes,
+    shape: &'a RecordDescription,
+    /// Absent for a producer that declares no region here: a constant, or a
+    /// derivation this version does not understand, or a joining shape
+    /// carrying no query at all.
+    region: Option<Region>,
+}
+
+/// Every distinct description across `relations`, deduplicated by value.
+///
+/// By value rather than by entry, because one source feeding two relations
+/// appears under both and is still one producer. Counting it twice would make
+/// a region look shared and force a group where a lone producer's cheaper
+/// path is correct.
+fn producers(relations: &[RelationShapes]) -> Vec<Producer<'_>> {
+    let mut out: Vec<Producer<'_>> = Vec::new();
+    for entry in relations {
+        for shape in &entry.shapes {
+            if out.iter().any(|seen| seen.shape == shape) {
+                continue;
+            }
+            out.push(Producer {
+                entry,
+                shape,
+                region: region_of(shape),
+            });
+        }
+    }
+    out
+}
+
+/// Whether `shape` states facts whose region nothing here can bound.
+///
+/// A joining shape carrying no query at all is the reachable case: `rls2fga`
+/// reports the shape and the scope lives inside the query, so there is nothing
+/// to read the region off. A derivation this version does not understand is
+/// the same problem by another route.
+///
+/// It matters because a group deletes over its whole region, and a producer
+/// whose facts cannot be placed can neither be gathered into that group nor
+/// proven to lie outside it.
+const fn bounds_no_region(shape: &RecordDescription) -> bool {
+    match &shape.derivation {
+        RecordDerivation::FromRow { .. }
+        | RecordDerivation::Constant { .. }
+        | RecordDerivation::WholeShape { .. } => false,
+        RecordDerivation::Joined { queries, .. } => queries.is_empty(),
+        _ => true,
+    }
+}
+
+/// The region `shape` states facts in, unnarrowed.
+///
+/// A joining shape's queries are folded, all of them: the contract holds a
+/// list because one producer can be replayed from several tables, and taking
+/// one scope would leave the rest of its facts outside the region that
+/// reconciles them.
+fn region_of(shape: &RecordDescription) -> Option<Region> {
+    match &shape.derivation {
+        RecordDerivation::FromRow { template, .. } => Some(Region::of_template(
+            template.object_type.as_str(),
+            &template.relation,
+            template.subject_type.as_str(),
+        )),
+        RecordDerivation::Joined { queries, .. } => {
+            let mut region: Option<Region> = None;
+            for query in queries {
+                let next = Region::of(query.scope());
+                match region.as_mut() {
+                    Some(held) => held.absorb(&next),
+                    None => region = Some(next),
+                }
+            }
+            region
+        }
+        RecordDerivation::WholeShape { scope, .. } => Some(Region::of(scope)),
+        // A constant is authoritative over its one fact and nothing more, so it
+        // holds no region: a region would be a type and a relation wide, and two
+        // constants alone would then form a group claiming the authority to
+        // delete every other fact in it. It joins a group as a donor instead,
+        // and its presence is what makes that group necessary.
+        //
+        // `RecordDerivation` is `#[non_exhaustive]`, and a derivation this does
+        // not understand states nothing here either.
+        _ => None,
+    }
+}
+
+/// The fact a constant producer states, if that is what it is.
+const fn constant_of(shape: &RecordDescription) -> Option<&Record> {
+    match &shape.derivation {
+        RecordDerivation::Constant { record } => Some(record),
+        _ => None,
+    }
+}
+
+/// Where one producer's records come from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Maintained on its own, by differencing or by its own keyed replay.
+    Alone,
+    /// Maintained by the group at this position.
+    Grouped(usize),
+    /// Shares a region needing one authoritative reconcile with a producer
+    /// whose facts nothing here enumerates.
+    Refused,
+}
+
+/// Which group each producer belongs to, and the groups themselves.
+struct GroupPlan {
+    groups: Vec<Materialisation>,
+    /// One entry per producer, in the order [`producers`] returned them.
+    placed: Vec<Placement>,
+}
+
+impl GroupPlan {
+    fn of(&self, producer: usize) -> Placement {
+        self.placed[producer]
+    }
+}
+
+/// Gather producers whose regions overlap into groups, and decide which
+/// regions need one.
+///
+/// A region needs a group when a whole shape states facts in it, since nothing
+/// narrower can maintain one, when more than one producer states facts in it,
+/// since then no producer alone may delete over the region, or when a constant
+/// states a fact inside it, since differencing a sibling would delete what the
+/// constant still states.
+///
+/// The region and its constants are settled before that decision, because two
+/// of the three reasons cannot be read off the members alone.
+///
+/// # A producer nothing can place refuses every group
+///
+/// A group deletes over its whole region. A producer whose facts cannot be
+/// placed can neither be gathered into that group nor shown to lie outside it,
+/// so while one exists no group may delete anything at all. That is what this
+/// path did before groups existed, by reconciling nothing, and it was safe for
+/// the same reason. Such a producer is separately named in
+/// [`Shapes::uncovered`](Shapes::uncovered), so the refusal is reported rather
+/// than silent.
+fn plan_groups(producers: &[Producer<'_>], enumerations: &[Enumeration<'_>]) -> GroupPlan {
+    let mut groups = Vec::new();
+    let mut placed = alloc::vec![Placement::Alone; producers.len()];
+    if producers
+        .iter()
+        .any(|producer| bounds_no_region(producer.shape))
+    {
+        return GroupPlan { groups, placed };
+    }
+
+    for members in components(producers) {
+        let mut region: Option<Region> = None;
+        for position in &members {
+            if let Some(own) = producers[*position].region.as_ref() {
+                match region.as_mut() {
+                    Some(held) => held.absorb(own),
+                    None => region = Some(own.clone()),
+                }
+            }
+        }
+        let Some(region) = region else {
+            continue;
+        };
+        // Gathered by the fact each one states, since a constant holds no
+        // region to overlap with.
+        let constants: Vec<Record> = producers
+            .iter()
+            .filter_map(|producer| constant_of(producer.shape))
+            .filter(|record| region.holds_record(record))
+            .cloned()
+            .collect();
+        if !needs_group(producers, &members, &constants) {
+            continue;
+        }
+
+        let mut replays = Vec::with_capacity(members.len());
+        let mut enumerable = true;
+        for position in &members {
+            let producer = &producers[*position];
+            let Some(own) = producer.region.as_ref() else {
+                continue;
+            };
+            match replay_of(producer, own, enumerations) {
+                Some(replay) => replays.push(replay),
+                None => enumerable = false,
+            }
+        }
+        if !enumerable {
+            for position in &members {
+                placed[*position] = Placement::Refused;
+            }
+            continue;
+        }
+        for position in &members {
+            placed[*position] = Placement::Grouped(groups.len());
+        }
+        groups.push(Materialisation::new(region, replays, constants));
+    }
+
+    GroupPlan { groups, placed }
+}
+
+/// The unnarrowed query for one producer, or [`None`] where nothing enumerates
+/// its facts.
+fn replay_of(
+    producer: &Producer<'_>,
+    region: &Region,
+    enumerations: &[Enumeration<'_>],
+) -> Option<Replay> {
+    if let RecordDerivation::WholeShape {
+        query, condition, ..
+    } = &producer.shape.derivation
+    {
+        return Some(Replay::new(
+            query.clone(),
+            condition.clone(),
+            region.clone(),
+        ));
+    }
+    let mut found: Option<&Enumeration<'_>> = None;
+    for candidate in enumerations {
+        if candidate.description != producer.shape {
+            continue;
+        }
+        // One description reported with two different queries is an ambiguity
+        // nothing here can settle, so the region is refused rather than
+        // reconciled from a guess.
+        if found.is_some_and(|held| held.sql != candidate.sql) {
+            return None;
+        }
+        found = Some(candidate);
+    }
+    let enumeration = found?;
+    Some(Replay::new(
+        enumeration.sql.to_string(),
+        enumeration.condition.map(ToString::to_string),
+        region.clone(),
+    ))
+}
+
+/// Whether the region these producers share has to be reconciled as one unit.
+fn needs_group(producers: &[Producer<'_>], members: &[usize], constants: &[Record]) -> bool {
+    members.len() > 1
+        || !constants.is_empty()
+        || members.iter().any(|position| {
+            matches!(
+                producers[*position].shape.derivation,
+                RecordDerivation::WholeShape { .. }
+            )
+        })
+}
+
+/// Producers grouped into components by region overlap, transitively.
+///
+/// Transitive because overlap is not transitive on its own: two regions that
+/// miss each other can both meet a third, and reconciling either without the
+/// other would delete over facts the third states.
+fn components(producers: &[Producer<'_>]) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..producers.len()).collect();
+    for (left, one) in producers.iter().enumerate() {
+        let Some(one) = one.region.as_ref() else {
+            continue;
+        };
+        for (right, two) in producers.iter().enumerate().skip(left + 1) {
+            if two.region.as_ref().is_some_and(|two| one.overlaps(two)) {
+                union(&mut parent, left, right);
+            }
+        }
+    }
+
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut roots: Vec<(usize, usize)> = Vec::new();
+    for (position, producer) in producers.iter().enumerate() {
+        if producer.region.is_none() {
+            continue;
+        }
+        let root = find(&mut parent, position);
+        if let Some((_, bucket)) = roots.iter().find(|(seen, _)| *seen == root) {
+            out[*bucket].push(position);
+        } else {
+            roots.push((root, out.len()));
+            out.push(alloc::vec![position]);
+        }
+    }
+    out
+}
+
+/// The representative of `position`'s component, halving the path on the way.
+const fn find(parent: &mut [usize], mut position: usize) -> usize {
+    while parent[position] != position {
+        let grandparent = parent[parent[position]];
+        parent[position] = grandparent;
+        position = grandparent;
+    }
+    position
+}
+
+/// Put both components under one representative.
+const fn union(parent: &mut [usize], left: usize, right: usize) {
+    let left = find(parent, left);
+    let right = find(parent, right);
+    if left != right {
+        parent[right] = left;
+    }
+}
+
+/// Index one producer by the table whose changes move it, naming it uncovered
 /// when nothing here can keep its records current.
 fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
     db: &DB,
-    entry: &RelationShapes,
-    shape: &RecordDescription,
-    contested: &HashSet<(String, RelationName)>,
+    producer: &Producer<'_>,
+    placement: Placement,
     by_table: &mut HashMap<TableId, TableShapes>,
     uncovered: &mut Vec<Uncovered>,
 ) {
+    let Producer { entry, shape, .. } = producer;
+    match placement {
+        Placement::Refused => {
+            uncovered.extend(
+                shape.tables.iter().map(|table| {
+                    name_gap(entry, shape, table, UncoveredReason::MissingEnumeration)
+                }),
+            );
+            return;
+        }
+        Placement::Grouped(group) => {
+            index_grouped(db, shape, group, by_table);
+            return;
+        }
+        Placement::Alone => {}
+    }
+
     match &shape.derivation {
         RecordDerivation::FromRow { table, .. } => {
             if !is_evaluable::<B, DB>(shape, db) {
@@ -444,25 +820,10 @@ fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
                 return;
             }
             if let Some(id) = catalog_helpers::contract_table_id(db, table) {
-                by_table.entry(id).or_default().settled.push(shape.clone());
+                let held = by_table.entry(id).or_default();
+                held.differenced.push(held.settled.len());
+                held.settled.push((*shape).clone());
             }
-        }
-        RecordDerivation::Joined { .. }
-            if stated_pairs(shape)
-                .iter()
-                .any(|pair| contested.contains(pair)) =>
-        {
-            // A slice another shape also states is not this one's to
-            // reconcile: what the replay stopped returning may be the other
-            // shape's living fact. The whole shape is named rather than
-            // partially maintained, since a difference right about some
-            // relations and silently wrong about others is worse than none.
-            uncovered.extend(
-                shape
-                    .tables
-                    .iter()
-                    .map(|table| name_gap(entry, shape, table, UncoveredReason::SharedSlice)),
-            );
         }
         RecordDerivation::Joined { queries, .. } => {
             let mut bound: Vec<&ContractTableId> = Vec::with_capacity(queries.len());
@@ -491,72 +852,56 @@ fn index_shape<B: crate::backend::Backend, DB: DatabaseLike>(
                 }
             }
         }
+        // A constant needs no table and no query: the load writes it and no
+        // event moves it.
+        RecordDerivation::Constant { .. } => {}
+        // A whole shape only ever reaches here when its region was refused a
+        // group, since nothing narrower can maintain one. Naming it as a
+        // derivation this does not understand would be the same false report
+        // this arm exists to stop making.
+        RecordDerivation::WholeShape { .. } => uncovered.extend(
+            shape
+                .tables
+                .iter()
+                .map(|table| name_gap(entry, shape, table, UncoveredReason::MissingEnumeration)),
+        ),
         // `RecordDerivation` is `#[non_exhaustive]`: a shape this does not
         // understand is named rather than assumed covered.
         _ => uncovered.extend(
             shape
                 .tables
                 .iter()
-                .map(|table| name_gap(entry, shape, table, UncoveredReason::UnreadableColumn)),
+                .map(|table| name_gap(entry, shape, table, UncoveredReason::UnknownDerivation)),
         ),
     }
 }
 
-/// The (type, relation) pairs stated by more than one distinct description.
+/// Index a producer whose region a group maintains.
 ///
-/// A replay's slice inside such a pair belongs to nobody alone, and two
-/// entries carrying the same description state each pair once: the same
-/// source feeding two relations is deduplicated by value, not by entry.
-fn contested_pairs(relations: &[RelationShapes]) -> HashSet<(String, RelationName)> {
-    let mut stated: HashMap<(String, RelationName), Vec<&RecordDescription>> = HashMap::new();
-    for entry in relations {
-        for shape in &entry.shapes {
-            for pair in stated_pairs(shape) {
-                let bucket = stated.entry(pair).or_default();
-                if !bucket.contains(&shape) {
-                    bucket.push(shape);
-                }
-            }
+/// The group covers every table the shape reads, so no gap is named, and
+/// neither differencing nor a keyed replay is indexed beside it: the group's
+/// reconcile is the one authoritative operation over that region.
+fn index_grouped<DB: DatabaseLike>(
+    db: &DB,
+    shape: &RecordDescription,
+    group: usize,
+    by_table: &mut HashMap<TableId, TableShapes>,
+) {
+    for table in &shape.tables {
+        let Some(id) = catalog_helpers::contract_table_id(db, table) else {
+            continue;
+        };
+        let held = by_table.entry(id).or_default();
+        if !held.groups.contains(&group) {
+            held.groups.push(group);
         }
     }
-    stated
-        .into_iter()
-        .filter(|(_, shapes)| shapes.len() > 1)
-        .map(|(pair, _)| pair)
-        .collect()
-}
-
-/// Every (type, relation) pair `shape` states records for.
-fn stated_pairs(shape: &RecordDescription) -> Vec<(String, RelationName)> {
-    match &shape.derivation {
-        RecordDerivation::FromRow { template, .. } => {
-            alloc::vec![(template.object_type.to_string(), template.relation.clone())]
+    // A row of the table still implies these records, which is a different
+    // question from who keeps the store current.
+    if let RecordDerivation::FromRow { table, .. } = &shape.derivation {
+        if let Some(id) = catalog_helpers::contract_table_id(db, table) {
+            by_table.entry(id).or_default().settled.push(shape.clone());
         }
-        RecordDerivation::Joined { queries, .. } => {
-            let mut out = Vec::new();
-            for query in queries {
-                match query.scope() {
-                    ReplayScope::Object {
-                        object_type,
-                        relations,
-                    } => {
-                        for relation in relations {
-                            out.push((object_type.clone(), relation.clone()));
-                        }
-                    }
-                    ReplayScope::Subject {
-                        object_type,
-                        relation,
-                        ..
-                    } => out.push((object_type.clone(), relation.clone())),
-                }
-            }
-            out
-        }
-        // `RecordDerivation` is `#[non_exhaustive]`: a shape this does not
-        // understand states nothing here, and `index_shape` already names it
-        // uncovered.
-        _ => Vec::new(),
     }
 }
 
@@ -640,7 +985,7 @@ mod tests {
     use rls2fga_types::{ActionAnswer, ActionStatement};
     use sqlparser::dialect::PostgreSqlDialect;
 
-    use super::Shapes;
+    use super::{Enumeration, Shapes};
     use crate::{catalog_helpers, ParserDB, TableId};
 
     /// Every statement a table can be asked about, so a test says "every" rather
@@ -659,19 +1004,30 @@ mod tests {
     /// Build the index the way a real caller does, from all three reports.
     fn shapes(sql: &str) -> Shapes<ParserDB> {
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
-        let translation = TranslatorBuilder::new()
+        let outputs = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .build()
             .translate(&db)
-            .unwrap();
-        let (relations, naming, answers, unrestricted) = (
-            translation.relations().to_vec(),
-            alloc::borrow::Cow::from(translation.row_naming()).into_owned(),
-            translation.action_relations().to_vec(),
-            translation.unrestricted_tables().to_vec(),
-        );
-        drop(translation);
-        Shapes::new::<Postgres>(db, &relations)
+            .unwrap()
+            .outputs_accepting_gaps();
+        let translation = outputs.translation();
+        // A skipped query carries no description, so `filter_map` drops exactly
+        // the entries that enumerate nothing.
+        let enumerations: Vec<Enumeration<'_>> = outputs
+            .tuple_queries()
+            .iter()
+            .filter_map(|query| {
+                query.description.as_ref().map(|description| Enumeration {
+                    description,
+                    sql: &query.sql,
+                    condition: query.condition.as_deref(),
+                })
+            })
+            .collect();
+        let naming = alloc::borrow::Cow::from(translation.row_naming()).into_owned();
+        let answers = translation.action_relations().to_vec();
+        let unrestricted = translation.unrestricted_tables().to_vec();
+        Shapes::new::<Postgres>(db, translation.relations(), &enumerations)
             .with_row_naming(&naming)
             .with_action_relations(&answers)
             .with_unrestricted_tables(&unrestricted)

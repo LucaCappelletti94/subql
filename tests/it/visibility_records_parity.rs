@@ -42,6 +42,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{CdcEvent, Postgres, RowKind, Value};
 use subql::visibility::records::{is_evaluable, records_from_row_view};
 use subql::visibility::shapes::Shapes;
+use subql::visibility::store::{Enumeration, Requery};
 use subql::visibility::EventRow;
 use subql::{catalog_helpers, parse_wal2json_v2, MessageV2, ParserDB};
 
@@ -473,16 +474,28 @@ fn the_difference_a_change_reports_matches_what_the_loader_would_reload() {
         .flat_map(|(sql, conditional, _)| records_from_sql(&mut pg, sql, *conditional))
         .collect();
 
-    let relations = TranslatorBuilder::new()
+    let outputs = TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
         .build()
         .translate(&catalog)
         .expect("the parity schema translates")
-        .relations()
-        .to_vec();
+        .outputs_accepting_gaps();
+    let relations = outputs.translation().relations().to_vec();
+    let enumerations: Vec<Enumeration<'_>> = outputs
+        .tuple_queries()
+        .iter()
+        .filter_map(|query| {
+            query.description.as_ref().map(|description| Enumeration {
+                description,
+                sql: &query.sql,
+                condition: query.condition.as_deref(),
+            })
+        })
+        .collect();
     let store = Shapes::new::<Postgres>(
         ParserDB::parse::<PostgreSqlDialect>(SCHEMA).unwrap(),
         &relations,
+        &enumerations,
     );
     assert!(store.uncovered().is_empty(), "{:?}", store.uncovered());
 
@@ -656,7 +669,7 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(GRANTS_SCHEMA).unwrap();
 
     let relations = compound_replay_relations(&catalog);
-    let store = Shapes::new::<Postgres>(catalog, &relations);
+    let store = Shapes::new::<Postgres>(catalog, &relations, &[]);
 
     let diff = store
         .diff(&events[0])
@@ -666,34 +679,31 @@ fn a_replayed_compound_key_query_selects_only_the_row_that_changed() {
         "the change must hand over at least one replay: {diff:?}"
     );
     for requery in &diff.requeries {
-        assert_eq!(requery.query.table().name(), "meter_members");
-        assert_eq!(requery.query.key_columns(), ["tenant_id", "meter_id"]);
+        let Requery::Keyed(keyed) = requery else {
+            panic!("expected KeyedRequery, got Whole materialisation");
+        };
+        assert_eq!(keyed.query.table().name(), "meter_members");
+        assert_eq!(keyed.query.key_columns(), ["tenant_id", "meter_id"]);
 
-        // The one statement the typed DSL cannot express, since rls2fga
-        // generates its text at run time. Bound with the same SQL type the
-        // `table!` above gives these columns, so the two cannot drift.
-        let rows = sql_query(requery.query.sql())
-            .bind::<Integer, _>(key_int(&requery.key[0]))
-            .bind::<Integer, _>(key_int(&requery.key[1]))
+        let rows = sql_query(keyed.query.sql())
+            .bind::<Integer, _>(key_int(&keyed.key[0]))
+            .bind::<Integer, _>(key_int(&keyed.key[1]))
             .load::<TupleRow>(&mut pg)
             .unwrap_or_else(|error| {
-                panic!(
-                    "the replayed query failed: {error}\n{}",
-                    requery.query.sql()
-                )
+                panic!("the replayed query failed: {error}\n{}", keyed.query.sql())
             });
 
         assert!(
             !rows.is_empty(),
             "the replay returns the changed row's facts:\n{}",
-            requery.query.sql()
+            keyed.query.sql()
         );
         for row in &rows {
             assert_eq!(
                 row.object,
                 "meters:1|20",
                 "the whole key names the changed row and no other:\n{}",
-                requery.query.sql()
+                keyed.query.sql()
             );
         }
     }

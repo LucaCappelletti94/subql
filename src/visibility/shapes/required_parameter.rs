@@ -40,8 +40,23 @@ impl RequiredParameter {
 #[derive(Debug, Default)]
 pub struct TableShapes {
     /// Shapes whose records a row of this table settles on its own.
+    ///
+    /// Answers "what does this row imply", which is independent of who keeps
+    /// the store current, so a shape a group maintains is still here.
     pub settled: Vec<RecordDescription>,
+    /// Positions in [`settled`](Self::settled) the difference reads.
+    ///
+    /// Excludes every shape a group maintains. A group's reconcile is the one
+    /// authoritative operation over its region, and differencing beside it
+    /// would be a second one: the difference reports what *this* producer
+    /// stopped stating, which deletes a fact a sibling producer still states.
+    pub differenced: Vec<usize>,
     /// Queries to replay when a row of this table changes, with the columns
     /// each one binds, in the order its placeholders take them.
+    ///
+    /// Empty for a shape under a group's authority, for the same reason.
     pub requeries: Vec<(Vec<ColumnId>, BoundQuery)>,
+    /// Groups a change to this table obliges, as positions in
+    /// [`Shapes::materialisations`](crate::visibility::shapes::Shapes::materialisations).
+    pub groups: Vec<usize>,
 }
