@@ -16,20 +16,37 @@
 //! scope, across every relation and every type, and whether one row decides
 //! the relation is irrelevant here.
 //!
-//! # Three kinds of shape, three outcomes
+//! # Four kinds of shape, and who maintains each
 //!
-//! A shape the row settles yields records directly, and the difference
-//! between the two images is what moved. A shape whose records span two
-//! tables cannot be differenced from one of them, so the query
-//! `rls2fga` already bound to one row is handed over with the key read
-//! off the row, and the caller runs it: the result is the whole truth for
-//! the slice the query declares, so reconciling it both writes what is new
-//! and takes out what the result stopped returning. A shape that can be
-//! neither differenced nor replayed is named in
-//! [`Shapes::uncovered`](crate::visibility::shapes::Shapes::uncovered) and nothing else, because a caller that
-//! believes its store is complete when it is not is the failure this whole
-//! path exists to remove. That covers a shape in a list column, and one
-//! whose slice another shape also states, which reconciling would clobber.
+//! A shape a row settles, alone in the region it states facts in, yields
+//! records directly and the difference between the two images is what moved. A
+//! shape whose records span two tables, alone in its region, hands over the
+//! query `rls2fga` bound to one row with the key read off the row, and the
+//! caller runs it: the result is the whole truth for the slice that key names.
+//!
+//! A shape whose records depend on rows the changed row does not name carries
+//! no key at all, because a whole-table aggregate moves records keyed on rows
+//! that never changed. And a region more than one shape states facts in cannot
+//! be reconciled by any one of them, since deleting what one replay stopped
+//! returning would delete what its siblings still state. Both are answered the
+//! same way: the region becomes a [`Materialisation`], every member's
+//! unnarrowed query runs, the rows are unioned, and the region is reconciled
+//! once. That is one authoritative operation per region, so a shape under a
+//! group's authority is neither differenced nor keyed-replayed beside it.
+//!
+//! A shape none of that reaches is named in
+//! [`Shapes::uncovered`](crate::visibility::shapes::Shapes::uncovered) and
+//! nothing else, because a caller that believes its store is complete when it
+//! is not is the failure this whole path exists to remove. That covers a shape
+//! in a list column, and a region holding a shape nothing enumerates.
+//!
+//! # The load runs the same operation
+//!
+//! [`Shapes::materialisations`](crate::visibility::shapes::Shapes::materialisations)
+//! is every group. The load runs all of them and an event runs the ones it
+//! obliged, which is the same call, so the load heals whatever drifted and the
+//! replay path is exercised at startup rather than only by a change that
+//! happens to arrive.
 //!
 //! # When a replayed query has to have finished
 //!
@@ -75,9 +92,11 @@
 //! absent on both sides, yields no record on either, and so moves nothing.
 
 pub(crate) mod diff;
+pub(crate) mod group;
 pub(crate) mod store_diff;
 pub(crate) mod uncovered;
 
 pub(crate) use diff::name_gap;
+pub use group::{Enumeration, Materialisation, Region, RegionPart, Replay, Replayer};
 pub use store_diff::{StoreDiff, StoreDiffError};
-pub use uncovered::{Requery, Uncovered, UncoveredReason};
+pub use uncovered::{KeyedRequery, Requery, Uncovered, UncoveredReason};

@@ -69,4 +69,4 @@ pub(crate) mod errors;
 pub(crate) mod open_fga_policy;
 
 pub use errors::OpenFgaError;
-pub use open_fga_policy::{OpenFgaPolicy, Reconciled, WithdrawnFact};
+pub use open_fga_policy::{MaterialiseError, OpenFgaPolicy, Reconciled, WithdrawnFact};

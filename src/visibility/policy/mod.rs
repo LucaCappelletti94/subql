@@ -391,8 +391,11 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
                 translation.notes().to_vec(),
             )
         };
+        // No enumerations: every fixture here passes its own relations, so a
+        // translation's queries would not describe them. Each producer is then
+        // alone in its region, which needs none.
         Arc::new(
-            Shapes::new::<Postgres>(db, relations)
+            Shapes::new::<Postgres>(db, relations, &[])
                 .with_row_naming(&naming)
                 .with_action_relations(&answers)
                 .with_required_parameters(&notes),

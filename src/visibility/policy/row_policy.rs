@@ -23,6 +23,7 @@ use crate::TableId;
 /// use rls2fga_types::ActionStatement;
 /// use subql::visibility::policy::RowPolicy;
 /// use subql::visibility::shapes::Shapes;
+/// use subql::visibility::store::Enumeration;
 /// use subql::visibility::{EventRow, RowView, RowWrite, Verdict, VisibilityPolicy};
 /// use subql::{catalog_helpers, ParserDB};
 ///
@@ -66,15 +67,23 @@ use crate::TableId;
 /// let translator = TranslatorBuilder::new()
 ///     .with_min_confidence(ConfidenceLevel::B)
 ///     .build();
-/// let translation = translator.translate(&db)?;
-/// // `relations` borrows the translation, which borrows `db`, so take an owned
-/// // copy and end the borrow before `Shapes::new` takes the catalog.
-/// let relations = translation.relations().to_vec();
+/// let outputs = translator.translate(&db)?.outputs_accepting_gaps();
+/// let translation = outputs.translation();
+/// let enumerations: Vec<Enumeration<'_>> = outputs
+///     .tuple_queries()
+///     .iter()
+///     .filter_map(|query| {
+///         query.description.as_ref().map(|description| Enumeration {
+///             description,
+///             sql: &query.sql,
+///             condition: query.condition.as_deref(),
+///         })
+///     })
+///     .collect();
 /// let naming = std::borrow::Cow::from(translation.row_naming()).into_owned();
 /// let answers = translation.action_relations().to_vec();
-/// drop(translation);
 /// let shapes = Arc::new(
-///     Shapes::new::<Postgres>(db, &relations)
+///     Shapes::new::<Postgres>(db, translation.relations(), &enumerations)
 ///         .with_row_naming(&naming)
 ///         .with_action_relations(&answers),
 /// );

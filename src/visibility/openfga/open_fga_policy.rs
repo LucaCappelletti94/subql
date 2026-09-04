@@ -28,7 +28,7 @@ use rls2fga_types::{ActionAnswer, ActionStatement, RowVersion};
 
 use crate::visibility::records::render_text;
 use crate::visibility::shapes::{RequiredParameter, Shapes, SharedShapes};
-use crate::visibility::store::{Requery, StoreDiff};
+use crate::visibility::store::{KeyedRequery, Materialisation, Replayer, StoreDiff};
 use crate::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
 use super::errors::OpenFgaError;
@@ -633,7 +633,7 @@ where
     /// in the slice the result no longer states is stale and is deleted, which
     /// is what [`write_records`](Self::write_records) can never do. This is
     /// where a caller puts what replaying a
-    /// [`Requery`] returned, due before the
+    /// [`KeyedRequery`] returned, due before the
     /// event is delivered, exactly as the store module's contract says.
     ///
     /// The read asks authoritatively whatever the configured read preference
@@ -648,7 +648,7 @@ where
     /// declaration disagree and nothing here can say which one is right.
     pub async fn reconcile_records(
         &self,
-        requery: &Requery<'_, B>,
+        requery: &KeyedRequery<'_, B>,
         records: &[Record],
     ) -> Result<Reconciled, OpenFgaError> {
         let scope = requery.query.scope();
@@ -679,10 +679,6 @@ where
             }
         }
 
-        let desired: BTreeMap<Triple, Option<RelationshipCondition>> = records
-            .iter()
-            .map(|record| (triple_of(record), record.context.as_ref().map(condition_of)))
-            .collect();
         let mut stored: BTreeMap<Triple, Option<RelationshipCondition>> = BTreeMap::new();
         for tuple in self.read_slice(scope, &slice).await? {
             // An object slice reads every relation on the object, and the ones
@@ -701,34 +697,128 @@ where
                 tuple.condition,
             );
         }
+        let moved = difference(&stored, records);
+        self.send(&moved).await?;
+        Ok(moved)
+    }
 
-        // The report and the sent difference come from one filtering each, so
-        // the two cannot disagree about what moved.
-        let removed: Vec<WithdrawnFact> = stored
-            .iter()
-            .filter(|(key, condition)| desired.get(*key) != Some(condition))
-            .map(|((subject, relation, object), _)| WithdrawnFact {
-                subject: subject.clone(),
-                relation: relation.clone(),
-                object: object.clone(),
-            })
-            .collect();
-        let mut added = Vec::new();
-        let mut taken = alloc::collections::BTreeSet::new();
-        for record in records {
-            let key = triple_of(record);
-            if !taken.insert(key.clone()) {
-                continue;
-            }
-            if stored.get(&key) != Some(&record.context.as_ref().map(condition_of)) {
-                added.push(record.clone());
+    /// Replace what the store holds in one group's region with the union of
+    /// every member's replay, and report what moved.
+    ///
+    /// One authoritative operation per region, add and remove. Every member is
+    /// run before anything is deleted, because a fact one member stopped
+    /// returning may be a fact another still states, and the union is the only
+    /// thing that is the whole truth for the region.
+    ///
+    /// The store is read once for the whole pass and filtered in memory.
+    /// `Read` takes a user or an object id and nothing else, so a region is
+    /// not a filter the server accepts, and one unfiltered pass shared by
+    /// every group beats one per group. Sharing it is sound because groups are
+    /// closed over region overlap, so no group's writes fall in another's
+    /// region.
+    ///
+    /// The load runs every group of
+    /// [`Shapes::materialisations`](crate::visibility::shapes::Shapes::materialisations)
+    /// and an event runs the ones it obliged, which is the same call, so the
+    /// load heals whatever drifted.
+    ///
+    /// # A failure part way through a pass keeps what it already wrote
+    ///
+    /// Groups are reconciled one after another, and each one's difference is
+    /// sent before the next is read. An error therefore leaves the groups
+    /// before it applied and the rest untouched, which is worth stating rather
+    /// than leaving a caller to assume either all or nothing. Retrying the
+    /// whole pass is safe: every group's reconcile is authoritative over its
+    /// own region, so re-running one that already succeeded sends no writes.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterialiseError::Replay`] carrying the caller's own error when a
+    /// member's query could not be run, [`MaterialiseError::OutOfRegion`] when
+    /// a replay returned a fact outside the region its group declared,
+    /// [`MaterialiseError::Contradiction`] when two members state one fact
+    /// under different conditions, and [`MaterialiseError::Store`] as
+    /// [`apply`](Self::apply). Only the last of the four is worth retrying
+    /// unchanged, and the first three are raised before anything is written
+    /// for the group that caused them.
+    pub async fn materialise<'a, R>(
+        &self,
+        groups: impl IntoIterator<Item = &'a Materialisation> + Send,
+        replayer: &R,
+    ) -> Result<Vec<Reconciled>, MaterialiseError<R::Error>>
+    where
+        R: Replayer + Sync,
+    {
+        // One pass may name a group once per table of it the event touched.
+        let mut pass: Vec<&Materialisation> = Vec::new();
+        for group in groups {
+            if !pass.iter().any(|seen| seen.region() == group.region()) {
+                pass.push(group);
             }
         }
+        if pass.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // A context that moved is a delete and a write of the same key, which
-        // `write_difference` already refuses to send as one call and orders
-        // removals first.
-        let deletes: Vec<TupleKeyWithoutCondition> = removed
+        let held = self.read_every_tuple().await?;
+        let mut reports = Vec::with_capacity(pass.len());
+        for group in pass {
+            let mut records = Vec::new();
+            for member in group.members() {
+                records.extend(
+                    replayer
+                        .replay(member)
+                        .await
+                        .map_err(MaterialiseError::Replay)?,
+                );
+            }
+            records.extend_from_slice(group.constants());
+            for record in &records {
+                if !group.region().holds_record(record) {
+                    return Err(MaterialiseError::OutOfRegion(alloc::format!(
+                        "({}, {}, {})",
+                        record.subject,
+                        record.relation,
+                        record.object
+                    )));
+                }
+            }
+            if let Some(fact) = contradiction(&records) {
+                return Err(MaterialiseError::Contradiction(fact));
+            }
+
+            let mut stored: BTreeMap<Triple, Option<RelationshipCondition>> = BTreeMap::new();
+            for tuple in &held {
+                if !group
+                    .region()
+                    .holds(&tuple.object, &tuple.relation, &tuple.user)
+                {
+                    continue;
+                }
+                stored.insert(
+                    (
+                        tuple.user.clone(),
+                        tuple.relation.clone(),
+                        tuple.object.clone(),
+                    ),
+                    tuple.condition.clone(),
+                );
+            }
+            let moved = difference(&stored, &records);
+            self.send(&moved).await?;
+            reports.push(moved);
+        }
+        Ok(reports)
+    }
+
+    /// Send one reconciliation's difference.
+    ///
+    /// A context that moved is a delete and a write of the same key, which
+    /// `write_difference` already refuses to send as one call and orders
+    /// removals first.
+    async fn send(&self, moved: &Reconciled) -> Result<(), OpenFgaError> {
+        let deletes: Vec<TupleKeyWithoutCondition> = moved
+            .removed
             .iter()
             .map(|fact| TupleKeyWithoutCondition {
                 user: fact.subject.clone(),
@@ -736,9 +826,36 @@ where
                 object: fact.object.clone(),
             })
             .collect();
-        let writes: Vec<TupleKey> = added.iter().map(tuple_of).collect();
-        self.write_difference(writes, deletes).await?;
-        Ok(Reconciled { added, removed })
+        let writes: Vec<TupleKey> = moved.added.iter().map(tuple_of).collect();
+        self.write_difference(writes, deletes).await
+    }
+
+    /// Every tuple the store holds, read page by page.
+    ///
+    /// Unfiltered because `Read` accepts a non-empty user or a non-empty
+    /// object id and nothing else, so a `(type, relation)` region cannot be
+    /// asked for. Authoritative for the same reason
+    /// [`read_slice`](Self::read_slice) is: this read precedes a write built
+    /// from it.
+    async fn read_every_tuple(&self) -> Result<Vec<TupleKey>, OpenFgaError> {
+        let mut out = Vec::new();
+        let mut continuation_token = String::new();
+        loop {
+            let request = ReadRequest {
+                store_id: self.store_id.clone(),
+                tuple_key: None,
+                page_size: None,
+                continuation_token: continuation_token.clone(),
+                // Discriminant extraction: the generated field is a bare `i32`.
+                consistency: ConsistencyPreference::HigherConsistency as i32,
+            };
+            let response = self.read_page(&request).await?;
+            out.extend(response.tuples.into_iter().filter_map(|tuple| tuple.key));
+            if response.continuation_token.is_empty() {
+                return Ok(out);
+            }
+            continuation_token = response.continuation_token;
+        }
     }
 
     /// Every tuple the store holds in `slice`, read page by page.
@@ -776,32 +893,40 @@ where
                 // since this read precedes a write built from it.
                 consistency: ConsistencyPreference::HigherConsistency as i32,
             };
-            let mut attempts = 0;
-            let response = loop {
-                attempts += 1;
-                let mut client = self.client.clone();
-                match client.read(request.clone()).await {
-                    Ok(response) => break response.into_inner(),
-                    Err(status) if OpenFgaError::is_transport(status.code()) => {
-                        if attempts > self.connect_retries {
-                            return Err(OpenFgaError::Transport {
-                                attempts,
-                                message: status.message().to_string(),
-                            });
-                        }
-                    }
-                    Err(status) => {
-                        return Err(OpenFgaError::Rejected {
-                            message: status.message().to_string(),
-                        })
-                    }
-                }
-            };
+            let response = self.read_page(&request).await?;
             out.extend(response.tuples.into_iter().filter_map(|tuple| tuple.key));
             if response.continuation_token.is_empty() {
                 return Ok(out);
             }
             continuation_token = response.continuation_token;
+        }
+    }
+
+    /// One page of a read, retrying a transport failure as far as configured.
+    async fn read_page(
+        &self,
+        request: &ReadRequest,
+    ) -> Result<openfga_client::client::ReadResponse, OpenFgaError> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut client = self.client.clone();
+            match client.read(request.clone()).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if OpenFgaError::is_transport(status.code()) => {
+                    if attempts > self.connect_retries {
+                        return Err(OpenFgaError::Transport {
+                            attempts,
+                            message: status.message().to_string(),
+                        });
+                    }
+                }
+                Err(status) => {
+                    return Err(OpenFgaError::Rejected {
+                        message: status.message().to_string(),
+                    })
+                }
+            }
         }
     }
 
@@ -864,7 +989,7 @@ where
     /// Write `records` as tuples, splitting them across calls the server accepts.
     ///
     /// This is where the initial load's rows go: it only ever writes, so what a
-    /// replayed [`Requery`] returned goes
+    /// replayed [`KeyedRequery`] returned goes
     /// through [`reconcile_records`](Self::reconcile_records) instead, which
     /// also takes out what the replay stopped returning.
     ///
@@ -927,6 +1052,104 @@ where
             }
         }
     }
+}
+
+/// Why a group could not be reconciled.
+///
+/// Three causes, kept apart because only one of them is worth retrying: a
+/// store that could not be reached may work on the next attempt, while a
+/// replay that returned the wrong facts returns them again for ever.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MaterialiseError<E> {
+    /// A member's query could not be run.
+    #[error("replaying a group member failed: {0}")]
+    Replay(E),
+    /// A replay returned a fact outside the region its group declared, so the
+    /// query and the declaration disagree and nothing here can say which is
+    /// right.
+    #[error("a replayed fact lies outside its group's region: {0}")]
+    OutOfRegion(String),
+    /// Two members state the same fact under different conditions, so nothing
+    /// here can say which of them is the grant. A tuple carries one condition,
+    /// and collapsing to either would hand somebody access on terms a producer
+    /// did not state.
+    #[error("two members state {0} under different conditions")]
+    Contradiction(String),
+    /// The store could not be read or written, which is the retryable one.
+    #[error(transparent)]
+    Store(#[from] OpenFgaError),
+}
+
+/// What one region's stored facts have to become for `records` to be its whole
+/// truth.
+///
+/// The report and the sent difference come from one filtering each, so the two
+/// cannot disagree about what moved. Both take the first record naming a
+/// triple: one fact stated by two members collapses, and the two filters agree
+/// about which of them they collapsed to. Reading the last here and the first
+/// below would delete a tuple and write nothing in its place.
+fn difference(
+    stored: &BTreeMap<Triple, Option<RelationshipCondition>>,
+    records: &[Record],
+) -> Reconciled {
+    let mut desired: BTreeMap<Triple, Option<RelationshipCondition>> = BTreeMap::new();
+    for record in records {
+        desired
+            .entry(triple_of(record))
+            .or_insert_with(|| record.context.as_ref().map(condition_of));
+    }
+    let removed: Vec<WithdrawnFact> = stored
+        .iter()
+        .filter(|(key, condition)| desired.get(*key) != Some(condition))
+        .map(|((subject, relation, object), _)| WithdrawnFact {
+            subject: subject.clone(),
+            relation: relation.clone(),
+            object: object.clone(),
+        })
+        .collect();
+    let mut added = Vec::new();
+    let mut taken = alloc::collections::BTreeSet::new();
+    for record in records {
+        let key = triple_of(record);
+        if !taken.insert(key.clone()) {
+            continue;
+        }
+        if stored.get(&key) != Some(&record.context.as_ref().map(condition_of)) {
+            added.push(record.clone());
+        }
+    }
+    Reconciled { added, removed }
+}
+
+/// The first fact two records state under different conditions, spelled for a
+/// report.
+///
+/// One fact stated twice identically is a duplicate and collapses. One stated
+/// twice with different conditions is a contradiction between its producers:
+/// the tuple can carry one condition, and nothing here can say which of them
+/// is the grant. Collapsing to either would hand somebody access on terms a
+/// producer did not state.
+fn contradiction(records: &[Record]) -> Option<String> {
+    let mut seen: BTreeMap<Triple, Option<RelationshipCondition>> = BTreeMap::new();
+    for record in records {
+        let condition = record.context.as_ref().map(condition_of);
+        let key = triple_of(record);
+        match seen.get(&key) {
+            Some(held) if *held != condition => {
+                return Some(alloc::format!(
+                    "({}, {}, {})",
+                    record.subject,
+                    record.relation,
+                    record.object
+                ))
+            }
+            Some(_) => {}
+            None => {
+                seen.insert(key, condition);
+            }
+        }
+    }
+    None
 }
 
 /// What [`OpenFgaPolicy::reconcile_records`] moved.
@@ -1108,15 +1331,16 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
 
     use super::{
-        batch_request, consistency_for, context_for, fits_one_call, tuple_of, usable_index,
-        ActionStatement, Asked, BatchCheckItem, CheckRequestTupleKey, ConsistencyPreference, Kind,
-        OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, Question, Record, RecordContextValue,
-        RequestValues, RequiredParameter, RowWrite, Subject, TupleKeyWithoutCondition,
-        MAX_TUPLES_PER_WRITE,
+        batch_request, condition_of, consistency_for, context_for, difference, fits_one_call,
+        triple_of, tuple_of, usable_index, ActionStatement, Asked, BatchCheckItem,
+        CheckRequestTupleKey, ConsistencyPreference, Kind, OpenFgaError, OpenFgaPolicy,
+        OpenFgaServiceClient, Question, Record, RecordContextValue, RequestValues,
+        RequiredParameter, RowWrite, Subject, TupleKeyWithoutCondition, MAX_TUPLES_PER_WRITE,
     };
     use crate::backend::{Postgres, Value};
     use crate::testing::TestEvent;
     use crate::visibility::shapes::Shapes;
+    use crate::visibility::store::Enumeration;
     use crate::visibility::{test_names, EventRow, Verdict, VisibilityPolicy};
     use crate::{catalog_helpers, ParserDB};
     use alloc::string::String;
@@ -1475,7 +1699,7 @@ CREATE POLICY notes_p ON notes USING (
   owner = ANY(string_to_array(current_setting('app.subjects', true), ',')));
 ";
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
-        let translation = TranslatorBuilder::new()
+        let outputs = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .with_session_attributes([SessionAttribute::setting(
                 "app.subjects",
@@ -1483,12 +1707,14 @@ CREATE POLICY notes_p ON notes USING (
             )])
             .build()
             .translate(&db)
-            .unwrap();
-        let relations = translation.relations().to_vec();
+            .unwrap()
+            .outputs_accepting_gaps();
+        let translation = outputs.translation();
         let notes = translation.notes().to_vec();
-        drop(translation);
+        let enumerations = enumerations_of(&outputs);
 
-        let bare = Shapes::new::<crate::backend::Postgres>(db, &relations);
+        let bare =
+            Shapes::new::<crate::backend::Postgres>(db, translation.relations(), &enumerations);
         assert!(
             bare.has_request_gated_recipe(),
             "the recipe grants through the caller's own values"
@@ -1506,7 +1732,8 @@ CREATE POLICY notes_p ON notes USING (
 
         let told = Shapes::new::<crate::backend::Postgres>(
             ParserDB::parse::<PostgreSqlDialect>(sql).unwrap(),
-            &relations,
+            translation.relations(),
+            &enumerations,
         )
         .with_required_parameters(&notes);
         assert_eq!(told.required_parameters().len(), 1);
@@ -1515,6 +1742,24 @@ CREATE POLICY notes_p ON notes USING (
             Ok(()),
             "and one told which parameters carry it builds"
         );
+    }
+
+    /// The enumeration inputs one translation reports.
+    ///
+    /// A skipped query carries no description, so `filter_map` drops exactly
+    /// the entries that enumerate nothing.
+    fn enumerations_of(outputs: &rls2fga::translator::Outputs) -> Vec<Enumeration<'_>> {
+        outputs
+            .tuple_queries()
+            .iter()
+            .filter_map(|query| {
+                query.description.as_ref().map(|description| Enumeration {
+                    description,
+                    sql: &query.sql,
+                    condition: query.condition.as_deref(),
+                })
+            })
+            .collect()
     }
 
     /// A transport that panics if anything is asked of it.
@@ -1541,19 +1786,18 @@ CREATE POLICY notes_p ON notes USING (
 
     fn policy_over(sql: &str) -> OpenFgaPolicy<ParserDB, NeverAsked, String, Postgres> {
         let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
-        let translation = TranslatorBuilder::new()
+        let outputs = TranslatorBuilder::new()
             .with_min_confidence(ConfidenceLevel::B)
             .build()
             .translate(&db)
-            .unwrap();
-        let (relations, naming, answers) = (
-            translation.relations().to_vec(),
-            Cow::from(translation.row_naming()).into_owned(),
-            translation.action_relations().to_vec(),
-        );
-        drop(translation);
+            .unwrap()
+            .outputs_accepting_gaps();
+        let translation = outputs.translation();
+        let naming = Cow::from(translation.row_naming()).into_owned();
+        let answers = translation.action_relations().to_vec();
+        let enumerations = enumerations_of(&outputs);
         let shapes = Arc::new(
-            Shapes::new::<crate::backend::Postgres>(db, &relations)
+            Shapes::new::<crate::backend::Postgres>(db, translation.relations(), &enumerations)
                 .with_row_naming(&naming)
                 .with_action_relations(&answers),
         );
@@ -1635,5 +1879,43 @@ ALTER TABLE ledger ENABLE ROW LEVEL SECURITY;
             panic!("a granted read names the relation that answers it");
         };
         assert_eq!(relation.as_str(), "can_select");
+    }
+
+    /// One fact stated twice with different conditions must not be deleted
+    /// with nothing written back.
+    ///
+    /// The removal reads a map of what is wanted and the write walks the
+    /// records, so the two have to collapse a duplicate the same way. Reading
+    /// the last for one and the first for the other takes the tuple out and
+    /// puts nothing in its place, which is a grant silently lost. The group
+    /// path refuses such a union outright; this is the keyed path, which has
+    /// one query and no group to refuse it.
+    #[test]
+    fn a_duplicate_fact_under_two_conditions_is_never_deleted_outright() {
+        let held = membership_record(Some("when_one"));
+        let stored = BTreeMap::from([(triple_of(&held), held.context.as_ref().map(condition_of))]);
+
+        let moved = difference(&stored, &[held, membership_record(Some("when_two"))]);
+
+        assert!(
+            moved.removed.is_empty(),
+            "the fact is still stated, so nothing may be withdrawn: {moved:?}"
+        );
+        assert!(
+            moved.added.is_empty(),
+            "and it is already stored as the record the write would send: {moved:?}"
+        );
+    }
+
+    fn membership_record(condition: Option<&str>) -> Record {
+        Record {
+            object: "teams:3".to_string(),
+            relation: test_names::relation("owner"),
+            subject: "user:alice".to_string(),
+            context: condition.map(|condition| RecordContextValue {
+                condition: condition.to_string(),
+                values: BTreeMap::new(),
+            }),
+        }
     }
 }

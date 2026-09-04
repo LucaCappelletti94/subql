@@ -17,6 +17,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,16 +28,17 @@ use openfga_client::client::{
 use openfga_client::tonic::transport::Channel;
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::generator::well_known::member_relation;
-use rls2fga::translator::TranslatorBuilder;
+use rls2fga::translator::{Outputs, TranslatorBuilder};
 use rls2fga::types::ActionStatement;
 use rls2fga::types::ConfidenceLevel;
 use rls2fga::types::{Record, RecordContextValue};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::{Postgres, Value};
 use subql::testing::TestEvent;
-use subql::visibility::openfga::OpenFgaPolicy;
+use subql::visibility::openfga::{MaterialiseError, OpenFgaPolicy};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
+use subql::visibility::store::{Enumeration, Replay, Replayer, Requery};
 use subql::visibility::{EventRow, Verdict, VisibilityPolicy};
 use subql::{catalog_helpers, ParserDB};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -50,10 +52,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 /// the recipes, the naming, the answers and the model cannot disagree.
 struct Wiring {
     db: ParserDB,
-    relations: Vec<rls2fga::types::RelationShapes>,
-    naming: Vec<rls2fga::types::RowNaming>,
-    notes: Vec<rls2fga::types::TranslationNote>,
-    answers: Vec<rls2fga::types::ActionRelations>,
+    outputs: Outputs,
     model: rls2fga::generator::json_model::AuthorizationModel,
 }
 
@@ -62,47 +61,43 @@ struct Wiring {
 /// schema that has no such arm is unaffected by the declaration.
 fn wiring(sql: &str) -> Wiring {
     let db = ParserDB::parse::<PostgreSqlDialect>(sql).unwrap();
-    let translator = TranslatorBuilder::new()
+    let outputs = TranslatorBuilder::new()
         .with_min_confidence(ConfidenceLevel::B)
         .with_session_attributes([
             SessionAttribute::setting("app.user_id", SessionAttributeKind::CallerId),
             SessionAttribute::setting("app.subjects", SessionAttributeKind::SetAttribute),
         ])
-        .build();
-    let (relations, naming, notes, answers) = {
-        let translation = translator
-            .translate(&db)
-            .expect("the visibility schema translates");
-        (
-            translation.relations().to_vec(),
-            Cow::from(translation.row_naming()).into_owned(),
-            translation.notes().to_vec(),
-            translation.action_relations().to_vec(),
-        )
-    };
-    let model = translator
+        .build()
         .translate(&db)
         .expect("the visibility schema translates")
-        .outputs_accepting_gaps()
-        .json_model();
-    Wiring {
-        db,
-        relations,
-        naming,
-        notes,
-        answers,
-        model,
-    }
+        .outputs_accepting_gaps();
+    let model = outputs.json_model();
+    Wiring { db, outputs, model }
 }
 
 impl Wiring {
     /// The index every reader shares.
     fn shapes(self) -> Arc<Shapes<ParserDB>> {
+        let Self { db, outputs, .. } = self;
+        let translation = outputs.translation();
+        // A skipped query carries no description, so `filter_map` drops exactly
+        // the entries that enumerate nothing.
+        let enumerations: Vec<Enumeration<'_>> = outputs
+            .tuple_queries()
+            .iter()
+            .filter_map(|query| {
+                query.description.as_ref().map(|description| Enumeration {
+                    description,
+                    sql: &query.sql,
+                    condition: query.condition.as_deref(),
+                })
+            })
+            .collect();
         Arc::new(
-            Shapes::new::<Postgres>(self.db, &self.relations)
-                .with_row_naming(&self.naming)
-                .with_action_relations(&self.answers)
-                .with_required_parameters(&self.notes),
+            Shapes::new::<Postgres>(db, translation.relations(), &enumerations)
+                .with_row_naming(translation.row_naming())
+                .with_action_relations(translation.action_relations())
+                .with_required_parameters(translation.notes()),
         )
     }
 }
@@ -527,8 +522,8 @@ CREATE POLICY p ON docs FOR SELECT USING (
     let diff = shapes
         .diff(&withdrawn)
         .expect("the previous image is whole");
-    let [requery] = diff.requeries.as_slice() else {
-        panic!("one replay, one table the change arrived on: {diff:?}");
+    let [Requery::Keyed(requery)] = diff.requeries.as_slice() else {
+        panic!("one keyed replay, one table the change arrived on: {diff:?}");
     };
     let condition = requery
         .query
@@ -600,6 +595,360 @@ CREATE POLICY p ON docs FOR SELECT USING (
     );
 }
 
+/// Two membership sources feeding one relation, one settled by the row and one
+/// only a replay reaches. Their regions overlap, so they form one group.
+const SHARED_REGION: &str = "
+CREATE TABLE public.teams(id INTEGER PRIMARY KEY);
+CREATE TABLE public.team_members(team_id INTEGER REFERENCES teams(id), user_id TEXT);
+CREATE TABLE public.team_guests(team_id INTEGER REFERENCES teams(id), user_id TEXT,
+    expires_at TIMESTAMPTZ);
+CREATE TABLE public.docs(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id));
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = docs.team_id AND team_members.user_id = current_user)
+  OR EXISTS (SELECT 1 FROM team_guests
+          WHERE team_guests.team_id = docs.team_id AND team_guests.user_id = current_user
+            AND team_guests.expires_at > now()));
+";
+
+/// A membership whose residual compares one row against an aggregate over the
+/// whole table. No key narrows it, so the shape carries the unnarrowed query
+/// and one changed share can move a grant on any paper at all.
+const WHOLE_SHAPE: &str = "
+CREATE TABLE public.papers(id INTEGER PRIMARY KEY, owner TEXT);
+CREATE TABLE public.paper_shares(paper_id INTEGER REFERENCES papers(id), viewer TEXT,
+    weight NUMERIC, PRIMARY KEY(paper_id, viewer));
+ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON papers FOR SELECT USING (
+  EXISTS (SELECT 1 FROM paper_shares s
+          WHERE s.paper_id = papers.id AND s.viewer = current_user
+            AND s.weight > (SELECT avg(weight) FROM paper_shares)));
+";
+
+/// The caller's half of a group reconcile: run one member's query and hand
+/// back its rows.
+///
+/// Canned rather than run against a database, because what is under test is
+/// the reconciliation of the union, not the SQL. Each member is recognised by
+/// the table its query reads, which is what distinguishes the two producers.
+struct CannedReplay {
+    rows: Vec<(&'static str, Vec<Record>)>,
+}
+
+impl Replayer for CannedReplay {
+    type Error = core::convert::Infallible;
+
+    fn replay(
+        &self,
+        member: &Replay,
+    ) -> impl Future<Output = Result<Vec<Record>, Self::Error>> + Send {
+        let matched = self
+            .rows
+            .iter()
+            .find(|(table, _)| member.sql().contains(table))
+            .unwrap_or_else(|| panic!("no canned rows for {}", member.sql()));
+        core::future::ready(Ok(matched.1.clone()))
+    }
+}
+
+fn plain_membership(object: &str, subject: &str) -> Record {
+    Record {
+        object: object.to_owned(),
+        relation: member_relation(),
+        subject: subject.to_owned(),
+        context: None,
+    }
+}
+
+/// Both producers' facts survive one reconcile of the region they share, which
+/// the old code refused to attempt at all rather than delete one with the
+/// other.
+///
+/// Deliberately not a pair of already-stored facts asserted to still be there,
+/// which a materialiser that did nothing would also pass. One expected fact is
+/// seeded and one is not, and a third is stored that no member returns, so the
+/// report has to name one addition and one removal.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_group_keeps_every_members_facts_in_one_reconcile() {
+    let (_container, mut client) = openfga().await;
+
+    let wired = wiring(SHARED_REGION);
+    let model = wired.model.clone();
+    let store = client
+        .create_store(CreateStoreRequest {
+            name: "subql-group-union".to_owned(),
+        })
+        .await
+        .expect("create store")
+        .into_inner()
+        .id;
+    let model_id = write_model(&mut client, &store, &model).await;
+
+    let shapes = wired.shapes();
+    let backend = OpenFgaPolicy::<_, _, String, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model_id);
+
+    // carol is stored and still granted, dave is stored and granted by nobody,
+    // and alice is granted by the settled producer but not yet stored.
+    backend
+        .write_records(&[
+            plain_membership("teams:3", "user:carol"),
+            plain_membership("teams:3", "user:dave"),
+        ])
+        .await
+        .expect("seed the store");
+    // Outside the region entirely: another relation on another type, which no
+    // member states and this reconcile has no authority over. Written through
+    // the raw client because a `Record` carries a relation name only rls2fga
+    // can mint.
+    client
+        .write(WriteRequest {
+            store_id: store.clone(),
+            writes: Some(WriteRequestWrites {
+                tuple_keys: vec![TupleKey {
+                    user: "teams:1".to_owned(),
+                    relation: "teams".to_owned(),
+                    object: "docs:4".to_owned(),
+                    condition: None,
+                }],
+                on_duplicate: String::new(),
+            }),
+            deletes: None,
+            authorization_model_id: String::new(),
+        })
+        .await
+        .expect("seed the out-of-region tuple");
+
+    let replay = CannedReplay {
+        rows: vec![
+            (
+                "team_members",
+                vec![plain_membership("teams:3", "user:alice")],
+            ),
+            (
+                "team_guests",
+                vec![plain_membership("teams:3", "user:carol")],
+            ),
+        ],
+    };
+
+    let [group] = shapes.materialisations() else {
+        panic!(
+            "one group over the shared region: {:?}",
+            shapes.materialisations()
+        );
+    };
+    let reports = backend
+        .materialise([group], &replay)
+        .await
+        .expect("reconcile the group");
+    let [report] = reports.as_slice() else {
+        panic!("one report per group: {reports:?}");
+    };
+
+    assert_eq!(
+        report.added,
+        [plain_membership("teams:3", "user:alice")],
+        "the settled producer's fact was missing and is written"
+    );
+    let [withdrawn] = report.removed.as_slice() else {
+        panic!("one stale fact, got {:?}", report.removed);
+    };
+    assert_eq!(withdrawn.subject, "user:dave");
+
+    let mut stored = stored_members(&mut client, &store).await;
+    stored.sort();
+    assert_eq!(
+        stored,
+        ["user:alice".to_owned(), "user:carol".to_owned()],
+        "both producers' facts stand, so neither member deleted the other's"
+    );
+    assert!(
+        stored_relation(&mut client, &store, "teams", "docs:4")
+            .await
+            .contains(&"teams:1".to_owned()),
+        "a fact outside the region is not this reconcile's to delete"
+    );
+}
+
+/// Two members stating one fact under different conditions is refused, and
+/// refused before anything is written.
+///
+/// A tuple carries one condition. Collapsing to whichever member came first
+/// would hand somebody access on terms the other producer did not state, and
+/// reading the last for the removal while writing the first would delete the
+/// tuple and put nothing back.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn two_members_contradicting_one_fact_are_refused_before_any_write() {
+    let (_container, mut client) = openfga().await;
+
+    let wired = wiring(SHARED_REGION);
+    let model = wired.model.clone();
+    let store = client
+        .create_store(CreateStoreRequest {
+            name: "subql-group-contradiction".to_owned(),
+        })
+        .await
+        .expect("create store")
+        .into_inner()
+        .id;
+    let model_id = write_model(&mut client, &store, &model).await;
+
+    let shapes = wired.shapes();
+    let backend = OpenFgaPolicy::<_, _, String, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model_id);
+
+    backend
+        .write_records(&[plain_membership("teams:3", "user:carol")])
+        .await
+        .expect("seed the store");
+
+    // Both members name carol on team 3. One grants outright, the other only
+    // under a condition, and the store can hold one of the two.
+    let conditional = Record {
+        context: Some(RecordContextValue {
+            condition: "when_team_guests_expires_at".to_owned(),
+            values: BTreeMap::from([(
+                "expires_at".to_owned(),
+                "2027-01-01T00:00:00+00:00".to_owned(),
+            )]),
+        }),
+        ..plain_membership("teams:3", "user:carol")
+    };
+    let replay = CannedReplay {
+        rows: vec![
+            (
+                "team_members",
+                vec![plain_membership("teams:3", "user:carol")],
+            ),
+            ("team_guests", vec![conditional]),
+        ],
+    };
+
+    let [group] = shapes.materialisations() else {
+        panic!(
+            "one group over the shared region: {:?}",
+            shapes.materialisations()
+        );
+    };
+    let refused = backend
+        .materialise([group], &replay)
+        .await
+        .expect_err("a contradiction is refused");
+    assert!(
+        matches!(&refused, MaterialiseError::Contradiction(fact) if fact.contains("user:carol")),
+        "named as a contradiction rather than as a store failure, which a \
+         caller would retry for ever: {refused:?}"
+    );
+
+    assert_eq!(
+        stored_members(&mut client, &store).await,
+        ["user:carol".to_owned()],
+        "and the store is untouched, so nothing was written before the refusal"
+    );
+}
+
+/// The point of the whole change: a fact the replay stopped returning is
+/// removed even for an object the event never named.
+///
+/// A whole-shape grant moves with rows the changed row does not name, so the
+/// object whose grant is withdrawn need have nothing to do with the event. A
+/// keyed replay cannot reach it, which is why attaching one would have left it
+/// standing with nothing saying so.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn a_reconcile_removes_a_fact_for_an_object_the_event_never_named() {
+    let (_container, mut client) = openfga().await;
+
+    let wired = wiring(WHOLE_SHAPE);
+    let share_table =
+        catalog_helpers::table_id(&wired.db, "paper_shares").expect("shares are in the catalog");
+    let model = wired.model.clone();
+    let store = client
+        .create_store(CreateStoreRequest {
+            name: "subql-group-unnamed".to_owned(),
+        })
+        .await
+        .expect("create store")
+        .into_inner()
+        .id;
+    let model_id = write_model(&mut client, &store, &model).await;
+
+    let shapes = wired.shapes();
+    let backend = OpenFgaPolicy::<_, _, String, Postgres>::new(
+        Arc::clone(&shapes),
+        client.clone(),
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model_id);
+
+    backend
+        .write_records(&[
+            plain_membership("papers:1", "user:alice"),
+            plain_membership("papers:2", "user:bob"),
+        ])
+        .await
+        .expect("seed the store");
+
+    // The event names paper 1 only. Paper 2 is not in it anywhere.
+    let event = TestEvent::<Postgres>::delete(
+        share_table,
+        vec![
+            Value::Int(1),
+            Value::String("carol".into()),
+            Value::String("7".into()),
+        ],
+    );
+    let diff = shapes.diff(&event).expect("the previous image is whole");
+    let [Requery::Whole(group)] = diff.requeries.as_slice() else {
+        panic!("the change schedules its whole group: {diff:?}");
+    };
+
+    // One share leaving moved the average, so bob's own share fell below it and
+    // the replay stops returning his grant on a paper the event never named.
+    let replay = CannedReplay {
+        rows: vec![(
+            "paper_shares",
+            vec![plain_membership("papers:1", "user:alice")],
+        )],
+    };
+
+    let reports = backend
+        .materialise([*group], &replay)
+        .await
+        .expect("reconcile the group");
+    let [report] = reports.as_slice() else {
+        panic!("one report per group: {reports:?}");
+    };
+
+    let [withdrawn] = report.removed.as_slice() else {
+        panic!("one stale fact, got {:?}", report.removed);
+    };
+    assert_eq!(withdrawn.subject, "user:bob");
+    assert_eq!(
+        withdrawn.object, "papers:2",
+        "the object the event never named is exactly the one that had to move"
+    );
+    assert!(
+        report.added.is_empty(),
+        "alice was already stored: {report:?}"
+    );
+}
+
 fn membership(subject: &str, condition: &str, expires_at: &str) -> Record {
     Record {
         object: "teams:3".to_owned(),
@@ -613,20 +962,30 @@ fn membership(subject: &str, condition: &str, expires_at: &str) -> Record {
 }
 
 async fn stored_members(client: &mut OpenFgaServiceClient<Channel>, store: &str) -> Vec<String> {
+    stored_relation(client, store, &member_relation().to_string(), "teams:3").await
+}
+
+/// Every subject the store holds for one relation on one object.
+async fn stored_relation(
+    client: &mut OpenFgaServiceClient<Channel>,
+    store: &str,
+    relation: &str,
+    object: &str,
+) -> Vec<String> {
     let response = client
         .read(ReadRequest {
             store_id: store.to_owned(),
             tuple_key: Some(ReadRequestTupleKey {
                 user: String::new(),
-                relation: member_relation().to_string(),
-                object: "teams:3".to_owned(),
+                relation: relation.to_owned(),
+                object: object.to_owned(),
             }),
             page_size: None,
             continuation_token: String::new(),
             consistency: ConsistencyPreference::HigherConsistency as i32,
         })
         .await
-        .expect("read memberships")
+        .expect("read the relation")
         .into_inner();
     response
         .tuples
