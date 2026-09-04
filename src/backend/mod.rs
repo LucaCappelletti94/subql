@@ -47,7 +47,7 @@ pub(crate) mod scalars_and_backend;
 pub(crate) mod shipped;
 
 pub(crate) use cdc_event::ResolvedEvent;
-pub use cdc_event::{decode_cell, encode_value_key, CdcEvent};
+pub use cdc_event::{decode_cell, encode_value_key, CdcEvent, CellPresence};
 pub use row_kind::RowKind;
 pub(crate) use scalar_value::jsonb_payloads_equal;
 pub use scalar_value::{

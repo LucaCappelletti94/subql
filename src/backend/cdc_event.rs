@@ -7,6 +7,26 @@ use crate::backend::{
 };
 use alloc::vec::Vec;
 
+/// What a row image says about one cell.
+///
+/// `Missing` is the variant that carries weight: a cell the source did not
+/// carry cannot be answered from the event, which is a different fact from
+/// the cell carrying SQL `NULL`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CellPresence {
+    /// The source's row image did not carry this cell.
+    Missing,
+    /// The cell carries SQL `NULL`.
+    Null,
+    /// The cell carries a value.
+    Present,
+    /// The source carried the cell but subql could not decode it to its
+    /// declared type. The prefilter cannot index it, so every predicate
+    /// depending on the column is selected as a candidate and the VM
+    /// surfaces the decode error.
+    Undecodable,
+}
+
 /// One CDC row event as seen by the engine.
 ///
 /// An impl exposes the event's structure (kind, table, PK layout, changed
@@ -134,6 +154,23 @@ pub trait CdcEvent {
         row: RowKind,
         col: ColumnId,
     ) -> Result<Value<Self::Backend>, crate::ValueError>;
+
+    /// What the row image says about one cell.
+    ///
+    /// The distinction [`CellPresence::Missing`] draws is the load-bearing
+    /// one: a cell the source did not carry, an unchanged TOAST value or a
+    /// column outside the replica identity, is not a SQL `NULL`, and a
+    /// predicate reading it cannot be answered from the event at all.
+    ///
+    /// No caller acts on this yet; the prefilter still classifies inline.
+    fn presence_at<DB: DatabaseLike>(&self, db: &DB, row: RowKind, col: ColumnId) -> CellPresence {
+        match self.value_at(db, row, col) {
+            Ok(Value::Missing) => CellPresence::Missing,
+            Ok(Value::Null) => CellPresence::Null,
+            Ok(_) => CellPresence::Present,
+            Err(_) => CellPresence::Undecodable,
+        }
+    }
 
     #[doc(hidden)]
     fn value_at_resolved<DB: DatabaseLike>(
@@ -337,6 +374,97 @@ where
 /// Returns `None` when postcard cannot encode the tuple.
 pub fn encode_value_key<B: Backend>(values: &[Value<B>]) -> Option<alloc::vec::Vec<u8>> {
     postcard::to_allocvec(values).ok()
+}
+
+/// The presence a row image reports per cell, which is what tells "the source
+/// did not say" apart from "the value is NULL".
+#[cfg(all(test, feature = "std"))]
+#[allow(clippy::unwrap_used)]
+mod cell_presence_tests {
+    use crate::backend::{CdcEvent, CellPresence, Postgres, RowKind, Value};
+    use crate::testing::TestEvent;
+    use alloc::vec;
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    #[test]
+    fn presence_distinguishes_missing_from_null() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (id INT PRIMARY KEY, absent TEXT, nulled TEXT);",
+        )
+        .expect("the DDL parses");
+        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        let event =
+            TestEvent::<Postgres>::insert(table, vec![Value::Int(1), Value::Missing, Value::Null])
+                .with_pk_columns([0u16]);
+
+        assert_eq!(
+            event.presence_at(&db, RowKind::New, 0),
+            CellPresence::Present
+        );
+        assert_eq!(
+            event.presence_at(&db, RowKind::New, 1),
+            CellPresence::Missing,
+            "a cell the source did not carry is not a NULL"
+        );
+        assert_eq!(event.presence_at(&db, RowKind::New, 2), CellPresence::Null);
+    }
+
+    #[test]
+    fn presence_reports_a_cell_the_source_could_not_decode() {
+        struct Corrupt(crate::TableId);
+
+        impl CdcEvent for Corrupt {
+            type Backend = Postgres;
+            type Checkpoint = crate::NoCheckpoint;
+
+            fn kind(&self) -> crate::EventKind {
+                crate::EventKind::Insert
+            }
+
+            fn table_id<DB: sql_traits::prelude::DatabaseLike>(&self, _db: &DB) -> crate::TableId {
+                self.0
+            }
+
+            fn checkpoint(&self) -> Option<Self::Checkpoint> {
+                None
+            }
+
+            fn pk_columns<DB: sql_traits::prelude::DatabaseLike>(
+                &self,
+                _db: &DB,
+            ) -> alloc::vec::Vec<crate::ColumnId> {
+                vec![0]
+            }
+
+            fn changed_columns<DB: sql_traits::prelude::DatabaseLike>(
+                &self,
+                _db: &DB,
+            ) -> alloc::vec::Vec<crate::ColumnId> {
+                alloc::vec::Vec::new()
+            }
+
+            fn value_at<DB: sql_traits::prelude::DatabaseLike>(
+                &self,
+                _db: &DB,
+                _row: RowKind,
+                col: crate::ColumnId,
+            ) -> Result<Value<Self::Backend>, crate::ValueError> {
+                Err(crate::ValueError::Builtin {
+                    column: col,
+                    kind: crate::backend::BuiltinKind::Int,
+                })
+            }
+        }
+
+        let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT PRIMARY KEY);")
+            .expect("the DDL parses");
+        let table = crate::catalog_helpers::table_id(&db, "t").expect("t is cataloged");
+        assert_eq!(
+            Corrupt(table).presence_at(&db, RowKind::New, 0),
+            CellPresence::Undecodable
+        );
+    }
 }
 
 #[cfg(test)]

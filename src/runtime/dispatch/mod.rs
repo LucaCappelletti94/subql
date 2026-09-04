@@ -548,11 +548,10 @@ fn collect_stamps_for_predicate<I: IdTypes, B: Backend>(
 /// Callers whose source cannot provide a complete old row (Postgres
 /// REPLICA IDENTITY DEFAULT for example) will see `Value::Missing` on
 /// old-row accessors, causing the VM to return `Tri::Unknown`. Unknown
-/// verdicts collapse to "did not match" in this splitter; that is
-/// conservative-safe but may misclassify view membership. A future
-/// enhancement would surface the incompleteness through a
-/// `CdcEvent::has_complete_row` method and fall back to single-eval on
-/// the new row (matches to `updated`, matching pre-Phase-5 behaviour).
+/// verdicts still collapse to "did not match" here, which is
+/// indistinguishable from a genuine non-match.
+/// [`CdcEvent::presence_at`](crate::backend::CdcEvent::presence_at) is what
+/// tells the two apart; no caller acts on it yet.
 fn dispatch_update_with_stamps<I, E, DB>(
     event: &E,
     partition: &TablePartition<I, E::Backend>,
