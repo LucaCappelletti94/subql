@@ -28,6 +28,7 @@
 //!   `Bool = i64`).
 
 pub mod arithmetic;
+pub mod refusal;
 
 use super::{
     value_cmp::{compare_ordered_values, values_equal},
@@ -40,18 +41,19 @@ use arithmetic::{
     arithmetic_add, arithmetic_divide, arithmetic_modulo, arithmetic_multiply, arithmetic_negate,
     arithmetic_subtract,
 };
+use refusal::{DanglingEscape, EvaluationRefusal, LikeEscape};
 use sql_traits::prelude::DatabaseLike;
 
 /// One arithmetic instruction's operation, which either answers or reports
 /// what the engine refuses.
-type BinaryValueOp<B> = fn(Value<B>, Value<B>) -> Result<Value<B>, arithmetic::ArithmeticFailure>;
+type BinaryValueOp<B> = fn(Value<B>, Value<B>) -> Result<Value<B>, refusal::EvaluationRefusal>;
 
 /// VM evaluation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmError {
     /// The target engine refuses this evaluation, so no answer exists to
     /// give. Reported per subscription rather than failing the dispatch.
-    Arithmetic(arithmetic::ArithmeticFailure),
+    Refused(refusal::EvaluationRefusal),
 
     /// Popped from an empty stack.
     StackUnderflow,
@@ -449,14 +451,29 @@ impl<B: Backend> Vm<B> {
                         return Ok(());
                     };
 
-                let matched = if *case_sensitive {
-                    simple_like(str_val, pat_val, B::LIKE_DEFAULT_ESCAPE)
+                let escape = B::LIKE_ESCAPE.map(|escape| escape.character);
+                let walk = if *case_sensitive {
+                    simple_like(str_val, pat_val, escape)
                 } else {
-                    simple_like(
-                        &str_val.to_lowercase(),
-                        &pat_val.to_lowercase(),
-                        B::LIKE_DEFAULT_ESCAPE,
-                    )
+                    simple_like(&str_val.to_lowercase(), &pat_val.to_lowercase(), escape)
+                };
+                // The walk reports a dangling escape only where the engine
+                // refuses it, which is where the matcher reached it with
+                // input left. What that means is the engine's: PostgreSQL
+                // raises, MySQL answers no-match.
+                let matched = match walk {
+                    Ok(matched) => matched,
+                    Err(PatternError::TrailingEscape) => match B::LIKE_ESCAPE {
+                        Some(LikeEscape {
+                            dangling: DanglingEscape::Fails,
+                            ..
+                        }) => {
+                            return Err(VmError::Refused(
+                                EvaluationRefusal::LikePatternEndsWithEscape,
+                            ))
+                        }
+                        _ => false,
+                    },
                 };
 
                 self.stack.push(StackValue::Tri(if matched {
@@ -474,7 +491,7 @@ impl<B: Backend> Vm<B> {
 
             Instruction::Negate => {
                 let a = self.pop_value()?;
-                let result = arithmetic_negate::<B>(a).map_err(VmError::Arithmetic)?;
+                let result = arithmetic_negate::<B>(a).map_err(VmError::Refused)?;
                 self.stack.push(StackValue::Value(result, None));
             }
 
@@ -496,7 +513,7 @@ impl<B: Backend> Vm<B> {
     fn execute_binary_value_op(&mut self, op: BinaryValueOp<B>) -> Result<(), VmError> {
         let b = self.pop_value()?;
         let a = self.pop_value()?;
-        let value = op(a, b).map_err(VmError::Arithmetic)?;
+        let value = op(a, b).map_err(VmError::Refused)?;
         self.stack.push(StackValue::Value(value, None));
         Ok(())
     }
@@ -620,8 +637,25 @@ enum PatternAtom {
     /// One character, matched as itself.
     Literal(char),
     /// The escape character with nothing left to escape, which only the
-    /// final position can hold. It matches nothing.
+    /// final position can hold. It matches nothing, and reaching it with
+    /// input still to read is what PostgreSQL refuses.
     DanglingEscape,
+}
+
+/// A `LIKE` pattern the walk reached but cannot answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PatternError {
+    /// The walk reached a [`PatternAtom::DanglingEscape`] with input still
+    /// to read.
+    ///
+    /// PostgreSQL raises `LIKE pattern must not end with escape character`
+    /// exactly here, and answers false when the input ran out before the
+    /// matcher arrived, which is why this is reported from the walk rather
+    /// than from parsing. MySQL answers false either way. Keeping it
+    /// distinct from a no-match is what lets a per-subscription evaluation
+    /// failure report it once the engine carries one, without revisiting
+    /// the walk.
+    TrailingEscape,
 }
 
 /// Compile `pattern` under `escape`, the engine's default escape character.
@@ -651,8 +685,12 @@ fn compile_pattern(pattern: &str, escape: Option<char>) -> Vec<PatternAtom> {
     atoms
 }
 
-/// SQL `LIKE` pattern matching under one engine's default escape.
-fn simple_like(string: &str, pattern: &str, escape: Option<char>) -> bool {
+/// SQL `LIKE` pattern matching under one engine's default escape character.
+///
+/// Supports `%` (zero or more characters), `_` (exactly one character) and
+/// the default escape. An explicit `ESCAPE` clause is refused before
+/// reaching here.
+fn simple_like(string: &str, pattern: &str, escape: Option<char>) -> Result<bool, PatternError> {
     let s: Vec<char> = string.chars().collect();
     let p = compile_pattern(pattern, escape);
     let pn = p.len();
@@ -691,17 +729,17 @@ fn simple_like(string: &str, pattern: &str, escape: Option<char>) -> bool {
                         new_dp[j + 1] = true;
                     }
                 }
-                // Matches nothing, so a pattern ending with the escape
-                // answers no-match. PostgreSQL raises here instead, which
-                // needs a per-subscription failure channel the engine does
-                // not carry yet.
-                PatternAtom::DanglingEscape => {}
+                // Reached with `sc` still to read, which is the exact
+                // condition PostgreSQL refuses. Input that ran out before
+                // this point never gets here, and the atom matches
+                // nothing, so such a pattern answers no-match below.
+                PatternAtom::DanglingEscape => return Err(PatternError::TrailingEscape),
             }
         }
         dp = new_dp;
     }
 
-    dp[pn]
+    Ok(dp[pn])
 }
 
 #[cfg(test)]
@@ -908,9 +946,9 @@ mod tests {
         let e = insert_pg(vec![Value::Int(10)]);
         assert_eq!(
             vm.eval(&program, &e, RowKind::New, &pg_catalog()),
-            Err(VmError::Arithmetic(
-                super::arithmetic::ArithmeticFailure::DivisionByZero {
-                    operation: super::arithmetic::ArithmeticOp::Divide,
+            Err(VmError::Refused(
+                super::refusal::EvaluationRefusal::DivisionByZero {
+                    operation: super::refusal::ArithmeticOp::Divide,
                 }
             ))
         );

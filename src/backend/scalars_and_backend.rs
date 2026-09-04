@@ -304,7 +304,7 @@ pub trait Backend: 'static {
     /// Required rather than defaulted, because the engines disagree:
     /// measured, PostgreSQL raises `division by zero` for `/` and `%` alike
     /// and for every numeric type, while MySQL and SQLite answer `NULL`.
-    const DIVISION_BY_ZERO: crate::compiler::vm::arithmetic::DivisionByZero;
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero;
 
     /// This backend's checked integer arithmetic, or the failure it raises.
     ///
@@ -319,10 +319,10 @@ pub trait Backend: 'static {
     ///
     /// The refusal this backend's engine raises for the operation.
     fn integer_binary(
-        operation: crate::compiler::vm::arithmetic::ArithmeticOp,
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: Self::Int,
         right: Self::Int,
-    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure>
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal>
     where
         Self: Sized;
 
@@ -333,7 +333,7 @@ pub trait Backend: 'static {
     /// The refusal this backend's engine raises for `-i64::MIN`.
     fn integer_negate(
         value: Self::Int,
-    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure>
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal>
     where
         Self: Sized;
 
@@ -398,15 +398,13 @@ pub trait Backend: 'static {
     where
         Self: Sized;
 
-    /// The character a `LIKE` pattern uses to escape the next character
-    /// without an `ESCAPE` clause, or `None` when the engine has no default.
+    /// This engine's default `LIKE` escape, and what a dangling one does,
+    /// or `None` when the engine has no default escape.
     ///
-    /// A constant rather than a dialect lookup at match time, because it is
-    /// a property of the engine and every row would otherwise pay for the
-    /// lookup. Measured: PostgreSQL and MySQL escape with a backslash,
-    /// SQLite has no default escape at all, so a backslash in a SQLite
-    /// pattern matches a backslash.
-    const LIKE_DEFAULT_ESCAPE: Option<char>;
+    /// The two facts travel together because an engine with no default
+    /// escape cannot have a dangling one, which makes that a type-level
+    /// fact rather than an unused second answer.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape>;
 
     /// SQL parser dialect for this backend.
     type Dialect: sqlparser::dialect::Dialect;

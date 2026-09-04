@@ -17,9 +17,12 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
-use subql::backend::{MySql, Postgres, SQLite, Value};
+use subql::backend::{Backend, MySql, Postgres, SQLite, Value};
+use subql::compiler::vm::refusal::DanglingEscape;
 use subql::testing::TestEvent;
-use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
+use subql::{
+    catalog_helpers, DefaultIds, EvaluationRefusal, SubscriptionEngine, SubscriptionRequest,
+};
 
 const DDL: &str = "CREATE TABLE names (id INT PRIMARY KEY, name TEXT)";
 
@@ -150,5 +153,120 @@ fn sqlite_has_no_default_like_escape() {
     assert!(
         sqlite_notifies(r"SELECT * FROM names WHERE name LIKE 'a\%b'", r"a\%b"),
         "the backslash is matched literally and the percent sign is a wildcard"
+    );
+}
+
+/// A pattern whose last character is the escape character escapes nothing.
+/// Measured on 16.11: PostgreSQL raises `LIKE pattern must not end with
+/// escape character` once its matcher reaches that character with input
+/// still to read, and answers false when the input ran out first. So the
+/// row that still has input to match is a per-subscription evaluation
+/// failure, and the row that does not is a plain no-match.
+///
+/// The walk has reproduced that condition since this phase landed; what was
+/// missing was a channel to report it, which the overflow work built.
+#[test]
+fn a_pattern_ending_with_the_escape_fails_the_subscription() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).expect("DDL parses");
+    let table = catalog_helpers::table_id(&db, "names").expect("names is in the catalog");
+    let mut engine: SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, PostgreSqlDialect {});
+    let subscription = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            r"SELECT * FROM names WHERE name LIKE 'a\'",
+        ))
+        .expect("the predicate registers")
+        .subscription_id;
+
+    let dispatch = |engine: &mut SubscriptionEngine<TestEvent<Postgres>, DefaultIds, ParserDB>,
+                    name: &str| {
+        engine
+            .consumers(&TestEvent::insert(
+                table,
+                vec![Value::Int(1), Value::String(name.to_string())],
+            ))
+            .expect("dispatch succeeds")
+    };
+
+    // Input remains when the matcher arrives, which is what PostgreSQL
+    // refuses.
+    let refused = dispatch(&mut engine, "ab");
+    assert_eq!(
+        refused
+            .evaluation_failures()
+            .iter()
+            .map(|failure| (failure.subscription_id, failure.refusal))
+            .collect::<Vec<_>>(),
+        vec![(subscription, EvaluationRefusal::LikePatternEndsWithEscape)],
+        "the report names the subscription and the malformed pattern"
+    );
+    assert!(refused.inserted().is_empty());
+
+    // The input ran out first, so the server answers false and so does this.
+    let exhausted = dispatch(&mut engine, "a");
+    assert!(
+        exhausted.evaluation_failures().is_empty(),
+        "PostgreSQL answers false here rather than raising"
+    );
+    assert!(exhausted.inserted().is_empty());
+}
+
+/// MySQL never raises for a dangling escape: measured, it answers 0
+/// whether or not input remains, so its rule is no-match rather than
+/// PostgreSQL's refusal. The constants are asserted because they are the
+/// per-backend rule the walk consults.
+///
+/// The end-to-end half is a different answer from PostgreSQL's, and it is
+/// not the escape rule that decides it. MySQL's own literal rules make a
+/// backslash escape the closing quote, so the pattern is written `'a\\'`
+/// there, and rendering that back out yields SQL MySQL itself rejects,
+/// which the server confirms with error 1064. subql's canonicalizer sees
+/// exactly that and declines to serve a predicate whose spelling does not
+/// read back as itself, so the subscription becomes a database read. That
+/// is the honest answer, not a wrong one, and it means no in-process
+/// dangling escape arises under MySQL at all.
+#[test]
+fn mysql_pattern_ending_with_the_escape_is_a_no_match() {
+    assert_eq!(
+        <MySql as Backend>::LIKE_ESCAPE
+            .expect("MySQL has a default escape")
+            .dangling,
+        DanglingEscape::NoMatch,
+        "measured as 0 on 8.4.11, not an error"
+    );
+    assert_eq!(
+        <Postgres as Backend>::LIKE_ESCAPE
+            .expect("PostgreSQL has a default escape")
+            .dangling,
+        DanglingEscape::Fails,
+        "and PostgreSQL raises, which is why the rule is per backend"
+    );
+    assert!(
+        <SQLite as Backend>::LIKE_ESCAPE.is_none(),
+        "SQLite has no default escape, so it can have no dangling one"
+    );
+
+    let db = ParserDB::parse::<MySqlDialect>(MYSQL_DDL).expect("DDL parses");
+    let mut engine: SubscriptionEngine<TestEvent<MySql>, DefaultIds, ParserDB> =
+        SubscriptionEngine::new(db, MySqlDialect {});
+    let registered = engine
+        .register(SubscriptionRequest::new(
+            1u64,
+            "SELECT * FROM names WHERE name LIKE 'a\\\\'",
+        ))
+        .expect("a read answers it, so registration succeeds");
+    assert!(
+        registered.served().is_none(),
+        "the pattern has no canonical spelling MySQL would accept back"
+    );
+    assert!(
+        registered
+            .not_served_because
+            .as_ref()
+            .map(std::string::ToString::to_string)
+            .is_some_and(|reason| reason.contains("canonical spelling")),
+        "got {:?}",
+        registered.not_served_because
     );
 }

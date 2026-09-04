@@ -20,7 +20,7 @@ struct AggregateStops {
     /// Subscriptions whose filter the engine refuses to evaluate.
     evaluation_refused: Vec<(
         SubscriptionId,
-        crate::compiler::vm::arithmetic::ArithmeticFailure,
+        crate::compiler::vm::refusal::EvaluationRefusal,
     )>,
     /// Subscriptions that would exceed the configured group limit.
     group_limit: Vec<SubscriptionId>,

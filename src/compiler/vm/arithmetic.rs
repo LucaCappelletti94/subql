@@ -1,65 +1,7 @@
 //! Arithmetic instructions split out of `vm`.
 
+use super::refusal::{ArithmeticOp, DivisionByZero, EvaluationRefusal, IntegerOverflow};
 use crate::backend::{Backend, Value};
-
-/// Which arithmetic operation failed, as the statement spelled it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArithmeticOp {
-    /// `+`
-    Add,
-    /// `-`, binary
-    Subtract,
-    /// `*`
-    Multiply,
-    /// `-`, unary
-    Negate,
-    /// `/`
-    Divide,
-    /// `%`
-    Modulo,
-}
-
-/// What a backend answers when a divisor is zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DivisionByZero {
-    /// Raise, which becomes a per-subscription evaluation failure.
-    Fails,
-    /// Answer SQL `NULL`, which composes to `Tri::Unknown`.
-    IsNull,
-}
-
-/// An evaluation the target engine refuses to answer.
-///
-/// Not a `Value::Null`: null composes through `OR` and would turn a refused
-/// evaluation into a silent no-match, which is the divergence this removes.
-/// Reported per subscription alongside the notifications instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ArithmeticFailure {
-    /// The result does not fit the integer type. Measured: PostgreSQL and
-    /// MySQL raise `out of range`, while SQLite promotes the result to a
-    /// real, which is an answer rather than a failure.
-    IntegerOverflow {
-        /// The operation whose result did not fit.
-        operation: ArithmeticOp,
-    },
-    /// The divisor is zero. Measured: PostgreSQL raises `division by zero`
-    /// for `/` and `%` alike and for every numeric type, while MySQL and
-    /// SQLite answer `NULL`, which is unknown rather than a failure.
-    DivisionByZero {
-        /// The operator whose divisor was zero.
-        operation: ArithmeticOp,
-    },
-}
-
-/// What a backend answers when an integer operation overflows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IntegerOverflow {
-    /// Raise, which becomes a per-subscription evaluation failure.
-    Fails,
-    /// Carry the result as a float, which is SQLite's answer.
-    PromotesToFloat,
-}
 
 /// `Value::Missing` / `Value::Null` on either side propagates to
 /// `Value::Null` (SQL NULL propagation).
@@ -83,14 +25,14 @@ pub(crate) const fn null_propagate_binary<B: Backend>(
 ///
 /// # Errors
 ///
-/// [`ArithmeticFailure::IntegerOverflow`] when the result does not fit and
+/// [`EvaluationRefusal::IntegerOverflow`] when the result does not fit and
 /// this backend raises rather than promoting.
 pub fn checked_integer_binary<B>(
     overflow: IntegerOverflow,
     operation: ArithmeticOp,
     a: i64,
     b: i64,
-) -> Result<Value<B>, ArithmeticFailure>
+) -> Result<Value<B>, EvaluationRefusal>
 where
     B: Backend<Int = i64, Float = f64>,
 {
@@ -114,7 +56,7 @@ where
     match (checked, overflow) {
         (Some(value), _) => Ok(Value::Int(value)),
         (None, IntegerOverflow::PromotesToFloat) => Ok(Value::Float(promoted(operation, a, b))),
-        (None, IntegerOverflow::Fails) => Err(ArithmeticFailure::IntegerOverflow { operation }),
+        (None, IntegerOverflow::Fails) => Err(EvaluationRefusal::IntegerOverflow { operation }),
     }
 }
 
@@ -139,7 +81,7 @@ fn promoted(operation: ArithmeticOp, a: i64, b: i64) -> f64 {
 pub(crate) fn arithmetic_add<B: Backend>(
     a: Value<B>,
     b: Value<B>,
-) -> Result<Value<B>, ArithmeticFailure> {
+) -> Result<Value<B>, EvaluationRefusal> {
     if let Some(null) = null_propagate_binary(&a, &b) {
         return Ok(null);
     }
@@ -155,7 +97,7 @@ pub(crate) fn arithmetic_add<B: Backend>(
 pub(crate) fn arithmetic_subtract<B: Backend>(
     a: Value<B>,
     b: Value<B>,
-) -> Result<Value<B>, ArithmeticFailure> {
+) -> Result<Value<B>, EvaluationRefusal> {
     if let Some(null) = null_propagate_binary(&a, &b) {
         return Ok(null);
     }
@@ -171,7 +113,7 @@ pub(crate) fn arithmetic_subtract<B: Backend>(
 pub(crate) fn arithmetic_multiply<B: Backend>(
     a: Value<B>,
     b: Value<B>,
-) -> Result<Value<B>, ArithmeticFailure> {
+) -> Result<Value<B>, EvaluationRefusal> {
     if let Some(null) = null_propagate_binary(&a, &b) {
         return Ok(null);
     }
@@ -195,13 +137,13 @@ pub(crate) fn arithmetic_multiply<B: Backend>(
 ///
 /// # Errors
 ///
-/// [`ArithmeticFailure::DivisionByZero`] on a zero divisor where this
-/// backend raises, and [`ArithmeticFailure::IntegerOverflow`] for the one
+/// [`EvaluationRefusal::DivisionByZero`] on a zero divisor where this
+/// backend raises, and [`EvaluationRefusal::IntegerOverflow`] for the one
 /// quotient that does not fit, `i64::MIN / -1`.
 pub(crate) fn arithmetic_divide<B: Backend>(
     a: Value<B>,
     b: Value<B>,
-) -> Result<Value<B>, ArithmeticFailure> {
+) -> Result<Value<B>, EvaluationRefusal> {
     if let Some(null) = null_propagate_binary(&a, &b) {
         return Ok(null);
     }
@@ -236,7 +178,7 @@ pub(crate) fn arithmetic_divide<B: Backend>(
 pub(crate) fn arithmetic_modulo<B: Backend>(
     a: Value<B>,
     b: Value<B>,
-) -> Result<Value<B>, ArithmeticFailure> {
+) -> Result<Value<B>, EvaluationRefusal> {
     if let Some(null) = null_propagate_binary(&a, &b) {
         return Ok(null);
     }
@@ -257,11 +199,11 @@ pub(crate) fn arithmetic_modulo<B: Backend>(
 ///
 /// # Errors
 ///
-/// [`ArithmeticFailure::DivisionByZero`] where this backend raises.
+/// [`EvaluationRefusal::DivisionByZero`] where this backend raises.
 fn zero_divisor<B: Backend, T>(
     divisor: &T,
     operation: ArithmeticOp,
-) -> Result<Option<Value<B>>, ArithmeticFailure>
+) -> Result<Option<Value<B>>, EvaluationRefusal>
 where
     T: Clone + PartialEq + core::ops::Sub<Output = T>,
 {
@@ -270,12 +212,12 @@ where
     }
     match B::DIVISION_BY_ZERO {
         DivisionByZero::IsNull => Ok(Some(Value::Null)),
-        DivisionByZero::Fails => Err(ArithmeticFailure::DivisionByZero { operation }),
+        DivisionByZero::Fails => Err(EvaluationRefusal::DivisionByZero { operation }),
     }
 }
 
 /// Negate: same-scalar only.
-pub(crate) fn arithmetic_negate<B: Backend>(a: Value<B>) -> Result<Value<B>, ArithmeticFailure> {
+pub(crate) fn arithmetic_negate<B: Backend>(a: Value<B>) -> Result<Value<B>, EvaluationRefusal> {
     if a.is_absent() {
         return Ok(Value::Null);
     }

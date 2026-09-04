@@ -101,21 +101,25 @@ impl CustomScalars for MyScalars {
 struct Custom;
 
 impl Backend for Custom {
-    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+    const LIKE_ESCAPE: Option<subql::compiler::vm::refusal::LikeEscape> =
+        Some(subql::compiler::vm::refusal::LikeEscape {
+            character: '\\',
+            dangling: subql::compiler::vm::refusal::DanglingEscape::Fails,
+        });
 
     /// The fixtures raise on a zero divisor, as PostgreSQL does.
-    const DIVISION_BY_ZERO: subql::compiler::vm::arithmetic::DivisionByZero =
-        subql::compiler::vm::arithmetic::DivisionByZero::Fails;
+    const DIVISION_BY_ZERO: subql::compiler::vm::refusal::DivisionByZero =
+        subql::compiler::vm::refusal::DivisionByZero::Fails;
 
     /// The fixtures use the standard integer carrier, so the shared
     /// checked arithmetic serves, raising as PostgreSQL does.
     fn integer_binary(
-        operation: subql::compiler::vm::arithmetic::ArithmeticOp,
+        operation: subql::compiler::vm::refusal::ArithmeticOp,
         left: i64,
         right: i64,
-    ) -> Result<Value<Self>, subql::compiler::vm::arithmetic::ArithmeticFailure> {
+    ) -> Result<Value<Self>, subql::compiler::vm::refusal::EvaluationRefusal> {
         subql::compiler::vm::arithmetic::checked_integer_binary(
-            subql::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            subql::compiler::vm::refusal::IntegerOverflow::Fails,
             operation,
             left,
             right,
@@ -124,10 +128,10 @@ impl Backend for Custom {
 
     fn integer_negate(
         value: i64,
-    ) -> Result<Value<Self>, subql::compiler::vm::arithmetic::ArithmeticFailure> {
+    ) -> Result<Value<Self>, subql::compiler::vm::refusal::EvaluationRefusal> {
         subql::compiler::vm::arithmetic::checked_integer_binary(
-            subql::compiler::vm::arithmetic::IntegerOverflow::Fails,
-            subql::compiler::vm::arithmetic::ArithmeticOp::Negate,
+            subql::compiler::vm::refusal::IntegerOverflow::Fails,
+            subql::compiler::vm::refusal::ArithmeticOp::Negate,
             value,
             value,
         )

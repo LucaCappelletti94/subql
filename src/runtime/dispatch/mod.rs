@@ -11,7 +11,7 @@ use super::{
 use crate::backend::{Backend, CdcEvent, RowKind};
 use crate::term::TermLookup;
 use crate::{
-    compiler::{sql_shape::QueryProjection, vm::arithmetic::ArithmeticFailure, Tri, Vm, VmError},
+    compiler::{sql_shape::QueryProjection, vm::refusal::EvaluationRefusal, Tri, Vm, VmError},
     ConsumerNotifications, DispatchError, EventKind, IdTypes, SubscriptionId,
 };
 use alloc::vec::Vec;
@@ -38,7 +38,7 @@ fn dispatch_vm_error(error: VmError) -> DispatchError {
 /// every event, so they travel together rather than as two parameters.
 #[derive(Default)]
 struct DispatchReports {
-    refusals: Vec<(ConsumerOrdinal, SubscriptionId, ArithmeticFailure)>,
+    refusals: Vec<(ConsumerOrdinal, SubscriptionId, EvaluationRefusal)>,
 }
 
 /// The four values every evaluation pass carries: which event, which row
@@ -91,7 +91,7 @@ struct RowVerdict<'a> {
     /// The subscribers the row test reached.
     matched: Matched<'a>,
     /// The subscribers whose evaluation the engine refuses, and why.
-    refused: Option<(RoaringBitmap, ArithmeticFailure)>,
+    refused: Option<(RoaringBitmap, EvaluationRefusal)>,
 }
 
 impl Matched<'_> {
@@ -199,7 +199,7 @@ where
         let verdict = match vm.eval(&pred.bytecode, event, row, db) {
             Ok(verdict) => verdict,
             // No term, so the refusal is the whole predicate's.
-            Err(VmError::Arithmetic(failure)) => {
+            Err(VmError::Refused(failure)) => {
                 return Ok(RowVerdict {
                     matched: Matched::Nobody,
                     refused: Some((bitmap.clone(), failure)),
@@ -235,7 +235,7 @@ where
     // refusal in one predicate has the same cause: the arithmetic is the
     // row's, and only whether it is reached varies.
     let mut refused = RoaringBitmap::new();
-    let mut cause: Option<ArithmeticFailure> = None;
+    let mut cause: Option<EvaluationRefusal> = None;
     // The same, per assignment, for a cell the event does not carry: an
     // assignment that short-circuits before reading it is answered.
     // Reused across assignments: each one starts from the predicate's own
@@ -258,7 +258,7 @@ where
             // Every other verdict is an answer, so this assignment reports
             // nothing.
             Ok(_) => continue,
-            Err(VmError::Arithmetic(failure)) => Some(failure),
+            Err(VmError::Refused(failure)) => Some(failure),
             Err(other) => return Err(dispatch_vm_error(other)),
         };
 
@@ -663,8 +663,8 @@ fn collect_refusals_for_predicate<I: IdTypes, B: Backend>(
     predicates: &PredicateStore<I, B>,
     pred_id: PredicateId,
     consumers: &RoaringBitmap,
-    failure: ArithmeticFailure,
-    out: &mut Vec<(ConsumerOrdinal, SubscriptionId, ArithmeticFailure)>,
+    failure: EvaluationRefusal,
+    out: &mut Vec<(ConsumerOrdinal, SubscriptionId, EvaluationRefusal)>,
 ) {
     for ord_u32 in consumers {
         let ord = ConsumerOrdinal::new(ord_u32);
@@ -955,10 +955,10 @@ pub(crate) struct AggregateDelta<B: crate::backend::Backend> {
 /// would move the total by a row the filter never judged. The caller
 /// applies the stop after folding, so the removal happens here.
 fn refused_subscriptions<B: crate::backend::Backend>(
-    refusals: Vec<(ConsumerOrdinal, SubscriptionId, ArithmeticFailure)>,
+    refusals: Vec<(ConsumerOrdinal, SubscriptionId, EvaluationRefusal)>,
     deltas: &mut Vec<AggregateDelta<B>>,
-) -> Vec<(SubscriptionId, ArithmeticFailure)> {
-    let mut refused: Vec<(SubscriptionId, ArithmeticFailure)> = refusals
+) -> Vec<(SubscriptionId, EvaluationRefusal)> {
+    let mut refused: Vec<(SubscriptionId, EvaluationRefusal)> = refusals
         .into_iter()
         .map(|(_, subscription, failure)| (subscription, failure))
         .collect();
@@ -981,7 +981,7 @@ pub(crate) struct AggregateComputation<B: crate::backend::Backend> {
     /// Subscriptions whose filter the engine refuses to evaluate for this
     /// event. An aggregate emits maintenance rather than rows, so these
     /// surface as maintenance stops rather than in a notification set.
-    pub evaluation_refused: Vec<(SubscriptionId, ArithmeticFailure)>,
+    pub evaluation_refused: Vec<(SubscriptionId, EvaluationRefusal)>,
 }
 
 type AggregateNet<B> = HashMap<

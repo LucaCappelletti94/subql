@@ -7,6 +7,7 @@
 extern crate alloc;
 
 // Re-export public API
+pub use compiler::vm::refusal::EvaluationRefusal;
 pub use compiler::{AggHaving, AggSpec, HavingFunction, HavingOp, HavingSubject, QueryProjection};
 pub use errors::*;
 #[cfg(feature = "pg-sqlite-emu")]

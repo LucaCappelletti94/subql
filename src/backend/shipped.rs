@@ -52,17 +52,17 @@ pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomDat
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     /// Measured: PostgreSQL raises `division by zero`.
-    const DIVISION_BY_ZERO: crate::compiler::vm::arithmetic::DivisionByZero =
-        crate::compiler::vm::arithmetic::DivisionByZero::Fails;
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
+        crate::compiler::vm::refusal::DivisionByZero::Fails;
 
     /// Measured: PostgreSQL raises `bigint out of range`.
     fn integer_binary(
-        operation: crate::compiler::vm::arithmetic::ArithmeticOp,
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: i64,
         right: i64,
-    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
             operation,
             left,
             right,
@@ -71,10 +71,10 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 
     fn integer_negate(
         value: i64,
-    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::arithmetic::IntegerOverflow::Fails,
-            crate::compiler::vm::arithmetic::ArithmeticOp::Negate,
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            crate::compiler::vm::refusal::ArithmeticOp::Negate,
             value,
             value,
         )
@@ -132,8 +132,13 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         })
     }
 
-    /// Measured: a backslash escapes the next character.
-    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+    /// Measured: a backslash escapes, and a pattern ending with one
+    /// raises `LIKE pattern must not end with escape character`.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
+        Some(crate::compiler::vm::refusal::LikeEscape {
+            character: '\\',
+            dangling: crate::compiler::vm::refusal::DanglingEscape::Fails,
+        });
 
     type Custom = NoCustomScalars<Self>;
 
@@ -246,17 +251,17 @@ pub struct MySql;
 
 impl Backend for MySql {
     /// Measured: MySQL answers `NULL`.
-    const DIVISION_BY_ZERO: crate::compiler::vm::arithmetic::DivisionByZero =
-        crate::compiler::vm::arithmetic::DivisionByZero::IsNull;
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
+        crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
     /// Measured: MySQL raises `BIGINT value is out of range`.
     fn integer_binary(
-        operation: crate::compiler::vm::arithmetic::ArithmeticOp,
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: i64,
         right: i64,
-    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
             operation,
             left,
             right,
@@ -265,10 +270,10 @@ impl Backend for MySql {
 
     fn integer_negate(
         value: i64,
-    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::arithmetic::IntegerOverflow::Fails,
-            crate::compiler::vm::arithmetic::ArithmeticOp::Negate,
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            crate::compiler::vm::refusal::ArithmeticOp::Negate,
             value,
             value,
         )
@@ -355,8 +360,13 @@ impl Backend for MySql {
             .or(Some(TextRule::EXACT))
     }
 
-    /// Measured: a backslash escapes the next character.
-    const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
+    /// Measured: a backslash escapes, and a pattern ending with one
+    /// answers no-match whether or not input remains.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
+        Some(crate::compiler::vm::refusal::LikeEscape {
+            character: '\\',
+            dangling: crate::compiler::vm::refusal::DanglingEscape::NoMatch,
+        });
 
     type Custom = NoCustomScalars<Self>;
 
@@ -423,17 +433,17 @@ pub struct SQLite;
 
 impl Backend for SQLite {
     /// Measured: SQLite answers `NULL`.
-    const DIVISION_BY_ZERO: crate::compiler::vm::arithmetic::DivisionByZero =
-        crate::compiler::vm::arithmetic::DivisionByZero::IsNull;
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
+        crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
     /// Measured: SQLite carries the overflowed result as a real.
     fn integer_binary(
-        operation: crate::compiler::vm::arithmetic::ArithmeticOp,
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: i64,
         right: i64,
-    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::arithmetic::IntegerOverflow::PromotesToFloat,
+            crate::compiler::vm::refusal::IntegerOverflow::PromotesToFloat,
             operation,
             left,
             right,
@@ -442,10 +452,10 @@ impl Backend for SQLite {
 
     fn integer_negate(
         value: i64,
-    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
         crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::arithmetic::IntegerOverflow::PromotesToFloat,
-            crate::compiler::vm::arithmetic::ArithmeticOp::Negate,
+            crate::compiler::vm::refusal::IntegerOverflow::PromotesToFloat,
+            crate::compiler::vm::refusal::ArithmeticOp::Negate,
             value,
             value,
         )
@@ -518,9 +528,9 @@ impl Backend for SQLite {
         Some(rule)
     }
 
-    /// Measured: SQLite has no default escape, so a backslash in a
-    /// pattern matches a backslash.
-    const LIKE_DEFAULT_ESCAPE: Option<char> = None;
+    /// SQLite gives `LIKE` no default escape: a backslash in a pattern
+    /// matches a backslash, so no pattern can end with one dangling.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> = None;
 
     type Custom = NoCustomScalars<Self>;
 

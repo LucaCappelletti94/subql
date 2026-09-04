@@ -251,7 +251,7 @@ pub struct EvaluationFailure<I: IdTypes> {
     /// The consumer that subscription belongs to.
     pub consumer_id: I::ConsumerId,
     /// What the engine refuses.
-    pub refusal: crate::compiler::vm::arithmetic::ArithmeticFailure,
+    pub refusal: crate::compiler::vm::refusal::EvaluationRefusal,
 }
 
 // Hand-implemented for the same reason as `Value<B>`: `#[derive]` would
@@ -526,7 +526,7 @@ pub struct AggregateMaintenanceOutput<
     /// never judged, and the next event is evaluated normally.
     pub evaluation_failures: Vec<(
         crate::SubscriptionId,
-        crate::compiler::vm::arithmetic::ArithmeticFailure,
+        crate::compiler::vm::refusal::EvaluationRefusal,
     )>,
 }
 

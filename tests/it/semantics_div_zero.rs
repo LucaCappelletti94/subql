@@ -24,7 +24,7 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use subql::backend::{MySql, Postgres, SQLite, Value};
-use subql::compiler::vm::arithmetic::{ArithmeticFailure, ArithmeticOp};
+use subql::compiler::vm::refusal::{ArithmeticOp, EvaluationRefusal};
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
 
@@ -68,7 +68,7 @@ fn pg_division_by_zero_fails_the_subscription() {
             .iter()
             .map(|failure| failure.refusal)
             .collect::<Vec<_>>(),
-        vec![ArithmeticFailure::DivisionByZero {
+        vec![EvaluationRefusal::DivisionByZero {
             operation: ArithmeticOp::Divide,
         }],
         "the report names the operator that could not be evaluated"
@@ -92,7 +92,7 @@ fn pg_modulo_by_zero_fails_the_subscription() {
             .iter()
             .map(|failure| failure.refusal)
             .collect::<Vec<_>>(),
-        vec![ArithmeticFailure::DivisionByZero {
+        vec![EvaluationRefusal::DivisionByZero {
             operation: ArithmeticOp::Modulo,
         }],
     );
@@ -115,7 +115,7 @@ fn pg_float_division_by_zero_fails_the_subscription() {
             .iter()
             .map(|failure| failure.refusal)
             .collect::<Vec<_>>(),
-        vec![ArithmeticFailure::DivisionByZero {
+        vec![EvaluationRefusal::DivisionByZero {
             operation: ArithmeticOp::Divide,
         }],
         "measured as ERROR for float8 as well as for bigint"
@@ -186,7 +186,7 @@ fn the_one_quotient_that_does_not_fit_is_an_overflow() {
             .iter()
             .map(|failure| failure.refusal)
             .collect::<Vec<_>>(),
-        vec![ArithmeticFailure::IntegerOverflow {
+        vec![EvaluationRefusal::IntegerOverflow {
             operation: ArithmeticOp::Divide,
         }],
         "measured as `bigint out of range`, not as a division error"

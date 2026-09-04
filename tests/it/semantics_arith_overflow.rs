@@ -29,7 +29,7 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use subql::backend::{MySql, Postgres, SQLite, Value};
-use subql::compiler::vm::arithmetic::{ArithmeticFailure, ArithmeticOp};
+use subql::compiler::vm::refusal::{ArithmeticOp, EvaluationRefusal};
 use subql::testing::TestEvent;
 use subql::{
     catalog_helpers, DefaultIds, EvaluationFailure, SubscriptionEngine, SubscriptionRequest,
@@ -78,7 +78,7 @@ fn pg_overflow_fails_the_subscription() {
         &[EvaluationFailure {
             subscription_id: notifications.evaluation_failures()[0].subscription_id,
             consumer_id: 1u64,
-            refusal: ArithmeticFailure::IntegerOverflow {
+            refusal: EvaluationRefusal::IntegerOverflow {
                 operation: ArithmeticOp::Add,
             },
         }],
@@ -99,7 +99,7 @@ fn mysql_overflow_fails_the_subscription() {
         &[EvaluationFailure {
             subscription_id: notifications.evaluation_failures()[0].subscription_id,
             consumer_id: 1u64,
-            refusal: ArithmeticFailure::IntegerOverflow {
+            refusal: EvaluationRefusal::IntegerOverflow {
                 operation: ArithmeticOp::Add,
             },
         }]
@@ -217,7 +217,7 @@ fn one_consumer_with_two_subscriptions_fails_only_the_overflowing_one() {
         &[EvaluationFailure {
             subscription_id: overflowing,
             consumer_id: 7u64,
-            refusal: ArithmeticFailure::IntegerOverflow {
+            refusal: EvaluationRefusal::IntegerOverflow {
                 operation: ArithmeticOp::Add,
             },
         }],
@@ -392,7 +392,7 @@ fn an_overflowing_aggregate_filter_stops_maintenance() {
         output.evaluation_failures,
         vec![(
             subscription,
-            ArithmeticFailure::IntegerOverflow {
+            EvaluationRefusal::IntegerOverflow {
                 operation: ArithmeticOp::Add,
             },
         )],
