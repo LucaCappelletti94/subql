@@ -17,6 +17,7 @@ use super::{
     sql_shape, BytecodeProgram, Instruction, PredicateHash, PrefilterPlan,
 };
 use crate::backend::{Backend, BuiltinKind, Value};
+use crate::compiler::bytecode::ComparisonRef;
 use crate::compiler::sql_shape::{AggSpec, QueryProjection};
 use crate::table_resolution::{resolve_table_reference, TableResolutionError};
 use crate::term::CompiledTerm;
@@ -40,6 +41,9 @@ use sqlparser_canonicalize::Canonicalizer;
 struct Compiling<B: Backend> {
     out: Vec<Instruction<B>>,
     terms: Vec<CompiledTerm>,
+    /// Comparison facts interned as they are needed, addressed by
+    /// [`crate::compiler::bytecode::ComparisonRef`] index.
+    comparisons: Vec<crate::backend::ColumnComparisonOf<B>>,
 }
 
 impl<B: Backend> Compiling<B> {
@@ -47,6 +51,7 @@ impl<B: Backend> Compiling<B> {
         Self {
             out: Vec::new(),
             terms: Vec::new(),
+            comparisons: Vec::new(),
         }
     }
 
@@ -76,6 +81,134 @@ impl<B: Backend> Compiling<B> {
             expr: expr.clone(),
         });
         Ok(slot)
+    }
+
+    /// The slot holding `expr`'s comparison facts, interning them on first
+    /// use, or `None` when `expr` names no single column or the catalog
+    /// cannot classify it.
+    ///
+    /// Facts are deduplicated by value: two columns declaring the same type
+    /// and collation compare the same way, so they share a slot.
+    fn intern_comparison<DB: DatabaseLike>(
+        &mut self,
+        expr: &Expr,
+        table_id: TableId,
+        database: &DB,
+    ) -> Option<u16> {
+        let column = crate::compiler::literals::resolve_column_ref(expr, table_id, database)?;
+        let facts = crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)?;
+        if let Some(slot) = self.comparisons.iter().position(|held| *held == facts) {
+            return u16::try_from(slot).ok();
+        }
+        let slot = u16::try_from(self.comparisons.len()).ok()?;
+        self.comparisons.push(facts);
+        Some(slot)
+    }
+
+    /// The facts of both operands of one comparison, with its text rule
+    /// resolved for `operation`, or the refusal that sends the statement
+    /// to a database read.
+    ///
+    /// Two reasons a comparison cannot be answered in process, both
+    /// resolved here so the decision is taken once, at registration:
+    ///
+    /// * The operand kind has no order this build reproduces. `jsonb` is
+    ///   that kind: PostgreSQL's order over it is not the order of the
+    ///   canonical binary form. Its equality is fine, being equivalence of
+    ///   that form.
+    /// * The operands' collations describe a text comparison this build
+    ///   cannot reproduce, which the backend decides per operation. A
+    ///   locale ordering and a case-insensitive equality are both in that
+    ///   set, and answering them by byte would answer wrongly.
+    fn comparison_for<DB: DatabaseLike>(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        table_id: TableId,
+        database: &DB,
+        operation: crate::backend::TextOperation,
+    ) -> Result<ComparisonRef, RegisterError> {
+        use crate::backend::TextOperation;
+
+        let mut text_column = None;
+        let mut columns = alloc::vec::Vec::with_capacity(2);
+        for side in [left, right] {
+            let Some(column) =
+                crate::compiler::literals::resolve_column_ref(side, table_id, database)
+            else {
+                continue;
+            };
+            let kind = crate::catalog_helpers::column_builtin_kind(database, table_id, column);
+            columns.push((column, kind));
+            match kind {
+                Some(crate::backend::BuiltinKind::Jsonb)
+                    if operation == TextOperation::Ordering =>
+                {
+                    return Err(RegisterError::NotServedInProcess(
+                        crate::errors::Refusal::OrderNotReproducible {
+                            column,
+                            kind: crate::backend::BuiltinKind::Jsonb,
+                        },
+                    ));
+                }
+                Some(crate::backend::BuiltinKind::String) => text_column = Some(column),
+                _ => {}
+            }
+        }
+
+        // Two columns of different kinds: served only where this backend
+        // has a widening for the pair. Nothing coerces silently, because a
+        // coercion the engine does not perform is a wrong answer, and the
+        // engines differ on which pairs they widen and how.
+        if let [(left_column, Some(left_kind)), (right_column, Some(right_kind))] = columns[..] {
+            if left_kind != right_kind && B::numeric_widening(left_kind, right_kind).is_none() {
+                return Err(RegisterError::NotServedInProcess(
+                    crate::errors::Refusal::CrossKindComparison {
+                        left: left_column,
+                        left_kind,
+                        right: right_column,
+                        right_kind,
+                    },
+                ));
+            }
+        }
+
+        let reference = ComparisonRef::new(
+            self.intern_comparison(left, table_id, database),
+            self.intern_comparison(right, table_id, database),
+        );
+        let Some(column) = text_column else {
+            return Ok(reference);
+        };
+
+        let context = crate::backend::ComparisonContext {
+            left: reference
+                .left
+                .and_then(|slot| self.comparisons.get(usize::from(slot))),
+            right: reference
+                .right
+                .and_then(|slot| self.comparisons.get(usize::from(slot))),
+            // The rule is what this call resolves; it is not an input.
+            text: None,
+        };
+        let Some(rule) = B::text_rule(&context, operation) else {
+            let collation = match &self.comparisons[usize::from(
+                reference
+                    .left
+                    .or(reference.right)
+                    .expect("a text column interned its facts"),
+            )]
+            .collation
+            {
+                crate::backend::CollationFacts::Named { name, .. } => Some(name.name.clone()),
+                crate::backend::CollationFacts::DatabaseDefault
+                | crate::backend::CollationFacts::Unknown => None,
+            };
+            return Err(RegisterError::NotServedInProcess(
+                crate::errors::Refusal::CollationNotReproducible { column, collation },
+            ));
+        };
+        Ok(reference.with_text(Some(rule)))
     }
 }
 
@@ -148,30 +281,6 @@ impl SqlTableName {
             qualified,
         })
     }
-}
-
-/// Resolve the comparison facts of every column a compiled program loads.
-///
-/// One catalog pass per registration, so no comparison consults the catalog
-/// per row. A column the catalog cannot classify carries no facts and
-/// compares structurally, which is what an unresolvable column did before.
-fn resolve_column_comparisons<B, DB>(
-    program: &mut BytecodeProgram<B>,
-    table_id: TableId,
-    database: &DB,
-) where
-    B: Backend,
-    DB: DatabaseLike,
-{
-    let comparisons = program
-        .dependency_columns
-        .iter()
-        .filter_map(|column| {
-            crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, *column)
-                .map(|facts| (*column, facts))
-        })
-        .collect();
-    program.set_column_comparisons(comparisons);
 }
 
 /// Parse and compile a subscription SQL statement into bytecode.
@@ -296,12 +405,9 @@ where
                 &SqlValue::Boolean(true),
                 BuiltinKind::Bool.into(),
             )?)];
-            wrap_bare_value_as_tri::<B>(&mut instructions)?;
+            wrap_bare_value_as_tri::<B>(&mut instructions, ComparisonRef::NONE)?;
             (BytecodeProgram::new(instructions), Vec::new())
         };
-
-    let mut program = program;
-    resolve_column_comparisons::<B, DB>(&mut program, pq.table_id, database);
 
     let prefilter_plan =
         build_prefilter_plan::<B, DB>(pq.where_clause.as_ref(), pq.table_id, database);
@@ -384,11 +490,9 @@ where
             &SqlValue::Boolean(true),
             BuiltinKind::Bool.into(),
         )?)];
-        wrap_bare_value_as_tri::<B>(&mut instructions)?;
+        wrap_bare_value_as_tri::<B>(&mut instructions, ComparisonRef::NONE)?;
         BytecodeProgram::new(instructions)
     };
-    let mut where_program = where_program;
-    resolve_column_comparisons::<B, DB>(&mut where_program, table_id, database);
     let where_dependency_columns = where_program.dependency_columns.clone();
     Ok(TableAndWhereDeps {
         table_id,

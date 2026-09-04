@@ -1550,6 +1550,7 @@ where
         session: Option<I::SessionId>,
         database_reads_per_consumer: bool,
     ) -> Result<Registered<E::Backend>, RegisterError> {
+        // Routed on the cause, not on the sentence describing it.
         if database_reads_per_consumer
             && matches!(refusal, Refusal::RowSecurityNeedsPerConsumerRead { .. })
         {
@@ -1588,7 +1589,11 @@ where
                 self.persist_reads_after_change(subscription_id)?;
                 Ok(registered)
             }
-            // No tier can serve it either, so the compiler's refusal stands.
+            // No tier can serve it either, so the registration is refused
+            // outright. `NotServedInProcess` never reaches a caller as an
+            // error: it says a read will answer this, which is the opposite
+            // of what happened here, so the cause is rendered as the
+            // unsupported-SQL refusal it now is.
             Err(_) => Err(RegisterError::UnsupportedSql(
                 Self::lift_refusal(refusal).to_string(),
             )),

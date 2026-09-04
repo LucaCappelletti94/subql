@@ -16,6 +16,11 @@ use subql::backend::Postgres;
 use subql::backend::{
     Backend, BuiltinKind, Carried, CustomScalars, ScalarKind, ScalarKindOf, Value,
 };
+use subql::backend::{NumericWidening, TextOperation, TextRule};
+use subql::compiler::vm::arithmetic::checked_integer_binary;
+use subql::compiler::vm::refusal::{
+    ArithmeticOp, DanglingEscape, DivisionByZero, EvaluationRefusal, IntegerOverflow, LikeEscape,
+};
 use subql::compiler::SqlLiteralParse;
 use subql::testing::TestEvent;
 use subql::{
@@ -101,57 +106,43 @@ impl CustomScalars for MyScalars {
 struct Custom;
 
 impl Backend for Custom {
-    const LIKE_ESCAPE: Option<subql::compiler::vm::refusal::LikeEscape> =
-        Some(subql::compiler::vm::refusal::LikeEscape {
-            character: '\\',
-            dangling: subql::compiler::vm::refusal::DanglingEscape::Fails,
-        });
+    /// This backend speaks the PostgreSQL dialect, so it takes
+    /// PostgreSQL's `LIKE` escape rule with it.
+    const LIKE_ESCAPE: Option<LikeEscape> = Some(LikeEscape {
+        character: '\\',
+        dangling: DanglingEscape::Fails,
+    });
 
-    /// The fixtures raise on a zero divisor, as PostgreSQL does.
-    const DIVISION_BY_ZERO: subql::compiler::vm::refusal::DivisionByZero =
-        subql::compiler::vm::refusal::DivisionByZero::Fails;
+    /// PostgreSQL's dialect, so PostgreSQL's rule.
+    const DIVISION_BY_ZERO: DivisionByZero = DivisionByZero::Fails;
 
-    /// The fixtures use the standard integer carrier, so the shared
-    /// checked arithmetic serves, raising as PostgreSQL does.
+    /// This backend carries its integers in `i64`, so it takes the checked
+    /// arithmetic, and it speaks the PostgreSQL dialect, which raises on
+    /// overflow.
     fn integer_binary(
-        operation: subql::compiler::vm::refusal::ArithmeticOp,
+        operation: ArithmeticOp,
         left: i64,
         right: i64,
-    ) -> Result<Value<Self>, subql::compiler::vm::refusal::EvaluationRefusal> {
-        subql::compiler::vm::arithmetic::checked_integer_binary(
-            subql::compiler::vm::refusal::IntegerOverflow::Fails,
-            operation,
-            left,
-            right,
-        )
+    ) -> Result<Value<Self>, EvaluationRefusal> {
+        checked_integer_binary(IntegerOverflow::Fails, operation, left, right)
     }
 
-    fn integer_negate(
-        value: i64,
-    ) -> Result<Value<Self>, subql::compiler::vm::refusal::EvaluationRefusal> {
-        subql::compiler::vm::arithmetic::checked_integer_binary(
-            subql::compiler::vm::refusal::IntegerOverflow::Fails,
-            subql::compiler::vm::refusal::ArithmeticOp::Negate,
-            value,
-            value,
-        )
+    fn integer_negate(value: i64) -> Result<Value<Self>, EvaluationRefusal> {
+        checked_integer_binary(IntegerOverflow::Fails, ArithmeticOp::Negate, value, 0)
     }
 
     /// No cross-kind numeric comparison: this backend's fixtures compare
     /// same-kind values only.
-    fn numeric_widening(
-        _left: subql::backend::BuiltinKind,
-        _right: subql::backend::BuiltinKind,
-    ) -> Option<subql::backend::NumericWidening> {
+    fn numeric_widening(_left: BuiltinKind, _right: BuiltinKind) -> Option<NumericWidening> {
         None
     }
 
     /// Byte comparison, which is all this backend's fixtures need.
     fn text_rule(
         _comparison: &subql::backend::ComparisonContext<'_, Self>,
-        _operation: subql::backend::TextOperation,
-    ) -> Option<subql::backend::TextRule> {
-        Some(subql::backend::TextRule::EXACT)
+        _operation: TextOperation,
+    ) -> Option<TextRule> {
+        Some(TextRule::EXACT)
     }
 
     type Dialect = PostgreSqlDialect;

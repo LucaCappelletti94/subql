@@ -30,10 +30,11 @@ use sql_traits::{
     structs::{AlgorithmId, SchemaFingerprint},
 };
 
-/// Shard format version. v8: a stored bytecode program carries the comparison
-/// facts of every column it loads. v7: full fingerprint envelope replaced the
-/// legacy `u64` field.
-const SHARD_VERSION: u16 = 8;
+/// Shard format version. v9: a stored comparison carries the text rule
+/// resolved for its operation, so no evaluation consults a collation. v8: a
+/// stored bytecode program carries the comparison facts of every column it
+/// loads. v7: full fingerprint envelope replaced the legacy `u64` field.
+const SHARD_VERSION: u16 = 9;
 
 /// Hard cap for decompressed shard payload size (defense in depth).
 ///
@@ -632,7 +633,7 @@ mod tests {
 
     /// Every envelope field roundtrips through the on-wire header.
     #[test]
-    fn test_v8_envelope_roundtrip() {
+    fn test_v9_envelope_roundtrip() {
         let catalog = make_catalog();
         let tid = fixture_table_id(&catalog);
         let payload = shard_payload_with_consumers(vec![1, 2, 3], 42);
@@ -640,7 +641,7 @@ mod tests {
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
         let (header, _) = deserialize_shard::<DefaultIds, _>(&bytes, &catalog).unwrap();
 
-        assert_eq!(header.version, 8);
+        assert_eq!(header.version, 9);
         assert_eq!(header.fingerprint.algorithm_id, ALGORITHM_ID_SHA2_256);
         assert_eq!(header.fingerprint.canonicalization_version, 1);
         assert_eq!(header.fingerprint.profile_id, 1);
@@ -662,7 +663,7 @@ mod tests {
         let payload = empty_shard_payload(1);
         let bytes = serialize_shard(tid, &payload, &catalog).unwrap();
 
-        for stored in [6_u16, 7] {
+        for stored in [6_u16, 7, 8] {
             let tampered = tamper_shard_header(&bytes, |hdr| {
                 hdr.version = stored;
             });
@@ -671,10 +672,10 @@ mod tests {
             assert!(
                 matches!(
                     &result,
-                    Err(StorageError::VersionMismatch { expected: 8, got })
+                    Err(StorageError::VersionMismatch { expected: 9, got })
                         if *got == stored
                 ),
-                "expected VersionMismatch{{expected: 8, got: {stored}}}, got {result:?}"
+                "expected VersionMismatch{{expected: 9, got: {stored}}}, got {result:?}"
             );
         }
     }

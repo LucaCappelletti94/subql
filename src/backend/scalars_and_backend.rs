@@ -263,77 +263,35 @@ pub trait Backend: 'static {
         (!value.is_missing()).then_some(value)
     }
 
-    /// Whether two scalars are equal for this backend, given both operands'
-    /// catalog facts.
+    /// The default `LIKE` escape for this engine, or `None` when it gives
+    /// `LIKE` no default escape.
     ///
-    /// The default is the structural same-scalar rule and reads no facts. A
-    /// backend whose engine disagrees (PostgreSQL NaN, a collation the
-    /// comparator can reproduce, `char(n)` padding, a cross-width numeric
-    /// pair) overrides this and reads the context, which is why the context
-    /// carries both sides rather than one.
+    /// Required rather than defaulted, because there is no rule that is
+    /// right for an unknown engine: PostgreSQL and MySQL escape with a
+    /// backslash, SQLite escapes with nothing, and guessing either way
+    /// answers some pattern wrongly.
+    ///
+    /// One answer rather than two constants: an engine with no default
+    /// escape cannot have a dangling one, so the two facts belong together.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape>;
+
+    /// How this backend answers one text comparison in process, or `None`
+    /// when no in-process comparison reproduces it and the statement must
+    /// take a database read.
+    ///
+    /// Asked per operation because reproducibility does not factor per
+    /// column: PostgreSQL's default collation has byte equality and locale
+    /// ordering at once. Resolved once per comparison at registration and
+    /// carried in the compiled program, so no row consults a collation.
+    ///
+    /// Required rather than defaulted: byte comparison is right for some
+    /// engines and silently wrong for others, and guessing is the defect
+    /// this answers.
     #[must_use]
-    fn scalars_equal(
-        _comparison: super::scalar_value::ComparisonContext<'_, Self>,
-        left: &Value<Self>,
-        right: &Value<Self>,
-    ) -> bool
-    where
-        Self: Sized,
-    {
-        crate::compiler::value_cmp::structural_equality(left, right)
-    }
-
-    /// How two scalars order for this backend, or `None` when the pair has
-    /// no defined order, which the caller lifts to `Tri::Unknown`.
-    ///
-    /// Same contract as [`Backend::scalars_equal`].
-    #[must_use]
-    fn compare_scalars(
-        _comparison: super::scalar_value::ComparisonContext<'_, Self>,
-        left: &Value<Self>,
-        right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering>
-    where
-        Self: Sized,
-    {
-        crate::compiler::value_cmp::structural_ordering(left, right)
-    }
-
-    /// What this backend answers when a divisor is zero.
-    ///
-    /// Required rather than defaulted, because the engines disagree:
-    /// measured, PostgreSQL raises `division by zero` for `/` and `%` alike
-    /// and for every numeric type, while MySQL and SQLite answer `NULL`.
-    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero;
-
-    /// This backend's checked integer arithmetic, or the failure it raises.
-    ///
-    /// Required rather than defaulted, because the engines disagree:
-    /// measured, PostgreSQL and MySQL raise `out of range` while SQLite
-    /// promotes the result to a real. A backend on the standard `i64`
-    /// carrier delegates to
-    /// [`checked_integer_binary`](crate::compiler::vm::arithmetic::checked_integer_binary)
-    /// with its own overflow rule.
-    ///
-    /// # Errors
-    ///
-    /// The refusal this backend's engine raises for the operation.
-    fn integer_binary(
-        operation: crate::compiler::vm::refusal::ArithmeticOp,
-        left: Self::Int,
-        right: Self::Int,
-    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal>
-    where
-        Self: Sized;
-
-    /// As [`Backend::integer_binary`], for unary negation.
-    ///
-    /// # Errors
-    ///
-    /// The refusal this backend's engine raises for `-i64::MIN`.
-    fn integer_negate(
-        value: Self::Int,
-    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal>
+    fn text_rule(
+        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
+        operation: crate::backend::TextOperation,
+    ) -> Option<crate::backend::TextRule>
     where
         Self: Sized;
 
@@ -378,33 +336,79 @@ pub trait Backend: 'static {
         None
     }
 
-    /// How this backend answers one text comparison in process, or `None`
-    /// when no in-process comparison reproduces it and the statement must
-    /// take a database read.
+    /// What this backend answers when a divisor is zero.
     ///
-    /// Asked per operation because reproducibility does not factor per
-    /// column: PostgreSQL's default collation has byte equality and locale
-    /// ordering at once. Resolved at registration, so a refusal is a
-    /// classification rather than a wrong answer per row.
+    /// Required, and per backend, because the engines disagree: measured,
+    /// PostgreSQL raises `division by zero` for `/` and `%` alike and for
+    /// every numeric type, while MySQL and SQLite answer `NULL`.
+    const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero;
+
+    /// Integer `+`, `-` or `*` as this backend answers it, including what
+    /// it answers when the result does not fit.
     ///
-    /// Required rather than defaulted: byte comparison is right for some
-    /// engines and silently wrong for others, and guessing is the defect
-    /// this replaces.
-    #[must_use]
-    fn text_rule(
-        comparison: &super::scalar_value::ComparisonContext<'_, Self>,
-        operation: super::scalar_value::TextOperation,
-    ) -> Option<super::scalar_value::TextRule>
+    /// Required, and per backend, because the engines disagree: measured,
+    /// PostgreSQL and MySQL raise `out of range` while SQLite promotes the
+    /// result to a real. A backend on the standard `i64` carrier delegates
+    /// to [`crate::compiler::vm::arithmetic::checked_integer_binary`].
+    ///
+    /// # Errors
+    ///
+    /// The failure this backend's engine raises, which the caller reports
+    /// per subscription rather than folding into `Value::Null`.
+    fn integer_binary(
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
+        left: Self::Int,
+        right: Self::Int,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal>
     where
         Self: Sized;
 
-    /// This engine's default `LIKE` escape, and what a dangling one does,
-    /// or `None` when the engine has no default escape.
+    /// Integer unary `-`, same contract as [`Backend::integer_binary`].
     ///
-    /// The two facts travel together because an engine with no default
-    /// escape cannot have a dangling one, which makes that a type-level
-    /// fact rather than an unused second answer.
-    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape>;
+    /// # Errors
+    ///
+    /// The failure this backend's engine raises.
+    fn integer_negate(
+        value: Self::Int,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal>
+    where
+        Self: Sized;
+
+    /// Whether two scalars are equal for this backend, given both operands'
+    /// catalog facts.
+    ///
+    /// The default is the structural same-scalar rule and reads no facts. A
+    /// backend whose engine disagrees (PostgreSQL NaN, a collation the
+    /// comparator can reproduce, `char(n)` padding, a cross-width numeric
+    /// pair) overrides this and reads the context, which is why the context
+    /// carries both sides rather than one.
+    #[must_use]
+    fn scalars_equal(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        crate::compiler::value_cmp::structural_equality(comparison, left, right)
+    }
+
+    /// How two scalars order for this backend, or `None` when the pair has
+    /// no defined order, which the caller lifts to `Tri::Unknown`.
+    ///
+    /// Same contract as [`Backend::scalars_equal`].
+    #[must_use]
+    fn compare_scalars(
+        comparison: super::scalar_value::ComparisonContext<'_, Self>,
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering>
+    where
+        Self: Sized,
+    {
+        crate::compiler::value_cmp::structural_ordering(comparison, left, right)
+    }
 
     /// SQL parser dialect for this backend.
     type Dialect: sqlparser::dialect::Dialect;

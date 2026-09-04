@@ -2,6 +2,7 @@
 
 use super::{Compiling, MAX_TERMS_PER_FILTER};
 use crate::backend::{Backend, BuiltinKind, ScalarKindOf, Value};
+use crate::compiler::bytecode::ComparisonRef;
 use crate::compiler::literals::{resolve_column_ref, SqlLiteralParse};
 use crate::compiler::{canonicalize, sql_shape, BytecodeProgram, Instruction};
 use crate::term::{term_columns, CompiledTerm};
@@ -58,146 +59,25 @@ fn nested_column_scalar_of<B: Backend, DB: DatabaseLike>(
     }
 }
 
-/// Refuse a comparison between two columns of different kinds that this
-/// backend does not widen.
-///
-/// The widening is the engine's, and the engines disagree: against a float
-/// PostgreSQL and MySQL cast to `double precision` while SQLite compares
-/// exactly. Nothing coerces silently here, because a coercion the engine
-/// does not perform is a wrong answer.
-fn refuse_unwidened_pair<B: Backend, DB: DatabaseLike>(
-    operands: [&Expr; 2],
-    table_id: TableId,
-    database: &DB,
-) -> Result<(), RegisterError> {
-    let sides: Vec<(crate::ColumnId, BuiltinKind)> = operands
-        .iter()
-        .filter_map(|side| {
-            let column = resolve_column_ref(side, table_id, database)?;
-            let kind = crate::catalog_helpers::column_builtin_kind(database, table_id, column)?;
-            Some((column, kind))
-        })
-        .collect();
-    let [(left, left_kind), (right, right_kind)] = sides[..] else {
-        return Ok(());
-    };
-    if left_kind == right_kind || B::numeric_widening(left_kind, right_kind).is_some() {
-        return Ok(());
-    }
-    Err(RegisterError::NotServedInProcess(
-        crate::errors::Refusal::CrossKindComparison {
-            left,
-            left_kind,
-            right,
-            right_kind,
-        },
-    ))
-}
-
-/// Refuse a text comparison the backend does not reproduce in process.
-///
-/// Asked per operation, because reproducibility does not factor per column:
-/// PostgreSQL's default collation has byte equality and locale ordering at
-/// once, so `name = 'a'` is served while `name < 'B'` is not. Resolved here,
-/// at registration, so the statement takes a database read rather than
-/// answering every row with the wrong rule.
-fn refuse_unreproducible_text<B: Backend, DB: DatabaseLike>(
-    operands: [&Expr; 2],
-    operation: crate::backend::TextOperation,
-    table_id: TableId,
-    database: &DB,
-) -> Result<(), RegisterError> {
-    let facts: Vec<(crate::ColumnId, crate::backend::ColumnComparisonOf<B>)> = operands
-        .iter()
-        .filter_map(|side| {
-            let column = resolve_column_ref(side, table_id, database)?;
-            let facts =
-                crate::catalog_helpers::column_comparison::<B, DB>(database, table_id, column)?;
-            Some((column, facts))
-        })
-        .collect();
-    if !facts
-        .iter()
-        .any(|(_, facts)| facts.kind.as_builtin() == Some(BuiltinKind::String))
-    {
-        return Ok(());
-    }
-    let context = crate::backend::ComparisonContext {
-        left: facts.first().map(|(_, facts)| facts),
-        right: facts.get(1).map(|(_, facts)| facts),
-    };
-    if B::text_rule(&context, operation).is_some() {
-        return Ok(());
-    }
-    let (column, facts) = facts
-        .first()
-        .expect("a text operand resolved its facts above");
-    let collation = match &facts.collation {
-        crate::backend::CollationFacts::Named { name, .. } => Some(name.name.clone()),
-        crate::backend::CollationFacts::DatabaseDefault
-        | crate::backend::CollationFacts::Unknown => None,
-    };
-    Err(RegisterError::NotServedInProcess(
-        crate::errors::Refusal::CollationNotReproducible {
-            column: *column,
-            collation,
-        },
-    ))
-}
-
-/// Refuse an ordered comparison whose operand kind has no order this build
-/// reproduces.
-///
-/// `jsonb` is that kind. PostgreSQL's order over it is neither the order of
-/// the canonical binary form nor a byte order at all: its string arm follows
-/// the database collation. Answering such a comparison in process would
-/// answer it differently from the server, so the statement is classified at
-/// registration and served by a database read instead.
-///
-/// Equality is unaffected, being equivalence of the canonical form, which
-/// the encoder already reproduces.
-fn refuse_unordered_kind<DB: DatabaseLike>(
-    operands: [&Expr; 2],
-    table_id: TableId,
-    database: &DB,
-) -> Result<(), RegisterError> {
-    for side in operands {
-        let Some(column) = resolve_column_ref(side, table_id, database) else {
-            continue;
-        };
-        if crate::catalog_helpers::column_builtin_kind(database, table_id, column)
-            == Some(BuiltinKind::Jsonb)
-        {
-            return Err(RegisterError::NotServedInProcess(
-                crate::errors::Refusal::OrderNotReproducible {
-                    column,
-                    kind: BuiltinKind::Jsonb,
-                },
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Return `true` if `instr` produces a [`crate::compiler::Tri`] on the
 /// stack. Used to detect whether a top-level WHERE program leaves a
 /// boolean at TOS or needs to be wrapped with `= true`.
 const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
     matches!(
         instr,
-        Instruction::Equal
-            | Instruction::NotEqual
-            | Instruction::LessThan
-            | Instruction::LessThanOrEqual
-            | Instruction::GreaterThan
-            | Instruction::GreaterThanOrEqual
+        Instruction::Equal(_)
+            | Instruction::NotEqual(_)
+            | Instruction::LessThan(_)
+            | Instruction::LessThanOrEqual(_)
+            | Instruction::GreaterThan(_)
+            | Instruction::GreaterThanOrEqual(_)
             | Instruction::IsNull
             | Instruction::IsNotNull
             | Instruction::And
             | Instruction::Or
             | Instruction::Not
-            | Instruction::In(_)
-            | Instruction::Between
+            | Instruction::In { .. }
+            | Instruction::Between { .. }
             | Instruction::Like { .. }
             | Instruction::JumpIfFalse(_)
             | Instruction::JumpIfTrue(_)
@@ -212,6 +92,7 @@ const fn instruction_is_tri_typed<B: Backend>(instr: &Instruction<B>) -> bool {
 /// A no-op when the trailing instruction already produces a Tri.
 pub(super) fn wrap_bare_value_as_tri<B>(
     instructions: &mut Vec<Instruction<B>>,
+    comparison: ComparisonRef,
 ) -> Result<(), RegisterError>
 where
     B: Backend + SqlLiteralParse,
@@ -223,7 +104,7 @@ where
                 &SqlValue::Boolean(true),
                 BuiltinKind::Bool.into(),
             )?));
-            instructions.push(Instruction::Equal);
+            instructions.push(Instruction::Equal(comparison));
             Ok(())
         }
         None => Err(RegisterError::UnsupportedSql(
@@ -261,10 +142,14 @@ where
         0,
         BuiltinKind::String.into(),
     )?;
-    wrap_bare_value_as_tri::<B>(&mut compiling)?;
+    let bare = ComparisonRef::new(compiling.intern_comparison(expr, table_id, database), None);
+    wrap_bare_value_as_tri::<B>(&mut compiling.out, bare)?;
     let terms = canonicalize_term_slots(&mut compiling, canonicalizer)?;
     let columns = term_columns(&terms);
-    Ok((BytecodeProgram::with_terms(compiling.out, columns), terms))
+    Ok((
+        BytecodeProgram::with_comparisons(compiling.out, columns, compiling.comparisons),
+        terms,
+    ))
 }
 
 /// Renumber the term slots into normalized-text order and rewrite the
@@ -450,39 +335,70 @@ where
                         child_target,
                     )?;
 
+                    // Interned inside the comparison arms only: an
+                    // arithmetic instruction cannot reference a descriptor, so
+                    // resolving one for its operands would persist facts no
+                    // comparison reads.
                     match op {
-                        BinaryOperator::Eq | BinaryOperator::NotEq => {
-                            refuse_unwidened_pair::<B, DB>([left, right], table_id, database)?;
-                            refuse_unreproducible_text::<B, DB>(
-                                [left, right],
+                        BinaryOperator::Eq => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
                                 crate::backend::TextOperation::Equality,
-                                table_id,
-                                database,
                             )?;
-                            out.push(if matches!(op, BinaryOperator::Eq) {
-                                Instruction::Equal
-                            } else {
-                                Instruction::NotEqual
-                            });
+                            out.push(Instruction::Equal(cmp));
                         }
-                        BinaryOperator::Lt
-                        | BinaryOperator::LtEq
-                        | BinaryOperator::Gt
-                        | BinaryOperator::GtEq => {
-                            refuse_unordered_kind::<DB>([left, right], table_id, database)?;
-                            refuse_unwidened_pair::<B, DB>([left, right], table_id, database)?;
-                            refuse_unreproducible_text::<B, DB>(
-                                [left, right],
-                                crate::backend::TextOperation::Ordering,
+                        BinaryOperator::NotEq => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
                                 table_id,
                                 database,
+                                crate::backend::TextOperation::Equality,
                             )?;
-                            out.push(match op {
-                                BinaryOperator::Lt => Instruction::LessThan,
-                                BinaryOperator::LtEq => Instruction::LessThanOrEqual,
-                                BinaryOperator::Gt => Instruction::GreaterThan,
-                                _ => Instruction::GreaterThanOrEqual,
-                            });
+                            out.push(Instruction::NotEqual(cmp));
+                        }
+                        BinaryOperator::Lt => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Ordering,
+                            )?;
+                            out.push(Instruction::LessThan(cmp));
+                        }
+                        BinaryOperator::LtEq => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Ordering,
+                            )?;
+                            out.push(Instruction::LessThanOrEqual(cmp));
+                        }
+                        BinaryOperator::Gt => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Ordering,
+                            )?;
+                            out.push(Instruction::GreaterThan(cmp));
+                        }
+                        BinaryOperator::GtEq => {
+                            let cmp = out.comparison_for(
+                                left,
+                                right,
+                                table_id,
+                                database,
+                                crate::backend::TextOperation::Ordering,
+                            )?;
+                            out.push(Instruction::GreaterThanOrEqual(cmp));
                         }
 
                         BinaryOperator::Plus => out.push(Instruction::Add),
@@ -564,7 +480,11 @@ where
                 }
             }
 
-            out.push(Instruction::In(literals));
+            let tested = out.intern_comparison(expr, table_id, database);
+            out.push(Instruction::In {
+                literals,
+                comparison: ComparisonRef::new(tested, None),
+            });
 
             if *negated {
                 out.push(Instruction::Not);
@@ -639,23 +559,6 @@ where
             high,
             negated,
         } => {
-            // A range is two ordered comparisons, so the same classification
-            // applies to each bound.
-            refuse_unordered_kind::<DB>([expr, low], table_id, database)?;
-            refuse_unordered_kind::<DB>([expr, high], table_id, database)?;
-            refuse_unreproducible_text::<B, DB>(
-                [expr, low],
-                crate::backend::TextOperation::Ordering,
-                table_id,
-                database,
-            )?;
-            refuse_unreproducible_text::<B, DB>(
-                [expr, high],
-                crate::backend::TextOperation::Ordering,
-                table_id,
-                database,
-            )?;
-
             let range_target = column_scalar_of::<B, DB>(expr, table_id, database)
                 .unwrap_or_else(|| BuiltinKind::String.into());
 
@@ -678,7 +581,20 @@ where
                 range_target,
             )?;
 
-            out.push(Instruction::Between);
+            // Two ordered comparisons, so the same classification applies:
+            // the lower bound's pair carries it for both.
+            let lower = out.comparison_for(
+                expr,
+                low,
+                table_id,
+                database,
+                crate::backend::TextOperation::Ordering,
+            )?;
+            let high_facts = out.intern_comparison(high, table_id, database);
+            out.push(Instruction::Between {
+                lower,
+                upper: ComparisonRef::new(lower.left, high_facts),
+            });
 
             if *negated {
                 out.push(Instruction::Not);
@@ -782,14 +698,16 @@ where
                 BuiltinKind::String.into(),
             )?;
 
-            refuse_unreproducible_text::<B, DB>(
-                [expr, pattern],
-                crate::backend::TextOperation::Pattern,
+            let cmp = out.comparison_for(
+                expr,
+                pattern,
                 table_id,
                 database,
+                crate::backend::TextOperation::Pattern,
             )?;
             out.push(Instruction::Like {
                 case_sensitive: true,
+                comparison: cmp,
             });
 
             if *negated {
@@ -827,14 +745,16 @@ where
                 BuiltinKind::String.into(),
             )?;
 
-            refuse_unreproducible_text::<B, DB>(
-                [expr, pattern],
-                crate::backend::TextOperation::Pattern,
+            let cmp = out.comparison_for(
+                expr,
+                pattern,
                 table_id,
                 database,
+                crate::backend::TextOperation::Pattern,
             )?;
             out.push(Instruction::Like {
                 case_sensitive: false,
+                comparison: cmp,
             });
 
             if *negated {

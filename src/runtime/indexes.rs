@@ -360,6 +360,8 @@ impl HybridIndexes {
         value: &IndexableCell,
         out: &mut RoaringBitmap,
     ) {
+        // Ranges are numeric, so a cell of any other scalar is not a
+        // candidate for one.
         let Some(numeric) = NumericValue::from_indexable(value) else {
             return;
         };

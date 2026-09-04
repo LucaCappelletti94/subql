@@ -65,7 +65,8 @@ pub enum CatalogError {
 /// Carries only backend-independent data, because this type is not generic
 /// and a custom backend scalar kind cannot cross it. A cause whose operands
 /// are builtin travels whole; a cause naming a custom kind has to be built in
-/// generic code instead.
+/// generic code instead, which is where the collation and cross-kind reasons
+/// will be produced.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Refusal {
@@ -142,10 +143,12 @@ pub enum RegisterError {
     #[error("Unsupported SQL: {0}")]
     UnsupportedSql(String),
 
-    /// The compiler can register the statement, but the in-process evaluator
-    /// cannot answer it, so a tier that reads the database has to. Lifted to
-    /// [`NotServed<B>`](crate::NotServed) at the engine boundary, widening a
-    /// builtin kind into that backend's scalar kind.
+    /// The in-process evaluator cannot answer this form, naming the cause so
+    /// the engine routes on it and a caller branches on it.
+    ///
+    /// The engine catches this, plans a read, and lifts the cause into
+    /// [`NotServed<B>`](crate::NotServed), widening a builtin kind into that
+    /// backend's scalar kind.
     #[error("{0}")]
     NotServedInProcess(Refusal),
 

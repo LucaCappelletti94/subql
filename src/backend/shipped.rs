@@ -8,10 +8,23 @@ use super::scalar_value::{
 };
 use super::{
     Backend, BuiltinKind, ColumnComparisonOf, GroupKeyEncoder, NoCustomScalars, NumericWidening,
-    ScalarKindOf, SqliteJson, TextOperation, TextRule, Value,
+    ScalarKindOf, SqliteJson, TextRule, Value,
 };
 use alloc::string::ToString;
 
+/// How PostgreSQL reads trailing spaces for one text comparison.
+///
+/// Measured on 16.11, with a `char(5)` column holding `ab` (so stored as
+/// `ab   `) and a `varchar`/`text` column holding `ab   `:
+///
+/// | left   | right             | answer for `=`               |
+/// |--------|-------------------|------------------------------|
+/// | `char` | `char`            | trailing spaces ignored      |
+/// | `char` | literal           | trailing spaces ignored      |
+/// | `char` | `varchar`         | trailing spaces ignored      |
+/// | `char` | `text`            | `char` side stripped, then exact |
+/// | other  | other             | exact                        |
+///
 /// The `text` row is not an inconsistency: converting `char` to `text`
 /// strips the padding, and `text` comparison is then exact. So a `char`
 /// against `text` answers `false` for `ab` versus `ab   `, while the same
@@ -55,53 +68,15 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::Fails;
 
-    /// Measured: PostgreSQL raises `bigint out of range`.
-    fn integer_binary(
-        operation: crate::compiler::vm::refusal::ArithmeticOp,
-        left: i64,
-        right: i64,
-    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
-        crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::refusal::IntegerOverflow::Fails,
-            operation,
-            left,
-            right,
-        )
-    }
+    type Custom = NoCustomScalars<Self>;
 
-    fn integer_negate(
-        value: i64,
-    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
-        crate::compiler::vm::arithmetic::checked_integer_binary(
-            crate::compiler::vm::refusal::IntegerOverflow::Fails,
-            crate::compiler::vm::refusal::ArithmeticOp::Negate,
-            value,
-            value,
-        )
-    }
-
-    /// Measured: against a float, both engines cast the other operand to
-    /// `double precision`, so two integers `f64` cannot separate compare
-    /// equal. Against a decimal an integer compares exactly.
-    fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
-        match (left, right) {
-            (BuiltinKind::Float, BuiltinKind::Int | BuiltinKind::Decimal)
-            | (BuiltinKind::Int | BuiltinKind::Decimal, BuiltinKind::Float) => {
-                Some(NumericWidening::AtFloatWidth)
-            }
-            (BuiltinKind::Int, BuiltinKind::Decimal) | (BuiltinKind::Decimal, BuiltinKind::Int) => {
-                Some(NumericWidening::Exact)
-            }
-            _ => None,
-        }
-    }
-
-    fn compare_cross_kind_numeric(
-        left: &Value<Self>,
-        right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering> {
-        crate::backend::cross_kind_numeric_ordering(left, right)
-    }
+    /// Measured: a backslash escapes, and a pattern ending with one is
+    /// refused once the matcher reaches it with input still to read.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
+        Some(crate::compiler::vm::refusal::LikeEscape {
+            character: '\\',
+            dangling: crate::compiler::vm::refusal::DanglingEscape::Fails,
+        });
 
     /// Measured on 16.11. Equality under a deterministic collation is byte
     /// equality, including for the database default, since `CREATE
@@ -132,15 +107,52 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
         })
     }
 
-    /// Measured: a backslash escapes, and a pattern ending with one
-    /// raises `LIKE pattern must not end with escape character`.
-    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
-        Some(crate::compiler::vm::refusal::LikeEscape {
-            character: '\\',
-            dangling: crate::compiler::vm::refusal::DanglingEscape::Fails,
-        });
+    /// Measured: PostgreSQL raises `bigint out of range`.
+    fn integer_binary(
+        operation: crate::compiler::vm::refusal::ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            operation,
+            left,
+            right,
+        )
+    }
 
-    type Custom = NoCustomScalars<Self>;
+    fn integer_negate(
+        value: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::refusal::EvaluationRefusal> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::refusal::IntegerOverflow::Fails,
+            crate::compiler::vm::refusal::ArithmeticOp::Negate,
+            value,
+            0,
+        )
+    }
+
+    /// Measured: a float operand puts the comparison at `double precision`
+    /// width, and an integer against a decimal is exact.
+    fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
+        match (left, right) {
+            (BuiltinKind::Float, BuiltinKind::Int | BuiltinKind::Decimal)
+            | (BuiltinKind::Int | BuiltinKind::Decimal, BuiltinKind::Float) => {
+                Some(NumericWidening::AtFloatWidth)
+            }
+            (BuiltinKind::Int, BuiltinKind::Decimal) | (BuiltinKind::Decimal, BuiltinKind::Int) => {
+                Some(NumericWidening::Exact)
+            }
+            _ => None,
+        }
+    }
+
+    fn compare_cross_kind_numeric(
+        left: &Value<Self>,
+        right: &Value<Self>,
+    ) -> Option<core::cmp::Ordering> {
+        crate::backend::cross_kind_numeric_ordering(left, right)
+    }
 
     /// PostgreSQL's own float rule: NaN equals NaN. IEEE, which is what
     /// `PartialOrd` on `f64` implements, says a NaN equals nothing, so
@@ -158,18 +170,21 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
             (Value::Float(x), Value::Float(y)) if x.is_nan() || y.is_nan() => {
                 x.is_nan() && y.is_nan()
             }
+            // The rule was resolved at registration, so no collation is
+            // consulted here. Its absence means the comparison came from a
+            // path that carries no facts, such as extreme maintenance,
+            // where byte comparison is the standing behaviour.
             (Value::String(x), Value::String(y)) => {
-                Self::text_rule(&comparison, TextOperation::Equality)
-                    .unwrap_or(TextRule::EXACT)
-                    .equal(x, y)
+                comparison.text.unwrap_or(TextRule::EXACT).equal(x, y)
             }
-            _ => crate::compiler::value_cmp::structural_equality(left, right),
+            _ => crate::compiler::value_cmp::structural_equality(comparison, left, right),
         }
     }
 
     /// NaN is PostgreSQL's largest float: above every non-NaN value, and
     /// equal to another NaN. IEEE leaves every such pair unordered, which
-    /// answered `Tri::Unknown` and dropped the row.
+    /// answered `Tri::Unknown` and dropped the row. Text ordering reads
+    /// trailing spaces the same way equality does.
     fn compare_scalars(
         comparison: super::scalar_value::ComparisonContext<'_, Self>,
         left: &Value<Self>,
@@ -185,12 +200,7 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
                     core::cmp::Ordering::Less
                 })
             }
-            (Value::String(x), Value::String(y)) => Some(
-                Self::text_rule(&comparison, TextOperation::Ordering)
-                    .unwrap_or(TextRule::EXACT)
-                    .compare(x, y),
-            ),
-            _ => crate::compiler::value_cmp::structural_ordering(left, right),
+            _ => crate::compiler::value_cmp::structural_ordering(comparison, left, right),
         }
     }
 
@@ -250,11 +260,25 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
-    /// Measured: MySQL answers `NULL`.
+    type Custom = NoCustomScalars<Self>;
+
+    /// Measured: a backslash escapes, and a pattern ending with one
+    /// answers 0 whether or not input remains, so it never raises.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
+        Some(crate::compiler::vm::refusal::LikeEscape {
+            character: '\\',
+            dangling: crate::compiler::vm::refusal::DanglingEscape::NoMatch,
+        });
+
+    /// Measured: MySQL answers `NULL` with warning 1365, even with
+    /// `ERROR_FOR_DIVISION_BY_ZERO` in `sql_mode`, which raises on writes.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
-    /// Measured: MySQL raises `BIGINT value is out of range`.
+    /// Measured: MySQL raises `BIGINT value is out of range`. Its unary
+    /// minus on the smallest integer promotes past `i64` instead, which is
+    /// reported as a failure here rather than answered from a number this
+    /// carrier cannot hold.
     fn integer_binary(
         operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: i64,
@@ -275,13 +299,12 @@ impl Backend for MySql {
             crate::compiler::vm::refusal::IntegerOverflow::Fails,
             crate::compiler::vm::refusal::ArithmeticOp::Negate,
             value,
-            value,
+            0,
         )
     }
 
-    /// Measured: against a float, both engines cast the other operand to
-    /// `double precision`, so two integers `f64` cannot separate compare
-    /// equal. Against a decimal an integer compares exactly.
+    /// Measured: a float operand puts the comparison at `double precision`
+    /// width, and an integer against a decimal is exact.
     fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
         match (left, right) {
             (BuiltinKind::Float, BuiltinKind::Int | BuiltinKind::Decimal)
@@ -300,39 +323,6 @@ impl Backend for MySql {
         right: &Value<Self>,
     ) -> Option<core::cmp::Ordering> {
         crate::backend::cross_kind_numeric_ordering(left, right)
-    }
-
-    /// A `PAD SPACE` collation ignores trailing spaces on both sides, which
-    /// no structural comparison reproduces.
-    fn scalars_equal(
-        comparison: super::scalar_value::ComparisonContext<'_, Self>,
-        left: &Value<Self>,
-        right: &Value<Self>,
-    ) -> bool {
-        match (left, right) {
-            (Value::String(x), Value::String(y)) => {
-                Self::text_rule(&comparison, TextOperation::Equality)
-                    .unwrap_or(TextRule::EXACT)
-                    .equal(x, y)
-            }
-            _ => crate::compiler::value_cmp::structural_equality(left, right),
-        }
-    }
-
-    /// Ordering reads trailing spaces the same way equality does.
-    fn compare_scalars(
-        comparison: super::scalar_value::ComparisonContext<'_, Self>,
-        left: &Value<Self>,
-        right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering> {
-        match (left, right) {
-            (Value::String(x), Value::String(y)) => Some(
-                Self::text_rule(&comparison, TextOperation::Ordering)
-                    .unwrap_or(TextRule::EXACT)
-                    .compare(x, y),
-            ),
-            _ => crate::compiler::value_cmp::structural_ordering(left, right),
-        }
     }
 
     /// Measured on 8.4.11: only the binary collations are reproducible.
@@ -359,16 +349,6 @@ impl Backend for MySql {
             .and_then(mysql_binary_text_rule)
             .or(Some(TextRule::EXACT))
     }
-
-    /// Measured: a backslash escapes, and a pattern ending with one
-    /// answers no-match whether or not input remains.
-    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> =
-        Some(crate::compiler::vm::refusal::LikeEscape {
-            character: '\\',
-            dangling: crate::compiler::vm::refusal::DanglingEscape::NoMatch,
-        });
-
-    type Custom = NoCustomScalars<Self>;
 
     fn group_key_encoder(
         columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,
@@ -432,11 +412,13 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    type Custom = NoCustomScalars<Self>;
+
     /// Measured: SQLite answers `NULL`.
     const DIVISION_BY_ZERO: crate::compiler::vm::refusal::DivisionByZero =
         crate::compiler::vm::refusal::DivisionByZero::IsNull;
 
-    /// Measured: SQLite carries the overflowed result as a real.
+    /// Measured: SQLite carries an overflowed integer result as a real.
     fn integer_binary(
         operation: crate::compiler::vm::refusal::ArithmeticOp,
         left: i64,
@@ -457,12 +439,14 @@ impl Backend for SQLite {
             crate::compiler::vm::refusal::IntegerOverflow::PromotesToFloat,
             crate::compiler::vm::refusal::ArithmeticOp::Negate,
             value,
-            value,
+            0,
         )
     }
 
-    /// Measured: SQLite compares an integer against a real without
-    /// rounding either, so the pair is exact. It has no decimal type.
+    /// SQLite compares an integer against a real without rounding either,
+    /// measured: `9007199254740993 = 9007199254740992.0` is 0 where the
+    /// other two engines answer 1. It has no decimal type, so a decimal
+    /// operand has no measured rule and is not served.
     fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {
         match (left, right) {
             (BuiltinKind::Int, BuiltinKind::Float) | (BuiltinKind::Float, BuiltinKind::Int) => {
@@ -472,44 +456,15 @@ impl Backend for SQLite {
         }
     }
 
+    /// SQLite gives `LIKE` no default escape: a backslash in a pattern
+    /// matches a backslash, so no pattern can end with one dangling.
+    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> = None;
+
     fn compare_cross_kind_numeric(
         left: &Value<Self>,
         right: &Value<Self>,
     ) -> Option<core::cmp::Ordering> {
         crate::backend::cross_kind_numeric_ordering(left, right)
-    }
-
-    /// `NOCASE` folds ASCII case and `RTRIM` ignores trailing spaces, and
-    /// no structural comparison reproduces either.
-    fn scalars_equal(
-        comparison: super::scalar_value::ComparisonContext<'_, Self>,
-        left: &Value<Self>,
-        right: &Value<Self>,
-    ) -> bool {
-        match (left, right) {
-            (Value::String(x), Value::String(y)) => {
-                Self::text_rule(&comparison, TextOperation::Equality)
-                    .unwrap_or(TextRule::EXACT)
-                    .equal(x, y)
-            }
-            _ => crate::compiler::value_cmp::structural_equality(left, right),
-        }
-    }
-
-    /// Ordering reads the collation the same way equality does.
-    fn compare_scalars(
-        comparison: super::scalar_value::ComparisonContext<'_, Self>,
-        left: &Value<Self>,
-        right: &Value<Self>,
-    ) -> Option<core::cmp::Ordering> {
-        match (left, right) {
-            (Value::String(x), Value::String(y)) => Some(
-                Self::text_rule(&comparison, TextOperation::Ordering)
-                    .unwrap_or(TextRule::EXACT)
-                    .compare(x, y),
-            ),
-            _ => crate::compiler::value_cmp::structural_ordering(left, right),
-        }
     }
 
     /// SQLite's three built-in collations are all exactly reproducible,
@@ -527,12 +482,6 @@ impl Backend for SQLite {
         }
         Some(rule)
     }
-
-    /// SQLite gives `LIKE` no default escape: a backslash in a pattern
-    /// matches a backslash, so no pattern can end with one dangling.
-    const LIKE_ESCAPE: Option<crate::compiler::vm::refusal::LikeEscape> = None;
-
-    type Custom = NoCustomScalars<Self>;
 
     fn group_key_encoder(
         columns: alloc::vec::Vec<ColumnComparisonOf<Self>>,

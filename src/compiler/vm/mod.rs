@@ -31,11 +31,11 @@ pub mod arithmetic;
 pub mod refusal;
 
 use super::{
+    bytecode::ComparisonRef,
     value_cmp::{compare_ordered_values, values_equal},
     BytecodeProgram, Instruction, Tri,
 };
 use crate::backend::{Backend, CdcEvent, ComparisonContext, RowKind, Value};
-use crate::ColumnId;
 use alloc::vec::Vec;
 use arithmetic::{
     arithmetic_add, arithmetic_divide, arithmetic_modulo, arithmetic_multiply, arithmetic_negate,
@@ -44,15 +44,19 @@ use arithmetic::{
 use refusal::{DanglingEscape, EvaluationRefusal, LikeEscape};
 use sql_traits::prelude::DatabaseLike;
 
-/// One arithmetic instruction's operation, which either answers or reports
-/// what the engine refuses.
-type BinaryValueOp<B> = fn(Value<B>, Value<B>) -> Result<Value<B>, refusal::EvaluationRefusal>;
+/// A binary arithmetic operation the target engine may refuse.
+type FallibleBinaryOp<B> = fn(Value<B>, Value<B>) -> Result<Value<B>, EvaluationRefusal>;
+
+/// The unary form of [`FallibleBinaryOp`].
+type FallibleUnaryOp<B> = fn(Value<B>) -> Result<Value<B>, EvaluationRefusal>;
 
 /// VM evaluation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmError {
-    /// The target engine refuses this evaluation, so no answer exists to
-    /// give. Reported per subscription rather than failing the dispatch.
+    /// The target engine refuses this evaluation. Not a program defect:
+    /// the caller reports it against the subscription whose predicate
+    /// asked, and every other subscription on the same event is
+    /// unaffected.
     Refused(refusal::EvaluationRefusal),
 
     /// Popped from an empty stack.
@@ -97,10 +101,8 @@ pub enum VmError {
 /// arithmetic instructions. `Tri(_)` variants come from comparison,
 /// null-check, and logical instructions.
 enum StackValue<B: Backend> {
-    /// Scalar value, with the column it was loaded from when it came from
-    /// one. The provenance is what lets a comparison consult the compared
-    /// columns' catalog facts without a per-row lookup.
-    Value(Value<B>, Option<ColumnId>),
+    /// Scalar value (from literals, column loads, or arithmetic results).
+    Value(Value<B>),
     /// Tri-state boolean (from comparisons, null checks, or logical ops).
     Tri(Tri),
 }
@@ -112,7 +114,7 @@ enum StackValue<B: Backend> {
 impl<B: Backend> Clone for StackValue<B> {
     fn clone(&self) -> Self {
         match self {
-            Self::Value(v, column) => Self::Value(v.clone(), *column),
+            Self::Value(v) => Self::Value(v.clone()),
             Self::Tri(t) => Self::Tri(*t),
         }
     }
@@ -121,7 +123,7 @@ impl<B: Backend> Clone for StackValue<B> {
 impl<B: Backend> core::fmt::Debug for StackValue<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Value(v, column) => f.debug_tuple("Value").field(v).field(column).finish(),
+            Self::Value(v) => f.debug_tuple("Value").field(v).finish(),
             Self::Tri(t) => f.debug_tuple("Tri").field(t).finish(),
         }
     }
@@ -130,7 +132,7 @@ impl<B: Backend> core::fmt::Debug for StackValue<B> {
 impl<B: Backend> PartialEq for StackValue<B> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Value(a, left), Self::Value(b, right)) => a == b && left == right,
+            (Self::Value(a), Self::Value(b)) => a == b,
             (Self::Tri(a), Self::Tri(b)) => a == b,
             _ => false,
         }
@@ -282,7 +284,7 @@ impl<B: Backend> Vm<B> {
                     Err(VmError::MalformedProgram)
                 }
             }
-            Some(StackValue::Value(v, _)) => {
+            Some(StackValue::Value(v)) => {
                 // Bare `Null` / `Missing` at TOS is a legitimate `WHERE NULL`
                 // (or a `value_at` that returned `Value::Missing` fed
                 // straight into the WHERE): both collapse to `Unknown`.
@@ -314,50 +316,54 @@ impl<B: Backend> Vm<B> {
     {
         match instruction {
             Instruction::PushLiteral(value) => {
-                self.stack.push(StackValue::Value(value.clone(), None));
+                self.stack.push(StackValue::Value(value.clone()));
             }
 
             Instruction::LoadColumn(col_id) => {
                 let value = event.value_at(db, row, *col_id).map_err(VmError::Value)?;
-                // Recorded here, where the cell is read: a predicate that
-                // short-circuits before this load has nothing absent.
                 if value.is_missing() && self.absent_column.is_none() {
                     self.absent_column = Some(*col_id);
                 }
-                self.stack.push(StackValue::Value(value, Some(*col_id)));
+                self.stack.push(StackValue::Value(value));
             }
 
-            Instruction::Equal => {
-                let result = self.compare_values(program, |ctx, a, b| values_equal(ctx, a, b))?;
-                self.stack.push(StackValue::Tri(result));
-            }
-
-            Instruction::NotEqual => {
-                let result = self.compare_values(program, |ctx, a, b| !values_equal(ctx, a, b))?;
-                self.stack.push(StackValue::Tri(result));
-            }
-
-            Instruction::LessThan => {
+            Instruction::Equal(comparison) => {
                 let result =
-                    self.compare_ordered(program, |ord| matches!(ord, core::cmp::Ordering::Less))?;
+                    self.compare_values(program, *comparison, |ctx, a, b| values_equal(ctx, a, b))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
-            Instruction::LessThanOrEqual => {
+            Instruction::NotEqual(comparison) => {
                 let result = self
-                    .compare_ordered(program, |ord| !matches!(ord, core::cmp::Ordering::Greater))?;
+                    .compare_values(program, *comparison, |ctx, a, b| !values_equal(ctx, a, b))?;
                 self.stack.push(StackValue::Tri(result));
             }
 
-            Instruction::GreaterThan => {
-                let result = self
-                    .compare_ordered(program, |ord| matches!(ord, core::cmp::Ordering::Greater))?;
+            Instruction::LessThan(comparison) => {
+                let result = self.compare_ordered(program, *comparison, |ord| {
+                    matches!(ord, core::cmp::Ordering::Less)
+                })?;
                 self.stack.push(StackValue::Tri(result));
             }
 
-            Instruction::GreaterThanOrEqual => {
-                let result =
-                    self.compare_ordered(program, |ord| !matches!(ord, core::cmp::Ordering::Less))?;
+            Instruction::LessThanOrEqual(comparison) => {
+                let result = self.compare_ordered(program, *comparison, |ord| {
+                    !matches!(ord, core::cmp::Ordering::Greater)
+                })?;
+                self.stack.push(StackValue::Tri(result));
+            }
+
+            Instruction::GreaterThan(comparison) => {
+                let result = self.compare_ordered(program, *comparison, |ord| {
+                    matches!(ord, core::cmp::Ordering::Greater)
+                })?;
+                self.stack.push(StackValue::Tri(result));
+            }
+
+            Instruction::GreaterThanOrEqual(comparison) => {
+                let result = self.compare_ordered(program, *comparison, |ord| {
+                    !matches!(ord, core::cmp::Ordering::Less)
+                })?;
                 self.stack.push(StackValue::Tri(result));
             }
 
@@ -398,9 +404,12 @@ impl<B: Backend> Vm<B> {
                 self.stack.push(StackValue::Tri(a.not()));
             }
 
-            Instruction::In(literals) => {
-                let (value, origin) = self.pop_operand()?;
-                let ctx = comparison_context(program, origin, None);
+            Instruction::In {
+                literals,
+                comparison,
+            } => {
+                let value = self.pop_value()?;
+                let ctx = comparison_context(program, *comparison)?;
 
                 if value.is_absent() {
                     self.stack.push(StackValue::Tri(Tri::Unknown));
@@ -429,10 +438,13 @@ impl<B: Backend> Vm<B> {
                 self.stack.push(StackValue::Tri(result));
             }
 
-            Instruction::Between => {
-                let (upper, upper_origin) = self.pop_operand()?;
-                let (lower, lower_origin) = self.pop_operand()?;
-                let (value, origin) = self.pop_operand()?;
+            Instruction::Between {
+                lower: lower_facts,
+                upper: upper_facts,
+            } => {
+                let upper = self.pop_value()?;
+                let lower = self.pop_value()?;
+                let value = self.pop_value()?;
 
                 if value.is_absent() || lower.is_absent() || upper.is_absent() {
                     self.stack.push(StackValue::Tri(Tri::Unknown));
@@ -440,13 +452,13 @@ impl<B: Backend> Vm<B> {
                 }
 
                 let ge_lower = compare_ordered_values(
-                    comparison_context(program, origin, lower_origin),
+                    comparison_context(program, *lower_facts)?,
                     &value,
                     &lower,
                     |ord| !matches!(ord, core::cmp::Ordering::Less),
                 );
                 let le_upper = compare_ordered_values(
-                    comparison_context(program, origin, upper_origin),
+                    comparison_context(program, *upper_facts)?,
                     &value,
                     &upper,
                     |ord| !matches!(ord, core::cmp::Ordering::Greater),
@@ -456,7 +468,10 @@ impl<B: Backend> Vm<B> {
                 self.stack.push(StackValue::Tri(result));
             }
 
-            Instruction::Like { case_sensitive } => {
+            Instruction::Like {
+                case_sensitive,
+                comparison: _,
+            } => {
                 let pattern = self.pop_value()?;
                 let string = self.pop_value()?;
 
@@ -515,11 +530,7 @@ impl<B: Backend> Vm<B> {
             Instruction::Divide => self.execute_binary_value_op(arithmetic_divide::<B>)?,
             Instruction::Modulo => self.execute_binary_value_op(arithmetic_modulo::<B>)?,
 
-            Instruction::Negate => {
-                let a = self.pop_value()?;
-                let result = arithmetic_negate::<B>(a).map_err(VmError::Refused)?;
-                self.stack.push(StackValue::Value(result, None));
-            }
+            Instruction::Negate => self.execute_unary_value_op(arithmetic_negate::<B>)?,
 
             // Jumps are handled in eval() before execute() is called.
             Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_) => {}
@@ -536,29 +547,25 @@ impl<B: Backend> Vm<B> {
         Ok(())
     }
 
-    fn execute_binary_value_op(&mut self, op: BinaryValueOp<B>) -> Result<(), VmError> {
+    fn execute_binary_value_op(&mut self, op: FallibleBinaryOp<B>) -> Result<(), VmError> {
         let b = self.pop_value()?;
         let a = self.pop_value()?;
-        let value = op(a, b).map_err(VmError::Refused)?;
-        self.stack.push(StackValue::Value(value, None));
+        self.stack
+            .push(StackValue::Value(op(a, b).map_err(VmError::Refused)?));
         Ok(())
     }
 
-    /// Pop a value together with the column it was loaded from, when any.
-    fn pop_operand(&mut self) -> Result<(Value<B>, Option<ColumnId>), VmError> {
-        match self.stack.pop() {
-            Some(StackValue::Value(v, column)) => Ok((v, column)),
-            Some(StackValue::Tri(_)) => Err(VmError::TypeMismatch {
-                expected: "Value",
-                got: "Tri",
-            }),
-            None => Err(VmError::StackUnderflow),
-        }
+    /// The same for a fallible unary operation.
+    fn execute_unary_value_op(&mut self, op: FallibleUnaryOp<B>) -> Result<(), VmError> {
+        let a = self.pop_value()?;
+        self.stack
+            .push(StackValue::Value(op(a).map_err(VmError::Refused)?));
+        Ok(())
     }
 
     fn pop_value(&mut self) -> Result<Value<B>, VmError> {
         match self.stack.pop() {
-            Some(StackValue::Value(v, _)) => Ok(v),
+            Some(StackValue::Value(v)) => Ok(v),
             Some(StackValue::Tri(_)) => Err(VmError::TypeMismatch {
                 expected: "Value",
                 got: "Tri",
@@ -574,8 +581,8 @@ impl<B: Backend> Vm<B> {
             // (`NULL AND true` = `Unknown`). Concrete scalar values are
             // NOT, the compiler must lower boolean columns via an
             // explicit comparison. `Bool` on the stack is a compiler bug.
-            Some(StackValue::Value(v, _)) if v.is_absent() => Ok(Tri::Unknown),
-            Some(StackValue::Value(_, _)) => Err(VmError::TypeMismatch {
+            Some(StackValue::Value(v)) if v.is_absent() => Ok(Tri::Unknown),
+            Some(StackValue::Value(_)) => Err(VmError::TypeMismatch {
                 expected: "Tri",
                 got: "Value",
             }),
@@ -586,8 +593,8 @@ impl<B: Backend> Vm<B> {
     fn peek_tri(&self) -> Result<Tri, VmError> {
         match self.stack.last() {
             Some(StackValue::Tri(t)) => Ok(*t),
-            Some(StackValue::Value(v, _)) if v.is_absent() => Ok(Tri::Unknown),
-            Some(StackValue::Value(_, _)) => Err(VmError::TypeMismatch {
+            Some(StackValue::Value(v)) if v.is_absent() => Ok(Tri::Unknown),
+            Some(StackValue::Value(_)) => Err(VmError::TypeMismatch {
                 expected: "Tri",
                 got: "Value",
             }),
@@ -595,18 +602,23 @@ impl<B: Backend> Vm<B> {
         }
     }
 
-    fn compare_values<F>(&mut self, program: &BytecodeProgram<B>, f: F) -> Result<Tri, VmError>
+    fn compare_values<F>(
+        &mut self,
+        program: &BytecodeProgram<B>,
+        comparison: ComparisonRef,
+        f: F,
+    ) -> Result<Tri, VmError>
     where
         F: FnOnce(ComparisonContext<'_, B>, &Value<B>, &Value<B>) -> bool,
     {
-        let (b, right) = self.pop_operand()?;
-        let (a, left) = self.pop_operand()?;
+        let b = self.pop_value()?;
+        let a = self.pop_value()?;
 
         if a.is_absent() || b.is_absent() {
             return Ok(Tri::Unknown);
         }
 
-        let ctx = comparison_context(program, left, right);
+        let ctx = comparison_context(program, comparison)?;
         Ok(if f(ctx, &a, &b) {
             Tri::True
         } else {
@@ -614,14 +626,19 @@ impl<B: Backend> Vm<B> {
         })
     }
 
-    fn compare_ordered<F>(&mut self, program: &BytecodeProgram<B>, f: F) -> Result<Tri, VmError>
+    fn compare_ordered<F>(
+        &mut self,
+        program: &BytecodeProgram<B>,
+        comparison: ComparisonRef,
+        f: F,
+    ) -> Result<Tri, VmError>
     where
         F: FnOnce(core::cmp::Ordering) -> bool,
     {
-        let (b, right) = self.pop_operand()?;
-        let (a, left) = self.pop_operand()?;
+        let b = self.pop_value()?;
+        let a = self.pop_value()?;
         Ok(compare_ordered_values(
-            comparison_context(program, left, right),
+            comparison_context(program, comparison)?,
             &a,
             &b,
             f,
@@ -629,16 +646,27 @@ impl<B: Backend> Vm<B> {
     }
 }
 
-/// The comparison facts the program resolved for these two operands.
+/// The facts the compiler interned for one comparison's operands.
+///
+/// # Errors
+///
+/// [`VmError::MalformedProgram`] when either side names a slot the program
+/// does not carry.
 fn comparison_context<B: Backend>(
     program: &BytecodeProgram<B>,
-    left: Option<ColumnId>,
-    right: Option<ColumnId>,
-) -> ComparisonContext<'_, B> {
-    ComparisonContext {
-        left: left.and_then(|column| program.comparison_for(column)),
-        right: right.and_then(|column| program.comparison_for(column)),
-    }
+    comparison: ComparisonRef,
+) -> Result<ComparisonContext<'_, B>, VmError> {
+    Ok(ComparisonContext {
+        left: program
+            .comparison_at(comparison.left)
+            .map_err(|_| VmError::MalformedProgram)?,
+        right: program
+            .comparison_at(comparison.right)
+            .map_err(|_| VmError::MalformedProgram)?,
+        // Resolved at registration and carried by the instruction, so the
+        // comparator reads a rule rather than a collation.
+        text: comparison.text,
+    })
 }
 
 impl<B: Backend> Default for Vm<B> {
@@ -649,11 +677,12 @@ impl<B: Backend> Default for Vm<B> {
 
 // LIKE
 
-/// SQL `LIKE` pattern matching.
-///
-/// Supports `%` (zero or more characters) and `_` (exactly one character).
-/// Does not support `ESCAPE` clauses.
 /// One step of a compiled `LIKE` pattern.
+///
+/// Parsing the pattern before matching is what makes the escape rule a
+/// property of the pattern rather than of every step of the walk: once a
+/// character is escaped it is a [`Self::Literal`], indistinguishable from
+/// any other literal character.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PatternAtom {
     /// `%`: zero or more characters.
@@ -784,7 +813,7 @@ mod tests {
     //! `backend.rs` and the parser tests once Phase 4 lands.
 
     use super::arithmetic::is_zero_scalar;
-    use super::{Vm, VmError};
+    use super::{simple_like, ComparisonRef, PatternError, Vm, VmError};
     use crate::backend::{Postgres, RowKind, Value};
     use crate::compiler::{BytecodeProgram, Instruction, Tri};
     use crate::testing::TestEvent;
@@ -814,7 +843,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
         ]);
 
         let e = insert_pg(vec![Value::Int(25)]);
@@ -842,7 +871,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
         ]);
 
         let e = insert_pg(vec![Value::Null]);
@@ -858,7 +887,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(5), // out of range
             Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
         ]);
 
         let e = insert_pg(vec![Value::Int(25)]);
@@ -875,7 +904,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::String("5".into())),
-            Instruction::Equal,
+            Instruction::Equal(ComparisonRef::NONE),
         ]);
 
         let e = insert_pg(vec![Value::Int(5)]);
@@ -909,10 +938,13 @@ mod tests {
         let mut vm: Vm<Postgres> = Vm::new();
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
-            Instruction::In(vec![
-                Value::String("pending".into()),
-                Value::String("active".into()),
-            ]),
+            Instruction::In {
+                literals: vec![
+                    Value::String("pending".into()),
+                    Value::String("active".into()),
+                ],
+                comparison: ComparisonRef::NONE,
+            },
         ]);
 
         let e = insert_pg(vec![Value::String("pending".into())]);
@@ -937,7 +969,7 @@ mod tests {
             Instruction::PushLiteral(Value::Int(3)),
             Instruction::Add,
             Instruction::PushLiteral(Value::Int(10)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
         ]);
 
         let e = insert_pg(vec![Value::Int(8)]);
@@ -966,7 +998,7 @@ mod tests {
             Instruction::PushLiteral(Value::Int(0)),
             Instruction::Divide,
             Instruction::PushLiteral(Value::Int(1)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
         ]);
 
         let e = insert_pg(vec![Value::Int(10)]);
@@ -987,7 +1019,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(1)),
-            Instruction::Equal,
+            Instruction::Equal(ComparisonRef::NONE),
         ]);
         // Event has one PK column at index 1 (not 0), so RowKind::Pk lookup
         // on column 0 returns Missing per handoff design gotcha 3.
@@ -1014,6 +1046,7 @@ mod tests {
             Instruction::PushLiteral(Value::String("h%".into())),
             Instruction::Like {
                 case_sensitive: true,
+                comparison: ComparisonRef::NONE,
             },
         ]);
 
@@ -1097,7 +1130,7 @@ mod tests {
             vec![
                 Instruction::LoadColumn(0),
                 Instruction::PushLiteral(Value::Int(18)),
-                Instruction::GreaterThan,
+                Instruction::GreaterThan(ComparisonRef::NONE),
                 Instruction::JumpIfFalse(3),
                 Instruction::TermTruth(0),
                 Instruction::And,
@@ -1176,7 +1209,7 @@ mod tests {
         let program: BytecodeProgram<Postgres> = BytecodeProgram::new(vec![
             Instruction::LoadColumn(0),
             Instruction::PushLiteral(Value::Int(18)),
-            Instruction::GreaterThan,
+            Instruction::GreaterThan(ComparisonRef::NONE),
         ]);
         let e = insert_pg(vec![Value::Int(25)]);
 
@@ -1184,5 +1217,45 @@ mod tests {
             vm.eval(&program, &e, RowKind::New, &pg_catalog()),
             vm.eval_with_terms(&program, &e, RowKind::New, &pg_catalog(), &[]),
         );
+    }
+
+    /// A pattern whose last character is the escape character escapes
+    /// nothing, and PostgreSQL refuses it *only* once its matcher arrives
+    /// there with input still to read. The walk reports the same
+    /// condition, so the two cases are distinguishable rather than both
+    /// collapsed into a no-match.
+    #[test]
+    fn a_trailing_escape_is_reported_when_the_walk_reaches_it() {
+        assert_eq!(
+            simple_like("ab", r"a\", Some('\\')),
+            Err(PatternError::TrailingEscape),
+            "input remains when the matcher arrives, which is what PostgreSQL refuses"
+        );
+        assert_eq!(
+            simple_like("a", r"a\", Some('\\')),
+            Ok(false),
+            "the input ran out first, and PostgreSQL answers false rather than raising"
+        );
+        assert_eq!(
+            simple_like("axb", r"a%\", Some('\\')),
+            Err(PatternError::TrailingEscape),
+            "a wildcard ahead of it does not hide the dangling escape"
+        );
+    }
+
+    /// Without a default escape the same pattern is well formed: the
+    /// backslash is an ordinary character to be matched.
+    #[test]
+    fn a_trailing_backslash_is_ordinary_without_an_escape() {
+        assert_eq!(simple_like(r"a\", r"a\", None), Ok(true));
+        assert_eq!(simple_like("ab", r"a\", None), Ok(false));
+    }
+
+    /// The escape only escapes; it does not change what the wildcards mean
+    /// elsewhere in the pattern.
+    #[test]
+    fn escaping_one_wildcard_leaves_the_others_alone() {
+        assert_eq!(simple_like("a%xb", r"a\%%b", Some('\\')), Ok(true));
+        assert_eq!(simple_like("axxb", r"a\%%b", Some('\\')), Ok(false));
     }
 }

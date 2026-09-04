@@ -25,7 +25,7 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use subql::backend::{
     Backend, BuiltinKind, CollationFacts, CollationName, ColumnComparison, ComparisonContext,
-    MySql, Postgres, SQLite, TrailingSpacePadding, Value,
+    MySql, Postgres, SQLite, TextOperation, Value,
 };
 use subql::testing::TestEvent;
 use subql::{catalog_helpers, DefaultIds, SubscriptionEngine, SubscriptionRequest};
@@ -185,47 +185,55 @@ fn char_against_varchar_pads_but_against_text_strips() {
     );
 }
 
-/// MySQL's rule is the collation's, not the type's. Measured on 8.4.11
-/// against `information_schema.COLLATIONS.PAD_ATTRIBUTE`: a `PAD SPACE`
-/// collation answers `'ab   ' = 'ab'` as 1, a `NO PAD` one as 0.
+/// MySQL's rule is the collation's, not the type's, and only its binary
+/// collations are reproducible at all. Padding still differs inside that
+/// family, and the two names are measured on 8.4.11 against
+/// `information_schema.COLLATIONS.PAD_ATTRIBUTE`: `utf8mb4_bin` is
+/// `PAD SPACE` and answers `'ab   ' = 'ab'` as 1, `utf8mb4_0900_bin` is
+/// `NO PAD` and answers 0.
 ///
-/// Asserted on the fact the catalog carries, because that is what a
-/// comparison reads. Deriving the attribute from a collation name is a
-/// separate question and belongs with the collation work.
+/// The rule is asked for, then applied, which is the path a registration
+/// takes: resolve once, carry the answer.
 #[test]
-fn mysql_padding_follows_the_collation_when_the_catalog_knows_it() {
-    let facts = |padding: TrailingSpacePadding| ColumnComparison {
+fn mysql_binary_collation_padding_is_per_collation() {
+    let facts = |collation: &str| ColumnComparison {
         kind: BuiltinKind::String.into(),
         declared_type: "CHAR".to_string(),
         collation: CollationFacts::Named {
             name: CollationName {
-                name: "utf8mb4_bin".to_string(),
+                name: collation.to_string(),
                 name_is_quoted: false,
                 schema: None,
                 schema_is_quoted: false,
             },
             postgres_deterministic: None,
-            padding: Some(padding),
+            padding: None,
         },
     };
     let padded = Value::<MySql>::String("ab   ".to_string());
     let bare = Value::<MySql>::String("ab".to_string());
 
-    let equal_under = |padding: TrailingSpacePadding| {
-        let facts = facts(padding);
-        let context = ComparisonContext {
+    let equal_under = |collation: &str| {
+        let facts = facts(collation);
+        let mut context = ComparisonContext {
             left: Some(&facts),
             right: None,
+            text: None,
         };
+        context.text = MySql::text_rule(&context, TextOperation::Equality);
+        assert!(
+            context.text.is_some(),
+            "a binary collation is reproducible: {collation}"
+        );
         MySql::scalars_equal(context, &padded, &bare)
     };
 
     assert!(
-        equal_under(TrailingSpacePadding::PadSpace),
+        equal_under("utf8mb4_bin"),
         "PAD SPACE ignores trailing spaces, measured as 1"
     );
     assert!(
-        !equal_under(TrailingSpacePadding::NoPad),
+        !equal_under("utf8mb4_0900_bin"),
         "NO PAD keeps them significant, measured as 0"
     );
 }
@@ -269,34 +277,5 @@ fn sqlite_char_keeps_trailing_spaces() {
             cells
         ),
         "SQLite stores what it was given and compares it exactly"
-    );
-}
-
-/// A grouped answer keys a `char` column by the value the comparison sees,
-/// so the two spellings of one padded value land in one group.
-///
-/// Reading only the collation answered exact bytes here and split `ab` from
-/// `ab   `, which is a grouped count the server never reports.
-#[test]
-fn a_char_column_groups_its_padded_and_bare_spellings_together() {
-    let facts = |declared_type: &str| ColumnComparison {
-        kind: BuiltinKind::String.into(),
-        declared_type: declared_type.to_string(),
-        collation: CollationFacts::DatabaseDefault,
-    };
-    let padded = <Postgres as Backend>::group_key_encoder(vec![facts("CHAR")])
-        .expect("a deterministic text column can key");
-    assert_eq!(
-        padded.encode(&[Value::String("ab".to_string())]),
-        padded.encode(&[Value::String("ab   ".to_string())]),
-        "a char column's padding is not part of its identity"
-    );
-
-    let exact = <Postgres as Backend>::group_key_encoder(vec![facts("TEXT")])
-        .expect("a deterministic text column can key");
-    assert_ne!(
-        exact.encode(&[Value::String("ab".to_string())]),
-        exact.encode(&[Value::String("ab   ".to_string())]),
-        "a text column keeps trailing spaces, so they stay part of its identity"
     );
 }

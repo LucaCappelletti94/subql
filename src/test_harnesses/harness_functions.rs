@@ -12,7 +12,7 @@ use sql_traits::structs::ParserDB;
 use sqlparser::dialect::PostgreSqlDialect;
 
 use crate::backend::{Postgres, RowKind, Value};
-use crate::compiler::bytecode::{BytecodeProgram, Instruction};
+use crate::compiler::bytecode::{BytecodeProgram, ComparisonRef, Instruction};
 use crate::compiler::canonicalize::{hash_sql, normalize_sql};
 use crate::compiler::parser::parse_and_compile;
 use crate::compiler::vm::Vm;
@@ -63,17 +63,33 @@ pub fn arb_value(u: &mut Unstructured<'_>) -> arbitrary::Result<Value<Postgres>>
     }
 }
 
+/// Generate a [`ComparisonRef`] from fuzzer-controlled bytes.
+///
+/// Indices deliberately reach past any table a generated program carries, so
+/// the resolution path is fuzzed for out-of-range slots as well as valid ones.
+fn arb_comparison_ref(u: &mut Unstructured<'_>) -> arbitrary::Result<ComparisonRef> {
+    let side = |u: &mut Unstructured<'_>| -> arbitrary::Result<Option<u16>> {
+        Ok(match u.int_in_range(0u8..=3)? {
+            0 => None,
+            other => Some(u16::from(other) - 1),
+        })
+    };
+    let left = side(u)?;
+    let right = side(u)?;
+    Ok(ComparisonRef::new(left, right))
+}
+
 /// Generate an [`Instruction<Postgres>`] from fuzzer-controlled bytes.
 pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instruction<Postgres>> {
     match u.int_in_range(0u8..=23)? {
         0 => Ok(Instruction::PushLiteral(arb_value(u)?)),
         1 => Ok(Instruction::LoadColumn(u.int_in_range(0u16..=63)?)),
-        2 => Ok(Instruction::Equal),
-        3 => Ok(Instruction::NotEqual),
-        4 => Ok(Instruction::LessThan),
-        5 => Ok(Instruction::LessThanOrEqual),
-        6 => Ok(Instruction::GreaterThan),
-        7 => Ok(Instruction::GreaterThanOrEqual),
+        2 => Ok(Instruction::Equal(arb_comparison_ref(u)?)),
+        3 => Ok(Instruction::NotEqual(arb_comparison_ref(u)?)),
+        4 => Ok(Instruction::LessThan(arb_comparison_ref(u)?)),
+        5 => Ok(Instruction::LessThanOrEqual(arb_comparison_ref(u)?)),
+        6 => Ok(Instruction::GreaterThan(arb_comparison_ref(u)?)),
+        7 => Ok(Instruction::GreaterThanOrEqual(arb_comparison_ref(u)?)),
         8 => Ok(Instruction::IsNull),
         9 => Ok(Instruction::IsNotNull),
         10 => Ok(Instruction::And),
@@ -90,11 +106,18 @@ pub fn arb_instruction(u: &mut Unstructured<'_>) -> arbitrary::Result<Instructio
             let list: Vec<Value<Postgres>> = (0..len)
                 .map(|_| arb_value(u))
                 .collect::<arbitrary::Result<_>>()?;
-            Ok(Instruction::In(list))
+            Ok(Instruction::In {
+                literals: list,
+                comparison: arb_comparison_ref(u)?,
+            })
         }
-        20 => Ok(Instruction::Between),
+        20 => Ok(Instruction::Between {
+            lower: arb_comparison_ref(u)?,
+            upper: arb_comparison_ref(u)?,
+        }),
         21 => Ok(Instruction::Like {
             case_sensitive: bool::arbitrary(u)?,
+            comparison: arb_comparison_ref(u)?,
         }),
         // Jump instructions with bounded offsets (0..=31 to stay within any reasonable program)
         22 => Ok(Instruction::JumpIfFalse(u.int_in_range(0usize..=31)?)),
