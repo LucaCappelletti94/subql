@@ -103,6 +103,32 @@ struct Custom;
 impl Backend for Custom {
     const LIKE_DEFAULT_ESCAPE: Option<char> = Some('\\');
 
+    /// The fixtures use the standard integer carrier, so the shared
+    /// checked arithmetic serves, raising as PostgreSQL does.
+    fn integer_binary(
+        operation: subql::compiler::vm::arithmetic::ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, subql::compiler::vm::arithmetic::ArithmeticFailure> {
+        subql::compiler::vm::arithmetic::checked_integer_binary(
+            subql::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            operation,
+            left,
+            right,
+        )
+    }
+
+    fn integer_negate(
+        value: i64,
+    ) -> Result<Value<Self>, subql::compiler::vm::arithmetic::ArithmeticFailure> {
+        subql::compiler::vm::arithmetic::checked_integer_binary(
+            subql::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            subql::compiler::vm::arithmetic::ArithmeticOp::Negate,
+            value,
+            value,
+        )
+    }
+
     /// No cross-kind numeric comparison: this backend's fixtures compare
     /// same-kind values only.
     fn numeric_widening(

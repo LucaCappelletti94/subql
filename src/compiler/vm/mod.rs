@@ -27,7 +27,7 @@
 //!   `Tri` (that lift is backend-specific: Postgres `Bool = bool`, SQLite
 //!   `Bool = i64`).
 
-mod arithmetic;
+pub mod arithmetic;
 
 use super::{
     value_cmp::{compare_ordered_values, values_equal},
@@ -42,9 +42,17 @@ use arithmetic::{
 };
 use sql_traits::prelude::DatabaseLike;
 
+/// One arithmetic instruction's operation, which either answers or reports
+/// what the engine refuses.
+type BinaryValueOp<B> = fn(Value<B>, Value<B>) -> Result<Value<B>, arithmetic::ArithmeticFailure>;
+
 /// VM evaluation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmError {
+    /// The target engine refuses this evaluation, so no answer exists to
+    /// give. Reported per subscription rather than failing the dispatch.
+    Arithmetic(arithmetic::ArithmeticFailure),
+
     /// Popped from an empty stack.
     StackUnderflow,
 
@@ -466,7 +474,7 @@ impl<B: Backend> Vm<B> {
 
             Instruction::Negate => {
                 let a = self.pop_value()?;
-                let result = arithmetic_negate::<B>(a);
+                let result = arithmetic_negate::<B>(a).map_err(VmError::Arithmetic)?;
                 self.stack.push(StackValue::Value(result, None));
             }
 
@@ -485,13 +493,11 @@ impl<B: Backend> Vm<B> {
         Ok(())
     }
 
-    fn execute_binary_value_op(
-        &mut self,
-        op: fn(Value<B>, Value<B>) -> Value<B>,
-    ) -> Result<(), VmError> {
+    fn execute_binary_value_op(&mut self, op: BinaryValueOp<B>) -> Result<(), VmError> {
         let b = self.pop_value()?;
         let a = self.pop_value()?;
-        self.stack.push(StackValue::Value(op(a, b), None));
+        let value = op(a, b).map_err(VmError::Arithmetic)?;
+        self.stack.push(StackValue::Value(value, None));
         Ok(())
     }
 

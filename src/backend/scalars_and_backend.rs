@@ -299,6 +299,37 @@ pub trait Backend: 'static {
         crate::compiler::value_cmp::structural_ordering(left, right)
     }
 
+    /// This backend's checked integer arithmetic, or the failure it raises.
+    ///
+    /// Required rather than defaulted, because the engines disagree:
+    /// measured, PostgreSQL and MySQL raise `out of range` while SQLite
+    /// promotes the result to a real. A backend on the standard `i64`
+    /// carrier delegates to
+    /// [`checked_integer_binary`](crate::compiler::vm::arithmetic::checked_integer_binary)
+    /// with its own overflow rule.
+    ///
+    /// # Errors
+    ///
+    /// The refusal this backend's engine raises for the operation.
+    fn integer_binary(
+        operation: crate::compiler::vm::arithmetic::ArithmeticOp,
+        left: Self::Int,
+        right: Self::Int,
+    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure>
+    where
+        Self: Sized;
+
+    /// As [`Backend::integer_binary`], for unary negation.
+    ///
+    /// # Errors
+    ///
+    /// The refusal this backend's engine raises for `-i64::MIN`.
+    fn integer_negate(
+        value: Self::Int,
+    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure>
+    where
+        Self: Sized;
+
     /// How this backend reads a numeric pair whose operands are two
     /// different scalars, or `None` when it does not compare that pair at
     /// all, which classifies the comparison as a database read.

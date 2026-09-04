@@ -51,6 +51,31 @@ fn postgres_trailing_spaces<V: postgres_jsonb_canonical::PgVersion + 'static>(
 pub struct Postgres<V = postgres_jsonb_canonical::Pg18>(core::marker::PhantomData<V>);
 
 impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
+    /// Measured: PostgreSQL raises `bigint out of range`.
+    fn integer_binary(
+        operation: crate::compiler::vm::arithmetic::ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            operation,
+            left,
+            right,
+        )
+    }
+
+    fn integer_negate(
+        value: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            crate::compiler::vm::arithmetic::ArithmeticOp::Negate,
+            value,
+            value,
+        )
+    }
+
     /// Measured: against a float, both engines cast the other operand to
     /// `double precision`, so two integers `f64` cannot separate compare
     /// equal. Against a decimal an integer compares exactly.
@@ -216,6 +241,31 @@ impl<V: postgres_jsonb_canonical::PgVersion + 'static> Backend for Postgres<V> {
 pub struct MySql;
 
 impl Backend for MySql {
+    /// Measured: MySQL raises `BIGINT value is out of range`.
+    fn integer_binary(
+        operation: crate::compiler::vm::arithmetic::ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            operation,
+            left,
+            right,
+        )
+    }
+
+    fn integer_negate(
+        value: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::arithmetic::IntegerOverflow::Fails,
+            crate::compiler::vm::arithmetic::ArithmeticOp::Negate,
+            value,
+            value,
+        )
+    }
+
     /// Measured: against a float, both engines cast the other operand to
     /// `double precision`, so two integers `f64` cannot separate compare
     /// equal. Against a decimal an integer compares exactly.
@@ -364,6 +414,31 @@ impl Backend for MySql {
 pub struct SQLite;
 
 impl Backend for SQLite {
+    /// Measured: SQLite carries the overflowed result as a real.
+    fn integer_binary(
+        operation: crate::compiler::vm::arithmetic::ArithmeticOp,
+        left: i64,
+        right: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::arithmetic::IntegerOverflow::PromotesToFloat,
+            operation,
+            left,
+            right,
+        )
+    }
+
+    fn integer_negate(
+        value: i64,
+    ) -> Result<Value<Self>, crate::compiler::vm::arithmetic::ArithmeticFailure> {
+        crate::compiler::vm::arithmetic::checked_integer_binary(
+            crate::compiler::vm::arithmetic::IntegerOverflow::PromotesToFloat,
+            crate::compiler::vm::arithmetic::ArithmeticOp::Negate,
+            value,
+            value,
+        )
+    }
+
     /// Measured: SQLite compares an integer against a real without
     /// rounding either, so the pair is exact. It has no decimal type.
     fn numeric_widening(left: BuiltinKind, right: BuiltinKind) -> Option<NumericWidening> {

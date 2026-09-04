@@ -2034,6 +2034,7 @@ where
             updates: Vec::new(),
             triggers: alloc::vec![trigger],
             transitions: alloc::vec![transition],
+            evaluation_failures: Vec::new(),
         })
     }
 

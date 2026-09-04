@@ -20,8 +20,8 @@ pub use subscription_types::{DurabilityMode, MergeReport};
 pub use trait_definitions::{
     AggValue, AggregateDispatch, AggregateMaintenanceOutput, AggregateResultValue,
     AggregateValueChange, AggregateValueUpdate, AsyncSubscriptionDispatch, ConsumerNotifications,
-    ConsumerNotificationsIter, DispatchOutput, GroupIdentity, MaintenanceStopReason,
-    MaintenanceTransition, SubscriptionDispatch, SubscriptionRegistration,
+    ConsumerNotificationsIter, DispatchOutput, EvaluationFailure, GroupIdentity,
+    MaintenanceStopReason, MaintenanceTransition, SubscriptionDispatch, SubscriptionRegistration,
     SubscriptionUnregistration, TermNarrowing,
 };
 #[cfg(feature = "std")]

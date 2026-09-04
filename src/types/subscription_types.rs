@@ -655,13 +655,13 @@ impl<B: Backend> Clone for AggregateBootstrap<B> {
 
 /// Why an answer is maintained by a database read instead of in process.
 ///
-/// Typed so a caller branches rather than parsing prose: "a shared answer
-/// over this table would be one viewer's answer served to another" is a
-/// deployment fact, while "this aggregate reads a column the fold cannot
-/// carry" is a query fix, and the two used to arrive as the same `String`.
+/// Typed so a caller branches rather than parsing prose: "your column's
+/// collation is not reproducible in process, so this query now costs a round
+/// trip" is a deployment decision, while "this comparison mixes two column
+/// types" is a query fix, and the two used to arrive as the same `String`.
 ///
 /// Generic over the backend because a cause names a column's scalar kind, and
-/// a custom backend kind is not a [`BuiltinKind`](crate::backend::BuiltinKind).
+/// a custom backend kind is not a [`BuiltinKind`].
 ///
 /// [`Display`](core::fmt::Display) renders the sentence a caller logs today,
 /// so migrating is a match arm rather than a message change.
@@ -698,12 +698,12 @@ pub enum NotServed<B: Backend> {
     CollationNotReproducible {
         /// The compared column.
         column: ColumnId,
-        /// The collation as the catalog names it, or `None` for the
-        /// database default and for rules the catalog cannot name.
+        /// The collation as the catalog names it, or `None` when the catalog
+        /// reports the rules changed without naming them.
         collation: Option<String>,
     },
-    /// The comparison names two columns whose kinds this backend does not
-    /// reconcile in process.
+    /// The comparison mixes two column types the in-process comparator does
+    /// not reconcile, so the database's own coercion decides it.
     CrossKindComparison {
         /// Left operand column.
         left: ColumnId,
@@ -714,13 +714,13 @@ pub enum NotServed<B: Backend> {
         /// Right operand's declared scalar kind.
         right_kind: ScalarKindOf<B>,
     },
-    /// A form the compiler refused with prose rather than a structured
-    /// cause.
+    /// A form with no structured cause to report, carrying the compiler's own
+    /// words.
     UnsupportedSql(String),
 }
 
-/// A scalar kind as a refusal names it: a builtin by its own name, a custom
-/// kind by the embedder's `Debug`.
+/// Renders a scalar kind the way a refusal message names it: the builtin's
+/// own name, without the wrapper `Debug` would print.
 struct ScalarKindName<'a, B: Backend>(&'a ScalarKindOf<B>);
 
 impl<B: Backend> core::fmt::Display for ScalarKindName<'_, B> {

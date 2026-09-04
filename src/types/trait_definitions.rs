@@ -231,7 +231,41 @@ pub struct ConsumerNotifications<
     /// than because a row they read changed. Empty for every event on a table no
     /// membership subquery reads through.
     pub(crate) narrowings: Vec<TermNarrowing<B>>,
+    /// Subscriptions whose predicate the target engine refuses to evaluate
+    /// for this row, with the cause. Reported rather than folded into a
+    /// no-match, because `Value::Null` composes through `OR` and would turn
+    /// a refusal into a silent wrong answer.
+    pub(crate) evaluation_failures: Vec<EvaluationFailure<I>>,
 }
+
+/// One subscription's predicate that the target engine refuses to evaluate
+/// for one row.
+///
+/// Per subscription: a row that overflows one predicate's arithmetic leaves
+/// every other subscription reading the same event answered.
+#[derive(Clone, Copy, Debug)]
+pub struct EvaluationFailure<I: IdTypes> {
+    /// The subscription that could not be evaluated. One consumer can hold
+    /// several, so this and not the consumer is what identifies the failure.
+    pub subscription_id: crate::SubscriptionId,
+    /// The consumer that subscription belongs to.
+    pub consumer_id: I::ConsumerId,
+    /// What the engine refuses.
+    pub refusal: crate::compiler::vm::arithmetic::ArithmeticFailure,
+}
+
+// Hand-implemented for the same reason as `Value<B>`: `#[derive]` would
+// require `I: PartialEq`, which `IdTypes` does not imply, while the two
+// fields it compares are both comparable on their own.
+impl<I: IdTypes> PartialEq for EvaluationFailure<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.subscription_id == other.subscription_id
+            && self.consumer_id == other.consumer_id
+            && self.refusal == other.refusal
+    }
+}
+
+impl<I: IdTypes> Eq for EvaluationFailure<I> {}
 
 impl<I: IdTypes, C: Checkpoint, B: Backend> ConsumerNotifications<I, C, B> {
     /// No consumer notified, no checkpoint, no narrowing.
@@ -250,6 +284,7 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> ConsumerNotifications<I, C, B> {
             updated,
             checkpoint: None,
             narrowings: Vec::new(),
+            evaluation_failures: Vec::new(),
         }
     }
 
@@ -294,6 +329,20 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> ConsumerNotifications<I, C, B> {
         &self.narrowings
     }
 
+    /// The subscriptions whose predicate could not be evaluated for this
+    /// row, and why. Empty for every event whose predicates all answered.
+    #[must_use]
+    pub fn evaluation_failures(&self) -> &[EvaluationFailure<I>] {
+        &self.evaluation_failures
+    }
+
+    /// Attach the evaluation failures one event produced.
+    #[must_use]
+    pub(crate) fn with_evaluation_failures(mut self, failures: Vec<EvaluationFailure<I>>) -> Self {
+        self.evaluation_failures = failures;
+        self
+    }
+
     /// Attach the narrowings a membership change produced.
     #[must_use]
     pub(crate) fn with_narrowings(mut self, narrowings: Vec<TermNarrowing<B>>) -> Self {
@@ -318,6 +367,16 @@ impl<I: IdTypes, C: Checkpoint, B: Backend> core::fmt::Debug for ConsumerNotific
             .field("updated", &self.updated)
             .field("checkpoint", &self.checkpoint)
             .field("narrowings", &self.narrowings)
+            // `I::ConsumerId` carries no `Debug`, so the causes are what
+            // this can show; the ids are read through the accessor.
+            .field(
+                "evaluation_failures",
+                &self
+                    .evaluation_failures
+                    .iter()
+                    .map(|failure| failure.refusal)
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -458,6 +517,17 @@ pub struct AggregateMaintenanceOutput<
     pub triggers: Vec<crate::reexec::ReExecutionTrigger<I, C, B>>,
     /// Tier changes caused by this operation.
     pub transitions: Vec<MaintenanceTransition<B>>,
+    /// Subscriptions whose filter the engine refuses to evaluate for this
+    /// event, with the cause.
+    ///
+    /// No trigger and no tier change accompanies one: a database read would
+    /// raise the same error, so there is nothing for it to answer. The
+    /// subscription's fold is left exactly as it was, since the row was
+    /// never judged, and the next event is evaluated normally.
+    pub evaluation_failures: Vec<(
+        crate::SubscriptionId,
+        crate::compiler::vm::arithmetic::ArithmeticFailure,
+    )>,
 }
 
 impl<I: IdTypes, B: Backend, C: Checkpoint> AggregateMaintenanceOutput<I, B, C> {
@@ -466,6 +536,7 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> AggregateMaintenanceOutput<I, B, C> 
             updates: Vec::new(),
             triggers: Vec::new(),
             transitions: Vec::new(),
+            evaluation_failures: Vec::new(),
         }
     }
 }

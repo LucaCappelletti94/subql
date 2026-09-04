@@ -11,7 +11,7 @@ use super::{
 use crate::backend::{Backend, CdcEvent, RowKind};
 use crate::term::TermLookup;
 use crate::{
-    compiler::{sql_shape::QueryProjection, Tri, Vm, VmError},
+    compiler::{sql_shape::QueryProjection, vm::arithmetic::ArithmeticFailure, Tri, Vm, VmError},
     ConsumerNotifications, DispatchError, EventKind, IdTypes, SubscriptionId,
 };
 use alloc::vec::Vec;
@@ -30,6 +30,24 @@ fn dispatch_vm_error(error: VmError) -> DispatchError {
         VmError::Value(inner) => DispatchError::Value(inner),
         other => DispatchError::VmError(format!("{other:?}")),
     }
+}
+
+/// What a dispatch pass reports besides the notification sets: the
+/// subscriptions it could not evaluate, and those whose cell the event did
+/// not carry. Both are per subscription, and both are empty for almost
+/// every event, so they travel together rather than as two parameters.
+#[derive(Default)]
+struct DispatchReports {
+    refusals: Vec<(ConsumerOrdinal, SubscriptionId, ArithmeticFailure)>,
+}
+
+/// The four values every evaluation pass carries: which event, which row
+/// version of it, the VM to run, and the catalog to read cells through.
+struct EvalContext<'a, E: CdcEvent, DB: DatabaseLike> {
+    event: &'a E,
+    row: RowKind,
+    vm: &'a mut Vm<E::Backend>,
+    db: &'a DB,
 }
 
 /// Which of a predicate's subscribers one row version reached.
@@ -59,6 +77,37 @@ impl Matched<'_> {
             Self::Every(all) => Some(all),
             Self::Nobody => None,
             Self::Narrowed(some) => Some(some),
+        }
+    }
+}
+
+/// One predicate's verdict for one row version.
+///
+/// Both halves at once, because a predicate carrying a membership term can
+/// answer some of its subscribers and be refused for others: with
+/// `term OR overflowing`, the assignment where the term holds short-circuits
+/// and never reaches the arithmetic.
+struct RowVerdict<'a> {
+    /// The subscribers the row test reached.
+    matched: Matched<'a>,
+    /// The subscribers whose evaluation the engine refuses, and why.
+    refused: Option<(RoaringBitmap, ArithmeticFailure)>,
+}
+
+impl Matched<'_> {
+    /// This verdict without the subscribers whose evaluation was refused.
+    ///
+    /// A refused subscription gets the failure and nothing else: reporting a
+    /// transition as well would tell the caller both that the row left the
+    /// answer and that the answer could not be computed.
+    fn without(self, refused: &RoaringBitmap) -> Self {
+        if refused.is_empty() {
+            return self;
+        }
+        match self {
+            Self::Every(all) => Self::Narrowed(all - refused),
+            Self::Nobody => Self::Nobody,
+            Self::Narrowed(some) => Self::Narrowed(some - refused),
         }
     }
 }
@@ -140,55 +189,35 @@ fn matched_for_row<'a, I, E, DB>(
     row: RowKind,
     vm: &mut Vm<E::Backend>,
     db: &DB,
-) -> Result<Matched<'a>, DispatchError>
+) -> Result<RowVerdict<'a>, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
     DB: DatabaseLike,
 {
     if pred.bytecode.term_columns.is_empty() {
-        let held = vm
-            .eval(&pred.bytecode, event, row, db)
-            .map_err(dispatch_vm_error)?
-            == Tri::True;
-        return Ok(if held {
-            Matched::Every(bitmap)
-        } else {
-            Matched::Nobody
+        let verdict = match vm.eval(&pred.bytecode, event, row, db) {
+            Ok(verdict) => verdict,
+            // No term, so the refusal is the whole predicate's.
+            Err(VmError::Arithmetic(failure)) => {
+                return Ok(RowVerdict {
+                    matched: Matched::Nobody,
+                    refused: Some((bitmap.clone(), failure)),
+                })
+            }
+            Err(other) => return Err(dispatch_vm_error(other)),
+        };
+        return Ok(RowVerdict {
+            matched: if verdict == Tri::True {
+                Matched::Every(bitmap)
+            } else {
+                Matched::Nobody
+            },
+            refused: None,
         });
     }
 
-    let mut facts: Vec<TermFacts<'a>> = Vec::with_capacity(pred.bytecode.term_columns.len());
-    for (slot, columns) in pred.bytecode.term_columns.iter().enumerate() {
-        let slot = u16::try_from(slot).unwrap_or(u16::MAX);
-        // A NULL cell dominates an unreadable one: SQL never matches through a
-        // NULL, so the term admits nobody whatever the other cells hold, while
-        // an unreadable cell alone leaves the term unable to say.
-        let mut keys = Vec::with_capacity(columns.len());
-        let mut nobody = false;
-        let mut unknown = false;
-        for column in columns {
-            let value = event
-                .value_at(db, row, *column)
-                .map_err(DispatchError::Value)?;
-            match TermLookup::of(value) {
-                TermLookup::Key(key) => keys.push(key),
-                TermLookup::Nobody => nobody = true,
-                TermLookup::Unknown => unknown = true,
-            }
-        }
-        facts.push(if nobody {
-            TermFacts::Admits(None)
-        } else if unknown {
-            TermFacts::CannotSay
-        } else {
-            TermFacts::Admits(
-                store
-                    .term_members(pred.id, slot)
-                    .and_then(|members| members.admits(&keys)),
-            )
-        });
-    }
+    let facts = term_facts_for_row(pred, store, event, row, db)?;
 
     // Only a term the row can answer partitions the subscribers. One it cannot
     // answers alike for all of them, so it is a fixed `Unknown` rather than an
@@ -202,6 +231,13 @@ where
 
     let mut truths = alloc::vec![Tri::Unknown; facts.len()];
     let mut matched = RoaringBitmap::new();
+    // The subscribers some assignment was refused for, and the cause. Every
+    // refusal in one predicate has the same cause: the arithmetic is the
+    // row's, and only whether it is reached varies.
+    let mut refused = RoaringBitmap::new();
+    let mut cause: Option<ArithmeticFailure> = None;
+    // The same, per assignment, for a cell the event does not carry: an
+    // assignment that short-circuits before reading it is answered.
     // Reused across assignments: each one starts from the predicate's own
     // subscribers, so the buffer is refilled rather than reallocated.
     let mut described = RoaringBitmap::new();
@@ -214,13 +250,17 @@ where
             };
         }
 
-        if vm
-            .eval_with_terms(&pred.bytecode, event, row, db, &truths)
-            .map_err(dispatch_vm_error)?
-            != Tri::True
-        {
-            continue;
-        }
+        // Only an assignment that matched, was refused, or could not be
+        // answered needs its subscriber set computed, so this costs what it
+        // did before either report existed.
+        let refusal = match vm.eval_with_terms(&pred.bytecode, event, row, db, &truths) {
+            Ok(Tri::True) => None,
+            // Every other verdict is an answer, so this assignment reports
+            // nothing.
+            Ok(_) => continue,
+            Err(VmError::Arithmetic(failure)) => Some(failure),
+            Err(other) => return Err(dispatch_vm_error(other)),
+        };
 
         // The subscribers this assignment describes: in every term it says the
         // subscriber is in, out of every term it says they are not. Complemented
@@ -243,10 +283,73 @@ where
                 break;
             }
         }
-        matched |= &described;
+        if let Some(failure) = refusal {
+            refused |= &described;
+            cause = Some(failure);
+        } else {
+            matched |= &described;
+        }
     }
 
-    Ok(Matched::Narrowed(matched))
+    Ok(RowVerdict {
+        matched: Matched::Narrowed(matched),
+        refused: cause
+            .filter(|_| !refused.is_empty())
+            .map(|failure| (refused, failure)),
+    })
+}
+
+/// What every membership term of `pred` says about one row version, and the
+/// first column the event did not carry.
+///
+/// A term's columns are read here rather than by the VM, so an absent one is
+/// invisible to the evaluator and settled here.
+fn term_facts_for_row<'a, I, E, DB>(
+    pred: &Predicate<E::Backend>,
+    store: &'a PredicateStore<I, E::Backend>,
+    event: &E,
+    row: RowKind,
+    db: &DB,
+) -> Result<Vec<TermFacts<'a>>, DispatchError>
+where
+    I: IdTypes,
+    E: CdcEvent,
+    DB: DatabaseLike,
+{
+    let mut facts: Vec<TermFacts<'a>> = Vec::with_capacity(pred.bytecode.term_columns.len());
+    for (slot, columns) in pred.bytecode.term_columns.iter().enumerate() {
+        let slot = u16::try_from(slot).unwrap_or(u16::MAX);
+        // A NULL cell dominates an unreadable one: SQL never matches through a
+        // NULL, so the term admits nobody whatever the other cells hold, while
+        // an unreadable cell alone leaves the term unable to say.
+        let mut keys = Vec::with_capacity(columns.len());
+        let mut nobody = false;
+        let mut unknown = false;
+        for column in columns {
+            let value = event
+                .value_at(db, row, *column)
+                .map_err(DispatchError::Value)?;
+            match TermLookup::of(value) {
+                TermLookup::Key(key) => keys.push(key),
+                TermLookup::Nobody => nobody = true,
+                TermLookup::Unknown => {
+                    unknown = true;
+                }
+            }
+        }
+        facts.push(if nobody {
+            TermFacts::Admits(None)
+        } else if unknown {
+            TermFacts::CannotSay
+        } else {
+            TermFacts::Admits(
+                store
+                    .term_members(pred.id, slot)
+                    .and_then(|members| members.admits(&keys)),
+            )
+        });
+    }
+    Ok(facts)
 }
 
 /// Consumer dictionary translating between ordinals and ConsumerIds.
@@ -484,6 +587,7 @@ where
 {
     let checkpoint = event.checkpoint();
     let mut stamps: Vec<SubscriptionId> = Vec::new();
+    let mut reports = DispatchReports::default();
     let notifs: ConsumerNotifications<I, E::Checkpoint, E::Backend> = match event.kind() {
         EventKind::Truncate => {
             let _ = vm;
@@ -497,7 +601,7 @@ where
                 vm,
                 arity,
                 db,
-                &mut stamps,
+                (&mut stamps, &mut reports),
             )?;
             ConsumerNotifications::from_parts(
                 resolve_ordinals(bitmap, consumer_dict),
@@ -513,7 +617,7 @@ where
                 vm,
                 arity,
                 db,
-                &mut stamps,
+                (&mut stamps, &mut reports),
             )?;
             ConsumerNotifications::from_parts(
                 Vec::new(),
@@ -521,11 +625,53 @@ where
                 Vec::new(),
             )
         }
-        EventKind::Update => {
-            dispatch_update_with_stamps(event, partition, consumer_dict, vm, db, &mut stamps)?
-        }
+        EventKind::Update => dispatch_update_with_stamps(
+            event,
+            partition,
+            consumer_dict,
+            vm,
+            db,
+            &mut stamps,
+            &mut reports,
+        )?,
     };
-    Ok((notifs.with_checkpoint(checkpoint), stamps))
+    let failures = reports
+        .refusals
+        .into_iter()
+        .filter_map(|(ordinal, subscription_id, failure)| {
+            Some(crate::types::EvaluationFailure {
+                subscription_id,
+                consumer_id: consumer_dict.get_consumer(ordinal)?,
+                refusal: failure,
+            })
+        })
+        .collect();
+    Ok((
+        notifs
+            .with_checkpoint(checkpoint)
+            .with_evaluation_failures(failures),
+        stamps,
+    ))
+}
+
+/// Record one refused predicate against every subscription bound to it.
+///
+/// The failure is per subscription, not per consumer: one consumer can hold
+/// several subscriptions, and only the ones whose predicate was refused
+/// failed.
+fn collect_refusals_for_predicate<I: IdTypes, B: Backend>(
+    predicates: &PredicateStore<I, B>,
+    pred_id: PredicateId,
+    consumers: &RoaringBitmap,
+    failure: ArithmeticFailure,
+    out: &mut Vec<(ConsumerOrdinal, SubscriptionId, ArithmeticFailure)>,
+) {
+    for ord_u32 in consumers {
+        let ord = ConsumerOrdinal::new(ord_u32);
+        if let Some(sub_ids) = predicates.binding_lookup.get(&(pred_id, ord)) {
+            out.extend(sub_ids.iter().map(|sub_id| (ord, *sub_id, failure)));
+        }
+    }
 }
 
 fn collect_stamps_for_predicate<I: IdTypes, B: Backend>(
@@ -559,6 +705,7 @@ fn dispatch_update_with_stamps<I, E, DB>(
     vm: &mut Vm<E::Backend>,
     db: &DB,
     stamps: &mut Vec<SubscriptionId>,
+    reports: &mut DispatchReports,
 ) -> Result<ConsumerNotifications<I, E::Checkpoint, E::Backend>, DispatchError>
 where
     I: IdTypes,
@@ -609,7 +756,28 @@ where
             db,
         )?;
 
-        split_transition(&new_matched, &old_matched, |slot, set| {
+        // A row version refused for some subscribers is reported for those,
+        // and the transition is computed for the rest. A subscription refused
+        // on either version is refused for the update: an answer needs both
+        // versions, so it gets the failure and no transition.
+        let mut refused_here = RoaringBitmap::new();
+        for (consumers, failure) in [new_matched.refused, old_matched.refused]
+            .into_iter()
+            .flatten()
+        {
+            collect_refusals_for_predicate(
+                &snapshot.predicates,
+                pred_id,
+                &consumers,
+                failure,
+                &mut reports.refusals,
+            );
+            refused_here |= consumers;
+        }
+
+        let new_served = new_matched.matched.without(&refused_here);
+        let old_served = old_matched.matched.without(&refused_here);
+        split_transition(&new_served, &old_served, |slot, set| {
             collect_stamps_for_predicate(&snapshot.predicates, pred_id, set, stamps);
             let target = match slot {
                 Slot::Inserted => &mut inserted_ordinals,
@@ -637,13 +805,14 @@ fn dispatch_single_eval_bitmap_with_stamps<I, E, DB>(
     vm: &mut Vm<E::Backend>,
     arity: usize,
     db: &DB,
-    stamps: &mut Vec<SubscriptionId>,
+    accumulators: (&mut Vec<SubscriptionId>, &mut DispatchReports),
 ) -> Result<RoaringBitmap, DispatchError>
 where
     I: IdTypes,
     E: CdcEvent,
     DB: DatabaseLike,
 {
+    let (stamps, reports) = accumulators;
     let candidates = partition.select_candidates(arity, |col| {
         probe_column_for_index(event, row, col, arity, db)
     });
@@ -653,10 +822,8 @@ where
     for_each_matching_predicate(
         &candidates,
         &snapshot.predicates,
-        event,
-        row,
-        vm,
-        db,
+        &mut EvalContext { event, row, vm, db },
+        reports,
         |pred, consumers| {
             if matches!(pred.projection, QueryProjection::Rows) {
                 matching_ordinals |= consumers;
@@ -672,10 +839,8 @@ where
 fn for_each_matching_predicate<I, E, F, DB>(
     candidates: &RoaringBitmap,
     store: &PredicateStore<I, E::Backend>,
-    event: &E,
-    row: RowKind,
-    vm: &mut Vm<E::Backend>,
-    db: &DB,
+    context: &mut EvalContext<'_, E, DB>,
+    reports: &mut DispatchReports,
     mut on_match: F,
 ) -> Result<(), DispatchError>
 where
@@ -702,8 +867,25 @@ where
         // bitmap. Without the narrowing an insert would reach every subscriber
         // sharing the filter, which is the failure the staged refusal existed to
         // prevent.
-        let matched = matched_for_row(pred, bitmap, store, event, row, vm, db)?;
-        if let Some(reached) = matched.bitmap().filter(|set| !set.is_empty()) {
+        let verdict = matched_for_row(
+            pred,
+            bitmap,
+            store,
+            context.event,
+            context.row,
+            context.vm,
+            context.db,
+        )?;
+        if let Some((consumers, failure)) = verdict.refused {
+            collect_refusals_for_predicate(
+                store,
+                pred_id,
+                &consumers,
+                failure,
+                &mut reports.refusals,
+            );
+        }
+        if let Some(reached) = verdict.matched.bitmap().filter(|set| !set.is_empty()) {
             on_match(pred, reached)?;
         }
     }
@@ -766,10 +948,40 @@ pub(crate) struct AggregateDelta<B: crate::backend::Backend> {
     pub rows: i64,
 }
 
+/// The refused subscriptions of one event, with their deltas removed.
+///
+/// A refused subscription contributes no delta, even when one row version
+/// was served: an update's fold needs both versions, and folding half of it
+/// would move the total by a row the filter never judged. The caller
+/// applies the stop after folding, so the removal happens here.
+fn refused_subscriptions<B: crate::backend::Backend>(
+    refusals: Vec<(ConsumerOrdinal, SubscriptionId, ArithmeticFailure)>,
+    deltas: &mut Vec<AggregateDelta<B>>,
+) -> Vec<(SubscriptionId, ArithmeticFailure)> {
+    let mut refused: Vec<(SubscriptionId, ArithmeticFailure)> = refusals
+        .into_iter()
+        .map(|(_, subscription, failure)| (subscription, failure))
+        .collect();
+    refused.sort_unstable_by_key(|(subscription, _)| *subscription);
+    refused.dedup_by_key(|(subscription, _)| *subscription);
+    if !refused.is_empty() {
+        deltas.retain(|delta| {
+            refused
+                .binary_search_by_key(&delta.subscription, |(subscription, _)| *subscription)
+                .is_err()
+        });
+    }
+    refused
+}
+
 pub(crate) struct AggregateComputation<B: crate::backend::Backend> {
     pub deltas: Vec<AggregateDelta<B>>,
     pub missing_old: Vec<SubscriptionId>,
     pub group_key_failed: Vec<SubscriptionId>,
+    /// Subscriptions whose filter the engine refuses to evaluate for this
+    /// event. An aggregate emits maintenance rather than rows, so these
+    /// surface as maintenance stops rather than in a notification set.
+    pub evaluation_refused: Vec<(SubscriptionId, ArithmeticFailure)>,
 }
 
 type AggregateNet<B> = HashMap<
@@ -938,15 +1150,14 @@ where
     };
     let missing_old = subscriptions_missing_old(event, &candidates, &snapshot.predicates, db);
     let mut group_key_failed = HashSet::new();
+    let mut reports = DispatchReports::default();
 
     for (weight, row) in weighted_rows {
         for_each_matching_predicate(
             &candidates,
             &snapshot.predicates,
-            event,
-            row,
-            vm,
-            db,
+            &mut EvalContext { event, row, vm, db },
+            &mut reports,
             |pred, consumers| {
                 let Some((spec, groups)) = delta_spec_and_groups(&pred.projection) else {
                     return Ok(());
@@ -999,7 +1210,7 @@ where
         )?;
     }
 
-    let deltas = net
+    let mut deltas: Vec<AggregateDelta<E::Backend>> = net
         .into_iter()
         .filter_map(|((subscription, _), (delta, rows, group))| {
             (rows != 0 || delta.as_ref().is_some_and(|delta| !delta.is_zero())).then_some(
@@ -1016,10 +1227,13 @@ where
     missing_old.sort_unstable();
     let mut group_key_failed: Vec<_> = group_key_failed.into_iter().collect();
     group_key_failed.sort_unstable();
+    let evaluation_refused = refused_subscriptions(reports.refusals, &mut deltas);
+
     Ok(AggregateComputation {
         deltas,
         missing_old,
         group_key_failed,
+        evaluation_refused,
     })
 }
 

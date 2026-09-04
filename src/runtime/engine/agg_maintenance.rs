@@ -10,6 +10,22 @@ use super::{
 };
 use crate::backend::Backend;
 
+/// The per-subscription reasons one event stops an aggregate's
+/// stream maintenance, gathered so the reporting takes one argument.
+struct AggregateStops {
+    /// Subscriptions whose UPDATE omitted an old-row column they read.
+    missing_old: Vec<SubscriptionId>,
+    /// Subscriptions whose group key could not be encoded.
+    group_key_failed: Vec<SubscriptionId>,
+    /// Subscriptions whose filter the engine refuses to evaluate.
+    evaluation_refused: Vec<(
+        SubscriptionId,
+        crate::compiler::vm::arithmetic::ArithmeticFailure,
+    )>,
+    /// Subscriptions that would exceed the configured group limit.
+    group_limit: Vec<SubscriptionId>,
+}
+
 impl<E: CdcEvent, I: IdTypes, DB: DatabaseLike + 'static> SubscriptionEngine<E, I, DB>
 where
     E::Backend: SqlLiteralParse,
@@ -89,12 +105,16 @@ where
     fn push_aggregate_stops(
         &mut self,
         table_id: TableId,
-        missing_old: Vec<SubscriptionId>,
-        group_key_failed: Vec<SubscriptionId>,
-        mut group_limit: Vec<SubscriptionId>,
+        stops: AggregateStops,
         checkpoint: Option<&E::Checkpoint>,
         output: &mut crate::AggregateMaintenanceOutput<I, E::Backend, E::Checkpoint>,
     ) -> Result<(), DispatchError> {
+        let AggregateStops {
+            missing_old,
+            group_key_failed,
+            evaluation_refused,
+            mut group_limit,
+        } = stops;
         for subscription in missing_old {
             self.push_aggregate_stop(
                 subscription,
@@ -103,6 +123,9 @@ where
                 output,
             )?;
         }
+        // A refused evaluation is not a tier change: a read would raise
+        // the same error, so it is reported and nothing else happens.
+        output.evaluation_failures.extend(evaluation_refused);
         for subscription in group_key_failed {
             self.push_aggregate_stop(
                 subscription,
@@ -301,9 +324,12 @@ where
 
         self.push_aggregate_stops(
             table_id,
-            computation.missing_old,
-            computation.group_key_failed,
-            group_limit,
+            AggregateStops {
+                missing_old: computation.missing_old,
+                group_key_failed: computation.group_key_failed,
+                evaluation_refused: computation.evaluation_refused,
+                group_limit,
+            },
             at.as_ref(),
             &mut output,
         )?;
