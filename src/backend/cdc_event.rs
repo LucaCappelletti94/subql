@@ -2,8 +2,8 @@
 //! rather than a banner comment.
 
 use crate::backend::{
-    Backend, BuiltinKind, Checkpoint, ColumnId, CustomScalars, DatabaseLike, EventKind, RowKind,
-    ScalarKindOf, TableId, Value,
+    Backend, Checkpoint, ColumnId, CustomScalars, DatabaseLike, EventKind, RowKind, ScalarKindOf,
+    TableId, Value,
 };
 use alloc::vec::Vec;
 
@@ -329,16 +329,18 @@ pub fn decode_cell<B, F>(
 ) -> Result<Value<B>, crate::ValueError>
 where
     B: Backend,
-    F: FnOnce(BuiltinKind) -> Value<B>,
+    F: FnOnce(crate::backend::BuiltinType) -> Value<B>,
 {
     let Some(custom) = kind.custom().copied() else {
-        // Total: `custom()` answered `None`, so `as_builtin` answers `Some`.
-        let builtin = kind.as_builtin().unwrap_or(BuiltinKind::String);
+        // Total: `custom()` answered `None`, so `builtin` answers `Some`.
+        let builtin = kind.builtin().unwrap_or(crate::backend::BuiltinType::Text(
+            crate::backend::TextWidth::Varying,
+        ));
         let decoded = decode(builtin);
         return if decoded.is_missing() {
             Err(crate::ValueError::Builtin {
                 column,
-                kind: builtin,
+                kind: builtin.family(),
             })
         } else {
             Ok(decoded)
@@ -346,7 +348,13 @@ where
     };
 
     let carrier = <B::Custom as CustomScalars>::carrier(custom);
-    let raw = decode(carrier);
+    // A carrier is a family: a custom type declares no width, so the decode
+    // reads the common case rather than inventing a refinement.
+    let raw = decode(crate::backend::refined_builtin(
+        carrier,
+        crate::backend::FloatWidth::Double,
+        crate::backend::TextWidth::Varying,
+    ));
     let Some(view) = raw.as_carried() else {
         return Err(crate::ValueError::Builtin {
             column,

@@ -264,14 +264,22 @@ fn a_declared_custom_type_classifies_as_itself() {
 fn a_wire_cell_decodes_through_the_carrier_and_the_conversion() {
     let decoded =
         subql::backend::decode_cell::<Custom, _>(0, ScalarKind::Custom(MyKind::Mood), |carrier| {
-            assert_eq!(carrier, BuiltinKind::String, "a mood travels as text");
+            assert_eq!(
+                carrier.family(),
+                BuiltinKind::String,
+                "a mood travels as text"
+            );
             Value::String("happy".to_owned())
         });
     assert_eq!(decoded, Ok(Value::Custom(MyValue::Mood(Mood::Happy))));
 
     let decoded =
         subql::backend::decode_cell::<Custom, _>(1, ScalarKind::Custom(MyKind::Build), |carrier| {
-            assert_eq!(carrier, BuiltinKind::Int, "a build travels as an integer");
+            assert_eq!(
+                carrier.family(),
+                BuiltinKind::Int,
+                "a build travels as an integer"
+            );
             Value::Int(1234)
         });
     assert_eq!(decoded, Ok(Value::Custom(MyValue::Build(1234))));
