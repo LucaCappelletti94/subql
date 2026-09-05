@@ -465,6 +465,28 @@ enum AggKind {
     StddevSamp,
 }
 
+impl AggKind {
+    /// The kind a `HAVING` family function reads through.
+    ///
+    /// The one place the pairing is spelled. `from_spec` derives the same
+    /// kind from the projected `AggSpec`, and the two must agree, because
+    /// a projected `SUM` and a `HAVING SUM(...)` over one subscription
+    /// read the same held components and have to report the same number.
+    /// `COUNT(*)` has no function here: it aggregates no column, so
+    /// `HavingFunction::of` answers `None` for it.
+    const fn of_having(function: crate::HavingFunction) -> Self {
+        match function {
+            crate::HavingFunction::CountColumn => Self::Count,
+            crate::HavingFunction::Sum => Self::Sum,
+            crate::HavingFunction::Avg => Self::Avg,
+            crate::HavingFunction::VarPop => Self::VarPop,
+            crate::HavingFunction::VarSamp => Self::VarSamp,
+            crate::HavingFunction::StddevPop => Self::StddevPop,
+            crate::HavingFunction::StddevSamp => Self::StddevSamp,
+        }
+    }
+}
+
 /// How one subscription's fold answers, resolved once at registration.
 ///
 /// Three facts that all follow from the summed column and the engine, and
@@ -991,7 +1013,17 @@ impl AggAccumulator {
 
     /// Current aggregate value.
     pub fn value(&self) -> AggValue {
-        match self.kind {
+        self.value_of(self.kind)
+    }
+
+    /// The value this held state renders as, read through `kind`.
+    ///
+    /// One renderer, because the projected value and the value a sibling
+    /// `HAVING` function reads are the same formulas over the same held
+    /// components. Two copies could only ever differ by mistake, and the
+    /// mistake would be silent: both answers are plausible.
+    fn value_of(&self, kind: AggKind) -> AggValue {
+        match kind {
             AggKind::Count => AggValue::Count(self.count),
             AggKind::Sum => AggValue::Sum(self.reported_total()),
             AggKind::Avg => AggValue::Avg(self.mean()),
@@ -1070,15 +1102,7 @@ impl AggAccumulator {
     /// Meaningful only when the components are maintained in full, which the
     /// widened delta and seed paths guarantee.
     pub fn value_as(&self, function: crate::HavingFunction) -> AggValue {
-        match function {
-            crate::HavingFunction::CountColumn => AggValue::Count(self.count),
-            crate::HavingFunction::Sum => AggValue::Sum(self.reported_total()),
-            crate::HavingFunction::Avg => AggValue::Avg(self.mean()),
-            crate::HavingFunction::VarPop => AggValue::Real(self.var_pop()),
-            crate::HavingFunction::VarSamp => AggValue::Real(self.var_samp()),
-            crate::HavingFunction::StddevPop => AggValue::Real(self.var_pop().map(f64::sqrt)),
-            crate::HavingFunction::StddevSamp => AggValue::Real(self.var_samp().map(f64::sqrt)),
-        }
+        self.value_of(AggKind::of_having(function))
     }
 
     /// The population variance, which is the spread divided by the rows.
@@ -1785,5 +1809,110 @@ impl<I: IdTypes, B: Backend, C: Checkpoint> GroupedAggregateTotal<I, B, C> {
         self.groups = groups;
         self.pending = None;
         Ok(opening)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AggAccumulator, AggDelta, FoldRule, Spread};
+    use crate::compiler::sql_shape::{AggSpec, HavingFunction};
+
+    /// Three rows, each as the exact value the total takes and the real
+    /// the spread takes.
+    ///
+    /// Spelled both ways rather than cast, so the test states the two
+    /// numbers it means. A count of 3, a total of 9 and a mean of 3 are
+    /// all different, which is what makes a wrong pairing visible.
+    const ROWS: [(i128, f64); 3] = [(1, 1.0), (2, 2.0), (6, 6.0)];
+
+    /// A fold rule that maintains every component, so both renderers have
+    /// something to disagree about.
+    const RULE: FoldRule = FoldRule {
+        total: crate::backend::SumRule::Integer,
+        mean: crate::backend::MeanRule::Double,
+        quotient: crate::compiler::bytecode::Quotient::FromTheOperands,
+        variance_seed: crate::backend::VarianceSeed::EnginesOwn,
+        float_overflow: crate::backend::FloatSumOverflow::Raises,
+    };
+
+    /// The `AggSpec` a `HavingFunction` names, which is the pairing both
+    /// renderers have to agree about.
+    fn spec_of(function: HavingFunction) -> AggSpec {
+        let column: crate::ColumnId = 0;
+        match function {
+            HavingFunction::CountColumn => AggSpec::CountColumn { column },
+            HavingFunction::Sum => AggSpec::Sum { column },
+            HavingFunction::Avg => AggSpec::Avg { column },
+            HavingFunction::VarPop => AggSpec::VarPop { column },
+            HavingFunction::VarSamp => AggSpec::VarSamp { column },
+            HavingFunction::StddevPop => AggSpec::StddevPop { column },
+            HavingFunction::StddevSamp => AggSpec::StddevSamp { column },
+        }
+    }
+
+    /// The two renderers answer the same thing for every function.
+    ///
+    /// A guard rather than a failing test: nothing is wrong with either
+    /// answer today, only with there being two places to change. Both
+    /// read the same held components through the same formulas, so the
+    /// only way they can part is by pairing a function with the wrong
+    /// kind, and that is what this asserts. The state is chosen so every
+    /// kind renders differently: three rows worth 1, 2 and 6 give a count
+    /// of 3, a total of 9, a mean of 3 and a spread nobody else reports.
+    #[test]
+    fn having_and_projected_renderers_agree_for_every_kind() {
+        const FUNCTIONS: [HavingFunction; 7] = [
+            HavingFunction::CountColumn,
+            HavingFunction::Sum,
+            HavingFunction::Avg,
+            HavingFunction::VarPop,
+            HavingFunction::VarSamp,
+            HavingFunction::StddevPop,
+            HavingFunction::StddevSamp,
+        ];
+        for function in FUNCTIONS {
+            let mut accumulator = AggAccumulator::from_spec(&spec_of(function), RULE);
+            for (exact, real) in ROWS {
+                accumulator
+                    .apply(&AggDelta::Stats {
+                        value: super::TotalDelta::Integer(exact),
+                        added: Spread::of_one(real),
+                        removed: Spread::EMPTY,
+                    })
+                    .expect("three small integers stay in range");
+            }
+            assert_eq!(
+                accumulator.value(),
+                accumulator.value_as(function),
+                "the projected renderer and the HAVING renderer disagree for {function:?}"
+            );
+        }
+    }
+
+    /// And they disagree when the pairing is wrong, so the test above is
+    /// not vacuous.
+    ///
+    /// Without this, a mapping that sent every function to one kind would
+    /// pass: each accumulator would be built from that kind's spec and
+    /// both renderers would agree on the wrong answer. Asserting that a
+    /// deliberately mismatched pair differs is what makes the agreement
+    /// above mean something.
+    #[test]
+    fn a_mismatched_pairing_is_visible() {
+        let mut accumulator = AggAccumulator::from_spec(&AggSpec::Sum { column: 0 }, RULE);
+        for (exact, real) in ROWS {
+            accumulator
+                .apply(&AggDelta::Stats {
+                    value: super::TotalDelta::Integer(exact),
+                    added: Spread::of_one(real),
+                    removed: Spread::EMPTY,
+                })
+                .expect("three small integers stay in range");
+        }
+        assert_ne!(
+            accumulator.value(),
+            accumulator.value_as(HavingFunction::Avg),
+            "a total of 9 and a mean of 3 are not the same value"
+        );
     }
 }
