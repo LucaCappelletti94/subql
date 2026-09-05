@@ -567,11 +567,22 @@ impl Backend for MySql {
         }
         // Both sides agree, so either resolves the pair; a literal side
         // takes the column's collation.
-        comparison
+        let rule = comparison
             .left
             .or(comparison.right)
             .and_then(mysql_binary_text_rule)
-            .or(Some(TextRule::EXACT))
+            .unwrap_or(TextRule::EXACT);
+        // A collation's padding is a fact about equality and ordering, not
+        // about a pattern. Measured on 8.0 with a `VARCHAR` holding
+        // `ab   ` under `utf8mb4_bin`, which is `PAD SPACE`: `b = 'ab'`
+        // is 1 and `b LIKE 'ab'` is 0, so the pattern reads the stored
+        // value with its spaces where equality does not.
+        Some(match operation {
+            crate::backend::TextOperation::Pattern => {
+                rule.with_spaces(crate::backend::TrailingSpaces::BothSignificant)
+            }
+            _ => rule,
+        })
     }
 
     fn group_key_encoder(
@@ -812,6 +823,10 @@ impl Backend for SQLite {
         }
         if matches!(operation, crate::backend::TextOperation::Pattern) {
             rule.case = crate::backend::TextCase::AsciiNoCase;
+            // `LIKE` is a function here and consults no collation at all.
+            // Measured on 3.51.1 with a `TEXT COLLATE RTRIM` column
+            // holding `ab   `: `r = 'ab'` is 1 and `r LIKE 'ab'` is 0.
+            rule.spaces = crate::backend::TrailingSpaces::BothSignificant;
         }
         Some(rule)
     }

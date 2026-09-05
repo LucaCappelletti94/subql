@@ -279,3 +279,101 @@ fn sqlite_char_keeps_trailing_spaces() {
         "SQLite stores what it was given and compares it exactly"
     );
 }
+
+/// A pattern keeps trailing spaces significant whatever the collation
+/// says about equality.
+///
+/// Measured, and the two engines reach it by different routes while
+/// agreeing on the answer. On MySQL 8.0 with a `VARCHAR` column holding
+/// `ab   ` under `utf8mb4_bin`, which is `PAD SPACE`:
+///
+/// ```text
+/// b = 'ab'         1        the collation pads, so equality ignores them
+/// b LIKE 'ab'      0        the pattern does not
+/// b LIKE 'ab   '   1
+/// ```
+///
+/// On SQLite 3.51.1 with a `TEXT COLLATE RTRIM` column holding the same:
+///
+/// ```text
+/// r = 'ab'         1        RTRIM ignores trailing spaces
+/// r LIKE 'ab'      0        LIKE is a function and does not consult the
+/// r LIKE 'ab   '   1        collation at all
+/// ```
+///
+/// So a padding collation's trailing-space rule belongs to equality and
+/// ordering, and a pattern must override it. PostgreSQL already answers
+/// this way, because its `Pattern` arm returns `TextRule::EXACT` rather
+/// than reading the padding.
+#[test]
+fn a_pattern_keeps_trailing_spaces_whatever_the_collation_pads() {
+    let facts = |collation: &str| ColumnComparison {
+        kind: BuiltinKind::String.into(),
+        declared_type: "VARCHAR".to_string(),
+        collation: CollationFacts::Named {
+            name: CollationName {
+                name: collation.to_string(),
+                name_is_quoted: false,
+                schema: None,
+                schema_is_quoted: false,
+            },
+            postgres_deterministic: None,
+            padding: None,
+        },
+    };
+
+    let rule_for = |collation: &str, operation| {
+        let facts = facts(collation);
+        let context = ComparisonContext {
+            left: Some(&facts),
+            right: None,
+            text: None,
+        };
+        MySql::text_rule(&context, operation).expect("a binary collation is reproducible")
+    };
+
+    assert_eq!(
+        rule_for("utf8mb4_bin", TextOperation::Equality).spaces,
+        subql::backend::TrailingSpaces::BothIgnored,
+        "PAD SPACE pads for equality, which is what the collation is for"
+    );
+    assert_eq!(
+        rule_for("utf8mb4_bin", TextOperation::Pattern).spaces,
+        subql::backend::TrailingSpaces::BothSignificant,
+        "and a pattern under the same collation keeps them, measured as `b LIKE 'ab'` = 0"
+    );
+
+    let sqlite_rule = |collation: &str, operation| {
+        let facts = ColumnComparison {
+            kind: BuiltinKind::String.into(),
+            declared_type: "TEXT".to_string(),
+            collation: CollationFacts::Named {
+                name: CollationName {
+                    name: collation.to_string(),
+                    name_is_quoted: false,
+                    schema: None,
+                    schema_is_quoted: false,
+                },
+                postgres_deterministic: None,
+                padding: None,
+            },
+        };
+        let context = ComparisonContext {
+            left: Some(&facts),
+            right: None,
+            text: None,
+        };
+        SQLite::text_rule(&context, operation).expect("RTRIM is reproducible")
+    };
+
+    assert_eq!(
+        sqlite_rule("RTRIM", TextOperation::Equality).spaces,
+        subql::backend::TrailingSpaces::BothIgnored,
+        "RTRIM ignores trailing spaces for equality, measured as `r = 'ab'` = 1"
+    );
+    assert_eq!(
+        sqlite_rule("RTRIM", TextOperation::Pattern).spaces,
+        subql::backend::TrailingSpaces::BothSignificant,
+        "and keeps them for a pattern, measured as `r LIKE 'ab'` = 0"
+    );
+}
